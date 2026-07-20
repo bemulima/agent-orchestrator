@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/example/course-dev-orchestrator/internal/domain/repository"
+	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
 const (

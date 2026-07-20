@@ -6,7 +6,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 
-	"github.com/example/course-dev-orchestrator/internal/activities"
+	"github.com/bemulima/agent-orchestrator/internal/activities"
 )
 
 // SystemProbeWorkflow exercises durable workflow/activity execution for

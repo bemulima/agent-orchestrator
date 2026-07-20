@@ -8,8 +8,8 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
-	"github.com/example/course-dev-orchestrator/internal/adapters/http/handlers"
-	httpmiddleware "github.com/example/course-dev-orchestrator/internal/adapters/http/middleware"
+	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
+	httpmiddleware "github.com/bemulima/agent-orchestrator/internal/adapters/http/middleware"
 )
 
 // RouterDependencies collects HTTP handlers and cross-cutting dependencies.

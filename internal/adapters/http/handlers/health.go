@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	healthuc "github.com/example/course-dev-orchestrator/internal/usecase/health"
+	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 )
 
 type HealthHandler struct {

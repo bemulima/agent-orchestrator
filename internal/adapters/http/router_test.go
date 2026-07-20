@@ -8,9 +8,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/example/course-dev-orchestrator/internal/adapters/http/handlers"
-	"github.com/example/course-dev-orchestrator/internal/domain/repository"
-	healthuc "github.com/example/course-dev-orchestrator/internal/usecase/health"
+	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
+	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 )
 
 type routerChecker struct {

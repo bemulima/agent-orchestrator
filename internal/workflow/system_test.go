@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/example/course-dev-orchestrator/internal/activities"
+	"github.com/bemulima/agent-orchestrator/internal/activities"
 )
 
 func TestSystemProbeWorkflow(t *testing.T) {

@@ -17,15 +17,15 @@ import (
 	"go.temporal.io/sdk/worker"
 	"go.uber.org/zap"
 
-	"github.com/example/course-dev-orchestrator/internal/activities"
-	httpadapter "github.com/example/course-dev-orchestrator/internal/adapters/http"
-	"github.com/example/course-dev-orchestrator/internal/adapters/http/handlers"
-	pgadapter "github.com/example/course-dev-orchestrator/internal/adapters/postgres"
-	temporaladapter "github.com/example/course-dev-orchestrator/internal/adapters/temporal"
-	"github.com/example/course-dev-orchestrator/internal/config"
-	"github.com/example/course-dev-orchestrator/internal/domain/repository"
-	healthuc "github.com/example/course-dev-orchestrator/internal/usecase/health"
-	orchestratorworkflow "github.com/example/course-dev-orchestrator/internal/workflow"
+	"github.com/bemulima/agent-orchestrator/internal/activities"
+	httpadapter "github.com/bemulima/agent-orchestrator/internal/adapters/http"
+	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
+	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
+	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
+	"github.com/bemulima/agent-orchestrator/internal/config"
+	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
+	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
 )
 
 var (

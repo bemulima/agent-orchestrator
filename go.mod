@@ -1,4 +1,4 @@
-module github.com/example/course-dev-orchestrator
+module github.com/bemulima/agent-orchestrator
 
 go 1.23.0
 
