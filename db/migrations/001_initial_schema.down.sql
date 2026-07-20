@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS audit_event;
+DROP TABLE IF EXISTS telegram_user;
+DROP TABLE IF EXISTS gitlab_link;
+DROP TABLE IF EXISTS approval;
+DROP TABLE IF EXISTS artifact;
+DROP TABLE IF EXISTS task_attempt;
+DROP TABLE IF EXISTS task_dependency;
+DROP TABLE IF EXISTS task;
+DROP TABLE IF EXISTS plan;
+DROP TABLE IF EXISTS command;
+DROP TABLE IF EXISTS service_relation;
+DROP TABLE IF EXISTS contract;
+DROP TABLE IF EXISTS service_ownership;
+DROP TABLE IF EXISTS service_capability;
+DROP TABLE IF EXISTS service_snapshot;
+DROP TABLE IF EXISTS project;
