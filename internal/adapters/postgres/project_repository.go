@@ -377,13 +377,24 @@ func insertAuditTx(
 	resourceID string,
 	payload map[string]any,
 ) error {
+	return insertResourceAuditTx(ctx, tx, "project", action, resourceID, payload)
+}
+
+func insertResourceAuditTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	resourceType string,
+	action string,
+	resourceID string,
+	payload map[string]any,
+) error {
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal audit payload: %w", err)
 	}
 	_, err = tx.Exec(ctx, `
 INSERT INTO audit_event (actor_type, action, resource_type, resource_id, payload)
-VALUES ('system', $1, 'project', $2, $3)`, action, resourceID, rawPayload)
+VALUES ('system', $1, $2, $3, $4)`, action, resourceType, resourceID, rawPayload)
 	if err != nil {
 		return fmt.Errorf("insert audit event: %w", err)
 	}

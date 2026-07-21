@@ -282,7 +282,9 @@ func (s ProjectSource) run(ctx context.Context, directory string, args ...string
 		}
 		return "", errors.New(message)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	// Preserve leading spaces: porcelain status uses them as part of its
+	// two-column state machine. Git's trailing line ending is not meaningful.
+	return strings.TrimRight(stdout.String(), "\r\n"), nil
 }
 
 func (s ProjectSource) isAllowed(path string) bool {

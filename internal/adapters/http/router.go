@@ -14,9 +14,10 @@ import (
 
 // RouterDependencies collects HTTP handlers and cross-cutting dependencies.
 type RouterDependencies struct {
-	HealthHandler  handlers.HealthHandler
-	ProjectHandler *handlers.ProjectHandler
-	Logger         *zap.Logger
+	HealthHandler     handlers.HealthHandler
+	ProjectHandler    *handlers.ProjectHandler
+	OnboardingHandler *handlers.OnboardingHandler
+	Logger            *zap.Logger
 }
 
 // NewRouter builds the chi router.
@@ -37,6 +38,14 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/projects/{projectId}", deps.ProjectHandler.GetProject)
 		root.Post("/api/v1/projects/{projectId}/scan", deps.ProjectHandler.ScanProject)
 		root.Get("/api/v1/projects/{projectId}/reports/latest", deps.ProjectHandler.LatestDiscoveryReport)
+	}
+	if deps.OnboardingHandler != nil {
+		root.Post("/api/v1/projects/{projectId}/onboard", deps.OnboardingHandler.PrepareProject)
+		root.Get("/api/v1/onboarding-runs/{runId}", deps.OnboardingHandler.GetRun)
+		root.Get("/api/v1/onboarding-runs/{runId}/diff", deps.OnboardingHandler.GetDiff)
+		root.Post("/api/v1/onboarding-runs/{runId}/approve", deps.OnboardingHandler.ApproveRun)
+		root.Post("/api/v1/onboarding-runs/{runId}/reject", deps.OnboardingHandler.RejectRun)
+		root.Post("/api/v1/onboarding-runs/{runId}/apply", deps.OnboardingHandler.ApplyRun)
 	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {

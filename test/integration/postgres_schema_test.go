@@ -55,7 +55,7 @@ ORDER BY tablename`)
 
 	expected := []string{
 		"approval", "artifact", "audit_event", "command", "contract",
-		"gitlab_link", "plan", "project", "service_capability",
+		"gitlab_link", "onboarding_run", "plan", "project", "service_capability",
 		"service_ownership", "service_relation", "service_snapshot", "task",
 		"task_attempt", "task_dependency", "telegram_user",
 	}
@@ -68,6 +68,99 @@ ORDER BY tablename`)
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Fatalf("missing tables: %v", missing)
+	}
+}
+
+func TestOnboardingRepositoryEnforcesApprovalStateMachine(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	runs := pgadapter.OnboardingRepoPG{Pool: pool}
+	path := "/fixtures/" + uuid.NewString()
+	project, err := projects.Upsert(context.Background(), domain.Project{
+		Name: "onboarding-integration", Status: domain.ProjectStatusAnalyzed,
+		RepositoryRole: domain.RepositoryRoleService, SourceIdentity: "integration:" + uuid.NewString(),
+		LocalPath: &path, DefaultBranch: "main", CurrentBranch: "main", HeadCommit: "abc123",
+	})
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	now := time.Now().UTC()
+	report := domain.DiscoveryReport{
+		SchemaVersion: 1, ProjectID: project.ID, ProjectName: project.Name,
+		RepositoryRole: project.RepositoryRole, RepositoryPath: path,
+		CommitSHA: "abc123", Branch: "main", ContentChecksum: "checksum", StartedAt: now, CompletedAt: now,
+	}
+	snapshot, err := projects.SaveDiscovery(context.Background(), project, domain.ServiceSnapshot{
+		CommitSHA: "abc123", Branch: "main", ContentChecksum: "checksum",
+		ServiceKind: domain.ServiceKindBackendService, Status: string(domain.ProjectStatusAnalyzed),
+	}, report)
+	if err != nil {
+		t.Fatalf("SaveDiscovery() error = %v", err)
+	}
+	proposal := domain.OnboardingProposal{
+		SchemaVersion: 1, Generator: "integration", ProjectID: project.ID,
+		SnapshotID: snapshot.ID, BaseCommit: snapshot.CommitSHA, Checksum: "proposal-checksum",
+		Files: []domain.ProposedFile{{
+			Path: "AGENTS.md", Content: "managed\n", Action: domain.ProposalFileCreate,
+			Checksum: "file-checksum", Explanation: "integration fixture",
+		}},
+	}
+	run, err := runs.CreateOrGet(context.Background(), domain.OnboardingRun{
+		ProjectID: project.ID, SnapshotID: snapshot.ID, Status: domain.OnboardingStatusProposalReady,
+		BaseCommit: snapshot.CommitSHA, BaseBranch: snapshot.Branch,
+		ProposalChecksum: proposal.Checksum, Proposal: proposal, UnifiedDiff: "fixture diff",
+		Checks: []domain.OnboardingCheck{},
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGet() error = %v", err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM audit_event WHERE resource_id IN ($1, $2)`, project.ID, run.ID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM gitlab_link WHERE resource_type = 'onboarding_run' AND resource_id = $1`, run.ID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM approval WHERE resource_type = 'onboarding_run' AND resource_id = $1`, run.ID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, project.ID)
+	}()
+	if run.Status != domain.OnboardingStatusAwaitingApproval || run.ApprovalID == nil {
+		t.Fatalf("prepared run = %#v", run)
+	}
+	reused, err := runs.CreateOrGet(context.Background(), domain.OnboardingRun{
+		ProjectID: project.ID, SnapshotID: snapshot.ID, Status: domain.OnboardingStatusProposalReady,
+		BaseCommit: snapshot.CommitSHA, BaseBranch: snapshot.Branch,
+		ProposalChecksum: proposal.Checksum, Proposal: proposal, UnifiedDiff: "fixture diff",
+		Checks: []domain.OnboardingCheck{},
+	})
+	if err != nil || reused.ID != run.ID {
+		t.Fatalf("idempotent CreateOrGet() = %#v, %v", reused, err)
+	}
+	if _, err := runs.BeginApply(context.Background(), run.ID); !errors.Is(err, domain.ErrApprovalNeeded) {
+		t.Fatalf("BeginApply() before approval error = %v", err)
+	}
+	approved, err := runs.Approve(context.Background(), run.ID, "integration-owner", "approved")
+	if err != nil || approved.Status != domain.OnboardingStatusAwaitingApproval {
+		t.Fatalf("Approve() = %#v, %v", approved, err)
+	}
+	applying, err := runs.BeginApply(context.Background(), run.ID)
+	if err != nil || applying.Status != domain.OnboardingStatusApplying {
+		t.Fatalf("BeginApply() = %#v, %v", applying, err)
+	}
+	if _, err := runs.BeginApply(context.Background(), run.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("concurrent BeginApply() error = %v, want conflict", err)
+	}
+	published, err := runs.RecordPublication(context.Background(), run.ID, domain.OnboardingPublication{
+		Published: true, GitLabProjectID: 42, MergeRequestIID: 7,
+		MergeRequestURL: "https://gitlab.example.test/group/project/-/merge_requests/7",
+	})
+	if err != nil || published.Status != domain.OnboardingStatusMRCreated || published.MergeRequestURL == nil {
+		t.Fatalf("RecordPublication() = %#v, %v", published, err)
+	}
+	completed, err := runs.CompleteApply(context.Background(), run.ID, domain.OnboardingApplyResult{
+		WorktreePath: "/worktrees/orders", BranchName: "ai/onboard-orders", CommitSHA: "def456",
+		Checks: []domain.OnboardingCheck{{Name: "write_scope", Status: "passed"}},
+	})
+	if err != nil || completed.Status != domain.OnboardingStatusCompleted || completed.CommitSHA == nil || *completed.CommitSHA != "def456" ||
+		completed.MergeRequestURL == nil {
+		t.Fatalf("CompleteApply() = %#v, %v", completed, err)
 	}
 }
 

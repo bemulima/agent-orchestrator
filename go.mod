@@ -10,6 +10,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.5.4
 	github.com/kelseyhightower/envconfig v1.4.0
+	github.com/pmezard/go-difflib v1.0.0
 	github.com/stretchr/testify v1.10.0
 	go.temporal.io/sdk v1.35.0
 	go.uber.org/zap v1.26.0
@@ -30,7 +31,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/nexus-rpc/sdk-go v0.3.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	go.temporal.io/api v1.49.1 // indirect

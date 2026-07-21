@@ -43,6 +43,20 @@ func TestLoad_RejectsFilesystemRootAsAllowedRoot(t *testing.T) {
 	}
 }
 
+func TestLoad_ValidatesGitLabConfigurationPair(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "https://gitlab.example.test")
+	t.Setenv("GITLAB_TOKEN", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted GitLab base URL without token")
+	}
+
+	t.Setenv("GITLAB_TOKEN", "secret")
+	t.Setenv("GITLAB_BASE_URL", "https://user:password@gitlab.example.test")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted credentials in GitLab base URL")
+	}
+}
+
 func TestConfig_ModelUsesProfilesWithoutCompiledDefaults(t *testing.T) {
 	cfg := Config{
 		CodexModelFast:     "configured-fast",

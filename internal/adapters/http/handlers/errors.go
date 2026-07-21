@@ -27,6 +27,10 @@ func WriteDomainError(w http.ResponseWriter, err error) {
 		WriteError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.Is(err, domain.ErrInvalidStatus):
 		WriteError(w, http.StatusConflict, "invalid_status", err.Error())
+	case errors.Is(err, domain.ErrApprovalNeeded):
+		WriteError(w, http.StatusConflict, "approval_required", "onboarding approval is required")
+	case errors.Is(err, domain.ErrWriteScope):
+		WriteError(w, http.StatusForbidden, "write_scope_violation", "operation exceeds the approved write scope")
 	default:
 		WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 	}

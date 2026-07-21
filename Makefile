@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report fmt fmt-check lint test test-unit test-integration verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply fmt fmt-check lint test test-unit test-integration verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -90,6 +90,26 @@ project-scan: ## Run read-only discovery for SERVICE=id-or-name
 project-report: ## Show latest discovery report for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-report --service "$(SERVICE)"
+
+project-onboard: ## Prepare onboarding proposal for SERVICE=id-or-name (optional DRY_RUN=true)
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-onboard --service "$(SERVICE)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
+
+project-diff: ## Print proposal diff for RUN_ID=uuid
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-diff --run-id "$(RUN_ID)"
+
+project-approve: ## Approve RUN_ID=uuid (optional ACTOR=... COMMENT=...)
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-approve --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+project-reject: ## Reject RUN_ID=uuid (optional ACTOR=... COMMENT=...)
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-reject --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+project-apply: ## Apply approved RUN_ID=uuid in an isolated worktree (optional DRY_RUN=true)
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-apply --run-id "$(RUN_ID)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
 
 fmt: ## Format Go source files
 	@gofmt -w $(GO_FILES)

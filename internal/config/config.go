@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -26,13 +27,17 @@ type Config struct {
 	TemporalNamespace string `envconfig:"TEMPORAL_NAMESPACE" default:"default" validate:"required"`
 	TemporalTaskQueue string `envconfig:"TEMPORAL_TASK_QUEUE" default:"course-dev-orchestrator" validate:"required"`
 
-	RepositoryAllowedRoots []string `envconfig:"REPOSITORY_ALLOWED_ROOTS" default:"/projects" validate:"required,min=1,dive,required"`
-	RepositoryStoragePath  string   `envconfig:"REPOSITORY_STORAGE_PATH" default:"/data/repositories" validate:"required"`
-	WorktreeStoragePath    string   `envconfig:"WORKTREE_STORAGE_PATH" default:"/data/worktrees" validate:"required"`
-	DiscoveryMaxFiles      int      `envconfig:"DISCOVERY_MAX_FILES" default:"10000" validate:"min=1,max=100000"`
-	DiscoveryMaxFileBytes  int64    `envconfig:"DISCOVERY_MAX_FILE_BYTES" default:"1048576" validate:"min=1024,max=10485760"`
-	DiscoveryMaxTotalBytes int64    `envconfig:"DISCOVERY_MAX_TOTAL_BYTES" default:"20971520" validate:"min=1024,max=104857600"`
-	DiscoveryMaxDepth      int      `envconfig:"DISCOVERY_MAX_DEPTH" default:"24" validate:"min=1,max=100"`
+	RepositoryAllowedRoots  []string `envconfig:"REPOSITORY_ALLOWED_ROOTS" default:"/projects" validate:"required,min=1,dive,required"`
+	RepositoryStoragePath   string   `envconfig:"REPOSITORY_STORAGE_PATH" default:"/data/repositories" validate:"required"`
+	WorktreeStoragePath     string   `envconfig:"WORKTREE_STORAGE_PATH" default:"/data/worktrees" validate:"required"`
+	DiscoveryMaxFiles       int      `envconfig:"DISCOVERY_MAX_FILES" default:"10000" validate:"min=1,max=100000"`
+	DiscoveryMaxFileBytes   int64    `envconfig:"DISCOVERY_MAX_FILE_BYTES" default:"1048576" validate:"min=1024,max=10485760"`
+	DiscoveryMaxTotalBytes  int64    `envconfig:"DISCOVERY_MAX_TOTAL_BYTES" default:"20971520" validate:"min=1024,max=104857600"`
+	DiscoveryMaxDepth       int      `envconfig:"DISCOVERY_MAX_DEPTH" default:"24" validate:"min=1,max=100"`
+	OnboardingMaxFileBytes  int64    `envconfig:"ONBOARDING_MAX_FILE_BYTES" default:"2097152" validate:"min=1024,max=10485760"`
+	OnboardingMaxTotalBytes int64    `envconfig:"ONBOARDING_MAX_TOTAL_BYTES" default:"10485760" validate:"min=1024,max=52428800"`
+	OnboardingAuthorName    string   `envconfig:"ONBOARDING_AUTHOR_NAME" default:"Course Dev Orchestrator" validate:"required"`
+	OnboardingAuthorEmail   string   `envconfig:"ONBOARDING_AUTHOR_EMAIL" default:"orchestrator@local.invalid" validate:"required,email"`
 
 	MaxTaskAttempts      int `envconfig:"MAX_TASK_ATTEMPTS" default:"3" validate:"min=1,max=3"`
 	MaxReviewAttempts    int `envconfig:"MAX_REVIEW_ATTEMPTS" default:"2" validate:"min=1,max=2"`
@@ -92,6 +97,19 @@ func Load() (Config, error) {
 	if cfg.RepositoryStoragePath == cfg.WorktreeStoragePath {
 		return Config{}, fmt.Errorf("repository and worktree storage paths must be different")
 	}
+	gitLabBaseConfigured := strings.TrimSpace(cfg.GitLabBaseURL) != ""
+	gitLabTokenConfigured := strings.TrimSpace(cfg.GitLabToken) != ""
+	if gitLabBaseConfigured != gitLabTokenConfigured {
+		return Config{}, fmt.Errorf("GITLAB_BASE_URL and GITLAB_TOKEN must be configured together")
+	}
+	if gitLabBaseConfigured {
+		gitLabURL, parseErr := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.GitLabBaseURL), "/"))
+		if parseErr != nil || gitLabURL.Host == "" || gitLabURL.User != nil || gitLabURL.RawQuery != "" ||
+			gitLabURL.Fragment != "" || gitLabURL.Scheme != "https" && gitLabURL.Scheme != "http" {
+			return Config{}, fmt.Errorf("GITLAB_BASE_URL must be an HTTP(S) URL without credentials, query, or fragment")
+		}
+		cfg.GitLabBaseURL = gitLabURL.String()
+	}
 	return cfg, nil
 }
 
@@ -126,6 +144,8 @@ type Summary struct {
 	DiscoveryMaxFileBytes    int64    `json:"discovery_max_file_bytes"`
 	DiscoveryMaxTotalBytes   int64    `json:"discovery_max_total_bytes"`
 	DiscoveryMaxDepth        int      `json:"discovery_max_depth"`
+	OnboardingMaxFileBytes   int64    `json:"onboarding_max_file_bytes"`
+	OnboardingMaxTotalBytes  int64    `json:"onboarding_max_total_bytes"`
 	MaxTaskAttempts          int      `json:"max_task_attempts"`
 	MaxReviewAttempts        int      `json:"max_review_attempts"`
 	MaxReplans               int      `json:"max_replans"`
@@ -160,6 +180,8 @@ func (c Config) SafeSummary() Summary {
 		DiscoveryMaxFileBytes:    c.DiscoveryMaxFileBytes,
 		DiscoveryMaxTotalBytes:   c.DiscoveryMaxTotalBytes,
 		DiscoveryMaxDepth:        c.DiscoveryMaxDepth,
+		OnboardingMaxFileBytes:   c.OnboardingMaxFileBytes,
+		OnboardingMaxTotalBytes:  c.OnboardingMaxTotalBytes,
 		MaxTaskAttempts:          c.MaxTaskAttempts,
 		MaxReviewAttempts:        c.MaxReviewAttempts,
 		MaxReplans:               c.MaxReplans,

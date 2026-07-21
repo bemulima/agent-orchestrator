@@ -6,9 +6,10 @@ run isolated Codex agents through Temporal, verify their output, and integrate
 with self-hosted GitLab and Telegram. It is not a public runtime service and it
 never merges or deploys automatically.
 
-The current implementation includes Stage 1 platform bootstrap and Stage 2
-project connection/read-only discovery. Onboarding writes, topology, planning,
-Codex execution, GitLab, and Telegram remain explicitly tracked in
+The current implementation includes Stage 1 platform bootstrap, Stage 2
+project connection/read-only discovery, and Stage 3 evidence-backed onboarding
+with approval-gated isolated writes. Topology, planning, Codex execution,
+GitLab publication, and Telegram remain explicitly tracked in
 [docs/progress.md](docs/progress.md).
 
 ## Architecture
@@ -20,6 +21,7 @@ Codex execution, GitLab, and Telegram remain explicitly tracked in
 - `internal/adapters/postgres`: pgx infrastructure.
 - `internal/adapters/git`: allowlisted local Git resolution and managed clones.
 - `internal/discovery`: bounded read-only inventory and evidence detectors.
+- `internal/onboarding`: deterministic proposal/manifests and safe merge rules.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
 - `db/migrations`: tracked PostgreSQL schema migrations.
@@ -61,6 +63,11 @@ course-dev-orchestrator project-list
 course-dev-orchestrator project-show --service repository-name
 course-dev-orchestrator project-scan --service repository-name
 course-dev-orchestrator project-report --service repository-name
+course-dev-orchestrator project-onboard --service repository-name [--dry-run]
+course-dev-orchestrator project-diff --run-id UUID
+course-dev-orchestrator project-approve --run-id UUID --actor owner [--comment text]
+course-dev-orchestrator project-reject --run-id UUID --actor owner [--comment text]
+course-dev-orchestrator project-apply --run-id UUID [--dry-run]
 course-dev-orchestrator version
 ```
 
@@ -78,13 +85,18 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
   `REPOSITORY_STORAGE_PATH`, `WORKTREE_STORAGE_PATH` (all absolute).
 - Discovery bounds: `DISCOVERY_MAX_FILES`, `DISCOVERY_MAX_FILE_BYTES`,
   `DISCOVERY_MAX_TOTAL_BYTES`, `DISCOVERY_MAX_DEPTH`.
+- Onboarding bounds/commit identity: `ONBOARDING_MAX_FILE_BYTES`,
+  `ONBOARDING_MAX_TOTAL_BYTES`, `ONBOARDING_AUTHOR_NAME`,
+  `ONBOARDING_AUTHOR_EMAIL`.
 - Limits: `MAX_TASK_ATTEMPTS=3`, `MAX_REVIEW_ATTEMPTS=2`,
   `MAX_REPLANS=2`, `MAX_PARALLEL_TASKS=3`,
   `MAX_REQUIRED_TASK_DEPTH=3`.
 - Model profiles: `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`,
   `CODEX_MODEL_DEEP`, `CODEX_MODEL_REVIEW`. Empty values defer model selection
   to the future runner; code contains no model name.
-- Integrations: GitLab and Telegram variables are reserved for Stages 7 and 8.
+- Integrations: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, and `GITLAB_DRY_RUN`
+  control the minimal Stage 3 branch/MR publisher. Broader GitLab issue/webhook
+  synchronization and Telegram remain Stages 7 and 8.
 
 Comma-separate multiple repository roots and Telegram IDs. Never commit `.env`.
 
@@ -138,6 +150,58 @@ The Stage 2 HTTP API is synchronous and available under `/api/v1`:
 
 Connecting the same source and retrying an unchanged scan are idempotent.
 
+## Approved onboarding
+
+Stage 3 turns the latest clean discovery snapshot into a stored proposal and
+unified diff. Proposal generation is read-only: neither `AGENTS.md` nor `.ai`
+is written in the connected checkout. Existing user-authored YAML values and
+Markdown instructions are preserved; differing discovered values become
+explicit conflicts. Prompt/instruction files are linked by path and checksum,
+never copied or rewritten automatically. Generated repository paths are
+portable and do not embed an absolute local checkout path.
+
+Only files supported by discovery evidence are proposed. Depending on the
+evidence, this can include `AGENTS.md`, `.ai/service.yaml`, architecture,
+commands, HTTP/event/database contracts, specialized agent instructions,
+workflows, and `.ai/discovery/latest-report.json`. Missing evidence means the
+corresponding file is omitted.
+
+The normal owner flow is:
+
+```sh
+make project-onboard SERVICE=repository-name
+make project-diff RUN_ID=uuid
+make project-apply RUN_ID=uuid DRY_RUN=true
+make project-approve RUN_ID=uuid ACTOR=owner COMMENT="reviewed proposal"
+make project-apply RUN_ID=uuid
+```
+
+`project-apply DRY_RUN=true` validates the base commit, proposal/file
+checksums, formats, and source cleanliness without creating a worktree. A real
+apply requires a persisted approval and creates an `ai/onboard-*` branch in a
+dedicated path below `WORKTREE_STORAGE_PATH`. It atomically writes and stages
+only `AGENTS.md` and `.ai/**`, runs `git diff --check`, commits there, and then
+verifies that the connected source checkout still has its original clean HEAD.
+Repeated prepare/apply operations reuse the same run and commit. Without
+GitLab configuration, apply stops at the local worktree commit. With a matching
+GitLab base URL/token, `GITLAB_DRY_RUN=true` still suppresses all external
+writes; setting it to `false` after approval pushes the onboarding branch,
+reuses or creates an open merge request, and persists its `GitLabLink`. GitLab
+credentials are never added to a remote URL or logged. Stage 3 never merges or
+deploys; broader GitLab issue/webhook synchronization remains Stage 7.
+
+The Stage 3 HTTP API is also synchronous:
+
+- `POST /api/v1/projects/{projectId}/onboard`;
+- `GET /api/v1/onboarding-runs/{runId}`;
+- `GET /api/v1/onboarding-runs/{runId}/diff`;
+- `POST /api/v1/onboarding-runs/{runId}/approve`;
+- `POST /api/v1/onboarding-runs/{runId}/reject`;
+- `POST /api/v1/onboarding-runs/{runId}/apply`.
+
+The prepare/apply request body is `{"dry_run":true|false}`. Approval and
+rejection accept `{"actor":"owner","comment":"..."}`.
+
 ## Quality commands
 
 ```sh
@@ -148,5 +212,6 @@ make verify
 ```
 
 After `make up && make migrate`, run `make test-integration` to verify the
-schema and PostgreSQL project/snapshot idempotency. Tests use only disposable
-fixtures and never access user repositories.
+schema, project/snapshot idempotency, and the onboarding approval state
+machine. Tests use only disposable repositories/fixtures and never access user
+repositories.

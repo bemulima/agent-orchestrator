@@ -70,14 +70,18 @@ Acceptance:
 
 ## Stage 3 — onboarding proposals and approved writes
 
+Status: completed and verified on 2026-07-21. The minimal GitLab publisher is
+approval-gated and dry-run by default; automatic merge/deploy does not exist.
+
 Scope:
 
 - generate only evidence-backed `.ai/*` and an `AGENTS.md` merge proposal;
 - preserve existing rules and prompts, surfacing duplication/conflicts;
 - store proposed files and unified diff without touching the source checkout;
 - approval/rejection state machine and dry-run;
-- approved worktree, `ai/onboard-{service}` branch, checks, commit, optional
-  push, and GitLab merge request.
+- approved worktree, deterministic `ai/onboard-*` branch, checks, and commit;
+- optional idempotent GitLab push/MR publication with persisted `GitLabLink`;
+- dry-run that suppresses both project writes and external GitLab writes.
 
 Acceptance:
 

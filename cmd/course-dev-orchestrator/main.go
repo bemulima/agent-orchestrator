@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 
 	"github.com/bemulima/agent-orchestrator/internal/activities"
 	gitadapter "github.com/bemulima/agent-orchestrator/internal/adapters/git"
+	gitlabadapter "github.com/bemulima/agent-orchestrator/internal/adapters/gitlab"
 	httpadapter "github.com/bemulima/agent-orchestrator/internal/adapters/http"
 	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
 	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
@@ -30,7 +32,9 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
+	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
 )
@@ -82,7 +86,8 @@ func run(args []string) error {
 		return runWorker(cfg, logger)
 	case "workflow-probe":
 		return runWorkflowProbe(cfg, logger)
-	case "project-connect", "project-list", "project-show", "project-scan", "project-report":
+	case "project-connect", "project-list", "project-show", "project-scan", "project-report",
+		"project-onboard", "project-diff", "project-approve", "project-reject", "project-apply":
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	default:
 		printUsage()
@@ -114,10 +119,19 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Scan:         projectOperations.Scan,
 		LatestReport: projectOperations.Latest,
 	}
+	onboardingOperations := newOnboardingOperations(cfg, pool)
+	onboardingHandler := handlers.OnboardingHandler{
+		Prepare: onboardingOperations.Prepare,
+		Get:     onboardingOperations.Get,
+		Approve: onboardingOperations.Approve,
+		Reject:  onboardingOperations.Reject,
+		Apply:   onboardingOperations.Apply,
+	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
-		HealthHandler:  healthHandler,
-		ProjectHandler: &projectHandler,
-		Logger:         logger,
+		HealthHandler:     healthHandler,
+		ProjectHandler:    &projectHandler,
+		OnboardingHandler: &onboardingHandler,
+		Logger:            logger,
 	})
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
@@ -151,6 +165,39 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+type onboardingOperations struct {
+	Prepare onboardinguc.Prepare
+	Get     onboardinguc.Get
+	Approve onboardinguc.Approve
+	Reject  onboardinguc.Reject
+	Apply   onboardinguc.Apply
+}
+
+func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) onboardingOperations {
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	runs := pgadapter.OnboardingRepoPG{Pool: pool}
+	sources := gitadapter.ProjectSource{
+		AllowedRoots: cfg.RepositoryAllowedRoots,
+		StoragePath:  cfg.RepositoryStoragePath,
+	}
+	generator := onboardinggenerator.NewGenerator(onboardinggenerator.GeneratorConfig{
+		MaxFileBytes: cfg.OnboardingMaxFileBytes, MaxTotalBytes: cfg.OnboardingMaxTotalBytes,
+	})
+	worktrees := gitadapter.OnboardingWorktree{
+		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
+	}
+	publisher := gitlabadapter.OnboardingPublisher{
+		BaseURL: cfg.GitLabBaseURL, Token: cfg.GitLabToken, DryRun: cfg.GitLabDryRun,
+	}
+	return onboardingOperations{
+		Prepare: onboardinguc.Prepare{Projects: projects, Sources: sources, Runs: runs, Generator: generator},
+		Get:     onboardinguc.Get{Runs: runs},
+		Approve: onboardinguc.Approve{Runs: runs},
+		Reject:  onboardinguc.Reject{Runs: runs},
+		Apply:   onboardinguc.Apply{Projects: projects, Runs: runs, Worktree: worktrees, Publisher: publisher},
+	}
 }
 
 type projectOperations struct {
@@ -191,6 +238,7 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 	}
 	defer pool.Close()
 	operations := newProjectOperations(cfg, pool)
+	onboardingOperations := newOnboardingOperations(cfg, pool)
 
 	switch command {
 	case "project-connect":
@@ -220,7 +268,7 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 			return err
 		}
 		return writeJSON(output, map[string]any{"projects": projects})
-	case "project-show", "project-scan", "project-report":
+	case "project-show", "project-scan", "project-report", "project-onboard":
 		identifier, err := projectIdentifier(command, args)
 		if err != nil {
 			return err
@@ -238,10 +286,52 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 				return scanErr
 			}
 			return writeJSON(output, result)
-		default:
+		case "project-report":
 			result, reportErr := operations.Latest.Handle(ctx, project.ID)
 			if reportErr != nil {
 				return reportErr
+			}
+			return writeJSON(output, result)
+		default:
+			dryRun, parseErr := booleanFlag(command, args, "dry-run")
+			if parseErr != nil {
+				return parseErr
+			}
+			run, prepareErr := onboardingOperations.Prepare.Handle(ctx, onboardinguc.PrepareInput{ProjectID: project.ID, DryRun: dryRun})
+			if prepareErr != nil {
+				return prepareErr
+			}
+			return writeJSON(output, run)
+		}
+	case "project-diff", "project-approve", "project-reject", "project-apply":
+		runID, actor, comment, dryRun, parseErr := onboardingFlags(command, args)
+		if parseErr != nil {
+			return parseErr
+		}
+		switch command {
+		case "project-diff":
+			run, getErr := onboardingOperations.Get.Handle(ctx, runID)
+			if getErr != nil {
+				return getErr
+			}
+			_, writeErr := io.WriteString(output, run.UnifiedDiff)
+			return writeErr
+		case "project-approve":
+			run, approveErr := onboardingOperations.Approve.Handle(ctx, onboardinguc.DecideInput{RunID: runID, Actor: actor, Comment: comment})
+			if approveErr != nil {
+				return approveErr
+			}
+			return writeJSON(output, run)
+		case "project-reject":
+			run, rejectErr := onboardingOperations.Reject.Handle(ctx, onboardinguc.DecideInput{RunID: runID, Actor: actor, Comment: comment})
+			if rejectErr != nil {
+				return rejectErr
+			}
+			return writeJSON(output, run)
+		default:
+			result, applyErr := onboardingOperations.Apply.Handle(ctx, onboardinguc.ApplyInput{RunID: runID, DryRun: dryRun})
+			if applyErr != nil {
+				return applyErr
 			}
 			return writeJSON(output, result)
 		}
@@ -254,6 +344,7 @@ func projectIdentifier(command string, args []string) (string, error) {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	service := flags.String("service", "", "project ID or unique name")
+	_ = flags.Bool("dry-run", false, "prepare without approval")
 	if err := flags.Parse(args); err != nil {
 		return "", fmt.Errorf("parse %s flags: %w", command, err)
 	}
@@ -265,6 +356,33 @@ func projectIdentifier(command string, args []string) (string, error) {
 		return "", fmt.Errorf("--service is required: %w", domain.ErrValidation)
 	}
 	return identifier, nil
+}
+
+func booleanFlag(command string, args []string, name string) (bool, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	_ = flags.String("service", "", "project ID or unique name")
+	value := flags.Bool(name, false, name)
+	if err := flags.Parse(args); err != nil {
+		return false, fmt.Errorf("parse %s flags: %w", command, err)
+	}
+	return *value, nil
+}
+
+func onboardingFlags(command string, args []string) (runID, actor, comment string, dryRun bool, err error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	runIDValue := flags.String("run-id", "", "onboarding run ID")
+	actorValue := flags.String("actor", "owner", "approval actor")
+	commentValue := flags.String("comment", "", "approval comment")
+	dryRunValue := flags.Bool("dry-run", false, "validate without writes")
+	if parseErr := flags.Parse(args); parseErr != nil {
+		return "", "", "", false, fmt.Errorf("parse %s flags: %w", command, parseErr)
+	}
+	if strings.TrimSpace(*runIDValue) == "" || flags.NArg() != 0 {
+		return "", "", "", false, fmt.Errorf("--run-id is required: %w", domain.ErrValidation)
+	}
+	return strings.TrimSpace(*runIDValue), strings.TrimSpace(*actorValue), strings.TrimSpace(*commentValue), *dryRunValue, nil
 }
 
 func runWorker(cfg config.Config, logger *zap.Logger) error {
@@ -342,6 +460,11 @@ Commands:
   project-show    Show a project by ID or unique name
   project-scan    Run read-only discovery for a project
   project-report  Show the latest discovery report
+  project-onboard Prepare an evidence-backed onboarding proposal
+  project-diff    Print an onboarding proposal diff
+  project-approve Approve an onboarding proposal
+  project-reject  Reject an onboarding proposal
+  project-apply   Validate or apply an approved proposal in a worktree
   version         Print build version
   help            Show this help`)
 }

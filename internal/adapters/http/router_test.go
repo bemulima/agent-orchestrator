@@ -13,6 +13,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
+	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
 )
 
@@ -68,6 +69,62 @@ func TestRouter_ProjectConnectRejectsUnknownJSONField(t *testing.T) {
 		ProjectHandler: projectHandler,
 	})
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/projects/connect", bytes.NewBufferString(`{"path":"/projects/fixture","secret":"value"}`))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestRouter_OnboardingAPI(t *testing.T) {
+	run := domain.OnboardingRun{ID: "run-id", ProjectID: "project-id", UnifiedDiff: "--- a/AGENTS.md\n+++ b/AGENTS.md\n"}
+	onboardingHandler := &handlers.OnboardingHandler{
+		Prepare: prepareOnboardingFake{run: run},
+		Get:     getOnboardingFake{run: run},
+		Approve: approveOnboardingFake{run: run},
+		Reject:  rejectOnboardingFake{run: run},
+		Apply:   applyOnboardingFake{output: onboardinguc.ApplyOutput{Run: run, Result: domain.OnboardingApplyResult{DryRun: true}}},
+	}
+	router := NewRouter(RouterDependencies{
+		HealthHandler:     handlers.HealthHandler{Readiness: healthuc.CheckReadiness{}},
+		OnboardingHandler: onboardingHandler,
+	})
+	tests := []struct {
+		method string
+		path   string
+		body   string
+		status int
+		typeIs string
+	}{
+		{method: http.MethodPost, path: "/api/v1/projects/project-id/onboard", body: `{"dry_run":true}`, status: http.StatusCreated},
+		{method: http.MethodGet, path: "/api/v1/onboarding-runs/run-id", status: http.StatusOK},
+		{method: http.MethodGet, path: "/api/v1/onboarding-runs/run-id/diff", status: http.StatusOK, typeIs: "text/x-diff; charset=utf-8"},
+		{method: http.MethodPost, path: "/api/v1/onboarding-runs/run-id/approve", body: `{"actor":"owner"}`, status: http.StatusOK},
+		{method: http.MethodPost, path: "/api/v1/onboarding-runs/run-id/reject", body: `{"actor":"owner"}`, status: http.StatusOK},
+		{method: http.MethodPost, path: "/api/v1/onboarding-runs/run-id/apply", body: `{"dry_run":true}`, status: http.StatusOK},
+	}
+	for _, test := range tests {
+		request := httptest.NewRequest(test.method, test.path, bytes.NewBufferString(test.body))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("%s %s status = %d, body=%s", test.method, test.path, response.Code, response.Body.String())
+		}
+		if test.typeIs != "" && response.Header().Get("Content-Type") != test.typeIs {
+			t.Fatalf("%s content type = %q", test.path, response.Header().Get("Content-Type"))
+		}
+	}
+}
+
+func TestRouter_OnboardingRejectsUnknownJSONField(t *testing.T) {
+	router := NewRouter(RouterDependencies{
+		HealthHandler: handlers.HealthHandler{Readiness: healthuc.CheckReadiness{}},
+		OnboardingHandler: &handlers.OnboardingHandler{
+			Prepare: prepareOnboardingFake{}, Get: getOnboardingFake{},
+			Approve: approveOnboardingFake{}, Reject: rejectOnboardingFake{}, Apply: applyOnboardingFake{},
+		},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-id/onboard", bytes.NewBufferString(`{"dry_run":true,"write_source":true}`))
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
@@ -213,4 +270,49 @@ type latestReportFake struct {
 
 func (f latestReportFake) Handle(context.Context, string) (projectuc.LatestDiscoveryResult, error) {
 	return f.result, f.err
+}
+
+type prepareOnboardingFake struct {
+	run domain.OnboardingRun
+	err error
+}
+
+func (f prepareOnboardingFake) Handle(context.Context, onboardinguc.PrepareInput) (domain.OnboardingRun, error) {
+	return f.run, f.err
+}
+
+type getOnboardingFake struct {
+	run domain.OnboardingRun
+	err error
+}
+
+func (f getOnboardingFake) Handle(context.Context, string) (domain.OnboardingRun, error) {
+	return f.run, f.err
+}
+
+type approveOnboardingFake struct {
+	run domain.OnboardingRun
+	err error
+}
+
+func (f approveOnboardingFake) Handle(context.Context, onboardinguc.DecideInput) (domain.OnboardingRun, error) {
+	return f.run, f.err
+}
+
+type rejectOnboardingFake struct {
+	run domain.OnboardingRun
+	err error
+}
+
+func (f rejectOnboardingFake) Handle(context.Context, onboardinguc.DecideInput) (domain.OnboardingRun, error) {
+	return f.run, f.err
+}
+
+type applyOnboardingFake struct {
+	output onboardinguc.ApplyOutput
+	err    error
+}
+
+func (f applyOnboardingFake) Handle(context.Context, onboardinguc.ApplyInput) (onboardinguc.ApplyOutput, error) {
+	return f.output, f.err
 }

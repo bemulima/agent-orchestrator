@@ -38,6 +38,15 @@ and engineering conventions come from the reference service.
   worktrees use their common Git directory when no supported remote exists.
 - Discovery reports contain evidence provenance and immutable content
   fingerprints; unchanged retries reuse an existing snapshot.
+- Onboarding proposals are deterministic artifacts stored before approval.
+  User-authored YAML/Markdown wins on conflict, while every difference remains
+  visible in the proposal and unified diff.
+- Approved onboarding writes are confined to `AGENTS.md` and `.ai/**` in a
+  dedicated Git worktree. The connected source checkout is treated as an
+  immutable clean base and verified again after apply.
+- Minimal GitLab onboarding publication is a separate adapter invoked only
+  after persisted approval and local verification. It matches the configured
+  GitLab host, never embeds a token in Git URLs, and reuses an open MR.
 
 ## Deliberate extensions required by this service
 

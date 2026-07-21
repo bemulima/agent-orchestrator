@@ -1,13 +1,14 @@
 # Implementation progress
 
-Last updated: 2026-07-20
+Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1 and 2 are complete and verified. The Docker Compose stack is currently
+Stages 1–3 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-No user repository has been connected. Stages 3–8 have not been implemented
-and are not represented by placeholders.
+No user repository has been connected. Stage 3 verification used only
+disposable fixture repositories. Stages 4–8 have not been implemented and are
+not represented by placeholders.
 
 ## Completed
 
@@ -64,6 +65,32 @@ and are not represented by placeholders.
 - Added fixtures for Go, Next.js, gateway, infrastructure, prompts, existing
   `.ai`, conflicts, and unknown repositories, plus disposable Git and
   PostgreSQL integration coverage.
+- Added the reversible `004_stage3_onboarding` schema with durable proposal,
+  diff, approval, status, worktree, commit, checks, error, and audit metadata.
+- Implemented an idempotent PostgreSQL onboarding state machine for proposal
+  preparation, approval/rejection, approval-gated apply, completion, and
+  failure.
+- Implemented deterministic, size-bounded proposal generation for
+  evidence-backed `AGENTS.md` and `.ai/**` files, with portable repository
+  metadata and exact discovery provenance.
+- Preserved existing user-authored Markdown and YAML values, recorded merge
+  conflicts without overwriting them, linked prompt/instruction paths without
+  copying content, and rejected symlinked targets.
+- Added proposal/file checksums and unified diffs while keeping the connected
+  checkout unchanged before approval.
+- Implemented dry-run validation and real apply in a deterministic isolated
+  worktree/`ai/onboard-*` branch. Apply uses atomic file replacement, stages
+  only the approved scope, runs Git diff checks, commits with configurable
+  identity, and verifies the source checkout remains clean at the base commit.
+- Added the minimal Stage 3 GitLab publisher: host validation, bounded API
+  responses, approval-gated branch push, idempotent open-MR reuse/creation,
+  persisted `GitLabLink`, `merge_request_created` transition, and external
+  write suppression while `GITLAB_DRY_RUN=true` (the default).
+- Added the six Stage 3 HTTP endpoints plus `project-onboard`, `project-diff`,
+  `project-approve`, `project-reject`, and `project-apply` CLI/Make commands.
+- Added generator, existing-rule conflict, symlink, approval gate, worktree
+  idempotency/isolation, exact approved-file scope, GitLab dry-run/MR
+  idempotency, HTTP contract, migration, and PostgreSQL state-machine tests.
 
 ## Files changed
 
@@ -74,14 +101,15 @@ and are not represented by placeholders.
 - Application/transport: `internal/usecase/health/*`,
   `internal/usecase/project/*`,
   `internal/adapters/http/*`.
-- Infrastructure: `internal/adapters/git/*`, `internal/adapters/postgres/*`,
-  `internal/discovery/*`,
+- Infrastructure: `internal/adapters/git/*`, `internal/adapters/gitlab/*`,
+  `internal/adapters/postgres/*`, `internal/discovery/*`,
   `internal/adapters/temporal/*`, `internal/activities/*`,
   `internal/workflow/*`.
 - Database/runtime: `db/migrations/*`, `scripts/migrate*.sh`,
   `docker/Dockerfile`.
 - Tests: package-local `*_test.go` files and
-  `test/integration/postgres_schema_test.go`, plus Stage 2 discovery fixtures.
+  `test/integration/postgres_schema_test.go`, plus discovery/onboarding
+  fixtures and disposable Git worktrees.
 - Documentation: `docs/architecture-conventions.md`,
   `docs/implementation-plan.md`, `docs/progress.md`.
 
@@ -110,16 +138,29 @@ and are not represented by placeholders.
 - Stage 2 `go test -race ./...` and `make verify` — passed.
 - Rebuilt Docker Compose stack — all services running; `/health`, `/ready`,
   `/api/v1/projects`, and the Temporal workflow probe passed.
+- Stage 3 focused unit tests — passed for deterministic proposal generation,
+  preservation/conflicts, symlink rejection, approval gating, dry-run, isolated
+  worktree apply/idempotency, HTTP routes, and source immutability.
+- Reversible `004_stage3_onboarding` migration — rolled back, verified absent,
+  reapplied, and then skipped idempotently.
+- Stage 3 `make test-integration` — passed without Go test cache; approval and
+  apply transitions were exercised against PostgreSQL 16.
+- Stage 3 `make verify` and `go test -race ./...` — passed.
+- Disposable Stage 3 CLI E2E — connect/discover, prepare, diff, dry-run,
+  approve, apply, and repeated apply passed against PostgreSQL and a temporary
+  Git repository; the source checkout stayed clean at its original HEAD and
+  all temporary worktree, branch, database, and filesystem state was removed.
+- Rebuilt the Stage 3 Docker Compose images — API/PostgreSQL/Temporal health,
+  empty project catalog, worker workflow probe, and all service states passed.
 
 ## Remaining work
 
-- Stages 3–8 remain as specified in `docs/implementation-plan.md`; in
-  particular `.ai` onboarding, topology, planning, Codex runner, GitLab, and
-  Telegram are not yet implemented.
+- Stages 4–8 remain as specified in `docs/implementation-plan.md`: topology,
+  planning/DAG execution, Codex runner/verification, GitLab, and Telegram.
 
 ## Exact next task
 
-Implement Stage 3 proposal persistence and the read-only onboarding generator:
-build evidence-backed `.ai/*` and `AGENTS.md` merge proposals, preserve existing
-instructions, store unified diffs without touching source checkouts, and add
-approval/rejection plus dry-run tests before any worktree write path.
+Implement Stage 4 topology and contract drift from the persisted Stage 2
+discovery evidence: deterministic capability/ownership/relation rebuild,
+producer/consumer correlation, impact paths, drift severity, and API/CLI
+queries.
