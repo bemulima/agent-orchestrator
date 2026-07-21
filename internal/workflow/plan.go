@@ -17,6 +17,7 @@ const (
 	PlanResumeSignal     = "plan.resume"
 	PlanCancelSignal     = "plan.cancel"
 	PlanTaskResultSignal = "plan.task_result"
+	PlanTaskRetrySignal  = "plan.task_retry"
 	PlanStateQuery       = "plan.state"
 )
 
@@ -50,6 +51,16 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 			MaximumInterval: 10 * time.Second, MaximumAttempts: int32(schedule.MaxActivityAttempts),
 		},
 	})
+	executionCtx := temporalworkflow.WithActivityOptions(ctx, temporalworkflow.ActivityOptions{
+		StartToCloseTimeout:    2 * time.Hour,
+		HeartbeatTimeout:       45 * time.Second,
+		ScheduleToCloseTimeout: 6 * time.Hour,
+		WaitForCancellation:    true,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 5 * time.Second, BackoffCoefficient: 2,
+			MaximumInterval: time.Minute, MaximumAttempts: int32(schedule.MaxActivityAttempts),
+		},
+	})
 	state := PlanWorkflowState{
 		RunID: schedule.RunID, PlanID: schedule.PlanID, Status: domain.PlanRunStatusPending,
 		TaskStatus: make(map[string]domain.TaskStatus, len(schedule.Tasks)), ActiveTasks: []string{},
@@ -66,20 +77,74 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 	resumeChannel := temporalworkflow.GetSignalChannel(ctx, PlanResumeSignal)
 	cancelChannel := temporalworkflow.GetSignalChannel(ctx, PlanCancelSignal)
 	resultChannel := temporalworkflow.GetSignalChannel(ctx, PlanTaskResultSignal)
+	retryChannel := temporalworkflow.GetSignalChannel(ctx, PlanTaskRetrySignal)
 
 	if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusRunning, ""); err != nil {
 		return PlanWorkflowOutput{}, err
 	}
 	state.Status = domain.PlanRunStatusRunning
 	active := make(map[string]struct{})
+	activeFutures := make(map[string]temporalworkflow.Future)
+	activeCancels := make(map[string]temporalworkflow.CancelFunc)
+	retryable := make(map[string]bool)
+	attemptSequence := make(map[string]int)
 	var pendingControl domain.RunControlAction
 	var pendingResult *domain.TaskResult
+	var pendingRetry string
+	var pendingExecution *taskExecutionCompletion
 
 	for {
-		control, result := pendingControl, pendingResult
-		pendingControl, pendingResult = "", nil
-		if control == "" && result == nil {
+		control, result, retryTaskID, completedExecution := pendingControl, pendingResult, pendingRetry, pendingExecution
+		pendingControl, pendingResult, pendingRetry, pendingExecution = "", nil, "", nil
+		if control == "" && result == nil && retryTaskID == "" && completedExecution == nil {
 			control, result = receivePendingSignals(pauseChannel, resumeChannel, cancelChannel, resultChannel)
+		}
+		if completedExecution != nil {
+			taskID := completedExecution.TaskID
+			delete(active, taskID)
+			delete(activeFutures, taskID)
+			delete(activeCancels, taskID)
+			state.ActiveTasks = activeTaskIDs(active)
+			if completedExecution.Error != "" {
+				state.TaskStatus[taskID] = domain.TaskStatusFailed
+				_ = recordTaskResult(ctx, schedule.RunID, domain.TaskResult{
+					TaskID: taskID, Status: domain.TaskStatusFailed, Error: completedExecution.Error,
+				})
+				return failPlanWorkflow(ctx, schedule, state, active, completedExecution.Error)
+			}
+			result := completedExecution.Outcome.Result
+			if result.TaskID != taskID {
+				return failPlanWorkflow(ctx, schedule, state, active, "task execution returned a mismatched task ID")
+			}
+			state.TaskStatus[taskID] = result.Status
+			switch result.Status {
+			case domain.TaskStatusCompleted:
+			case domain.TaskStatusBlocked:
+				if completedExecution.Outcome.RequiredSchedule != nil {
+					if err := mergeRequiredSchedule(&schedule, state.TaskStatus, taskID, *completedExecution.Outcome.RequiredSchedule); err != nil {
+						return failPlanWorkflow(ctx, schedule, state, active, err.Error())
+					}
+					retryable[taskID] = true
+				} else {
+					if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusPaused, result.Error); err != nil {
+						return PlanWorkflowOutput{}, err
+					}
+					state.Status = domain.PlanRunStatusPaused
+				}
+			case domain.TaskStatusChangesRequested:
+				if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusPaused, result.Error); err != nil {
+					return PlanWorkflowOutput{}, err
+				}
+				state.Status = domain.PlanRunStatusPaused
+			case domain.TaskStatusFailed, domain.TaskStatusCancelled:
+				message := result.Error
+				if message == "" {
+					message = fmt.Sprintf("task %s finished with status %s", taskID, result.Status)
+				}
+				return failPlanWorkflow(ctx, schedule, state, active, message)
+			default:
+				return failPlanWorkflow(ctx, schedule, state, active, "task execution returned a non-terminal status")
+			}
 		}
 		if result != nil {
 			current, exists := state.TaskStatus[result.TaskID]
@@ -90,6 +155,11 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 					return failPlanWorkflow(ctx, schedule, state, active, err.Error())
 				}
 				state.TaskStatus[result.TaskID] = result.Status
+				if cancel, activeExecution := activeCancels[result.TaskID]; activeExecution {
+					cancel()
+					delete(activeCancels, result.TaskID)
+					delete(activeFutures, result.TaskID)
+				}
 				delete(active, result.TaskID)
 				state.ActiveTasks = activeTaskIDs(active)
 				if result.Status == domain.TaskStatusFailed || result.Status == domain.TaskStatusBlocked || result.Status == domain.TaskStatusCancelled {
@@ -101,8 +171,25 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 				}
 			}
 		}
+		if retryTaskID != "" {
+			status, exists := state.TaskStatus[retryTaskID]
+			if exists && schedule.ExecuteTasks && (status == domain.TaskStatusBlocked || status == domain.TaskStatusChangesRequested) {
+				retryable[retryTaskID] = true
+				if state.Status == domain.PlanRunStatusPaused {
+					if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusRunning, ""); err != nil {
+						return PlanWorkflowOutput{}, err
+					}
+					state.Status = domain.PlanRunStatusRunning
+				}
+			}
+		}
 		switch control {
 		case domain.RunControlCancel:
+			for _, taskID := range activeTaskIDs(active) {
+				if cancel := activeCancels[taskID]; cancel != nil {
+					cancel()
+				}
+			}
 			if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusCancelled, ""); err != nil {
 				return PlanWorkflowOutput{}, err
 			}
@@ -138,7 +225,7 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 		}
 
 		if state.Status == domain.PlanRunStatusRunning {
-			ready := runnableTasks(schedule.Tasks, state.TaskStatus)
+			ready := runnableTasksForExecution(schedule.Tasks, state.TaskStatus, retryable)
 			slots := schedule.MaxParallelTasks - len(active)
 			if slots > len(ready) {
 				slots = len(ready)
@@ -147,6 +234,14 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 				selected := ready[:slots]
 				futures := make([]temporalworkflow.Future, 0, len(selected))
 				for _, task := range selected {
+					if retryable[task.TaskID] {
+						if err := temporalworkflow.ExecuteActivity(ctx, "RetryPlanTask", activities.RetryPlanTaskInput{
+							TaskID: task.TaskID, MaxAttempts: schedule.MaxActivityAttempts,
+						}).Get(ctx, nil); err != nil {
+							return failPlanWorkflow(ctx, schedule, state, active, err.Error())
+						}
+						delete(retryable, task.TaskID)
+					}
 					state.TaskStatus[task.TaskID] = domain.TaskStatusReady
 					active[task.TaskID] = struct{}{}
 					futures = append(futures, temporalworkflow.ExecuteActivity(ctx, "DispatchPlanTask", activities.DispatchPlanTaskInput{
@@ -163,11 +258,23 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 						_ = recordTaskResult(ctx, schedule.RunID, domain.TaskResult{TaskID: taskID, Status: domain.TaskStatusFailed, Error: err.Error()})
 						return failPlanWorkflow(ctx, schedule, state, active, err.Error())
 					}
+					if schedule.ExecuteTasks {
+						taskID := selected[index].TaskID
+						attemptSequence[taskID]++
+						taskCtx, cancel := temporalworkflow.WithCancel(executionCtx)
+						activeCancels[taskID] = cancel
+						activeFutures[taskID] = temporalworkflow.ExecuteActivity(taskCtx, "ExecutePlanTask", activities.ExecutePlanTaskInput{
+							RunID: schedule.RunID, PlanID: schedule.PlanID, TaskID: taskID,
+							WorkflowID: fmt.Sprintf("%s:%s:%d", schedule.RunID, taskID, attemptSequence[taskID]),
+						})
+						state.TaskStatus[taskID] = domain.TaskStatusRunning
+					}
 				}
 			}
 		}
 
-		if len(active) == 0 && state.Status == domain.PlanRunStatusRunning && len(runnableTasks(schedule.Tasks, state.TaskStatus)) == 0 {
+		if len(active) == 0 && state.Status == domain.PlanRunStatusRunning &&
+			len(runnableTasksForExecution(schedule.Tasks, state.TaskStatus, retryable)) == 0 {
 			return failPlanWorkflow(ctx, schedule, state, active, "no runnable tasks remain before plan completion")
 		}
 
@@ -192,8 +299,34 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 			channel.Receive(ctx, &value)
 			pendingResult = &value
 		})
+		selector.AddReceive(retryChannel, func(channel temporalworkflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &pendingRetry)
+		})
+		for _, taskID := range activeTaskIDs(active) {
+			future, exists := activeFutures[taskID]
+			if !exists {
+				continue
+			}
+			selectedTaskID := taskID
+			selector.AddFuture(future, func(selected temporalworkflow.Future) {
+				var value domain.TaskExecutionOutcome
+				completion := &taskExecutionCompletion{TaskID: selectedTaskID}
+				if err := selected.Get(ctx, &value); err != nil {
+					completion.Error = err.Error()
+				} else {
+					completion.Outcome = value
+				}
+				pendingExecution = completion
+			})
+		}
 		selector.Select(ctx)
 	}
+}
+
+type taskExecutionCompletion struct {
+	TaskID  string
+	Outcome domain.TaskExecutionOutcome
+	Error   string
 }
 
 func receivePendingSignals(
@@ -217,9 +350,18 @@ func receivePendingSignals(
 }
 
 func runnableTasks(tasks []domain.ScheduledTask, status map[string]domain.TaskStatus) []domain.ScheduledTask {
+	return runnableTasksForExecution(tasks, status, nil)
+}
+
+func runnableTasksForExecution(
+	tasks []domain.ScheduledTask,
+	status map[string]domain.TaskStatus,
+	retryable map[string]bool,
+) []domain.ScheduledTask {
 	result := make([]domain.ScheduledTask, 0)
 	for _, task := range tasks {
-		if status[task.TaskID] != domain.TaskStatusPlanned {
+		current := status[task.TaskID]
+		if current != domain.TaskStatusPlanned && !retryable[task.TaskID] {
 			continue
 		}
 		ready := true
@@ -240,6 +382,64 @@ func runnableTasks(tasks []domain.ScheduledTask, status map[string]domain.TaskSt
 		return result[i].TaskID < result[j].TaskID
 	})
 	return result
+}
+
+func mergeRequiredSchedule(
+	schedule *domain.PlanSchedule,
+	status map[string]domain.TaskStatus,
+	parentTaskID string,
+	required domain.RequiredTaskSchedule,
+) error {
+	if len(required.Tasks) == 0 || len(required.ParentDependencies) == 0 || len(schedule.Tasks)+len(required.Tasks) > 100 {
+		return fmt.Errorf("invalid required-task schedule: %w", domain.ErrValidation)
+	}
+	known := make(map[string]struct{}, len(schedule.Tasks)+len(required.Tasks))
+	for _, task := range schedule.Tasks {
+		known[task.TaskID] = struct{}{}
+	}
+	for _, task := range required.Tasks {
+		if task.TaskID == "" || task.TaskID == parentTaskID {
+			return fmt.Errorf("invalid required task %q: %w", task.TaskID, domain.ErrValidation)
+		}
+		known[task.TaskID] = struct{}{}
+	}
+	for _, task := range required.Tasks {
+		for _, dependency := range task.Dependencies {
+			if _, exists := known[dependency]; !exists || dependency == task.TaskID {
+				return fmt.Errorf("invalid dynamic dependency %q: %w", dependency, domain.ErrValidation)
+			}
+		}
+		if _, exists := status[task.TaskID]; !exists {
+			schedule.Tasks = append(schedule.Tasks, task)
+			status[task.TaskID] = domain.TaskStatusPlanned
+		}
+	}
+	parentFound := false
+	for index := range schedule.Tasks {
+		if schedule.Tasks[index].TaskID != parentTaskID {
+			continue
+		}
+		parentFound = true
+		dependencies := make(map[string]struct{}, len(schedule.Tasks[index].Dependencies)+len(required.ParentDependencies))
+		for _, dependency := range schedule.Tasks[index].Dependencies {
+			dependencies[dependency] = struct{}{}
+		}
+		for _, dependency := range required.ParentDependencies {
+			if _, exists := known[dependency]; !exists || dependency == parentTaskID {
+				return fmt.Errorf("invalid parent required dependency %q: %w", dependency, domain.ErrValidation)
+			}
+			dependencies[dependency] = struct{}{}
+		}
+		schedule.Tasks[index].Dependencies = schedule.Tasks[index].Dependencies[:0]
+		for dependency := range dependencies {
+			schedule.Tasks[index].Dependencies = append(schedule.Tasks[index].Dependencies, dependency)
+		}
+		sort.Strings(schedule.Tasks[index].Dependencies)
+	}
+	if !parentFound {
+		return fmt.Errorf("required-task parent is not scheduled: %w", domain.ErrConflict)
+	}
+	return nil
 }
 
 func setRunStatus(ctx temporalworkflow.Context, runID string, status domain.PlanRunStatus, message string) error {

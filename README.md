@@ -10,8 +10,9 @@ The current implementation includes Stage 1 platform bootstrap, Stage 2
 project connection/read-only discovery, Stage 3 evidence-backed onboarding
 with approval-gated isolated writes, Stage 4 materialized service topology
 with contract drift and impact queries, and Stage 5 approval-gated planning
-with a durable Temporal DAG scheduler. Codex execution, broader GitLab
-integration, and Telegram remain explicitly tracked in
+with a durable Temporal DAG scheduler, and Stage 6 isolated Codex execution
+with independent verification and review. Broader GitLab integration and
+Telegram remain explicitly tracked in
 [docs/progress.md](docs/progress.md).
 
 ## Architecture
@@ -26,6 +27,9 @@ integration, and Telegram remain explicitly tracked in
 - `internal/onboarding`: deterministic proposal/manifests and safe merge rules.
 - `internal/topology`: deterministic catalog, relation, and drift builder.
 - `internal/planning`: deterministic evidence planner and DAG validation.
+- `internal/agent`: embedded coder/reviewer JSON Schemas and validation.
+- `internal/execution`: prompt boundary, verification, review, and task executor.
+- `runner`: pinned TypeScript `@openai/codex-sdk` process adapter.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
 - `db/migrations`: tracked PostgreSQL schema migrations.
@@ -35,8 +39,8 @@ The precise conventions inherited from `ms-go-course` are documented in
 
 ## Quick start
 
-Requirements: Docker with Compose and Go 1.23+ (the module selects toolchain
-1.24.4).
+Requirements: Docker with Compose, Go 1.23+ (the module selects toolchain
+1.24.4), and Node.js 18+ for local runner tests.
 
 ```sh
 make bootstrap
@@ -87,6 +91,8 @@ course-dev-orchestrator run-pause --run-id UUID
 course-dev-orchestrator run-resume --run-id UUID
 course-dev-orchestrator run-cancel --run-id UUID
 course-dev-orchestrator task-show --task-id UUID
+course-dev-orchestrator task-log --task-id UUID
+course-dev-orchestrator task-retry --task-id UUID
 course-dev-orchestrator task-cancel --task-id UUID
 course-dev-orchestrator version
 ```
@@ -111,9 +117,11 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
 - Limits: `MAX_TASK_ATTEMPTS=3`, `MAX_REVIEW_ATTEMPTS=2`,
   `MAX_REPLANS=2`, `MAX_PARALLEL_TASKS=3`,
   `MAX_REQUIRED_TASK_DEPTH=3`.
-- Model profiles: `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`,
-  `CODEX_MODEL_DEEP`, `CODEX_MODEL_REVIEW`. Empty values defer model selection
-  to the future runner; code contains no model name.
+- Codex execution: `CODEX_RUNNER_COMMAND`, `CODEX_API_KEY`, and model profiles
+  `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
+  `CODEX_MODEL_REVIEW`. Empty model values defer selection to Codex; no model
+  name is compiled into the Go service. Keep the key only in ignored `.env` or
+  an external secret store.
 - Integrations: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, and `GITLAB_DRY_RUN`
   control the minimal Stage 3 branch/MR publisher. Broader GitLab issue/webhook
   synchronization and Telegram remain Stages 7 and 8.
@@ -287,13 +295,32 @@ make run-pause RUN_ID=uuid
 make run-resume RUN_ID=uuid
 make run-cancel RUN_ID=uuid
 make task-show TASK_ID=uuid
+make task-log TASK_ID=uuid
+make task-retry TASK_ID=uuid
 make task-cancel TASK_ID=uuid
 ```
 
-Stage 5 deliberately stops when a scheduled task becomes `ready`. Stage 6
-will create isolated worktrees/Codex threads, execute changes, verify results,
-and signal task outcomes back to the already durable plan workflow. Stage 5
-therefore never claims that repository work ran when no executor exists.
+Stage 6 extends the durable scheduler with one deterministic `ai/task-*`
+worktree, branch, and coder thread per task. The worker persists a new thread
+ID from the SDK event stream before accepting the final result, validates the
+result against an embedded JSON Schema, and independently compares claims to
+Git, write scope, allowlisted checks, artifacts, migrations, and contract
+paths. A separate read-only reviewer thread must approve the actual worktree
+before the worker commits. The connected source checkout remains a clean,
+unchanged base; Stage 6 never pushes, merges, or deploys.
+
+Reviewer changes resume the same coder thread, but each review uses a fresh
+thread. Blocked tasks can request at most three bounded cross-project tasks;
+Temporal runs them first and resumes the parent subject to replan/depth/attempt
+limits. Manual blockers and verification/review changes pause the run until
+`task-retry`. `task-log` exposes durable attempts, structured results,
+verification evidence, and artifact metadata.
+
+The TypeScript runner communicates with Go over bounded JSONL, disables agent
+network access and approvals, uses `workspace-write` for coders and
+`read-only` for reviewers, and applies an explicit secret-free shell
+environment policy. `CODEX_API_KEY`, database credentials, and integration
+tokens are never included in prompts or child tool environments.
 
 The Stage 5 API is available under `/api/v1`:
 
@@ -302,7 +329,8 @@ The Stage 5 API is available under `/api/v1`:
 - `GET /plans/{planId}`, `GET /plans/{planId}/tasks`, and plan
   `approve`, `reject`, and `run` actions;
 - `GET /runs/{runId}` and run `pause`, `resume`, and `cancel` actions;
-- `GET /tasks/{taskId}` and `POST /tasks/{taskId}/cancel`.
+- `GET /tasks/{taskId}`, task `attempts` and `artifacts` queries, and task
+  `retry` and `cancel` actions.
 
 Plan lifecycle states are `draft`, `planned`, `awaiting_approval`, `approved`,
 `running`, `paused`, `completed`, `failed`, and `cancelled`. Task states are
@@ -319,6 +347,6 @@ make verify
 ```
 
 After `make up && make migrate`, run `make test-integration` to verify the
-schema, project/snapshot idempotency, and the onboarding approval state
-machine plus topology replacement/idempotency. Tests use only disposable
+schema and PostgreSQL state machines, including durable coder/reviewer thread
+separation, verification, and artifacts. Tests use only disposable
 repositories/fixtures and never access user repositories.

@@ -216,7 +216,7 @@ func buildSchedule(run domain.PlanRun, bundle domain.PlanBundle, maxAttempts int
 	}
 	return domain.PlanSchedule{
 		RunID: run.ID, PlanID: run.PlanID, MaxParallelTasks: run.MaxParallelTasks,
-		MaxActivityAttempts: maxAttempts, Tasks: tasks,
+		MaxActivityAttempts: maxAttempts, ExecuteTasks: true, Tasks: tasks,
 	}
 }
 

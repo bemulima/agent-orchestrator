@@ -211,6 +211,7 @@ type PlanSchedule struct {
 	PlanID              string          `json:"plan_id"`
 	MaxParallelTasks    int             `json:"max_parallel_tasks"`
 	MaxActivityAttempts int             `json:"max_activity_attempts"`
+	ExecuteTasks        bool            `json:"execute_tasks"`
 	Tasks               []ScheduledTask `json:"tasks"`
 }
 
@@ -229,30 +230,34 @@ type TaskResult struct {
 }
 
 type TaskAttempt struct {
-	ID               string          `json:"id"`
-	TaskID           string          `json:"task_id"`
-	AttemptNumber    int             `json:"attempt_number"`
-	AgentThreadID    *string         `json:"agent_thread_id,omitempty"`
-	WorkflowID       string          `json:"workflow_id"`
-	WorktreePath     string          `json:"worktree_path"`
-	BranchName       string          `json:"branch_name"`
-	CommitSHA        *string         `json:"commit_sha,omitempty"`
-	Status           string          `json:"status"`
-	StructuredResult json.RawMessage `json:"structured_result"`
-	Error            *string         `json:"error,omitempty"`
-	StartedAt        time.Time       `json:"started_at"`
-	HeartbeatAt      *time.Time      `json:"heartbeat_at,omitempty"`
-	FinishedAt       *time.Time      `json:"finished_at,omitempty"`
+	ID               string            `json:"id"`
+	TaskID           string            `json:"task_id"`
+	AttemptNumber    int               `json:"attempt_number"`
+	AgentThreadID    *string           `json:"agent_thread_id,omitempty"`
+	WorkflowID       string            `json:"workflow_id"`
+	WorktreePath     string            `json:"worktree_path"`
+	BranchName       string            `json:"branch_name"`
+	CommitSHA        *string           `json:"commit_sha,omitempty"`
+	Status           TaskAttemptStatus `json:"status"`
+	StructuredResult json.RawMessage   `json:"structured_result"`
+	Verification     json.RawMessage   `json:"verification_result"`
+	ReviewCount      int               `json:"review_count"`
+	Error            *string           `json:"error,omitempty"`
+	StartedAt        time.Time         `json:"started_at"`
+	HeartbeatAt      *time.Time        `json:"heartbeat_at,omitempty"`
+	FinishedAt       *time.Time        `json:"finished_at,omitempty"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 type Artifact struct {
-	ID       string          `json:"id"`
-	TaskID   string          `json:"task_id"`
-	Type     string          `json:"type"`
-	Name     string          `json:"name"`
-	URI      string          `json:"uri"`
-	Checksum string          `json:"checksum"`
-	Metadata json.RawMessage `json:"metadata"`
+	ID        string          `json:"id"`
+	TaskID    string          `json:"task_id"`
+	Type      string          `json:"type"`
+	Name      string          `json:"name"`
+	URI       string          `json:"uri"`
+	Checksum  string          `json:"checksum"`
+	Metadata  json.RawMessage `json:"metadata"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 type Approval struct {

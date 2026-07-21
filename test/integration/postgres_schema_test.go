@@ -59,7 +59,7 @@ ORDER BY tablename`)
 		"gitlab_link", "onboarding_run", "plan", "project", "service_capability",
 		"service_ownership", "service_relation", "service_snapshot", "task",
 		"task_attempt", "task_dependency", "telegram_user", "topology_revision",
-		"topology_service", "contract_drift", "plan_run",
+		"topology_service", "contract_drift", "plan_run", "task_review",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -70,6 +70,132 @@ ORDER BY tablename`)
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Fatalf("missing tables: %v", missing)
+	}
+}
+
+func TestTaskExecutionRepositoryPersistsThreadsVerificationReviewAndArtifacts(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	executions := pgadapter.TaskExecutionRepoPG{Pool: pool}
+	path := "/fixtures/" + uuid.NewString()
+	project, err := projects.Upsert(ctx, domain.Project{
+		Name: "execution-" + uuid.NewString(), Status: domain.ProjectStatusAnalyzed,
+		RepositoryRole: domain.RepositoryRoleService, SourceIdentity: "integration:" + uuid.NewString(),
+		LocalPath: &path, DefaultBranch: "main", CurrentBranch: "main", HeadCommit: "abc123",
+	})
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	var revisionID string
+	if err := pool.QueryRow(ctx, `
+INSERT INTO topology_revision (
+    fingerprint, project_count, service_count, capability_count,
+    ownership_count, contract_count, relation_count, drift_count
+) VALUES ($1, 1, 1, 0, 0, 0, 0, 0) RETURNING id`, strings.Repeat("e", 64)).Scan(&revisionID); err != nil {
+		t.Fatalf("insert topology revision: %v", err)
+	}
+	command, err := plans.CreateCommand(ctx, domain.Command{
+		Source: domain.CommandSourceAPI, Text: "execution fixture", Status: domain.CommandStatusReceived,
+		IdempotencyKey: "integration:" + uuid.NewString(),
+	})
+	if err != nil {
+		t.Fatalf("CreateCommand() error = %v", err)
+	}
+	defer func() {
+		_, _ = pool.Exec(ctx, `
+DELETE FROM audit_event WHERE resource_id IN (
+    SELECT $1::uuid
+    UNION SELECT $2::uuid
+    UNION SELECT id FROM plan WHERE command_id = $2
+    UNION SELECT task.id FROM task JOIN plan ON plan.id = task.plan_id WHERE plan.command_id = $2
+    UNION SELECT plan_run.id FROM plan_run JOIN plan ON plan.id = plan_run.plan_id WHERE plan.command_id = $2
+)`, project.ID, command.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM approval WHERE resource_type = 'plan' AND resource_id IN (SELECT id FROM plan WHERE command_id = $1)`, command.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM command WHERE id = $1`, command.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM topology_revision WHERE id = $1`, revisionID)
+		_, _ = pool.Exec(ctx, `DELETE FROM project WHERE id = $1`, project.ID)
+	}()
+	bundle, err := plans.CreatePlan(ctx, command, domain.PlannerInput{
+		CommandID: command.ID, CommandText: command.Text, TopologyRevisionID: revisionID,
+	}, domain.PlannerOutput{
+		Summary: "execution fixture", RiskLevel: domain.RiskLevelLow,
+		Tasks: []domain.PlannedTask{{
+			Key: "fixture", ProjectID: project.ID, Role: "coder", Title: "fixture", Description: "fixture",
+			AcceptanceCriteria: []string{"passes"}, WriteScope: []string{"internal/**"}, ModelProfile: "standard",
+			RiskLevel: domain.RiskLevelLow, VerificationCommands: []string{"go test ./..."},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePlan() error = %v", err)
+	}
+	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, "integration", "approved")
+	if err != nil {
+		t.Fatalf("ApprovePlan() error = %v", err)
+	}
+	run, bundle, err := plans.PrepareRun(ctx, bundle.Plan.ID, 1)
+	if err != nil {
+		t.Fatalf("PrepareRun() error = %v", err)
+	}
+	if _, err := plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusRunning, ""); err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	task := bundle.Tasks[0]
+	if _, err := plans.MarkTaskReady(ctx, run.ID, task.ID); err != nil {
+		t.Fatalf("MarkTaskReady() error = %v", err)
+	}
+	executionContext, err := executions.GetExecutionContext(ctx, task.ID)
+	if err != nil || executionContext.Project.ID != project.ID || executionContext.Command.ID != command.ID {
+		t.Fatalf("GetExecutionContext() = %#v, %v", executionContext, err)
+	}
+	workspace := domain.TaskWorkspace{Path: "/worktrees/fixture", BranchName: "ai/task-fixture", BaseCommit: project.HeadCommit}
+	attempt, err := executions.BeginAttempt(ctx, task.ID, "workflow:"+uuid.NewString(), workspace, 3)
+	if err != nil {
+		t.Fatalf("BeginAttempt() error = %v", err)
+	}
+	reused, err := executions.BeginAttempt(ctx, task.ID, attempt.WorkflowID, workspace, 3)
+	if err != nil || reused.ID != attempt.ID {
+		t.Fatalf("reused BeginAttempt() = %#v, %v", reused, err)
+	}
+	attempt, err = executions.AttachAgentThread(ctx, attempt.ID, "coder-thread-"+uuid.NewString())
+	if err != nil || attempt.AgentThreadID == nil {
+		t.Fatalf("AttachAgentThread() = %#v, %v", attempt, err)
+	}
+	if _, err := executions.BeginReview(ctx, attempt.ID, 1, *attempt.AgentThreadID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("BeginReview(coder thread) error = %v", err)
+	}
+	reviewerThread := "review-thread-" + uuid.NewString()
+	if _, err := executions.BeginReview(ctx, attempt.ID, 1, reviewerThread); err != nil {
+		t.Fatalf("BeginReview() error = %v", err)
+	}
+	if _, err := executions.CreateReview(ctx, attempt.ID, 1, reviewerThread, domain.ReviewerResult{
+		Status: domain.ReviewApproved, Summary: "approved", BlockingIssues: []domain.ReviewIssue{},
+		NonBlockingIssues: []domain.ReviewIssue{}, Risks: []string{}, SuggestedChecks: []string{},
+	}); err != nil {
+		t.Fatalf("CreateReview() error = %v", err)
+	}
+	storedArtifact, err := executions.StoreArtifact(ctx, domain.Artifact{
+		TaskID: task.ID, Type: "report", Name: "fixture", URI: "task-worktree://fixture/report.json",
+		Checksum: strings.Repeat("a", 64), Metadata: json.RawMessage(`{"path":"report.json"}`),
+	})
+	if err != nil || storedArtifact.ID == "" {
+		t.Fatalf("StoreArtifact() = %#v, %v", storedArtifact, err)
+	}
+	completed, err := executions.CompleteAttempt(ctx, attempt.ID, domain.AgentResult{
+		Status: domain.AgentResultCompleted, Summary: "done", FilesChanged: []string{"internal/fixture.go"},
+	}, domain.VerificationReport{Status: "passed", ChangedFiles: []string{"internal/fixture.go"}, VerifiedAt: time.Now().UTC()}, strings.Repeat("b", 40))
+	if err != nil || completed.Status != domain.TaskAttemptStatusCompleted || completed.ReviewCount != 1 {
+		t.Fatalf("CompleteAttempt() = %#v, %v", completed, err)
+	}
+	attempts, err := executions.ListAttempts(ctx, task.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].AgentThreadID == nil {
+		t.Fatalf("ListAttempts() = %#v, %v", attempts, err)
+	}
+	artifacts, err := executions.ListArtifacts(ctx, task.ID)
+	if err != nil || len(artifacts) != 1 || artifacts[0].Checksum != storedArtifact.Checksum {
+		t.Fatalf("ListArtifacts() = %#v, %v", artifacts, err)
 	}
 }
 

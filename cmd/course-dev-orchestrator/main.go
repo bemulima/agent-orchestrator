@@ -23,19 +23,23 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bemulima/agent-orchestrator/internal/activities"
+	codexadapter "github.com/bemulima/agent-orchestrator/internal/adapters/codex"
 	gitadapter "github.com/bemulima/agent-orchestrator/internal/adapters/git"
 	gitlabadapter "github.com/bemulima/agent-orchestrator/internal/adapters/gitlab"
 	httpadapter "github.com/bemulima/agent-orchestrator/internal/adapters/http"
 	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
 	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
 	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
+	"github.com/bemulima/agent-orchestrator/internal/agent"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	executionengine "github.com/bemulima/agent-orchestrator/internal/execution"
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
+	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	planninguc "github.com/bemulima/agent-orchestrator/internal/usecase/planning"
@@ -97,7 +101,7 @@ func run(args []string) error {
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
 	case "plan", "plan-show", "plan-approve", "plan-reject", "plan-run",
-		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-cancel":
+		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-log", "task-retry", "task-cancel":
 		return runPlanningCommand(cfg, command, args[1:], os.Stdout)
 	default:
 		printUsage()
@@ -159,7 +163,8 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		ApprovePlan: planningOperations.ApprovePlan, RejectPlan: planningOperations.RejectPlan,
 		StartPlan: planningOperations.StartPlan, GetRun: planningOperations.GetRun,
 		ControlRun: planningOperations.ControlRun, GetTask: planningOperations.GetTask,
-		CancelTask: planningOperations.CancelTask,
+		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
+		GetArtifacts: planningOperations.GetArtifacts, RetryTask: planningOperations.RetryTask,
 	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
 		HealthHandler:     healthHandler,
@@ -215,10 +220,15 @@ type planningOperations struct {
 	ControlRun    planninguc.ControlRun
 	GetTask       planninguc.GetTask
 	CancelTask    planninguc.CancelTask
+	GetAttempts   executionuc.GetAttempts
+	GetArtifacts  executionuc.GetArtifacts
+	TaskLog       executionuc.TaskLog
+	RetryTask     executionuc.RetryTask
 }
 
 func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner repository.PlanRunner) planningOperations {
 	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	taskExecutions := pgadapter.TaskExecutionRepoPG{Pool: pool}
 	catalog := pgadapter.TopologyRepoPG{Pool: pool}
 	return planningOperations{
 		CreateCommand: planninguc.CreateCommand{Plans: plans},
@@ -237,10 +247,16 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 			Plans: plans, Runner: runner, MaxParallelTasks: cfg.MaxParallelTasks,
 			MaxActivityAttempts: cfg.MaxTaskAttempts,
 		},
-		GetRun:     planninguc.GetRun{Plans: plans},
-		ControlRun: planninguc.ControlRun{Plans: plans, Runner: runner},
-		GetTask:    planninguc.GetTask{Plans: plans},
-		CancelTask: planninguc.CancelTask{Plans: plans, Runner: runner},
+		GetRun:       planninguc.GetRun{Plans: plans},
+		ControlRun:   planninguc.ControlRun{Plans: plans, Runner: runner},
+		GetTask:      planninguc.GetTask{Plans: plans},
+		CancelTask:   planninguc.CancelTask{Plans: plans, Runner: runner},
+		GetAttempts:  executionuc.GetAttempts{Tasks: taskExecutions},
+		GetArtifacts: executionuc.GetArtifacts{Tasks: taskExecutions},
+		TaskLog:      executionuc.TaskLog{Tasks: taskExecutions},
+		RetryTask: executionuc.RetryTask{
+			Plans: plans, Tasks: taskExecutions, Runner: runner, MaxAttempts: cfg.MaxTaskAttempts,
+		},
 	}
 }
 
@@ -601,7 +617,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 			return controlErr
 		}
 		return writeJSON(output, run)
-	case "task-show", "task-cancel":
+	case "task-show", "task-log", "task-retry", "task-cancel":
 		taskID, err := requiredIDFlag(command, args, "task-id")
 		if err != nil {
 			return err
@@ -610,6 +626,20 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 			task, getErr := operations.GetTask.Handle(ctx, taskID)
 			if getErr != nil {
 				return getErr
+			}
+			return writeJSON(output, task)
+		}
+		if command == "task-log" {
+			logResult, logErr := operations.TaskLog.Handle(ctx, taskID)
+			if logErr != nil {
+				return logErr
+			}
+			return writeJSON(output, logResult)
+		}
+		if command == "task-retry" {
+			task, retryErr := operations.RetryTask.Handle(ctx, taskID)
+			if retryErr != nil {
+				return retryErr
 			}
 			return writeJSON(output, task)
 		}
@@ -625,7 +655,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 
 func planningCommandNeedsTemporal(command string) bool {
 	switch command {
-	case "plan-run", "run-pause", "run-resume", "run-cancel", "task-cancel":
+	case "plan-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
 		return true
 	default:
 		return false
@@ -762,12 +792,37 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("connect temporal: %w", err)
 	}
 	defer client.Close()
+	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return err
+	}
+	resultValidator, err := agent.NewValidator()
+	if err != nil {
+		return fmt.Errorf("create agent result validator: %w", err)
+	}
+	taskExecutions := pgadapter.TaskExecutionRepoPG{Pool: pool}
+	worktrees := gitadapter.TaskWorktree{
+		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
+	}
+	executor := &executionengine.Service{
+		Repository: taskExecutions, Worktrees: worktrees, Runner: runner, Validator: resultValidator,
+		Verifier: executionengine.Verifier{Worktrees: worktrees},
+		Models: map[string]string{
+			config.ModelProfileFast: cfg.CodexModelFast, config.ModelProfileStandard: cfg.CodexModelStandard,
+			config.ModelProfileDeep: cfg.CodexModelDeep,
+		},
+		ReviewModel: cfg.CodexModelReview, MaxTaskAttempts: cfg.MaxTaskAttempts,
+		MaxReviewAttempts: cfg.MaxReviewAttempts, MaxReplans: cfg.MaxReplans,
+		MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+	}
 
 	temporalWorker := worker.New(client, cfg.TemporalTaskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.SystemProbeWorkflow)
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.PlanWorkflow)
 	temporalWorker.RegisterActivity(&activities.SystemActivities{})
-	temporalWorker.RegisterActivity(&activities.PlanActivities{Plans: pgadapter.PlanningRepoPG{Pool: pool}})
+	temporalWorker.RegisterActivity(&activities.PlanActivities{
+		Plans: pgadapter.PlanningRepoPG{Pool: pool}, TaskExecutions: taskExecutions, Executor: executor,
+	})
 	logger.Info("starting temporal worker",
 		zap.String("namespace", cfg.TemporalNamespace),
 		zap.String("task_queue", cfg.TemporalTaskQueue),
@@ -849,6 +904,8 @@ Commands:
   run-resume      Resume task dispatch
   run-cancel      Cancel a plan run
   task-show       Show a planned task
+  task-log        Show task attempts, verification results, and artifacts
+  task-retry      Retry a blocked or changes-requested task
   task-cancel     Signal cancellation for a dispatched task
   version         Print build version
   help            Show this help`)

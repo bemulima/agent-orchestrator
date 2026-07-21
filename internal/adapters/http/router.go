@@ -73,6 +73,9 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/runs/{runId}/resume", deps.PlanningHandler.ResumeRun)
 		root.Post("/api/v1/runs/{runId}/cancel", deps.PlanningHandler.CancelRun)
 		root.Get("/api/v1/tasks/{taskId}", deps.PlanningHandler.GetTaskRequest)
+		root.Get("/api/v1/tasks/{taskId}/attempts", deps.PlanningHandler.GetTaskAttempts)
+		root.Get("/api/v1/tasks/{taskId}/artifacts", deps.PlanningHandler.GetTaskArtifacts)
+		root.Post("/api/v1/tasks/{taskId}/retry", deps.PlanningHandler.RetryTaskRequest)
 		root.Post("/api/v1/tasks/{taskId}/cancel", deps.PlanningHandler.CancelTaskRequest)
 	}
 

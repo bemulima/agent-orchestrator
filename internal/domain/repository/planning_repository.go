@@ -35,4 +35,5 @@ type PlanRunner interface {
 	Start(context.Context, domain.PlanRun, domain.PlanSchedule) (string, error)
 	Control(context.Context, string, domain.RunControlAction) error
 	ReportTaskResult(context.Context, string, domain.TaskResult) error
+	RetryTask(context.Context, string, string) error
 }

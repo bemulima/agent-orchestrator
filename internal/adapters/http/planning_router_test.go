@@ -25,7 +25,8 @@ func TestRouterPlanningAPI(t *testing.T) {
 		ApprovePlan: planningDecidePlanFake{bundle: bundle}, RejectPlan: planningDecidePlanFake{bundle: bundle},
 		StartPlan: planningStartPlanFake{run: run}, GetRun: planningGetRunFake{run: run},
 		ControlRun: planningControlRunFake{run: run}, GetTask: planningGetTaskFake{task: task},
-		CancelTask: planningCancelTaskFake{task: task},
+		CancelTask: planningCancelTaskFake{task: task}, RetryTask: planningRetryTaskFake{task: task},
+		GetAttempts: planningGetAttemptsFake{}, GetArtifacts: planningGetArtifactsFake{},
 	}
 	router := NewRouter(RouterDependencies{
 		HealthHandler: handlers.HealthHandler{Readiness: healthuc.CheckReadiness{}}, PlanningHandler: handler,
@@ -49,6 +50,9 @@ func TestRouterPlanningAPI(t *testing.T) {
 		{http.MethodPost, "/api/v1/runs/run-id/resume", "", http.StatusAccepted},
 		{http.MethodPost, "/api/v1/runs/run-id/cancel", "", http.StatusAccepted},
 		{http.MethodGet, "/api/v1/tasks/task-id", "", http.StatusOK},
+		{http.MethodGet, "/api/v1/tasks/task-id/attempts", "", http.StatusOK},
+		{http.MethodGet, "/api/v1/tasks/task-id/artifacts", "", http.StatusOK},
+		{http.MethodPost, "/api/v1/tasks/task-id/retry", "", http.StatusAccepted},
 		{http.MethodPost, "/api/v1/tasks/task-id/cancel", "", http.StatusAccepted},
 	}
 	for _, test := range tests {
@@ -130,4 +134,22 @@ type planningCancelTaskFake struct{ task domain.Task }
 
 func (f planningCancelTaskFake) Handle(context.Context, string) (domain.Task, error) {
 	return f.task, nil
+}
+
+type planningRetryTaskFake struct{ task domain.Task }
+
+func (f planningRetryTaskFake) Handle(context.Context, string) (domain.Task, error) {
+	return f.task, nil
+}
+
+type planningGetAttemptsFake struct{}
+
+func (planningGetAttemptsFake) Handle(context.Context, string) ([]domain.TaskAttempt, error) {
+	return []domain.TaskAttempt{}, nil
+}
+
+type planningGetArtifactsFake struct{}
+
+func (planningGetArtifactsFake) Handle(context.Context, string) ([]domain.Artifact, error) {
+	return []domain.Artifact{}, nil
 }

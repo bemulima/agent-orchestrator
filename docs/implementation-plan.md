@@ -130,6 +130,10 @@ Acceptance:
 
 ## Stage 6 — Codex execution, verification, and review
 
+Status: completed and verified on 2026-07-21 with disposable Git/PostgreSQL
+fixtures. A live paid Codex turn is intentionally not part of the automated
+suite; the pinned SDK runner is compiled and protocol-tested without a key.
+
 Scope:
 
 - TypeScript runner using `@openai/codex-sdk` and configurable model profiles;

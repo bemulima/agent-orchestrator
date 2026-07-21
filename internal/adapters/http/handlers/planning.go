@@ -51,6 +51,18 @@ type cancelTaskUseCase interface {
 	Handle(context.Context, string) (domain.Task, error)
 }
 
+type getAttemptsUseCase interface {
+	Handle(context.Context, string) ([]domain.TaskAttempt, error)
+}
+
+type getArtifactsUseCase interface {
+	Handle(context.Context, string) ([]domain.Artifact, error)
+}
+
+type retryTaskUseCase interface {
+	Handle(context.Context, string) (domain.Task, error)
+}
+
 type PlanningHandler struct {
 	CreateCommand createCommandUseCase
 	GetCommand    getCommandUseCase
@@ -63,6 +75,9 @@ type PlanningHandler struct {
 	ControlRun    controlRunUseCase
 	GetTask       getTaskUseCase
 	CancelTask    cancelTaskUseCase
+	GetAttempts   getAttemptsUseCase
+	GetArtifacts  getArtifactsUseCase
+	RetryTask     retryTaskUseCase
 }
 
 type createCommandRequest struct {
@@ -209,6 +224,35 @@ func (h PlanningHandler) GetTaskRequest(w http.ResponseWriter, r *http.Request) 
 
 func (h PlanningHandler) CancelTaskRequest(w http.ResponseWriter, r *http.Request) {
 	task, err := h.CancelTask.Handle(r.Context(), chi.URLParam(r, "taskId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (h PlanningHandler) GetTaskAttempts(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	attempts, err := h.GetAttempts.Handle(r.Context(), taskID)
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task_id": taskID, "attempts": attempts})
+}
+
+func (h PlanningHandler) GetTaskArtifacts(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	artifacts, err := h.GetArtifacts.Handle(r.Context(), taskID)
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task_id": taskID, "artifacts": artifacts})
+}
+
+func (h PlanningHandler) RetryTaskRequest(w http.ResponseWriter, r *http.Request) {
+	task, err := h.RetryTask.Handle(r.Context(), chi.URLParam(r, "taskId"))
 	if err != nil {
 		WriteDomainError(w, err)
 		return

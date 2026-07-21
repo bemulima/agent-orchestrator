@@ -74,9 +74,19 @@ and engineering conventions come from the reference service.
 - PostgreSQL and Temporal are separate readiness dependencies. Long-running
   execution state will remain authoritative in Temporal and durable metadata
   will be stored in PostgreSQL.
-- Stage 5 dispatch only makes a task `ready` and waits for a durable task-result
-  signal. Worktree creation, Codex invocation, independent verification, and
-  review are Stage 6 responsibilities and cannot be inferred from dispatch.
+- Stage 6 production schedules extend Stage 5 dispatch with a long-running
+  execution activity; the original signal boundary remains available for
+  compatibility tests and external cancellation.
+- Each task has one isolated worktree/branch and one resumable coder thread.
+  Reviewers always use distinct read-only threads. Thread IDs are persisted
+  from streaming start events before final structured results are accepted.
+- Agent claims are untrusted input. Embedded JSON Schemas validate shape;
+  independent Go code checks actual Git paths, write scope, allowlisted
+  commands, artifacts, migration pairs, and contract paths before review and
+  commit.
+- The SDK runner receives secrets only for its own Codex invocation. Codex
+  tool subprocesses use an explicit `inherit = none` environment policy and
+  receive no API key, database URL, or integration token.
 
 ## Dependency direction
 

@@ -54,4 +54,14 @@ func (r PlanRunner) ReportTaskResult(ctx context.Context, workflowID string, res
 	return nil
 }
 
+func (r PlanRunner) RetryTask(ctx context.Context, workflowID, taskID string) error {
+	if taskID == "" {
+		return fmt.Errorf("task ID is required: %w", domain.ErrValidation)
+	}
+	if err := r.Client.SignalWorkflow(ctx, workflowID, "", orchestratorworkflow.PlanTaskRetrySignal, taskID); err != nil {
+		return fmt.Errorf("signal plan task retry: %w", err)
+	}
+	return nil
+}
+
 var _ repository.PlanRunner = PlanRunner{}

@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-cancel fmt fmt-check lint test test-unit test-integration verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -31,6 +31,7 @@ bootstrap: ## Prepare local configuration and download Go dependencies
 	@if [ ! -f .env ]; then cp .env.dist .env; echo "Created .env from .env.dist"; fi
 	@mkdir -p .cache/go-build .cache/gomod .cache/bin
 	$(GO_ENV) go mod download
+	cd runner && npm ci
 
 up: ## Start PostgreSQL, Temporal, API, worker, and Temporal UI
 	$(COMPOSE) up -d --build
@@ -168,6 +169,14 @@ task-show: ## Show TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-show --task-id "$(TASK_ID)"
 
+task-log: ## Show attempts and artifacts for TASK_ID=uuid
+	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-log --task-id "$(TASK_ID)"
+
+task-retry: ## Retry blocked or changes-requested TASK_ID=uuid
+	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-retry --task-id "$(TASK_ID)"
+
 task-cancel: ## Signal cancellation for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-cancel --task-id "$(TASK_ID)"
@@ -189,7 +198,10 @@ test-unit: ## Run unit and Temporal workflow tests
 test-integration: ## Run PostgreSQL integration tests against the local stack
 	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" $(GO_ENV) go test -count=1 -tags=integration ./test/integration/...
 
+runner-test: ## Build and test the pinned Codex SDK runner
+	cd runner && npm test
+
 compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet
 
-verify: fmt-check lint test-unit compose-check ## Run all Stage 1 non-destructive checks
+verify: fmt-check lint test-unit runner-test compose-check ## Run all non-destructive checks

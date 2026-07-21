@@ -4,12 +4,12 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–5 are complete and verified. The Docker Compose stack is currently
+Stages 1–6 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-No user repository has been connected. Stage 5 verification used only
-in-memory fixtures and a disposable Git repository/PostgreSQL records, all of
-which were removed afterward. Stages 6–8 have not been implemented and are not
-represented by placeholders.
+No user repository has been connected. Stage 6 verification used only
+in-memory fakes, disposable Git repositories, and disposable PostgreSQL
+records. No live Codex request was made without an explicitly configured key.
+Stages 7–8 have not been implemented and are not represented by placeholders.
 
 ## Completed
 
@@ -136,6 +136,29 @@ represented by placeholders.
   `ready`; actual Codex execution and verification remain Stage 6.
 - Added planner/validator, workflow, HTTP routing, migration, and PostgreSQL
   state-machine/idempotency coverage.
+- Added the pinned TypeScript `@openai/codex-sdk` runner with bounded JSONL,
+  streaming thread persistence, new/resumed threads, coder workspace-write,
+  reviewer read-only mode, disabled network/approvals, structured output, and
+  an explicit secret-free subprocess environment.
+- Added embedded strict JSON Schemas and semantic validation for coder and
+  reviewer results, including bounded paths, blocker handoffs, and review
+  consistency.
+- Implemented deterministic `ai/task-*` worktrees/branches, clean immutable
+  source-base checks, actual Git inspection, allowlisted verification commands,
+  bounded artifact reads, verified staging, commit idempotency, and source
+  immutability checks.
+- Implemented independent verification of claimed files, write scopes,
+  non-empty diffs, command evidence, failed/unsupported claims, migration
+  pairs, contract paths, and artifact checksums.
+- Added the Stage 6 executor with immediate coder/reviewer thread persistence,
+  same-thread coder retry, fresh reviewer threads, review feedback loops,
+  approved-only commits, artifacts, and bounded required-task handoff.
+- Extended Temporal with long heartbeat execution activities, automatic task
+  outcomes, dynamic required-task dependencies, owner retry signals, paused
+  changes-requested/manual blockers, and attempt/review/replan/depth limits.
+- Added migration `007_stage6_execution`, task attempt/review/artifact pgx
+  persistence, three task execution API routes, `task-log`/`task-retry` CLI and
+  Make targets, and production worker wiring.
 
 ## Files changed
 
@@ -232,14 +255,33 @@ represented by placeholders.
   all database records were removed afterward.
 - Rebuilt Stage 5 services — API/PostgreSQL/Temporal readiness and the real
   worker workflow probe passed after the restart/recovery scenario.
+- Stage 6 schema/semantic/runner/worktree/verifier/executor unit tests — passed.
+- Stage 6 Temporal tests — automatic execution, owner retry after review
+  changes, and dependent-task handoff/resume passed alongside Stage 5 signal
+  compatibility tests.
+- Disposable Stage 6 fixture E2E — a structured coder result produced a real
+  isolated Git diff, independent checks and a separate reviewer approved it,
+  the worktree committed, and the source checkout stayed clean at its base.
+- Stage 6 `make test-integration` — passed; coder thread persistence, reviewer
+  separation, review result, verification report, completion, and artifacts
+  were exercised against PostgreSQL 16.
+- The pinned SDK runner unit tests and production Docker image build passed.
+- Reversible `007_stage6_execution` migration — applied, rolled back with the
+  review table/attempt columns verified absent, reapplied, and then skipped
+  idempotently.
+- Stage 6 `make verify` and `go test -race ./...` — passed on the final
+  executor, runner, workflow, API, and documentation state.
+- Rebuilt Stage 6 services — all containers are running, API/PostgreSQL/
+  Temporal readiness is healthy, and the real worker workflow probe completed
+  with structured `status=ok` output.
 
 ## Remaining work
 
-- Stages 6–8 remain as specified in `docs/implementation-plan.md`: Codex
-  runner/verification, broader GitLab integration, and Telegram.
+- Stages 7–8 remain as specified in `docs/implementation-plan.md`: broader
+  self-hosted GitLab integration and Telegram.
 
 ## Exact next task
 
-Implement Stage 6 isolated Codex execution, structured results, independent
-Git/write-scope/check/contract/migration verification, and reviewer loops on
-top of the Stage 5 durable task-result signal boundary.
+Implement Stage 7 self-hosted GitLab issue/MR/webhook synchronization while
+preserving approval gates, idempotency, dry-run, and the no-merge/no-deploy
+boundary.
