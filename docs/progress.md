@@ -206,7 +206,8 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `test/integration/postgres_schema_test.go`, plus discovery/onboarding
   fixtures and disposable Git worktrees.
 - Documentation: `docs/architecture-conventions.md`,
-  `docs/implementation-plan.md`, `docs/progress.md`.
+  `docs/implementation-plan.md`, `docs/progress.md`, and
+  `docs/repository-onboarding-runbook.md`.
 
 ## Tests
 
@@ -360,6 +361,18 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Final cleanup assertions and direct database audit — zero projects, commands,
   Telegram updates/callbacks, and GitLab links after rehearsal. The temporary
   repository and worktrees were removed automatically.
+- Completed a read-only operational inventory of the requested local project
+  landscape. It identified 36 primary microservices Git roots, 13 linked issue
+  worktrees that must not be registered separately, the nested
+  `infra/messaging` repository, branch/dirty blockers, and the correct
+  non-runtime roles for `journal`, `prompts`, and `wiki`.
+- Added a configurable `PROJECTS_HOST_ROOT` bind mount to both Compose API and
+  worker services. Local projects now have one stable container namespace at
+  `/projects` for discovery and eventual approved worktree execution.
+- Added `docs/repository-onboarding-runbook.md` with the reviewed candidate
+  groups, exclusions, connection order, three-repository pilot, and explicit
+  container commands. No command from that runbook has been executed and the
+  project catalog remains empty.
 
 ## Remaining work
 
@@ -370,7 +383,7 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Exact next task
 
-Prepare the reviewed command sequence for connecting selected real projects,
-or configure an owner-approved Telegram/GitLab pilot. Do not connect or mutate
-any real project until the owner explicitly selects it and runs/approves the
-corresponding command.
+Await an explicit owner command to configure the ignored `.env`, recreate the
+API/worker mounts, and execute the three-repository read-only discovery pilot
+from `docs/repository-onboarding-runbook.md`. Do not connect, onboard, or mutate
+any real project before that command.

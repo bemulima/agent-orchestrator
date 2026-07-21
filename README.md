@@ -112,8 +112,9 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
 - PostgreSQL: `DATABASE_URL` for local processes and `POSTGRES_*` for Compose.
 - Temporal: `TEMPORAL_HOST_PORT`, `TEMPORAL_NAMESPACE`,
   `TEMPORAL_TASK_QUEUE`.
-- Repository safety: `REPOSITORY_ALLOWED_ROOTS`,
-  `REPOSITORY_STORAGE_PATH`, `WORKTREE_STORAGE_PATH` (all absolute).
+- Repository mount: `PROJECTS_HOST_ROOT` (an absolute host path is recommended).
+- Repository safety: `REPOSITORY_ALLOWED_ROOTS`, `REPOSITORY_STORAGE_PATH`,
+  `WORKTREE_STORAGE_PATH` (all absolute container paths).
 - Discovery bounds: `DISCOVERY_MAX_FILES`, `DISCOVERY_MAX_FILE_BYTES`,
   `DISCOVERY_MAX_TOTAL_BYTES`, `DISCOVERY_MAX_DEPTH`.
 - Onboarding bounds/commit identity: `ONBOARDING_MAX_FILE_BYTES`,
@@ -188,6 +189,13 @@ The Stage 2 HTTP API is synchronous and available under `/api/v1`:
 - `GET /api/v1/projects/{projectId}/reports/latest`.
 
 Connecting the same source and retrying an unchanged scan are idempotent.
+
+For the Docker Compose stack, `PROJECTS_HOST_ROOT` is the host directory bound
+into both the API and worker at `/projects`. Persist container paths such as
+`/projects/microservices/service-name`; host `/Users/...` paths do not exist in
+the containers. The reviewed inventory, exclusions, roles, connection waves,
+and exact container commands are in
+[`docs/repository-onboarding-runbook.md`](docs/repository-onboarding-runbook.md).
 
 ## Approved onboarding
 

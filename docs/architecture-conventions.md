@@ -109,6 +109,10 @@ and engineering conventions come from the reference service.
   It refuses a database containing projects or commands, uses only temporary
   Git worktrees and fake external adapters, and asserts database cleanup before
   reporting success.
+- Compose exposes one explicitly configured host repository root to both the
+  API and worker at the stable `/projects` path. Persisted local paths always
+  use that container namespace so discovery and later worker execution resolve
+  the same checkout.
 
 ## Dependency direction
 
