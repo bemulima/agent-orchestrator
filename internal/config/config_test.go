@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"reflect"
 	"testing"
 )
@@ -51,9 +52,48 @@ func TestLoad_ValidatesGitLabConfigurationPair(t *testing.T) {
 	}
 
 	t.Setenv("GITLAB_TOKEN", "secret")
+	t.Setenv("GITLAB_CONTROL_PROJECT", "group/control")
 	t.Setenv("GITLAB_BASE_URL", "https://user:password@gitlab.example.test")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() accepted credentials in GitLab base URL")
+	}
+}
+
+func TestLoad_ValidatesGitLabControlProjectAndWebhookSecret(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "https://gitlab.example.test")
+	t.Setenv("GITLAB_TOKEN", "secret")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected Stage 3 GitLab configuration without control project: %v", err)
+	}
+	t.Setenv("GITLAB_CONTROL_PROJECT", "../unsafe")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an unsafe GitLab control project")
+	}
+	t.Setenv("GITLAB_CONTROL_PROJECT", "group/control")
+	t.Setenv("GITLAB_WEBHOOK_SECRET", "short")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a short GitLab webhook secret")
+	}
+	t.Setenv("GITLAB_WEBHOOK_SECRET", "0123456789abcdef")
+	cfg, err := Load()
+	if err != nil || cfg.GitLabControlProject != "group/control" {
+		t.Fatalf("Load() = %#v, %v", cfg, err)
+	}
+}
+
+func TestLoad_ValidatesGitLabSigningToken(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "https://gitlab.example.test")
+	t.Setenv("GITLAB_TOKEN", "secret")
+	t.Setenv("GITLAB_CONTROL_PROJECT", "group/control")
+	t.Setenv("GITLAB_WEBHOOK_SIGNING_TOKEN", "invalid")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an invalid GitLab signing token")
+	}
+	token := "whsec_" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	t.Setenv("GITLAB_WEBHOOK_SIGNING_TOKEN", token)
+	cfg, err := Load()
+	if err != nil || cfg.GitLabWebhookSigningToken != token || !cfg.SafeSummary().GitLabWebhookSigned {
+		t.Fatalf("Load() signing token = %#v, %v", cfg.SafeSummary(), err)
 	}
 }
 
@@ -90,7 +130,7 @@ func TestSafeSummary_DoesNotExposeSensitiveValues(t *testing.T) {
 		DatabaseURL:            "postgres://user:secret@db/orchestrator",
 		GitLabToken:            "gitlab-secret",
 		GitLabBaseURL:          "https://gitlab.example.test",
-		GitLabWebhookSecret:    "webhook-secret",
+		GitLabWebhookSecret:    "webhook-secret-123",
 		TelegramBotToken:       "telegram-secret",
 		TelegramAllowedUserIDs: []int64{12345},
 		TelegramAllowedChatIDs: []int64{67890},
@@ -102,6 +142,9 @@ func TestSafeSummary_DoesNotExposeSensitiveValues(t *testing.T) {
 	summary := cfg.SafeSummary()
 	if !summary.DatabaseConfigured || !summary.GitLabConfigured || !summary.TelegramConfigured {
 		t.Fatalf("SafeSummary() configuration flags = %#v", summary)
+	}
+	if !summary.GitLabWebhookConfigured {
+		t.Fatal("SafeSummary() did not report configured GitLab webhook")
 	}
 	if summary.TelegramAllowedUserCount != 1 {
 		t.Fatalf("TelegramAllowedUserCount = %d, want 1", summary.TelegramAllowedUserCount)

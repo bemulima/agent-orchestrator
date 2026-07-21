@@ -21,8 +21,6 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const maxGitLabResponseBytes = 1 << 20
-
 var onboardingBranchPattern = regexp.MustCompile(`^ai/onboard-[a-z0-9._-]+$`)
 
 type OnboardingPublisher struct {

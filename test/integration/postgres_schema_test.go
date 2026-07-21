@@ -60,6 +60,7 @@ ORDER BY tablename`)
 		"service_ownership", "service_relation", "service_snapshot", "task",
 		"task_attempt", "task_dependency", "telegram_user", "topology_revision",
 		"topology_service", "contract_drift", "plan_run", "task_review",
+		"gitlab_webhook_event",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -70,6 +71,90 @@ ORDER BY tablename`)
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Fatalf("missing tables: %v", missing)
+	}
+}
+
+func TestGitLabRepositoryIdempotentlyPersistsLinksAndWebhookState(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	repository := pgadapter.GitLabRepoPG{Pool: pool}
+	resourceID := uuid.NewString()
+	ignoredEventID := "ignored-" + uuid.NewString()
+	defer func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM gitlab_webhook_event WHERE event_uuid IN ($1, $2, $3, $4, $5, $6)`,
+			"issue-"+resourceID, "merge-"+resourceID, "pipeline-"+resourceID,
+			ignoredEventID, "invalid-"+resourceID, "reopen-"+resourceID)
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, resourceID)
+		_, _ = pool.Exec(ctx, `DELETE FROM gitlab_link WHERE resource_id = $1`, resourceID)
+	}()
+	issueIID := int64(17)
+	first, err := repository.SaveGitLabLink(ctx, domain.GitLabLink{
+		ResourceType: domain.GitLabResourceTask, ResourceID: resourceID, GitLabProjectID: 42,
+		IssueIID: &issueIID, URL: "https://gitlab.example.test/group/service/-/issues/17", ExternalState: "opened",
+	})
+	if err != nil {
+		t.Fatalf("SaveGitLabLink(issue) error = %v", err)
+	}
+	mergeRequestIID := int64(9)
+	second, err := repository.SaveGitLabLink(ctx, domain.GitLabLink{
+		ResourceType: domain.GitLabResourceTask, ResourceID: resourceID, GitLabProjectID: 42,
+		IssueIID: &issueIID, MergeRequestIID: &mergeRequestIID,
+		URL: "https://gitlab.example.test/group/service/-/merge_requests/9", ExternalState: "opened",
+	})
+	if err != nil || second.ID != first.ID || second.IssueIID == nil || second.MergeRequestIID == nil {
+		t.Fatalf("SaveGitLabLink(MR) = %#v, %v", second, err)
+	}
+	issueEvent := domain.GitLabWebhookEvent{
+		EventUUID: "issue-" + resourceID, EventType: "Issue Hook", ObjectKind: "issue",
+		GitLabProjectID: 42, ObjectIID: issueIID, ExternalState: "closed",
+		PayloadChecksum: strings.Repeat("a", 64), ReceivedAt: time.Now().UTC(),
+	}
+	processed, err := repository.ApplyGitLabWebhook(ctx, issueEvent)
+	if err != nil || processed.Status != "processed" || processed.Link == nil || processed.Link.ExternalState != "closed" {
+		t.Fatalf("ApplyGitLabWebhook(issue) = %#v, %v", processed, err)
+	}
+	duplicate, err := repository.ApplyGitLabWebhook(ctx, issueEvent)
+	if err != nil || !duplicate.Duplicate || duplicate.Link == nil {
+		t.Fatalf("duplicate ApplyGitLabWebhook() = %#v, %v", duplicate, err)
+	}
+	invalid := issueEvent
+	invalid.EventUUID = "invalid-" + resourceID
+	invalid.ExternalState = "merged"
+	if _, err := repository.ApplyGitLabWebhook(ctx, invalid); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("invalid issue transition error = %v", err)
+	}
+	mergeEvent := domain.GitLabWebhookEvent{
+		EventUUID: "merge-" + resourceID, EventType: "Merge Request Hook", ObjectKind: "merge_request",
+		GitLabProjectID: 42, ObjectIID: mergeRequestIID, ExternalState: "merged",
+		PayloadChecksum: strings.Repeat("b", 64), ReceivedAt: time.Now().UTC(),
+	}
+	merged, err := repository.ApplyGitLabWebhook(ctx, mergeEvent)
+	if err != nil || merged.Link == nil || merged.Link.ExternalState != "merged" {
+		t.Fatalf("ApplyGitLabWebhook(MR) = %#v, %v", merged, err)
+	}
+	reopened := mergeEvent
+	reopened.EventUUID = "reopen-" + resourceID
+	reopened.ExternalState = "opened"
+	if _, err := repository.ApplyGitLabWebhook(ctx, reopened); !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("reopened merged MR error = %v", err)
+	}
+	pipelineEvent := domain.GitLabWebhookEvent{
+		EventUUID: "pipeline-" + resourceID, EventType: "Pipeline Hook", ObjectKind: "pipeline",
+		GitLabProjectID: 42, ObjectIID: mergeRequestIID, ExternalState: "unknown", PipelineStatus: "success",
+		PayloadChecksum: strings.Repeat("c", 64), ReceivedAt: time.Now().UTC(),
+	}
+	pipeline, err := repository.ApplyGitLabWebhook(ctx, pipelineEvent)
+	if err != nil || pipeline.Link == nil || pipeline.Link.PipelineStatus != "success" || pipeline.Link.ExternalState != "merged" {
+		t.Fatalf("ApplyGitLabWebhook(pipeline) = %#v, %v", pipeline, err)
+	}
+	ignored, err := repository.ApplyGitLabWebhook(ctx, domain.GitLabWebhookEvent{
+		EventUUID: ignoredEventID, EventType: "Issue Hook", ObjectKind: "issue",
+		GitLabProjectID: 999, ObjectIID: 999, ExternalState: "opened",
+		PayloadChecksum: strings.Repeat("d", 64), ReceivedAt: time.Now().UTC(),
+	})
+	if err != nil || ignored.Status != "ignored" || ignored.Link != nil {
+		t.Fatalf("ignored ApplyGitLabWebhook() = %#v, %v", ignored, err)
 	}
 }
 

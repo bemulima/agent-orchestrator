@@ -87,6 +87,18 @@ and engineering conventions come from the reference service.
 - The SDK runner receives secrets only for its own Codex invocation. Codex
   tool subprocesses use an explicit `inherit = none` environment policy and
   receive no API key, database URL, or integration token.
+- Stage 7 treats GitLab as an external projection of approved plan/task state.
+  The bounded adapter exposes project lookup, issues, notes, related-issue
+  links, branch push, and merge-request create/update only; merge, deploy, and
+  generic destructive REST methods do not exist.
+- GitLab retries recover from stable HTML markers, source/target branches, and
+  persisted `GitLabLink` rows. Dry-run uses a separate no-network adapter and
+  never persists links or pushes branches.
+- Signed GitLab webhooks verify HMAC-SHA256 over the raw Standard Webhooks
+  message, enforce a five-minute timestamp window, and deduplicate delivery
+  IDs transactionally. Legacy header tokens are constant-time compared.
+  External issue and MR states are stored separately and never override the
+  orchestrator's authoritative task result.
 
 ## Dependency direction
 

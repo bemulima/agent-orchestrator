@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -180,6 +180,14 @@ task-retry: ## Retry blocked or changes-requested TASK_ID=uuid
 task-cancel: ## Signal cancellation for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-cancel --task-id "$(TASK_ID)"
+
+gitlab-sync: ## Synchronize approved PLAN_ID=uuid to GitLab (dry-run by default)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator gitlab-sync --plan-id "$(PLAN_ID)"
+
+gitlab-links: ## Show persisted GitLab links for PLAN_ID=uuid
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator gitlab-links --plan-id "$(PLAN_ID)"
 
 fmt: ## Format Go source files
 	@gofmt -w $(GO_FILES)

@@ -20,7 +20,7 @@ func WriteDomainError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrValidation):
 		WriteError(w, http.StatusBadRequest, "validation_error", err.Error())
 	case errors.Is(err, domain.ErrForbidden):
-		WriteError(w, http.StatusForbidden, "forbidden", "repository source is not allowed")
+		WriteError(w, http.StatusForbidden, "forbidden", "operation is forbidden")
 	case errors.Is(err, domain.ErrNotFound):
 		WriteError(w, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, domain.ErrConflict):

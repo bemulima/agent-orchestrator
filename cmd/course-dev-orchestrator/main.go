@@ -40,6 +40,7 @@ import (
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
+	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	planninguc "github.com/bemulima/agent-orchestrator/internal/usecase/planning"
@@ -103,6 +104,8 @@ func run(args []string) error {
 	case "plan", "plan-show", "plan-approve", "plan-reject", "plan-run",
 		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-log", "task-retry", "task-cancel":
 		return runPlanningCommand(cfg, command, args[1:], os.Stdout)
+	case "gitlab-sync", "gitlab-links":
+		return runGitLabCommand(cfg, command, args[1:], os.Stdout)
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
@@ -166,12 +169,17 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
 		GetArtifacts: planningOperations.GetArtifacts, RetryTask: planningOperations.RetryTask,
 	}
+	gitLabOperations := newGitLabOperations(cfg, pool)
+	gitLabHandler := handlers.GitLabHandler{
+		Sync: gitLabOperations.Sync, Links: gitLabOperations.Links, Webhook: gitLabOperations.Webhook,
+	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
 		HealthHandler:     healthHandler,
 		ProjectHandler:    &projectHandler,
 		OnboardingHandler: &onboardingHandler,
 		TopologyHandler:   &topologyHandler,
 		PlanningHandler:   &planningHandler,
+		GitLabHandler:     &gitLabHandler,
 		Logger:            logger,
 	})
 	server := &http.Server{
@@ -206,6 +214,33 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+type gitLabOperations struct {
+	Sync    gitlabuc.Sync
+	Links   gitlabuc.Links
+	Webhook gitlabuc.ProcessWebhook
+}
+
+func newGitLabOperations(cfg config.Config, pool *pgxpool.Pool) gitLabOperations {
+	links := pgadapter.GitLabRepoPG{Pool: pool}
+	var gateway repository.GitLabGateway
+	if cfg.GitLabDryRun {
+		gateway = gitlabadapter.DryRunAdapter{BaseURL: cfg.GitLabBaseURL, Token: cfg.GitLabToken}
+	} else {
+		gateway = gitlabadapter.Client{BaseURL: cfg.GitLabBaseURL, Token: cfg.GitLabToken}
+	}
+	return gitLabOperations{
+		Sync: gitlabuc.Sync{
+			Plans: pgadapter.PlanningRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+			TaskExecutions: pgadapter.TaskExecutionRepoPG{Pool: pool}, Links: links,
+			Gateway: gateway, ControlProject: cfg.GitLabControlProject,
+		},
+		Links: gitlabuc.Links{Links: links, Plans: pgadapter.PlanningRepoPG{Pool: pool}},
+		Webhook: gitlabuc.ProcessWebhook{
+			Secret: cfg.GitLabWebhookSecret, SigningToken: cfg.GitLabWebhookSigningToken, Links: links,
+		},
+	}
 }
 
 type planningOperations struct {
@@ -653,6 +688,32 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 	}
 }
 
+func runGitLabCommand(cfg config.Config, command string, args []string, output io.Writer) error {
+	planID, err := requiredIDFlag(command, args, "plan-id")
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect postgres: %w", err)
+	}
+	defer pool.Close()
+	operations := newGitLabOperations(cfg, pool)
+	if command == "gitlab-sync" {
+		result, syncErr := operations.Sync.Handle(ctx, planID)
+		if syncErr != nil {
+			return syncErr
+		}
+		return writeJSON(output, result)
+	}
+	links, linksErr := operations.Links.Handle(ctx, planID)
+	if linksErr != nil {
+		return linksErr
+	}
+	return writeJSON(output, map[string]any{"plan_id": planID, "links": links})
+}
+
 func planningCommandNeedsTemporal(command string) bool {
 	switch command {
 	case "plan-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
@@ -907,6 +968,8 @@ Commands:
   task-log        Show task attempts, verification results, and artifacts
   task-retry      Retry a blocked or changes-requested task
   task-cancel     Signal cancellation for a dispatched task
+  gitlab-sync     Create or update plan/task issues and completed-task MRs
+  gitlab-links    Show persisted GitLab links for a plan
   version         Print build version
   help            Show this help`)
 }

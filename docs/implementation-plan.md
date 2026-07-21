@@ -152,6 +152,9 @@ Acceptance:
 
 ## Stage 7 — self-hosted GitLab
 
+Status: completed and verified on 2026-07-21 with fake HTTP/Git adapters and
+disposable PostgreSQL records. No real GitLab project was changed.
+
 Scope:
 
 - configurable REST client for any GitLab base URL;

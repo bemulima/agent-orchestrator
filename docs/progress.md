@@ -4,12 +4,14 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–6 are complete and verified. The Docker Compose stack is currently
+Stages 1–7 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
 No user repository has been connected. Stage 6 verification used only
 in-memory fakes, disposable Git repositories, and disposable PostgreSQL
 records. No live Codex request was made without an explicitly configured key.
-Stages 7–8 have not been implemented and are not represented by placeholders.
+Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
+PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
+Stage 8 has not been implemented and is not represented by placeholders.
 
 ## Completed
 
@@ -159,6 +161,29 @@ Stages 7–8 have not been implemented and are not represented by placeholders.
 - Added migration `007_stage6_execution`, task attempt/review/artifact pgx
   persistence, three task execution API routes, `task-log`/`task-retry` CLI and
   Make targets, and production worker wiring.
+- Added the reversible `008_stage7_gitlab` schema with separate issue/MR
+  state, pipeline state, delivery identifiers, sync timestamps, partial
+  uniqueness constraints, and payload-checksum-only webhook history.
+- Implemented a bounded REST client for arbitrary self-hosted GitLab base
+  paths with redirect refusal, response limits, encoded project references,
+  issue/MR recovery, user-label preservation, notes, related-issue links, and
+  task-branch publication.
+- Added separate deterministic dry-run and in-memory fake GitLab adapters.
+  Dry-run performs no HTTP, Git push, or link persistence; the fake exposes
+  create counters for retry/idempotency assertions.
+- Added approved-plan synchronization to one control-project plan issue and
+  per-project task issues, with labels, checklists, links, marker-keyed status
+  comments, and completed-task merge requests from verified `ai/task-*`
+  attempts only.
+- Added signed GitLab 19+ webhook verification using Standard Webhooks
+  HMAC-SHA256, constant-time multi-signature matching, a five-minute replay
+  window, stable delivery deduplication, and legacy `X-Gitlab-Token` fallback.
+- Added transactional webhook state validation and synchronization for issue,
+  merge-request, and related pipeline events. External state remains a
+  projection and cannot complete an internal task or trigger merge/deploy.
+- Added Stage 7 plan sync/link/webhook HTTP routes, `gitlab-sync` and
+  `gitlab-links` CLI/Make commands, redacted configuration flags, and explicit
+  `GITLAB_CONTROL_PROJECT`/webhook signing configuration.
 
 ## Files changed
 
@@ -168,7 +193,7 @@ Stages 7–8 have not been implemented and are not represented by placeholders.
 - Domain/config: `internal/config/*`, `internal/domain/*`.
 - Application/transport: `internal/usecase/health/*`,
   `internal/usecase/project/*`, `internal/usecase/planning/*`,
-  `internal/adapters/http/*`.
+  `internal/usecase/gitlab/*`, `internal/adapters/http/*`.
 - Infrastructure: `internal/adapters/git/*`, `internal/adapters/gitlab/*`,
   `internal/adapters/postgres/*`, `internal/discovery/*`,
   `internal/planning/*`, `internal/adapters/temporal/*`, `internal/activities/*`,
@@ -274,14 +299,29 @@ Stages 7–8 have not been implemented and are not represented by placeholders.
 - Rebuilt Stage 6 services — all containers are running, API/PostgreSQL/
   Temporal readiness is healthy, and the real worker workflow probe completed
   with structured `status=ok` output.
+- Stage 7 REST/fake/dry-run tests — passed for encoded self-hosted paths,
+  bounded responses, issue/note/link/MR reuse, branch idempotency,
+  deterministic no-write previews, approval gating, and preservation of
+  non-managed labels.
+- Stage 7 webhook tests — passed for HMAC-SHA256 signatures, timestamp replay
+  rejection, tampered bodies, legacy tokens, event/header matching, body
+  limits, duplicate delivery IDs, state transitions, ignored unknown links,
+  and separate issue/MR/pipeline state.
+- Reversible `008_stage7_gitlab` migration — applied, rolled back, reapplied,
+  and exercised by the PostgreSQL integration suite.
+- Stage 7 `make test-integration` and `make verify` — passed on the GitLab
+  repository, use cases, HTTP routes, CLI wiring, runner, and Compose config.
+- Stage 7 `go test -race ./...` — passed across all Go packages.
+- Rebuilt Stage 7 services — API/PostgreSQL/Temporal readiness is healthy and
+  the real worker workflow probe completed with structured `status=ok` output.
 
 ## Remaining work
 
-- Stages 7–8 remain as specified in `docs/implementation-plan.md`: broader
-  self-hosted GitLab integration and Telegram.
+- Stage 8 remains as specified in `docs/implementation-plan.md`: the Telegram
+  owner interface.
 
 ## Exact next task
 
-Implement Stage 7 self-hosted GitLab issue/MR/webhook synchronization while
-preserving approval gates, idempotency, dry-run, and the no-merge/no-deploy
-boundary.
+Implement Stage 8 Telegram polling/webhook owner interface while preserving
+allowlists, expiring resource-bound approvals, replay protection, concise
+payloads, and the no-secret/no-large-output boundary.

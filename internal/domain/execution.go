@@ -273,13 +273,21 @@ type Approval struct {
 }
 
 type GitLabLink struct {
-	ID              string `json:"id"`
-	ResourceType    string `json:"resource_type"`
-	ResourceID      string `json:"resource_id"`
-	GitLabProjectID int64  `json:"gitlab_project_id"`
-	IssueIID        *int64 `json:"issue_iid,omitempty"`
-	MergeRequestIID *int64 `json:"merge_request_iid,omitempty"`
-	URL             string `json:"url"`
+	ID                string     `json:"id"`
+	ResourceType      string     `json:"resource_type"`
+	ResourceID        string     `json:"resource_id"`
+	GitLabProjectID   int64      `json:"gitlab_project_id"`
+	IssueIID          *int64     `json:"issue_iid,omitempty"`
+	MergeRequestIID   *int64     `json:"merge_request_iid,omitempty"`
+	URL               string     `json:"url"`
+	ExternalState     string     `json:"external_state"`
+	IssueState        string     `json:"issue_state"`
+	MergeRequestState string     `json:"merge_request_state"`
+	PipelineStatus    string     `json:"pipeline_status,omitempty"`
+	LastEventUUID     *string    `json:"last_event_uuid,omitempty"`
+	LastSyncedAt      *time.Time `json:"last_synced_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type TelegramUser struct {

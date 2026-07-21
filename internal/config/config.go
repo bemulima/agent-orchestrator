@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -45,10 +46,12 @@ type Config struct {
 	MaxParallelTasks     int `envconfig:"MAX_PARALLEL_TASKS" default:"3" validate:"min=1,max=3"`
 	MaxRequiredTaskDepth int `envconfig:"MAX_REQUIRED_TASK_DEPTH" default:"3" validate:"min=1,max=10"`
 
-	GitLabBaseURL       string `envconfig:"GITLAB_BASE_URL"`
-	GitLabToken         string `envconfig:"GITLAB_TOKEN"`
-	GitLabWebhookSecret string `envconfig:"GITLAB_WEBHOOK_SECRET"`
-	GitLabDryRun        bool   `envconfig:"GITLAB_DRY_RUN" default:"true"`
+	GitLabBaseURL             string `envconfig:"GITLAB_BASE_URL"`
+	GitLabToken               string `envconfig:"GITLAB_TOKEN"`
+	GitLabControlProject      string `envconfig:"GITLAB_CONTROL_PROJECT"`
+	GitLabWebhookSecret       string `envconfig:"GITLAB_WEBHOOK_SECRET"`
+	GitLabWebhookSigningToken string `envconfig:"GITLAB_WEBHOOK_SIGNING_TOKEN"`
+	GitLabDryRun              bool   `envconfig:"GITLAB_DRY_RUN" default:"true"`
 
 	TelegramBotToken       string  `envconfig:"TELEGRAM_BOT_TOKEN"`
 	TelegramAllowedUserIDs []int64 `envconfig:"TELEGRAM_ALLOWED_USER_IDS"`
@@ -102,6 +105,10 @@ func Load() (Config, error) {
 	if gitLabBaseConfigured != gitLabTokenConfigured {
 		return Config{}, fmt.Errorf("GITLAB_BASE_URL and GITLAB_TOKEN must be configured together")
 	}
+	if !gitLabBaseConfigured && (strings.TrimSpace(cfg.GitLabControlProject) != "" ||
+		strings.TrimSpace(cfg.GitLabWebhookSecret) != "" || strings.TrimSpace(cfg.GitLabWebhookSigningToken) != "") {
+		return Config{}, fmt.Errorf("GitLab project and webhook configuration require GITLAB_BASE_URL and GITLAB_TOKEN")
+	}
 	if gitLabBaseConfigured {
 		gitLabURL, parseErr := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.GitLabBaseURL), "/"))
 		if parseErr != nil || gitLabURL.Host == "" || gitLabURL.User != nil || gitLabURL.RawQuery != "" ||
@@ -109,6 +116,22 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("GITLAB_BASE_URL must be an HTTP(S) URL without credentials, query, or fragment")
 		}
 		cfg.GitLabBaseURL = gitLabURL.String()
+		cfg.GitLabControlProject = strings.Trim(strings.TrimSpace(cfg.GitLabControlProject), "/")
+		if len(cfg.GitLabControlProject) > 512 || strings.Contains(cfg.GitLabControlProject, "..") {
+			return Config{}, fmt.Errorf("GITLAB_CONTROL_PROJECT must be a numeric ID or safe project path")
+		}
+		if secret := strings.TrimSpace(cfg.GitLabWebhookSecret); secret != "" && len(secret) < 16 {
+			return Config{}, fmt.Errorf("GITLAB_WEBHOOK_SECRET must contain at least 16 characters")
+		}
+		if signingToken := strings.TrimSpace(cfg.GitLabWebhookSigningToken); signingToken != "" {
+			if !strings.HasPrefix(signingToken, "whsec_") {
+				return Config{}, fmt.Errorf("GITLAB_WEBHOOK_SIGNING_TOKEN must start with whsec_")
+			}
+			decoded, decodeErr := base64.StdEncoding.DecodeString(strings.TrimPrefix(signingToken, "whsec_"))
+			if decodeErr != nil || len(decoded) < 16 {
+				return Config{}, fmt.Errorf("GITLAB_WEBHOOK_SIGNING_TOKEN must contain a base64 key of at least 16 bytes")
+			}
+		}
 	}
 	return cfg, nil
 }
@@ -153,6 +176,8 @@ type Summary struct {
 	MaxRequiredTaskDepth     int      `json:"max_required_task_depth"`
 	GitLabConfigured         bool     `json:"gitlab_configured"`
 	GitLabDryRun             bool     `json:"gitlab_dry_run"`
+	GitLabWebhookConfigured  bool     `json:"gitlab_webhook_configured"`
+	GitLabWebhookSigned      bool     `json:"gitlab_webhook_signed"`
 	TelegramConfigured       bool     `json:"telegram_configured"`
 	TelegramAllowedUserCount int      `json:"telegram_allowed_user_count"`
 	ConfiguredModelProfiles  []string `json:"configured_model_profiles"`
@@ -168,27 +193,30 @@ func (c Config) SafeSummary() Summary {
 		}
 	}
 	return Summary{
-		HTTPPort:                 c.HTTPPort,
-		DatabaseConfigured:       c.DatabaseURL != "",
-		TemporalHostPort:         c.TemporalHostPort,
-		TemporalNamespace:        c.TemporalNamespace,
-		TemporalTaskQueue:        c.TemporalTaskQueue,
-		RepositoryAllowedRoots:   append([]string(nil), c.RepositoryAllowedRoots...),
-		RepositoryStoragePath:    c.RepositoryStoragePath,
-		WorktreeStoragePath:      c.WorktreeStoragePath,
-		DiscoveryMaxFiles:        c.DiscoveryMaxFiles,
-		DiscoveryMaxFileBytes:    c.DiscoveryMaxFileBytes,
-		DiscoveryMaxTotalBytes:   c.DiscoveryMaxTotalBytes,
-		DiscoveryMaxDepth:        c.DiscoveryMaxDepth,
-		OnboardingMaxFileBytes:   c.OnboardingMaxFileBytes,
-		OnboardingMaxTotalBytes:  c.OnboardingMaxTotalBytes,
-		MaxTaskAttempts:          c.MaxTaskAttempts,
-		MaxReviewAttempts:        c.MaxReviewAttempts,
-		MaxReplans:               c.MaxReplans,
-		MaxParallelTasks:         c.MaxParallelTasks,
-		MaxRequiredTaskDepth:     c.MaxRequiredTaskDepth,
-		GitLabConfigured:         c.GitLabBaseURL != "" && c.GitLabToken != "",
-		GitLabDryRun:             c.GitLabDryRun,
+		HTTPPort:                c.HTTPPort,
+		DatabaseConfigured:      c.DatabaseURL != "",
+		TemporalHostPort:        c.TemporalHostPort,
+		TemporalNamespace:       c.TemporalNamespace,
+		TemporalTaskQueue:       c.TemporalTaskQueue,
+		RepositoryAllowedRoots:  append([]string(nil), c.RepositoryAllowedRoots...),
+		RepositoryStoragePath:   c.RepositoryStoragePath,
+		WorktreeStoragePath:     c.WorktreeStoragePath,
+		DiscoveryMaxFiles:       c.DiscoveryMaxFiles,
+		DiscoveryMaxFileBytes:   c.DiscoveryMaxFileBytes,
+		DiscoveryMaxTotalBytes:  c.DiscoveryMaxTotalBytes,
+		DiscoveryMaxDepth:       c.DiscoveryMaxDepth,
+		OnboardingMaxFileBytes:  c.OnboardingMaxFileBytes,
+		OnboardingMaxTotalBytes: c.OnboardingMaxTotalBytes,
+		MaxTaskAttempts:         c.MaxTaskAttempts,
+		MaxReviewAttempts:       c.MaxReviewAttempts,
+		MaxReplans:              c.MaxReplans,
+		MaxParallelTasks:        c.MaxParallelTasks,
+		MaxRequiredTaskDepth:    c.MaxRequiredTaskDepth,
+		GitLabConfigured:        c.GitLabBaseURL != "" && c.GitLabToken != "",
+		GitLabDryRun:            c.GitLabDryRun,
+		GitLabWebhookConfigured: len(strings.TrimSpace(c.GitLabWebhookSecret)) >= 16 ||
+			strings.HasPrefix(strings.TrimSpace(c.GitLabWebhookSigningToken), "whsec_"),
+		GitLabWebhookSigned:      strings.HasPrefix(strings.TrimSpace(c.GitLabWebhookSigningToken), "whsec_"),
 		TelegramConfigured:       c.TelegramBotToken != "",
 		TelegramAllowedUserCount: len(c.TelegramAllowedUserIDs),
 		ConfiguredModelProfiles:  profiles,

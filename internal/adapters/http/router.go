@@ -19,6 +19,7 @@ type RouterDependencies struct {
 	OnboardingHandler *handlers.OnboardingHandler
 	TopologyHandler   *handlers.TopologyHandler
 	PlanningHandler   *handlers.PlanningHandler
+	GitLabHandler     *handlers.GitLabHandler
 	Logger            *zap.Logger
 }
 
@@ -77,6 +78,11 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/tasks/{taskId}/artifacts", deps.PlanningHandler.GetTaskArtifacts)
 		root.Post("/api/v1/tasks/{taskId}/retry", deps.PlanningHandler.RetryTaskRequest)
 		root.Post("/api/v1/tasks/{taskId}/cancel", deps.PlanningHandler.CancelTaskRequest)
+	}
+	if deps.GitLabHandler != nil {
+		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)
+		root.Get("/api/v1/plans/{planId}/gitlab", deps.GitLabHandler.ListPlanLinks)
+		root.Post("/api/v1/integrations/gitlab/webhook", deps.GitLabHandler.ReceiveWebhook)
 	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {

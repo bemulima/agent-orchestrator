@@ -11,8 +11,8 @@ project connection/read-only discovery, Stage 3 evidence-backed onboarding
 with approval-gated isolated writes, Stage 4 materialized service topology
 with contract drift and impact queries, and Stage 5 approval-gated planning
 with a durable Temporal DAG scheduler, and Stage 6 isolated Codex execution
-with independent verification and review. Broader GitLab integration and
-Telegram remain explicitly tracked in
+with independent verification and review, plus Stage 7 self-hosted GitLab
+issue/MR synchronization and signed webhooks. Telegram remains tracked in
 [docs/progress.md](docs/progress.md).
 
 ## Architecture
@@ -29,6 +29,7 @@ Telegram remain explicitly tracked in
 - `internal/planning`: deterministic evidence planner and DAG validation.
 - `internal/agent`: embedded coder/reviewer JSON Schemas and validation.
 - `internal/execution`: prompt boundary, verification, review, and task executor.
+- `internal/adapters/gitlab`: bounded self-hosted GitLab REST, fake, and dry-run adapters.
 - `runner`: pinned TypeScript `@openai/codex-sdk` process adapter.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
@@ -94,6 +95,8 @@ course-dev-orchestrator task-show --task-id UUID
 course-dev-orchestrator task-log --task-id UUID
 course-dev-orchestrator task-retry --task-id UUID
 course-dev-orchestrator task-cancel --task-id UUID
+course-dev-orchestrator gitlab-sync --plan-id UUID
+course-dev-orchestrator gitlab-links --plan-id UUID
 course-dev-orchestrator version
 ```
 
@@ -122,9 +125,11 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
   `CODEX_MODEL_REVIEW`. Empty model values defer selection to Codex; no model
   name is compiled into the Go service. Keep the key only in ignored `.env` or
   an external secret store.
-- Integrations: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, and `GITLAB_DRY_RUN`
-  control the minimal Stage 3 branch/MR publisher. Broader GitLab issue/webhook
-  synchronization and Telegram remain Stages 7 and 8.
+- GitLab: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, `GITLAB_CONTROL_PROJECT`, and
+  `GITLAB_DRY_RUN`. New GitLab 19+ webhooks should use
+  `GITLAB_WEBHOOK_SIGNING_TOKEN=whsec_<base64-key>`; the legacy
+  `GITLAB_WEBHOOK_SECRET` header token remains supported during migration.
+- Telegram configuration remains reserved for Stage 8.
 
 Comma-separate multiple repository roots and Telegram IDs. Never commit `.env`.
 
@@ -216,7 +221,7 @@ GitLab base URL/token, `GITLAB_DRY_RUN=true` still suppresses all external
 writes; setting it to `false` after approval pushes the onboarding branch,
 reuses or creates an open merge request, and persists its `GitLabLink`. GitLab
 credentials are never added to a remote URL or logged. Stage 3 never merges or
-deploys; broader GitLab issue/webhook synchronization remains Stage 7.
+deploys. Stage 7 uses the same host/token boundary for broader synchronization.
 
 The Stage 3 HTTP API is also synchronous:
 
@@ -336,6 +341,43 @@ Plan lifecycle states are `draft`, `planned`, `awaiting_approval`, `approved`,
 `running`, `paused`, `completed`, `failed`, and `cancelled`. Task states are
 `draft`, `planned`, `ready`, `running`, `blocked`, `verification`,
 `changes_requested`, `completed`, `failed`, and `cancelled`.
+
+## Self-hosted GitLab synchronization
+
+Stage 7 projects an approved plan into a configurable self-hosted GitLab
+instance. `GITLAB_CONTROL_PROJECT` receives the parent plan issue; every task
+gets an issue in its own connected GitLab project. The adapter maintains
+orchestrator labels, Markdown checklists, related-issue links, and
+marker-keyed status comments while preserving unrelated user labels. Logical
+child issues use the edition-portable related-issues API rather than a
+paid-tier hierarchy.
+
+```sh
+make gitlab-sync PLAN_ID=uuid
+make gitlab-links PLAN_ID=uuid
+```
+
+`GITLAB_DRY_RUN=true` is the default. It returns deterministic issue/MR
+previews without HTTP calls, Git pushes, or `GitLabLink` writes. Real writes
+require the persisted plan approval. Repeated syncs recover by embedded
+resource markers and source/target branches, so they reuse issues, comments,
+links, branches, and merge requests. A completed task publishes only its
+verified `ai/task-*` commit and opens or updates an MR against the recorded
+default branch. No adapter method can merge or deploy.
+
+The Stage 7 HTTP routes are:
+
+- `POST /api/v1/plans/{planId}/gitlab/sync`;
+- `GET /api/v1/plans/{planId}/gitlab`;
+- `POST /api/v1/integrations/gitlab/webhook`.
+
+For GitLab 19+, the webhook receiver verifies the Standard Webhooks
+HMAC-SHA256 signature over the raw body, checks a five-minute timestamp
+window, and deduplicates the stable `webhook-id`. Older self-hosted versions
+can use a constant-time `X-Gitlab-Token` comparison. Issue, MR, and related
+pipeline events update separate persisted external states; they never make an
+internal task successful and never trigger merge or deploy. Raw webhook
+payloads and authentication values are not stored.
 
 ## Quality commands
 
