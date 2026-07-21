@@ -83,6 +83,8 @@ type ServiceSnapshot struct {
 
 type ServiceCapability struct {
 	ID          string  `json:"id"`
+	RevisionID  string  `json:"revision_id"`
+	SnapshotID  string  `json:"snapshot_id"`
 	ProjectID   string  `json:"project_id"`
 	Code        string  `json:"code"`
 	Name        string  `json:"name"`
@@ -93,6 +95,8 @@ type ServiceCapability struct {
 
 type ServiceOwnership struct {
 	ID           string  `json:"id"`
+	RevisionID   string  `json:"revision_id"`
+	SnapshotID   string  `json:"snapshot_id"`
 	ProjectID    string  `json:"project_id"`
 	ResourceType string  `json:"resource_type"`
 	ResourceName string  `json:"resource_name"`
@@ -117,6 +121,8 @@ const (
 
 type ServiceRelation struct {
 	ID              string       `json:"id"`
+	RevisionID      string       `json:"revision_id"`
+	SnapshotID      string       `json:"snapshot_id"`
 	SourceProjectID string       `json:"source_project_id"`
 	TargetProjectID string       `json:"target_project_id"`
 	RelationType    RelationType `json:"relation_type"`
@@ -139,6 +145,8 @@ const (
 
 type Contract struct {
 	ID           string          `json:"id"`
+	RevisionID   string          `json:"revision_id"`
+	SnapshotID   string          `json:"snapshot_id"`
 	ProjectID    string          `json:"project_id"`
 	Code         string          `json:"code"`
 	Type         ContractType    `json:"type"`

@@ -143,6 +143,8 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 		}
 		state.collector.fact("capability", "http_route", method+" "+route, .84, path,
 			"A route registration or controller decorator exposes this HTTP operation.")
+		state.collector.fact("contract", "http_produce", method+" "+route, .84, path,
+			"The service implementation provides this HTTP contract.")
 	}
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
@@ -153,6 +155,14 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 		for _, match := range subjectPattern.FindAllStringSubmatch(line, -1) {
 			state.collector.fact("capability", "event_subject", match[1], .72, path,
 				"A NATS/event-related source line references this subject.")
+			if strings.Contains(lower, "publish") {
+				state.collector.fact("contract", "event_publish", match[1], .78, path,
+					"An event publisher emits this subject.")
+			}
+			if strings.Contains(lower, "subscribe") {
+				state.collector.fact("contract", "event_subscribe", match[1], .78, path,
+					"An event subscriber consumes this subject.")
+			}
 		}
 	}
 }
@@ -201,12 +211,19 @@ func (s Scanner) extractFrontendConsumers(state *detectorState, path, content st
 		return
 	}
 	for _, match := range frontendCallPattern.FindAllStringSubmatch(content, -1) {
-		endpoint := redactURLQuery(match[1])
+		endpoint := redactURLQuery(match[2])
 		if !strings.Contains(endpoint, "/api/") && !strings.HasPrefix(endpoint, "http") {
 			continue
 		}
-		state.collector.fact("relation", "frontend_consumes", endpoint, .72, path,
+		method := "GET"
+		if strings.HasPrefix(strings.ToLower(match[1]), "axios.") {
+			method = strings.ToUpper(strings.TrimPrefix(strings.ToLower(match[1]), "axios."))
+		}
+		value := method + " " + endpoint
+		state.collector.fact("relation", "frontend_consumes", value, .72, path,
 			"A frontend HTTP client call references this endpoint.")
+		state.collector.fact("contract", "http_consume", value, .72, path,
+			"The frontend implementation consumes this HTTP contract.")
 	}
 }
 

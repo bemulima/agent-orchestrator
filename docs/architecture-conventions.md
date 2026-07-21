@@ -47,6 +47,10 @@ and engineering conventions come from the reference service.
 - Minimal GitLab onboarding publication is a separate adapter invoked only
   after persisted approval and local verification. It matches the configured
   GitLab host, never embeds a token in Git URLs, and reuses an open MR.
+- Topology is a deterministic materialized projection of latest immutable
+  discovery snapshots. Fingerprint reuse and transactional replacement make
+  rebuilds idempotent and prevent stale relations; repositories are not read
+  again during a rebuild.
 
 ## Deliberate extensions required by this service
 

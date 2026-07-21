@@ -32,7 +32,7 @@ var (
 	environmentKeyPattern = regexp.MustCompile(`(?m)^([A-Z][A-Z0-9_]*)\s*=`)
 	makeTargetPattern     = regexp.MustCompile(`(?m)^([a-zA-Z0-9][a-zA-Z0-9_.-]*):(?:[^=]|$)`)
 	proxyPassPattern      = regexp.MustCompile(`(?m)proxy_pass\s+([^;\s]+)`)
-	frontendCallPattern   = regexp.MustCompile(`(?i)(?:fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
+	frontendCallPattern   = regexp.MustCompile(`(?i)(fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
 	subjectPattern        = regexp.MustCompile(`["` + "`" + `']([a-zA-Z][a-zA-Z0-9_-]*(?:\.[a-zA-Z0-9_*>-]+){1,})["` + "`" + `']`)
 	aiServiceKindPattern  = regexp.MustCompile(`(?m)^\s*(?:service_kind|kind):\s*["']?([a-z_]+)`)
 )

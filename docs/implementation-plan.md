@@ -92,6 +92,9 @@ Acceptance:
 
 ## Stage 4 — topology and contract drift
 
+Status: completed and verified on 2026-07-21. Rebuilds consume persisted
+discovery snapshots only and do not access connected repository files.
+
 Scope:
 
 - persist capabilities, ownership, relations, and versioned contracts;

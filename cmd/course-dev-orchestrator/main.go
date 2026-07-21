@@ -33,9 +33,11 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
+	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
+	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
 )
 
@@ -89,6 +91,8 @@ func run(args []string) error {
 	case "project-connect", "project-list", "project-show", "project-scan", "project-report",
 		"project-onboard", "project-diff", "project-approve", "project-reject", "project-apply":
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
+	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
+		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
@@ -127,10 +131,17 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Reject:  onboardingOperations.Reject,
 		Apply:   onboardingOperations.Apply,
 	}
+	topologyOperations := newTopologyOperations(pool)
+	topologyHandler := handlers.TopologyHandler{
+		Rebuild: topologyOperations.Rebuild, Get: topologyOperations.Get,
+		Services: topologyOperations.Services, Contracts: topologyOperations.Contracts,
+		Drift: topologyOperations.Drift, ProjectQuery: topologyOperations.Project,
+	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
 		HealthHandler:     healthHandler,
 		ProjectHandler:    &projectHandler,
 		OnboardingHandler: &onboardingHandler,
+		TopologyHandler:   &topologyHandler,
 		Logger:            logger,
 	})
 	server := &http.Server{
@@ -165,6 +176,28 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+type topologyOperations struct {
+	Rebuild   topologyuc.Rebuild
+	Get       topologyuc.Get
+	Services  topologyuc.Services
+	Contracts topologyuc.Contracts
+	Drift     topologyuc.ContractDrift
+	Project   topologyuc.ProjectQuery
+}
+
+func newTopologyOperations(pool *pgxpool.Pool) topologyOperations {
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	catalog := pgadapter.TopologyRepoPG{Pool: pool}
+	return topologyOperations{
+		Rebuild:   topologyuc.Rebuild{Projects: projects, Catalog: catalog, Builder: topologybuilder.Builder{}},
+		Get:       topologyuc.Get{Catalog: catalog},
+		Services:  topologyuc.Services{Catalog: catalog},
+		Contracts: topologyuc.Contracts{Catalog: catalog},
+		Drift:     topologyuc.ContractDrift{Catalog: catalog},
+		Project:   topologyuc.ProjectQuery{Projects: projects, Catalog: catalog},
+	}
 }
 
 type onboardingOperations struct {
@@ -340,6 +373,61 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 	}
 }
 
+func runTopologyCommand(cfg config.Config, command string, args []string, output io.Writer) error {
+	ctx := context.Background()
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect postgres: %w", err)
+	}
+	defer pool.Close()
+	operations := newTopologyOperations(pool)
+
+	switch command {
+	case "topology":
+		if len(args) != 0 {
+			return fmt.Errorf("topology accepts no arguments: %w", domain.ErrValidation)
+		}
+		catalog, rebuildErr := operations.Rebuild.Handle(ctx)
+		if rebuildErr != nil {
+			return rebuildErr
+		}
+		return writeJSON(output, catalog)
+	case "contracts":
+		if len(args) != 0 {
+			return fmt.Errorf("contracts accepts no arguments: %w", domain.ErrValidation)
+		}
+		contracts, queryErr := operations.Contracts.Handle(ctx)
+		if queryErr != nil {
+			return queryErr
+		}
+		return writeJSON(output, map[string]any{"contracts": contracts})
+	case "contract-drift":
+		if len(args) != 0 {
+			return fmt.Errorf("contract-drift accepts no arguments: %w", domain.ErrValidation)
+		}
+		drifts, queryErr := operations.Drift.Handle(ctx)
+		if queryErr != nil {
+			return queryErr
+		}
+		return writeJSON(output, map[string]any{"contract_drift": drifts})
+	case "dependencies", "consumers":
+		identifier, parseErr := projectIdentifier(command, args)
+		if parseErr != nil {
+			return parseErr
+		}
+		view, queryErr := operations.Project.Handle(ctx, identifier)
+		if queryErr != nil {
+			return queryErr
+		}
+		if command == "dependencies" {
+			return writeJSON(output, map[string]any{"project": view.Project, "dependencies": view.Dependencies, "impact": view.Impact})
+		}
+		return writeJSON(output, map[string]any{"project": view.Project, "consumers": view.Consumers, "impact": view.Impact})
+	default:
+		return fmt.Errorf("unknown topology command %q", command)
+	}
+}
+
 func projectIdentifier(command string, args []string) (string, error) {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -465,6 +553,11 @@ Commands:
   project-approve Approve an onboarding proposal
   project-reject  Reject an onboarding proposal
   project-apply   Validate or apply an approved proposal in a worktree
+  topology        Rebuild and print the materialized service topology
+  contracts       List discovered service contracts
+  contract-drift  List producer/consumer contract drift
+  dependencies    Show direct dependencies and impact for a service
+  consumers       Show direct and transitive consumers for a service
   version         Print build version
   help            Show this help`)
 }

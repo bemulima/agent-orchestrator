@@ -57,6 +57,12 @@ func TestScanner_Fixtures(t *testing.T) {
 			}
 			assertFact(t, report.Facts, "classification", "service_kind", test.wantKind)
 			assertFact(t, report.Facts, test.wantCategory, test.wantName, test.wantValue)
+			if test.name == "go-service" {
+				assertFact(t, report.Facts, "contract", "http_produce", "GET /api/v1/orders")
+			}
+			if test.name == "nextjs" {
+				assertFact(t, report.Facts, "contract", "http_consume", "GET /api/v1/courses")
+			}
 			if test.wantConflicts && len(report.Conflicts) == 0 {
 				t.Fatal("conflicts = empty, want at least one conflict")
 			}

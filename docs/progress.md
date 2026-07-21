@@ -4,11 +4,12 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–3 are complete and verified. The Docker Compose stack is currently
+Stages 1–4 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-No user repository has been connected. Stage 3 verification used only
-disposable fixture repositories. Stages 4–8 have not been implemented and are
-not represented by placeholders.
+No user repository has been connected. Stage 4 verification used only
+in-memory fixtures, disposable PostgreSQL records, and an empty-catalog CLI/API
+smoke test. Stages 5–8 have not been implemented and are not represented by
+placeholders.
 
 ## Completed
 
@@ -91,6 +92,28 @@ not represented by placeholders.
 - Added generator, existing-rule conflict, symlink, approval gate, worktree
   idempotency/isolation, exact approved-file scope, GitLab dry-run/MR
   idempotency, HTTP contract, migration, and PostgreSQL state-machine tests.
+- Added the reversible `005_stage4_topology` schema with revision fingerprints,
+  materialized services, snapshot provenance, indexes, severity-constrained
+  contract drift, and audit events.
+- Extended discovery with explicit HTTP producer/consumer and event
+  publisher/subscriber evidence while preserving bounded read-only behavior.
+- Implemented the deterministic topology builder for runtime services,
+  purpose/stack, capabilities, ownership, versioned contracts, gateway,
+  frontend and infrastructure relations, and canonical project aliases.
+- Correlated producers and consumers across HTTP paths and event subjects,
+  persisting missing-producer, version-mismatch, and multiple-producer drift
+  with ranked severity, machine-readable differences, and suggested actions.
+- Implemented transactional PostgreSQL replacement under an advisory lock.
+  Unchanged fingerprints reuse the current revision; changed rebuilds remove
+  all stale materialized rows atomically and emit one audit event.
+- Added direct dependency/consumer queries and deterministic transitive impact
+  traversal, with project lookup by UUID or unique name.
+- Added Stage 4 CLI/Make commands (`topology`, `contracts`, `contract-drift`,
+  `dependencies`, `consumers`) and eight topology/project HTTP routes with
+  search/filter parameters.
+- Added deterministic builder/drift/impact unit tests, HTTP contract tests,
+  discovery contract assertions, and a real PostgreSQL topology idempotency
+  integration test.
 
 ## Files changed
 
@@ -152,15 +175,31 @@ not represented by placeholders.
   all temporary worktree, branch, database, and filesystem state was removed.
 - Rebuilt the Stage 3 Docker Compose images — API/PostgreSQL/Temporal health,
   empty project catalog, worker workflow probe, and all service states passed.
+- Stage 4 focused unit/HTTP tests — passed for deterministic fingerprints,
+  runtime-role exclusion, HTTP/event version drift, missing producers,
+  gateway/frontend/infrastructure relations, direct queries, and transitive
+  impact.
+- Reversible `005_stage4_topology` migration — applied, rolled back, reapplied,
+  and then skipped idempotently.
+- Stage 4 `make test-integration` — passed without Go test cache; catalog
+  replacement, fingerprint reuse, changed revisions, provenance, contracts,
+  relations, drift, and empty-stack normalization were exercised against
+  PostgreSQL 16.
+- Stage 4 `make verify` and `go test -race ./...` — passed.
+- Empty-catalog Stage 4 CLI/API smoke — `topology`, `contracts`,
+  `contract-drift`, rebuild, query filters, `/health`, and `/ready` passed; the
+  temporary topology revision/audit event was removed afterward.
+- Rebuilt the Stage 4 Docker Compose images — all services are running,
+  API/PostgreSQL/Temporal health passes, and the real worker workflow probe
+  completed with structured `status=ok` output.
 
 ## Remaining work
 
-- Stages 4–8 remain as specified in `docs/implementation-plan.md`: topology,
-  planning/DAG execution, Codex runner/verification, GitLab, and Telegram.
+- Stages 5–8 remain as specified in `docs/implementation-plan.md`: planning/DAG
+  execution, Codex runner/verification, GitLab, and Telegram.
 
 ## Exact next task
 
-Implement Stage 4 topology and contract drift from the persisted Stage 2
-discovery evidence: deterministic capability/ownership/relation rebuild,
-producer/consumer correlation, impact paths, drift severity, and API/CLI
-queries.
+Implement Stage 5 command capture, persisted plan/task DAG validation,
+approval-gated Temporal execution, bounded concurrency, retry/recovery, and
+pause/resume/cancel operations.

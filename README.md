@@ -7,9 +7,10 @@ with self-hosted GitLab and Telegram. It is not a public runtime service and it
 never merges or deploys automatically.
 
 The current implementation includes Stage 1 platform bootstrap, Stage 2
-project connection/read-only discovery, and Stage 3 evidence-backed onboarding
-with approval-gated isolated writes. Topology, planning, Codex execution,
-GitLab publication, and Telegram remain explicitly tracked in
+project connection/read-only discovery, Stage 3 evidence-backed onboarding
+with approval-gated isolated writes, and Stage 4 materialized service topology
+with contract drift and impact queries. Planning, Codex execution, broader
+GitLab integration, and Telegram remain explicitly tracked in
 [docs/progress.md](docs/progress.md).
 
 ## Architecture
@@ -22,6 +23,7 @@ GitLab publication, and Telegram remain explicitly tracked in
 - `internal/adapters/git`: allowlisted local Git resolution and managed clones.
 - `internal/discovery`: bounded read-only inventory and evidence detectors.
 - `internal/onboarding`: deterministic proposal/manifests and safe merge rules.
+- `internal/topology`: deterministic catalog, relation, and drift builder.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
 - `db/migrations`: tracked PostgreSQL schema migrations.
@@ -68,6 +70,11 @@ course-dev-orchestrator project-diff --run-id UUID
 course-dev-orchestrator project-approve --run-id UUID --actor owner [--comment text]
 course-dev-orchestrator project-reject --run-id UUID --actor owner [--comment text]
 course-dev-orchestrator project-apply --run-id UUID [--dry-run]
+course-dev-orchestrator topology
+course-dev-orchestrator contracts
+course-dev-orchestrator contract-drift
+course-dev-orchestrator dependencies --service repository-name
+course-dev-orchestrator consumers --service repository-name
 course-dev-orchestrator version
 ```
 
@@ -202,6 +209,45 @@ The Stage 3 HTTP API is also synchronous:
 The prepare/apply request body is `{"dry_run":true|false}`. Approval and
 rejection accept `{"actor":"owner","comment":"..."}`.
 
+## Service topology and contract drift
+
+Stage 4 rebuilds a versioned, materialized catalog from the latest persisted
+discovery snapshot of every scanned project. The rebuild does not reopen or
+write connected repositories. Content, policy, documentation, and archive
+repositories remain visible as projects but never become runtime topology
+nodes.
+
+The catalog stores service purpose and stack, capabilities, database/resource
+ownership, HTTP/event/database/gRPC contracts, gateway/frontend/infrastructure
+relations, and producer/consumer drift. HTTP paths and event subjects retain
+their observed version while using a canonical contract code for correlation.
+Missing producers are `critical`, incompatible producer/consumer versions are
+`error`, and ambiguous multiple producers are `warning`. Rebuilds with the
+same fingerprint reuse the current revision; changed rebuilds atomically
+replace all materialized rows, so stale relations cannot remain.
+
+```sh
+make topology
+make contracts
+make contract-drift
+make dependencies SERVICE=repository-name
+make consumers SERVICE=repository-name
+```
+
+`dependencies` returns direct outgoing relations and transitive incoming
+impact; `consumers` returns direct consumers and the same deterministic impact
+closure. Project IDs and unique project names are accepted. The Stage 4 HTTP
+API is synchronous:
+
+- `POST /api/v1/topology/rebuild`;
+- `GET /api/v1/topology` (optional generic `q` filter);
+- `GET /api/v1/topology/services` (`q`, `role`, `kind` filters);
+- `GET /api/v1/topology/contracts` (`q`, `project_id`, `type`, `direction`);
+- `GET /api/v1/topology/contract-drift` (`severity`, `project_id`);
+- `GET /api/v1/projects/{projectId}/dependencies`;
+- `GET /api/v1/projects/{projectId}/contracts`;
+- `GET /api/v1/projects/{projectId}/consumers`.
+
 ## Quality commands
 
 ```sh
@@ -213,5 +259,5 @@ make verify
 
 After `make up && make migrate`, run `make test-integration` to verify the
 schema, project/snapshot idempotency, and the onboarding approval state
-machine. Tests use only disposable repositories/fixtures and never access user
-repositories.
+machine plus topology replacement/idempotency. Tests use only disposable
+repositories/fixtures and never access user repositories.

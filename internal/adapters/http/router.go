@@ -17,6 +17,7 @@ type RouterDependencies struct {
 	HealthHandler     handlers.HealthHandler
 	ProjectHandler    *handlers.ProjectHandler
 	OnboardingHandler *handlers.OnboardingHandler
+	TopologyHandler   *handlers.TopologyHandler
 	Logger            *zap.Logger
 }
 
@@ -46,6 +47,16 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/onboarding-runs/{runId}/approve", deps.OnboardingHandler.ApproveRun)
 		root.Post("/api/v1/onboarding-runs/{runId}/reject", deps.OnboardingHandler.RejectRun)
 		root.Post("/api/v1/onboarding-runs/{runId}/apply", deps.OnboardingHandler.ApplyRun)
+	}
+	if deps.TopologyHandler != nil {
+		root.Post("/api/v1/topology/rebuild", deps.TopologyHandler.RebuildTopology)
+		root.Get("/api/v1/topology", deps.TopologyHandler.GetTopology)
+		root.Get("/api/v1/topology/services", deps.TopologyHandler.ListServices)
+		root.Get("/api/v1/topology/contracts", deps.TopologyHandler.ListContracts)
+		root.Get("/api/v1/topology/contract-drift", deps.TopologyHandler.ListContractDrift)
+		root.Get("/api/v1/projects/{projectId}/dependencies", deps.TopologyHandler.ProjectDependencies)
+		root.Get("/api/v1/projects/{projectId}/contracts", deps.TopologyHandler.ProjectContracts)
+		root.Get("/api/v1/projects/{projectId}/consumers", deps.TopologyHandler.ProjectConsumers)
 	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {

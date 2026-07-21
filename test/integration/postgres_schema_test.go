@@ -57,7 +57,8 @@ ORDER BY tablename`)
 		"approval", "artifact", "audit_event", "command", "contract",
 		"gitlab_link", "onboarding_run", "plan", "project", "service_capability",
 		"service_ownership", "service_relation", "service_snapshot", "task",
-		"task_attempt", "task_dependency", "telegram_user",
+		"task_attempt", "task_dependency", "telegram_user", "topology_revision",
+		"topology_service", "contract_drift",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -239,6 +240,114 @@ func TestProjectRepositoryPersistsIdempotentDiscovery(t *testing.T) {
 	}
 	if !json.Valid(latest.RawReport) {
 		t.Fatalf("raw report is invalid JSON: %s", latest.RawReport)
+	}
+}
+
+func TestTopologyRepositoryReplacesCatalogIdempotently(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	topologies := pgadapter.TopologyRepoPG{Pool: pool}
+
+	createSource := func(name string, role domain.RepositoryRole, kind domain.ServiceKind) (domain.Project, domain.ServiceSnapshot) {
+		path := "/fixtures/" + uuid.NewString()
+		project, err := projects.Upsert(ctx, domain.Project{
+			Name: name, Status: domain.ProjectStatusAnalyzed, RepositoryRole: role,
+			SourceIdentity: "integration:" + uuid.NewString(), LocalPath: &path,
+			DefaultBranch: "main", CurrentBranch: "main", HeadCommit: "abc123",
+		})
+		if err != nil {
+			t.Fatalf("Upsert(%s) error = %v", name, err)
+		}
+		now := time.Now().UTC()
+		report := domain.DiscoveryReport{
+			SchemaVersion: 1, ProjectID: project.ID, ProjectName: name, RepositoryRole: role,
+			RepositoryPath: path, CommitSHA: "abc123", Branch: "main", ContentChecksum: "checksum-" + name,
+			StartedAt: now, CompletedAt: now,
+		}
+		snapshot, err := projects.SaveDiscovery(ctx, project, domain.ServiceSnapshot{
+			CommitSHA: "abc123", Branch: "main", ContentChecksum: report.ContentChecksum,
+			ServiceKind: kind, Purpose: name + " purpose", Status: string(domain.ProjectStatusAnalyzed),
+		}, report)
+		if err != nil {
+			t.Fatalf("SaveDiscovery(%s) error = %v", name, err)
+		}
+		return project, snapshot
+	}
+	producer, producerSnapshot := createSource("topology-producer", domain.RepositoryRoleService, domain.ServiceKindBackendService)
+	consumer, consumerSnapshot := createSource("topology-consumer", domain.RepositoryRoleFrontend, domain.ServiceKindFrontendApplication)
+	var first, second domain.TopologyCatalog
+	var err error
+	defer func() {
+		for _, revisionID := range []string{first.Revision.ID, second.Revision.ID} {
+			if revisionID != "" {
+				_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, revisionID)
+				_, _ = pool.Exec(ctx, `DELETE FROM topology_revision WHERE id = $1`, revisionID)
+			}
+		}
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id IN ($1, $2)`, producer.ID, consumer.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM project WHERE id IN ($1, $2)`, producer.ID, consumer.ID)
+	}()
+	code := "http:get:/api/{version}/orders"
+	producerID, consumerID := producer.ID, consumer.ID
+	now := time.Now().UTC()
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{
+			Fingerprint:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			ProjectCount: 2, ServiceCount: 2, CapabilityCount: 1, OwnershipCount: 1,
+			ContractCount: 2, RelationCount: 1, DriftCount: 1,
+		},
+		Services: []domain.TopologyService{
+			{ProjectID: producer.ID, SnapshotID: producerSnapshot.ID, Name: producer.Name, RepositoryRole: producer.RepositoryRole, ServiceKind: producerSnapshot.ServiceKind},
+			{ProjectID: consumer.ID, SnapshotID: consumerSnapshot.ID, Name: consumer.Name, RepositoryRole: consumer.RepositoryRole, ServiceKind: consumerSnapshot.ServiceKind},
+		},
+		Capabilities: []domain.ServiceCapability{{
+			ProjectID: producer.ID, SnapshotID: producerSnapshot.ID, Code: "orders", Name: "orders",
+			Confidence: .9, Source: "routes.go",
+		}},
+		Ownership: []domain.ServiceOwnership{{
+			ProjectID: producer.ID, SnapshotID: producerSnapshot.ID, ResourceType: "database_table",
+			ResourceName: "orders", Confidence: .9, Source: "db/001.sql",
+		}},
+		Contracts: []domain.Contract{
+			{ProjectID: producer.ID, SnapshotID: producerSnapshot.ID, Code: code, Type: domain.ContractTypeHTTP,
+				Version: "v1", Direction: domain.ContractDirectionProvides, Definition: json.RawMessage(`{"path":"/api/v1/orders"}`),
+				SourcePath: "routes.go", Checksum: "producer-checksum", DiscoveredAt: now},
+			{ProjectID: consumer.ID, SnapshotID: consumerSnapshot.ID, Code: code, Type: domain.ContractTypeHTTP,
+				Version: "v2", Direction: domain.ContractDirectionConsumes, Definition: json.RawMessage(`{"path":"/api/v2/orders"}`),
+				SourcePath: "client.ts", Checksum: "consumer-checksum", DiscoveredAt: now},
+		},
+		Relations: []domain.ServiceRelation{{
+			SnapshotID: consumerSnapshot.ID, SourceProjectID: consumer.ID, TargetProjectID: producer.ID,
+			RelationType: domain.RelationConsumes, ContractCode: &code, Confidence: .9, Source: "client.ts",
+		}},
+		Drifts: []domain.ContractDrift{{
+			ProducerProjectID: &producerID, ConsumerProjectID: &consumerID, ContractCode: code,
+			ContractType: domain.ContractTypeHTTP, ProducerVersion: "v1", ConsumerVersion: "v2",
+			Difference: json.RawMessage(`{"version_mismatch":true}`), Severity: domain.DriftSeverityError,
+			SuggestedAction: "align versions",
+		}},
+	}
+
+	first, err = topologies.Replace(ctx, catalog)
+	if err != nil {
+		t.Fatalf("first Replace() error = %v", err)
+	}
+	reused, err := topologies.Replace(ctx, catalog)
+	if err != nil {
+		t.Fatalf("reused Replace() error = %v", err)
+	}
+	if reused.Revision.ID != first.Revision.ID || len(reused.Services) != 2 || len(reused.Drifts) != 1 {
+		t.Fatalf("reused catalog = %#v", reused)
+	}
+	catalog.Revision.Fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	second, err = topologies.Replace(ctx, catalog)
+	if err != nil {
+		t.Fatalf("changed Replace() error = %v", err)
+	}
+	if second.Revision.ID == first.Revision.ID || second.Contracts[0].RevisionID != second.Revision.ID {
+		t.Fatalf("changed catalog revision = %#v", second.Revision)
 	}
 }
 
