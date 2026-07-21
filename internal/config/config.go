@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -58,6 +59,8 @@ type Config struct {
 	TelegramAllowedChatIDs []int64 `envconfig:"TELEGRAM_ALLOWED_CHAT_IDS"`
 	TelegramWebhookURL     string  `envconfig:"TELEGRAM_WEBHOOK_URL"`
 	TelegramWebhookSecret  string  `envconfig:"TELEGRAM_WEBHOOK_SECRET"`
+	TelegramPollTimeout    int     `envconfig:"TELEGRAM_POLL_TIMEOUT" default:"30" validate:"min=1,max=50"`
+	TelegramCallbackTTL    int     `envconfig:"TELEGRAM_CALLBACK_TTL" default:"900" validate:"min=60,max=3600"`
 
 	CodexRunnerCommand string `envconfig:"CODEX_RUNNER_COMMAND" default:"node runner/dist/index.js" validate:"required"`
 	CodexModelFast     string `envconfig:"CODEX_MODEL_FAST"`
@@ -133,7 +136,65 @@ func Load() (Config, error) {
 			}
 		}
 	}
+	if err := validateTelegram(&cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+var telegramWebhookSecretPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,256}$`)
+
+func validateTelegram(cfg *Config) error {
+	cfg.TelegramBotToken = strings.TrimSpace(cfg.TelegramBotToken)
+	cfg.TelegramWebhookURL = strings.TrimSpace(cfg.TelegramWebhookURL)
+	cfg.TelegramWebhookSecret = strings.TrimSpace(cfg.TelegramWebhookSecret)
+	configured := cfg.TelegramBotToken != ""
+	if !configured {
+		if len(cfg.TelegramAllowedUserIDs) > 0 || len(cfg.TelegramAllowedChatIDs) > 0 ||
+			cfg.TelegramWebhookURL != "" || cfg.TelegramWebhookSecret != "" {
+			return fmt.Errorf("Telegram allowlists and webhook configuration require TELEGRAM_BOT_TOKEN")
+		}
+		return nil
+	}
+	if len(cfg.TelegramAllowedUserIDs) == 0 || len(cfg.TelegramAllowedChatIDs) == 0 {
+		return fmt.Errorf("TELEGRAM_ALLOWED_USER_IDS and TELEGRAM_ALLOWED_CHAT_IDS are required with TELEGRAM_BOT_TOKEN")
+	}
+	seenUsers := make(map[int64]struct{}, len(cfg.TelegramAllowedUserIDs))
+	for _, id := range cfg.TelegramAllowedUserIDs {
+		if id <= 0 {
+			return fmt.Errorf("Telegram user IDs must be positive")
+		}
+		if _, exists := seenUsers[id]; exists {
+			return fmt.Errorf("duplicate Telegram user ID: %d", id)
+		}
+		seenUsers[id] = struct{}{}
+	}
+	seenChats := make(map[int64]struct{}, len(cfg.TelegramAllowedChatIDs))
+	for _, id := range cfg.TelegramAllowedChatIDs {
+		if id == 0 {
+			return fmt.Errorf("Telegram chat IDs must be non-zero")
+		}
+		if _, exists := seenChats[id]; exists {
+			return fmt.Errorf("duplicate Telegram chat ID: %d", id)
+		}
+		seenChats[id] = struct{}{}
+	}
+	if (cfg.TelegramWebhookURL == "") != (cfg.TelegramWebhookSecret == "") {
+		return fmt.Errorf("TELEGRAM_WEBHOOK_URL and TELEGRAM_WEBHOOK_SECRET must be configured together")
+	}
+	if cfg.TelegramWebhookURL == "" {
+		return nil
+	}
+	webhookURL, err := url.Parse(cfg.TelegramWebhookURL)
+	if err != nil || webhookURL.Scheme != "https" || webhookURL.Host == "" || webhookURL.User != nil ||
+		webhookURL.RawQuery != "" || webhookURL.Fragment != "" {
+		return fmt.Errorf("TELEGRAM_WEBHOOK_URL must be an HTTPS URL without credentials, query, or fragment")
+	}
+	if !telegramWebhookSecretPattern.MatchString(cfg.TelegramWebhookSecret) {
+		return fmt.Errorf("TELEGRAM_WEBHOOK_SECRET must contain 16-256 characters from A-Z, a-z, 0-9, _ and -")
+	}
+	cfg.TelegramWebhookURL = webhookURL.String()
+	return nil
 }
 
 // Model returns the configured model name for a profile. An empty value means
@@ -180,6 +241,8 @@ type Summary struct {
 	GitLabWebhookSigned      bool     `json:"gitlab_webhook_signed"`
 	TelegramConfigured       bool     `json:"telegram_configured"`
 	TelegramAllowedUserCount int      `json:"telegram_allowed_user_count"`
+	TelegramAllowedChatCount int      `json:"telegram_allowed_chat_count"`
+	TelegramMode             string   `json:"telegram_mode"`
 	ConfiguredModelProfiles  []string `json:"configured_model_profiles"`
 }
 
@@ -190,6 +253,13 @@ func (c Config) SafeSummary() Summary {
 		model, _ := c.Model(profile)
 		if model != "" {
 			profiles = append(profiles, profile)
+		}
+	}
+	telegramMode := "disabled"
+	if c.TelegramBotToken != "" {
+		telegramMode = "polling"
+		if c.TelegramWebhookURL != "" {
+			telegramMode = "webhook"
 		}
 	}
 	return Summary{
@@ -219,6 +289,8 @@ func (c Config) SafeSummary() Summary {
 		GitLabWebhookSigned:      strings.HasPrefix(strings.TrimSpace(c.GitLabWebhookSigningToken), "whsec_"),
 		TelegramConfigured:       c.TelegramBotToken != "",
 		TelegramAllowedUserCount: len(c.TelegramAllowedUserIDs),
+		TelegramAllowedChatCount: len(c.TelegramAllowedChatIDs),
+		TelegramMode:             telegramMode,
 		ConfiguredModelProfiles:  profiles,
 	}
 }

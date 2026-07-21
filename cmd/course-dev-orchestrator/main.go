@@ -29,6 +29,7 @@ import (
 	httpadapter "github.com/bemulima/agent-orchestrator/internal/adapters/http"
 	"github.com/bemulima/agent-orchestrator/internal/adapters/http/handlers"
 	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
+	telegramadapter "github.com/bemulima/agent-orchestrator/internal/adapters/telegram"
 	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
 	"github.com/bemulima/agent-orchestrator/internal/agent"
 	"github.com/bemulima/agent-orchestrator/internal/config"
@@ -45,6 +46,7 @@ import (
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	planninguc "github.com/bemulima/agent-orchestrator/internal/usecase/planning"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
+	telegramuc "github.com/bemulima/agent-orchestrator/internal/usecase/telegram"
 	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
 )
@@ -96,6 +98,8 @@ func run(args []string) error {
 		return runWorker(cfg, logger)
 	case "workflow-probe":
 		return runWorkflowProbe(cfg, logger)
+	case "telegram":
+		return runTelegram(cfg, logger)
 	case "project-connect", "project-list", "project-show", "project-scan", "project-report",
 		"project-onboard", "project-diff", "project-approve", "project-reject", "project-apply":
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
@@ -173,6 +177,16 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	gitLabHandler := handlers.GitLabHandler{
 		Sync: gitLabOperations.Sync, Links: gitLabOperations.Links, Webhook: gitLabOperations.Webhook,
 	}
+	var telegramHandler *handlers.TelegramHandler
+	if cfg.TelegramBotToken != "" {
+		telegramClient, clientErr := telegramadapter.NewClient(cfg.TelegramBotToken, "", nil)
+		if clientErr != nil {
+			return clientErr
+		}
+		telegramService := newTelegramService(cfg, pool, telegramClient, projectOperations,
+			onboardingOperations, topologyOperations, planningOperations, gitLabOperations)
+		telegramHandler = &handlers.TelegramHandler{Processor: telegramService, Secret: cfg.TelegramWebhookSecret}
+	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
 		HealthHandler:     healthHandler,
 		ProjectHandler:    &projectHandler,
@@ -180,6 +194,7 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		TopologyHandler:   &topologyHandler,
 		PlanningHandler:   &planningHandler,
 		GitLabHandler:     &gitLabHandler,
+		TelegramHandler:   telegramHandler,
 		Logger:            logger,
 	})
 	server := &http.Server{
@@ -214,6 +229,85 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+func newTelegramService(
+	cfg config.Config,
+	pool *pgxpool.Pool,
+	gateway repository.TelegramGateway,
+	projects projectOperations,
+	onboarding onboardingOperations,
+	topology topologyOperations,
+	planning planningOperations,
+	gitLab gitLabOperations,
+) *telegramuc.Service {
+	return telegramuc.NewService(
+		pgadapter.TelegramRepoPG{Pool: pool}, gateway,
+		telegramuc.Operations{
+			ConnectProject: projects.Connect, GetProject: projects.Get, ListProjects: projects.List,
+			ScanProject: projects.Scan, RebuildTopology: topology.Rebuild,
+			CreateCommand: planning.CreateCommand, CreatePlan: planning.CreatePlan, GetPlan: planning.GetPlan,
+			ApprovePlan: planning.ApprovePlan, RejectPlan: planning.RejectPlan,
+			GetRun: planning.GetRun, ControlRun: planning.ControlRun, GetTask: planning.GetTask,
+			RetryTask: planning.RetryTask, CancelTask: planning.CancelTask,
+			GetOnboarding: onboarding.Get, ApproveOnboarding: onboarding.Approve,
+			RejectOnboarding: onboarding.Reject, GitLabLinks: gitLab.Links,
+		},
+		cfg.TelegramAllowedUserIDs, cfg.TelegramAllowedChatIDs,
+		time.Duration(cfg.TelegramCallbackTTL)*time.Second,
+	)
+}
+
+func runTelegram(cfg config.Config, logger *zap.Logger) error {
+	if cfg.TelegramBotToken == "" {
+		return fmt.Errorf("TELEGRAM_BOT_TOKEN is required: %w", domain.ErrValidation)
+	}
+	client, err := telegramadapter.NewClient(cfg.TelegramBotToken, "", nil)
+	if err != nil {
+		return err
+	}
+	if cfg.TelegramWebhookURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := client.SetWebhook(ctx, cfg.TelegramWebhookURL, cfg.TelegramWebhookSecret); err != nil {
+			return err
+		}
+		logger.Info("Telegram webhook configured")
+		return nil
+	}
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := client.DeleteWebhook(deleteCtx, false); err != nil {
+		deleteCancel()
+		return fmt.Errorf("disable Telegram webhook for polling: %w", err)
+	}
+	deleteCancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect Telegram postgres: %w", err)
+	}
+	defer pool.Close()
+	temporalClient, err := temporalclient.Dial(temporalclient.Options{
+		HostPort: cfg.TemporalHostPort, Namespace: cfg.TemporalNamespace, Logger: temporaladapter.NewLogger(logger),
+	})
+	if err != nil {
+		return fmt.Errorf("connect Telegram temporal client: %w", err)
+	}
+	defer temporalClient.Close()
+	projects := newProjectOperations(cfg, pool)
+	onboarding := newOnboardingOperations(cfg, pool)
+	topology := newTopologyOperations(pool)
+	planning := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
+		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
+	})
+	gitLab := newGitLabOperations(cfg, pool)
+	service := newTelegramService(cfg, pool, client, projects, onboarding, topology, planning, gitLab)
+	logger.Info("starting Telegram long polling")
+	return telegramadapter.Poller{
+		Gateway: client, Processor: service, State: pgadapter.TelegramRepoPG{Pool: pool},
+		BotToken: cfg.TelegramBotToken, Timeout: cfg.TelegramPollTimeout,
+	}.Run(ctx)
 }
 
 type gitLabOperations struct {
@@ -939,6 +1033,7 @@ Commands:
   serve           Start the internal HTTP API (default)
   worker          Start the Temporal worker
   workflow-probe  Run a Temporal workflow/activity smoke test
+  telegram        Run long polling or configure the signed webhook
   config-check    Validate configuration and print a secret-free summary
   project-connect Connect a local path or Git URL and run read-only discovery
   project-list    List connected projects

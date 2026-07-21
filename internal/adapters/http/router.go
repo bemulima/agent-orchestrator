@@ -20,6 +20,7 @@ type RouterDependencies struct {
 	TopologyHandler   *handlers.TopologyHandler
 	PlanningHandler   *handlers.PlanningHandler
 	GitLabHandler     *handlers.GitLabHandler
+	TelegramHandler   *handlers.TelegramHandler
 	Logger            *zap.Logger
 }
 
@@ -83,6 +84,9 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)
 		root.Get("/api/v1/plans/{planId}/gitlab", deps.GitLabHandler.ListPlanLinks)
 		root.Post("/api/v1/integrations/gitlab/webhook", deps.GitLabHandler.ReceiveWebhook)
+	}
+	if deps.TelegramHandler != nil {
+		root.Post("/api/v1/integrations/telegram/webhook", deps.TelegramHandler.ReceiveWebhook)
 	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {

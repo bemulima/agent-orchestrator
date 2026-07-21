@@ -153,3 +153,40 @@ func TestSafeSummary_DoesNotExposeSensitiveValues(t *testing.T) {
 		t.Fatalf("ConfiguredModelProfiles = %#v, want %#v", got, want)
 	}
 }
+
+func TestLoad_ValidatesTelegramAllowlistsAndWebhook(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "123456:abcdefghijklmnopqrstuvwxyzABCDE")
+	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+	t.Setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-303,404")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() polling config error = %v", err)
+	}
+	if cfg.SafeSummary().TelegramMode != "polling" || cfg.SafeSummary().TelegramAllowedChatCount != 2 {
+		t.Fatalf("Telegram polling summary = %#v", cfg.SafeSummary())
+	}
+	t.Setenv("TELEGRAM_WEBHOOK_URL", "https://orchestrator.example.test/api/v1/integrations/telegram/webhook")
+	t.Setenv("TELEGRAM_WEBHOOK_SECRET", "valid_webhook_secret_123")
+	cfg, err = Load()
+	if err != nil || cfg.SafeSummary().TelegramMode != "webhook" {
+		t.Fatalf("Load() webhook config = %#v, %v", cfg.SafeSummary(), err)
+	}
+}
+
+func TestLoad_RejectsUnsafeTelegramConfiguration(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "123456:abcdefghijklmnopqrstuvwxyzABCDE")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a bot token without allowlists")
+	}
+	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "101,101")
+	t.Setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-303")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted duplicate Telegram users")
+	}
+	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "101")
+	t.Setenv("TELEGRAM_WEBHOOK_URL", "http://orchestrator.example.test/webhook")
+	t.Setenv("TELEGRAM_WEBHOOK_SECRET", "short")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an unsafe Telegram webhook")
+	}
+}

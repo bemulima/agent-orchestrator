@@ -11,9 +11,9 @@ project connection/read-only discovery, Stage 3 evidence-backed onboarding
 with approval-gated isolated writes, Stage 4 materialized service topology
 with contract drift and impact queries, and Stage 5 approval-gated planning
 with a durable Temporal DAG scheduler, and Stage 6 isolated Codex execution
-with independent verification and review, plus Stage 7 self-hosted GitLab
-issue/MR synchronization and signed webhooks. Telegram remains tracked in
-[docs/progress.md](docs/progress.md).
+with independent verification and review, Stage 7 self-hosted GitLab issue/MR
+synchronization and signed webhooks, and the Stage 8 Telegram owner interface
+with polling/webhook delivery and replay-safe inline approvals.
 
 ## Architecture
 
@@ -30,6 +30,7 @@ issue/MR synchronization and signed webhooks. Telegram remains tracked in
 - `internal/agent`: embedded coder/reviewer JSON Schemas and validation.
 - `internal/execution`: prompt boundary, verification, review, and task executor.
 - `internal/adapters/gitlab`: bounded self-hosted GitLab REST, fake, and dry-run adapters.
+- `internal/adapters/telegram`: bounded Bot API client and durable long poller.
 - `runner`: pinned TypeScript `@openai/codex-sdk` process adapter.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
@@ -65,6 +66,7 @@ destructive action.
 course-dev-orchestrator serve
 course-dev-orchestrator worker
 course-dev-orchestrator workflow-probe
+course-dev-orchestrator telegram
 course-dev-orchestrator config-check
 course-dev-orchestrator project-connect --path /absolute/repository --role service
 course-dev-orchestrator project-connect --git-url https://git.example/group/repository.git --role service
@@ -129,7 +131,11 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
   `GITLAB_DRY_RUN`. New GitLab 19+ webhooks should use
   `GITLAB_WEBHOOK_SIGNING_TOKEN=whsec_<base64-key>`; the legacy
   `GITLAB_WEBHOOK_SECRET` header token remains supported during migration.
-- Telegram configuration remains reserved for Stage 8.
+- Telegram: `TELEGRAM_BOT_TOKEN`, comma-separated
+  `TELEGRAM_ALLOWED_USER_IDS`/`TELEGRAM_ALLOWED_CHAT_IDS`,
+  `TELEGRAM_POLL_TIMEOUT`, and `TELEGRAM_CALLBACK_TTL`. Polling is the default.
+  To use a webhook, also set an HTTPS `TELEGRAM_WEBHOOK_URL` and a 16–256
+  character `TELEGRAM_WEBHOOK_SECRET` accepted by the Bot API.
 
 Comma-separate multiple repository roots and Telegram IDs. Never commit `.env`.
 
@@ -379,6 +385,32 @@ pipeline events update separate persisted external states; they never make an
 internal task successful and never trigger merge or deploy. Raw webhook
 payloads and authentication values are not stored.
 
+## Telegram owner interface
+
+Run `make telegram`. With no webhook URL it removes any previous webhook and
+starts long polling from the durable next offset. With a webhook URL it calls
+`setWebhook` once; the already-running API receives signed updates at:
+
+- `POST /api/v1/integrations/telegram/webhook`.
+
+Both the Telegram user ID and chat ID must be allowlisted. Supported commands
+are `/start`, `/help`, `/projects`, `/connect`, `/analyze`, `/topology`,
+`/plan`, `/status`, `/approve`, `/reject`, `/pause`, `/resume`, `/retry`,
+`/cancel`, and `/issues`. Natural Russian/English requests are routed through
+the same project/planning operations used by CLI and HTTP.
+
+`/approve`, `/reject`, `/pause`, `/resume`, `/retry`, and `/cancel` never
+perform the requested change from message text. They issue a short-lived
+inline button bound to the exact user, chat, action, resource type, and UUID.
+The database stores only a SHA-256 token hash; consumption is atomic, so stale,
+cross-user, and repeated clicks fail. Plan cards expose `Подтвердить`,
+`Показать задачи`, `Изменить`, and `Отклонить` callbacks.
+
+Telegram update rows contain no command text or raw webhook payload. Replies
+are bounded and sanitized; full prompts, `.env` content, logs, diffs, bot
+tokens, and adapter errors are never sent. Large results are summarized, with
+`/issues <plan-uuid>` returning bounded GitLab issue/MR links.
+
 ## Quality commands
 
 ```sh
@@ -390,5 +422,6 @@ make verify
 
 After `make up && make migrate`, run `make test-integration` to verify the
 schema and PostgreSQL state machines, including durable coder/reviewer thread
-separation, verification, and artifacts. Tests use only disposable
+separation, Telegram update/callback replay protection, verification, and
+artifacts. Tests use only disposable
 repositories/fixtures and never access user repositories.

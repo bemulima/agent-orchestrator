@@ -4,14 +4,15 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–7 are complete and verified. The Docker Compose stack is currently
+Stages 1–8 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
 No user repository has been connected. Stage 6 verification used only
 in-memory fakes, disposable Git repositories, and disposable PostgreSQL
 records. No live Codex request was made without an explicitly configured key.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
-Stage 8 has not been implemented and is not represented by placeholders.
+Stage 8 used a fake Bot API adapter, signed local webhook requests, and
+disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Completed
 
@@ -314,14 +315,44 @@ Stage 8 has not been implemented and is not represented by placeholders.
 - Stage 7 `go test -race ./...` — passed across all Go packages.
 - Rebuilt Stage 7 services — API/PostgreSQL/Temporal readiness is healthy and
   the real worker workflow probe completed with structured `status=ok` output.
+- Added the bounded Telegram Bot API adapter, long polling with durable
+  highest-update-plus-one offsets, explicit webhook registration/removal, and
+  the signed webhook HTTP endpoint.
+- Added allowlisted user/chat authorization and all Stage 8 commands:
+  `/start`, `/help`, `/projects`, `/connect`, `/analyze`, `/topology`, `/plan`,
+  `/status`, `/approve`, `/reject`, `/pause`, `/resume`, `/retry`, `/cancel`,
+  and `/issues`, plus natural Russian/English routing through the existing
+  application operations.
+- Added opaque inline callbacks for approve/reject/show/change and run/task
+  controls. Grants are bound to user, chat, action, resource type, and UUID,
+  expire after a bounded TTL, persist only SHA-256 token hashes, and are
+  consumed atomically with replay and cross-user rejection.
+- Added bounded/sanitized Telegram rendering: no raw update body, command text,
+  full prompt, `.env`, log, diff, bot token, or adapter error is persisted or
+  returned; large results use concise summaries and bounded GitLab links.
+- Stage 8 fake tests cover all 15 commands and every callback action, including
+  unauthorized user/chat, text-only mutation attempts, stale grants, repeated
+  clicks, resource/user binding, callback acknowledgement, Bot API body limits,
+  webhook secret validation, and token-free network errors.
+- Reversible `009_stage8_telegram` migration — applied, rolled back with all
+  Stage 8 tables verified absent, reapplied, and exercised by the PostgreSQL
+  integration suite for update deduplication, monotonic polling offsets,
+  callback expiry, binding, atomic consumption, and replay protection.
+- Stage 8 `make test-integration`, `make verify`, and `go test -race ./...` —
+  passed. The production Docker image rebuilt successfully; API/PostgreSQL/
+  Temporal readiness and the real worker workflow probe passed after restart.
+- The final database audit still reports zero projects, commands, Telegram
+  updates, and Telegram callbacks; no user project or external integration was
+  touched during Stage 8.
 
 ## Remaining work
 
-- Stage 8 remains as specified in `docs/implementation-plan.md`: the Telegram
-  owner interface.
+- Run the final cross-stage MVP fixture rehearsal described in
+  `docs/implementation-plan.md`. This remains fake/integration-mode for Codex,
+  GitLab, and Telegram unless the owner explicitly provides live credentials.
 
 ## Exact next task
 
-Implement Stage 8 Telegram polling/webhook owner interface while preserving
-allowlists, expiring resource-bound approvals, replay protection, concise
-payloads, and the no-secret/no-large-output boundary.
+Compose the existing disposable discovery/onboarding/planning/execution,
+Telegram observation, GitLab dry-run, and Temporal restart checks into one
+clean end-to-end MVP rehearsal with duplicate detection and cleanup assertions.

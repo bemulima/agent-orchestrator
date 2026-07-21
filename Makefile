@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -68,6 +68,9 @@ worker: ## Run the Temporal worker locally
 
 workflow-probe: ## Execute the system probe workflow through Temporal
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator workflow-probe
+
+telegram: ## Run Telegram long polling, or configure the webhook when TELEGRAM_WEBHOOK_URL is set
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator telegram
 
 config-check: ## Validate environment and print a secret-free summary
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator config-check

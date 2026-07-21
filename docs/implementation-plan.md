@@ -171,6 +171,10 @@ Acceptance:
 
 ## Stage 8 — Telegram owner interface
 
+Status: completed and verified on 2026-07-21 with fake Bot API adapters,
+signed local webhook requests, and disposable PostgreSQL records. No real
+Telegram bot, user, or chat was contacted.
+
 Scope:
 
 - long polling by default and optional signed webhook;

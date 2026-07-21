@@ -99,6 +99,12 @@ and engineering conventions come from the reference service.
   IDs transactionally. Legacy header tokens are constant-time compared.
   External issue and MR states are stored separately and never override the
   orchestrator's authoritative task result.
+- Stage 8 keeps Telegram transport in adapters and command/callback routing in
+  the application layer. Long polling persists the next update offset, while
+  webhook and polling deliveries share the same update-ID deduplication path.
+- Telegram mutation grants are opaque, resource-bound, user/chat-bound,
+  expiring, and single-use. Only their SHA-256 hashes are persisted; message
+  text and raw Telegram payloads are not stored.
 
 ## Dependency direction
 

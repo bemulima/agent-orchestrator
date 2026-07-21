@@ -61,6 +61,7 @@ ORDER BY tablename`)
 		"task_attempt", "task_dependency", "telegram_user", "topology_revision",
 		"topology_service", "contract_drift", "plan_run", "task_review",
 		"gitlab_webhook_event",
+		"telegram_update", "telegram_callback", "telegram_poll_state",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -71,6 +72,85 @@ ORDER BY tablename`)
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Fatalf("missing tables: %v", missing)
+	}
+}
+
+func TestTelegramRepositoryDeduplicatesUpdatesAndConsumesBoundCallbacks(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	repository := pgadapter.TelegramRepoPG{Pool: pool}
+	resourceID := uuid.NewString()
+	updateID := time.Now().UnixNano()
+	userID := int64(700000000 + time.Now().UnixNano()%100000000)
+	chatID := -userID
+	botKey := strings.Repeat("a", 64)
+	validHash := strings.Repeat("b", 64)
+	expiredHash := strings.Repeat("c", 64)
+	defer func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM telegram_update WHERE update_id = $1`, updateID)
+		_, _ = pool.Exec(ctx, `DELETE FROM telegram_callback WHERE resource_id = $1`, resourceID)
+		_, _ = pool.Exec(ctx, `DELETE FROM telegram_poll_state WHERE bot_key = $1`, botKey)
+		_, _ = pool.Exec(ctx, `DELETE FROM telegram_user WHERE telegram_user_id = $1`, userID)
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, resourceID)
+	}()
+	receipt := domain.TelegramUpdateReceipt{
+		UpdateID: updateID, Source: "polling", Checksum: strings.Repeat("d", 64),
+		TelegramUserID: &userID, TelegramChatID: &chatID, ReceivedAt: time.Now().UTC(),
+	}
+	claimed, err := repository.BeginUpdate(ctx, receipt)
+	if err != nil || !claimed {
+		t.Fatalf("BeginUpdate() = %t, %v", claimed, err)
+	}
+	claimed, err = repository.BeginUpdate(ctx, receipt)
+	if err != nil || claimed {
+		t.Fatalf("duplicate BeginUpdate() = %t, %v", claimed, err)
+	}
+	if err := repository.FinishUpdate(ctx, updateID, domain.TelegramUpdateStatusProcessed); err != nil {
+		t.Fatalf("FinishUpdate() error = %v", err)
+	}
+	if offset, err := repository.GetPollOffset(ctx, botKey); err != nil || offset != 0 {
+		t.Fatalf("GetPollOffset() = %d, %v", offset, err)
+	}
+	if err := repository.SavePollOffset(ctx, botKey, updateID+1); err != nil {
+		t.Fatalf("SavePollOffset() error = %v", err)
+	}
+	if err := repository.SavePollOffset(ctx, botKey, updateID); err != nil {
+		t.Fatalf("SavePollOffset(lower) error = %v", err)
+	}
+	if offset, err := repository.GetPollOffset(ctx, botKey); err != nil || offset != updateID+1 {
+		t.Fatalf("monotonic GetPollOffset() = %d, %v", offset, err)
+	}
+
+	now := time.Now().UTC()
+	grant := domain.TelegramCallbackGrant{
+		TokenHash: validHash, Action: "approve", ResourceType: "plan", ResourceID: resourceID,
+		TelegramUserID: userID, TelegramChatID: chatID, Status: domain.TelegramCallbackStatusPending,
+		CreatedAt: now, ExpiresAt: now.Add(15 * time.Minute),
+	}
+	if err := repository.SaveCallback(ctx, grant); err != nil {
+		t.Fatalf("SaveCallback() error = %v", err)
+	}
+	if _, err := repository.ConsumeCallback(ctx, validHash, userID+1, chatID, now); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("cross-user ConsumeCallback() error = %v", err)
+	}
+	consumed, err := repository.ConsumeCallback(ctx, validHash, userID, chatID, now)
+	if err != nil || consumed.Status != domain.TelegramCallbackStatusConsumed || consumed.ConsumedAt == nil {
+		t.Fatalf("ConsumeCallback() = %#v, %v", consumed, err)
+	}
+	if _, err := repository.ConsumeCallback(ctx, validHash, userID, chatID, now); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("replayed ConsumeCallback() error = %v", err)
+	}
+	expired := grant
+	expired.TokenHash = expiredHash
+	expired.Action = "reject"
+	expired.CreatedAt = now.Add(-2 * time.Minute)
+	expired.ExpiresAt = now.Add(-time.Minute)
+	if err := repository.SaveCallback(ctx, expired); err != nil {
+		t.Fatalf("SaveCallback(expired fixture) error = %v", err)
+	}
+	if _, err := repository.ConsumeCallback(ctx, expiredHash, userID, chatID, now); !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("expired ConsumeCallback() error = %v", err)
 	}
 }
 
