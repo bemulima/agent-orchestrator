@@ -179,8 +179,9 @@ SELECT id, project_id, version, commit_sha, branch, is_dirty, content_checksum,
 FROM service_snapshot
 WHERE project_id = $1 AND commit_sha = $2 AND branch = $3 AND is_dirty = $4
   AND content_checksum = $5
+  AND COALESCE((raw_report->>'schema_version')::integer, 0) = $6
 ORDER BY version DESC
-LIMIT 1`, project.ID, snapshot.CommitSHA, snapshot.Branch, snapshot.IsDirty, snapshot.ContentChecksum))
+LIMIT 1`, project.ID, snapshot.CommitSHA, snapshot.Branch, snapshot.IsDirty, snapshot.ContentChecksum, report.SchemaVersion))
 	if existingErr == nil {
 		if _, err := tx.Exec(ctx, `
 UPDATE project SET status = 'analyzed', current_branch = $2, head_commit = $3,

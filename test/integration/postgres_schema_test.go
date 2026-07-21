@@ -514,13 +514,21 @@ func TestProjectRepositoryPersistsIdempotentDiscovery(t *testing.T) {
 	if reused.ID != first.ID || reused.Version != 1 {
 		t.Fatalf("reused snapshot = %#v, want first snapshot", reused)
 	}
+	report.SchemaVersion = 2
+	schemaChanged, err := repository.SaveDiscovery(context.Background(), project, snapshotInput, report)
+	if err != nil {
+		t.Fatalf("schema-changed SaveDiscovery() error = %v", err)
+	}
+	if schemaChanged.ID == first.ID || schemaChanged.Version != 2 {
+		t.Fatalf("schema-changed snapshot = %#v, want a new version", schemaChanged)
+	}
 	snapshotInput.ContentChecksum = "checksum-two"
 	report.ContentChecksum = "checksum-two"
 	second, err := repository.SaveDiscovery(context.Background(), project, snapshotInput, report)
 	if err != nil {
 		t.Fatalf("second distinct SaveDiscovery() error = %v", err)
 	}
-	if first.Version != 1 || second.Version != 2 {
+	if first.Version != 1 || second.Version != 3 {
 		t.Fatalf("distinct snapshot versions = %d, %d", first.Version, second.Version)
 	}
 	latest, latestReport, err := repository.GetLatestDiscovery(context.Background(), project.ID)

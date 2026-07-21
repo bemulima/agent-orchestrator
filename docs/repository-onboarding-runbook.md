@@ -1,8 +1,8 @@
 # Repository onboarding runbook
 
-Inventory snapshot: 2026-07-21. This runbook is an operator-reviewed command
-plan. None of the `project-connect`, onboarding, GitLab, Telegram, or Codex
-commands below were executed while preparing it.
+Inventory snapshot: 2026-07-21. The three-repository read-only pilot in this
+runbook was owner-approved and completed on the same date. No onboarding,
+GitLab, Telegram, or Codex command has been executed.
 
 ## Safety boundary
 
@@ -34,6 +34,13 @@ The following clean `main` checkouts are eligible for a read-only pilot now:
   `ms-go-statistic`, `ms-py-validator`,
   `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`);
 - `journal` (`archive`) and `prompts` (`policy`).
+
+The completed pilot connected `ms-go-http-runtime-validator`,
+`ms-ts-nextjs-validator`, and `infra/messaging`. The remaining clean service
+wave is `ms-go-cache-search-validator`, `ms-go-docker-validator`,
+`ms-go-git-validator`, `ms-go-linux-validator`,
+`ms-go-php-framework-validator`, `ms-go-statistic`, `ms-py-validator`, and
+`ms-ts-browser-runtime-validator`.
 
 `journal`, `prompts`, and `wiki` are not loose generated directories. They are
 clean repositories with remotes and contain respectively 149, 20, and 32
@@ -118,11 +125,17 @@ become a project.
 
 ## Recommended connection order
 
-1. Recreate only the API and worker with the reviewed host-root mount.
-2. Run a three-repository discovery pilot: one Go service, one TypeScript
+Steps 1–3 are complete:
+
+1. Recreated only the API and worker with the reviewed host-root mount.
+2. Ran the three-repository discovery pilot: one Go service, one TypeScript
    service, and messaging infrastructure.
-3. Review each discovery report and confirm that no private file content,
-   build cache, issue worktree, or incorrect runtime role was captured.
+3. Reviewed each discovery report and confirmed bounded inventory, roles,
+   clean source state, and evidence paths. Two orchestrator defects found by
+   the review were corrected and the reports were regenerated as schema v2.
+
+Continue only with a new owner command:
+
 4. Connect the remaining clean `main` validators.
 5. After branch hygiene, connect platform anchors (`ms-gateway`, course,
    authentication, user/RBAC, storage, sandbox, student, statistic and related
@@ -167,10 +180,23 @@ docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-list
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-go-http-runtime-validator
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-ts-nextjs-validator
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service messaging
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-infra-messaging
 docker compose exec -T orchestrator /app/course-dev-orchestrator topology
 docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
 ```
+
+Pilot result after corrections:
+
+- all three projects are `analyzed`, on clean `main` checkouts, with unchanged
+  source HEADs;
+- name-based `project-report` and `project-scan` work for all three projects;
+- discovery schema v2 removed the false `server.py`, `workspace.root_path`, and
+  `nextjs.app` event capabilities;
+- repeated scans reused snapshot version 2, and repeated topology rebuilds
+  reused the corrected revision;
+- the topology has three services, nine capabilities, two HTTP contracts, no
+  relations, and no contract drift; the seven remaining event capabilities all
+  originate from `infra/messaging/streams/*.json`.
 
 Stop after the reports if a role, branch, dirty flag, source path, ownership,
 contract, or evidence path is unexpected. Do not continue by guessing.

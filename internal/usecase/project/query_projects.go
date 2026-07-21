@@ -2,8 +2,9 @@ package project
 
 import (
 	"context"
-	"errors"
 	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -15,9 +16,8 @@ type GetProject struct {
 
 func (uc GetProject) Handle(ctx context.Context, identifier string) (domain.Project, error) {
 	identifier = strings.TrimSpace(identifier)
-	project, err := uc.Projects.Get(ctx, identifier)
-	if err == nil || !errors.Is(err, domain.ErrNotFound) {
-		return project, err
+	if _, err := uuid.Parse(identifier); err == nil {
+		return uc.Projects.Get(ctx, identifier)
 	}
 	return uc.Projects.GetByName(ctx, identifier)
 }

@@ -101,6 +101,25 @@ func TestSnapshotFromReport(t *testing.T) {
 	}
 }
 
+func TestGetProject_UsesNameLookupWithoutSendingNameToUUIDRepositoryQuery(t *testing.T) {
+	repository := newMemoryProjectRepository()
+	path := "/allowed/fixture"
+	created, err := repository.Upsert(context.Background(), domain.Project{
+		Name: "fixture", SourceIdentity: "local:fixture", LocalPath: &path,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository.getErr = errors.New("invalid UUID input")
+	got, err := (GetProject{Projects: repository}).Handle(context.Background(), "fixture")
+	if err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if got.ID != created.ID || repository.getCalls != 0 {
+		t.Fatalf("project = %#v, UUID Get calls = %d", got, repository.getCalls)
+	}
+}
+
 type fakeProjectSource struct {
 	source domain.RepositorySource
 	err    error
@@ -148,6 +167,8 @@ type memoryProjectRepository struct {
 	snapshots  map[string][]domain.ServiceSnapshot
 	reports    map[string][]domain.DiscoveryReport
 	nextID     int
+	getCalls   int
+	getErr     error
 }
 
 func newMemoryProjectRepository() *memoryProjectRepository {
@@ -176,6 +197,10 @@ func (r *memoryProjectRepository) Upsert(_ context.Context, project domain.Proje
 }
 
 func (r *memoryProjectRepository) Get(_ context.Context, id string) (domain.Project, error) {
+	r.getCalls++
+	if r.getErr != nil {
+		return domain.Project{}, r.getErr
+	}
 	project, exists := r.projects[id]
 	if !exists {
 		return domain.Project{}, domain.ErrNotFound
@@ -235,8 +260,10 @@ func (r *memoryProjectRepository) UpdateStatus(_ context.Context, id string, sta
 func (r *memoryProjectRepository) SaveDiscovery(_ context.Context, project domain.Project, snapshot domain.ServiceSnapshot, report domain.DiscoveryReport) (domain.ServiceSnapshot, error) {
 	if existing := r.snapshots[project.ID]; len(existing) > 0 {
 		latest := existing[len(existing)-1]
+		latestReport := r.reports[project.ID][len(r.reports[project.ID])-1]
 		if latest.CommitSHA == snapshot.CommitSHA && latest.Branch == snapshot.Branch &&
-			latest.IsDirty == snapshot.IsDirty && latest.ContentChecksum == snapshot.ContentChecksum {
+			latest.IsDirty == snapshot.IsDirty && latest.ContentChecksum == snapshot.ContentChecksum &&
+			latestReport.SchemaVersion == report.SchemaVersion {
 			project.Status = domain.ProjectStatusAnalyzed
 			r.projects[project.ID] = project
 			return latest, nil

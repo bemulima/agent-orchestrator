@@ -149,7 +149,7 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
 		if !strings.Contains(lower, "nats") && !strings.Contains(lower, "subject") &&
-			!strings.Contains(lower, "publish") && !strings.Contains(lower, "subscribe") && !strings.Contains(lower, "request") {
+			!strings.Contains(lower, "publish") && !strings.Contains(lower, "subscribe") {
 			continue
 		}
 		for _, match := range subjectPattern.FindAllStringSubmatch(line, -1) {

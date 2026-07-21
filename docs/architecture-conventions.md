@@ -37,7 +37,10 @@ and engineering conventions come from the reference service.
 - Git source identity is normalized independently of checkout path. Local
   worktrees use their common Git directory when no supported remote exists.
 - Discovery reports contain evidence provenance and immutable content
-  fingerprints; unchanged retries reuse an existing snapshot.
+  fingerprints; unchanged retries reuse an existing snapshot only when the
+  discovery schema version also matches. Detector-semantic changes increment
+  that version so a corrected report can supersede an older snapshot without
+  pretending repository content changed.
 - Onboarding proposals are deterministic artifacts stored before approval.
   User-authored YAML/Markdown wins on conflict, while every difference remains
   visible in the proposal and unified diff.

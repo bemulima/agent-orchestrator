@@ -7,9 +7,13 @@ Last updated: 2026-07-21
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-No user repository has been connected. Stage 6 verification used only
-in-memory fakes, disposable Git repositories, and disposable PostgreSQL
-records. No live Codex request was made without an explicitly configured key.
+Three owner-approved pilot repositories are connected read-only:
+`ms-go-http-runtime-validator`, `ms-ts-nextjs-validator`, and
+`ms-infra-messaging`. Their source checkouts remain clean and no onboarding,
+Codex, GitLab, or Telegram operation has been started. Stage 6 verification
+used only in-memory fakes, disposable Git repositories, and disposable
+PostgreSQL records. No live Codex request was made without an explicitly
+configured key.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -371,19 +375,31 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `/projects` for discovery and eventual approved worktree execution.
 - Added `docs/repository-onboarding-runbook.md` with the reviewed candidate
   groups, exclusions, connection order, three-repository pilot, and explicit
-  container commands. No command from that runbook has been executed and the
-  project catalog remains empty.
+  container commands.
+- Executed the owner-approved read-only discovery pilot for one Go validator,
+  one TypeScript validator, and the nested messaging infrastructure repository.
+  All three resolved to clean `main` checkouts under `/projects`, produced
+  bounded non-truncated reports, and left their source HEAD/status unchanged.
+- The pilot exposed and fixed name-based project lookup passing names into a
+  PostgreSQL UUID query, plus generic request values being misclassified as
+  NATS subjects. Regression tests cover both defects.
+- Discovery report schema v2 now participates in snapshot reuse. Corrected
+  reports created version-2 snapshots at unchanged commits; repeated scans
+  reused those snapshots instead of duplicating them.
+- Rebuilt the corrected pilot topology twice. The second rebuild reused the
+  corrected revision; it contains three services, nine capabilities, two HTTP
+  contracts, no drift, and event subjects only from the messaging stream
+  definitions.
 
 ## Remaining work
 
 - No implementation stage remains for the specified MVP.
-- A controlled live pilot and connection of real repositories remain optional
-  owner-authorized operational steps; they are intentionally not part of the
-  automated rehearsal.
+- The next read-only connection wave and later onboarding remain separate,
+  owner-authorized operational steps.
 
 ## Exact next task
 
-Await an explicit owner command to configure the ignored `.env`, recreate the
-API/worker mounts, and execute the three-repository read-only discovery pilot
-from `docs/repository-onboarding-runbook.md`. Do not connect, onboard, or mutate
-any real project before that command.
+Await an explicit owner command to connect the remaining clean `main`
+validators listed in `docs/repository-onboarding-runbook.md`, review every
+report, and rebuild topology. Do not connect deferred/dirty/worktree projects
+and do not start onboarding.

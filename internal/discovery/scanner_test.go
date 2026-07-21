@@ -59,6 +59,7 @@ func TestScanner_Fixtures(t *testing.T) {
 			assertFact(t, report.Facts, test.wantCategory, test.wantName, test.wantValue)
 			if test.name == "go-service" {
 				assertFact(t, report.Facts, "contract", "http_produce", "GET /api/v1/orders")
+				assertFact(t, report.Facts, "capability", "event_subject", "orders.created.v1")
 			}
 			if test.name == "nextjs" {
 				assertFact(t, report.Facts, "contract", "http_consume", "GET /api/v1/courses")
@@ -72,6 +73,34 @@ func TestScanner_Fixtures(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestScanner_DoesNotTreatGenericRequestValuesAsEventSubjects(t *testing.T) {
+	root := t.TempDir()
+	content := `package fixture
+
+func validate(request Request) bool {
+	return request.Engine == "nextjs.app" || request.File == "server.py"
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "validate.go"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"),
+		[]byte("# Fixture\n\nThe request uses `workspace.root_path` for validation.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "generic-request", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Name == "event_subject" {
+			t.Fatalf("unexpected event subject from generic request value: %#v", fact)
+		}
 	}
 }
 
