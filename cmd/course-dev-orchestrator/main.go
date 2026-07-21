@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -33,9 +34,11 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
+	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
+	planninguc "github.com/bemulima/agent-orchestrator/internal/usecase/planning"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
 	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
@@ -93,6 +96,9 @@ func run(args []string) error {
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
+	case "plan", "plan-show", "plan-approve", "plan-reject", "plan-run",
+		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-cancel":
+		return runPlanningCommand(cfg, command, args[1:], os.Stdout)
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
@@ -137,11 +143,30 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Services: topologyOperations.Services, Contracts: topologyOperations.Contracts,
 		Drift: topologyOperations.Drift, ProjectQuery: topologyOperations.Project,
 	}
+	temporalClient, err := temporalclient.Dial(temporalclient.Options{
+		HostPort: cfg.TemporalHostPort, Namespace: cfg.TemporalNamespace, Logger: temporaladapter.NewLogger(logger),
+	})
+	if err != nil {
+		return fmt.Errorf("connect temporal plan client: %w", err)
+	}
+	defer temporalClient.Close()
+	planningOperations := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
+		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
+	})
+	planningHandler := handlers.PlanningHandler{
+		CreateCommand: planningOperations.CreateCommand, GetCommand: planningOperations.GetCommand,
+		CreatePlan: planningOperations.CreatePlan, GetPlan: planningOperations.GetPlan,
+		ApprovePlan: planningOperations.ApprovePlan, RejectPlan: planningOperations.RejectPlan,
+		StartPlan: planningOperations.StartPlan, GetRun: planningOperations.GetRun,
+		ControlRun: planningOperations.ControlRun, GetTask: planningOperations.GetTask,
+		CancelTask: planningOperations.CancelTask,
+	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
 		HealthHandler:     healthHandler,
 		ProjectHandler:    &projectHandler,
 		OnboardingHandler: &onboardingHandler,
 		TopologyHandler:   &topologyHandler,
+		PlanningHandler:   &planningHandler,
 		Logger:            logger,
 	})
 	server := &http.Server{
@@ -176,6 +201,47 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+type planningOperations struct {
+	CreateCommand planninguc.CreateCommand
+	GetCommand    planninguc.GetCommand
+	CreatePlan    planninguc.CreatePlan
+	GetPlan       planninguc.GetPlan
+	ApprovePlan   planninguc.ApprovePlan
+	RejectPlan    planninguc.RejectPlan
+	StartPlan     planninguc.StartPlan
+	GetRun        planninguc.GetRun
+	ControlRun    planninguc.ControlRun
+	GetTask       planninguc.GetTask
+	CancelTask    planninguc.CancelTask
+}
+
+func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner repository.PlanRunner) planningOperations {
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	catalog := pgadapter.TopologyRepoPG{Pool: pool}
+	return planningOperations{
+		CreateCommand: planninguc.CreateCommand{Plans: plans},
+		GetCommand:    planninguc.GetCommand{Plans: plans},
+		CreatePlan: planninguc.CreatePlan{
+			Plans: plans, Topology: catalog,
+			Planner: planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
+			Validator: planningengine.Validator{
+				MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+			},
+		},
+		GetPlan:     planninguc.GetPlan{Plans: plans},
+		ApprovePlan: planninguc.ApprovePlan{Plans: plans},
+		RejectPlan:  planninguc.RejectPlan{Plans: plans},
+		StartPlan: planninguc.StartPlan{
+			Plans: plans, Runner: runner, MaxParallelTasks: cfg.MaxParallelTasks,
+			MaxActivityAttempts: cfg.MaxTaskAttempts,
+		},
+		GetRun:     planninguc.GetRun{Plans: plans},
+		ControlRun: planninguc.ControlRun{Plans: plans, Runner: runner},
+		GetTask:    planninguc.GetTask{Plans: plans},
+		CancelTask: planninguc.CancelTask{Plans: plans, Runner: runner},
+	}
 }
 
 type topologyOperations struct {
@@ -428,6 +494,214 @@ func runTopologyCommand(cfg config.Config, command string, args []string, output
 	}
 }
 
+func runPlanningCommand(cfg config.Config, command string, args []string, output io.Writer) error {
+	ctx := context.Background()
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect postgres: %w", err)
+	}
+	defer pool.Close()
+	var runner repository.PlanRunner
+	if planningCommandNeedsTemporal(command) {
+		temporalClient, dialErr := temporalclient.Dial(temporalclient.Options{
+			HostPort: cfg.TemporalHostPort, Namespace: cfg.TemporalNamespace,
+		})
+		if dialErr != nil {
+			return fmt.Errorf("connect temporal: %w", dialErr)
+		}
+		defer temporalClient.Close()
+		runner = temporaladapter.PlanRunner{Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue}
+	}
+	operations := newPlanningOperations(cfg, pool, runner)
+
+	switch command {
+	case "plan":
+		flags := flag.NewFlagSet(command, flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		file := flags.String("file", "", "natural-language command file")
+		projectIDs := flags.String("project-ids", "", "optional comma-separated project IDs")
+		if err := flags.Parse(args); err != nil {
+			return fmt.Errorf("parse plan flags: %w", err)
+		}
+		if strings.TrimSpace(*file) == "" || flags.NArg() != 0 {
+			return fmt.Errorf("--file is required: %w", domain.ErrValidation)
+		}
+		text, err := readCommandFile(*file)
+		if err != nil {
+			return err
+		}
+		created, err := operations.CreateCommand.Handle(ctx, planninguc.CreateCommandInput{
+			Source: domain.CommandSourceCLI, Text: text,
+		})
+		if err != nil {
+			return err
+		}
+		bundle, err := operations.CreatePlan.Handle(ctx, created.ID, domain.PlanRequest{
+			RequestedProjectIDs: commaSeparated(*projectIDs),
+		})
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, bundle)
+	case "plan-show", "plan-approve", "plan-reject", "plan-run":
+		planID, actor, comment, err := planCommandFlags(command, args)
+		if err != nil {
+			return err
+		}
+		switch command {
+		case "plan-show":
+			bundle, getErr := operations.GetPlan.Handle(ctx, planID)
+			if getErr != nil {
+				return getErr
+			}
+			return writeJSON(output, bundle)
+		case "plan-approve":
+			bundle, approveErr := operations.ApprovePlan.Handle(ctx, planninguc.DecidePlanInput{
+				PlanID: planID, Actor: actor, Comment: comment,
+			})
+			if approveErr != nil {
+				return approveErr
+			}
+			return writeJSON(output, bundle)
+		case "plan-reject":
+			bundle, rejectErr := operations.RejectPlan.Handle(ctx, planninguc.DecidePlanInput{
+				PlanID: planID, Actor: actor, Comment: comment,
+			})
+			if rejectErr != nil {
+				return rejectErr
+			}
+			return writeJSON(output, bundle)
+		default:
+			run, runErr := operations.StartPlan.Handle(ctx, planID)
+			if runErr != nil {
+				return runErr
+			}
+			return writeJSON(output, run)
+		}
+	case "run-status", "run-pause", "run-resume", "run-cancel":
+		runID, err := requiredIDFlag(command, args, "run-id")
+		if err != nil {
+			return err
+		}
+		if command == "run-status" {
+			run, getErr := operations.GetRun.Handle(ctx, runID)
+			if getErr != nil {
+				return getErr
+			}
+			return writeJSON(output, run)
+		}
+		action := domain.RunControlPause
+		if command == "run-resume" {
+			action = domain.RunControlResume
+		} else if command == "run-cancel" {
+			action = domain.RunControlCancel
+		}
+		run, controlErr := operations.ControlRun.Handle(ctx, planninguc.ControlRunInput{RunID: runID, Action: action})
+		if controlErr != nil {
+			return controlErr
+		}
+		return writeJSON(output, run)
+	case "task-show", "task-cancel":
+		taskID, err := requiredIDFlag(command, args, "task-id")
+		if err != nil {
+			return err
+		}
+		if command == "task-show" {
+			task, getErr := operations.GetTask.Handle(ctx, taskID)
+			if getErr != nil {
+				return getErr
+			}
+			return writeJSON(output, task)
+		}
+		task, cancelErr := operations.CancelTask.Handle(ctx, taskID)
+		if cancelErr != nil {
+			return cancelErr
+		}
+		return writeJSON(output, task)
+	default:
+		return fmt.Errorf("unknown planning command %q", command)
+	}
+}
+
+func planningCommandNeedsTemporal(command string) bool {
+	switch command {
+	case "plan-run", "run-pause", "run-resume", "run-cancel", "task-cancel":
+		return true
+	default:
+		return false
+	}
+}
+
+func readCommandFile(path string) (string, error) {
+	absolute, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return "", fmt.Errorf("resolve command file: %w", err)
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("inspect command file: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return "", fmt.Errorf("command file must be a regular file no larger than 1 MiB: %w", domain.ErrValidation)
+	}
+	file, err := os.Open(absolute)
+	if err != nil {
+		return "", fmt.Errorf("open command file: %w", err)
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	if err != nil {
+		return "", fmt.Errorf("read command file: %w", err)
+	}
+	text := strings.TrimSpace(string(content))
+	if text == "" {
+		return "", fmt.Errorf("command file is empty: %w", domain.ErrValidation)
+	}
+	return text, nil
+}
+
+func commaSeparated(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+func planCommandFlags(command string, args []string) (planID, actor, comment string, err error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	planIDValue := flags.String("plan-id", "", "plan ID")
+	actorValue := flags.String("actor", "owner", "decision actor")
+	commentValue := flags.String("comment", "", "decision comment")
+	if parseErr := flags.Parse(args); parseErr != nil {
+		return "", "", "", fmt.Errorf("parse %s flags: %w", command, parseErr)
+	}
+	if strings.TrimSpace(*planIDValue) == "" || flags.NArg() != 0 {
+		return "", "", "", fmt.Errorf("--plan-id is required: %w", domain.ErrValidation)
+	}
+	return strings.TrimSpace(*planIDValue), strings.TrimSpace(*actorValue), strings.TrimSpace(*commentValue), nil
+}
+
+func requiredIDFlag(command string, args []string, name string) (string, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	value := flags.String(name, "", name)
+	if err := flags.Parse(args); err != nil {
+		return "", fmt.Errorf("parse %s flags: %w", command, err)
+	}
+	if strings.TrimSpace(*value) == "" || flags.NArg() != 0 {
+		return "", fmt.Errorf("--%s is required: %w", name, domain.ErrValidation)
+	}
+	return strings.TrimSpace(*value), nil
+}
+
 func projectIdentifier(command string, args []string) (string, error) {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -474,6 +748,11 @@ func onboardingFlags(command string, args []string) (runID, actor, comment strin
 }
 
 func runWorker(cfg config.Config, logger *zap.Logger) error {
+	pool, err := pgadapter.Connect(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect worker postgres: %w", err)
+	}
+	defer pool.Close()
 	client, err := temporalclient.Dial(temporalclient.Options{
 		HostPort:  cfg.TemporalHostPort,
 		Namespace: cfg.TemporalNamespace,
@@ -486,7 +765,9 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 
 	temporalWorker := worker.New(client, cfg.TemporalTaskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.SystemProbeWorkflow)
+	temporalWorker.RegisterWorkflow(orchestratorworkflow.PlanWorkflow)
 	temporalWorker.RegisterActivity(&activities.SystemActivities{})
+	temporalWorker.RegisterActivity(&activities.PlanActivities{Plans: pgadapter.PlanningRepoPG{Pool: pool}})
 	logger.Info("starting temporal worker",
 		zap.String("namespace", cfg.TemporalNamespace),
 		zap.String("task_queue", cfg.TemporalTaskQueue),
@@ -558,6 +839,17 @@ Commands:
   contract-drift  List producer/consumer contract drift
   dependencies    Show direct dependencies and impact for a service
   consumers       Show direct and transitive consumers for a service
+  plan            Create an approval-gated DAG from a command file
+  plan-show       Show a persisted plan, tasks, dependencies, approval, and run
+  plan-approve    Approve a plan for execution
+  plan-reject     Reject and cancel a plan
+  plan-run        Start or reuse the Temporal plan workflow
+  run-status      Show a plan run
+  run-pause       Pause new task dispatch
+  run-resume      Resume task dispatch
+  run-cancel      Cancel a plan run
+  task-show       Show a planned task
+  task-cancel     Signal cancellation for a dispatched task
   version         Print build version
   help            Show this help`)
 }

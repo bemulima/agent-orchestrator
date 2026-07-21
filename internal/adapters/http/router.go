@@ -18,6 +18,7 @@ type RouterDependencies struct {
 	ProjectHandler    *handlers.ProjectHandler
 	OnboardingHandler *handlers.OnboardingHandler
 	TopologyHandler   *handlers.TopologyHandler
+	PlanningHandler   *handlers.PlanningHandler
 	Logger            *zap.Logger
 }
 
@@ -57,6 +58,22 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/projects/{projectId}/dependencies", deps.TopologyHandler.ProjectDependencies)
 		root.Get("/api/v1/projects/{projectId}/contracts", deps.TopologyHandler.ProjectContracts)
 		root.Get("/api/v1/projects/{projectId}/consumers", deps.TopologyHandler.ProjectConsumers)
+	}
+	if deps.PlanningHandler != nil {
+		root.Post("/api/v1/commands", deps.PlanningHandler.CreateCommandRequest)
+		root.Get("/api/v1/commands/{commandId}", deps.PlanningHandler.GetCommandRequest)
+		root.Post("/api/v1/commands/{commandId}/plan", deps.PlanningHandler.PlanCommand)
+		root.Get("/api/v1/plans/{planId}", deps.PlanningHandler.GetPlanRequest)
+		root.Get("/api/v1/plans/{planId}/tasks", deps.PlanningHandler.GetPlanTasks)
+		root.Post("/api/v1/plans/{planId}/approve", deps.PlanningHandler.ApprovePlanRequest)
+		root.Post("/api/v1/plans/{planId}/reject", deps.PlanningHandler.RejectPlanRequest)
+		root.Post("/api/v1/plans/{planId}/run", deps.PlanningHandler.RunPlan)
+		root.Get("/api/v1/runs/{runId}", deps.PlanningHandler.GetRunRequest)
+		root.Post("/api/v1/runs/{runId}/pause", deps.PlanningHandler.PauseRun)
+		root.Post("/api/v1/runs/{runId}/resume", deps.PlanningHandler.ResumeRun)
+		root.Post("/api/v1/runs/{runId}/cancel", deps.PlanningHandler.CancelRun)
+		root.Get("/api/v1/tasks/{taskId}", deps.PlanningHandler.GetTaskRequest)
+		root.Post("/api/v1/tasks/{taskId}/cancel", deps.PlanningHandler.CancelTaskRequest)
 	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ ORDER BY tablename`)
 		"gitlab_link", "onboarding_run", "plan", "project", "service_capability",
 		"service_ownership", "service_relation", "service_snapshot", "task",
 		"task_attempt", "task_dependency", "telegram_user", "topology_revision",
-		"topology_service", "contract_drift",
+		"topology_service", "contract_drift", "plan_run",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -351,6 +352,163 @@ func TestTopologyRepositoryReplacesCatalogIdempotently(t *testing.T) {
 	}
 }
 
+func TestPlanningRepositoryStateMachineAndIdempotency(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	createdProjects := make([]domain.Project, 0, 2)
+	for _, name := range []string{"planning-producer", "planning-consumer"} {
+		path := "/fixtures/" + uuid.NewString()
+		project, err := projects.Upsert(ctx, domain.Project{
+			Name: name, Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService,
+			SourceIdentity: "integration:" + uuid.NewString(), LocalPath: &path,
+			DefaultBranch: "main", CurrentBranch: "main", HeadCommit: "abc123",
+		})
+		if err != nil {
+			t.Fatalf("Upsert(%s) error = %v", name, err)
+		}
+		createdProjects = append(createdProjects, project)
+	}
+	var topologyRevisionID string
+	if err := pool.QueryRow(ctx, `
+INSERT INTO topology_revision (
+    fingerprint, project_count, service_count, capability_count,
+    ownership_count, contract_count, relation_count, drift_count
+) VALUES ($1, 2, 2, 0, 0, 0, 1, 0)
+RETURNING id`, strings.Repeat("c", 64)).Scan(&topologyRevisionID); err != nil {
+		t.Fatalf("insert topology revision: %v", err)
+	}
+	var command domain.Command
+	var bundle domain.PlanBundle
+	var run domain.PlanRun
+	defer func() {
+		resourceIDs := []string{command.ID, bundle.Plan.ID, run.ID}
+		for _, task := range bundle.Tasks {
+			resourceIDs = append(resourceIDs, task.ID)
+		}
+		for _, resourceID := range resourceIDs {
+			if resourceID != "" {
+				_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, resourceID)
+			}
+		}
+		if bundle.Approval != nil {
+			_, _ = pool.Exec(ctx, `DELETE FROM approval WHERE id = $1`, bundle.Approval.ID)
+		}
+		if command.ID != "" {
+			_, _ = pool.Exec(ctx, `
+DELETE FROM audit_event WHERE resource_id IN (
+    SELECT id FROM plan WHERE command_id = $1
+    UNION SELECT task.id FROM task JOIN plan ON plan.id = task.plan_id WHERE plan.command_id = $1
+    UNION SELECT plan_run.id FROM plan_run JOIN plan ON plan.id = plan_run.plan_id WHERE plan.command_id = $1
+)`, command.ID)
+			_, _ = pool.Exec(ctx, `DELETE FROM approval WHERE resource_type = 'plan' AND resource_id IN (SELECT id FROM plan WHERE command_id = $1)`, command.ID)
+			_, _ = pool.Exec(ctx, `DELETE FROM command WHERE id = $1`, command.ID)
+		}
+		_, _ = pool.Exec(ctx, `DELETE FROM topology_revision WHERE id = $1`, topologyRevisionID)
+		for _, project := range createdProjects {
+			_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, project.ID)
+			_, _ = pool.Exec(ctx, `DELETE FROM project WHERE id = $1`, project.ID)
+		}
+	}()
+
+	commandInput := domain.Command{
+		Source: domain.CommandSourceAPI, Text: "change planning fixtures",
+		Status: domain.CommandStatusReceived, IdempotencyKey: "integration:" + uuid.NewString(),
+	}
+	var err error
+	command, err = plans.CreateCommand(ctx, commandInput)
+	if err != nil {
+		t.Fatalf("CreateCommand() error = %v", err)
+	}
+	reusedCommand, err := plans.CreateCommand(ctx, commandInput)
+	if err != nil || reusedCommand.ID != command.ID {
+		t.Fatalf("reused CreateCommand() = %#v, %v", reusedCommand, err)
+	}
+	input := domain.PlannerInput{
+		CommandID: command.ID, CommandText: command.Text, TopologyRevisionID: topologyRevisionID,
+		RequestedProjectIDs: []string{createdProjects[0].ID, createdProjects[1].ID},
+	}
+	output := domain.PlannerOutput{
+		Summary: "integration plan", RiskLevel: domain.RiskLevelMedium, Risks: []string{},
+		Tasks: []domain.PlannedTask{
+			{Key: "producer", ProjectID: createdProjects[0].ID, Role: "backend-coder", Title: "producer", Description: command.Text,
+				AcceptanceCriteria: []string{"producer passes"}, WriteScope: []string{"internal/**"}, ModelProfile: "standard",
+				Priority: 2, RiskLevel: domain.RiskLevelMedium, VerificationCommands: []string{"go test ./..."}},
+			{Key: "consumer", ProjectID: createdProjects[1].ID, Role: "backend-coder", Title: "consumer", Description: command.Text,
+				AcceptanceCriteria: []string{"consumer passes"}, WriteScope: []string{"internal/**"}, ModelProfile: "standard",
+				Priority: 1, RiskLevel: domain.RiskLevelMedium, VerificationCommands: []string{"go test ./..."}},
+		},
+		Dependencies: []domain.PlannedDependency{{TaskKey: "consumer", DependsOnTaskKey: "producer", DependencyType: "consumes"}},
+	}
+	bundle, err = plans.CreatePlan(ctx, command, input, output)
+	if err != nil {
+		t.Fatalf("CreatePlan() error = %v", err)
+	}
+	reusedPlan, err := plans.CreatePlan(ctx, command, input, output)
+	if err != nil || reusedPlan.Plan.ID != bundle.Plan.ID || len(reusedPlan.Tasks) != 2 || len(reusedPlan.Dependencies) != 1 {
+		t.Fatalf("reused CreatePlan() = %#v, %v", reusedPlan, err)
+	}
+	if _, _, err := plans.PrepareRun(ctx, bundle.Plan.ID, 2); !errors.Is(err, domain.ErrApprovalNeeded) {
+		t.Fatalf("PrepareRun() before approval error = %v", err)
+	}
+	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, "integration-owner", "approved")
+	if err != nil || bundle.Plan.Status != domain.PlanStatusApproved || bundle.Approval == nil || bundle.Approval.Status != string(domain.ApprovalStatusApproved) {
+		t.Fatalf("ApprovePlan() = %#v, %v", bundle, err)
+	}
+	repeatedApproval, err := plans.ApprovePlan(ctx, bundle.Plan.ID, "integration-owner", "approved")
+	if err != nil || repeatedApproval.Plan.Status != domain.PlanStatusApproved {
+		t.Fatalf("repeated ApprovePlan() = %#v, %v", repeatedApproval, err)
+	}
+	run, bundle, err = plans.PrepareRun(ctx, bundle.Plan.ID, 2)
+	if err != nil {
+		t.Fatalf("PrepareRun() error = %v", err)
+	}
+	reusedRun, _, err := plans.PrepareRun(ctx, bundle.Plan.ID, 2)
+	if err != nil || reusedRun.ID != run.ID {
+		t.Fatalf("reused PrepareRun() = %#v, %v", reusedRun, err)
+	}
+	run, err = plans.AttachTemporalRun(ctx, run.ID, "temporal-run-id")
+	if err != nil || run.TemporalRunID == nil || *run.TemporalRunID != "temporal-run-id" {
+		t.Fatalf("AttachTemporalRun() = %#v, %v", run, err)
+	}
+	run, err = plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusRunning, "")
+	if err != nil {
+		t.Fatalf("UpdateRunStatus(running) error = %v", err)
+	}
+	producerTask, consumerTask := bundle.Tasks[0], bundle.Tasks[1]
+	if producerTask.Priority < consumerTask.Priority {
+		producerTask, consumerTask = consumerTask, producerTask
+	}
+	if _, err := plans.MarkTaskReady(ctx, run.ID, producerTask.ID); err != nil {
+		t.Fatalf("MarkTaskReady(producer) error = %v", err)
+	}
+	if _, err := plans.RecordTaskResult(ctx, run.ID, domain.TaskResult{TaskID: producerTask.ID, Status: domain.TaskStatusCompleted}); err != nil {
+		t.Fatalf("RecordTaskResult(producer) error = %v", err)
+	}
+	if _, err := plans.MarkTaskReady(ctx, run.ID, consumerTask.ID); err != nil {
+		t.Fatalf("MarkTaskReady(consumer) error = %v", err)
+	}
+	if _, err := plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusPaused, ""); err != nil {
+		t.Fatalf("pause run error = %v", err)
+	}
+	if _, err := plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusRunning, ""); err != nil {
+		t.Fatalf("resume run error = %v", err)
+	}
+	if _, err := plans.RecordTaskResult(ctx, run.ID, domain.TaskResult{TaskID: consumerTask.ID, Status: domain.TaskStatusCompleted}); err != nil {
+		t.Fatalf("RecordTaskResult(consumer) error = %v", err)
+	}
+	run, err = plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusCompleted, "")
+	if err != nil || run.Status != domain.PlanRunStatusCompleted {
+		t.Fatalf("complete run = %#v, %v", run, err)
+	}
+	completed, err := plans.GetPlan(ctx, bundle.Plan.ID)
+	if err != nil || completed.Plan.Status != domain.PlanStatusCompleted || completed.Run == nil || completed.Run.Status != domain.PlanRunStatusCompleted {
+		t.Fatalf("completed plan = %#v, %v", completed, err)
+	}
+}
+
 func TestInitialMigrationEnforcesIdempotencyConstraints(t *testing.T) {
 	pool := integrationPool(t)
 	defer pool.Close()
@@ -383,13 +541,13 @@ VALUES ('fixture-duplicate', 'connected', '/fixtures/project', 'local:/fixtures/
 
 		_, err = tx.Exec(context.Background(), `
 INSERT INTO command (source, text, status, idempotency_key)
-VALUES ('api', 'fixture command', 'created', 'fixture-key')`)
+VALUES ('api', 'fixture command', 'received', 'fixture-key')`)
 		if err != nil {
 			t.Fatalf("insert first command: %v", err)
 		}
 		_, err = tx.Exec(context.Background(), `
 INSERT INTO command (source, text, status, idempotency_key)
-VALUES ('api', 'duplicate command', 'created', 'fixture-key')`)
+VALUES ('api', 'duplicate command', 'received', 'fixture-key')`)
 		assertUniqueViolation(t, err)
 	})
 }

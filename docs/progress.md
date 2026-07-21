@@ -4,12 +4,12 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–4 are complete and verified. The Docker Compose stack is currently
+Stages 1–5 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-No user repository has been connected. Stage 4 verification used only
-in-memory fixtures, disposable PostgreSQL records, and an empty-catalog CLI/API
-smoke test. Stages 5–8 have not been implemented and are not represented by
-placeholders.
+No user repository has been connected. Stage 5 verification used only
+in-memory fixtures and a disposable Git repository/PostgreSQL records, all of
+which were removed afterward. Stages 6–8 have not been implemented and are not
+represented by placeholders.
 
 ## Completed
 
@@ -114,6 +114,28 @@ placeholders.
 - Added deterministic builder/drift/impact unit tests, HTTP contract tests,
   discovery contract assertions, and a real PostgreSQL topology idempotency
   integration test.
+- Added the reversible `006_stage5_planning` schema for structured planner
+  input/output, plan fingerprints, approvals, task execution metadata, and
+  durable plan runs.
+- Implemented idempotent natural-language command capture and a deterministic
+  evidence planner over the latest topology revision. It selects explicit or
+  matched projects, expands direct relations, creates one task per repository,
+  and persists risks, acceptance criteria, write scopes, verification commands,
+  migration/contract flags, priorities, and dependencies.
+- Added DAG validation for project existence, completeness, duplicate task
+  ownership, dependency references, cycles, maximum depth, model profiles,
+  write scopes, and bounded parallel waves.
+- Implemented the approval-gated PostgreSQL planning state machine. Repeated
+  command/plan/approval/run calls reuse the same records, terminal transitions
+  are guarded, and all material changes emit audit events.
+- Added the deterministic Temporal plan workflow with dependency-aware bounded
+  dispatch, activity heartbeat/retry, pause/resume/cancel and task-result
+  signals, workflow state queries, and worker restart recovery.
+- Added Stage 5 command/plan/run/task use cases, the fourteen HTTP routes, CLI
+  commands, and Make wrappers. Stage 5 dispatch intentionally ends at task
+  `ready`; actual Codex execution and verification remain Stage 6.
+- Added planner/validator, workflow, HTTP routing, migration, and PostgreSQL
+  state-machine/idempotency coverage.
 
 ## Files changed
 
@@ -122,11 +144,11 @@ placeholders.
 - Entrypoint: `cmd/course-dev-orchestrator/main.go`.
 - Domain/config: `internal/config/*`, `internal/domain/*`.
 - Application/transport: `internal/usecase/health/*`,
-  `internal/usecase/project/*`,
+  `internal/usecase/project/*`, `internal/usecase/planning/*`,
   `internal/adapters/http/*`.
 - Infrastructure: `internal/adapters/git/*`, `internal/adapters/gitlab/*`,
   `internal/adapters/postgres/*`, `internal/discovery/*`,
-  `internal/adapters/temporal/*`, `internal/activities/*`,
+  `internal/planning/*`, `internal/adapters/temporal/*`, `internal/activities/*`,
   `internal/workflow/*`.
 - Database/runtime: `db/migrations/*`, `scripts/migrate*.sh`,
   `docker/Dockerfile`.
@@ -192,14 +214,32 @@ placeholders.
 - Rebuilt the Stage 4 Docker Compose images — all services are running,
   API/PostgreSQL/Temporal health passes, and the real worker workflow probe
   completed with structured `status=ok` output.
+- Stage 5 planner/validator tests — deterministic multi-project DAGs,
+  dependency order, explicit-project validation, and rejection of incomplete,
+  cyclic, or over-parallelized plans passed.
+- Stage 5 Temporal tests — bounded dependency dispatch, pause/resume/cancel,
+  and transient activity retry passed.
+- Reversible `006_stage5_planning` migration — applied, rolled back, reapplied,
+  and then skipped idempotently.
+- Stage 5 `make test-integration` — passed; command/plan reuse, approval gate,
+  repeated approval/run, run transitions, task results, audit state, and schema
+  constraints were exercised against PostgreSQL 16.
+- Stage 5 `make verify` and `go test -race ./...` — passed on the final planning
+  and workflow implementation.
+- Disposable Stage 5 CLI/Temporal E2E — connect/discover, topology rebuild,
+  repeated planning, repeated approval/start, task dispatch to `ready`, pause,
+  worker restart, resume, and cancel passed. The temporary Git repository and
+  all database records were removed afterward.
+- Rebuilt Stage 5 services — API/PostgreSQL/Temporal readiness and the real
+  worker workflow probe passed after the restart/recovery scenario.
 
 ## Remaining work
 
-- Stages 5–8 remain as specified in `docs/implementation-plan.md`: planning/DAG
-  execution, Codex runner/verification, GitLab, and Telegram.
+- Stages 6–8 remain as specified in `docs/implementation-plan.md`: Codex
+  runner/verification, broader GitLab integration, and Telegram.
 
 ## Exact next task
 
-Implement Stage 5 command capture, persisted plan/task DAG validation,
-approval-gated Temporal execution, bounded concurrency, retry/recovery, and
-pause/resume/cancel operations.
+Implement Stage 6 isolated Codex execution, structured results, independent
+Git/write-scope/check/contract/migration verification, and reviewer loops on
+top of the Stage 5 durable task-result signal boundary.

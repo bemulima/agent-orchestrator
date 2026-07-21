@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers fmt fmt-check lint test test-unit test-integration verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-cancel fmt fmt-check lint test test-unit test-integration verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -127,6 +127,50 @@ dependencies: ## Show dependencies and impact for SERVICE=id-or-name
 consumers: ## Show direct and transitive consumers for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator consumers --service "$(SERVICE)"
+
+plan: ## Create a plan from FILE=command.md (optional PROJECT_IDS=id,id)
+	@test -n "$(FILE)" || (echo "Set FILE=path-to-command.md"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan --file "$(FILE)" $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",)
+
+plan-show: ## Show PLAN_ID=uuid with tasks and dependencies
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-show --plan-id "$(PLAN_ID)"
+
+plan-approve: ## Approve PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-approve --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+plan-reject: ## Reject PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-reject --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+plan-run: ## Start or reuse the Temporal workflow for PLAN_ID=uuid
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-run --plan-id "$(PLAN_ID)"
+
+run-status: ## Show RUN_ID=uuid
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-status --run-id "$(RUN_ID)"
+
+run-pause: ## Pause new task dispatch for RUN_ID=uuid
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-pause --run-id "$(RUN_ID)"
+
+run-resume: ## Resume task dispatch for RUN_ID=uuid
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-resume --run-id "$(RUN_ID)"
+
+run-cancel: ## Cancel RUN_ID=uuid and unfinished tasks
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-cancel --run-id "$(RUN_ID)"
+
+task-show: ## Show TASK_ID=uuid
+	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-show --task-id "$(TASK_ID)"
+
+task-cancel: ## Signal cancellation for TASK_ID=uuid
+	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-cancel --task-id "$(TASK_ID)"
 
 fmt: ## Format Go source files
 	@gofmt -w $(GO_FILES)

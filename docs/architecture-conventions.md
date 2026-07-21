@@ -51,6 +51,16 @@ and engineering conventions come from the reference service.
   discovery snapshots. Fingerprint reuse and transactional replacement make
   rebuilds idempotent and prevent stale relations; repositories are not read
   again during a rebuild.
+- Planning is a deterministic projection of a natural-language command and one
+  immutable topology revision. A task owns exactly one project; acceptance
+  criteria, write scope, verification commands, dependency depth, and risk
+  flags are persisted before approval.
+- DAG validation is an application boundary. Unknown projects, incomplete
+  tasks, cycles, invalid scopes/model profiles, excessive depth, and parallel
+  waves above the configured limit never reach Temporal.
+- PostgreSQL stores queryable plan/run/task state and audit history. Temporal
+  owns durable scheduling, dependency release, pause/resume/cancel signals,
+  bounded parallel dispatch, retry, and restart recovery.
 
 ## Deliberate extensions required by this service
 
@@ -64,6 +74,9 @@ and engineering conventions come from the reference service.
 - PostgreSQL and Temporal are separate readiness dependencies. Long-running
   execution state will remain authoritative in Temporal and durable metadata
   will be stored in PostgreSQL.
+- Stage 5 dispatch only makes a task `ready` and waits for a durable task-result
+  signal. Worktree creation, Codex invocation, independent verification, and
+  review are Stage 6 responsibilities and cannot be inferred from dispatch.
 
 ## Dependency direction
 

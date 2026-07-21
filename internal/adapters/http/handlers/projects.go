@@ -95,10 +95,21 @@ func (h ProjectHandler) LatestDiscoveryReport(w http.ResponseWriter, r *http.Req
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	return decodeJSONValue(w, r, target, false)
+}
+
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	return decodeJSONValue(w, r, target, true)
+}
+
+func decodeJSONValue(w http.ResponseWriter, r *http.Request, target any, optional bool) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxProjectRequestBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		if optional && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("decode request: %w", err)
 	}
 	var trailing any

@@ -110,6 +110,9 @@ Acceptance:
 
 ## Stage 5 — commands, planning, DAG, and Temporal plan workflow
 
+Status: completed and verified on 2026-07-21. The durable scheduler dispatches
+tasks into `ready`; repository/Codex execution begins in Stage 6.
+
 Scope:
 
 - natural-language command capture from API/CLI;

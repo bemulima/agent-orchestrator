@@ -8,9 +8,10 @@ never merges or deploys automatically.
 
 The current implementation includes Stage 1 platform bootstrap, Stage 2
 project connection/read-only discovery, Stage 3 evidence-backed onboarding
-with approval-gated isolated writes, and Stage 4 materialized service topology
-with contract drift and impact queries. Planning, Codex execution, broader
-GitLab integration, and Telegram remain explicitly tracked in
+with approval-gated isolated writes, Stage 4 materialized service topology
+with contract drift and impact queries, and Stage 5 approval-gated planning
+with a durable Temporal DAG scheduler. Codex execution, broader GitLab
+integration, and Telegram remain explicitly tracked in
 [docs/progress.md](docs/progress.md).
 
 ## Architecture
@@ -24,6 +25,7 @@ GitLab integration, and Telegram remain explicitly tracked in
 - `internal/discovery`: bounded read-only inventory and evidence detectors.
 - `internal/onboarding`: deterministic proposal/manifests and safe merge rules.
 - `internal/topology`: deterministic catalog, relation, and drift builder.
+- `internal/planning`: deterministic evidence planner and DAG validation.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
 - `db/migrations`: tracked PostgreSQL schema migrations.
@@ -75,6 +77,17 @@ course-dev-orchestrator contracts
 course-dev-orchestrator contract-drift
 course-dev-orchestrator dependencies --service repository-name
 course-dev-orchestrator consumers --service repository-name
+course-dev-orchestrator plan --file command.md [--project-ids uuid,uuid]
+course-dev-orchestrator plan-show --plan-id UUID
+course-dev-orchestrator plan-approve --plan-id UUID --actor owner [--comment text]
+course-dev-orchestrator plan-reject --plan-id UUID --actor owner [--comment text]
+course-dev-orchestrator plan-run --plan-id UUID
+course-dev-orchestrator run-status --run-id UUID
+course-dev-orchestrator run-pause --run-id UUID
+course-dev-orchestrator run-resume --run-id UUID
+course-dev-orchestrator run-cancel --run-id UUID
+course-dev-orchestrator task-show --task-id UUID
+course-dev-orchestrator task-cancel --task-id UUID
 course-dev-orchestrator version
 ```
 
@@ -247,6 +260,54 @@ API is synchronous:
 - `GET /api/v1/projects/{projectId}/dependencies`;
 - `GET /api/v1/projects/{projectId}/contracts`;
 - `GET /api/v1/projects/{projectId}/consumers`.
+
+## Commands, plans, and durable scheduling
+
+Stage 5 converts a natural-language command into a persisted, deterministic
+plan over the current topology revision. The planner selects explicit or
+evidence-matched projects, creates exactly one task per repository, records
+acceptance criteria and write scopes, marks migration/public-contract risk,
+adds project dependencies, and assigns verification commands. The validator
+rejects unknown projects, missing fields, invalid scopes/profiles, cycles,
+excessive dependency depth, and waves wider than `MAX_PARALLEL_TASKS`.
+
+Every MVP plan requires a persisted approval before it can run. Repeated plan,
+approval, and run requests reuse the same durable records and Temporal
+workflow. The workflow dispatches dependency-ready tasks with bounded
+parallelism and supports pause, resume, cancel, activity retry/heartbeat, and
+worker restart recovery.
+
+```sh
+make plan FILE=change.md
+make plan-show PLAN_ID=uuid
+make plan-approve PLAN_ID=uuid ACTOR=owner COMMENT="reviewed"
+make plan-run PLAN_ID=uuid
+make run-status RUN_ID=uuid
+make run-pause RUN_ID=uuid
+make run-resume RUN_ID=uuid
+make run-cancel RUN_ID=uuid
+make task-show TASK_ID=uuid
+make task-cancel TASK_ID=uuid
+```
+
+Stage 5 deliberately stops when a scheduled task becomes `ready`. Stage 6
+will create isolated worktrees/Codex threads, execute changes, verify results,
+and signal task outcomes back to the already durable plan workflow. Stage 5
+therefore never claims that repository work ran when no executor exists.
+
+The Stage 5 API is available under `/api/v1`:
+
+- `POST /commands`, `GET /commands/{commandId}`, and
+  `POST /commands/{commandId}/plan`;
+- `GET /plans/{planId}`, `GET /plans/{planId}/tasks`, and plan
+  `approve`, `reject`, and `run` actions;
+- `GET /runs/{runId}` and run `pause`, `resume`, and `cancel` actions;
+- `GET /tasks/{taskId}` and `POST /tasks/{taskId}/cancel`.
+
+Plan lifecycle states are `draft`, `planned`, `awaiting_approval`, `approved`,
+`running`, `paused`, `completed`, `failed`, and `cancelled`. Task states are
+`draft`, `planned`, `ready`, `running`, `blocked`, `verification`,
+`changes_requested`, `completed`, `failed`, and `cancelled`.
 
 ## Quality commands
 
