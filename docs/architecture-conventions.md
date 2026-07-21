@@ -34,6 +34,14 @@ and engineering conventions come from the reference service.
 - Repository role and runtime `ServiceKind` are separate concepts. Content,
   policy, documentation, and archive repositories never become runtime
   topology nodes merely because they contain executable tooling.
+- Discovery removes runtime-only capability, contract, infrastructure,
+  ownership, and relation evidence from content, policy, documentation, and
+  archive reports. Language/tooling, purpose, commands, configuration, and
+  instruction evidence remain available for repository-level analysis.
+- Markdown files in a repository explicitly connected as `policy` are stored
+  as checksum-only instruction evidence even when they live outside the usual
+  `prompts/**`, `.ai/**`, or `AGENTS.md` paths. Archive Markdown is not promoted
+  to policy evidence.
 - Git source identity is normalized independently of checkout path. Local
   worktrees use their common Git directory when no supported remote exists.
 - Discovery reports contain evidence provenance and immutable content

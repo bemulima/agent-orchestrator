@@ -222,6 +222,51 @@ func TestScanner_ContentRoleDoesNotBecomeRuntimeService(t *testing.T) {
 	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
 }
 
+func TestScanner_NonRuntimeRolesSuppressRuntimeEvidence(t *testing.T) {
+	root := t.TempDir()
+	content := `# Runtime examples
+
+router.Post("/users", handler)
+publisher.Publish("users.created", payload)
+CREATE TABLE users (id UUID);
+proxy_pass http://users:8080;
+`
+	if err := os.WriteFile(filepath.Join(root, "examples.md"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tool.py"), []byte("print('policy tool')\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	roles := []domain.RepositoryRole{
+		domain.RepositoryRolePolicy,
+		domain.RepositoryRoleDocumentation,
+		domain.RepositoryRoleArchive,
+		domain.RepositoryRoleContent,
+	}
+	for _, role := range roles {
+		t.Run(string(role), func(t *testing.T) {
+			report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+				ID: "id", Name: "non-runtime", RepositoryRole: role,
+			}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+			if err != nil {
+				t.Fatalf("Scan() error = %v", err)
+			}
+			assertFact(t, report.Facts, "classification", "service_kind", "unknown")
+			assertFact(t, report.Facts, "stack", "language", "python")
+			if role == domain.RepositoryRolePolicy {
+				assertFact(t, report.Facts, "instruction", "instruction_file", "")
+			}
+			for _, fact := range report.Facts {
+				switch fact.Category {
+				case "capability", "contract", "infrastructure", "ownership", "relation":
+					t.Fatalf("runtime fact for %s repository: %#v", role, fact)
+				}
+			}
+		})
+	}
+}
+
 func TestScanner_EnforcesInventoryLimits(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"one.md", "two.md", "three.md"} {

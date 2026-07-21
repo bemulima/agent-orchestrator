@@ -1,18 +1,18 @@
 # Implementation progress
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 ## Current status
 
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-Eleven owner-approved repositories are connected read-only: ten validators
-and `ms-infra-messaging`. Their source checkouts remain clean and no
-onboarding, Codex, GitLab, or Telegram operation has been started. Stage 6 verification
-used only in-memory fakes, disposable Git repositories, and disposable
-PostgreSQL records. No live Codex request was made without an explicitly
-configured key.
+Thirteen owner-approved repositories are connected read-only: ten validators,
+`ms-infra-messaging`, `ms-course-promts`, and `ms-course-journal`. Their source
+checkouts remain clean and no onboarding, Codex, GitLab, or Telegram operation
+has been started. Stage 6 verification used only in-memory fakes, disposable
+Git repositories, and disposable PostgreSQL records. No live Codex request was
+made without an explicitly configured key.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -414,6 +414,27 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   repositories: both are clean and exactly match `main`. `wiki`, both
   frontends, and `knowledge-tree` remain deferred for branch or dirty-state
   resolution.
+- Connected local `prompts` and `journal` read-only as `policy` and `archive`.
+  Their canonical Git identities produce project names `ms-course-promts` and
+  `ms-course-journal`; both remain on clean unchanged `main` checkouts.
+- Discovery report schema v6 suppresses capabilities, contracts,
+  infrastructure, ownership, and relations for non-runtime repository roles.
+  It also records every policy Markdown document as a checksum-only
+  instruction fact without treating ordinary archive Markdown as policy.
+- Regenerated all 13 discovery reports at schema v6 and verified repeated scan
+  reuse. `ms-course-promts` contains 19 policy instruction facts and zero
+  runtime facts; `ms-course-journal` contains only classification/purpose and
+  zero runtime facts.
+- Rebuilt topology twice with stable revision/fingerprint. The revision covers
+  13 projects but still materializes 11 services, 31 capabilities, one
+  ownership record, 25 contracts, no relations, and no contract drift. Direct
+  database checks found no non-runtime rows in any topology table.
+- The post-wave database audit reports zero onboarding runs, commands, GitLab
+  links/events, Telegram updates, plans, and plan runs.
+- Non-runtime-wave final verification — `make test-integration`, `make verify`,
+  and `go test -race ./...` passed. The rebuilt stack returned healthy
+  liveness, PostgreSQL/Temporal readiness, and a successful real Temporal
+  workflow probe.
 
 ## Remaining work
 
@@ -423,7 +444,8 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Exact next task
 
-Await an explicit owner command to connect only `prompts` as `policy` and
-`journal` as `archive`, review both reports, and verify they remain excluded
-from runtime topology. Do not connect the deferred runtime/frontend/content
-repositories and do not start onboarding.
+Await an owner decision for the deferred repositories: either synchronize the
+local primary checkouts to an approved default branch outside the orchestrator,
+or explicitly authorize managed clones from their remote default branches.
+Do not infer that choice, connect dirty/stale/worktree projects, or start
+onboarding.

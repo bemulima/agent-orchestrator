@@ -1,9 +1,9 @@
 # Repository onboarding runbook
 
-Inventory snapshot: 2026-07-21. The three-repository pilot and the subsequent
-eight-repository validator wave in this runbook were owner-approved and
-completed read-only on the same date. No onboarding, GitLab, Telegram, or
-Codex command has been executed.
+Inventory snapshot: 2026-07-21, last operational update: 2026-07-22. The
+three-repository pilot, eight-repository validator wave, and two-repository
+non-runtime wave in this runbook were owner-approved and completed read-only.
+No onboarding, GitLab, Telegram, or Codex command has been executed.
 
 ## Safety boundary
 
@@ -36,11 +36,12 @@ The following clean `main` checkouts have already been connected read-only:
   `ms-go-git-validator`, `ms-go-http-runtime-validator`,
   `ms-go-linux-validator`, `ms-go-php-framework-validator`,
   `ms-go-statistic`, `ms-py-validator`,
-  `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`).
+  `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`);
+- `journal` (`archive`) and `prompts` (`policy`).
 
-The only additional repositories currently eligible for the next read-only
-connection wave are `journal` (`archive`) and `prompts` (`policy`). Both are
-clean, on `main`, and exactly match the live remote default HEAD.
+No additional repository currently satisfies all connection preconditions.
+Every remaining candidate needs an owner decision about branch/checkout
+hygiene first.
 
 The completed first pilot connected `ms-go-http-runtime-validator`,
 `ms-ts-nextjs-validator`, and `infra/messaging`. The completed second wave
@@ -48,6 +49,8 @@ connected `ms-go-cache-search-validator`, `ms-go-docker-validator`,
 `ms-go-git-validator`, `ms-go-linux-validator`,
 `ms-go-php-framework-validator`, `ms-go-statistic`, `ms-py-validator`, and
 `ms-ts-browser-runtime-validator`.
+The completed third wave connected local `prompts` and `journal` using their
+canonical remote names `ms-course-promts` and `ms-course-journal`.
 
 `journal`, `prompts`, and `wiki` are not loose generated directories. They are
 clean repositories with remotes and contain respectively 149, 20, and 32
@@ -135,7 +138,7 @@ become a project.
 
 ## Recommended connection order
 
-Steps 1–4 are complete:
+Steps 1–5 are complete:
 
 1. Recreated only the API and worker with the reviewed host-root mount.
 2. Ran the three-repository discovery pilot: one Go service, one TypeScript
@@ -146,13 +149,14 @@ Steps 1–4 are complete:
 4. Connected and reviewed the remaining eight clean `main` validators. Their
    Go/Python route evidence exposed two additional discovery gaps; the reports
    were regenerated as schema v4 and verified idempotent.
+5. Connected `prompts` and `journal` as non-runtime `policy` and `archive`
+   repositories. Discovery schema v6 suppresses runtime evidence from their
+   documentation/examples, records root policy Markdown by checksum, and
+   leaves runtime topology at 11 services.
 
 The follow-up branch-hygiene audit is also complete. Continue only with a new
 owner command:
 
-5. Connect `prompts` and `journal` as non-runtime `policy` and `archive`
-   repositories. Review their reports and verify that topology remains at 11
-   runtime services.
 6. After branch hygiene, connect platform anchors (`ms-gateway`, course,
    authentication, user/RBAC, storage, sandbox, student and related services),
    then rebuild topology and review contract drift. `ms-go-statistic` is
@@ -224,7 +228,7 @@ docker compose exec -T orchestrator /app/course-dev-orchestrator topology
 docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
 ```
 
-Current connected-catalog result after both waves and corrections:
+Connected-catalog result after the validator waves and corrections:
 
 - all eleven projects are `analyzed`, on clean `main` checkouts, with unchanged
   source HEADs;
@@ -240,8 +244,8 @@ Current connected-catalog result after both waves and corrections:
 - the database contains no onboarding runs, commands, GitLab links/events,
   Telegram updates, plans, or plan runs.
 
-The next reviewed command group has not been run yet. It is intentionally
-limited to the two clean non-runtime repositories:
+The third wave used these read-only commands. Report lookup uses canonical
+remote names rather than local directory names:
 
 ```sh
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
@@ -249,11 +253,29 @@ docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
   --path /projects/microservices/journal --role archive
 
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service prompts
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service journal
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-course-promts
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-course-journal
 docker compose exec -T orchestrator /app/course-dev-orchestrator topology
 docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
 ```
+
+Current result after the non-runtime wave and discovery schema v6:
+
+- all 13 projects are `analyzed`, on clean `main` checkouts, with unchanged
+  source HEADs;
+- `ms-course-promts` has 19 checksum-only policy instruction facts and no
+  runtime evidence; `ms-course-journal` has classification/purpose evidence
+  and no runtime evidence;
+- repeated scans reuse snapshot version 6 for the original pilot, version 5
+  for the validator wave, and version 3 for the non-runtime wave;
+- repeated topology rebuilds reuse the same revision and fingerprint. The
+  revision covers 13 projects but materializes only 11 runtime services, 31
+  capabilities, one ownership record, 25 contracts, no relations, and no
+  contract drift;
+- neither non-runtime project has rows in topology service, capability,
+  ownership, contract, or relation tables;
+- the database contains no onboarding runs, commands, GitLab links/events,
+  Telegram updates, plans, or plan runs.
 
 Stop after the reports if a role, branch, dirty flag, source path, ownership,
 contract, or evidence path is unexpected. Do not continue by guessing.

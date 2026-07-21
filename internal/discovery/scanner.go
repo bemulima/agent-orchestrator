@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 4
+const reportSchemaVersion = 6
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -99,6 +99,9 @@ func (s Scanner) Scan(
 	}
 	s.detectDerivedFacts(&state)
 	s.detectConflicts(&state)
+	if isNonRuntimeRepositoryRole(project.RepositoryRole) {
+		collector.removeFactCategories("capability", "contract", "infrastructure", "ownership", "relation")
+	}
 	collector.sort()
 	return domain.DiscoveryReport{
 		SchemaVersion:   reportSchemaVersion,
@@ -344,6 +347,21 @@ func (c *collector) conflict(name, value string, confidence float64, sourcePath,
 	c.conflicts = append(c.conflicts, evidence)
 }
 
+func (c *collector) removeFactCategories(categories ...string) {
+	excluded := make(map[string]struct{}, len(categories))
+	for _, category := range categories {
+		excluded[category] = struct{}{}
+	}
+	filtered := c.facts[:0]
+	for _, fact := range c.facts {
+		if _, remove := excluded[fact.Category]; remove {
+			continue
+		}
+		filtered = append(filtered, fact)
+	}
+	c.facts = filtered
+}
+
 func (c *collector) sort() {
 	sortEvidence := func(values []domain.Evidence) {
 		sort.Slice(values, func(i, j int) bool {
@@ -376,6 +394,16 @@ type detectorState struct {
 	nginxDetected   bool
 	composeDetected bool
 	aiKind          string
+}
+
+func isNonRuntimeRepositoryRole(role domain.RepositoryRole) bool {
+	switch role {
+	case domain.RepositoryRoleContent, domain.RepositoryRolePolicy,
+		domain.RepositoryRoleDocumentation, domain.RepositoryRoleArchive:
+		return true
+	default:
+		return false
+	}
 }
 
 func checksum(content []byte) string {

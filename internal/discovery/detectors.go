@@ -342,12 +342,16 @@ func (s Scanner) analyzePrompts(state *detectorState, path string, content []byt
 	base := strings.ToLower(filepath.Base(path))
 	isPrompt := strings.HasPrefix(lower, "prompts/") || strings.Contains(lower, "/prompts/") ||
 		base == "agents.md" || strings.HasPrefix(lower, ".ai/")
-	if !isPrompt {
+	isPolicyDocument := state.project.RepositoryRole == domain.RepositoryRolePolicy && strings.HasSuffix(lower, ".md")
+	if !isPrompt && !isPolicyDocument {
 		return
 	}
 	hash := checksum(content)
 	state.collector.fact("instruction", "instruction_file", hash, .98, path,
 		"The file contains repository or agent instructions; only its checksum is collected.")
+	if !isPrompt {
+		return
+	}
 	state.promptChecksums[base] = append(state.promptChecksums[base], promptChecksum{path: path, checksum: hash})
 }
 
@@ -355,10 +359,7 @@ func (s Scanner) detectDerivedFacts(state *detectorState) {
 	kind, confidence, explanation := domain.ServiceKindUnknown, .45, "No stronger runtime service-kind signal was found."
 	sourcePath := "."
 	switch {
-	case state.project.RepositoryRole == domain.RepositoryRolePolicy ||
-		state.project.RepositoryRole == domain.RepositoryRoleDocumentation ||
-		state.project.RepositoryRole == domain.RepositoryRoleArchive ||
-		state.project.RepositoryRole == domain.RepositoryRoleContent:
+	case isNonRuntimeRepositoryRole(state.project.RepositoryRole):
 		kind, confidence, explanation = domain.ServiceKindUnknown, .99,
 			"This repository role is intentionally not a runtime service kind."
 	case state.project.RepositoryRole == domain.RepositoryRoleFrontend || state.nextDetected:
