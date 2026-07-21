@@ -405,6 +405,15 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `go test -race ./...` passed. The rebuilt stack returned healthy liveness,
   PostgreSQL/Temporal readiness, and a successful real Temporal workflow
   probe.
+- Completed a fresh read-only branch-hygiene audit of all 21 remaining
+  runtime-primary repositories. Live GitHub default/branch refs were queried
+  without `fetch`; none is simultaneously clean, on the remote default branch,
+  and current. No target checkout or Git ref was changed.
+- Rechecked the deferred non-runtime/frontend/content group against live
+  remotes. `prompts` and `journal` are the only immediately eligible next
+  repositories: both are clean and exactly match `main`. `wiki`, both
+  frontends, and `knowledge-tree` remain deferred for branch or dirty-state
+  resolution.
 
 ## Remaining work
 
@@ -414,7 +423,7 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Exact next task
 
-Perform a fresh read-only branch-hygiene audit for the deferred platform
-anchors before deciding which group can be connected next. Do not change
-their branches or files, do not connect dirty/stale/worktree projects, and do
-not start onboarding.
+Await an explicit owner command to connect only `prompts` as `policy` and
+`journal` as `archive`, review both reports, and verify they remain excluded
+from runtime topology. Do not connect the deferred runtime/frontend/content
+repositories and do not start onboarding.

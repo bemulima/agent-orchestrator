@@ -16,8 +16,11 @@ Codex command has been executed.
   until the discovery report and proposed role have been reviewed.
 - A dirty checkout can be discovered, but it is not a valid execution base.
   Issue worktrees are never separate projects.
-- The branch/divergence observations below use local Git refs only. No fetch,
-  pull, checkout, reset, clean, or file deletion was performed.
+- The initial branch observations used local Git refs. The 2026-07-21
+  follow-up audit queried live default/branch refs with `git ls-remote` and
+  used the read-only GitHub compare API where the default commit was absent
+  from the local object database. No fetch, pull, checkout, reset, clean, or
+  file deletion was performed.
 
 ## Inventory conclusions
 
@@ -26,15 +29,18 @@ roots, 13 linked issue worktrees, and the non-Git parent `infra`. The nested
 `infra/messaging` directory is another primary Git root, producing 36 primary
 repositories in the microservices tree.
 
-The following clean `main` checkouts are eligible for a read-only pilot now:
+The following clean `main` checkouts have already been connected read-only:
 
 - `infra/messaging` (`infrastructure`);
 - `ms-go-cache-search-validator`, `ms-go-docker-validator`,
   `ms-go-git-validator`, `ms-go-http-runtime-validator`,
   `ms-go-linux-validator`, `ms-go-php-framework-validator`,
   `ms-go-statistic`, `ms-py-validator`,
-  `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`);
-- `journal` (`archive`) and `prompts` (`policy`).
+  `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`).
+
+The only additional repositories currently eligible for the next read-only
+connection wave are `journal` (`archive`) and `prompts` (`policy`). Both are
+clean, on `main`, and exactly match the live remote default HEAD.
 
 The completed first pilot connected `ms-go-http-runtime-validator`,
 `ms-ts-nextjs-validator`, and `infra/messaging`. The completed second wave
@@ -47,7 +53,8 @@ connected `ms-go-cache-search-validator`, `ms-go-docker-validator`,
 clean repositories with remotes and contain respectively 149, 20, and 32
 tracked files with no untracked files. Keep them independent and connect them
 as `archive`, `policy`, and `documentation`; do not copy their files into
-service repositories. `wiki` first needs its non-default branch reviewed.
+service repositories. `wiki` remains deferred: its current non-default branch
+is one commit behind the live remote `main`.
 
 The parent `microservices/infra` is not a repository and must not be connected.
 Its `messaging` child is a clean repository with ten tracked NATS configuration,
@@ -57,47 +64,49 @@ the nested path with role `infrastructure`.
 `/Users/marat/Developments/knowlege` does not exist. The likely intended path is
 `/Users/marat/Developments/knowledge-tree`, but that assumption requires owner
 confirmation. `knowledge-tree` belongs to role `content`; it is currently on
-`fix/issue-159`, 55 commits behind the locally recorded `origin/main`, with one
-modified registry file and 29 untracked `.DS_Store` files. Do not connect it
-until the intended branch and dirty state are resolved.
+`fix/issue-159`, 55 commits behind the live remote `main`, and that current
+branch is absent from the remote. It also has one modified registry file and
+29 untracked `.DS_Store` files. Do not connect it until the intended path,
+branch, and dirty state are resolved.
 
 ## Deferred primary checkouts
 
-These clean repositories are on a non-default branch or have a locally stale
-default checkout. Review the intended branch and synchronize it outside the
-orchestrator before connection. The values are a local-ref snapshot, not a
-network freshness claim.
+These repositories are on a non-default branch, are behind/diverged from the
+live remote default, or are dirty. Review the intended branch and synchronize
+them outside the orchestrator before connection. Ahead/behind values below
+compare the local checkout HEAD to the live remote `main` without fetching.
 
 | Repository | Current state |
 | --- | --- |
-| `go-ms-ai-summary` | `feat/issue-1`; remote default not recorded locally |
-| `ms-gateway` | `refactor/issue-27`; one commit behind local `origin/main` |
-| `ms-go-ai-prompt` | `refactor/issue-3`; remote default not recorded locally |
-| `ms-go-auth` | rename branch; one commit ahead of local `origin/main` |
-| `ms-go-code-validator` | `docs/agent-prompts-5`; diverged 7 behind/1 ahead |
-| `ms-go-course` | `refactor/issue-41`; 76 commits behind local `origin/main` |
-| `ms-go-filestorage` | rename branch; one commit ahead |
-| `ms-go-image-processor` | rename branch; one commit ahead |
-| `ms-go-pet-project-orchestrator` | `refactor/issue-6`; one commit behind |
-| `ms-go-php-validator` | rename branch; one commit behind |
-| `ms-go-rbac` | rename branch; one commit ahead |
-| `ms-go-sandbox` | rename branch; one commit ahead |
-| `ms-go-student` | `refactor/issue-17`; 19 commits behind |
-| `ms-go-tarantool` | rename branch; one commit ahead |
-| `ms-go-user` | rename branch; one commit ahead |
-| `ms-go-validation-orchestrator` | clean `main`; 16 commits behind local `origin/main` |
-| `ms-node-validator` | rename branch; one commit behind |
-| `ms-ts-css-validator` | rename branch; one commit ahead |
-| `ms-ts-html-validator` | `fix/issue-9`; one commit ahead |
-| `ms-ts-react-validator` | rename branch; one commit ahead |
-| `wiki` | `agent/rename-practice-task-docs`; one commit ahead |
-| `nextjs` | `refactor/issue-49`; one commit behind; role `frontend` |
-| `admin-nextjs` | `fix/admin-practice-task-nav`; one commit ahead; role `frontend` |
+| `go-ms-ai-summary` | `feat/issue-1`; 5 ahead; branch exists remotely |
+| `ms-gateway` | `refactor/issue-27`; 1 behind; branch exists remotely |
+| `ms-go-ai-prompt` | `refactor/issue-3`; 1 behind; branch exists remotely |
+| `ms-go-auth` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-code-validator` | `docs/agent-prompts-5`; diverged 11 behind/1 ahead; branch absent remotely |
+| `ms-go-course` | `refactor/issue-41`; 76 behind; branch exists remotely |
+| `ms-go-filestorage` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-image-processor` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-pet-project-orchestrator` | `refactor/issue-6`; 1 behind; branch exists remotely |
+| `ms-go-php-validator` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-rbac` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-sandbox` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-student` | `refactor/issue-17`; 19 behind; branch exists remotely |
+| `ms-go-tarantool` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-user` | rename branch; 1 behind; branch absent remotely |
+| `ms-go-validation-orchestrator` | `main`; 16 behind the live remote `main` |
+| `ms-node-validator` | rename branch; 5 behind; branch absent remotely |
+| `ms-ts-css-validator` | rename branch; 1 behind; branch absent remotely |
+| `ms-ts-html-validator` | `fix/issue-9`; 1 ahead; branch exists remotely |
+| `ms-ts-react-validator` | rename branch; 1 behind; branch absent remotely |
+| `wiki` | `agent/rename-practice-task-docs`; 1 behind; branch exists remotely |
+| `nextjs` | `refactor/issue-49`; 1 behind; branch exists remotely; role `frontend` |
+| `admin-nextjs` | `fix/admin-practice-task-nav`; 1 behind; branch exists remotely; role `frontend` |
 
-`ms-go-db-validator` is additionally dirty because `.cache/` contains 1,793
-untracked files. Discovery would exclude that cache content, but execution
-would reject the checkout as a dirty base, so defer it until repository hygiene
-is handled by the owner.
+`ms-go-db-validator` is on `docs/agent-prompts-3`, diverged 1 behind/1 ahead
+from the live remote `main`, and that branch is absent remotely. It is also
+dirty because `.cache/` contains 1,793 untracked files. Discovery would exclude
+that cache content, but execution would reject the checkout as a dirty base,
+so defer it until repository and branch hygiene are handled by the owner.
 
 `course-dev-orchestrator` itself is intentionally excluded from the first
 pilot. Managing the orchestrator with itself needs a separate self-management
@@ -138,20 +147,24 @@ Steps 1–4 are complete:
    Go/Python route evidence exposed two additional discovery gaps; the reports
    were regenerated as schema v4 and verified idempotent.
 
-Continue only with a new owner command:
+The follow-up branch-hygiene audit is also complete. Continue only with a new
+owner command:
 
-5. After branch hygiene, connect platform anchors (`ms-gateway`, course,
-   authentication, user/RBAC, storage, sandbox, student, statistic and related
-   services), then rebuild topology and review contract drift.
-6. Connect `nextjs` and `admin-nextjs` as `frontend` after their branch state is
+5. Connect `prompts` and `journal` as non-runtime `policy` and `archive`
+   repositories. Review their reports and verify that topology remains at 11
+   runtime services.
+6. After branch hygiene, connect platform anchors (`ms-gateway`, course,
+   authentication, user/RBAC, storage, sandbox, student and related services),
+   then rebuild topology and review contract drift. `ms-go-statistic` is
+   already connected.
+7. Connect `nextjs` and `admin-nextjs` as `frontend` after their branch state is
    approved.
-7. Connect `prompts`, `wiki`, and `journal` as non-runtime policy,
-   documentation, and archive repositories. These must not become topology
-   services.
-8. Connect `knowledge-tree` as `content` only after the path assumption,
+8. Connect `wiki` as `documentation` after its branch state is approved. It
+   must not become a topology service.
+9. Connect `knowledge-tree` as `content` only after the path assumption,
    branch, modified registry, and `.DS_Store` state are resolved.
-9. Only after all reports are reviewed, prepare onboarding proposals one
-   repository at a time. Proposal approval and apply remain separate commands.
+10. Only after all reports are reviewed, prepare onboarding proposals one
+    repository at a time. Proposal approval and apply remain separate commands.
 
 ## Reviewed commands
 
@@ -226,6 +239,21 @@ Current connected-catalog result after both waves and corrections:
   contracts, no relations, and no contract drift;
 - the database contains no onboarding runs, commands, GitLab links/events,
   Telegram updates, plans, or plan runs.
+
+The next reviewed command group has not been run yet. It is intentionally
+limited to the two clean non-runtime repositories:
+
+```sh
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
+  --path /projects/microservices/prompts --role policy
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
+  --path /projects/microservices/journal --role archive
+
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service prompts
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service journal
+docker compose exec -T orchestrator /app/course-dev-orchestrator topology
+docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
+```
 
 Stop after the reports if a role, branch, dirty flag, source path, ownership,
 contract, or evidence path is unexpected. Do not continue by guessing.
