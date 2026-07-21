@@ -14,17 +14,39 @@ const (
 	ProjectStatusFailed    ProjectStatus = "failed"
 )
 
+// RepositoryRole describes how a Git repository participates in the
+// orchestrator. It is deliberately separate from ServiceKind: policy,
+// documentation, archive, and content repositories are projects, but are not
+// runtime services and must not become service-topology nodes accidentally.
+type RepositoryRole string
+
+const (
+	RepositoryRoleService        RepositoryRole = "service"
+	RepositoryRoleFrontend       RepositoryRole = "frontend"
+	RepositoryRoleInfrastructure RepositoryRole = "infrastructure"
+	RepositoryRoleContent        RepositoryRole = "content"
+	RepositoryRolePolicy         RepositoryRole = "policy"
+	RepositoryRoleDocumentation  RepositoryRole = "documentation"
+	RepositoryRoleArchive        RepositoryRole = "archive"
+	RepositoryRoleUnknown        RepositoryRole = "unknown"
+)
+
 // Project is a repository managed by the orchestrator.
 type Project struct {
-	ID              string        `json:"id"`
-	Name            string        `json:"name"`
-	Status          ProjectStatus `json:"status"`
-	LocalPath       *string       `json:"local_path,omitempty"`
-	GitURL          *string       `json:"git_url,omitempty"`
-	DefaultBranch   string        `json:"default_branch"`
-	GitLabProjectID *int64        `json:"gitlab_project_id,omitempty"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	Status          ProjectStatus  `json:"status"`
+	RepositoryRole  RepositoryRole `json:"repository_role"`
+	SourceIdentity  string         `json:"source_identity"`
+	LocalPath       *string        `json:"local_path,omitempty"`
+	GitURL          *string        `json:"git_url,omitempty"`
+	DefaultBranch   string         `json:"default_branch"`
+	CurrentBranch   string         `json:"current_branch"`
+	HeadCommit      string         `json:"head_commit"`
+	IsDirty         bool           `json:"is_dirty"`
+	GitLabProjectID *int64         `json:"gitlab_project_id,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
 }
 
 type ServiceKind string
@@ -42,18 +64,21 @@ const (
 )
 
 type ServiceSnapshot struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"project_id"`
-	Version      int             `json:"version"`
-	CommitSHA    string          `json:"commit_sha"`
-	ServiceKind  ServiceKind     `json:"service_kind"`
-	Language     string          `json:"language"`
-	Framework    string          `json:"framework"`
-	Purpose      string          `json:"purpose"`
-	Confidence   float64         `json:"confidence"`
-	DiscoveredAt time.Time       `json:"discovered_at"`
-	RawReport    json.RawMessage `json:"raw_report"`
-	Status       string          `json:"status"`
+	ID              string          `json:"id"`
+	ProjectID       string          `json:"project_id"`
+	Version         int             `json:"version"`
+	CommitSHA       string          `json:"commit_sha"`
+	Branch          string          `json:"branch"`
+	IsDirty         bool            `json:"is_dirty"`
+	ContentChecksum string          `json:"content_checksum"`
+	ServiceKind     ServiceKind     `json:"service_kind"`
+	Language        string          `json:"language"`
+	Framework       string          `json:"framework"`
+	Purpose         string          `json:"purpose"`
+	Confidence      float64         `json:"confidence"`
+	DiscoveredAt    time.Time       `json:"discovered_at"`
+	RawReport       json.RawMessage `json:"raw_report"`
+	Status          string          `json:"status"`
 }
 
 type ServiceCapability struct {

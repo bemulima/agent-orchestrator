@@ -15,6 +15,9 @@ and engineering conventions come from the reference service.
   `internal/usecase`; their public entrypoint is `Handle`.
 - Infrastructure is isolated under `internal/adapters`. HTTP uses `chi`,
   PostgreSQL uses `pgx`, and Temporal integration has its own adapter.
+- Git checkout resolution is an adapter under `internal/adapters/git`; the
+  bounded detector engine is isolated under `internal/discovery` and depends
+  only on domain contracts.
 - HTTP handlers decode and validate DTOs, delegate to use cases, and render one
   shared JSON error envelope. They do not contain orchestration rules.
 - Repository interfaces accept `context.Context` as the first parameter.
@@ -28,6 +31,13 @@ and engineering conventions come from the reference service.
   improves assertions. Unit tests stay beside code; infrastructure tests live
   under `test/integration`.
 - Local tool caches live only under `.cache`.
+- Repository role and runtime `ServiceKind` are separate concepts. Content,
+  policy, documentation, and archive repositories never become runtime
+  topology nodes merely because they contain executable tooling.
+- Git source identity is normalized independently of checkout path. Local
+  worktrees use their common Git directory when no supported remote exists.
+- Discovery reports contain evidence provenance and immutable content
+  fingerprints; unchanged retries reuse an existing snapshot.
 
 ## Deliberate extensions required by this service
 

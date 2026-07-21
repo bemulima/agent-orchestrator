@@ -4,13 +4,19 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
+	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
 func TestInitialMigrationCreatesCoreTables(t *testing.T) {
@@ -65,6 +71,84 @@ ORDER BY tablename`)
 	}
 }
 
+func TestProjectRepositoryPersistsIdempotentDiscovery(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	repository := pgadapter.ProjectRepoPG{Pool: pool}
+	identity := "integration:" + uuid.NewString()
+	path := "/fixtures/" + uuid.NewString()
+	projectInput := domain.Project{
+		Name: "integration-project", Status: domain.ProjectStatusConnected,
+		RepositoryRole: domain.RepositoryRoleService, SourceIdentity: identity,
+		LocalPath: &path, DefaultBranch: "main", CurrentBranch: "main",
+		HeadCommit: "abc123", IsDirty: true,
+	}
+	project, err := repository.Upsert(context.Background(), projectInput)
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM audit_event WHERE resource_id = $1`, project.ID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, project.ID)
+	}()
+	duplicate, err := repository.Upsert(context.Background(), projectInput)
+	if err != nil {
+		t.Fatalf("duplicate Upsert() error = %v", err)
+	}
+	if duplicate.ID != project.ID {
+		t.Fatalf("duplicate ID = %q, want %q", duplicate.ID, project.ID)
+	}
+
+	now := time.Now().UTC()
+	report := domain.DiscoveryReport{
+		SchemaVersion: 1, ProjectID: project.ID, ProjectName: project.Name,
+		RepositoryRole: project.RepositoryRole, RepositoryPath: path,
+		CommitSHA: "abc123", Branch: "main", IsDirty: true,
+		ContentChecksum: "checksum-one",
+		StartedAt:       now, CompletedAt: now,
+		Facts: []domain.Evidence{{
+			Category: "classification", Name: "service_kind", Value: "backend_service",
+			Confidence: .9, SourcePath: "go.mod", Explanation: "fixture evidence",
+		}},
+	}
+	snapshotInput := domain.ServiceSnapshot{
+		CommitSHA: "abc123", Branch: "main", IsDirty: true,
+		ContentChecksum: "checksum-one",
+		ServiceKind:     domain.ServiceKindBackendService, Language: "go",
+		Confidence: .9, Status: string(domain.ProjectStatusAnalyzed),
+	}
+	first, err := repository.SaveDiscovery(context.Background(), project, snapshotInput, report)
+	if err != nil {
+		t.Fatalf("first SaveDiscovery() error = %v", err)
+	}
+	reused, err := repository.SaveDiscovery(context.Background(), project, snapshotInput, report)
+	if err != nil {
+		t.Fatalf("reused SaveDiscovery() error = %v", err)
+	}
+	if reused.ID != first.ID || reused.Version != 1 {
+		t.Fatalf("reused snapshot = %#v, want first snapshot", reused)
+	}
+	snapshotInput.ContentChecksum = "checksum-two"
+	report.ContentChecksum = "checksum-two"
+	second, err := repository.SaveDiscovery(context.Background(), project, snapshotInput, report)
+	if err != nil {
+		t.Fatalf("second distinct SaveDiscovery() error = %v", err)
+	}
+	if first.Version != 1 || second.Version != 2 {
+		t.Fatalf("distinct snapshot versions = %d, %d", first.Version, second.Version)
+	}
+	latest, latestReport, err := repository.GetLatestDiscovery(context.Background(), project.ID)
+	if err != nil {
+		t.Fatalf("GetLatestDiscovery() error = %v", err)
+	}
+	if latest.ID != second.ID || latestReport.CommitSHA != report.CommitSHA {
+		t.Fatalf("latest snapshot/report = %#v / %#v", latest, latestReport)
+	}
+	if !json.Valid(latest.RawReport) {
+		t.Fatalf("raw report is invalid JSON: %s", latest.RawReport)
+	}
+}
+
 func TestInitialMigrationEnforcesIdempotencyConstraints(t *testing.T) {
 	pool := integrationPool(t)
 	defer pool.Close()
@@ -77,12 +161,14 @@ func TestInitialMigrationEnforcesIdempotencyConstraints(t *testing.T) {
 		defer func() { _ = tx.Rollback(context.Background()) }()
 
 		_, err = tx.Exec(context.Background(), `
-INSERT INTO project (name, status, local_path) VALUES ('fixture', 'connected', '/fixtures/project')`)
+INSERT INTO project (name, status, local_path, source_identity)
+VALUES ('fixture', 'connected', '/fixtures/project', 'local:/fixtures/project')`)
 		if err != nil {
 			t.Fatalf("insert first project: %v", err)
 		}
 		_, err = tx.Exec(context.Background(), `
-INSERT INTO project (name, status, local_path) VALUES ('fixture-duplicate', 'connected', '/fixtures/project')`)
+INSERT INTO project (name, status, local_path, source_identity)
+VALUES ('fixture-duplicate', 'connected', '/fixtures/project', 'local:/fixtures/project-duplicate')`)
 		assertUniqueViolation(t, err)
 	})
 

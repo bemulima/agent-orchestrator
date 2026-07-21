@@ -1,0 +1,3 @@
+# Rules
+
+Never squash commits.

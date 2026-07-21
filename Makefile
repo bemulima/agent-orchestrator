@@ -14,8 +14,14 @@ HTTP_PORT ?= 8080
 TEMPORAL_UI_PORT ?= 8233
 GO_ENV := XDG_CACHE_HOME=$(CURDIR)/.cache GOCACHE=$(CURDIR)/.cache/go-build GOMODCACHE=$(CURDIR)/.cache/gomod GOBIN=$(CURDIR)/.cache/bin
 GO_FILES := $$(find . -type f -name '*.go' -not -path './.cache/*')
+COMMAND_PATH ?= /usr/local/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ifeq ($(origin PATH),command line)
+PROJECT_PATH_FROM_PATH := $(PATH)
+override PATH := $(COMMAND_PATH)
+endif
+CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check fmt fmt-check lint test test-unit test-integration verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe config-check project-connect project-list project-show project-scan project-report fmt fmt-check lint test test-unit test-integration verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -65,6 +71,26 @@ workflow-probe: ## Execute the system probe workflow through Temporal
 config-check: ## Validate environment and print a secret-free summary
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator config-check
 
+project-connect: ## Connect and scan a project (PATH=.../PROJECT_PATH=... or GIT_URL=..., optional ROLE=...)
+	@if [ -n "$(CONNECT_PATH)" ] && [ -n "$(GIT_URL)" ]; then echo "Set only PATH/PROJECT_PATH or GIT_URL"; exit 2; fi
+	@if [ -z "$(CONNECT_PATH)" ] && [ -z "$(GIT_URL)" ]; then echo "Set PATH/PROJECT_PATH or GIT_URL"; exit 2; fi
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-connect $(if $(CONNECT_PATH),--path "$(CONNECT_PATH)",--git-url "$(GIT_URL)") --role "$(or $(ROLE),service)"
+
+project-list: ## List connected projects
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-list
+
+project-show: ## Show a project by SERVICE=id-or-name
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-show --service "$(SERVICE)"
+
+project-scan: ## Run read-only discovery for SERVICE=id-or-name
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-scan --service "$(SERVICE)"
+
+project-report: ## Show latest discovery report for SERVICE=id-or-name
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-report --service "$(SERVICE)"
+
 fmt: ## Format Go source files
 	@gofmt -w $(GO_FILES)
 
@@ -80,7 +106,7 @@ test-unit: ## Run unit and Temporal workflow tests
 	$(GO_ENV) go test ./...
 
 test-integration: ## Run PostgreSQL integration tests against the local stack
-	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" $(GO_ENV) go test -tags=integration ./test/integration/...
+	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" $(GO_ENV) go test -count=1 -tags=integration ./test/integration/...
 
 compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet

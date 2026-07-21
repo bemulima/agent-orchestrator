@@ -29,6 +29,10 @@ type Config struct {
 	RepositoryAllowedRoots []string `envconfig:"REPOSITORY_ALLOWED_ROOTS" default:"/projects" validate:"required,min=1,dive,required"`
 	RepositoryStoragePath  string   `envconfig:"REPOSITORY_STORAGE_PATH" default:"/data/repositories" validate:"required"`
 	WorktreeStoragePath    string   `envconfig:"WORKTREE_STORAGE_PATH" default:"/data/worktrees" validate:"required"`
+	DiscoveryMaxFiles      int      `envconfig:"DISCOVERY_MAX_FILES" default:"10000" validate:"min=1,max=100000"`
+	DiscoveryMaxFileBytes  int64    `envconfig:"DISCOVERY_MAX_FILE_BYTES" default:"1048576" validate:"min=1024,max=10485760"`
+	DiscoveryMaxTotalBytes int64    `envconfig:"DISCOVERY_MAX_TOTAL_BYTES" default:"20971520" validate:"min=1024,max=104857600"`
+	DiscoveryMaxDepth      int      `envconfig:"DISCOVERY_MAX_DEPTH" default:"24" validate:"min=1,max=100"`
 
 	MaxTaskAttempts      int `envconfig:"MAX_TASK_ATTEMPTS" default:"3" validate:"min=1,max=3"`
 	MaxReviewAttempts    int `envconfig:"MAX_REVIEW_ATTEMPTS" default:"2" validate:"min=1,max=2"`
@@ -118,6 +122,10 @@ type Summary struct {
 	RepositoryAllowedRoots   []string `json:"repository_allowed_roots"`
 	RepositoryStoragePath    string   `json:"repository_storage_path"`
 	WorktreeStoragePath      string   `json:"worktree_storage_path"`
+	DiscoveryMaxFiles        int      `json:"discovery_max_files"`
+	DiscoveryMaxFileBytes    int64    `json:"discovery_max_file_bytes"`
+	DiscoveryMaxTotalBytes   int64    `json:"discovery_max_total_bytes"`
+	DiscoveryMaxDepth        int      `json:"discovery_max_depth"`
 	MaxTaskAttempts          int      `json:"max_task_attempts"`
 	MaxReviewAttempts        int      `json:"max_review_attempts"`
 	MaxReplans               int      `json:"max_replans"`
@@ -148,6 +156,10 @@ func (c Config) SafeSummary() Summary {
 		RepositoryAllowedRoots:   append([]string(nil), c.RepositoryAllowedRoots...),
 		RepositoryStoragePath:    c.RepositoryStoragePath,
 		WorktreeStoragePath:      c.WorktreeStoragePath,
+		DiscoveryMaxFiles:        c.DiscoveryMaxFiles,
+		DiscoveryMaxFileBytes:    c.DiscoveryMaxFileBytes,
+		DiscoveryMaxTotalBytes:   c.DiscoveryMaxTotalBytes,
+		DiscoveryMaxDepth:        c.DiscoveryMaxDepth,
 		MaxTaskAttempts:          c.MaxTaskAttempts,
 		MaxReviewAttempts:        c.MaxReviewAttempts,
 		MaxReplans:               c.MaxReplans,

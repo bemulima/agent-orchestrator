@@ -4,9 +4,10 @@ Last updated: 2026-07-20
 
 ## Current status
 
-Stage 1 is complete and verified. The clean Docker Compose stack is currently
+Stages 1 and 2 are complete and verified. The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-Stages 2–8 have not been implemented and are not represented by placeholders.
+No user repository has been connected. Stages 3–8 have not been implemented
+and are not represented by placeholders.
 
 ## Completed
 
@@ -37,6 +38,32 @@ Stages 2–8 have not been implemented and are not represented by placeholders.
   integration tests, and verification.
 - Verified a clean first start after deleting only the disposable test volumes;
   Temporal auto-setup created its own databases successfully.
+- Added a reversible Stage 2 schema for repository roles, normalized source
+  identity, branch/commit/dirty state, and idempotent discovery fingerprints.
+- Implemented the pgx `ProjectRepository`, transactional audit events,
+  idempotent project upsert, immutable versioned snapshots, latest-report
+  lookup, and unchanged-snapshot reuse.
+- Implemented allowlisted local Git resolution with canonical/symlink checks,
+  worktree deduplication through Git common-dir identity, remote/default-branch
+  detection, and clean/dirty state capture.
+- Implemented validated HTTPS/HTTP/SSH/scp Git URLs, credential rejection,
+  normalized cross-protocol identity, collision-safe managed clone paths, and
+  no-overwrite/idempotent clone behavior.
+- Added repository roles separate from runtime service kinds: service,
+  frontend, infrastructure, content, policy, documentation, archive, and
+  unknown.
+- Implemented bounded read-only discovery with file/byte/depth limits,
+  explicit cache/build/dependency exclusions, no private `.env` reads, key and
+  certificate exclusions, and sanitized environment-example key extraction.
+- Added evidence-rich detectors for stack, runtime service kind, purpose,
+  capabilities, ownership, HTTP/event/database contracts, gateway/frontend/
+  infrastructure relations, repository commands, prompts, existing `.ai`, and
+  conflicts.
+- Added project connect/list/show/scan/report operations through CLI, Make, and
+  the five Stage 2 `/api/v1/projects` endpoints.
+- Added fixtures for Go, Next.js, gateway, infrastructure, prompts, existing
+  `.ai`, conflicts, and unknown repositories, plus disposable Git and
+  PostgreSQL integration coverage.
 
 ## Files changed
 
@@ -45,14 +72,16 @@ Stages 2–8 have not been implemented and are not represented by placeholders.
 - Entrypoint: `cmd/course-dev-orchestrator/main.go`.
 - Domain/config: `internal/config/*`, `internal/domain/*`.
 - Application/transport: `internal/usecase/health/*`,
+  `internal/usecase/project/*`,
   `internal/adapters/http/*`.
-- Infrastructure: `internal/adapters/postgres/*`,
+- Infrastructure: `internal/adapters/git/*`, `internal/adapters/postgres/*`,
+  `internal/discovery/*`,
   `internal/adapters/temporal/*`, `internal/activities/*`,
   `internal/workflow/*`.
 - Database/runtime: `db/migrations/*`, `scripts/migrate*.sh`,
   `docker/Dockerfile`.
 - Tests: package-local `*_test.go` files and
-  `test/integration/postgres_schema_test.go`.
+  `test/integration/postgres_schema_test.go`, plus Stage 2 discovery fixtures.
 - Documentation: `docs/architecture-conventions.md`,
   `docs/implementation-plan.md`, `docs/progress.md`.
 
@@ -70,17 +99,27 @@ Stages 2–8 have not been implemented and are not represented by placeholders.
 - `GET /health` and `GET /ready` — returned HTTP 200 with `status=ok`.
 - `make workflow-probe` — passed through the real Temporal worker and returned
   structured `status=ok` output.
+- Reversible `002` and `003` Stage 2 migrations — rolled back and reapplied
+  successfully.
+- Stage 2 `make test-integration` — passed without Go test cache; pgx project
+  upsert, snapshot versioning/reuse, report JSON, and schema constraints were
+  exercised against PostgreSQL 16.
+- Disposable command E2E — `project-connect`, `project-list`, `project-show`,
+  `project-scan`, and `project-report` passed; repeated scan reused the same
+  snapshot and all fixture DB/filesystem state was removed afterward.
+- Stage 2 `go test -race ./...` and `make verify` — passed.
+- Rebuilt Docker Compose stack — all services running; `/health`, `/ready`,
+  `/api/v1/projects`, and the Temporal workflow probe passed.
 
 ## Remaining work
 
-- Stage 2: project persistence, idempotent local/Git connection, allowlisted
-  path resolution, read-only discovery, evidence reports, fixtures, and tests.
 - Stages 3–8 remain as specified in `docs/implementation-plan.md`; in
   particular `.ai` onboarding, topology, planning, Codex runner, GitLab, and
   Telegram are not yet implemented.
 
 ## Exact next task
 
-Implement `ProjectRepository` with pgx and its repository tests, then implement
-`ConnectProject` for canonical local paths with `REPOSITORY_ALLOWED_ROOTS`
-enforcement and idempotency before adding Git clone support or discovery.
+Implement Stage 3 proposal persistence and the read-only onboarding generator:
+build evidence-backed `.ai/*` and `AGENTS.md` merge proposals, preserve existing
+instructions, store unified diffs without touching source checkouts, and add
+approval/rejection plus dry-run tests before any worktree write path.

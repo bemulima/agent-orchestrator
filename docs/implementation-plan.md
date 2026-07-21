@@ -46,6 +46,8 @@ Acceptance:
 
 ## Stage 2 — projects and read-only discovery
 
+Status: completed and verified on 2026-07-20.
+
 Scope:
 
 - idempotent local-path and Git URL connection;

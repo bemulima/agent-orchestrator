@@ -14,8 +14,9 @@ import (
 
 // RouterDependencies collects HTTP handlers and cross-cutting dependencies.
 type RouterDependencies struct {
-	HealthHandler handlers.HealthHandler
-	Logger        *zap.Logger
+	HealthHandler  handlers.HealthHandler
+	ProjectHandler *handlers.ProjectHandler
+	Logger         *zap.Logger
 }
 
 // NewRouter builds the chi router.
@@ -30,6 +31,13 @@ func NewRouter(deps RouterDependencies) http.Handler {
 
 	root.Get("/health", deps.HealthHandler.Health)
 	root.Get("/ready", deps.HealthHandler.Ready)
+	if deps.ProjectHandler != nil {
+		root.Get("/api/v1/projects", deps.ProjectHandler.ListProjects)
+		root.Post("/api/v1/projects/connect", deps.ProjectHandler.ConnectProject)
+		root.Get("/api/v1/projects/{projectId}", deps.ProjectHandler.GetProject)
+		root.Post("/api/v1/projects/{projectId}/scan", deps.ProjectHandler.ScanProject)
+		root.Get("/api/v1/projects/{projectId}/reports/latest", deps.ProjectHandler.LatestDiscoveryReport)
+	}
 
 	root.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		handlers.WriteError(w, http.StatusNotFound, "not_found", "resource not found")

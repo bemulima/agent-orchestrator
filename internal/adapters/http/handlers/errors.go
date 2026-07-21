@@ -2,12 +2,34 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+
+	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
 type ErrorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// WriteDomainError maps stable domain errors to the shared API envelope and
+// avoids leaking adapter details for unexpected failures.
+func WriteDomainError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrValidation):
+		WriteError(w, http.StatusBadRequest, "validation_error", err.Error())
+	case errors.Is(err, domain.ErrForbidden):
+		WriteError(w, http.StatusForbidden, "forbidden", "repository source is not allowed")
+	case errors.Is(err, domain.ErrNotFound):
+		WriteError(w, http.StatusNotFound, "not_found", "resource not found")
+	case errors.Is(err, domain.ErrConflict):
+		WriteError(w, http.StatusConflict, "conflict", err.Error())
+	case errors.Is(err, domain.ErrInvalidStatus):
+		WriteError(w, http.StatusConflict, "invalid_status", err.Error())
+	default:
+		WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+	}
 }
 
 type ErrorResponse struct {
