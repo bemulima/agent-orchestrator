@@ -104,6 +104,88 @@ func validate(request Request) bool {
 	}
 }
 
+func TestScanner_ClassifiesPythonServiceAsBackend(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.py"), []byte("print('fixture')\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "python-service", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "stack", "language", "python")
+	assertFact(t, report.Facts, "classification", "service_kind", "backend_service")
+}
+
+func TestScanner_ClassifiesPHPServiceAsBackend(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.php"), []byte("<?php echo 'fixture';\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "php-service", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "stack", "language", "php")
+	assertFact(t, report.Facts, "classification", "service_kind", "backend_service")
+}
+
+func TestScanner_DetectsGoServeMuxRoutes(t *testing.T) {
+	root := t.TempDir()
+	content := `package fixture
+
+import "net/http"
+
+func routes(mux *http.ServeMux) {
+	mux.HandleFunc("/health", func(http.ResponseWriter, *http.Request) {})
+	mux.HandleFunc("/api/v1/validate", func(_ http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost { return }
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "server.go"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "go-http", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "contract", "http_produce", "GET /health")
+	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/validate")
+}
+
+func TestScanner_DetectsPythonBaseHTTPHandlerRoutes(t *testing.T) {
+	root := t.TempDir()
+	content := `from http.server import BaseHTTPRequestHandler
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            return
+
+    def do_POST(self):
+        if self.path != "/api/v1/validate":
+            return
+`
+	if err := os.WriteFile(filepath.Join(root, "server.py"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "python-http", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "contract", "http_produce", "GET /health")
+	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/validate")
+}
+
 func TestScanner_DoesNotReadEnvironmentSecrets(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SUPER_SECRET=must-not-appear"), 0o600); err != nil {

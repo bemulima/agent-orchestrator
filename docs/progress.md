@@ -7,10 +7,9 @@ Last updated: 2026-07-21
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-Three owner-approved pilot repositories are connected read-only:
-`ms-go-http-runtime-validator`, `ms-ts-nextjs-validator`, and
-`ms-infra-messaging`. Their source checkouts remain clean and no onboarding,
-Codex, GitLab, or Telegram operation has been started. Stage 6 verification
+Eleven owner-approved repositories are connected read-only: ten validators
+and `ms-infra-messaging`. Their source checkouts remain clean and no
+onboarding, Codex, GitLab, or Telegram operation has been started. Stage 6 verification
 used only in-memory fakes, disposable Git repositories, and disposable
 PostgreSQL records. No live Codex request was made without an explicitly
 configured key.
@@ -383,23 +382,39 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - The pilot exposed and fixed name-based project lookup passing names into a
   PostgreSQL UUID query, plus generic request values being misclassified as
   NATS subjects. Regression tests cover both defects.
-- Discovery report schema v2 now participates in snapshot reuse. Corrected
-  reports created version-2 snapshots at unchanged commits; repeated scans
-  reused those snapshots instead of duplicating them.
-- Rebuilt the corrected pilot topology twice. The second rebuild reused the
-  corrected revision; it contains three services, nine capabilities, two HTTP
-  contracts, no drift, and event subjects only from the messaging stream
-  definitions.
+- Completed the owner-approved second read-only wave for
+  `ms-go-cache-search-validator`, `ms-go-docker-validator`,
+  `ms-go-git-validator`, `ms-go-linux-validator`,
+  `ms-go-php-framework-validator`, `ms-go-statistic`, `ms-py-validator`, and
+  `ms-ts-browser-runtime-validator`.
+- Discovery report schema v4 now recognizes Python/PHP runtime evidence,
+  classifies Python service repositories correctly, and extracts contracts
+  from Go `net/http` `HandleFunc` registrations and Python
+  `BaseHTTPRequestHandler` methods. Regression tests cover both route styles.
+- Regenerated all eleven reports at unchanged commits. Every report is
+  bounded and non-truncated; repeated scans reused snapshot version 4 for the
+  original pilot and version 3 for the second wave.
+- Rebuilt the eleven-project topology repeatedly. The same revision and
+  fingerprint were reused; it contains 11 services, 31 capabilities, one
+  ownership record, 25 contracts, no relations, and no contract drift.
+- Rechecked every connected source checkout after discovery. All remain on
+  clean `main`, and their stored/current HEADs match. Database audit reports
+  zero onboarding runs, commands, GitLab links/events, Telegram updates,
+  plans, and plan runs.
+- Second-wave final verification — `make test-integration`, `make verify`, and
+  `go test -race ./...` passed. The rebuilt stack returned healthy liveness,
+  PostgreSQL/Temporal readiness, and a successful real Temporal workflow
+  probe.
 
 ## Remaining work
 
 - No implementation stage remains for the specified MVP.
-- The next read-only connection wave and later onboarding remain separate,
+- Remaining repository connections and later onboarding remain separate,
   owner-authorized operational steps.
 
 ## Exact next task
 
-Await an explicit owner command to connect the remaining clean `main`
-validators listed in `docs/repository-onboarding-runbook.md`, review every
-report, and rebuild topology. Do not connect deferred/dirty/worktree projects
-and do not start onboarding.
+Perform a fresh read-only branch-hygiene audit for the deferred platform
+anchors before deciding which group can be connected next. Do not change
+their branches or files, do not connect dirty/stale/worktree projects, and do
+not start onboarding.

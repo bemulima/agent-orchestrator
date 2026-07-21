@@ -1,8 +1,9 @@
 # Repository onboarding runbook
 
-Inventory snapshot: 2026-07-21. The three-repository read-only pilot in this
-runbook was owner-approved and completed on the same date. No onboarding,
-GitLab, Telegram, or Codex command has been executed.
+Inventory snapshot: 2026-07-21. The three-repository pilot and the subsequent
+eight-repository validator wave in this runbook were owner-approved and
+completed read-only on the same date. No onboarding, GitLab, Telegram, or
+Codex command has been executed.
 
 ## Safety boundary
 
@@ -35,9 +36,9 @@ The following clean `main` checkouts are eligible for a read-only pilot now:
   `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`);
 - `journal` (`archive`) and `prompts` (`policy`).
 
-The completed pilot connected `ms-go-http-runtime-validator`,
-`ms-ts-nextjs-validator`, and `infra/messaging`. The remaining clean service
-wave is `ms-go-cache-search-validator`, `ms-go-docker-validator`,
+The completed first pilot connected `ms-go-http-runtime-validator`,
+`ms-ts-nextjs-validator`, and `infra/messaging`. The completed second wave
+connected `ms-go-cache-search-validator`, `ms-go-docker-validator`,
 `ms-go-git-validator`, `ms-go-linux-validator`,
 `ms-go-php-framework-validator`, `ms-go-statistic`, `ms-py-validator`, and
 `ms-ts-browser-runtime-validator`.
@@ -125,18 +126,20 @@ become a project.
 
 ## Recommended connection order
 
-Steps 1–3 are complete:
+Steps 1–4 are complete:
 
 1. Recreated only the API and worker with the reviewed host-root mount.
 2. Ran the three-repository discovery pilot: one Go service, one TypeScript
    service, and messaging infrastructure.
-3. Reviewed each discovery report and confirmed bounded inventory, roles,
-   clean source state, and evidence paths. Two orchestrator defects found by
-   the review were corrected and the reports were regenerated as schema v2.
+3. Reviewed each pilot report and confirmed bounded inventory, roles, clean
+   source state, and evidence paths. Two orchestrator defects found by the
+   review were corrected.
+4. Connected and reviewed the remaining eight clean `main` validators. Their
+   Go/Python route evidence exposed two additional discovery gaps; the reports
+   were regenerated as schema v4 and verified idempotent.
 
 Continue only with a new owner command:
 
-4. Connect the remaining clean `main` validators.
 5. After branch hygiene, connect platform anchors (`ms-gateway`, course,
    authentication, user/RBAC, storage, sandbox, student, statistic and related
    services), then rebuild topology and review contract drift.
@@ -185,18 +188,44 @@ docker compose exec -T orchestrator /app/course-dev-orchestrator topology
 docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
 ```
 
-Pilot result after corrections:
+The second wave used the same read-only command boundary:
 
-- all three projects are `analyzed`, on clean `main` checkouts, with unchanged
+```sh
+validators=(
+  ms-go-cache-search-validator
+  ms-go-docker-validator
+  ms-go-git-validator
+  ms-go-linux-validator
+  ms-go-php-framework-validator
+  ms-go-statistic
+  ms-py-validator
+  ms-ts-browser-runtime-validator
+)
+for validator in "${validators[@]}"; do
+  docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
+    --path "/projects/microservices/${validator}" --role service
+  docker compose exec -T orchestrator /app/course-dev-orchestrator project-report \
+    --service "${validator}"
+done
+docker compose exec -T orchestrator /app/course-dev-orchestrator topology
+docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
+```
+
+Current connected-catalog result after both waves and corrections:
+
+- all eleven projects are `analyzed`, on clean `main` checkouts, with unchanged
   source HEADs;
-- name-based `project-report` and `project-scan` work for all three projects;
-- discovery schema v2 removed the false `server.py`, `workspace.root_path`, and
-  `nextjs.app` event capabilities;
-- repeated scans reused snapshot version 2, and repeated topology rebuilds
-  reused the corrected revision;
-- the topology has three services, nine capabilities, two HTTP contracts, no
-  relations, and no contract drift; the seven remaining event capabilities all
-  originate from `infra/messaging/streams/*.json`.
+- name-based `project-report` and `project-scan` work for every project;
+- discovery schema v4 excludes false generic request values, recognizes
+  Python as a backend runtime, and extracts Go `net/http` and Python
+  `BaseHTTPRequestHandler` contracts;
+- repeated scans reuse snapshot version 4 for the original three projects and
+  version 3 for the second wave; repeated topology rebuilds reuse the same
+  revision and fingerprint;
+- the topology has 11 services, 31 capabilities, one ownership record, 25
+  contracts, no relations, and no contract drift;
+- the database contains no onboarding runs, commands, GitLab links/events,
+  Telegram updates, plans, or plan runs.
 
 Stop after the reports if a role, branch, dirty flag, source path, ownership,
 contract, or evidence path is unexpected. Do not continue by guessing.
@@ -212,4 +241,4 @@ docker compose exec -T orchestrator /app/course-dev-orchestrator project-apply -
 ```
 
 The approval and final apply commands are examples only. They must not be run
-in bulk and are not authorized merely by completing the discovery pilot.
+in bulk and are not authorized merely by completing the discovery waves.

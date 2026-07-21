@@ -41,6 +41,11 @@ and engineering conventions come from the reference service.
   discovery schema version also matches. Detector-semantic changes increment
   that version so a corrected report can supersede an older snapshot without
   pretending repository content changed.
+- HTTP discovery uses framework registrations plus bounded runtime-specific
+  parsing for Go `net/http` `HandleFunc` handlers and Python
+  `BaseHTTPRequestHandler` methods. Unrestricted conventional health handlers
+  are treated as `GET`; other unrestricted Go handlers remain `ANY` unless an
+  explicit method guard is present.
 - Onboarding proposals are deterministic artifacts stored before approval.
   User-authored YAML/Markdown wins on conflict, while every difference remains
   visible in the proposal and unified diff.

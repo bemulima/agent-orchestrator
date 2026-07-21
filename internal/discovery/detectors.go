@@ -105,9 +105,11 @@ func (s Scanner) detectStack(state *detectorState, path, base, content string) {
 			state.collector.fact("stack", "framework", "nginx", .98, path, "Nginx configuration is present.")
 		}
 		if strings.HasSuffix(base, ".py") {
+			state.pythonDetected = true
 			state.collector.fact("stack", "language", "python", .82, path, "Python source code is present.")
 		}
 		if strings.HasSuffix(base, ".php") {
+			state.phpDetected = true
 			state.collector.fact("stack", "language", "php", .82, path, "PHP source code is present.")
 		}
 	}
@@ -138,14 +140,11 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 	for _, match := range httpRoutePattern.FindAllStringSubmatch(content, -1) {
 		method := strings.ToUpper(match[1])
 		route := match[2]
-		if !looksLikeRoute(route) {
-			continue
-		}
-		state.collector.fact("capability", "http_route", method+" "+route, .84, path,
+		collectHTTPRoute(state, method, route, .84, path,
 			"A route registration or controller decorator exposes this HTTP operation.")
-		state.collector.fact("contract", "http_produce", method+" "+route, .84, path,
-			"The service implementation provides this HTTP contract.")
 	}
+	s.extractGoHTTPRoutes(state, path, content)
+	s.extractPythonHTTPRoutes(state, path, content)
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
 		if !strings.Contains(lower, "nats") && !strings.Contains(lower, "subject") &&
@@ -165,6 +164,69 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 			}
 		}
 	}
+}
+
+func (s Scanner) extractGoHTTPRoutes(state *detectorState, path, content string) {
+	if !strings.HasSuffix(strings.ToLower(path), ".go") {
+		return
+	}
+	matches := goHandleFuncPattern.FindAllStringSubmatchIndex(content, -1)
+	for index, match := range matches {
+		route := content[match[2]:match[3]]
+		end := len(content)
+		if index+1 < len(matches) {
+			end = matches[index+1][0]
+		}
+		block := content[match[0]:end]
+		method := "ANY"
+		confidence := .72
+		explanation := "A net/http HandleFunc registration exposes this route without a single-method guard."
+		if methodMatch := goHTTPMethodPattern.FindStringSubmatch(block); methodMatch != nil {
+			method = strings.ToUpper(methodMatch[1])
+			confidence = .86
+			explanation = "A net/http HandleFunc registration and method guard expose this HTTP operation."
+		} else if isHealthRoute(route) {
+			method = "GET"
+			explanation = "An unrestricted net/http health handler exposes the conventional GET health operation."
+		}
+		collectHTTPRoute(state, method, route, confidence, path, explanation)
+	}
+}
+
+func (s Scanner) extractPythonHTTPRoutes(state *detectorState, path, content string) {
+	if !strings.HasSuffix(strings.ToLower(path), ".py") {
+		return
+	}
+	handlers := pythonHandlerPattern.FindAllStringSubmatchIndex(content, -1)
+	for index, handler := range handlers {
+		method := strings.ToUpper(content[handler[2]:handler[3]])
+		end := len(content)
+		if index+1 < len(handlers) {
+			end = handlers[index+1][0]
+		}
+		block := content[handler[0]:end]
+		for _, pathMatch := range pythonPathPattern.FindAllStringSubmatch(block, -1) {
+			collectHTTPRoute(state, method, pathMatch[1], .86, path,
+				"A Python BaseHTTPRequestHandler method checks and serves this HTTP path.")
+		}
+	}
+}
+
+func collectHTTPRoute(
+	state *detectorState,
+	method string,
+	route string,
+	confidence float64,
+	path string,
+	explanation string,
+) {
+	if !looksLikeRoute(route) {
+		return
+	}
+	value := method + " " + route
+	state.collector.fact("capability", "http_route", value, confidence, path, explanation)
+	state.collector.fact("contract", "http_produce", value, confidence, path,
+		"The service implementation provides this HTTP contract.")
 }
 
 func (s Scanner) extractOwnership(state *detectorState, path, content string) {
@@ -317,9 +379,9 @@ func (s Scanner) detectDerivedFacts(state *detectorState) {
 	case strings.Contains(state.project.Name, "filestorage") || strings.Contains(state.project.Name, "tarantool"):
 		kind, confidence, explanation = domain.ServiceKindStorageService, .84,
 			"The canonical repository name and detected database/container evidence identify a storage service."
-	case state.goDetected || state.nodeDetected:
+	case state.goDetected || state.nodeDetected || state.pythonDetected || state.phpDetected:
 		kind, confidence, explanation = domain.ServiceKindBackendService, .80,
-			"Go or Node.js runtime manifests identify a backend service, with no stronger specialized kind signal."
+			"Detected runtime source or manifests identify a backend service, with no stronger specialized kind signal."
 	}
 	if sourcePath == "" {
 		sourcePath = "."
@@ -362,6 +424,11 @@ func (s Scanner) detectConflicts(state *detectorState) {
 
 func looksLikeRoute(value string) bool {
 	return strings.HasPrefix(value, "/") && len(value) <= 512 && !strings.ContainsAny(value, "\n\r")
+}
+
+func isHealthRoute(value string) bool {
+	value = strings.TrimSuffix(strings.ToLower(value), "/")
+	return value == "/health" || value == "/ready" || value == "/readiness" || value == "/liveness"
 }
 
 func isComposeFile(base string) bool {

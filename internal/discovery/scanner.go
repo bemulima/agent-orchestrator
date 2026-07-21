@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 2
+const reportSchemaVersion = 4
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -28,6 +28,10 @@ var excludedDirectories = map[string]struct{}{
 
 var (
 	httpRoutePattern      = regexp.MustCompile(`(?i)(?:\.|@)(get|post|put|patch|delete|options|head)\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
+	goHandleFuncPattern   = regexp.MustCompile(`(?m)(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?HandleFunc\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
+	goHTTPMethodPattern   = regexp.MustCompile(`(?i)\.Method\s*!=\s*http\.Method(Get|Post|Put|Patch|Delete|Options|Head)`)
+	pythonHandlerPattern  = regexp.MustCompile(`(?m)^\s*def\s+do_(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s*\(`)
+	pythonPathPattern     = regexp.MustCompile(`self\.path\s*(?:==|!=)\s*["']([^"']+)["']`)
 	databaseTablePattern  = regexp.MustCompile(`(?i)create\s+table\s+(?:if\s+not\s+exists\s+)?(?:["` + "`" + `]?[a-zA-Z0-9_-]+["` + "`" + `]?\.)?["` + "`" + `]?([a-zA-Z][a-zA-Z0-9_-]*)`)
 	environmentKeyPattern = regexp.MustCompile(`(?m)^([A-Z][A-Z0-9_]*)\s*=`)
 	makeTargetPattern     = regexp.MustCompile(`(?m)^([a-zA-Z0-9][a-zA-Z0-9_.-]*):(?:[^=]|$)`)
@@ -366,6 +370,8 @@ type detectorState struct {
 	readmePurpose   string
 	goDetected      bool
 	nodeDetected    bool
+	pythonDetected  bool
+	phpDetected     bool
 	nextDetected    bool
 	nginxDetected   bool
 	composeDetected bool
