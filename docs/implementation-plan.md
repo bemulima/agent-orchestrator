@@ -193,8 +193,27 @@ Acceptance:
 
 ## Final MVP verification
 
+Status: completed and verified on 2026-07-21 with `make mvp-rehearsal` against
+an empty local stack. All repositories and external integrations were
+disposable/fake; no user project or live Codex, GitLab, or Telegram resource
+was contacted.
+
 Run a clean end-to-end fixture scenario: bootstrap, migrate, connect, discover,
 prepare onboarding, approve/apply, rebuild topology, create/approve a plan,
 execute one Codex task, verify and review it, observe it in Telegram, create
 GitLab issue/MR in integration mode, restart the stack during execution, and
 confirm Temporal resumes without duplication.
+
+Verified evidence:
+
+- the temporary Go repository remained clean while onboarding and task work
+  occurred in isolated worktrees;
+- plan approval used a resource/user/chat-bound Telegram callback and replay
+  did not create a second approval event;
+- PostgreSQL, Temporal, API, and worker were restarted while coder execution
+  was active, then a new fixture worker resumed the persisted coder thread;
+- the completed lifecycle contained exactly one plan run, task attempt,
+  reviewer thread, task commit, GitLab parent/child issue pair, branch, and MR;
+- a second GitLab sync reused every external resource;
+- cleanup assertions found no remaining fixture project, command, Telegram
+  update/callback, GitLab link, or audit row.

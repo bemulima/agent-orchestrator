@@ -21,7 +21,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -208,6 +208,14 @@ test-unit: ## Run unit and Temporal workflow tests
 
 test-integration: ## Run PostgreSQL integration tests against the local stack
 	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" $(GO_ENV) go test -count=1 -tags=integration ./test/integration/...
+
+mvp-rehearsal: ## Run the disposable full-lifecycle MVP rehearsal (requires an empty project database)
+	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" \
+	TEMPORAL_HOST_PORT="$${TEMPORAL_HOST_PORT:-localhost:7233}" \
+	TEMPORAL_NAMESPACE="$${TEMPORAL_NAMESPACE:-default}" \
+	MVP_RESTART_COMPOSE=true \
+	MVP_COMPOSE_FILE="$(abspath docker-compose.yml)" \
+	$(GO_ENV) go test -count=1 -timeout=7m -tags=mvp ./test/mvp/...
 
 runner-test: ## Build and test the pinned Codex SDK runner
 	cd runner && npm test

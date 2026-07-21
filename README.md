@@ -418,6 +418,7 @@ make fmt
 make lint
 make test
 make verify
+make mvp-rehearsal
 ```
 
 After `make up && make migrate`, run `make test-integration` to verify the
@@ -425,3 +426,15 @@ schema and PostgreSQL state machines, including durable coder/reviewer thread
 separation, Telegram update/callback replay protection, verification, and
 artifacts. Tests use only disposable
 repositories/fixtures and never access user repositories.
+
+`make mvp-rehearsal` is the final cross-stage check and deliberately requires
+an empty project database. It creates a temporary local Git service, runs real
+PostgreSQL discovery/onboarding/topology/planning state machines, approves the
+plan through a fake Telegram callback, and executes the real Temporal workflow
+with a deterministic fake coder/reviewer. While the coder activity is active,
+the target restarts PostgreSQL, Temporal, the API, and the normal worker, then
+replaces the fixture worker and verifies resume with one durable coder thread.
+It synchronizes twice through the fake GitLab boundary and proves that issues,
+the MR, branch, plan run, attempt, and review were not duplicated. Fixture
+database rows and temporary repositories are removed before success. No Codex,
+GitLab, Telegram, or user repository is contacted.

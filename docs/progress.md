@@ -4,7 +4,8 @@ Last updated: 2026-07-21
 
 ## Current status
 
-Stages 1–8 are complete and verified. The Docker Compose stack is currently
+Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
+The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
 No user repository has been connected. Stage 6 verification used only
 in-memory fakes, disposable Git repositories, and disposable PostgreSQL
@@ -344,15 +345,32 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - The final database audit still reports zero projects, commands, Telegram
   updates, and Telegram callbacks; no user project or external integration was
   touched during Stage 8.
+- Added the opt-in `make mvp-rehearsal` target. It refuses a non-empty project
+  database and composes real PostgreSQL discovery, onboarding, topology,
+  planning, execution repositories, and the real Temporal workflow around a
+  temporary Git fixture and fake Codex/GitLab/Telegram boundaries.
+- Final MVP rehearsal — passed twice, including a run that restarted
+  PostgreSQL, Temporal, API, and the normal worker during an active coder
+  activity. A replacement fixture worker resumed the durable coder thread and
+  completed independent verification/review.
+- Final duplicate assertions — one plan run, one task attempt, one review, one
+  task commit, two GitLab links, one fake branch, and one fake MR. Repeated plan
+  start, Telegram approval callback, onboarding apply, and GitLab sync reused
+  their persisted/external resources.
+- Final cleanup assertions and direct database audit — zero projects, commands,
+  Telegram updates/callbacks, and GitLab links after rehearsal. The temporary
+  repository and worktrees were removed automatically.
 
 ## Remaining work
 
-- Run the final cross-stage MVP fixture rehearsal described in
-  `docs/implementation-plan.md`. This remains fake/integration-mode for Codex,
-  GitLab, and Telegram unless the owner explicitly provides live credentials.
+- No implementation stage remains for the specified MVP.
+- A controlled live pilot and connection of real repositories remain optional
+  owner-authorized operational steps; they are intentionally not part of the
+  automated rehearsal.
 
 ## Exact next task
 
-Compose the existing disposable discovery/onboarding/planning/execution,
-Telegram observation, GitLab dry-run, and Temporal restart checks into one
-clean end-to-end MVP rehearsal with duplicate detection and cleanup assertions.
+Prepare the reviewed command sequence for connecting selected real projects,
+or configure an owner-approved Telegram/GitLab pilot. Do not connect or mutate
+any real project until the owner explicitly selects it and runs/approves the
+corresponding command.

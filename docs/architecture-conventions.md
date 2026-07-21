@@ -105,6 +105,10 @@ and engineering conventions come from the reference service.
 - Telegram mutation grants are opaque, resource-bound, user/chat-bound,
   expiring, and single-use. Only their SHA-256 hashes are persisted; message
   text and raw Telegram payloads are not stored.
+- The final MVP rehearsal is opt-in because it restarts local Compose services.
+  It refuses a database containing projects or commands, uses only temporary
+  Git worktrees and fake external adapters, and asserts database cleanup before
+  reporting success.
 
 ## Dependency direction
 
