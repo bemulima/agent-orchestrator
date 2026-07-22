@@ -16,15 +16,17 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 	path := filepath.ToSlash(file.path)
 	base := strings.ToLower(filepath.Base(path))
 	content := string(file.content)
-	s.detectStack(state, path, base, content)
 	s.detectPurpose(state, path, base, content)
-	s.extractCapabilities(state, path, content)
-	s.extractOwnership(state, path, content)
-	s.extractContracts(state, path, base, content)
-	s.extractGatewayRelations(state, path, content)
-	s.extractFrontendConsumers(state, path, content)
-	s.extractInfrastructure(state, path, base, content)
-	s.extractCommands(state, path, base, content)
+	if !isNonProductionEvidencePath(path) {
+		s.detectStack(state, path, base, content)
+		s.extractCapabilities(state, path, content)
+		s.extractOwnership(state, path, content)
+		s.extractContracts(state, path, base, content)
+		s.extractGatewayRelations(state, path, content)
+		s.extractFrontendConsumers(state, path, content)
+		s.extractInfrastructure(state, path, base, content)
+		s.extractCommands(state, path, base, content)
+	}
 	s.analyzePrompts(state, path, file.content)
 	s.analyzeApprovedSemanticReport(state, path, file.content)
 
@@ -307,9 +309,11 @@ func collectHTTPRoute(
 }
 
 func (s Scanner) extractOwnership(state *detectorState, path, content string) {
-	for _, match := range databaseTablePattern.FindAllStringSubmatch(content, -1) {
-		state.collector.fact("ownership", "database_table", match[1], .96, path,
-			"A SQL migration creates this table, indicating schema ownership.")
+	if strings.HasSuffix(strings.ToLower(path), ".sql") {
+		for _, match := range databaseTablePattern.FindAllStringSubmatch(content, -1) {
+			state.collector.fact("ownership", "database_table", match[1], .96, path,
+				"A checked-in SQL schema file creates this table, indicating schema ownership.")
+		}
 	}
 	if isEnvironmentExample(strings.ToLower(filepath.Base(path))) {
 		for _, match := range environmentKeyPattern.FindAllStringSubmatch(content, -1) {

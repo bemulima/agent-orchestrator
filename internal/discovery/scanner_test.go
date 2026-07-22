@@ -186,6 +186,48 @@ class Handler(BaseHTTPRequestHandler):
 	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/validate")
 }
 
+func TestScanner_IgnoresRuntimeEvidenceFromTestsAndExamples(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"internal/http/server.go": `package http
+func routes(router Router) { router.Post("/api/v1/real", handler) }
+`,
+		"internal/http/server_test.go": `package http
+func testRoutes(router Router) { router.Get("/health", handler) }
+`,
+		"docs/examples/postgres-runtime.json": `{"migration":"CREATE TABLE users (id UUID);"}`,
+		"tests/fixture.sql":                   `CREATE TABLE test_records (id UUID);`,
+	}
+	for name, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "production-only", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/real")
+	for _, fact := range report.Facts {
+		if fact.Category != "capability" && fact.Category != "contract" && fact.Category != "ownership" &&
+			fact.Category != "relation" && fact.Category != "infrastructure" {
+			continue
+		}
+		if isNonProductionEvidencePath(fact.SourcePath) {
+			t.Fatalf("non-production file emitted runtime evidence: %#v", fact)
+		}
+		if fact.Name == "database_table" && (fact.Value == "users" || fact.Value == "test_records") {
+			t.Fatalf("example/test schema emitted ownership: %#v", fact)
+		}
+	}
+}
+
 func TestScanner_DoesNotReadEnvironmentSecrets(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SUPER_SECRET=must-not-appear"), 0o600); err != nil {

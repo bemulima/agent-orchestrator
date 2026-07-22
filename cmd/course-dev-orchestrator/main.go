@@ -440,7 +440,7 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) (onboardingO
 		return onboardingOperations{}, err
 	}
 	semanticGenerator := onboardinggenerator.SemanticGenerator{
-		Base: generator, Runner: runner, Model: cfg.CodexModelDeep,
+		Base: generator, Runner: runner, Projects: projects, Model: cfg.CodexModelDeep,
 	}
 	worktrees := gitadapter.OnboardingWorktree{
 		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,

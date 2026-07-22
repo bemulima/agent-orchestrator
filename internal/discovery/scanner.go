@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 7
+const reportSchemaVersion = 8
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -267,6 +267,29 @@ func shouldAnalyze(path string) bool {
 		}
 	}
 	return hasAnalyzableExtension(lowerBase)
+}
+
+func isNonProductionEvidencePath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	base := filepath.Base(path)
+	for _, suffix := range []string{
+		"_test.go", "_test.py", ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+		".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+	} {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	if strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	for _, segment := range strings.Split(path, "/") {
+		switch segment {
+		case "test", "tests", "testdata", "__tests__", "fixture", "fixtures", "example", "examples":
+			return true
+		}
+	}
+	return false
 }
 
 func hasAnalyzableExtension(name string) bool {

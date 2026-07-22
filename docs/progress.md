@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 ## Current status
 
@@ -23,9 +23,11 @@ as a proposal-only analyst pass: it cannot modify a connected checkout or
 affect topology until the owner reviews, approves, applies, and rescans its
 proposal. A live pilot for `ms-go-http-runtime-validator` produced run
 `95482dd4-4a59-48b6-8a51-61e99ec4e662` with 31 verified semantic facts, seven
-open questions, and two approved Taskfile commands. Its apply dry-run passed;
-the run remains `awaiting_approval`, no proposal has been applied, and no live
-coding task has yet been executed against the 38 projects.
+open questions, and two approved Taskfile commands. The owner approved it on
+2026-07-23; dry-run and real apply passed in the isolated
+`ai/onboard-ms-go-http-runtime-validator-95482dd44a59` worktree, commit
+`5b3c99391d2379b1e9ddeb40f772a371abaf0e85` was pushed, and GitHub draft PR #6
+was opened. No live coding task has yet been executed against the 38 projects.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -465,14 +467,25 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Completed the live `ms-go-http-runtime-validator` semantic pilot. Four
   superseded experimental proposals were cancelled, the final proposal passed
   dry-run checks, and the managed clone remained clean at its original HEAD.
+- Applied and published the owner-approved HTTP runtime validator pilot without
+  modifying its primary checkout. All proposal checksum, generated-format,
+  write-scope, worktree-isolation, commit, and source-immutability checks passed.
+- Rejected the first `ms-go-validation-orchestrator` semantic proposal during
+  evidence review because deterministic discovery treated SQL embedded in
+  `docs/examples/*.json` as owned tables and a route in `_test.go` as a
+  production endpoint.
+- Advanced discovery report schema to v8. Runtime topology evidence now ignores
+  test, fixture, and example paths, while database ownership requires a
+  checked-in production SQL file. Semantic analysts now receive the exact
+  connected-project name catalog, and relation facts targeting networks,
+  containers, URLs, or other non-project values are isolated as rejected facts.
+- Added regression coverage for example/test evidence suppression and
+  non-catalog semantic relation targets. Focused tests and `make verify` pass.
 
 ## Remaining work
 
-- Owner review and an explicit approve/reject decision for the final pilot
-  proposal remain required.
-- After approval: apply in an isolated branch/worktree, review/merge through the
-  repository workflow, rescan, and rebuild topology before trusting the new
-  semantic facts.
+- Review and merge the published pilot PR through the repository workflow before
+  rescanning its approved semantic report into the trusted topology.
 - Enrich the remaining 37 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
@@ -480,7 +493,6 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Exact next task
 
-Review the complete diff for onboarding run
-`95482dd4-4a59-48b6-8a51-61e99ec4e662`. Approve or reject it explicitly; do not
-apply, merge, or roll semantic enrichment out to the other repositories before
-that review.
+Rebuild the Compose services with discovery schema v8, rescan all connected
+projects, verify that example/test ownership and route false positives are gone,
+then regenerate and review `ms-go-validation-orchestrator` semantic enrichment.

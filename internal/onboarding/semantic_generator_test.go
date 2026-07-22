@@ -149,6 +149,32 @@ func TestSemanticGeneratorAcceptsRepositoryWideOpenQuestion(t *testing.T) {
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsRelationOutsideConnectedCatalog(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("Uses the shared ms-net Docker network.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	content := json.RawMessage(`{
+  "summary":"fixture",
+  "facts":[{
+    "category":"relation","name":"deploys","value":"ms-net","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"Uses the shared ms-net Docker network.",
+    "explanation":"The service uses this network."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, []string{"fixture", "ms-go-sandbox"})
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "relation_target_not_connected" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result json.RawMessage
 	role   domain.AgentRunRole

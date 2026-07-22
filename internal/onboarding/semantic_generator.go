@@ -22,9 +22,10 @@ const (
 )
 
 type SemanticGenerator struct {
-	Base   Generator
-	Runner repository.AgentRunner
-	Model  string
+	Base     Generator
+	Runner   repository.AgentRunner
+	Projects repository.ProjectRepository
+	Model    string
 }
 
 func (g SemanticGenerator) Generate(
@@ -36,7 +37,18 @@ func (g SemanticGenerator) Generate(
 	if g.Runner == nil || project.LocalPath == nil || strings.TrimSpace(*project.LocalPath) == "" {
 		return domain.OnboardingProposal{}, "", fmt.Errorf("semantic onboarding generator is incomplete: %w", domain.ErrInvalidStatus)
 	}
-	prompt, err := semanticPrompt(project, snapshot, report)
+	connectedProjects := make([]string, 0)
+	if g.Projects != nil {
+		projects, listErr := g.Projects.List(ctx)
+		if listErr != nil {
+			return domain.OnboardingProposal{}, "", fmt.Errorf("list connected projects for semantic analysis: %w", listErr)
+		}
+		for _, connected := range projects {
+			connectedProjects = append(connectedProjects, connected.Name)
+		}
+		sort.Strings(connectedProjects)
+	}
+	prompt, err := semanticPrompt(project, snapshot, report, connectedProjects)
 	if err != nil {
 		return domain.OnboardingProposal{}, "", err
 	}
@@ -54,7 +66,7 @@ func (g SemanticGenerator) Generate(
 	if threadID == "" || response.ThreadID != threadID {
 		return domain.OnboardingProposal{}, "", fmt.Errorf("semantic analyst thread was not captured: %w", domain.ErrConflict)
 	}
-	analysis, err := validateSemanticAnalysis(*project.LocalPath, project, snapshot, response.Result)
+	analysis, err := validateSemanticAnalysis(*project.LocalPath, project, snapshot, response.Result, connectedProjects)
 	if err != nil {
 		return domain.OnboardingProposal{}, "", err
 	}
@@ -95,14 +107,16 @@ func semanticPrompt(
 	project domain.Project,
 	snapshot domain.ServiceSnapshot,
 	report domain.DiscoveryReport,
+	connectedProjects []string,
 ) (string, error) {
 	contextPayload := struct {
-		ProjectName    string                `json:"project_name"`
-		RepositoryRole domain.RepositoryRole `json:"repository_role"`
-		ServiceKind    domain.ServiceKind    `json:"service_kind"`
-		Commit         string                `json:"commit"`
-		KnownFacts     []domain.Evidence     `json:"known_facts"`
-	}{project.Name, project.RepositoryRole, snapshot.ServiceKind, snapshot.CommitSHA, report.Facts}
+		ProjectName       string                `json:"project_name"`
+		RepositoryRole    domain.RepositoryRole `json:"repository_role"`
+		ServiceKind       domain.ServiceKind    `json:"service_kind"`
+		Commit            string                `json:"commit"`
+		ConnectedProjects []string              `json:"connected_projects"`
+		KnownFacts        []domain.Evidence     `json:"known_facts"`
+	}{project.Name, project.RepositoryRole, snapshot.ServiceKind, snapshot.CommitSHA, connectedProjects, report.Facts}
 	content, err := json.Marshal(contextPayload)
 	if err != nil {
 		return "", fmt.Errorf("encode semantic analyst context: %w", err)
@@ -124,7 +138,7 @@ Use these category/name conventions when applicable:
 - infrastructure: dependency identifier
 - command: stable command name; value must be the exact developer-facing command documented in Makefile, Taskfile, package/pyproject/composer manifest, README, or AGENTS.md; never classify a Dockerfile RUN or CI step as a local command
 Keep values concise, use repository-relative paths, return at most 200 facts and 30 open questions.
-For relation facts, use the exact connected service or repository name as value when the repository text identifies it.
+For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
 Never use .ai/discovery/semantic-report.json itself as evidence.
 For an open question with no specific source file, return an empty source_paths array; never use "." as a path.
 
@@ -137,6 +151,7 @@ func validateSemanticAnalysis(
 	project domain.Project,
 	snapshot domain.ServiceSnapshot,
 	content []byte,
+	connectedProjects []string,
 ) (domain.SemanticAnalysis, error) {
 	var result struct {
 		Summary       string                        `json:"summary"`
@@ -163,6 +178,10 @@ func validateSemanticAnalysis(
 		return domain.SemanticAnalysis{}, fmt.Errorf("resolve semantic repository root: %w", err)
 	}
 	seen := make(map[string]struct{}, len(result.Facts))
+	connectedNames := make(map[string]struct{}, len(connectedProjects))
+	for _, name := range connectedProjects {
+		connectedNames[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
 	validated := make([]domain.SemanticFact, 0, len(result.Facts))
 	rejected := make([]domain.SemanticRejectedFact, 0)
 	for _, fact := range result.Facts {
@@ -194,6 +213,15 @@ func validateSemanticAnalysis(
 				Reason: "self_relation_not_allowed",
 			})
 			continue
+		}
+		if fact.Category == "relation" && len(connectedNames) > 0 {
+			if _, exists := connectedNames[strings.ToLower(fact.Value)]; !exists {
+				rejected = append(rejected, domain.SemanticRejectedFact{
+					Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+					Reason: "relation_target_not_connected",
+				})
+				continue
+			}
 		}
 		if err := verifyEvidenceQuote(root, fact.SourcePath, fact.EvidenceQuote); err != nil {
 			rejected = append(rejected, domain.SemanticRejectedFact{
