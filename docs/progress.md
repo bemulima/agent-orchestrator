@@ -507,18 +507,27 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   topology relations. Semantic validation now fail-closes those categories for
   content, policy, documentation, and archive roles while retaining purpose,
   business rules, business processes, entities, and repository commands.
+- Regenerated and applied the corrected `course-wiki` proposal with 43 admitted
+  knowledge facts: 29 business rules, five business processes, eight entities,
+  and one purpose statement. Two unverifiable quotes were isolated and six
+  cross-document ambiguities remain explicit open questions; no runtime
+  ownership, contract, relation, capability, or infrastructure fact was admitted.
+- Published the five reviewed platform-anchor trees after exact tree-hash
+  comparison as GitHub draft PRs: validation orchestrator PR #21, sandbox PR
+  #13, course PR #74, gateway PR #29, and course-wiki PR #11. No PR was merged.
 
 ## Remaining work
 
 - Review and merge the published pilot PR through the repository workflow before
   rescanning its approved semantic report into the trusted topology.
-- Enrich the remaining 33 repositories in reviewed waves; do not approve or
+- Enrich the remaining 32 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Run the full verification suite for non-runtime semantic role gating, rebuild
-the Compose services, regenerate and review `course-wiki`, then publish the five
-reviewed platform-anchor branches as GitHub draft pull requests.
+Enrich and review the identity/core wave beginning with `ms-go-auth`,
+`ms-go-rbac`, `ms-go-user`, `ms-go-student`, `ms-go-filestorage`, and
+`ms-go-statistic`, applying only proposals whose evidence and command risk gates
+pass review.
