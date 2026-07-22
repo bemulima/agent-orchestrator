@@ -101,7 +101,7 @@ func run(args []string) error {
 	case "telegram":
 		return runTelegram(cfg, logger)
 	case "project-connect", "project-list", "project-show", "project-scan", "project-report",
-		"project-onboard", "project-diff", "project-approve", "project-reject", "project-apply":
+		"project-onboard", "project-enrich", "project-diff", "project-approve", "project-reject", "project-apply":
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
@@ -140,7 +140,10 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Scan:         projectOperations.Scan,
 		LatestReport: projectOperations.Latest,
 	}
-	onboardingOperations := newOnboardingOperations(cfg, pool)
+	onboardingOperations, err := newOnboardingOperations(cfg, pool)
+	if err != nil {
+		return err
+	}
 	onboardingHandler := handlers.OnboardingHandler{
 		Prepare: onboardingOperations.Prepare,
 		Get:     onboardingOperations.Get,
@@ -296,7 +299,10 @@ func runTelegram(cfg config.Config, logger *zap.Logger) error {
 	}
 	defer temporalClient.Close()
 	projects := newProjectOperations(cfg, pool)
-	onboarding := newOnboardingOperations(cfg, pool)
+	onboarding, err := newOnboardingOperations(cfg, pool)
+	if err != nil {
+		return err
+	}
 	topology := newTopologyOperations(pool)
 	planning := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
 		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
@@ -419,7 +425,7 @@ type onboardingOperations struct {
 	Apply   onboardinguc.Apply
 }
 
-func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) onboardingOperations {
+func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) (onboardingOperations, error) {
 	projects := pgadapter.ProjectRepoPG{Pool: pool}
 	runs := pgadapter.OnboardingRepoPG{Pool: pool}
 	sources := gitadapter.ProjectSource{
@@ -429,6 +435,13 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) onboardingOp
 	generator := onboardinggenerator.NewGenerator(onboardinggenerator.GeneratorConfig{
 		MaxFileBytes: cfg.OnboardingMaxFileBytes, MaxTotalBytes: cfg.OnboardingMaxTotalBytes,
 	})
+	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return onboardingOperations{}, err
+	}
+	semanticGenerator := onboardinggenerator.SemanticGenerator{
+		Base: generator, Runner: runner, Model: cfg.CodexModelDeep,
+	}
 	worktrees := gitadapter.OnboardingWorktree{
 		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
 	}
@@ -436,12 +449,15 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) onboardingOp
 		BaseURL: cfg.GitLabBaseURL, Token: cfg.GitLabToken, DryRun: cfg.GitLabDryRun,
 	}
 	return onboardingOperations{
-		Prepare: onboardinguc.Prepare{Projects: projects, Sources: sources, Runs: runs, Generator: generator},
+		Prepare: onboardinguc.Prepare{
+			Projects: projects, Sources: sources, Runs: runs, Generator: generator,
+			SemanticGenerator: semanticGenerator,
+		},
 		Get:     onboardinguc.Get{Runs: runs},
 		Approve: onboardinguc.Approve{Runs: runs},
 		Reject:  onboardinguc.Reject{Runs: runs},
 		Apply:   onboardinguc.Apply{Projects: projects, Runs: runs, Worktree: worktrees, Publisher: publisher},
-	}
+	}, nil
 }
 
 type projectOperations struct {
@@ -482,7 +498,10 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 	}
 	defer pool.Close()
 	operations := newProjectOperations(cfg, pool)
-	onboardingOperations := newOnboardingOperations(cfg, pool)
+	onboardingOperations, err := newOnboardingOperations(cfg, pool)
+	if err != nil {
+		return err
+	}
 
 	switch command {
 	case "project-connect":
@@ -512,7 +531,7 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 			return err
 		}
 		return writeJSON(output, map[string]any{"projects": projects})
-	case "project-show", "project-scan", "project-report", "project-onboard":
+	case "project-show", "project-scan", "project-report", "project-onboard", "project-enrich":
 		identifier, err := projectIdentifier(command, args)
 		if err != nil {
 			return err
@@ -536,12 +555,20 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 				return reportErr
 			}
 			return writeJSON(output, result)
-		default:
+		case "project-onboard":
 			dryRun, parseErr := booleanFlag(command, args, "dry-run")
 			if parseErr != nil {
 				return parseErr
 			}
 			run, prepareErr := onboardingOperations.Prepare.Handle(ctx, onboardinguc.PrepareInput{ProjectID: project.ID, DryRun: dryRun})
+			if prepareErr != nil {
+				return prepareErr
+			}
+			return writeJSON(output, run)
+		default:
+			run, prepareErr := onboardingOperations.Prepare.Handle(ctx, onboardinguc.PrepareInput{
+				ProjectID: project.ID, Semantic: true,
+			})
 			if prepareErr != nil {
 				return prepareErr
 			}
@@ -1041,6 +1068,7 @@ Commands:
   project-scan    Run read-only discovery for a project
   project-report  Show the latest discovery report
   project-onboard Prepare an evidence-backed onboarding proposal
+  project-enrich  Prepare a Codex semantic onboarding proposal with quoted evidence
   project-diff    Print an onboarding proposal diff
   project-approve Approve an onboarding proposal
   project-reject  Reject an onboarding proposal

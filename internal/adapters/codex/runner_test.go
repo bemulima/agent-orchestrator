@@ -43,6 +43,18 @@ func TestProcessRunnerRejectsUnsupportedProtocol(t *testing.T) {
 	require.ErrorContains(t, err, "unknown Codex runner event")
 }
 
+func TestProcessRunnerAcceptsReadOnlyAnalyst(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_HELPER", "success")
+	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
+	require.NoError(t, err)
+	response, err := runner.Run(context.Background(), domain.AgentRunRequest{
+		Role: domain.AgentRunAnalyst, WorkingDirectory: t.TempDir(), Prompt: "analyze fixture",
+		OutputSchema: map[string]any{"type": "object"},
+	}, nil)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"status":"completed"}`, string(response.Result))
+}
+
 func TestNewProcessRunnerRejectsShellSyntax(t *testing.T) {
 	_, err := NewProcessRunner("node runner.js; printenv")
 	require.Error(t, err)

@@ -222,6 +222,90 @@ func TestScanner_ContentRoleDoesNotBecomeRuntimeService(t *testing.T) {
 	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
 }
 
+func TestScannerImportsApprovedSemanticReport(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"),
+		[]byte("Only reviewed lessons can be published.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Taskfile.yml"), []byte("tasks:\n  test:\n    cmds:\n      - go test ./...\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	analysis := domain.SemanticAnalysis{
+		SchemaVersion: 1, ProjectID: "old-project-id", ProjectName: "lessons", BaseCommit: "base",
+		Summary: "Lesson rules", Facts: []domain.SemanticFact{{
+			Category: "business_rule", Name: "publish_reviewed_only",
+			Value: "Only reviewed lessons can be published", Confidence: .9,
+			SourcePath: "README.md", EvidenceQuote: "Only reviewed lessons can be published.",
+			Explanation: "Publication requires review.",
+		}, {
+			Category: "command", Name: "test", Value: "go test ./...", Confidence: .9,
+			SourcePath: "Taskfile.yml", EvidenceQuote: "- go test ./...",
+			Explanation: "Taskfile documents the test command.",
+		}},
+	}
+	content, err := json.Marshal(analysis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ai", "discovery", "semantic-report.json"), content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "new-project-id", Name: "lessons", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "merge-commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "business_rule", "publish_reviewed_only", "Only reviewed lessons can be published")
+	assertFact(t, report.Facts, "command", "test", "go test ./...")
+}
+
+func TestScannerRejectsSemanticFactWithoutCurrentQuotedEvidence(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("Current documented rule.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	content := `{
+  "schema_version": 1,
+  "project_id": "project-1",
+  "project_name": "fixture",
+  "base_commit": "abc123",
+  "summary": "Fixture rules.",
+  "facts": [{
+    "category": "business_rule",
+    "name": "invented_rule",
+    "value": "Invented rule",
+    "confidence": 0.9,
+    "source_path": "README.md",
+    "evidence_quote": "This text is not in the current README.",
+    "explanation": "Stale evidence."
+  }],
+  "open_questions": []
+}`
+	if err := os.WriteFile(filepath.Join(root, ".ai", "discovery", "semantic-report.json"), []byte(content), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "project-1", Name: "fixture", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "abc123", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Category == "business_rule" && fact.Name == "invented_rule" {
+			t.Fatal("scanner imported a semantic fact without current quoted evidence")
+		}
+	}
+	assertFact(t, report.Conflicts, "conflict", "invalid_semantic_fact", "business_rule:invented_rule")
+}
+
 func TestScanner_NonRuntimeRolesSuppressRuntimeEvidence(t *testing.T) {
 	root := t.TempDir()
 	content := `# Runtime examples

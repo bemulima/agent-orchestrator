@@ -69,6 +69,9 @@ func TestGeneratorBuildsEvidenceBackedProposalWithoutWritingSource(t *testing.T)
 	if hasProposed(proposal, ".ai/commands.yaml") || hasProposed(proposal, ".ai/workflows/test.yaml") {
 		t.Fatal("generator invented commands without command evidence")
 	}
+	if !containsProposed(proposal, ".ai/agents/backend-coder.md", "No repository commands have been approved") {
+		t.Fatal("backend agent did not fail closed when command evidence was absent")
+	}
 
 	second := NewGenerator(GeneratorConfig{Now: func() time.Time { return firstTime.Add(time.Hour) }})
 	repeated, repeatedDiff, err := second.Generate(context.Background(), project, snapshot, report)

@@ -14,13 +14,15 @@ import (
 type PrepareInput struct {
 	ProjectID string `json:"-"`
 	DryRun    bool   `json:"dry_run"`
+	Semantic  bool   `json:"semantic"`
 }
 
 type Prepare struct {
-	Projects  repository.ProjectRepository
-	Sources   repository.ProjectSource
-	Runs      repository.OnboardingRepository
-	Generator repository.OnboardingGenerator
+	Projects          repository.ProjectRepository
+	Sources           repository.ProjectSource
+	Runs              repository.OnboardingRepository
+	Generator         repository.OnboardingGenerator
+	SemanticGenerator repository.OnboardingGenerator
 }
 
 func (uc Prepare) Handle(ctx context.Context, input PrepareInput) (domain.OnboardingRun, error) {
@@ -48,7 +50,14 @@ func (uc Prepare) Handle(ctx context.Context, input PrepareInput) (domain.Onboar
 	if current.HeadCommit != snapshot.CommitSHA {
 		return domain.OnboardingRun{}, fmt.Errorf("repository changed since discovery; scan again: %w", domain.ErrConflict)
 	}
-	proposal, diff, err := uc.Generator.Generate(ctx, project, snapshot, report)
+	generator := uc.Generator
+	if input.Semantic {
+		generator = uc.SemanticGenerator
+	}
+	if generator == nil {
+		return domain.OnboardingRun{}, fmt.Errorf("requested onboarding generator is unavailable: %w", domain.ErrInvalidStatus)
+	}
+	proposal, diff, err := generator.Generate(ctx, project, snapshot, report)
 	if err != nil {
 		return domain.OnboardingRun{}, err
 	}

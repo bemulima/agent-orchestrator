@@ -166,6 +166,7 @@ type AgentRunRole string
 const (
 	AgentRunCoder    AgentRunRole = "coder"
 	AgentRunReviewer AgentRunRole = "reviewer"
+	AgentRunAnalyst  AgentRunRole = "analyst"
 )
 
 type AgentRunRequest struct {

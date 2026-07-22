@@ -7,12 +7,25 @@ Last updated: 2026-07-22
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-Thirteen owner-approved repositories are connected read-only: ten validators,
-`ms-infra-messaging`, `ms-course-promts`, and `ms-course-journal`. Their source
-checkouts remain clean and no onboarding, Codex, GitLab, or Telegram operation
-has been started. Stage 6 verification used only in-memory fakes, disposable
-Git repositories, and disposable PostgreSQL records. No live Codex request was
-made without an explicitly configured key.
+All 38 requested repositories are connected: 25 through orchestrator-managed
+clones of remote default branches and the original 13 through previously
+reviewed clean local checkouts. The catalog contains 31 services, two frontends, one
+infrastructure repository, and one repository in each of the policy,
+documentation, content, and archive roles. The user's primary checkouts were
+not modified. The materialized landscape currently includes 34 runtime
+services, 433 capabilities, 131 ownership records, 472 contracts, four
+explicit relations, and 12 reported contract drifts.
+
+Local Codex CLI execution now uses the existing ChatGPT login by default; no
+`CODEX_API_KEY` is required. A three-project planning smoke test was completed
+without starting execution. Evidence-backed semantic enrichment is implemented
+as a proposal-only analyst pass: it cannot modify a connected checkout or
+affect topology until the owner reviews, approves, applies, and rescans its
+proposal. A live pilot for `ms-go-http-runtime-validator` produced run
+`95482dd4-4a59-48b6-8a51-61e99ec4e662` with 31 verified semantic facts, seven
+open questions, and two approved Taskfile commands. Its apply dry-run passed;
+the run remains `awaiting_approval`, no proposal has been applied, and no live
+coding task has yet been executed against the 38 projects.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -435,17 +448,39 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   and `go test -race ./...` passed. The rebuilt stack returned healthy
   liveness, PostgreSQL/Temporal readiness, and a successful real Temporal
   workflow probe.
+- Connected all 38 requested repositories using 25 managed remote-default
+  clones plus 13 reviewed clean local checkouts, without modifying primary
+  user checkouts, and rebuilt the 34-service platform landscape used by
+  planning/execution context.
+- Switched live Codex execution to the existing local ChatGPT login and added
+  per-role model profiles without requiring `CODEX_API_KEY`.
+- Added proposal-only semantic enrichment with analyst JSON Schema, exact
+  source-quote validation, rejected-fact isolation, business rules/processes,
+  entities, relations, and evidence-backed commands.
+- Added scan-time revalidation of approved semantic quotes and discovery schema
+  v7 so altered or stale reports fail closed before topology ingestion.
+- Installed and verified `bubblewrap` inside the runtime containers; Compose
+  allows its unprivileged namespace while dropping all capabilities and
+  enforcing `no-new-privileges`.
+- Completed the live `ms-go-http-runtime-validator` semantic pilot. Four
+  superseded experimental proposals were cancelled, the final proposal passed
+  dry-run checks, and the managed clone remained clean at its original HEAD.
 
 ## Remaining work
 
-- No implementation stage remains for the specified MVP.
-- Remaining repository connections and later onboarding remain separate,
-  owner-authorized operational steps.
+- Owner review and an explicit approve/reject decision for the final pilot
+  proposal remain required.
+- After approval: apply in an isolated branch/worktree, review/merge through the
+  repository workflow, rescan, and rebuild topology before trusting the new
+  semantic facts.
+- Enrich the remaining 37 repositories in reviewed waves; do not approve or
+  apply proposals in bulk.
+- After the platform context is accepted, run the first real multi-project
+  coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Await an owner decision for the deferred repositories: either synchronize the
-local primary checkouts to an approved default branch outside the orchestrator,
-or explicitly authorize managed clones from their remote default branches.
-Do not infer that choice, connect dirty/stale/worktree projects, or start
-onboarding.
+Review the complete diff for onboarding run
+`95482dd4-4a59-48b6-8a51-61e99ec4e662`. Approve or reject it explicitly; do not
+apply, merge, or roll semantic enrichment out to the other repositories before
+that review.

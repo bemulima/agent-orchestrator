@@ -26,6 +26,7 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 	s.extractInfrastructure(state, path, base, content)
 	s.extractCommands(state, path, base, content)
 	s.analyzePrompts(state, path, file.content)
+	s.analyzeApprovedSemanticReport(state, path, file.content)
 
 	if strings.Contains(path, "/") && (base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb") ||
 		base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb" {
@@ -37,6 +38,82 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 			state.collector.fact("instruction", "existing_service_manifest", path, 1, path,
 				"An existing .ai service manifest declares service kind "+match[1]+".")
 		}
+	}
+}
+
+func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string, content []byte) {
+	if filepath.ToSlash(path) != ".ai/discovery/semantic-report.json" {
+		return
+	}
+	var analysis domain.SemanticAnalysis
+	if err := json.Unmarshal(content, &analysis); err != nil || analysis.SchemaVersion != 1 ||
+		analysis.ProjectName != state.project.Name || len(analysis.Facts) > 200 {
+		state.collector.conflict("invalid_semantic_report", path, 1, path,
+			"The approved semantic report is invalid, mismatched, or unsupported.")
+		return
+	}
+	allowed := map[string]struct{}{
+		"purpose": {}, "capability": {}, "ownership": {}, "relation": {}, "contract": {},
+		"business_rule": {}, "business_process": {}, "entity": {}, "infrastructure": {}, "command": {},
+	}
+	for _, fact := range analysis.Facts {
+		sourcePath := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(fact.SourcePath))))
+		sourceContent, sourceExists := state.filesByPath[sourcePath]
+		if _, exists := allowed[fact.Category]; !exists || strings.TrimSpace(fact.Name) == "" ||
+			strings.TrimSpace(fact.Value) == "" || fact.Confidence < .5 || fact.Confidence > .95 ||
+			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
+			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
+			fact.Category == "relation" && isSemanticSelfReference(fact.Value, state.project.Name) ||
+			!safeManifestReference(fact.SourcePath) || sourcePath == path || !sourceExists ||
+			len(fact.EvidenceQuote) < 8 || len(fact.EvidenceQuote) > 500 ||
+			!strings.Contains(normalizedSemanticEvidence(string(sourceContent)), normalizedSemanticEvidence(fact.EvidenceQuote)) {
+			state.collector.conflict("invalid_semantic_fact", fact.Category+":"+fact.Name, 1, path,
+				"A semantic fact is malformed, stale, or has no verifiable source quote and was not imported.")
+			continue
+		}
+		state.collector.fact(fact.Category, fact.Name, fact.Value, fact.Confidence, path,
+			"Approved semantic evidence references "+sourcePath+". "+fact.Explanation)
+	}
+	for _, question := range analysis.OpenQuestions {
+		if strings.TrimSpace(question.Question) == "" {
+			continue
+		}
+		state.collector.conflict("semantic_open_question", question.Question, .8, path, question.Reason)
+	}
+}
+
+func safeManifestReference(value string) bool {
+	value = strings.TrimSpace(value)
+	cleaned := filepath.Clean(filepath.FromSlash(value))
+	return value != "" && !strings.Contains(value, "\\") && !filepath.IsAbs(cleaned) && cleaned != "." && cleaned != ".." &&
+		!strings.HasPrefix(cleaned, ".."+string(filepath.Separator))
+}
+
+func normalizedSemanticEvidence(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func isSemanticSelfReference(value, projectName string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	projectName = strings.ToLower(strings.TrimSpace(projectName))
+	value = strings.TrimPrefix(value, "http://")
+	value = strings.TrimPrefix(value, "https://")
+	if slash := strings.IndexByte(value, '/'); slash >= 0 {
+		value = value[:slash]
+	}
+	if colon := strings.IndexByte(value, ':'); colon >= 0 {
+		value = value[:colon]
+	}
+	return value != "" && value == projectName
+}
+
+func isApprovedSemanticCommandSource(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(strings.TrimSpace(path)))
+	switch filepath.Base(path) {
+	case "makefile", "taskfile.yml", "taskfile.yaml", "package.json", "pyproject.toml", "composer.json", "readme.md", "agents.md":
+		return true
+	default:
+		return false
 	}
 }
 

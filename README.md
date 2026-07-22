@@ -75,6 +75,7 @@ course-dev-orchestrator project-show --service repository-name
 course-dev-orchestrator project-scan --service repository-name
 course-dev-orchestrator project-report --service repository-name
 course-dev-orchestrator project-onboard --service repository-name [--dry-run]
+course-dev-orchestrator project-enrich --service repository-name
 course-dev-orchestrator project-diff --run-id UUID
 course-dev-orchestrator project-approve --run-id UUID --actor owner [--comment text]
 course-dev-orchestrator project-reject --run-id UUID --actor owner [--comment text]
@@ -217,12 +218,40 @@ corresponding file is omitted.
 The normal owner flow is:
 
 ```sh
+make project-enrich SERVICE=repository-name
+make project-diff RUN_ID=semantic-run-uuid
+
+# Only after reviewing and accepting the semantic proposal:
+make project-apply RUN_ID=semantic-run-uuid DRY_RUN=true
+make project-approve RUN_ID=semantic-run-uuid ACTOR=owner COMMENT="reviewed semantic evidence"
+make project-apply RUN_ID=semantic-run-uuid
+make project-scan SERVICE=repository-name
+
+# Deterministic-only onboarding remains available separately:
 make project-onboard SERVICE=repository-name
 make project-diff RUN_ID=uuid
 make project-apply RUN_ID=uuid DRY_RUN=true
 make project-approve RUN_ID=uuid ACTOR=owner COMMENT="reviewed proposal"
 make project-apply RUN_ID=uuid
 ```
+
+`project-enrich` uses the local Codex CLI login and the `deep` model profile
+to inspect one clean, already-scanned repository read-only. It cannot silently
+teach the topology: every semantic fact must contain an exact quote from a
+repository-relative source file, and the result is stored only as an
+onboarding proposal. Facts whose quotes cannot be revalidated are excluded
+and listed as `rejected_facts` for review. The proposal can include purpose, capabilities,
+ownership, contracts, service relations, business rules, business processes,
+and domain entities, plus explicit open questions. The connected checkout is
+not changed. Only the normal diff, dry-run, owner approval, and isolated
+worktree apply flow can add `.ai/discovery/semantic-report.json` and the other
+proposed `.ai/**`/`AGENTS.md` files. A subsequent scan and topology rebuild
+make approved semantic facts available to planning and execution.
+The runtime image includes Linux `bubblewrap`, which Codex uses to enforce the
+analyst/reviewer read-only sandbox and the coder workspace-write sandbox inside
+the container. Compose permits the unprivileged user namespace required by
+`bubblewrap`, while dropping every container capability and enabling
+`no-new-privileges`. Do not replace these modes with `danger-full-access`.
 
 `project-apply DRY_RUN=true` validates the base commit, proposal/file
 checksums, formats, and source cleanliness without creating a worktree. A real
@@ -247,8 +276,10 @@ The Stage 3 HTTP API is also synchronous:
 - `POST /api/v1/onboarding-runs/{runId}/reject`;
 - `POST /api/v1/onboarding-runs/{runId}/apply`.
 
-The prepare/apply request body is `{"dry_run":true|false}`. Approval and
-rejection accept `{"actor":"owner","comment":"..."}`.
+The prepare request body is `{"dry_run":true|false,"semantic":true|false}`;
+`semantic:true` is the HTTP equivalent of `project-enrich`. The apply request
+body is `{"dry_run":true|false}`. Approval and rejection accept
+`{"actor":"owner","comment":"..."}`.
 
 ## Service topology and contract drift
 

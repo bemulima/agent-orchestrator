@@ -21,6 +21,16 @@ test("parses a bounded coder request", () => {
   assert.equal(request.working_directory, "/tmp/worktree");
 });
 
+test("parses a read-only analyst request", () => {
+  const request = parseRequest({
+    role: "analyst",
+    working_directory: "/tmp/repository",
+    prompt: "analyze the fixture",
+    output_schema: { type: "object" },
+  });
+  assert.equal(request.role, "analyst");
+});
+
 test("collects thread and structured agent response", () => {
   const state: StreamState = {};
   consumeEvent(state, { type: "thread.started", thread_id: "thread-1" });

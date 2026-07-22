@@ -42,7 +42,8 @@ func (r *ProcessRunner) Run(
 	request domain.AgentRunRequest,
 	onThread repository.AgentThreadCallback,
 ) (domain.AgentRunResponse, error) {
-	if len(r.command) == 0 || request.Role != domain.AgentRunCoder && request.Role != domain.AgentRunReviewer ||
+	if len(r.command) == 0 || request.Role != domain.AgentRunCoder && request.Role != domain.AgentRunReviewer &&
+		request.Role != domain.AgentRunAnalyst ||
 		request.WorkingDirectory == "" || request.Prompt == "" || len(request.OutputSchema) == 0 {
 		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner request: %w", domain.ErrValidation)
 	}

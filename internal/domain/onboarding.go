@@ -47,20 +47,26 @@ type OnboardingConflict struct {
 }
 
 type OnboardingProposal struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Generator     string               `json:"generator"`
-	ProjectID     string               `json:"project_id"`
-	SnapshotID    string               `json:"snapshot_id"`
-	BaseCommit    string               `json:"base_commit"`
-	Files         []ProposedFile       `json:"files"`
-	Conflicts     []OnboardingConflict `json:"conflicts,omitempty"`
-	Checksum      string               `json:"checksum"`
-	GeneratedAt   time.Time            `json:"generated_at"`
+	SchemaVersion int                       `json:"schema_version"`
+	Generator     string                    `json:"generator"`
+	ProjectID     string                    `json:"project_id"`
+	SnapshotID    string                    `json:"snapshot_id"`
+	BaseCommit    string                    `json:"base_commit"`
+	Files         []ProposedFile            `json:"files"`
+	Conflicts     []OnboardingConflict      `json:"conflicts,omitempty"`
+	Semantic      *SemanticProposalMetadata `json:"semantic,omitempty"`
+	Checksum      string                    `json:"checksum"`
+	GeneratedAt   time.Time                 `json:"generated_at"`
 }
 
 // OnboardingProposalChecksum fingerprints every approval-relevant proposal
 // field while deliberately excluding display-only generation time.
 func OnboardingProposalChecksum(proposal OnboardingProposal) (string, error) {
+	var semantic *SemanticAnalysis
+	if proposal.Semantic != nil {
+		copy := proposal.Semantic.Analysis
+		semantic = &copy
+	}
 	fingerprint := struct {
 		SchemaVersion int                  `json:"schema_version"`
 		Generator     string               `json:"generator"`
@@ -69,8 +75,12 @@ func OnboardingProposalChecksum(proposal OnboardingProposal) (string, error) {
 		BaseCommit    string               `json:"base_commit"`
 		Files         []ProposedFile       `json:"files"`
 		Conflicts     []OnboardingConflict `json:"conflicts"`
-	}{proposal.SchemaVersion, proposal.Generator, proposal.ProjectID, proposal.SnapshotID,
-		proposal.BaseCommit, proposal.Files, proposal.Conflicts}
+		Semantic      *SemanticAnalysis    `json:"semantic,omitempty"`
+	}{
+		SchemaVersion: proposal.SchemaVersion, Generator: proposal.Generator,
+		ProjectID: proposal.ProjectID, SnapshotID: proposal.SnapshotID, BaseCommit: proposal.BaseCommit,
+		Files: proposal.Files, Conflicts: proposal.Conflicts, Semantic: semantic,
+	}
 	content, err := json.Marshal(fingerprint)
 	if err != nil {
 		return "", fmt.Errorf("marshal onboarding proposal fingerprint: %w", err)

@@ -6,6 +6,7 @@ endif
 .DEFAULT_GOAL := help
 
 COMPOSE ?= docker compose
+ORCHESTRATOR_CLI := $(COMPOSE) exec -T orchestrator /app/course-dev-orchestrator
 DB_CONTAINER ?= postgres
 DB_NAME ?= course_dev_orchestrator
 DB_USER ?= postgres
@@ -23,7 +24,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -88,45 +89,49 @@ codex-auth-sync: ## Copy the existing local codex-cli ChatGPT login into the wor
 codex-auth-status: ## Check codex-cli login inside the worker
 	$(COMPOSE) exec -T worker /bin/sh -c 'set -eu; codex_bin=$$(find /app/runner/node_modules/@openai -type f -path "*/vendor/*/bin/codex" | head -n 1); test -n "$$codex_bin"; "$$codex_bin" login status'
 
-project-connect: ## Connect and scan a project (PATH=.../PROJECT_PATH=... or GIT_URL=..., optional ROLE=...)
+project-connect: ## Connect and scan a project (PATH=/projects/... or GIT_URL=..., optional ROLE=...)
 	@if [ -n "$(CONNECT_PATH)" ] && [ -n "$(GIT_URL)" ]; then echo "Set only PATH/PROJECT_PATH or GIT_URL"; exit 2; fi
 	@if [ -z "$(CONNECT_PATH)" ] && [ -z "$(GIT_URL)" ]; then echo "Set PATH/PROJECT_PATH or GIT_URL"; exit 2; fi
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-connect $(if $(CONNECT_PATH),--path "$(CONNECT_PATH)",--git-url "$(GIT_URL)") --role "$(or $(ROLE),service)"
+	$(ORCHESTRATOR_CLI) project-connect $(if $(CONNECT_PATH),--path "$(CONNECT_PATH)",--git-url "$(GIT_URL)") --role "$(or $(ROLE),service)"
 
 project-list: ## List connected projects
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-list
+	$(ORCHESTRATOR_CLI) project-list
 
 project-show: ## Show a project by SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-show --service "$(SERVICE)"
+	$(ORCHESTRATOR_CLI) project-show --service "$(SERVICE)"
 
 project-scan: ## Run read-only discovery for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-scan --service "$(SERVICE)"
+	$(ORCHESTRATOR_CLI) project-scan --service "$(SERVICE)"
 
 project-report: ## Show latest discovery report for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-report --service "$(SERVICE)"
+	$(ORCHESTRATOR_CLI) project-report --service "$(SERVICE)"
 
 project-onboard: ## Prepare onboarding proposal for SERVICE=id-or-name (optional DRY_RUN=true)
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-onboard --service "$(SERVICE)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
+	$(ORCHESTRATOR_CLI) project-onboard --service "$(SERVICE)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
+
+project-enrich: ## Prepare a read-only Codex semantic onboarding proposal for SERVICE=id-or-name
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(ORCHESTRATOR_CLI) project-enrich --service "$(SERVICE)"
 
 project-diff: ## Print proposal diff for RUN_ID=uuid
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-diff --run-id "$(RUN_ID)"
+	$(ORCHESTRATOR_CLI) project-diff --run-id "$(RUN_ID)"
 
 project-approve: ## Approve RUN_ID=uuid (optional ACTOR=... COMMENT=...)
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-approve --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	$(ORCHESTRATOR_CLI) project-approve --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 project-reject: ## Reject RUN_ID=uuid (optional ACTOR=... COMMENT=...)
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-reject --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	$(ORCHESTRATOR_CLI) project-reject --run-id "$(RUN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 project-apply: ## Apply approved RUN_ID=uuid in an isolated worktree (optional DRY_RUN=true)
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator project-apply --run-id "$(RUN_ID)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
+	$(ORCHESTRATOR_CLI) project-apply --run-id "$(RUN_ID)" $(if $(filter true 1 yes,$(DRY_RUN)),--dry-run,)
 
 topology: ## Rebuild and print the materialized service topology
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator topology

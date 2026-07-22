@@ -31,23 +31,26 @@ type discoveryMetadata struct {
 }
 
 type serviceManifest struct {
-	SchemaVersion  int                   `yaml:"schema_version"`
-	Name           string                `yaml:"name"`
-	ServiceKind    domain.ServiceKind    `yaml:"service_kind"`
-	RepositoryRole domain.RepositoryRole `yaml:"repository_role"`
-	Repository     serviceRepository     `yaml:"repository"`
-	Purpose        string                `yaml:"purpose,omitempty"`
-	Stack          []manifestFact        `yaml:"stack,omitempty"`
-	Capabilities   []manifestFact        `yaml:"capabilities,omitempty"`
-	Ownership      []manifestFact        `yaml:"ownership,omitempty"`
-	Dependencies   []manifestFact        `yaml:"dependencies,omitempty"`
-	Contracts      []manifestFact        `yaml:"contracts,omitempty"`
-	Gateway        []manifestFact        `yaml:"gateway,omitempty"`
-	Frontends      []manifestFact        `yaml:"frontends,omitempty"`
-	Infrastructure []manifestFact        `yaml:"infrastructure,omitempty"`
-	Instructions   []string              `yaml:"instructions,omitempty"`
-	Commands       []string              `yaml:"commands,omitempty"`
-	Discovery      discoveryMetadata     `yaml:"discovery"`
+	SchemaVersion     int                   `yaml:"schema_version"`
+	Name              string                `yaml:"name"`
+	ServiceKind       domain.ServiceKind    `yaml:"service_kind"`
+	RepositoryRole    domain.RepositoryRole `yaml:"repository_role"`
+	Repository        serviceRepository     `yaml:"repository"`
+	Purpose           string                `yaml:"purpose,omitempty"`
+	Stack             []manifestFact        `yaml:"stack,omitempty"`
+	Capabilities      []manifestFact        `yaml:"capabilities,omitempty"`
+	Ownership         []manifestFact        `yaml:"ownership,omitempty"`
+	Dependencies      []manifestFact        `yaml:"dependencies,omitempty"`
+	Contracts         []manifestFact        `yaml:"contracts,omitempty"`
+	Gateway           []manifestFact        `yaml:"gateway,omitempty"`
+	Frontends         []manifestFact        `yaml:"frontends,omitempty"`
+	Infrastructure    []manifestFact        `yaml:"infrastructure,omitempty"`
+	BusinessRules     []manifestFact        `yaml:"business_rules,omitempty"`
+	BusinessProcesses []manifestFact        `yaml:"business_processes,omitempty"`
+	Entities          []manifestFact        `yaml:"entities,omitempty"`
+	Instructions      []string              `yaml:"instructions,omitempty"`
+	Commands          []string              `yaml:"commands,omitempty"`
+	Discovery         discoveryMetadata     `yaml:"discovery"`
 }
 
 func buildServiceManifest(project domain.Project, snapshot domain.ServiceSnapshot, report domain.DiscoveryReport) serviceManifest {
@@ -61,22 +64,25 @@ func buildServiceManifest(project domain.Project, snapshot domain.ServiceSnapsho
 		localPath = ""
 	}
 	return serviceManifest{
-		SchemaVersion:  1,
-		Name:           project.Name,
-		ServiceKind:    snapshot.ServiceKind,
-		RepositoryRole: project.RepositoryRole,
-		Repository:     serviceRepository{GitURL: gitURL, LocalPath: localPath, DefaultBranch: project.DefaultBranch, Commit: snapshot.CommitSHA},
-		Purpose:        snapshot.Purpose,
-		Stack:          manifestFacts(report.Facts, "stack"),
-		Capabilities:   manifestFacts(report.Facts, "capability"),
-		Ownership:      manifestFacts(report.Facts, "ownership"),
-		Dependencies:   manifestFacts(report.Facts, "relation", "depends_on"),
-		Contracts:      manifestFacts(report.Facts, "contract"),
-		Gateway:        manifestFacts(report.Facts, "relation", "gateway_routes_to"),
-		Frontends:      manifestFacts(report.Facts, "relation", "frontend_consumes"),
-		Infrastructure: manifestFacts(report.Facts, "infrastructure"),
-		Instructions:   instructionPaths(report),
-		Commands:       commandNames(report),
+		SchemaVersion:     1,
+		Name:              project.Name,
+		ServiceKind:       snapshot.ServiceKind,
+		RepositoryRole:    project.RepositoryRole,
+		Repository:        serviceRepository{GitURL: gitURL, LocalPath: localPath, DefaultBranch: project.DefaultBranch, Commit: snapshot.CommitSHA},
+		Purpose:           snapshot.Purpose,
+		Stack:             manifestFacts(report.Facts, "stack"),
+		Capabilities:      manifestFacts(report.Facts, "capability"),
+		Ownership:         manifestFacts(report.Facts, "ownership"),
+		Dependencies:      manifestFacts(report.Facts, "relation", "depends_on"),
+		Contracts:         manifestFacts(report.Facts, "contract"),
+		Gateway:           manifestFacts(report.Facts, "relation", "gateway_routes_to"),
+		Frontends:         manifestFacts(report.Facts, "relation", "frontend_consumes"),
+		Infrastructure:    manifestFacts(report.Facts, "infrastructure"),
+		BusinessRules:     manifestFacts(report.Facts, "business_rule"),
+		BusinessProcesses: manifestFacts(report.Facts, "business_process"),
+		Entities:          manifestFacts(report.Facts, "entity"),
+		Instructions:      instructionPaths(report),
+		Commands:          commandNames(report),
 		Discovery: discoveryMetadata{SnapshotID: snapshot.ID, Commit: snapshot.CommitSHA, Branch: snapshot.Branch,
 			Dirty: snapshot.IsDirty, ContentChecksum: snapshot.ContentChecksum},
 	}
@@ -193,8 +199,12 @@ func reviewerAgent() string {
 	return "# Reviewer\n\nReview the real Git diff independently. Verify write scope, discovered commands, contracts, migrations, and evidence-backed acceptance criteria. Do not reuse the coder thread."
 }
 
-func backendAgent() string {
-	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. Run only commands listed in `.ai/commands.yaml`."
+func backendAgent(hasCommands bool) string {
+	verification := "No repository commands have been approved. Do not invent or run project commands until the owner supplies evidence-backed commands."
+	if hasCommands {
+		verification = "Run only commands listed in `.ai/commands.yaml`."
+	}
+	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. " + verification
 }
 
 func migrationAgent() string {

@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 6
+const reportSchemaVersion = 7
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -84,10 +84,15 @@ func (s Scanner) Scan(
 		return domain.DiscoveryReport{}, err
 	}
 	collector := newCollector()
+	filesByPath := make(map[string][]byte, len(files))
+	for _, file := range files {
+		filesByPath[filepath.ToSlash(file.path)] = file.content
+	}
 	state := detectorState{
 		project:         project,
 		source:          source,
 		collector:       collector,
+		filesByPath:     filesByPath,
 		promptChecksums: make(map[string][]promptChecksum),
 		lockFiles:       make([]string, 0),
 	}
@@ -383,6 +388,7 @@ type detectorState struct {
 	project         domain.Project
 	source          domain.RepositorySource
 	collector       *collector
+	filesByPath     map[string][]byte
 	promptChecksums map[string][]promptChecksum
 	lockFiles       []string
 	readmePurpose   string
