@@ -135,6 +135,7 @@ Inspect README.md, AGENTS.md, prompts, .ai files, source code, API/event contrac
 Do not edit files, use the network, inspect .env or credential files, or report secret values.
 Return only facts directly supported by repository text. Every fact must include an exact evidence_quote of 8 to 500 characters copied from source_path; include surrounding source context when the value itself is shorter.
 Use confidence between 0.50 and 0.95. Put ambiguity in open_questions instead of guessing.
+Runtime capability, ownership, relation, contract, and infrastructure facts must come from production code or authoritative runtime documentation, never tests, fixtures, examples, or testdata.
 Use these category/name conventions when applicable:
 - purpose: summary
 - capability: business capability or http_route
@@ -148,6 +149,7 @@ Use these category/name conventions when applicable:
 - command: stable command name; value must be the exact developer-facing command documented in Makefile, Taskfile, package/pyproject/composer manifest, README, or AGENTS.md; never classify a Dockerfile RUN or CI step as a local command
 Keep values concise, use repository-relative paths, return at most 200 facts and 30 open questions.
 For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
+Do not infer runtime relations from Makefile, Taskfile, or package-manager command manifests. Use gateway_routes_to only when the current repository is the gateway, and frontend_consumes only when it is a frontend.
 Never use .ai/discovery/semantic-report.json itself as evidence.
 For an open question with no specific source file, return an empty source_paths array; never use "." as a path.
 ` + roleGuidance + `
@@ -211,6 +213,27 @@ func validateSemanticAnalysis(
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
 				Reason: "runtime_category_not_allowed_for_repository_role",
+			})
+			continue
+		}
+		if isRuntimeSemanticCategory(fact.Category) && isNonProductionSemanticEvidencePath(fact.SourcePath) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "non_production_evidence_not_allowed_for_runtime_category",
+			})
+			continue
+		}
+		if fact.Category == "relation" && isOperationalSemanticRelationSource(fact.SourcePath) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "relation_source_is_operational_manifest",
+			})
+			continue
+		}
+		if fact.Category == "relation" && !semanticRelationAllowedForSource(fact.Name, project, snapshot) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "relation_type_not_allowed_for_source_kind",
 			})
 			continue
 		}
@@ -317,6 +340,51 @@ func isRuntimeSemanticCategory(category string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isNonProductionSemanticEvidencePath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	base := filepath.Base(path)
+	for _, suffix := range []string{
+		"_test.go", "_test.py", ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+		".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+	} {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	if strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	for _, segment := range strings.Split(path, "/") {
+		switch segment {
+		case "test", "tests", "testdata", "__tests__", "fixture", "fixtures", "example", "examples":
+			return true
+		}
+	}
+	return false
+}
+
+func isOperationalSemanticRelationSource(path string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(path))))
+	return base == "makefile" || base == "taskfile.yml" || base == "taskfile.yaml" ||
+		base == "package.json" || base == "pyproject.toml" || base == "composer.json"
+}
+
+func semanticRelationAllowedForSource(
+	name string,
+	project domain.Project,
+	snapshot domain.ServiceSnapshot,
+) bool {
+	switch name {
+	case "gateway_routes_to":
+		return snapshot.ServiceKind == domain.ServiceKindGateway
+	case "frontend_consumes":
+		return project.RepositoryRole == domain.RepositoryRoleFrontend ||
+			snapshot.ServiceKind == domain.ServiceKindFrontendApplication
+	default:
+		return true
 	}
 }
 

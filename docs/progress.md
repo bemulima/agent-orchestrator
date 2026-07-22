@@ -515,6 +515,12 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the five reviewed platform-anchor trees after exact tree-hash
   comparison as GitHub draft PRs: validation orchestrator PR #21, sandbox PR
   #13, course PR #74, gateway PR #29, and course-wiki PR #11. No PR was merged.
+- Rejected the first `ms-go-auth` proposal because an E2E-only path reversed a
+  gateway relation and a Taskfile comment promoted a local shared-Postgres setup
+  into runtime topology. Semantic runtime categories now reject evidence from
+  tests, fixtures, examples, and testdata; relations reject operational manifest
+  sources; gateway/frontend relation types are constrained to matching source
+  repository kinds.
 
 ## Remaining work
 

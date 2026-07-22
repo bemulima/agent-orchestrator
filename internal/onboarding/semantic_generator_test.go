@@ -235,6 +235,63 @@ func TestValidateSemanticAnalysisRejectsRuntimeFactsForDocumentationRepository(t
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsNonProductionAndOperationalRelations(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "test", "e2e"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "test", "e2e", "README.md"),
+		[]byte("Requests run through ms-gateway.\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "Taskfile.yml"),
+		[]byte("# Uses the ms-go-user shared database.\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "ms-go-auth", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{
+		ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindBackendService,
+	}
+	content := json.RawMessage(`{
+  "summary":"Authentication service.",
+  "facts":[{
+    "category":"relation","name":"gateway_routes_to","value":"ms-gateway","confidence":0.9,
+    "source_path":"test/e2e/README.md","evidence_quote":"Requests run through ms-gateway.",
+    "explanation":"E2E requests use the gateway."
+  },{
+    "category":"relation","name":"stores_in","value":"ms-go-user","confidence":0.9,
+    "source_path":"Taskfile.yml","evidence_quote":"Uses the ms-go-user shared database.",
+    "explanation":"The task manifest points to a local shared database."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(
+		root,
+		project,
+		snapshot,
+		content,
+		[]string{"ms-go-auth", "ms-gateway", "ms-go-user"},
+	)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	reasons := make(map[string]bool)
+	for _, fact := range analysis.RejectedFacts {
+		reasons[fact.Reason] = true
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 2 ||
+		!reasons["non_production_evidence_not_allowed_for_runtime_category"] ||
+		!reasons["relation_source_is_operational_manifest"] {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result json.RawMessage
 	role   domain.AgentRunRole
