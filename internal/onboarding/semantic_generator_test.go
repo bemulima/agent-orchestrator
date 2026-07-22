@@ -201,6 +201,40 @@ func TestValidateSemanticAnalysisRejectsMissingRootCommandPath(t *testing.T) {
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsRuntimeFactsForDocumentationRepository(t *testing.T) {
+	root := t.TempDir()
+	readme := "The wiki documents the course table and publication requires review.\n"
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte(readme), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{
+		ID: "project-1", Name: "course-wiki", RepositoryRole: domain.RepositoryRoleDocumentation, LocalPath: &root,
+	}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	content := json.RawMessage(`{
+  "summary":"Course platform documentation.",
+  "facts":[{
+    "category":"ownership","name":"database_table","value":"course","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"The wiki documents the course table",
+    "explanation":"The wiki documents the table."
+  },{
+    "category":"business_rule","name":"publication_requires_review","value":"Publication requires review","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"publication requires review",
+    "explanation":"The documentation states the rule."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 1 || analysis.Facts[0].Category != "business_rule" ||
+		len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "runtime_category_not_allowed_for_repository_role" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result json.RawMessage
 	role   domain.AgentRunRole

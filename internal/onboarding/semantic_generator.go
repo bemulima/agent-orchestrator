@@ -109,6 +109,15 @@ func semanticPrompt(
 	report domain.DiscoveryReport,
 	connectedProjects []string,
 ) (string, error) {
+	roleGuidance := ""
+	if isNonRuntimeSemanticRole(project.RepositoryRole) {
+		roleGuidance = `
+This repository has a non-runtime role (content, policy, documentation, or archive).
+Use only purpose, business_rule, business_process, entity, and command facts.
+Describe platform knowledge as rules or processes with the owning service named in the fact value when the source does so.
+Do not emit capability, ownership, relation, contract, or infrastructure facts: those would incorrectly make this repository a runtime owner, producer, consumer, or deployment component.
+`
+	}
 	contextPayload := struct {
 		ProjectName       string                `json:"project_name"`
 		RepositoryRole    domain.RepositoryRole `json:"repository_role"`
@@ -141,6 +150,7 @@ Keep values concise, use repository-relative paths, return at most 200 facts and
 For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
 Never use .ai/discovery/semantic-report.json itself as evidence.
 For an open question with no specific source file, return an empty source_paths array; never use "." as a path.
+` + roleGuidance + `
 
 Deterministic discovery context:
 ` + string(content), nil
@@ -196,6 +206,13 @@ func validateSemanticAnalysis(
 			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
 			fact.Confidence < .5 || fact.Confidence > .95 {
 			return domain.SemanticAnalysis{}, fmt.Errorf("invalid semantic fact %s/%s: %w", fact.Category, fact.Name, domain.ErrValidation)
+		}
+		if isNonRuntimeSemanticRole(project.RepositoryRole) && isRuntimeSemanticCategory(fact.Category) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "runtime_category_not_allowed_for_repository_role",
+			})
+			continue
 		}
 		if fact.Category == "command" && (containsCredentialLikeCommand(fact.Value) || !isSemanticCommandSource(fact.SourcePath)) {
 			reason := "command_source_not_approved"
@@ -282,6 +299,25 @@ func validateSemanticAnalysis(
 		BaseCommit: snapshot.CommitSHA, Summary: result.Summary, Facts: validated, RejectedFacts: rejected,
 		OpenQuestions: validatedQuestions,
 	}, nil
+}
+
+func isNonRuntimeSemanticRole(role domain.RepositoryRole) bool {
+	switch role {
+	case domain.RepositoryRoleContent, domain.RepositoryRolePolicy,
+		domain.RepositoryRoleDocumentation, domain.RepositoryRoleArchive:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRuntimeSemanticCategory(category string) bool {
+	switch category {
+	case "capability", "ownership", "relation", "contract", "infrastructure":
+		return true
+	default:
+		return false
+	}
 }
 
 func verifyEvidenceQuote(root, path, quote string) error {

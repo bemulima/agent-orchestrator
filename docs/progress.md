@@ -497,18 +497,28 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   quoted without its required working directory and did not exist relative to
   the repository root. Semantic command validation now rejects missing `./...`
   executable paths instead of placing non-runnable commands in agent manifests.
+- Completed reviewed, dry-run-validated onboarding applies for the platform
+  anchors `ms-go-validation-orchestrator`, `ms-go-sandbox`, `ms-go-course`, and
+  `ms-gateway`. Every apply used an isolated `ai/onboard-*` worktree, restricted
+  writes to `AGENTS.md` and `.ai/**`, committed the exact approved proposal, and
+  left the managed source checkout unchanged.
+- Rejected the first `course-wiki` semantic proposal because documentation-only
+  evidence was represented as runtime ownership, contracts, infrastructure, and
+  topology relations. Semantic validation now fail-closes those categories for
+  content, policy, documentation, and archive roles while retaining purpose,
+  business rules, business processes, entities, and repository commands.
 
 ## Remaining work
 
 - Review and merge the published pilot PR through the repository workflow before
   rescanning its approved semantic report into the trusted topology.
-- Enrich the remaining 37 repositories in reviewed waves; do not approve or
+- Enrich the remaining 33 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Rebuild the Compose services with discovery schema v9, rescan all connected
-projects, verify that example/test ownership and route false positives are gone,
-then regenerate and review `ms-go-validation-orchestrator` semantic enrichment.
+Run the full verification suite for non-runtime semantic role gating, rebuild
+the Compose services, regenerate and review `course-wiki`, then publish the five
+reviewed platform-anchor branches as GitHub draft pull requests.
