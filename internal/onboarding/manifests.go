@@ -103,10 +103,12 @@ func buildArchitectureManifest(report domain.DiscoveryReport) architectureManife
 }
 
 type commandEntry struct {
-	Name       string  `yaml:"name"`
-	Run        string  `yaml:"run"`
-	SourcePath string  `yaml:"source_path"`
-	Confidence float64 `yaml:"confidence"`
+	Name             string  `yaml:"name"`
+	Run              string  `yaml:"run"`
+	SourcePath       string  `yaml:"source_path"`
+	Confidence       float64 `yaml:"confidence"`
+	RequiresApproval bool    `yaml:"requires_approval"`
+	Risk             string  `yaml:"risk"`
 }
 
 type commandsManifest struct {
@@ -129,6 +131,7 @@ func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 		} else {
 			entry.Run = fact.Value
 		}
+		entry.RequiresApproval, entry.Risk = classifyCommandRisk(entry.Name, entry.Run)
 		commands = append(commands, entry)
 	}
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Name < commands[j].Name })
@@ -168,6 +171,9 @@ type workflowManifest struct {
 func buildTestWorkflow(commands commandsManifest) workflowManifest {
 	steps := make([]string, 0, len(commands.Commands))
 	for _, command := range commands.Commands {
+		if command.RequiresApproval {
+			continue
+		}
 		lower := strings.ToLower(command.Name)
 		if strings.Contains(lower, "test") || strings.Contains(lower, "lint") || strings.Contains(lower, "verify") || strings.Contains(lower, "check") {
 			steps = append(steps, command.Run)
@@ -175,8 +181,14 @@ func buildTestWorkflow(commands commandsManifest) workflowManifest {
 	}
 	if len(steps) == 0 {
 		for _, command := range commands.Commands {
+			if command.RequiresApproval {
+				continue
+			}
 			steps = append(steps, command.Run)
 		}
+	}
+	if len(steps) == 0 {
+		steps = append(steps, "request owner approval before running repository commands")
 	}
 	return workflowManifest{SchemaVersion: 1, Name: "test", RequiresApproval: false, Steps: uniqueSorted(steps)}
 }
@@ -202,9 +214,34 @@ func reviewerAgent() string {
 func backendAgent(hasCommands bool) string {
 	verification := "No repository commands have been approved. Do not invent or run project commands until the owner supplies evidence-backed commands."
 	if hasCommands {
-		verification = "Run only commands listed in `.ai/commands.yaml`."
+		verification = "Run only commands listed in `.ai/commands.yaml` with `requires_approval: false`. Request explicit owner approval before any command marked `requires_approval: true`."
 	}
 	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. " + verification
+}
+
+func classifyCommandRisk(name, command string) (bool, string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	command = strings.ToLower(strings.TrimSpace(command))
+	padded := " " + command + " "
+	for _, marker := range []string{
+		" rm ", "rm -", "delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
+		"reset", "rollback", "migrate-down", "migrate down", "compose down", " stop", "kill",
+		"deploy", "publish", "release", "git push", "docker push", "kubectl", "helm ", "terraform",
+		"curl ", "wget ", "sudo ",
+	} {
+		if strings.Contains(padded, marker) || strings.Contains(name, strings.TrimSpace(marker)) {
+			return true, "state_change"
+		}
+	}
+	if strings.HasPrefix(command, "docker ") || strings.HasPrefix(command, "docker-compose ") {
+		return true, "external_runtime"
+	}
+	for _, marker := range []string{"test", "lint", "verify", "check", "vet", "format", "fmt", "build"} {
+		if strings.Contains(name, marker) {
+			return false, "verification"
+		}
+	}
+	return true, "lifecycle"
 }
 
 func migrationAgent() string {

@@ -95,6 +95,32 @@ func TestGeneratorRejectsSymlinkedAITree(t *testing.T) {
 	}
 }
 
+func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
+	report := domain.DiscoveryReport{Facts: []domain.Evidence{
+		{Category: "command", Name: "test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "cleanup_exited_sandboxes", Value: "./scripts/cleanup_exited_sandboxes.sh", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "stop_containers", Value: "docker compose down", SourcePath: "Taskfile.yml", Confidence: .95},
+	}}
+	manifest := buildCommandsManifest(report)
+	if len(manifest.Commands) != 3 {
+		t.Fatalf("commands = %#v", manifest.Commands)
+	}
+	approval := make(map[string]bool, len(manifest.Commands))
+	for _, command := range manifest.Commands {
+		approval[command.Name] = command.RequiresApproval
+	}
+	if approval["test"] || !approval["cleanup_exited_sandboxes"] || !approval["stop_containers"] {
+		t.Fatalf("command approval classification = %#v", approval)
+	}
+	workflow := buildTestWorkflow(manifest)
+	if len(workflow.Steps) != 1 || workflow.Steps[0] != "go test ./..." {
+		t.Fatalf("test workflow included operational commands: %#v", workflow.Steps)
+	}
+	if !strings.Contains(backendAgent(true), "requires_approval: false") {
+		t.Fatal("backend agent does not enforce command approval metadata")
+	}
+}
+
 func TestGeneratorPreservesExistingAIValuesAndReportsConflict(t *testing.T) {
 	root := fixturePath(t, "existing-ai")
 	project, snapshot, report := generatorFixture(root)

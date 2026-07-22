@@ -482,6 +482,12 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   containers, URLs, or other non-project values are isolated as rejected facts.
 - Added regression coverage for example/test evidence suppression and
   non-catalog semantic relation targets. Focused tests and `make verify` pass.
+- Rejected the first `ms-go-sandbox` semantic proposal because its command
+  manifest exposed cleanup and Docker lifecycle commands without an explicit
+  approval boundary. Generated command catalogs now classify each entry as
+  verification, lifecycle, external-runtime, or state-change and set
+  `requires_approval` accordingly. Agent and test workflows run only
+  non-approval verification commands; all other commands require an owner gate.
 
 ## Remaining work
 
