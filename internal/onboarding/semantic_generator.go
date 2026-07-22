@@ -207,6 +207,13 @@ func validateSemanticAnalysis(
 			})
 			continue
 		}
+		if fact.Category == "command" && !semanticCommandPathExists(root, fact.Value) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "command_path_not_found_from_repository_root",
+			})
+			continue
+		}
 		if fact.Category == "relation" && isSelfSemanticRelation(fact.Value, project.Name) {
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
@@ -444,6 +451,20 @@ func containsCredentialLikeCommand(value string) bool {
 		}
 	}
 	return false
+}
+
+func semanticCommandPathExists(root, value string) bool {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "./") {
+		return true
+	}
+	relative := strings.TrimPrefix(fields[0], "./")
+	path, err := resolveSemanticEvidencePath(root, relative)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func isSemanticCommandSource(path string) bool {

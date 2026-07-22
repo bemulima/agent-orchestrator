@@ -175,6 +175,32 @@ func TestValidateSemanticAnalysisRejectsRelationOutsideConnectedCatalog(t *testi
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsMissingRootCommandPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("Run ./missing.sh after changing directories.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	content := json.RawMessage(`{
+  "summary":"fixture",
+  "facts":[{
+    "category":"command","name":"test","value":"./missing.sh","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"Run ./missing.sh after changing directories.",
+    "explanation":"The README documents this command."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "command_path_not_found_from_repository_root" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result json.RawMessage
 	role   domain.AgentRunRole

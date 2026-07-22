@@ -493,6 +493,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   Command risk precedence now treats migration, create, import, insert, seed,
   and integration operations as approval-required before considering test or
   validation keywords.
+- Rejected the first `ms-gateway` semantic proposal because an E2E command was
+  quoted without its required working directory and did not exist relative to
+  the repository root. Semantic command validation now rejects missing `./...`
+  executable paths instead of placing non-runnable commands in agent manifests.
 
 ## Remaining work
 
