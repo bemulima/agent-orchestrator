@@ -229,13 +229,18 @@ func (s Service) storeArtifacts(
 
 func coderPrompt(executionContext domain.TaskExecutionContext, feedback string) (string, error) {
 	payload := struct {
-		Command      string                     `json:"command"`
-		PlanSummary  string                     `json:"plan_summary"`
-		Task         domain.Task                `json:"task"`
-		Dependencies []domain.TaskDependencyRef `json:"dependencies"`
+		Command      string                             `json:"command"`
+		PlanSummary  string                             `json:"plan_summary"`
+		Project      domain.Project                     `json:"current_project"`
+		Task         domain.Task                        `json:"task"`
+		Projects     []domain.ConnectedProjectKnowledge `json:"connected_projects"`
+		Topology     agentLandscape                     `json:"connected_landscape"`
+		Dependencies []domain.TaskDependencyRef         `json:"dependencies"`
 	}{
 		Command: executionContext.Command.Text, PlanSummary: executionContext.Plan.Summary,
-		Task: executionContext.Task, Dependencies: executionContext.Dependencies,
+		Project: executionContext.Project, Task: executionContext.Task, Projects: executionContext.ConnectedProjects,
+		Topology:     landscapeForAgent(executionContext.Topology),
+		Dependencies: executionContext.Dependencies,
 	}
 	content, err := json.Marshal(payload)
 	if err != nil {
@@ -243,6 +248,9 @@ func coderPrompt(executionContext domain.TaskExecutionContext, feedback string) 
 	}
 	prompt := `You are the coder for exactly one persisted task in an isolated Git worktree.
 Read and obey AGENTS.md plus relevant .ai/prompts and .ai/contracts files in this repository.
+Use connected_landscape as the shared cross-project index of services, capabilities, ownership, contracts, relations, and drift.
+Use connected_projects to identify every connected runtime and knowledge repository, including policy, documentation, content, and archive sources.
+Treat its evidence paths as leads, verify assumptions against the current worktree, and never invent an undiscovered contract or business rule.
 Implement only this task. Never edit outside task.write_scope. Do not commit, create branches, push, or modify another checkout.
 Run only task.verification_commands and "git diff --check". Inspect actual Git status before answering.
 Return only JSON matching the supplied schema. files_changed must exactly match actual changed and untracked files.
@@ -267,11 +275,15 @@ func reviewerPrompt(
 		state.Diff = state.Diff[:256<<10] + "\n[diff truncated; inspect the worktree directly]"
 	}
 	payload := struct {
-		Task         domain.Task               `json:"task"`
-		CoderResult  domain.AgentResult        `json:"coder_result"`
-		Verification domain.VerificationReport `json:"verification"`
-		GitState     domain.WorkspaceState     `json:"git_state"`
-	}{executionContext.Task, result, report, state}
+		Project      domain.Project                     `json:"current_project"`
+		Task         domain.Task                        `json:"task"`
+		Projects     []domain.ConnectedProjectKnowledge `json:"connected_projects"`
+		Topology     agentLandscape                     `json:"connected_landscape"`
+		CoderResult  domain.AgentResult                 `json:"coder_result"`
+		Verification domain.VerificationReport          `json:"verification"`
+		GitState     domain.WorkspaceState              `json:"git_state"`
+	}{executionContext.Project, executionContext.Task, executionContext.ConnectedProjects,
+		landscapeForAgent(executionContext.Topology), result, report, state}
 	content, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("encode reviewer context: %w", err)
@@ -279,6 +291,7 @@ func reviewerPrompt(
 	return `You are an independent reviewer in a new, read-only agent thread.
 Do not edit files and do not accept the coder's claims without checking the actual worktree.
 Review the Git diff, untracked files, acceptance criteria, write scope, tests, migration safety, and contract changes.
+Cross-check affected services and contracts against connected_landscape; require a bounded cross-project task when another repository must change.
 Return only JSON matching the supplied reviewer schema. Approve only when no blocking issue remains.
 
 Review context:

@@ -123,11 +123,12 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
 - Limits: `MAX_TASK_ATTEMPTS=3`, `MAX_REVIEW_ATTEMPTS=2`,
   `MAX_REPLANS=2`, `MAX_PARALLEL_TASKS=3`,
   `MAX_REQUIRED_TASK_DEPTH=3`.
-- Codex execution: `CODEX_RUNNER_COMMAND`, `CODEX_API_KEY`, and model profiles
-  `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
-  `CODEX_MODEL_REVIEW`. Empty model values defer selection to Codex; no model
-  name is compiled into the Go service. Keep the key only in ignored `.env` or
-  an external secret store.
+- Codex execution: the default is the existing ChatGPT login from local
+  `codex-cli`. Run `codex login` once and `make codex-auth-sync`; `make up`
+  synchronizes that login automatically when it exists. No API key is
+  required. `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
+  and `CODEX_MODEL_REVIEW` select models by task profile and reviewer role.
+  Empty values defer model selection to Codex.
 - GitLab: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, `GITLAB_CONTROL_PROJECT`, and
   `GITLAB_DRY_RUN`. New GitLab 19+ webhooks should use
   `GITLAB_WEBHOOK_SIGNING_TOKEN=whsec_<base64-key>`; the legacy
@@ -328,6 +329,14 @@ paths. A separate read-only reviewer thread must approve the actual worktree
 before the worker commits. The connected source checkout remains a clean,
 unchanged base; Stage 6 never pushes, merges, or deploys.
 
+Every coder and reviewer receives the current connected landscape: service
+purposes, capabilities, ownership, contracts, relations, and contract drift.
+It also receives the complete connected-project catalog, including policy,
+documentation, content, and archive repositories with their discovery
+evidence and conflicts.
+The agent still verifies evidence in its own worktree and requests a bounded
+task for another connected repository instead of editing across checkouts.
+
 Reviewer changes resume the same coder thread, but each review uses a fresh
 thread. Blocked tasks can request at most three bounded cross-project tasks;
 Temporal runs them first and resumes the parent subject to replan/depth/attempt
@@ -338,7 +347,9 @@ verification evidence, and artifact metadata.
 The TypeScript runner communicates with Go over bounded JSONL, disables agent
 network access and approvals, uses `workspace-write` for coders and
 `read-only` for reviewers, and applies an explicit secret-free shell
-environment policy. `CODEX_API_KEY`, database credentials, and integration
+environment policy. The worker stores only a private copy of the local
+`codex-cli` credential file in its durable volume; the host Codex history and
+configuration are not mounted. Credentials, database settings, and integration
 tokens are never included in prompts or child tool environments.
 
 The Stage 5 API is available under `/api/v1`:

@@ -116,11 +116,25 @@ type TaskReview struct {
 }
 
 type TaskExecutionContext struct {
-	Task         Task                `json:"task"`
-	Project      Project             `json:"project"`
-	Plan         Plan                `json:"plan"`
-	Command      Command             `json:"command"`
-	Dependencies []TaskDependencyRef `json:"dependencies"`
+	Task              Task                        `json:"task"`
+	Project           Project                     `json:"project"`
+	Plan              Plan                        `json:"plan"`
+	Command           Command                     `json:"command"`
+	Topology          TopologyCatalog             `json:"topology"`
+	ConnectedProjects []ConnectedProjectKnowledge `json:"connected_projects"`
+	Dependencies      []TaskDependencyRef         `json:"dependencies"`
+}
+
+type ConnectedProjectKnowledge struct {
+	ProjectID      string         `json:"project_id"`
+	Name           string         `json:"name"`
+	RepositoryRole RepositoryRole `json:"repository_role"`
+	ServiceKind    ServiceKind    `json:"service_kind"`
+	Language       string         `json:"language,omitempty"`
+	Framework      string         `json:"framework,omitempty"`
+	Purpose        string         `json:"purpose,omitempty"`
+	Evidence       []Evidence     `json:"evidence,omitempty"`
+	Conflicts      []Evidence     `json:"conflicts,omitempty"`
 }
 
 type TaskDependencyRef struct {

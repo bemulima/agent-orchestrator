@@ -12,6 +12,8 @@ DB_USER ?= postgres
 POSTGRES_PORT ?= 5434
 HTTP_PORT ?= 8080
 TEMPORAL_UI_PORT ?= 8233
+DATABASE_URL ?= postgres://$(DB_USER):$(or $(POSTGRES_PASSWORD),postgres)@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable
+CODEX_HOST_AUTH_FILE ?= $(HOME)/.codex/auth.json
 GO_ENV := XDG_CACHE_HOME=$(CURDIR)/.cache GOCACHE=$(CURDIR)/.cache/go-build GOMODCACHE=$(CURDIR)/.cache/gomod GOBIN=$(CURDIR)/.cache/bin
 GO_FILES := $$(find . -type f -name '*.go' -not -path './.cache/*')
 COMMAND_PATH ?= /usr/local/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -21,7 +23,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -35,6 +37,11 @@ bootstrap: ## Prepare local configuration and download Go dependencies
 
 up: ## Start PostgreSQL, Temporal, API, worker, and Temporal UI
 	$(COMPOSE) up -d --build
+	@if [ -f "$(CODEX_HOST_AUTH_FILE)" ]; then \
+		COMPOSE_COMMAND="$(COMPOSE)" ./scripts/sync-codex-auth.sh "$(CODEX_HOST_AUTH_FILE)"; \
+	else \
+		echo "Codex CLI login is not configured; run 'codex login' and 'make codex-auth-sync' before executing plans"; \
+	fi
 
 down: ## Stop the local stack without deleting durable volumes
 	$(COMPOSE) down
@@ -74,6 +81,12 @@ telegram: ## Run Telegram long polling, or configure the webhook when TELEGRAM_W
 
 config-check: ## Validate environment and print a secret-free summary
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator config-check
+
+codex-auth-sync: ## Copy the existing local codex-cli ChatGPT login into the worker volume
+	COMPOSE_COMMAND="$(COMPOSE)" ./scripts/sync-codex-auth.sh "$(CODEX_HOST_AUTH_FILE)"
+
+codex-auth-status: ## Check codex-cli login inside the worker
+	$(COMPOSE) exec -T worker /bin/sh -c 'set -eu; codex_bin=$$(find /app/runner/node_modules/@openai -type f -path "*/vendor/*/bin/codex" | head -n 1); test -n "$$codex_bin"; "$$codex_bin" login status'
 
 project-connect: ## Connect and scan a project (PATH=.../PROJECT_PATH=... or GIT_URL=..., optional ROLE=...)
 	@if [ -n "$(CONNECT_PATH)" ] && [ -n "$(GIT_URL)" ]; then echo "Set only PATH/PROJECT_PATH or GIT_URL"; exit 2; fi
