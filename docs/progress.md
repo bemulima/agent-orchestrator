@@ -521,6 +521,11 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   tests, fixtures, examples, and testdata; relations reject operational manifest
   sources; gateway/frontend relation types are constrained to matching source
   repository kinds.
+- Two subsequent `ms-go-auth` analyses reached a child-runner failure after
+  emitting only the thread frame. The Go adapter previously returned only an
+  unhelpful incomplete-protocol error and discarded the runner's structured
+  stderr event. It now surfaces the bounded JSON error message while continuing
+  to ignore arbitrary stderr, with regression coverage for the partial protocol.
 
 ## Remaining work
 

@@ -76,6 +76,9 @@ func (r *ProcessRunner) Run(
 	}
 	waitErr := command.Wait()
 	if readErr != nil {
+		if message := reportedRunnerError(stderr.String()); message != "" {
+			return domain.AgentRunResponse{}, fmt.Errorf("%w: runner reported: %s", readErr, message)
+		}
 		return domain.AgentRunResponse{}, readErr
 	}
 	if waitErr != nil {
@@ -86,6 +89,23 @@ func (r *ProcessRunner) Run(
 		return domain.AgentRunResponse{}, fmt.Errorf("Codex runner failed: %s", message)
 	}
 	return response, nil
+}
+
+func reportedRunnerError(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		var event struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.Type == "error" {
+			message := strings.TrimSpace(event.Message)
+			if len(message) > 2000 {
+				message = message[:2000]
+			}
+			return message
+		}
+	}
+	return ""
 }
 
 func readProtocol(

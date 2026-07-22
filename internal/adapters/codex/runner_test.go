@@ -55,6 +55,18 @@ func TestProcessRunnerAcceptsReadOnlyAnalyst(t *testing.T) {
 	require.JSONEq(t, `{"status":"completed"}`, string(response.Result))
 }
 
+func TestProcessRunnerReportsStructuredChildErrorForIncompleteProtocol(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_HELPER", "incomplete")
+	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
+	require.NoError(t, err)
+	_, err = runner.Run(context.Background(), domain.AgentRunRequest{
+		Role: domain.AgentRunAnalyst, WorkingDirectory: t.TempDir(), Prompt: "analyze fixture",
+		OutputSchema: map[string]any{"type": "object"},
+	}, nil)
+	require.ErrorContains(t, err, "incomplete Codex runner protocol")
+	require.ErrorContains(t, err, "fixture structured result was invalid")
+}
+
 func TestNewProcessRunnerRejectsShellSyntax(t *testing.T) {
 	_, err := NewProcessRunner("node runner.js; printenv")
 	require.Error(t, err)
@@ -77,6 +89,10 @@ func TestCodexRunnerHelper(t *testing.T) {
 		os.Exit(0)
 	}
 	fmt.Println(`{"type":"thread_started","thread_id":"thread-fixture"}`)
+	if mode == "incomplete" {
+		fmt.Fprintln(os.Stderr, `{"type":"error","message":"fixture structured result was invalid"}`)
+		os.Exit(1)
+	}
 	fmt.Println(`{"type":"result","thread_id":"thread-fixture","result":{"status":"completed"}}`)
 	os.Exit(0)
 }
