@@ -474,9 +474,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   evidence review because deterministic discovery treated SQL embedded in
   `docs/examples/*.json` as owned tables and a route in `_test.go` as a
   production endpoint.
-- Advanced discovery report schema to v8. Runtime topology evidence now ignores
+- Advanced discovery report schema to v9. Runtime topology evidence now ignores
   test, fixture, and example paths, while database ownership requires a
-  checked-in production SQL file. Semantic analysts now receive the exact
+  checked-in production SQL file. Compose detection accepts only YAML manifests
+  and no longer misclassifies Go files such as `compose.go`. Semantic analysts now receive the exact
   connected-project name catalog, and relation facts targeting networks,
   containers, URLs, or other non-project values are isolated as rejected facts.
 - Added regression coverage for example/test evidence suppression and
@@ -493,6 +494,6 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Exact next task
 
-Rebuild the Compose services with discovery schema v8, rescan all connected
+Rebuild the Compose services with discovery schema v9, rescan all connected
 projects, verify that example/test ownership and route false positives are gone,
 then regenerate and review `ms-go-validation-orchestrator` semantic enrichment.

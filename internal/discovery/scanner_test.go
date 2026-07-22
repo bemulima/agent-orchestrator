@@ -195,6 +195,9 @@ func routes(router Router) { router.Post("/api/v1/real", handler) }
 		"internal/http/server_test.go": `package http
 func testRoutes(router Router) { router.Get("/health", handler) }
 `,
+		"internal/adapters/docker/compose.go": `package docker
+func runCompose() {}
+`,
 		"docs/examples/postgres-runtime.json": `{"migration":"CREATE TABLE users (id UUID);"}`,
 		"tests/fixture.sql":                   `CREATE TABLE test_records (id UUID);`,
 	}
@@ -224,6 +227,11 @@ func testRoutes(router Router) { router.Get("/health", handler) }
 		}
 		if fact.Name == "database_table" && (fact.Value == "users" || fact.Value == "test_records") {
 			t.Fatalf("example/test schema emitted ownership: %#v", fact)
+		}
+	}
+	for _, conflict := range report.Conflicts {
+		if conflict.Name == "invalid_manifest" && conflict.SourcePath == "internal/adapters/docker/compose.go" {
+			t.Fatalf("Go source was parsed as a Compose manifest: %#v", conflict)
 		}
 	}
 }

@@ -514,6 +514,10 @@ func isHealthRoute(value string) bool {
 }
 
 func isComposeFile(base string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	if !strings.HasSuffix(base, ".yml") && !strings.HasSuffix(base, ".yaml") {
+		return false
+	}
 	return base == "docker-compose.yml" || base == "docker-compose.yaml" ||
 		base == "compose.yml" || base == "compose.yaml" ||
 		strings.HasPrefix(base, "docker-compose.") || strings.HasPrefix(base, "compose.")
