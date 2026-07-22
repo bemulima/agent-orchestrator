@@ -488,6 +488,11 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   verification, lifecycle, external-runtime, or state-change and set
   `requires_approval` accordingly. Agent and test workflows run only
   non-approval verification commands; all other commands require an owner gate.
+- Rejected the first `ms-go-course` semantic proposal because seed-import and
+  integration commands were initially classified by their test-like names.
+  Command risk precedence now treats migration, create, import, insert, seed,
+  and integration operations as approval-required before considering test or
+  validation keywords.
 
 ## Remaining work
 

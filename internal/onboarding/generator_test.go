@@ -100,20 +100,24 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 		{Category: "command", Name: "test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
 		{Category: "command", Name: "cleanup_exited_sandboxes", Value: "./scripts/cleanup_exited_sandboxes.sh", SourcePath: "Taskfile.yml", Confidence: .95},
 		{Category: "command", Name: "stop_containers", Value: "docker compose down", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "import-test-seeds", Value: "make import-test-seeds", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "test-integration", Value: "make test-integration", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "validate-contract", Value: "make validate-contract", SourcePath: "Makefile", Confidence: .95},
 	}}
 	manifest := buildCommandsManifest(report)
-	if len(manifest.Commands) != 3 {
+	if len(manifest.Commands) != 6 {
 		t.Fatalf("commands = %#v", manifest.Commands)
 	}
 	approval := make(map[string]bool, len(manifest.Commands))
 	for _, command := range manifest.Commands {
 		approval[command.Name] = command.RequiresApproval
 	}
-	if approval["test"] || !approval["cleanup_exited_sandboxes"] || !approval["stop_containers"] {
+	if approval["test"] || approval["validate-contract"] || !approval["cleanup_exited_sandboxes"] ||
+		!approval["stop_containers"] || !approval["import-test-seeds"] || !approval["test-integration"] {
 		t.Fatalf("command approval classification = %#v", approval)
 	}
 	workflow := buildTestWorkflow(manifest)
-	if len(workflow.Steps) != 1 || workflow.Steps[0] != "go test ./..." {
+	if len(workflow.Steps) != 2 || workflow.Steps[0] != "go test ./..." || workflow.Steps[1] != "make validate-contract" {
 		t.Fatalf("test workflow included operational commands: %#v", workflow.Steps)
 	}
 	if !strings.Contains(backendAgent(true), "requires_approval: false") {

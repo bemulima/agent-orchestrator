@@ -175,7 +175,8 @@ func buildTestWorkflow(commands commandsManifest) workflowManifest {
 			continue
 		}
 		lower := strings.ToLower(command.Name)
-		if strings.Contains(lower, "test") || strings.Contains(lower, "lint") || strings.Contains(lower, "verify") || strings.Contains(lower, "check") {
+		if strings.Contains(lower, "test") || strings.Contains(lower, "lint") || strings.Contains(lower, "verify") ||
+			strings.Contains(lower, "validate") || strings.Contains(lower, "check") {
 			steps = append(steps, command.Run)
 		}
 	}
@@ -225,7 +226,8 @@ func classifyCommandRisk(name, command string) (bool, string) {
 	padded := " " + command + " "
 	for _, marker := range []string{
 		" rm ", "rm -", "delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
-		"reset", "rollback", "migrate-down", "migrate down", "compose down", " stop", "kill",
+		"reset", "rollback", "migrate", "migration", "create", "import", "insert", "seed",
+		"compose down", " stop", "kill",
 		"deploy", "publish", "release", "git push", "docker push", "kubectl", "helm ", "terraform",
 		"curl ", "wget ", "sudo ",
 	} {
@@ -236,7 +238,10 @@ func classifyCommandRisk(name, command string) (bool, string) {
 	if strings.HasPrefix(command, "docker ") || strings.HasPrefix(command, "docker-compose ") {
 		return true, "external_runtime"
 	}
-	for _, marker := range []string{"test", "lint", "verify", "check", "vet", "format", "fmt", "build"} {
+	if strings.Contains(name, "integration") || strings.Contains(command, "integration") {
+		return true, "external_runtime"
+	}
+	for _, marker := range []string{"test", "lint", "verify", "validate", "check", "vet", "format", "fmt", "build", "help"} {
 		if strings.Contains(name, marker) {
 			return false, "verification"
 		}
