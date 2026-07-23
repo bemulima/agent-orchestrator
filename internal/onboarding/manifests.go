@@ -118,6 +118,7 @@ type commandsManifest struct {
 
 func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 	commands := make([]commandEntry, 0)
+	commandIndexes := make(map[string]int)
 	for _, fact := range report.Facts {
 		if fact.Category != "command" {
 			continue
@@ -132,6 +133,14 @@ func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 			entry.Run = fact.Value
 		}
 		entry.RequiresApproval, entry.Risk = classifyCommandRisk(entry.Name, entry.Run)
+		key := entry.Name + "\x00" + entry.Run
+		if index, exists := commandIndexes[key]; exists {
+			if commands[index].Confidence < entry.Confidence {
+				commands[index] = entry
+			}
+			continue
+		}
+		commandIndexes[key] = len(commands)
 		commands = append(commands, entry)
 	}
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Name < commands[j].Name })

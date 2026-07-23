@@ -133,6 +133,21 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 	}
 }
 
+func TestCommandManifestDeduplicatesEquivalentDiscoveredCommands(t *testing.T) {
+	report := domain.DiscoveryReport{Facts: []domain.Evidence{
+		{Category: "command", Name: "make_target", Value: "test", SourcePath: "Makefile", Confidence: .92},
+		{Category: "command", Name: "test", Value: "make test", SourcePath: "Makefile", Confidence: .95},
+	}}
+	manifest := buildCommandsManifest(report)
+	if len(manifest.Commands) != 1 {
+		t.Fatalf("commands = %#v", manifest.Commands)
+	}
+	command := manifest.Commands[0]
+	if command.Name != "test" || command.Run != "make test" || command.Confidence != .95 || command.RequiresApproval {
+		t.Fatalf("deduplicated command = %#v", command)
+	}
+}
+
 func TestGeneratorPreservesExistingAIValuesAndReportsConflict(t *testing.T) {
 	root := fixturePath(t, "existing-ai")
 	project, snapshot, report := generatorFixture(root)
