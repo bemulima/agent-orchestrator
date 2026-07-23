@@ -548,19 +548,27 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `AllowedServices` evidence was renamed to `depends_on`. Caller allowlists are
   now rejected as evidence for every semantic relation type; outbound
   dependencies require outbound-client or explicit architecture evidence.
+- Completed reviewed onboarding applies for the identity/core wave:
+  `ms-go-auth`, `ms-go-rbac`, `ms-go-user`, `ms-go-student`,
+  `ms-go-filestorage`, and `ms-go-statistic`. Every proposal passed dry-run,
+  generated-format, exact write-scope, isolated-worktree, commit, and
+  source-checkout immutability checks.
+- Published the identity/core trees after exact tree-hash comparison as GitHub
+  draft PRs: auth #4, RBAC #8, user #11, student #30, filestorage #6, and
+  statistic #6. No PR was merged.
 
 ## Remaining work
 
 - Review and merge the published pilot PR through the repository workflow before
   rescanning its approved semantic report into the trusted topology.
-- Enrich the remaining 32 repositories in reviewed waves; do not approve or
+- Enrich the remaining 26 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the identity/core wave beginning with `ms-go-auth`,
-`ms-go-rbac`, `ms-go-user`, `ms-go-student`, `ms-go-filestorage`, and
-`ms-go-statistic`, applying only proposals whose evidence and command risk gates
+Enrich and review the AI/orchestration wave: `ms-go-ai-prompt`,
+`go-ms-ai-summary`, and `ms-go-pet-project-orchestrator`, applying only
+proposals whose evidence, relation direction, ownership, and command risk gates
 pass review.
