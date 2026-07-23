@@ -628,20 +628,33 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the four data/runtime trees after exact tree-hash comparison as
   GitHub draft PRs: cache/search #5, DB validator #5, Tarantool #5, and image
   processor #5. No PR was merged.
+- Completed reviewed onboarding applies for the Go validator wave:
+  `ms-go-code-validator`, `ms-go-docker-validator`, `ms-go-git-validator`,
+  `ms-go-linux-validator`, `ms-go-php-framework-validator`, and
+  `ms-go-php-validator`. Each proposal separates validator behavior from the
+  user workspace/runtime it inspects and leaves unidentified callers,
+  deployment controls, and persistence boundaries as open questions.
+- The Linux validator report explicitly records that caller-controlled commands
+  reach `os/exec` while no deployment isolation boundary is documented. The
+  PHP validator report preserves stale route/event and unenforced configuration
+  discrepancies rather than turning them into active contracts.
+- Published the six Go-validator trees after exact tree-hash comparison as
+  GitHub draft PRs: code #11, Docker #6, Git #6, Linux #5, PHP framework #6,
+  and PHP #8. No PR was merged.
 
 ## Remaining work
 
 - Review and merge the published onboarding PRs through each repository workflow
   before rescanning their approved semantic reports into the trusted topology.
-- Enrich the remaining 13 repositories in reviewed waves; do not approve or
+- Enrich the remaining seven repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the Go validator wave: `ms-go-code-validator`,
-`ms-go-docker-validator`, `ms-go-git-validator`, `ms-go-linux-validator`,
-`ms-go-php-framework-validator`, and `ms-go-php-validator`, applying only
-proposals whose validation contracts, runtime provisioning, business rules,
-and command risk gates pass review.
+Enrich and review the final polyglot validator wave: `ms-node-validator`,
+`ms-py-validator`, `ms-ts-browser-runtime-validator`, `ms-ts-css-validator`,
+`ms-ts-html-validator`, `ms-ts-nextjs-validator`, and `ms-ts-react-validator`,
+applying only proposals whose language/runtime contracts, sandbox boundaries,
+business rules, and command risk gates pass review.
