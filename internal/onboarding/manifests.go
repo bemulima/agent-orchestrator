@@ -31,23 +31,26 @@ type discoveryMetadata struct {
 }
 
 type serviceManifest struct {
-	SchemaVersion  int                   `yaml:"schema_version"`
-	Name           string                `yaml:"name"`
-	ServiceKind    domain.ServiceKind    `yaml:"service_kind"`
-	RepositoryRole domain.RepositoryRole `yaml:"repository_role"`
-	Repository     serviceRepository     `yaml:"repository"`
-	Purpose        string                `yaml:"purpose,omitempty"`
-	Stack          []manifestFact        `yaml:"stack,omitempty"`
-	Capabilities   []manifestFact        `yaml:"capabilities,omitempty"`
-	Ownership      []manifestFact        `yaml:"ownership,omitempty"`
-	Dependencies   []manifestFact        `yaml:"dependencies,omitempty"`
-	Contracts      []manifestFact        `yaml:"contracts,omitempty"`
-	Gateway        []manifestFact        `yaml:"gateway,omitempty"`
-	Frontends      []manifestFact        `yaml:"frontends,omitempty"`
-	Infrastructure []manifestFact        `yaml:"infrastructure,omitempty"`
-	Instructions   []string              `yaml:"instructions,omitempty"`
-	Commands       []string              `yaml:"commands,omitempty"`
-	Discovery      discoveryMetadata     `yaml:"discovery"`
+	SchemaVersion     int                   `yaml:"schema_version"`
+	Name              string                `yaml:"name"`
+	ServiceKind       domain.ServiceKind    `yaml:"service_kind"`
+	RepositoryRole    domain.RepositoryRole `yaml:"repository_role"`
+	Repository        serviceRepository     `yaml:"repository"`
+	Purpose           string                `yaml:"purpose,omitempty"`
+	Stack             []manifestFact        `yaml:"stack,omitempty"`
+	Capabilities      []manifestFact        `yaml:"capabilities,omitempty"`
+	Ownership         []manifestFact        `yaml:"ownership,omitempty"`
+	Dependencies      []manifestFact        `yaml:"dependencies,omitempty"`
+	Contracts         []manifestFact        `yaml:"contracts,omitempty"`
+	Gateway           []manifestFact        `yaml:"gateway,omitempty"`
+	Frontends         []manifestFact        `yaml:"frontends,omitempty"`
+	Infrastructure    []manifestFact        `yaml:"infrastructure,omitempty"`
+	BusinessRules     []manifestFact        `yaml:"business_rules,omitempty"`
+	BusinessProcesses []manifestFact        `yaml:"business_processes,omitempty"`
+	Entities          []manifestFact        `yaml:"entities,omitempty"`
+	Instructions      []string              `yaml:"instructions,omitempty"`
+	Commands          []string              `yaml:"commands,omitempty"`
+	Discovery         discoveryMetadata     `yaml:"discovery"`
 }
 
 func buildServiceManifest(project domain.Project, snapshot domain.ServiceSnapshot, report domain.DiscoveryReport) serviceManifest {
@@ -61,22 +64,25 @@ func buildServiceManifest(project domain.Project, snapshot domain.ServiceSnapsho
 		localPath = ""
 	}
 	return serviceManifest{
-		SchemaVersion:  1,
-		Name:           project.Name,
-		ServiceKind:    snapshot.ServiceKind,
-		RepositoryRole: project.RepositoryRole,
-		Repository:     serviceRepository{GitURL: gitURL, LocalPath: localPath, DefaultBranch: project.DefaultBranch, Commit: snapshot.CommitSHA},
-		Purpose:        snapshot.Purpose,
-		Stack:          manifestFacts(report.Facts, "stack"),
-		Capabilities:   manifestFacts(report.Facts, "capability"),
-		Ownership:      manifestFacts(report.Facts, "ownership"),
-		Dependencies:   manifestFacts(report.Facts, "relation", "depends_on"),
-		Contracts:      manifestFacts(report.Facts, "contract"),
-		Gateway:        manifestFacts(report.Facts, "relation", "gateway_routes_to"),
-		Frontends:      manifestFacts(report.Facts, "relation", "frontend_consumes"),
-		Infrastructure: manifestFacts(report.Facts, "infrastructure"),
-		Instructions:   instructionPaths(report),
-		Commands:       commandNames(report),
+		SchemaVersion:     1,
+		Name:              project.Name,
+		ServiceKind:       snapshot.ServiceKind,
+		RepositoryRole:    project.RepositoryRole,
+		Repository:        serviceRepository{GitURL: gitURL, LocalPath: localPath, DefaultBranch: project.DefaultBranch, Commit: snapshot.CommitSHA},
+		Purpose:           snapshot.Purpose,
+		Stack:             manifestFacts(report.Facts, "stack"),
+		Capabilities:      manifestFacts(report.Facts, "capability"),
+		Ownership:         manifestFacts(report.Facts, "ownership"),
+		Dependencies:      manifestFacts(report.Facts, "relation", "depends_on"),
+		Contracts:         manifestFacts(report.Facts, "contract"),
+		Gateway:           manifestFacts(report.Facts, "relation", "gateway_routes_to"),
+		Frontends:         manifestFacts(report.Facts, "relation", "frontend_consumes"),
+		Infrastructure:    manifestFacts(report.Facts, "infrastructure"),
+		BusinessRules:     manifestFacts(report.Facts, "business_rule"),
+		BusinessProcesses: manifestFacts(report.Facts, "business_process"),
+		Entities:          manifestFacts(report.Facts, "entity"),
+		Instructions:      instructionPaths(report),
+		Commands:          commandNames(report),
 		Discovery: discoveryMetadata{SnapshotID: snapshot.ID, Commit: snapshot.CommitSHA, Branch: snapshot.Branch,
 			Dirty: snapshot.IsDirty, ContentChecksum: snapshot.ContentChecksum},
 	}
@@ -97,10 +103,12 @@ func buildArchitectureManifest(report domain.DiscoveryReport) architectureManife
 }
 
 type commandEntry struct {
-	Name       string  `yaml:"name"`
-	Run        string  `yaml:"run"`
-	SourcePath string  `yaml:"source_path"`
-	Confidence float64 `yaml:"confidence"`
+	Name             string  `yaml:"name"`
+	Run              string  `yaml:"run"`
+	SourcePath       string  `yaml:"source_path"`
+	Confidence       float64 `yaml:"confidence"`
+	RequiresApproval bool    `yaml:"requires_approval"`
+	Risk             string  `yaml:"risk"`
 }
 
 type commandsManifest struct {
@@ -110,6 +118,7 @@ type commandsManifest struct {
 
 func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 	commands := make([]commandEntry, 0)
+	commandIndexes := make(map[string]int)
 	for _, fact := range report.Facts {
 		if fact.Category != "command" {
 			continue
@@ -123,6 +132,15 @@ func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 		} else {
 			entry.Run = fact.Value
 		}
+		entry.RequiresApproval, entry.Risk = classifyCommandRisk(entry.Name, entry.Run)
+		key := entry.Run
+		if index, exists := commandIndexes[key]; exists {
+			if commands[index].Confidence < entry.Confidence {
+				commands[index] = entry
+			}
+			continue
+		}
+		commandIndexes[key] = len(commands)
 		commands = append(commands, entry)
 	}
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Name < commands[j].Name })
@@ -162,15 +180,25 @@ type workflowManifest struct {
 func buildTestWorkflow(commands commandsManifest) workflowManifest {
 	steps := make([]string, 0, len(commands.Commands))
 	for _, command := range commands.Commands {
+		if command.RequiresApproval {
+			continue
+		}
 		lower := strings.ToLower(command.Name)
-		if strings.Contains(lower, "test") || strings.Contains(lower, "lint") || strings.Contains(lower, "verify") || strings.Contains(lower, "check") {
+		if strings.Contains(lower, "test") || strings.Contains(lower, "lint") || strings.Contains(lower, "verify") ||
+			strings.Contains(lower, "validate") || strings.Contains(lower, "check") {
 			steps = append(steps, command.Run)
 		}
 	}
 	if len(steps) == 0 {
 		for _, command := range commands.Commands {
+			if command.RequiresApproval {
+				continue
+			}
 			steps = append(steps, command.Run)
 		}
+	}
+	if len(steps) == 0 {
+		steps = append(steps, "request owner approval before running repository commands")
 	}
 	return workflowManifest{SchemaVersion: 1, Name: "test", RequiresApproval: false, Steps: uniqueSorted(steps)}
 }
@@ -193,8 +221,54 @@ func reviewerAgent() string {
 	return "# Reviewer\n\nReview the real Git diff independently. Verify write scope, discovered commands, contracts, migrations, and evidence-backed acceptance criteria. Do not reuse the coder thread."
 }
 
-func backendAgent() string {
-	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. Run only commands listed in `.ai/commands.yaml`."
+func backendAgent(hasCommands bool) string {
+	verification := "No repository commands have been approved. Do not invent or run project commands until the owner supplies evidence-backed commands."
+	if hasCommands {
+		verification = "Run only commands listed in `.ai/commands.yaml` with `requires_approval: false`. Request explicit owner approval before any command marked `requires_approval: true`."
+	}
+	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. " + verification
+}
+
+func classifyCommandRisk(name, command string) (bool, string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	command = strings.ToLower(strings.TrimSpace(command))
+	if strings.HasPrefix(name, "pre") || strings.HasPrefix(name, "post") ||
+		strings.Contains(name, ":ui") || strings.Contains(command, " --ui") ||
+		strings.Contains(name, "watch") || strings.Contains(command, "--watch") {
+		return true, "lifecycle"
+	}
+	if strings.Contains(command, "../") || strings.Contains(command, `..\`) {
+		return true, "state_change"
+	}
+	padded := " " + command + " "
+	for _, marker := range []string{" rm ", "rm -"} {
+		if strings.Contains(padded, marker) {
+			return true, "state_change"
+		}
+	}
+	for _, marker := range []string{
+		"delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
+		"reset", "rollback", "migrate", "migration", "create", "import", "insert", "seed",
+		"compose down", " stop", "kill",
+		"deploy", "publish", "release", "git push", "docker push", "kubectl", "helm ", "terraform",
+		"curl ", "wget ", "sudo ", "go fmt ", "gofmt -w", "format",
+	} {
+		if strings.Contains(padded, marker) || strings.Contains(name, strings.TrimSpace(marker)) {
+			return true, "state_change"
+		}
+	}
+	if strings.HasPrefix(command, "docker ") || strings.HasPrefix(command, "docker-compose ") {
+		return true, "external_runtime"
+	}
+	if strings.Contains(name, "integration") || strings.Contains(command, "integration") {
+		return true, "external_runtime"
+	}
+	for _, marker := range []string{"test", "lint", "verify", "validate", "check", "vet", "build", "help"} {
+		if strings.Contains(name, marker) {
+			return false, "verification"
+		}
+	}
+	return true, "lifecycle"
 }
 
 func migrationAgent() string {

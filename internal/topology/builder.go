@@ -47,7 +47,7 @@ func (Builder) Build(ctx context.Context, sources []domain.TopologySource) (doma
 		catalog.Services = append(catalog.Services, buildService(source))
 		for _, fact := range source.Report.Facts {
 			switch fact.Category {
-			case "capability":
+			case "capability", "business_rule", "business_process", "entity":
 				catalog.Capabilities = append(catalog.Capabilities, buildCapability(source, fact))
 			case "ownership":
 				catalog.Ownership = append(catalog.Ownership, buildOwnership(source, fact))
@@ -200,6 +200,15 @@ func buildRelations(sources []domain.TopologySource, contracts []domain.Contract
 			case fact.Category == "relation" && fact.Name == "depends_on":
 				targetID = aliases[referenceName(fact.Value)]
 				relationType = domain.RelationDependsOn
+			case fact.Category == "relation" && fact.Name == "authenticates_through":
+				targetID = aliases[referenceName(fact.Value)]
+				relationType = domain.RelationAuthenticatesThrough
+			case fact.Category == "relation" && fact.Name == "stores_in":
+				targetID = aliases[referenceName(fact.Value)]
+				relationType = domain.RelationStoresIn
+			case fact.Category == "relation" && fact.Name == "deploys":
+				targetID = aliases[referenceName(fact.Value)]
+				relationType = domain.RelationDeploys
 			case fact.Category == "relation" && fact.Name == "frontend_consumes",
 				fact.Category == "contract" && fact.Name == "http_consume":
 				method, path := parseHTTPReference(fact.Value)

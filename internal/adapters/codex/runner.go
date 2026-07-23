@@ -42,7 +42,8 @@ func (r *ProcessRunner) Run(
 	request domain.AgentRunRequest,
 	onThread repository.AgentThreadCallback,
 ) (domain.AgentRunResponse, error) {
-	if len(r.command) == 0 || request.Role != domain.AgentRunCoder && request.Role != domain.AgentRunReviewer ||
+	if len(r.command) == 0 || request.Role != domain.AgentRunCoder && request.Role != domain.AgentRunReviewer &&
+		request.Role != domain.AgentRunAnalyst ||
 		request.WorkingDirectory == "" || request.Prompt == "" || len(request.OutputSchema) == 0 {
 		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner request: %w", domain.ErrValidation)
 	}
@@ -75,7 +76,13 @@ func (r *ProcessRunner) Run(
 	}
 	waitErr := command.Wait()
 	if readErr != nil {
-		return domain.AgentRunResponse{}, readErr
+		if message := reportedRunnerError(stderr.String()); message != "" {
+			if isTransientRunnerError(message) {
+				return response, fmt.Errorf("%w: %w: runner reported: %s", readErr, domain.ErrTransient, message)
+			}
+			return response, fmt.Errorf("%w: runner reported: %s", readErr, message)
+		}
+		return response, readErr
 	}
 	if waitErr != nil {
 		message := strings.TrimSpace(stderr.String())
@@ -85,6 +92,36 @@ func (r *ProcessRunner) Run(
 		return domain.AgentRunResponse{}, fmt.Errorf("Codex runner failed: %s", message)
 	}
 	return response, nil
+}
+
+func isTransientRunnerError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"stream disconnected", "reconnecting", "unexpected-eof", "unexpected eof",
+		"tls close_notify", "connection reset", "connection closed", "temporarily unavailable",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func reportedRunnerError(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		var event struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.Type == "error" {
+			message := strings.TrimSpace(event.Message)
+			if len(message) > 2000 {
+				message = message[:2000]
+			}
+			return message
+		}
+	}
+	return ""
 }
 
 func readProtocol(
@@ -137,7 +174,7 @@ func readProtocol(
 		return domain.AgentRunResponse{}, fmt.Errorf("read Codex runner protocol: %w", err)
 	}
 	if !threadSeen || !resultSeen {
-		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner protocol: %w", domain.ErrValidation)
+		return response, fmt.Errorf("incomplete Codex runner protocol: %w", domain.ErrValidation)
 	}
 	return response, nil
 }

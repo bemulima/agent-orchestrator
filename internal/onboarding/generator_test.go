@@ -69,6 +69,9 @@ func TestGeneratorBuildsEvidenceBackedProposalWithoutWritingSource(t *testing.T)
 	if hasProposed(proposal, ".ai/commands.yaml") || hasProposed(proposal, ".ai/workflows/test.yaml") {
 		t.Fatal("generator invented commands without command evidence")
 	}
+	if !containsProposed(proposal, ".ai/agents/backend-coder.md", "No repository commands have been approved") {
+		t.Fatal("backend agent did not fail closed when command evidence was absent")
+	}
 
 	second := NewGenerator(GeneratorConfig{Now: func() time.Time { return firstTime.Add(time.Hour) }})
 	repeated, repeatedDiff, err := second.Generate(context.Background(), project, snapshot, report)
@@ -89,6 +92,59 @@ func TestGeneratorRejectsSymlinkedAITree(t *testing.T) {
 	project, snapshot, report := generatorFixture(root)
 	if _, _, err := NewGenerator(GeneratorConfig{}).Generate(context.Background(), project, snapshot, report); err == nil {
 		t.Fatal("Generate() followed a symlinked .ai directory")
+	}
+}
+
+func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
+	report := domain.DiscoveryReport{Facts: []domain.Evidence{
+		{Category: "command", Name: "test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "cleanup_exited_sandboxes", Value: "./scripts/cleanup_exited_sandboxes.sh", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "stop_containers", Value: "docker compose down", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "import-test-seeds", Value: "make import-test-seeds", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "test-integration", Value: "make test-integration", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "validate-contract", Value: "make validate-contract", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "unsafe_test_cache", Value: "GOCACHE=../.gocache go test ./...", SourcePath: "README.md", Confidence: .95},
+		{Category: "command", Name: "format_and_vet", Value: "go fmt ./... && go vet ./...", SourcePath: "AGENTS.md", Confidence: .95},
+		{Category: "command", Name: "performance_test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
+		{Category: "command", Name: "prebuild", Value: "npm run sync-assets", SourcePath: "package.json", Confidence: .95},
+		{Category: "command", Name: "test:ui", Value: "vitest --ui", SourcePath: "package.json", Confidence: .95},
+		{Category: "command", Name: "test:watch", Value: "jest --watchAll", SourcePath: "package.json", Confidence: .95},
+	}}
+	manifest := buildCommandsManifest(report)
+	if len(manifest.Commands) != 11 {
+		t.Fatalf("commands = %#v", manifest.Commands)
+	}
+	approval := make(map[string]bool, len(manifest.Commands))
+	for _, command := range manifest.Commands {
+		approval[command.Name] = command.RequiresApproval
+	}
+	if approval["test"] || approval["validate-contract"] || !approval["cleanup_exited_sandboxes"] ||
+		!approval["stop_containers"] || !approval["import-test-seeds"] || !approval["test-integration"] ||
+		!approval["unsafe_test_cache"] || !approval["format_and_vet"] || approval["performance_test"] ||
+		!approval["prebuild"] || !approval["test:ui"] || !approval["test:watch"] {
+		t.Fatalf("command approval classification = %#v", approval)
+	}
+	workflow := buildTestWorkflow(manifest)
+	if len(workflow.Steps) != 2 || workflow.Steps[0] != "go test ./..." || workflow.Steps[1] != "make validate-contract" {
+		t.Fatalf("test workflow included operational commands: %#v", workflow.Steps)
+	}
+	if !strings.Contains(backendAgent(true), "requires_approval: false") {
+		t.Fatal("backend agent does not enforce command approval metadata")
+	}
+}
+
+func TestCommandManifestDeduplicatesEquivalentDiscoveredCommands(t *testing.T) {
+	report := domain.DiscoveryReport{Facts: []domain.Evidence{
+		{Category: "command", Name: "make_target", Value: "test", SourcePath: "Makefile", Confidence: .92},
+		{Category: "command", Name: "run_tests", Value: "make test", SourcePath: "Makefile", Confidence: .95},
+	}}
+	manifest := buildCommandsManifest(report)
+	if len(manifest.Commands) != 1 {
+		t.Fatalf("commands = %#v", manifest.Commands)
+	}
+	command := manifest.Commands[0]
+	if command.Name != "run_tests" || command.Run != "make test" || command.Confidence != .95 || command.RequiresApproval {
+		t.Fatalf("deduplicated command = %#v", command)
 	}
 }
 

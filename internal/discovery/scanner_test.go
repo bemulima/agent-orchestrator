@@ -104,6 +104,28 @@ func validate(request Request) bool {
 	}
 }
 
+func TestScanner_DoesNotTreatPublishI18nKeysAsEventSubjects(t *testing.T) {
+	root := t.TempDir()
+	content := `export function View({ t }) {
+  return t('actions.publish') + t('toast.publishSuccess') + t('table.publishedAt')
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "view.tsx"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "frontend", RepositoryRole: domain.RepositoryRoleFrontend,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Name == "event_subject" || fact.Name == "event_publish" || fact.Name == "event_subscribe" {
+			t.Fatalf("unexpected event fact from i18n key: %#v", fact)
+		}
+	}
+}
+
 func TestScanner_ClassifiesPythonServiceAsBackend(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.py"), []byte("print('fixture')\n"), 0o600); err != nil {
@@ -186,6 +208,62 @@ class Handler(BaseHTTPRequestHandler):
 	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/validate")
 }
 
+func TestScanner_IgnoresRuntimeEvidenceFromTestsAndExamples(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"internal/http/server.go": `package http
+func routes(router Router) { router.Post("/api/v1/real", handler) }
+`,
+		"internal/http/server_test.go": `package http
+func testRoutes(router Router) { router.Get("/health", handler) }
+`,
+		"internal/adapters/docker/compose.go": `package docker
+func runCompose() {}
+`,
+		"docs/examples/postgres-runtime.json": `{"migration":"CREATE TABLE users (id UUID);"}`,
+		"docs/GOLANG_ARCHITECTURE.md": `r.Get("/users/:id", handler.Get)
+publisher.Publish("user.created", payload)
+subscriber.Subscribe("user.create", handler)`,
+		"tests/fixture.sql": `CREATE TABLE test_records (id UUID);`,
+	}
+	for name, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "production-only", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "contract", "http_produce", "POST /api/v1/real")
+	for _, fact := range report.Facts {
+		if fact.Category != "capability" && fact.Category != "contract" && fact.Category != "ownership" &&
+			fact.Category != "relation" && fact.Category != "infrastructure" {
+			continue
+		}
+		if isNonProductionEvidencePath(fact.SourcePath) {
+			t.Fatalf("non-production file emitted runtime evidence: %#v", fact)
+		}
+		if fact.Name == "database_table" && (fact.Value == "users" || fact.Value == "test_records") {
+			t.Fatalf("example/test schema emitted ownership: %#v", fact)
+		}
+		if fact.SourcePath == "docs/GOLANG_ARCHITECTURE.md" {
+			t.Fatalf("generic documentation emitted runtime evidence: %#v", fact)
+		}
+	}
+	for _, conflict := range report.Conflicts {
+		if conflict.Name == "invalid_manifest" && conflict.SourcePath == "internal/adapters/docker/compose.go" {
+			t.Fatalf("Go source was parsed as a Compose manifest: %#v", conflict)
+		}
+	}
+}
+
 func TestScanner_DoesNotReadEnvironmentSecrets(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SUPER_SECRET=must-not-appear"), 0o600); err != nil {
@@ -220,6 +298,127 @@ func TestScanner_ContentRoleDoesNotBecomeRuntimeService(t *testing.T) {
 		t.Fatalf("Scan() error = %v", err)
 	}
 	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
+}
+
+func TestScanner_RuntimeNameWithoutRuntimeEvidenceRemainsUnknown(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Use go test ./...\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(Config{MaxFiles: 100, MaxFileBytes: 1 << 20, MaxTotalBytes: 4 << 20, MaxDepth: 10})
+	report, err := scanner.Scan(context.Background(), domain.Project{
+		ID: "placeholder", Name: "go-ms-ai-summary", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
+}
+
+func TestScanner_FrontendNginxDoesNotOwnGatewayRoutes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"dependencies":{"next":"15.1.5"}}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nginx.conf"), []byte("location /api { proxy_pass http://gateway; }\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(Config{MaxFiles: 100, MaxFileBytes: 1 << 20, MaxTotalBytes: 4 << 20, MaxDepth: 10})
+	report, err := scanner.Scan(context.Background(), domain.Project{
+		ID: "frontend", Name: "nextjs", RepositoryRole: domain.RepositoryRoleFrontend,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Category == "relation" && fact.Name == "gateway_routes_to" {
+			t.Fatalf("frontend owns a gateway route: %#v", fact)
+		}
+	}
+}
+
+func TestScannerImportsApprovedSemanticReport(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"),
+		[]byte("Only reviewed lessons can be published.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Taskfile.yml"), []byte("tasks:\n  test:\n    cmds:\n      - go test ./...\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	analysis := domain.SemanticAnalysis{
+		SchemaVersion: 1, ProjectID: "old-project-id", ProjectName: "lessons", BaseCommit: "base",
+		Summary: "Lesson rules", Facts: []domain.SemanticFact{{
+			Category: "business_rule", Name: "publish_reviewed_only",
+			Value: "Only reviewed lessons can be published", Confidence: .9,
+			SourcePath: "README.md", EvidenceQuote: "Only reviewed lessons can be published.",
+			Explanation: "Publication requires review.",
+		}, {
+			Category: "command", Name: "test", Value: "go test ./...", Confidence: .9,
+			SourcePath: "Taskfile.yml", EvidenceQuote: "- go test ./...",
+			Explanation: "Taskfile documents the test command.",
+		}},
+	}
+	content, err := json.Marshal(analysis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ai", "discovery", "semantic-report.json"), content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "new-project-id", Name: "lessons", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "merge-commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "business_rule", "publish_reviewed_only", "Only reviewed lessons can be published")
+	assertFact(t, report.Facts, "command", "test", "go test ./...")
+}
+
+func TestScannerRejectsSemanticFactWithoutCurrentQuotedEvidence(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("Current documented rule.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	content := `{
+  "schema_version": 1,
+  "project_id": "project-1",
+  "project_name": "fixture",
+  "base_commit": "abc123",
+  "summary": "Fixture rules.",
+  "facts": [{
+    "category": "business_rule",
+    "name": "invented_rule",
+    "value": "Invented rule",
+    "confidence": 0.9,
+    "source_path": "README.md",
+    "evidence_quote": "This text is not in the current README.",
+    "explanation": "Stale evidence."
+  }],
+  "open_questions": []
+}`
+	if err := os.WriteFile(filepath.Join(root, ".ai", "discovery", "semantic-report.json"), []byte(content), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "project-1", Name: "fixture", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "abc123", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Category == "business_rule" && fact.Name == "invented_rule" {
+			t.Fatal("scanner imported a semantic fact without current quoted evidence")
+		}
+	}
+	assertFact(t, report.Conflicts, "conflict", "invalid_semantic_fact", "business_rule:invented_rule")
 }
 
 func TestScanner_NonRuntimeRolesSuppressRuntimeEvidence(t *testing.T) {
@@ -284,6 +483,51 @@ func TestScanner_EnforcesInventoryLimits(t *testing.T) {
 	if !report.Inventory.Truncated || report.Inventory.FilesVisited != 1 {
 		t.Fatalf("inventory = %#v, want one visited file and truncated", report.Inventory)
 	}
+}
+
+func TestSemanticPackageCommandDeclaredRequiresExactScriptName(t *testing.T) {
+	files := map[string][]byte{
+		"package.json": []byte(`{"scripts":{"test:watch":"jest --watchAll"}}`),
+	}
+	exact := domain.SemanticFact{Name: "test:watch", Value: "jest --watchAll", SourcePath: "package.json"}
+	if !semanticPackageCommandDeclared(exact, files) {
+		t.Fatal("exact package script was rejected")
+	}
+	renamed := exact
+	renamed.Name = "test_watch"
+	if semanticPackageCommandDeclared(renamed, files) {
+		t.Fatal("renamed package script was accepted")
+	}
+}
+
+func TestContainsUnexpandedCommandTemplate(t *testing.T) {
+	if !containsUnexpandedCommandTemplate("docker build -t {{.SERVICE_NAME}} .") {
+		t.Fatal("Task template was not detected")
+	}
+	if containsUnexpandedCommandTemplate("docker build -t ms-ts-react-validator .") {
+		t.Fatal("literal command was treated as a template")
+	}
+}
+
+func TestScannerClassifiesComposeNginxTemplateAsGateway(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "docker-compose.yml"), []byte("services:\n  gateway:\n    image: nginx\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "templates"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "templates", "gateway.conf.template"), []byte("location /users { proxy_pass http://$users_upstream; }\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "ms-gateway", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "classification", "service_kind", "gateway")
+	assertFact(t, report.Facts, "relation", "gateway_routes_to", "http://$users_upstream")
 }
 
 func fixturePath(t *testing.T, name string) string {

@@ -27,6 +27,11 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.True(t, repo.completed)
 	require.True(t, worktrees.committed)
 	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
+	require.Contains(t, runner.prompts[0], `"connected_landscape"`)
+	require.Contains(t, runner.prompts[0], "orders-service")
+	require.Contains(t, runner.prompts[1], "orders-service")
+	require.Contains(t, runner.prompts[0], "course-wiki")
+	require.NotContains(t, runner.prompts[0], "raw-contract-shape")
 	require.Equal(t, "coder-thread", repo.coderThread)
 	require.Equal(t, []string{"review-thread-1"}, repo.reviewThreads)
 	require.NotEqual(t, repo.coderThread, repo.reviewThreads[0])
@@ -139,6 +144,7 @@ type sequenceRunner struct {
 	results        []json.RawMessage
 	roles          []domain.AgentRunRole
 	requestThreads []string
+	prompts        []string
 	coderThread    string
 	reviewCount    int
 }
@@ -153,6 +159,7 @@ func (r *sequenceRunner) Run(
 	}
 	r.roles = append(r.roles, request.Role)
 	r.requestThreads = append(r.requestThreads, request.ThreadID)
+	r.prompts = append(r.prompts, request.Prompt)
 	threadID := request.ThreadID
 	if request.Role == domain.AgentRunCoder && threadID == "" {
 		threadID = "coder-thread"
@@ -190,6 +197,18 @@ func newFakeExecutionRepository() *fakeExecutionRepository {
 			Project: domain.Project{ID: "project-1", Name: "fixture", HeadCommit: "base"},
 			Plan:    domain.Plan{ID: "plan-1", Summary: "fixture plan"},
 			Command: domain.Command{ID: "command-1", Text: "change fixture"},
+			Topology: domain.TopologyCatalog{
+				Revision: domain.TopologyRevision{ID: "topology-1"},
+				Services: []domain.TopologyService{{ProjectID: "project-2", Name: "orders-service"}},
+				Contracts: []domain.Contract{{
+					ProjectID: "project-2", Code: "http:get:/orders", Type: domain.ContractTypeHTTP,
+					Definition: json.RawMessage(`{"detail":"raw-contract-shape"}`), SourcePath: "openapi/orders.yaml",
+				}},
+			},
+			ConnectedProjects: []domain.ConnectedProjectKnowledge{{
+				ProjectID: "project-docs", Name: "course-wiki", RepositoryRole: domain.RepositoryRoleDocumentation,
+				Purpose: "Platform business documentation",
+			}},
 		},
 		attempt: domain.TaskAttempt{ID: "attempt-1", TaskID: "task-1", AttemptNumber: 1, Status: domain.TaskAttemptStatusRunning},
 	}

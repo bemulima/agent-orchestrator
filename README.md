@@ -75,6 +75,7 @@ course-dev-orchestrator project-show --service repository-name
 course-dev-orchestrator project-scan --service repository-name
 course-dev-orchestrator project-report --service repository-name
 course-dev-orchestrator project-onboard --service repository-name [--dry-run]
+course-dev-orchestrator project-enrich --service repository-name
 course-dev-orchestrator project-diff --run-id UUID
 course-dev-orchestrator project-approve --run-id UUID --actor owner [--comment text]
 course-dev-orchestrator project-reject --run-id UUID --actor owner [--comment text]
@@ -123,11 +124,12 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
 - Limits: `MAX_TASK_ATTEMPTS=3`, `MAX_REVIEW_ATTEMPTS=2`,
   `MAX_REPLANS=2`, `MAX_PARALLEL_TASKS=3`,
   `MAX_REQUIRED_TASK_DEPTH=3`.
-- Codex execution: `CODEX_RUNNER_COMMAND`, `CODEX_API_KEY`, and model profiles
-  `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
-  `CODEX_MODEL_REVIEW`. Empty model values defer selection to Codex; no model
-  name is compiled into the Go service. Keep the key only in ignored `.env` or
-  an external secret store.
+- Codex execution: the default is the existing ChatGPT login from local
+  `codex-cli`. Run `codex login` once and `make codex-auth-sync`; `make up`
+  synchronizes that login automatically when it exists. No API key is
+  required. `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
+  and `CODEX_MODEL_REVIEW` select models by task profile and reviewer role.
+  Empty values defer model selection to Codex.
 - GitLab: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, `GITLAB_CONTROL_PROJECT`, and
   `GITLAB_DRY_RUN`. New GitLab 19+ webhooks should use
   `GITLAB_WEBHOOK_SIGNING_TOKEN=whsec_<base64-key>`; the legacy
@@ -216,12 +218,40 @@ corresponding file is omitted.
 The normal owner flow is:
 
 ```sh
+make project-enrich SERVICE=repository-name
+make project-diff RUN_ID=semantic-run-uuid
+
+# Only after reviewing and accepting the semantic proposal:
+make project-apply RUN_ID=semantic-run-uuid DRY_RUN=true
+make project-approve RUN_ID=semantic-run-uuid ACTOR=owner COMMENT="reviewed semantic evidence"
+make project-apply RUN_ID=semantic-run-uuid
+make project-scan SERVICE=repository-name
+
+# Deterministic-only onboarding remains available separately:
 make project-onboard SERVICE=repository-name
 make project-diff RUN_ID=uuid
 make project-apply RUN_ID=uuid DRY_RUN=true
 make project-approve RUN_ID=uuid ACTOR=owner COMMENT="reviewed proposal"
 make project-apply RUN_ID=uuid
 ```
+
+`project-enrich` uses the local Codex CLI login and the `deep` model profile
+to inspect one clean, already-scanned repository read-only. It cannot silently
+teach the topology: every semantic fact must contain an exact quote from a
+repository-relative source file, and the result is stored only as an
+onboarding proposal. Facts whose quotes cannot be revalidated are excluded
+and listed as `rejected_facts` for review. The proposal can include purpose, capabilities,
+ownership, contracts, service relations, business rules, business processes,
+and domain entities, plus explicit open questions. The connected checkout is
+not changed. Only the normal diff, dry-run, owner approval, and isolated
+worktree apply flow can add `.ai/discovery/semantic-report.json` and the other
+proposed `.ai/**`/`AGENTS.md` files. A subsequent scan and topology rebuild
+make approved semantic facts available to planning and execution.
+The runtime image includes Linux `bubblewrap`, which Codex uses to enforce the
+analyst/reviewer read-only sandbox and the coder workspace-write sandbox inside
+the container. Compose permits the unprivileged user namespace required by
+`bubblewrap`, while dropping every container capability and enabling
+`no-new-privileges`. Do not replace these modes with `danger-full-access`.
 
 `project-apply DRY_RUN=true` validates the base commit, proposal/file
 checksums, formats, and source cleanliness without creating a worktree. A real
@@ -246,8 +276,10 @@ The Stage 3 HTTP API is also synchronous:
 - `POST /api/v1/onboarding-runs/{runId}/reject`;
 - `POST /api/v1/onboarding-runs/{runId}/apply`.
 
-The prepare/apply request body is `{"dry_run":true|false}`. Approval and
-rejection accept `{"actor":"owner","comment":"..."}`.
+The prepare request body is `{"dry_run":true|false,"semantic":true|false}`;
+`semantic:true` is the HTTP equivalent of `project-enrich`. The apply request
+body is `{"dry_run":true|false}`. Approval and rejection accept
+`{"actor":"owner","comment":"..."}`.
 
 ## Service topology and contract drift
 
@@ -328,6 +360,14 @@ paths. A separate read-only reviewer thread must approve the actual worktree
 before the worker commits. The connected source checkout remains a clean,
 unchanged base; Stage 6 never pushes, merges, or deploys.
 
+Every coder and reviewer receives the current connected landscape: service
+purposes, capabilities, ownership, contracts, relations, and contract drift.
+It also receives the complete connected-project catalog, including policy,
+documentation, content, and archive repositories with their discovery
+evidence and conflicts.
+The agent still verifies evidence in its own worktree and requests a bounded
+task for another connected repository instead of editing across checkouts.
+
 Reviewer changes resume the same coder thread, but each review uses a fresh
 thread. Blocked tasks can request at most three bounded cross-project tasks;
 Temporal runs them first and resumes the parent subject to replan/depth/attempt
@@ -338,7 +378,9 @@ verification evidence, and artifact metadata.
 The TypeScript runner communicates with Go over bounded JSONL, disables agent
 network access and approvals, uses `workspace-write` for coders and
 `read-only` for reviewers, and applies an explicit secret-free shell
-environment policy. `CODEX_API_KEY`, database credentials, and integration
+environment policy. The worker stores only a private copy of the local
+`codex-cli` credential file in its durable volume; the host Codex history and
+configuration are not mounted. Credentials, database settings, and integration
 tokens are never included in prompts or child tool environments.
 
 The Stage 5 API is available under `/api/v1`:

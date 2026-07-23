@@ -3,7 +3,7 @@ import type { AgentMessageItem, ThreadEvent } from "@openai/codex-sdk";
 export const MAX_INPUT_BYTES = 1024 * 1024;
 export const MAX_RESULT_BYTES = 512 * 1024;
 
-export type RunnerRole = "coder" | "reviewer";
+export type RunnerRole = "coder" | "reviewer" | "analyst";
 
 export interface RunRequest {
   role: RunnerRole;
@@ -23,8 +23,8 @@ export function parseRequest(value: unknown): RunRequest {
   if (!isRecord(value)) {
     throw new Error("request must be a JSON object");
   }
-  if (value.role !== "coder" && value.role !== "reviewer") {
-    throw new Error("role must be coder or reviewer");
+  if (value.role !== "coder" && value.role !== "reviewer" && value.role !== "analyst") {
+    throw new Error("role must be coder, reviewer, or analyst");
   }
   const request: RunRequest = {
     role: value.role,

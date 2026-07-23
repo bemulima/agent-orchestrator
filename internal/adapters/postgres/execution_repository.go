@@ -40,6 +40,14 @@ func (r TaskExecutionRepoPG) GetExecutionContext(
 	if err != nil {
 		return domain.TaskExecutionContext{}, mapPlanningError(err)
 	}
+	result.Topology, err = (TopologyRepoPG{Pool: r.Pool}).Get(ctx)
+	if err != nil {
+		return domain.TaskExecutionContext{}, fmt.Errorf("load task execution topology: %w", err)
+	}
+	result.ConnectedProjects, err = r.listConnectedProjectKnowledge(ctx)
+	if err != nil {
+		return domain.TaskExecutionContext{}, err
+	}
 	rows, err := r.Pool.Query(ctx, `
 SELECT `+prefixedTaskColumns("prerequisite")+`
 FROM task_dependency dependency
@@ -77,6 +85,64 @@ ORDER BY prerequisite.id`, taskID)
 		return domain.TaskExecutionContext{}, fmt.Errorf("iterate task execution dependencies: %w", err)
 	}
 	return result, nil
+}
+
+func (r TaskExecutionRepoPG) listConnectedProjectKnowledge(
+	ctx context.Context,
+) ([]domain.ConnectedProjectKnowledge, error) {
+	rows, err := r.Pool.Query(ctx, `
+SELECT project.id, project.name, project.repository_role,
+       COALESCE(snapshot.service_kind, 'unknown'),
+       COALESCE(snapshot.language, ''), COALESCE(snapshot.framework, ''),
+       COALESCE(snapshot.purpose, ''), COALESCE(snapshot.raw_report, '{}'::jsonb)
+FROM project
+LEFT JOIN LATERAL (
+    SELECT service_kind, language, framework, purpose, raw_report
+    FROM service_snapshot
+    WHERE project_id = project.id
+    ORDER BY version DESC
+    LIMIT 1
+) snapshot ON true
+WHERE project.status = 'analyzed'
+ORDER BY project.name, project.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list connected project knowledge: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.ConnectedProjectKnowledge, 0)
+	for rows.Next() {
+		var value domain.ConnectedProjectKnowledge
+		var rawReport []byte
+		if err := rows.Scan(
+			&value.ProjectID, &value.Name, &value.RepositoryRole, &value.ServiceKind,
+			&value.Language, &value.Framework, &value.Purpose, &rawReport,
+		); err != nil {
+			return nil, fmt.Errorf("scan connected project knowledge: %w", err)
+		}
+		if isKnowledgeRepositoryRole(value.RepositoryRole) {
+			var report domain.DiscoveryReport
+			if err := json.Unmarshal(rawReport, &report); err != nil {
+				return nil, fmt.Errorf("decode discovery report for %s: %w", value.Name, err)
+			}
+			value.Evidence = report.Facts
+			value.Conflicts = report.Conflicts
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate connected project knowledge: %w", err)
+	}
+	return result, nil
+}
+
+func isKnowledgeRepositoryRole(role domain.RepositoryRole) bool {
+	switch role {
+	case domain.RepositoryRoleContent, domain.RepositoryRolePolicy,
+		domain.RepositoryRoleDocumentation, domain.RepositoryRoleArchive:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r TaskExecutionRepoPG) BeginAttempt(

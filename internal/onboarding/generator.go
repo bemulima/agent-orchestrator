@@ -214,7 +214,7 @@ func (g Generator) buildGeneratedFiles(
 	}
 
 	if isBackendKind(snapshot.ServiceKind) {
-		files = append(files, generatedFile{path: ".ai/agents/backend-coder.md", content: backendAgent(), format: formatMarkdown,
+		files = append(files, generatedFile{path: ".ai/agents/backend-coder.md", content: backendAgent(len(commands.Commands) > 0), format: formatMarkdown,
 			explanation: "Add backend implementation guidance for the detected runtime service.", evidencePaths: allEvidence})
 	}
 	if hasFact(report.Facts, "ownership", "database_table") || hasFact(report.Facts, "contract", "database_schema") {

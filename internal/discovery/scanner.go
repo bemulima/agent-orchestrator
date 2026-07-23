@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 6
+const reportSchemaVersion = 16
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -84,10 +84,15 @@ func (s Scanner) Scan(
 		return domain.DiscoveryReport{}, err
 	}
 	collector := newCollector()
+	filesByPath := make(map[string][]byte, len(files))
+	for _, file := range files {
+		filesByPath[filepath.ToSlash(file.path)] = file.content
+	}
 	state := detectorState{
 		project:         project,
 		source:          source,
 		collector:       collector,
+		filesByPath:     filesByPath,
 		promptChecksums: make(map[string][]promptChecksum),
 		lockFiles:       make([]string, 0),
 	}
@@ -264,10 +269,33 @@ func shouldAnalyze(path string) bool {
 	return hasAnalyzableExtension(lowerBase)
 }
 
+func isNonProductionEvidencePath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	base := filepath.Base(path)
+	for _, suffix := range []string{
+		"_test.go", "_test.py", ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+		".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+	} {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	if strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	for _, segment := range strings.Split(path, "/") {
+		switch segment {
+		case "test", "tests", "testdata", "__tests__", "fixture", "fixtures", "example", "examples":
+			return true
+		}
+	}
+	return false
+}
+
 func hasAnalyzableExtension(name string) bool {
 	for _, extension := range []string{
 		".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".php",
-		".sql", ".proto", ".yaml", ".yml", ".json", ".toml", ".md", ".conf",
+		".sql", ".proto", ".yaml", ".yml", ".json", ".toml", ".md", ".conf", ".conf.template",
 	} {
 		if strings.HasSuffix(name, extension) {
 			return true
@@ -383,6 +411,7 @@ type detectorState struct {
 	project         domain.Project
 	source          domain.RepositorySource
 	collector       *collector
+	filesByPath     map[string][]byte
 	promptChecksums map[string][]promptChecksum
 	lockFiles       []string
 	readmePurpose   string

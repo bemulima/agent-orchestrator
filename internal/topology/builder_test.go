@@ -79,6 +79,26 @@ func TestBuilderReportsMissingProducerAndRejectsMismatchedSource(t *testing.T) {
 	}
 }
 
+func TestBuilderIncludesApprovedSemanticCapabilitiesAndRelations(t *testing.T) {
+	sources := []domain.TopologySource{
+		topologySource("lessons-id", "ms-go-course", domain.RepositoryRoleService, domain.ServiceKindBackendService,
+			fact("business_rule", "publish_reviewed_only", "Only reviewed lessons can be published", ".ai/discovery/semantic-report.json"),
+			fact("relation", "authenticates_through", "ms-go-auth", ".ai/discovery/semantic-report.json")),
+		topologySource("auth-id", "ms-go-auth", domain.RepositoryRoleService, domain.ServiceKindBackendService),
+	}
+	catalog, err := (Builder{}).Build(context.Background(), sources)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(catalog.Capabilities) != 1 || catalog.Capabilities[0].Name != "Only reviewed lessons can be published" {
+		t.Fatalf("semantic capabilities = %#v", catalog.Capabilities)
+	}
+	if len(catalog.Relations) != 1 || catalog.Relations[0].RelationType != domain.RelationAuthenticatesThrough ||
+		catalog.Relations[0].TargetProjectID != "auth-id" {
+		t.Fatalf("semantic relations = %#v", catalog.Relations)
+	}
+}
+
 func topologySource(id, name string, role domain.RepositoryRole, kind domain.ServiceKind, facts ...domain.Evidence) domain.TopologySource {
 	return domain.TopologySource{
 		Project: domain.Project{ID: id, Name: name, RepositoryRole: role},

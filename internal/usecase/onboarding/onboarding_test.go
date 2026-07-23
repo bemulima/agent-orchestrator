@@ -43,6 +43,27 @@ func TestPrepareRequiresCleanCurrentDiscoveryAndPersistsProposal(t *testing.T) {
 	}
 }
 
+func TestPrepareUsesSemanticGeneratorOnlyWhenRequested(t *testing.T) {
+	path := "/projects/orders"
+	project := domain.Project{ID: "project-id", Name: "orders", LocalPath: &path, HeadCommit: "abc"}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-id", ProjectID: project.ID, CommitSHA: "abc", Branch: "main"}
+	report := domain.DiscoveryReport{ProjectID: project.ID, CommitSHA: "abc"}
+	base := &generatorFake{proposal: domain.OnboardingProposal{Checksum: "base"}}
+	semantic := &generatorFake{proposal: domain.OnboardingProposal{Checksum: "semantic"}}
+	useCase := Prepare{
+		Projects: &projectRepositoryFake{project: project, snapshot: snapshot, report: report},
+		Sources:  sourceFake{source: domain.RepositorySource{HeadCommit: "abc"}},
+		Runs:     &onboardingRepositoryFake{}, Generator: base, SemanticGenerator: semantic,
+	}
+	run, err := useCase.Handle(context.Background(), PrepareInput{ProjectID: project.ID, Semantic: true})
+	if err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if semantic.calls != 1 || base.calls != 0 || run.ProposalChecksum != "semantic" {
+		t.Fatalf("semantic generator selection failed: base=%d semantic=%d run=%#v", base.calls, semantic.calls, run)
+	}
+}
+
 func TestApplyEnforcesApprovalButAllowsReadOnlyDryRun(t *testing.T) {
 	path := "/projects/orders"
 	project := domain.Project{ID: "project-id", LocalPath: &path}

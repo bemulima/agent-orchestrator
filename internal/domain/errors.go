@@ -11,4 +11,5 @@ var (
 	ErrInvalidStatus  = errors.New("invalid status")
 	ErrApprovalNeeded = errors.New("approval required")
 	ErrWriteScope     = errors.New("write scope violation")
+	ErrTransient      = errors.New("transient failure")
 )

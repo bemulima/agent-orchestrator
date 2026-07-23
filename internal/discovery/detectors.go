@@ -16,16 +16,19 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 	path := filepath.ToSlash(file.path)
 	base := strings.ToLower(filepath.Base(path))
 	content := string(file.content)
-	s.detectStack(state, path, base, content)
 	s.detectPurpose(state, path, base, content)
-	s.extractCapabilities(state, path, content)
-	s.extractOwnership(state, path, content)
-	s.extractContracts(state, path, base, content)
-	s.extractGatewayRelations(state, path, content)
-	s.extractFrontendConsumers(state, path, content)
-	s.extractInfrastructure(state, path, base, content)
-	s.extractCommands(state, path, base, content)
+	if !isNonProductionEvidencePath(path) && !isDocumentationMarkdownPath(path) {
+		s.detectStack(state, path, base, content)
+		s.extractCapabilities(state, path, content)
+		s.extractOwnership(state, path, content)
+		s.extractContracts(state, path, base, content)
+		s.extractGatewayRelations(state, path, content)
+		s.extractFrontendConsumers(state, path, content)
+		s.extractInfrastructure(state, path, base, content)
+		s.extractCommands(state, path, base, content)
+	}
 	s.analyzePrompts(state, path, file.content)
+	s.analyzeApprovedSemanticReport(state, path, file.content)
 
 	if strings.Contains(path, "/") && (base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb") ||
 		base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb" {
@@ -37,6 +40,112 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 			state.collector.fact("instruction", "existing_service_manifest", path, 1, path,
 				"An existing .ai service manifest declares service kind "+match[1]+".")
 		}
+	}
+}
+
+func isDocumentationMarkdownPath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	return strings.HasPrefix(path, "docs/") && strings.HasSuffix(path, ".md")
+}
+
+func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string, content []byte) {
+	if filepath.ToSlash(path) != ".ai/discovery/semantic-report.json" {
+		return
+	}
+	var analysis domain.SemanticAnalysis
+	if err := json.Unmarshal(content, &analysis); err != nil || analysis.SchemaVersion != 1 ||
+		analysis.ProjectName != state.project.Name || len(analysis.Facts) > 200 {
+		state.collector.conflict("invalid_semantic_report", path, 1, path,
+			"The approved semantic report is invalid, mismatched, or unsupported.")
+		return
+	}
+	allowed := map[string]struct{}{
+		"purpose": {}, "capability": {}, "ownership": {}, "relation": {}, "contract": {},
+		"business_rule": {}, "business_process": {}, "entity": {}, "infrastructure": {}, "command": {},
+	}
+	for _, fact := range analysis.Facts {
+		sourcePath := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(fact.SourcePath))))
+		sourceContent, sourceExists := state.filesByPath[sourcePath]
+		if _, exists := allowed[fact.Category]; !exists || strings.TrimSpace(fact.Name) == "" ||
+			strings.TrimSpace(fact.Value) == "" || fact.Confidence < .5 || fact.Confidence > .95 ||
+			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
+			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value ||
+				containsUnexpandedCommandTemplate(fact.Value) || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
+			fact.Category == "command" && !semanticPackageCommandDeclared(fact, state.filesByPath) ||
+			fact.Category == "relation" && isSemanticSelfReference(fact.Value, state.project.Name) ||
+			!safeManifestReference(fact.SourcePath) || sourcePath == path || !sourceExists ||
+			len(fact.EvidenceQuote) < 8 || len(fact.EvidenceQuote) > 500 ||
+			!strings.Contains(normalizedSemanticEvidence(string(sourceContent)), normalizedSemanticEvidence(fact.EvidenceQuote)) {
+			state.collector.conflict("invalid_semantic_fact", fact.Category+":"+fact.Name, 1, path,
+				"A semantic fact is malformed, stale, or has no verifiable source quote and was not imported.")
+			continue
+		}
+		state.collector.fact(fact.Category, fact.Name, fact.Value, fact.Confidence, path,
+			"Approved semantic evidence references "+sourcePath+". "+fact.Explanation)
+	}
+	for _, question := range analysis.OpenQuestions {
+		if strings.TrimSpace(question.Question) == "" {
+			continue
+		}
+		state.collector.conflict("semantic_open_question", question.Question, .8, path, question.Reason)
+	}
+}
+
+func containsUnexpandedCommandTemplate(value string) bool {
+	return strings.Contains(value, "{{") || strings.Contains(value, "}}")
+}
+
+func semanticPackageCommandDeclared(fact domain.SemanticFact, files map[string][]byte) bool {
+	path := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(fact.SourcePath))))
+	if strings.ToLower(filepath.Base(path)) != "package.json" {
+		return true
+	}
+	content, exists := files[path]
+	if !exists {
+		return false
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return false
+	}
+	command, exists := manifest.Scripts[fact.Name]
+	return exists && strings.TrimSpace(command) == fact.Value
+}
+
+func safeManifestReference(value string) bool {
+	value = strings.TrimSpace(value)
+	cleaned := filepath.Clean(filepath.FromSlash(value))
+	return value != "" && !strings.Contains(value, "\\") && !filepath.IsAbs(cleaned) && cleaned != "." && cleaned != ".." &&
+		!strings.HasPrefix(cleaned, ".."+string(filepath.Separator))
+}
+
+func normalizedSemanticEvidence(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func isSemanticSelfReference(value, projectName string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	projectName = strings.ToLower(strings.TrimSpace(projectName))
+	value = strings.TrimPrefix(value, "http://")
+	value = strings.TrimPrefix(value, "https://")
+	if slash := strings.IndexByte(value, '/'); slash >= 0 {
+		value = value[:slash]
+	}
+	if colon := strings.IndexByte(value, ':'); colon >= 0 {
+		value = value[:colon]
+	}
+	return value != "" && value == projectName
+}
+
+func isApprovedSemanticCommandSource(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(strings.TrimSpace(path)))
+	switch filepath.Base(path) {
+	case "makefile", "taskfile.yml", "taskfile.yaml", "package.json", "pyproject.toml", "composer.json", "readme.md", "agents.md":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -147,18 +256,20 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 	s.extractPythonHTTPRoutes(state, path, content)
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
+		publishCall := strings.Contains(lower, ".publish(") || strings.Contains(lower, "publish(")
+		subscribeCall := strings.Contains(lower, ".subscribe(") || strings.Contains(lower, "subscribe(")
 		if !strings.Contains(lower, "nats") && !strings.Contains(lower, "subject") &&
-			!strings.Contains(lower, "publish") && !strings.Contains(lower, "subscribe") {
+			!publishCall && !subscribeCall {
 			continue
 		}
 		for _, match := range subjectPattern.FindAllStringSubmatch(line, -1) {
 			state.collector.fact("capability", "event_subject", match[1], .72, path,
 				"A NATS/event-related source line references this subject.")
-			if strings.Contains(lower, "publish") {
+			if publishCall {
 				state.collector.fact("contract", "event_publish", match[1], .78, path,
 					"An event publisher emits this subject.")
 			}
-			if strings.Contains(lower, "subscribe") {
+			if subscribeCall {
 				state.collector.fact("contract", "event_subscribe", match[1], .78, path,
 					"An event subscriber consumes this subject.")
 			}
@@ -230,9 +341,11 @@ func collectHTTPRoute(
 }
 
 func (s Scanner) extractOwnership(state *detectorState, path, content string) {
-	for _, match := range databaseTablePattern.FindAllStringSubmatch(content, -1) {
-		state.collector.fact("ownership", "database_table", match[1], .96, path,
-			"A SQL migration creates this table, indicating schema ownership.")
+	if strings.HasSuffix(strings.ToLower(path), ".sql") {
+		for _, match := range databaseTablePattern.FindAllStringSubmatch(content, -1) {
+			state.collector.fact("ownership", "database_table", match[1], .96, path,
+				"A checked-in SQL schema file creates this table, indicating schema ownership.")
+		}
 	}
 	if isEnvironmentExample(strings.ToLower(filepath.Base(path))) {
 		for _, match := range environmentKeyPattern.FindAllStringSubmatch(content, -1) {
@@ -262,6 +375,9 @@ func (s Scanner) extractContracts(state *detectorState, path, base, content stri
 func (s Scanner) extractGatewayRelations(state *detectorState, path, content string) {
 	for _, match := range proxyPassPattern.FindAllStringSubmatch(content, -1) {
 		state.nginxDetected = true
+		if state.project.RepositoryRole == domain.RepositoryRoleFrontend {
+			continue
+		}
 		state.collector.fact("relation", "gateway_routes_to", match[1], .92, path,
 			"An nginx proxy_pass directive routes traffic to this upstream.")
 	}
@@ -358,6 +474,8 @@ func (s Scanner) analyzePrompts(state *detectorState, path string, content []byt
 func (s Scanner) detectDerivedFacts(state *detectorState) {
 	kind, confidence, explanation := domain.ServiceKindUnknown, .45, "No stronger runtime service-kind signal was found."
 	sourcePath := "."
+	runtimeDetected := state.goDetected || state.nodeDetected || state.pythonDetected || state.phpDetected ||
+		state.nextDetected || state.nginxDetected || state.composeDetected
 	switch {
 	case isNonRuntimeRepositoryRole(state.project.RepositoryRole):
 		kind, confidence, explanation = domain.ServiceKindUnknown, .99,
@@ -366,18 +484,18 @@ func (s Scanner) detectDerivedFacts(state *detectorState) {
 		kind, confidence, explanation = domain.ServiceKindFrontendApplication, .96,
 			"The repository role or detected Next.js dependencies identify a frontend application."
 		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nextjs")
+	case state.nginxDetected || runtimeDetected && strings.Contains(state.project.Name, "gateway"):
+		kind, confidence, explanation = domain.ServiceKindGateway, .94,
+			"Nginx gateway configuration or the canonical repository name identifies a gateway."
+		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nginx")
 	case state.project.RepositoryRole == domain.RepositoryRoleInfrastructure || state.composeDetected && !state.goDetected && !state.nodeDetected:
 		kind, confidence, explanation = domain.ServiceKindInfrastructure, .93,
 			"The repository role or Compose-only manifest identifies infrastructure."
 		sourcePath = firstSource(state.collector.facts, "stack", "orchestration", "docker_compose")
-	case state.nginxDetected || strings.Contains(state.project.Name, "gateway"):
-		kind, confidence, explanation = domain.ServiceKindGateway, .94,
-			"Nginx gateway configuration or the canonical repository name identifies a gateway."
-		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nginx")
-	case strings.Contains(state.project.Name, "ai-") || strings.Contains(state.project.Name, "-ai"):
+	case runtimeDetected && (strings.Contains(state.project.Name, "ai-") || strings.Contains(state.project.Name, "-ai")):
 		kind, confidence, explanation = domain.ServiceKindAIService, .82,
 			"The canonical repository name and runtime manifests identify an AI-focused service."
-	case strings.Contains(state.project.Name, "filestorage") || strings.Contains(state.project.Name, "tarantool"):
+	case runtimeDetected && (strings.Contains(state.project.Name, "filestorage") || strings.Contains(state.project.Name, "tarantool")):
 		kind, confidence, explanation = domain.ServiceKindStorageService, .84,
 			"The canonical repository name and detected database/container evidence identify a storage service."
 	case state.goDetected || state.nodeDetected || state.pythonDetected || state.phpDetected:
@@ -433,6 +551,10 @@ func isHealthRoute(value string) bool {
 }
 
 func isComposeFile(base string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	if !strings.HasSuffix(base, ".yml") && !strings.HasSuffix(base, ".yaml") {
+		return false
+	}
 	return base == "docker-compose.yml" || base == "docker-compose.yaml" ||
 		base == "compose.yml" || base == "compose.yaml" ||
 		strings.HasPrefix(base, "docker-compose.") || strings.HasPrefix(base, "compose.")

@@ -1,9 +1,13 @@
 # Repository onboarding runbook
 
 Inventory snapshot: 2026-07-21, last operational update: 2026-07-22. The
-three-repository pilot, eight-repository validator wave, and two-repository
-non-runtime wave in this runbook were owner-approved and completed read-only.
-No onboarding, GitLab, Telegram, or Codex command has been executed.
+original local-checkout audit below is retained as the safety record that led
+to the selected connection strategy. All 38 requested repositories are now
+connected: the first 13 through reviewed clean local checkouts and the other
+25 through clean orchestrator-managed clones of remote default branches. The
+user's primary checkouts and issue worktrees were not modified.
+No onboarding proposal has been approved or applied, and no live coding task,
+GitLab write, or Telegram operation has been started.
 
 ## Safety boundary
 
@@ -29,7 +33,7 @@ roots, 13 linked issue worktrees, and the non-Git parent `infra`. The nested
 `infra/messaging` directory is another primary Git root, producing 36 primary
 repositories in the microservices tree.
 
-The following clean `main` checkouts have already been connected read-only:
+The following clean local `main` checkouts formed the first read-only waves:
 
 - `infra/messaging` (`infrastructure`);
 - `ms-go-cache-search-validator`, `ms-go-docker-validator`,
@@ -39,9 +43,10 @@ The following clean `main` checkouts have already been connected read-only:
   `ms-ts-browser-runtime-validator`, and `ms-ts-nextjs-validator` (`service`);
 - `journal` (`archive`) and `prompts` (`policy`).
 
-No additional repository currently satisfies all connection preconditions.
-Every remaining candidate needs an owner decision about branch/checkout
-hygiene first.
+The remaining requested repositories were subsequently connected by Git URL.
+The orchestrator therefore owns clean managed clones of their remote default
+branches under `REPOSITORY_STORAGE_PATH`; stale or dirty user checkouts remain
+untouched and are not execution bases.
 
 The completed first pilot connected `ms-go-http-runtime-validator`,
 `ms-ts-nextjs-validator`, and `infra/messaging`. The completed second wave
@@ -283,12 +288,26 @@ contract, or evidence path is unexpected. Do not continue by guessing.
 After an individual report is accepted, onboarding remains proposal-first:
 
 ```sh
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-onboard --service SERVICE
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-enrich --service SERVICE
 docker compose exec -T orchestrator /app/course-dev-orchestrator project-diff --run-id RUN_ID
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-apply --run-id RUN_ID --dry-run
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-approve --run-id RUN_ID --actor owner --comment "reviewed proposal"
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-apply --run-id RUN_ID
 ```
 
-The approval and final apply commands are examples only. They must not be run
-in bulk and are not authorized merely by completing the discovery waves.
+`project-enrich` invokes the local Codex CLI as a read-only analyst. It accepts
+only bounded structured facts with exact source quotes and stores them in the
+same approval-gated onboarding workflow. It does not edit the repository or
+immediately change topology. Review its complete diff first. If the proposal
+is accepted, continue explicitly and one project at a time:
+
+```sh
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-apply --run-id RUN_ID --dry-run
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-approve --run-id RUN_ID --actor owner --comment "reviewed semantic evidence"
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-apply --run-id RUN_ID
+docker compose exec -T orchestrator /app/course-dev-orchestrator project-scan --service SERVICE
+docker compose exec -T orchestrator /app/course-dev-orchestrator topology
+```
+
+Deterministic-only onboarding remains available through `project-onboard` as
+a separate flow. Do not replace the semantic `RUN_ID` with a newly generated
+deterministic run unless that is intentional. The approval and final apply
+commands are examples only. They must not be run in bulk and are not
+authorized merely by completing discovery or enrichment generation.

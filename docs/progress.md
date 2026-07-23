@@ -1,18 +1,37 @@
 # Implementation progress
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 ## Current status
 
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-Thirteen owner-approved repositories are connected read-only: ten validators,
-`ms-infra-messaging`, `ms-course-promts`, and `ms-course-journal`. Their source
-checkouts remain clean and no onboarding, Codex, GitLab, or Telegram operation
-has been started. Stage 6 verification used only in-memory fakes, disposable
-Git repositories, and disposable PostgreSQL records. No live Codex request was
-made without an explicitly configured key.
+All 38 requested repositories are connected: 25 through orchestrator-managed
+clones of remote default branches and the original 13 through previously
+reviewed clean local checkouts. The catalog contains 31 services, two frontends, one
+infrastructure repository, and one repository in each of the policy,
+documentation, content, and archive roles. The user's primary checkouts were
+not modified. The materialized landscape currently includes 34 runtime
+services, 433 capabilities, 131 ownership records, 472 contracts, four
+explicit relations, and 12 reported contract drifts.
+
+Local Codex CLI execution now uses the existing ChatGPT login by default; no
+`CODEX_API_KEY` is required. A three-project planning smoke test was completed
+without starting execution. Evidence-backed semantic enrichment is implemented
+as a proposal-only analyst pass: it cannot modify a connected checkout or
+affect topology until the owner reviews, approves, applies, and rescans its
+proposal. A live pilot for `ms-go-http-runtime-validator` produced run
+`95482dd4-4a59-48b6-8a51-61e99ec4e662` with 31 verified semantic facts, seven
+open questions, and two approved Taskfile commands. The owner approved it on
+2026-07-23; dry-run and real apply passed in the isolated
+`ai/onboard-ms-go-http-runtime-validator-95482dd44a59` worktree, commit
+`5b3c99391d2379b1e9ddeb40f772a371abaf0e85` was pushed, and GitHub draft PR #6
+was opened. No live coding task has yet been executed against the 38 projects.
+All 38 repositories now also have reviewed, applied, and published semantic
+onboarding proposals in isolated draft PRs. The current exact PR set is tracked
+in `docs/onboarding-prs.md`. None is merged, so the materialized topology still
+describes default branches without the approved semantic reports.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -435,17 +454,233 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   and `go test -race ./...` passed. The rebuilt stack returned healthy
   liveness, PostgreSQL/Temporal readiness, and a successful real Temporal
   workflow probe.
+- Connected all 38 requested repositories using 25 managed remote-default
+  clones plus 13 reviewed clean local checkouts, without modifying primary
+  user checkouts, and rebuilt the 34-service platform landscape used by
+  planning/execution context.
+- Switched live Codex execution to the existing local ChatGPT login and added
+  per-role model profiles without requiring `CODEX_API_KEY`.
+- Added proposal-only semantic enrichment with analyst JSON Schema, exact
+  source-quote validation, rejected-fact isolation, business rules/processes,
+  entities, relations, and evidence-backed commands.
+- Added scan-time revalidation of approved semantic quotes and discovery schema
+  v7 so altered or stale reports fail closed before topology ingestion.
+- Installed and verified `bubblewrap` inside the runtime containers; Compose
+  allows its unprivileged namespace while dropping all capabilities and
+  enforcing `no-new-privileges`.
+- Completed the live `ms-go-http-runtime-validator` semantic pilot. Four
+  superseded experimental proposals were cancelled, the final proposal passed
+  dry-run checks, and the managed clone remained clean at its original HEAD.
+- Applied and published the owner-approved HTTP runtime validator pilot without
+  modifying its primary checkout. All proposal checksum, generated-format,
+  write-scope, worktree-isolation, commit, and source-immutability checks passed.
+- Rejected the first `ms-go-validation-orchestrator` semantic proposal during
+  evidence review because deterministic discovery treated SQL embedded in
+  `docs/examples/*.json` as owned tables and a route in `_test.go` as a
+  production endpoint.
+- Advanced discovery report schema to v9. Runtime topology evidence now ignores
+  test, fixture, and example paths, while database ownership requires a
+  checked-in production SQL file. Compose detection accepts only YAML manifests
+  and no longer misclassifies Go files such as `compose.go`. Semantic analysts now receive the exact
+  connected-project name catalog, and relation facts targeting networks,
+  containers, URLs, or other non-project values are isolated as rejected facts.
+- Added regression coverage for example/test evidence suppression and
+  non-catalog semantic relation targets. Focused tests and `make verify` pass.
+- Rejected the first `ms-go-sandbox` semantic proposal because its command
+  manifest exposed cleanup and Docker lifecycle commands without an explicit
+  approval boundary. Generated command catalogs now classify each entry as
+  verification, lifecycle, external-runtime, or state-change and set
+  `requires_approval` accordingly. Agent and test workflows run only
+  non-approval verification commands; all other commands require an owner gate.
+- Rejected the first `ms-go-course` semantic proposal because seed-import and
+  integration commands were initially classified by their test-like names.
+  Command risk precedence now treats migration, create, import, insert, seed,
+  and integration operations as approval-required before considering test or
+  validation keywords.
+- Rejected the first `ms-gateway` semantic proposal because an E2E command was
+  quoted without its required working directory and did not exist relative to
+  the repository root. Semantic command validation now rejects missing `./...`
+  executable paths instead of placing non-runnable commands in agent manifests.
+- Completed reviewed, dry-run-validated onboarding applies for the platform
+  anchors `ms-go-validation-orchestrator`, `ms-go-sandbox`, `ms-go-course`, and
+  `ms-gateway`. Every apply used an isolated `ai/onboard-*` worktree, restricted
+  writes to `AGENTS.md` and `.ai/**`, committed the exact approved proposal, and
+  left the managed source checkout unchanged.
+- Rejected the first `course-wiki` semantic proposal because documentation-only
+  evidence was represented as runtime ownership, contracts, infrastructure, and
+  topology relations. Semantic validation now fail-closes those categories for
+  content, policy, documentation, and archive roles while retaining purpose,
+  business rules, business processes, entities, and repository commands.
+- Regenerated and applied the corrected `course-wiki` proposal with 43 admitted
+  knowledge facts: 29 business rules, five business processes, eight entities,
+  and one purpose statement. Two unverifiable quotes were isolated and six
+  cross-document ambiguities remain explicit open questions; no runtime
+  ownership, contract, relation, capability, or infrastructure fact was admitted.
+- Published the five reviewed platform-anchor trees after exact tree-hash
+  comparison as GitHub draft PRs: validation orchestrator PR #21, sandbox PR
+  #13, course PR #74, gateway PR #29, and course-wiki PR #11. No PR was merged.
+- Rejected the first `ms-go-auth` proposal because an E2E-only path reversed a
+  gateway relation and a Taskfile comment promoted a local shared-Postgres setup
+  into runtime topology. Semantic runtime categories now reject evidence from
+  tests, fixtures, examples, and testdata; relations reject operational manifest
+  sources; gateway/frontend relation types are constrained to matching source
+  repository kinds.
+- Two subsequent `ms-go-auth` analyses reached a child-runner failure after
+  emitting only the thread frame. The Go adapter previously returned only an
+  unhelpful incomplete-protocol error and discarded the runner's structured
+  stderr event. It now surfaces the bounded JSON error message while continuing
+  to ignore arbitrary stderr, with regression coverage for the partial protocol.
+- The surfaced cause was a TLS unexpected-EOF after the SDK exhausted its five
+  stream reconnect attempts. Partial protocol reads now return the captured
+  thread ID, transport-like runner messages are typed as transient failures,
+  and semantic enrichment performs one bounded same-thread resume instead of
+  discarding completed analysis work or retrying indefinitely.
+- Rejected the first `ms-go-rbac` proposal because its documented test command
+  set `GOCACHE=../.gocache`, which would write outside the isolated worktree and
+  contradicted repository instructions. Commands containing parent-directory
+  traversal now require approval and are excluded from automatic test workflows.
+- Rejected the first `ms-go-user` proposal because semantic GORM-model facts
+  duplicated four table ownership records already discovered from production
+  migrations. Semantic `ownership/database_table` facts now require checked-in
+  `.sql` evidence; code models remain valid evidence for domain entities only.
+- Rejected the first `ms-go-student` proposal because a sandbox caller allowlist
+  was represented backwards as authentication delegation. The
+  `authenticates_through` relation now requires direct authentication/JWT/token
+  evidence. Command risk matching no longer finds destructive `rm` inside words
+  such as `performance`; formatting commands are explicitly state-changing.
+- Rejected the second `ms-go-student` proposal because the same inbound
+  `AllowedServices` evidence was renamed to `depends_on`. Caller allowlists are
+  now rejected as evidence for every semantic relation type; outbound
+  dependencies require outbound-client or explicit architecture evidence.
+- Completed reviewed onboarding applies for the identity/core wave:
+  `ms-go-auth`, `ms-go-rbac`, `ms-go-user`, `ms-go-student`,
+  `ms-go-filestorage`, and `ms-go-statistic`. Every proposal passed dry-run,
+  generated-format, exact write-scope, isolated-worktree, commit, and
+  source-checkout immutability checks.
+- Published the identity/core trees after exact tree-hash comparison as GitHub
+  draft PRs: auth #4, RBAC #8, user #11, student #30, filestorage #6, and
+  statistic #6. No PR was merged.
+- Rejected the first `go-ms-ai-summary` proposal because the three-file checkout
+  contains copied/generic architecture instructions for different services but
+  no production code or manifests. Deterministic discovery now suppresses
+  runtime extraction from `docs/*.md`; semantic runtime categories reject
+  `AGENTS.md` and `prompts/**` evidence while retaining commands and working
+  rules. Discovery report schema advanced to v10 so every connected checkout is
+  rescanned under the documentation boundary before topology is rebuilt.
+- Rejected the second `go-ms-ai-summary` proposal because copied commands in
+  `AGENTS.md` had no corresponding Go module, Makefile, Taskfile, or Compose
+  manifest. Discovery schema v11 now leaves name-only runtime placeholders as
+  `service_kind: unknown`, and semantic commands sourced only from README or
+  AGENTS require the matching repository manifest. The corrected proposal has
+  no runtime topology, executable commands, backend coder, or feature workflow;
+  its missing source, contracts, schema, configuration, and deployment remain
+  explicit open questions.
+- Rejected the first `ms-go-pet-project-orchestrator` proposal because a README
+  statement about downstream services forwarding a contract was represented as
+  a direct dependency on `ms-go-validation-orchestrator`. Indirect downstream
+  mentions now fail the relation-evidence gate. The corrected proposal records
+  only the production-wired `ms-go-ai-prompt` and `ms-go-student` dependencies,
+  SQL-backed ownership, approval-gated state changes, and `task test` as the
+  automatic verification command.
+- Completed reviewed, dry-run-validated onboarding applies for the
+  AI/orchestration wave: `ms-go-ai-prompt`, `go-ms-ai-summary`, and
+  `ms-go-pet-project-orchestrator`. Every apply passed exact write-scope,
+  isolated-worktree, commit, and source-checkout immutability checks.
+- Published the AI/orchestration trees after exact tree-hash comparison as
+  GitHub draft PRs: AI prompt #5, AI summary #3, and practice-task orchestrator
+  #8. No PR was merged.
+- Completed reviewed onboarding applies for the platform-knowledge wave:
+  `ms-infra-messaging`, `ms-course-promts`, `ms-course-journal`, and
+  `knowledge-tree`. Infrastructure stream definitions remain distinct from
+  unknown publisher/consumer ownership; policy, archive, and content facts do
+  not create runtime topology.
+- The `knowledge-tree` proposal preserves the differing EN/RU
+  `02-generate-lesson.md` checksums as an unresolved conflict. Export, update,
+  dev, and other mutating scripts require approval; only safe check/test/
+  validation commands enter its automatic verification workflow.
+- Published the four platform-knowledge trees after exact tree-hash comparison
+  as GitHub draft PRs: messaging #3, shared policy #5, journal #1, and
+  knowledge-tree #224. No PR was merged.
+- Rejected the first `nextjs` frontend proposal because deterministic Nginx
+  detection represented the frontend reverse proxy as an owner of
+  `gateway_routes_to` relations. Discovery schema v12 suppresses gateway-owned
+  relations for frontend-role repositories while retaining endpoint-level
+  consumer evidence and unresolved backend ownership questions.
+- Rejected the second `nextjs` proposal because i18n keys such as
+  `actions.publish` and `toast.publishSuccess` were represented as event-bus
+  subjects. Discovery schema v13 requires explicit subject/NATS context or a
+  real publish/subscribe call; the corrected frontend report contains no false
+  event facts or `events.yaml`.
+- Rejected the first reviewed frontend command manifests because npm lifecycle
+  hooks and interactive Vitest UI were treated as automatic verification.
+  `pre*`/`post*` hooks and UI modes now require approval, covering admin Monaco
+  asset synchronization and both frontend test UIs.
+- Completed and published corrected frontend onboarding drafts: student
+  frontend PR #52 and admin frontend PR #77. Student PR #51 was closed as
+  superseded. Both corrected trees passed exact tree-hash, isolated-worktree,
+  write-scope, commit, and source-immutability checks; no PR was merged.
+- Completed reviewed data/runtime onboarding applies for
+  `ms-go-cache-search-validator`, `ms-go-db-validator`, `ms-go-tarantool`, and
+  `ms-go-image-processor`. Ephemeral validator engines are infrastructure, Lua
+  Tarantool spaces are database contracts rather than SQL table ownership, and
+  image-variant ownership is backed by a checked-in SQL migration.
+- The DB validator uses the clean orchestrator-managed remote clone; the 1,793
+  untracked files in the user's separate primary checkout were neither scanned
+  nor modified. Tarantool's stale NATS/cache documentation and image
+  processor's `ms-filestorage` versus `ms-go-filestorage` alias remain explicit
+  open questions.
+- Published the four data/runtime trees after exact tree-hash comparison as
+  GitHub draft PRs: cache/search #5, DB validator #5, Tarantool #5, and image
+  processor #5. No PR was merged.
+- Completed reviewed onboarding applies for the Go validator wave:
+  `ms-go-code-validator`, `ms-go-docker-validator`, `ms-go-git-validator`,
+  `ms-go-linux-validator`, `ms-go-php-framework-validator`, and
+  `ms-go-php-validator`. Each proposal separates validator behavior from the
+  user workspace/runtime it inspects and leaves unidentified callers,
+  deployment controls, and persistence boundaries as open questions.
+- The Linux validator report explicitly records that caller-controlled commands
+  reach `os/exec` while no deployment isolation boundary is documented. The
+  PHP validator report preserves stale route/event and unenforced configuration
+  discrepancies rather than turning them into active contracts.
+- Published the six Go-validator trees after exact tree-hash comparison as
+  GitHub draft PRs: code #11, Docker #6, Git #6, Linux #5, PHP framework #6,
+  and PHP #8. No PR was merged.
+- Completed the final polyglot wave for Node, Python, browser runtime, CSS,
+  HTML, Next.js, and React validators. Every proposal was individually
+  reviewed, dry-run validated, applied in an isolated worktree, tree-hash
+  checked, and published as a draft PR.
+- Advanced discovery through schemas v14-v16. Package-script facts must match
+  exact manifest scripts, watch/UI/lifecycle commands require approval,
+  unexpanded `{{...}}` command templates are rejected, and Compose-backed
+  Nginx `*.conf.template` repositories are classified as gateways before the
+  generic infrastructure fallback.
+- Added command-manifest deduplication by executable command, retaining the
+  strongest evidence and removing deterministic/semantic aliases from test
+  workflows.
+- Replaced stale or noisy onboarding drafts after the final audit: gateway #30
+  supersedes #29, filestorage #7 supersedes #6, RBAC #9 supersedes #8, user #12
+  supersedes #11, course #75 supersedes #74, browser runtime #9 supersedes #8,
+  CSS #12 supersedes #11, and Next.js validator #7 supersedes #6.
+- Audited the latest command manifests for all 38 projects. The audit found
+  zero duplicated run commands, zero unexpanded command templates, and zero
+  watch/UI/lifecycle commands incorrectly marked for automatic execution.
+- Confirmed exactly one current onboarding draft per connected project and
+  recorded the resource-level merge set in `docs/onboarding-prs.md`.
 
 ## Remaining work
 
-- No implementation stage remains for the specified MVP.
-- Remaining repository connections and later onboarding remain separate,
-  owner-authorized operational steps.
+- Obtain explicit resource-level authorization to merge the 38 drafts listed
+  in `docs/onboarding-prs.md`; onboarding approval did not authorize merges.
+- After merge, rescan all default branches under schema v16 and rebuild
+  topology, contracts, relations, and drift from the now-trusted reports.
+- Turn the recorded authentication, deployment, CI, path-containment, and
+  sandbox-isolation gaps into reviewed work items.
+- Run the first real concurrent multi-project coding plan through local Codex
+  CLI with independent reviewer agents and verify retry/resume behavior.
 
 ## Exact next task
 
-Await an owner decision for the deferred repositories: either synchronize the
-local primary checkouts to an approved default branch outside the orchestrator,
-or explicitly authorize managed clones from their remote default branches.
-Do not infer that choice, connect dirty/stale/worktree projects, or start
-onboarding.
+Receive explicit authorization for the exact 38 PRs in
+`docs/onboarding-prs.md`, merge only that approved set, then rescan all 38
+default branches and rebuild the trusted platform topology before executing a
+real coding task.

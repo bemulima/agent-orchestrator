@@ -22,7 +22,7 @@ RUN npm run build \
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates git nodejs npm openssh-client \
+RUN apk add --no-cache bubblewrap ca-certificates git nodejs npm openssh-client \
     && addgroup -S orchestrator \
     && adduser -S -G orchestrator orchestrator \
     && mkdir -p /data/repositories /data/worktrees /data/codex /projects \
