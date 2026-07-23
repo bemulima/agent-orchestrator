@@ -28,6 +28,10 @@ open questions, and two approved Taskfile commands. The owner approved it on
 `ai/onboard-ms-go-http-runtime-validator-95482dd44a59` worktree, commit
 `5b3c99391d2379b1e9ddeb40f772a371abaf0e85` was pushed, and GitHub draft PR #6
 was opened. No live coding task has yet been executed against the 38 projects.
+All 38 repositories now also have reviewed, applied, and published semantic
+onboarding proposals in isolated draft PRs. The current exact PR set is tracked
+in `docs/onboarding-prs.md`. None is merged, so the materialized topology still
+describes default branches without the approved semantic reports.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -641,20 +645,42 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the six Go-validator trees after exact tree-hash comparison as
   GitHub draft PRs: code #11, Docker #6, Git #6, Linux #5, PHP framework #6,
   and PHP #8. No PR was merged.
+- Completed the final polyglot wave for Node, Python, browser runtime, CSS,
+  HTML, Next.js, and React validators. Every proposal was individually
+  reviewed, dry-run validated, applied in an isolated worktree, tree-hash
+  checked, and published as a draft PR.
+- Advanced discovery through schemas v14-v16. Package-script facts must match
+  exact manifest scripts, watch/UI/lifecycle commands require approval,
+  unexpanded `{{...}}` command templates are rejected, and Compose-backed
+  Nginx `*.conf.template` repositories are classified as gateways before the
+  generic infrastructure fallback.
+- Added command-manifest deduplication by executable command, retaining the
+  strongest evidence and removing deterministic/semantic aliases from test
+  workflows.
+- Replaced stale or noisy onboarding drafts after the final audit: gateway #30
+  supersedes #29, filestorage #7 supersedes #6, RBAC #9 supersedes #8, user #12
+  supersedes #11, course #75 supersedes #74, browser runtime #9 supersedes #8,
+  CSS #12 supersedes #11, and Next.js validator #7 supersedes #6.
+- Audited the latest command manifests for all 38 projects. The audit found
+  zero duplicated run commands, zero unexpanded command templates, and zero
+  watch/UI/lifecycle commands incorrectly marked for automatic execution.
+- Confirmed exactly one current onboarding draft per connected project and
+  recorded the resource-level merge set in `docs/onboarding-prs.md`.
 
 ## Remaining work
 
-- Review and merge the published onboarding PRs through each repository workflow
-  before rescanning their approved semantic reports into the trusted topology.
-- Enrich the remaining seven repositories in reviewed waves; do not approve or
-  apply proposals in bulk.
-- After the platform context is accepted, run the first real multi-project
-  coding plan with independent reviewer agents.
+- Obtain explicit resource-level authorization to merge the 38 drafts listed
+  in `docs/onboarding-prs.md`; onboarding approval did not authorize merges.
+- After merge, rescan all default branches under schema v16 and rebuild
+  topology, contracts, relations, and drift from the now-trusted reports.
+- Turn the recorded authentication, deployment, CI, path-containment, and
+  sandbox-isolation gaps into reviewed work items.
+- Run the first real concurrent multi-project coding plan through local Codex
+  CLI with independent reviewer agents and verify retry/resume behavior.
 
 ## Exact next task
 
-Enrich and review the final polyglot validator wave: `ms-node-validator`,
-`ms-py-validator`, `ms-ts-browser-runtime-validator`, `ms-ts-css-validator`,
-`ms-ts-html-validator`, `ms-ts-nextjs-validator`, and `ms-ts-react-validator`,
-applying only proposals whose language/runtime contracts, sandbox boundaries,
-business rules, and command risk gates pass review.
+Receive explicit authorization for the exact 38 PRs in
+`docs/onboarding-prs.md`, merge only that approved set, then rescan all 38
+default branches and rebuild the trusted platform topology before executing a
+real coding task.
