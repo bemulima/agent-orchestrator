@@ -531,6 +531,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   thread ID, transport-like runner messages are typed as transient failures,
   and semantic enrichment performs one bounded same-thread resume instead of
   discarding completed analysis work or retrying indefinitely.
+- Rejected the first `ms-go-rbac` proposal because its documented test command
+  set `GOCACHE=../.gocache`, which would write outside the isolated worktree and
+  contradicted repository instructions. Commands containing parent-directory
+  traversal now require approval and are excluded from automatic test workflows.
 
 ## Remaining work
 

@@ -223,6 +223,9 @@ func backendAgent(hasCommands bool) string {
 func classifyCommandRisk(name, command string) (bool, string) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	command = strings.ToLower(strings.TrimSpace(command))
+	if strings.Contains(command, "../") || strings.Contains(command, `..\`) {
+		return true, "state_change"
+	}
 	padded := " " + command + " "
 	for _, marker := range []string{
 		" rm ", "rm -", "delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
