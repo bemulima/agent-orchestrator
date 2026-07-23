@@ -70,6 +70,7 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 			strings.TrimSpace(fact.Value) == "" || fact.Confidence < .5 || fact.Confidence > .95 ||
 			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
 			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
+			fact.Category == "command" && !semanticPackageCommandDeclared(fact, state.filesByPath) ||
 			fact.Category == "relation" && isSemanticSelfReference(fact.Value, state.project.Name) ||
 			!safeManifestReference(fact.SourcePath) || sourcePath == path || !sourceExists ||
 			len(fact.EvidenceQuote) < 8 || len(fact.EvidenceQuote) > 500 ||
@@ -87,6 +88,25 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 		}
 		state.collector.conflict("semantic_open_question", question.Question, .8, path, question.Reason)
 	}
+}
+
+func semanticPackageCommandDeclared(fact domain.SemanticFact, files map[string][]byte) bool {
+	path := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(fact.SourcePath))))
+	if strings.ToLower(filepath.Base(path)) != "package.json" {
+		return true
+	}
+	content, exists := files[path]
+	if !exists {
+		return false
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return false
+	}
+	command, exists := manifest.Scripts[fact.Name]
+	return exists && strings.TrimSpace(command) == fact.Value
 }
 
 func safeManifestReference(value string) bool {

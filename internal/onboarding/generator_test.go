@@ -108,9 +108,10 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 		{Category: "command", Name: "performance_test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
 		{Category: "command", Name: "prebuild", Value: "npm run sync-assets", SourcePath: "package.json", Confidence: .95},
 		{Category: "command", Name: "test:ui", Value: "vitest --ui", SourcePath: "package.json", Confidence: .95},
+		{Category: "command", Name: "test:watch", Value: "jest --watchAll", SourcePath: "package.json", Confidence: .95},
 	}}
 	manifest := buildCommandsManifest(report)
-	if len(manifest.Commands) != 11 {
+	if len(manifest.Commands) != 12 {
 		t.Fatalf("commands = %#v", manifest.Commands)
 	}
 	approval := make(map[string]bool, len(manifest.Commands))
@@ -120,7 +121,7 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 	if approval["test"] || approval["validate-contract"] || !approval["cleanup_exited_sandboxes"] ||
 		!approval["stop_containers"] || !approval["import-test-seeds"] || !approval["test-integration"] ||
 		!approval["unsafe_test_cache"] || !approval["format_and_vet"] || approval["performance_test"] ||
-		!approval["prebuild"] || !approval["test:ui"] {
+		!approval["prebuild"] || !approval["test:ui"] || !approval["test:watch"] {
 		t.Fatalf("command approval classification = %#v", approval)
 	}
 	workflow := buildTestWorkflow(manifest)

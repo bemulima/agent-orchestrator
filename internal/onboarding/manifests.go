@@ -224,7 +224,8 @@ func classifyCommandRisk(name, command string) (bool, string) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	command = strings.ToLower(strings.TrimSpace(command))
 	if strings.HasPrefix(name, "pre") || strings.HasPrefix(name, "post") ||
-		strings.Contains(name, ":ui") || strings.Contains(command, " --ui") {
+		strings.Contains(name, ":ui") || strings.Contains(command, " --ui") ||
+		strings.Contains(name, "watch") || strings.Contains(command, "--watch") {
 		return true, "lifecycle"
 	}
 	if strings.Contains(command, "../") || strings.Contains(command, `..\`) {

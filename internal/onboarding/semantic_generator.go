@@ -299,6 +299,13 @@ func validateSemanticAnalysis(
 			})
 			continue
 		}
+		if fact.Category == "command" && !semanticPackageCommandDeclared(root, fact) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "package_script_not_declared",
+			})
+			continue
+		}
 		if fact.Category == "relation" && isSelfSemanticRelation(fact.Value, project.Name) {
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
@@ -700,6 +707,28 @@ func semanticInstructionCommandSupported(root, sourcePath, value string) bool {
 	default:
 		return strings.HasPrefix(fields[0], "./") && semanticCommandPathExists(root, value)
 	}
+}
+
+func semanticPackageCommandDeclared(root string, fact domain.SemanticFact) bool {
+	if strings.ToLower(filepath.Base(filepath.ToSlash(fact.SourcePath))) != "package.json" {
+		return true
+	}
+	path, err := resolveSemanticEvidencePath(root, fact.SourcePath)
+	if err != nil {
+		return false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return false
+	}
+	command, exists := manifest.Scripts[fact.Name]
+	return exists && strings.TrimSpace(command) == fact.Value
 }
 
 func isSemanticCommandSource(path string) bool {

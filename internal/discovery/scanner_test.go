@@ -485,6 +485,21 @@ func TestScanner_EnforcesInventoryLimits(t *testing.T) {
 	}
 }
 
+func TestSemanticPackageCommandDeclaredRequiresExactScriptName(t *testing.T) {
+	files := map[string][]byte{
+		"package.json": []byte(`{"scripts":{"test:watch":"jest --watchAll"}}`),
+	}
+	exact := domain.SemanticFact{Name: "test:watch", Value: "jest --watchAll", SourcePath: "package.json"}
+	if !semanticPackageCommandDeclared(exact, files) {
+		t.Fatal("exact package script was rejected")
+	}
+	renamed := exact
+	renamed.Name = "test_watch"
+	if semanticPackageCommandDeclared(renamed, files) {
+		t.Fatal("renamed package script was accepted")
+	}
+}
+
 func fixturePath(t *testing.T, name string) string {
 	t.Helper()
 	path, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "discovery", name))
