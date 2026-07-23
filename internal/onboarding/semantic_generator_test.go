@@ -428,6 +428,32 @@ func TestValidateSemanticAnalysisRejectsRuntimeTopologyFromAgentInstructions(t *
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsInstructionCommandWithoutManifest(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Run `go test ./...` before review.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "placeholder", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindUnknown}
+	content := json.RawMessage(`{
+  "summary":"Instruction-only placeholder.",
+  "facts":[{
+    "category":"command","name":"test","value":"go test ./...","confidence":0.9,
+    "source_path":"AGENTS.md","evidence_quote":"Run ` + "`go test ./...`" + ` before review.",
+    "explanation":"The instruction file documents a Go test command."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "instruction_command_has_no_repository_manifest" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole

@@ -444,6 +444,8 @@ func (s Scanner) analyzePrompts(state *detectorState, path string, content []byt
 func (s Scanner) detectDerivedFacts(state *detectorState) {
 	kind, confidence, explanation := domain.ServiceKindUnknown, .45, "No stronger runtime service-kind signal was found."
 	sourcePath := "."
+	runtimeDetected := state.goDetected || state.nodeDetected || state.pythonDetected || state.phpDetected ||
+		state.nextDetected || state.nginxDetected || state.composeDetected
 	switch {
 	case isNonRuntimeRepositoryRole(state.project.RepositoryRole):
 		kind, confidence, explanation = domain.ServiceKindUnknown, .99,
@@ -456,14 +458,14 @@ func (s Scanner) detectDerivedFacts(state *detectorState) {
 		kind, confidence, explanation = domain.ServiceKindInfrastructure, .93,
 			"The repository role or Compose-only manifest identifies infrastructure."
 		sourcePath = firstSource(state.collector.facts, "stack", "orchestration", "docker_compose")
-	case state.nginxDetected || strings.Contains(state.project.Name, "gateway"):
+	case state.nginxDetected || runtimeDetected && strings.Contains(state.project.Name, "gateway"):
 		kind, confidence, explanation = domain.ServiceKindGateway, .94,
 			"Nginx gateway configuration or the canonical repository name identifies a gateway."
 		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nginx")
-	case strings.Contains(state.project.Name, "ai-") || strings.Contains(state.project.Name, "-ai"):
+	case runtimeDetected && (strings.Contains(state.project.Name, "ai-") || strings.Contains(state.project.Name, "-ai")):
 		kind, confidence, explanation = domain.ServiceKindAIService, .82,
 			"The canonical repository name and runtime manifests identify an AI-focused service."
-	case strings.Contains(state.project.Name, "filestorage") || strings.Contains(state.project.Name, "tarantool"):
+	case runtimeDetected && (strings.Contains(state.project.Name, "filestorage") || strings.Contains(state.project.Name, "tarantool")):
 		kind, confidence, explanation = domain.ServiceKindStorageService, .84,
 			"The canonical repository name and detected database/container evidence identify a storage service."
 	case state.goDetected || state.nodeDetected || state.pythonDetected || state.phpDetected:

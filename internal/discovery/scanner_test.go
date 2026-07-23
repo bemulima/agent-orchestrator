@@ -278,6 +278,21 @@ func TestScanner_ContentRoleDoesNotBecomeRuntimeService(t *testing.T) {
 	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
 }
 
+func TestScanner_RuntimeNameWithoutRuntimeEvidenceRemainsUnknown(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Use go test ./...\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(Config{MaxFiles: 100, MaxFileBytes: 1 << 20, MaxTotalBytes: 4 << 20, MaxDepth: 10})
+	report, err := scanner.Scan(context.Background(), domain.Project{
+		ID: "placeholder", Name: "go-ms-ai-summary", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
+}
+
 func TestScannerImportsApprovedSemanticReport(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {

@@ -149,7 +149,7 @@ Return only facts directly supported by repository text. Every fact must include
 Use confidence between 0.50 and 0.95. Put ambiguity in open_questions instead of guessing.
 Runtime capability, ownership, relation, contract, and infrastructure facts must come from production code or authoritative runtime documentation, never tests, fixtures, examples, or testdata.
 Database-table ownership must use a checked-in .sql source; models, ORM tags, and prose may describe entities but cannot establish schema ownership.
-AGENTS.md and prompts are instructions, not runtime topology evidence. They may support commands and working rules, but not capability, ownership, relation, contract, or infrastructure facts.
+AGENTS.md and prompts are instructions, not runtime topology evidence. They may support working rules, but not capability, ownership, relation, contract, or infrastructure facts. A command documented only in README.md or AGENTS.md is valid only when the repository contains the corresponding runtime or command manifest (for example go.mod for go, Makefile for make, Taskfile for task, package.json for npm, or a Compose manifest for docker compose).
 Use these category/name conventions when applicable:
 - purpose: summary
 - capability: business capability or http_route
@@ -288,6 +288,13 @@ func validateSemanticAnalysis(
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
 				Reason: "command_path_not_found_from_repository_root",
+			})
+			continue
+		}
+		if fact.Category == "command" && !semanticInstructionCommandSupported(root, fact.SourcePath, fact.Value) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "instruction_command_has_no_repository_manifest",
 			})
 			continue
 		}
@@ -630,6 +637,58 @@ func semanticCommandPathExists(root, value string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+func semanticInstructionCommandSupported(root, sourcePath, value string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(strings.TrimSpace(sourcePath))))
+	if base != "readme.md" && base != "agents.md" {
+		return true
+	}
+	fields := strings.Fields(strings.TrimSpace(value))
+	for len(fields) > 0 && strings.Contains(fields[0], "=") && !strings.HasPrefix(fields[0], "./") {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 {
+		return false
+	}
+	has := func(paths ...string) bool {
+		for _, path := range paths {
+			if info, err := os.Stat(filepath.Join(root, path)); err == nil && !info.IsDir() {
+				return true
+			}
+		}
+		return false
+	}
+	switch fields[0] {
+	case "go", "gofmt", "goimports", "golangci-lint":
+		return has("go.mod", "go.work")
+	case "make", "gmake":
+		return has("Makefile", "makefile", "GNUmakefile")
+	case "task":
+		return has("Taskfile.yml", "Taskfile.yaml", "taskfile.yml", "taskfile.yaml")
+	case "npm", "npx", "node", "pnpm", "yarn", "bun":
+		return has("package.json")
+	case "docker-compose":
+		return has("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+	case "docker":
+		if len(fields) > 1 && fields[1] == "compose" {
+			return has("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+		}
+		return has("Dockerfile", "dockerfile")
+	case "python", "python3", "pytest", "pip", "pip3", "poetry", "uv":
+		return has("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile")
+	case "php", "composer":
+		return has("composer.json")
+	case "buf":
+		return has("buf.yaml", "buf.work.yaml", "buf.gen.yaml")
+	case "helm":
+		return has("Chart.yaml")
+	case "terraform", "tofu":
+		matches, _ := filepath.Glob(filepath.Join(root, "*.tf"))
+		return len(matches) > 0
+	default:
+		return strings.HasPrefix(fields[0], "./") && semanticCommandPathExists(root, value)
+	}
 }
 
 func isSemanticCommandSource(path string) bool {
