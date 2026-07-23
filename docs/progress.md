@@ -597,18 +597,37 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the four platform-knowledge trees after exact tree-hash comparison
   as GitHub draft PRs: messaging #3, shared policy #5, journal #1, and
   knowledge-tree #224. No PR was merged.
+- Rejected the first `nextjs` frontend proposal because deterministic Nginx
+  detection represented the frontend reverse proxy as an owner of
+  `gateway_routes_to` relations. Discovery schema v12 suppresses gateway-owned
+  relations for frontend-role repositories while retaining endpoint-level
+  consumer evidence and unresolved backend ownership questions.
+- Rejected the second `nextjs` proposal because i18n keys such as
+  `actions.publish` and `toast.publishSuccess` were represented as event-bus
+  subjects. Discovery schema v13 requires explicit subject/NATS context or a
+  real publish/subscribe call; the corrected frontend report contains no false
+  event facts or `events.yaml`.
+- Rejected the first reviewed frontend command manifests because npm lifecycle
+  hooks and interactive Vitest UI were treated as automatic verification.
+  `pre*`/`post*` hooks and UI modes now require approval, covering admin Monaco
+  asset synchronization and both frontend test UIs.
+- Completed and published corrected frontend onboarding drafts: student
+  frontend PR #52 and admin frontend PR #77. Student PR #51 was closed as
+  superseded. Both corrected trees passed exact tree-hash, isolated-worktree,
+  write-scope, commit, and source-immutability checks; no PR was merged.
 
 ## Remaining work
 
 - Review and merge the published onboarding PRs through each repository workflow
   before rescanning their approved semantic reports into the trusted topology.
-- Enrich the remaining 19 repositories in reviewed waves; do not approve or
+- Enrich the remaining 17 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the frontend wave: `nextjs` and `admin-nextjs`, applying only
-proposals whose consumed contracts, authentication boundaries, business rules,
-and command risk gates pass review.
+Enrich and review the data/runtime wave: `ms-go-cache-search-validator`,
+`ms-go-db-validator`, `ms-go-tarantool`, and `ms-go-image-processor`, applying
+only proposals whose storage ownership, contracts, direct dependencies,
+business rules, and command risk gates pass review.
