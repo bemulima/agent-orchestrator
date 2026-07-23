@@ -293,6 +293,28 @@ func TestScanner_RuntimeNameWithoutRuntimeEvidenceRemainsUnknown(t *testing.T) {
 	assertFact(t, report.Facts, "classification", "service_kind", "unknown")
 }
 
+func TestScanner_FrontendNginxDoesNotOwnGatewayRoutes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"dependencies":{"next":"15.1.5"}}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nginx.conf"), []byte("location /api { proxy_pass http://gateway; }\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(Config{MaxFiles: 100, MaxFileBytes: 1 << 20, MaxTotalBytes: 4 << 20, MaxDepth: 10})
+	report, err := scanner.Scan(context.Background(), domain.Project{
+		ID: "frontend", Name: "nextjs", RepositoryRole: domain.RepositoryRoleFrontend,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Category == "relation" && fact.Name == "gateway_routes_to" {
+			t.Fatalf("frontend owns a gateway route: %#v", fact)
+		}
+	}
+}
+
 func TestScannerImportsApprovedSemanticReport(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".ai", "discovery"), 0o750); err != nil {

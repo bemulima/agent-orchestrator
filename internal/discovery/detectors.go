@@ -348,6 +348,9 @@ func (s Scanner) extractContracts(state *detectorState, path, base, content stri
 func (s Scanner) extractGatewayRelations(state *detectorState, path, content string) {
 	for _, match := range proxyPassPattern.FindAllStringSubmatch(content, -1) {
 		state.nginxDetected = true
+		if state.project.RepositoryRole == domain.RepositoryRoleFrontend {
+			continue
+		}
 		state.collector.fact("relation", "gateway_routes_to", match[1], .92, path,
 			"An nginx proxy_pass directive routes traffic to this upstream.")
 	}
