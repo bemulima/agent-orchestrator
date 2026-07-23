@@ -38,7 +38,6 @@ func TestFixtureExecutionProducesRealIsolatedDiffAndStructuredResult(t *testing.
 	service := Service{
 		Repository: repo, Worktrees: worktrees, Runner: runner, Validator: validator,
 		Verifier: Verifier{Worktrees: worktrees}, MaxTaskAttempts: 3, MaxReviewAttempts: 2,
-		MaxReplans: 2, MaxRequiredTaskDepth: 3,
 	}
 
 	outcome, err := service.Execute(context.Background(), "task-1", "workflow-1")

@@ -31,6 +31,22 @@ type decidePlanUseCase interface {
 	Handle(context.Context, planninguc.DecidePlanInput) (domain.PlanBundle, error)
 }
 
+type prepareIssuesUseCase interface {
+	Prepare(context.Context, string) ([]domain.WorkItem, error)
+}
+
+type publishIssuesUseCase interface {
+	Publish(context.Context, string) ([]domain.WorkItem, error)
+}
+
+type preparePullRequestUseCase interface {
+	Prepare(context.Context, string) (domain.WorkItem, error)
+}
+
+type publishPullRequestUseCase interface {
+	Publish(context.Context, string) (domain.WorkItem, error)
+}
+
 type startPlanUseCase interface {
 	Handle(context.Context, string) (domain.PlanRun, error)
 }
@@ -68,8 +84,14 @@ type PlanningHandler struct {
 	GetCommand    getCommandUseCase
 	CreatePlan    createPlanUseCase
 	GetPlan       getPlanUseCase
+	CommentPlan   decidePlanUseCase
+	SubmitPlan    decidePlanUseCase
 	ApprovePlan   decidePlanUseCase
 	RejectPlan    decidePlanUseCase
+	PrepareIssues prepareIssuesUseCase
+	PublishIssues publishIssuesUseCase
+	PreparePR     preparePullRequestUseCase
+	PublishPR     publishPullRequestUseCase
 	StartPlan     startPlanUseCase
 	GetRun        getRunUseCase
 	ControlRun    controlRunUseCase
@@ -147,6 +169,32 @@ func (h PlanningHandler) GetPlanTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"plan_id": plan.Plan.ID, "tasks": plan.Tasks, "dependencies": plan.Dependencies,
 	})
+}
+
+func (h PlanningHandler) CommentPlanRequest(w http.ResponseWriter, r *http.Request) {
+	h.decidePlan(w, r, h.CommentPlan)
+}
+
+func (h PlanningHandler) SubmitPlanRequest(w http.ResponseWriter, r *http.Request) {
+	h.decidePlan(w, r, h.SubmitPlan)
+}
+
+func (h PlanningHandler) PreparePlanIssues(w http.ResponseWriter, r *http.Request) {
+	items, err := h.PrepareIssues.Prepare(r.Context(), chi.URLParam(r, "planId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"work_items": items})
+}
+
+func (h PlanningHandler) PublishPlanIssues(w http.ResponseWriter, r *http.Request) {
+	items, err := h.PublishIssues.Publish(r.Context(), chi.URLParam(r, "planId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"work_items": items})
 }
 
 func (h PlanningHandler) ApprovePlanRequest(w http.ResponseWriter, r *http.Request) {
@@ -258,4 +306,22 @@ func (h PlanningHandler) RetryTaskRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (h PlanningHandler) PrepareTaskPullRequest(w http.ResponseWriter, r *http.Request) {
+	item, err := h.PreparePR.Prepare(r.Context(), chi.URLParam(r, "taskId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (h PlanningHandler) PublishWorkItem(w http.ResponseWriter, r *http.Request) {
+	item, err := h.PublishPR.Publish(r.Context(), chi.URLParam(r, "workItemId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }

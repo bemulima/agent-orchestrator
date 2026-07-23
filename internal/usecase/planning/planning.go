@@ -55,6 +55,7 @@ func (uc GetCommand) Handle(ctx context.Context, id string) (domain.Command, err
 type CreatePlan struct {
 	Plans     repository.PlanningRepository
 	Topology  repository.TopologyRepository
+	Projects  repository.ProjectRepository
 	Planner   repository.Planner
 	Validator repository.PlanValidator
 }
@@ -67,6 +68,12 @@ func (uc CreatePlan) Handle(ctx context.Context, commandID string, request domai
 	catalog, err := uc.Topology.Get(ctx)
 	if err != nil {
 		return domain.PlanBundle{}, err
+	}
+	if uc.Projects != nil {
+		request.AvailableProjects, err = uc.Projects.List(ctx)
+		if err != nil {
+			return domain.PlanBundle{}, err
+		}
 	}
 	input, output, err := uc.Planner.Build(ctx, command, catalog, request)
 	if err != nil {
@@ -87,9 +94,26 @@ func (uc GetPlan) Handle(ctx context.Context, id string) (domain.PlanBundle, err
 }
 
 type DecidePlanInput struct {
-	PlanID  string `json:"-"`
-	Actor   string `json:"actor"`
-	Comment string `json:"comment,omitempty"`
+	PlanID      string `json:"-"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Actor       string `json:"actor"`
+	Comment     string `json:"comment,omitempty"`
+}
+
+type CommentPlan struct {
+	Plans repository.PlanningRepository
+}
+
+func (uc CommentPlan) Handle(ctx context.Context, input DecidePlanInput) (domain.PlanBundle, error) {
+	return uc.Plans.AddPlanComment(ctx, strings.TrimSpace(input.PlanID), strings.TrimSpace(input.Actor), strings.TrimSpace(input.Comment))
+}
+
+type SubmitPlan struct {
+	Plans repository.PlanningRepository
+}
+
+func (uc SubmitPlan) Handle(ctx context.Context, input DecidePlanInput) (domain.PlanBundle, error) {
+	return uc.Plans.SubmitPlan(ctx, strings.TrimSpace(input.PlanID), strings.TrimSpace(input.Actor), strings.TrimSpace(input.Comment))
 }
 
 type ApprovePlan struct {
@@ -97,7 +121,8 @@ type ApprovePlan struct {
 }
 
 func (uc ApprovePlan) Handle(ctx context.Context, input DecidePlanInput) (domain.PlanBundle, error) {
-	return uc.Plans.ApprovePlan(ctx, strings.TrimSpace(input.PlanID), strings.TrimSpace(input.Actor), strings.TrimSpace(input.Comment))
+	return uc.Plans.ApprovePlan(ctx, strings.TrimSpace(input.PlanID), strings.TrimSpace(input.Fingerprint),
+		strings.TrimSpace(input.Actor), strings.TrimSpace(input.Comment))
 }
 
 type RejectPlan struct {

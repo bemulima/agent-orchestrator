@@ -24,7 +24,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-approve plan-reject plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -150,21 +150,39 @@ consumers: ## Show direct and transitive consumers for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator consumers --service "$(SERVICE)"
 
-plan: ## Create a plan from FILE=command.md (optional PROJECT_IDS=id,id)
+plan: ## Create discussion plan from FILE (optional PROJECT_IDS and SOURCE_ISSUES=github:id:number)
 	@test -n "$(FILE)" || (echo "Set FILE=path-to-command.md"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan --file "$(FILE)" $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan --file "$(FILE)" $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",) $(if $(SOURCE_ISSUES),--source-issues "$(SOURCE_ISSUES)",)
 
 plan-show: ## Show PLAN_ID=uuid with tasks and dependencies
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-show --plan-id "$(PLAN_ID)"
 
-plan-approve: ## Approve PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
+plan-comment: ## Add COMMENT to discussion of PLAN_ID=uuid
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-approve --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	@test -n "$(COMMENT)" || (echo "Set COMMENT=text"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-comment --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" --comment "$(COMMENT)"
+
+plan-issues: ## Ask issue-manage-agent to prepare Russian issue proposals for PLAN_ID=uuid
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-issues --plan-id "$(PLAN_ID)"
+
+plan-submit: ## Freeze PLAN_ID=uuid issue-backed version for approval
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-submit --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+plan-approve: ## Approve exact PLAN_ID=uuid FINGERPRINT=sha256:... (optional ACTOR/COMMENT)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	@test -n "$(FINGERPRINT)" || (echo "Set FINGERPRINT=sha256:..."; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-approve --plan-id "$(PLAN_ID)" --fingerprint "$(FINGERPRINT)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 plan-reject: ## Reject PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-reject --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+plan-publish-issues: ## Publish approved PLAN_ID issues (preview while GITHUB_DRY_RUN=true)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-publish-issues --plan-id "$(PLAN_ID)"
 
 plan-run: ## Start or reuse the Temporal workflow for PLAN_ID=uuid
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
@@ -190,6 +208,14 @@ task-show: ## Show TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-show --task-id "$(TASK_ID)"
 
+task-pr-prepare: ## Ask PR manager to prepare a Russian draft PR proposal for TASK_ID=uuid
+	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-pr-prepare --task-id "$(TASK_ID)"
+
+task-pr-publish: ## Publish WORK_ITEM_ID=uuid (preview while GITHUB_DRY_RUN=true)
+	@test -n "$(WORK_ITEM_ID)" || (echo "Set WORK_ITEM_ID=uuid"; exit 2)
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-pr-publish --work-item-id "$(WORK_ITEM_ID)"
+
 task-log: ## Show attempts and artifacts for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-log --task-id "$(TASK_ID)"
@@ -202,7 +228,7 @@ task-cancel: ## Signal cancellation for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-cancel --task-id "$(TASK_ID)"
 
-gitlab-sync: ## Synchronize approved PLAN_ID=uuid to GitLab (dry-run by default)
+gitlab-sync: ## Preview legacy GitLab synchronization (real writes are disabled)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator gitlab-sync --plan-id "$(PLAN_ID)"
 

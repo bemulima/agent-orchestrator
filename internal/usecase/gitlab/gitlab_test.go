@@ -16,53 +16,17 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
-func TestSyncIsIdempotentAcrossIssuesCommentsBranchAndMergeRequest(t *testing.T) {
-	projectID := int64(42)
-	gitURL := "https://gitlab.example.test/group/service.git"
-	task := domain.Task{
-		ID: "task-id", PlanID: "plan-id", ProjectID: "project-id", Title: "Implement change",
-		Description: "A bounded fixture task", Status: domain.TaskStatusCompleted,
-		AcceptanceCriteria: []string{"tests pass"}, WriteScope: []string{"internal/**"},
-		RiskLevel: domain.RiskLevelLow,
-	}
-	bundle := approvedBundle(task)
-	commit := "0123456789abcdef0123456789abcdef01234567"
-	attempts := attemptListFake{values: map[string][]domain.TaskAttempt{
-		task.ID: {{
-			TaskID: task.ID, Status: domain.TaskAttemptStatusCompleted, CommitSHA: &commit,
-			WorktreePath: "/tmp/worktree", BranchName: "ai/task-fixture",
-		}},
-	}}
+func TestSyncRejectsLegacyExternalWritesWithoutManagerAgentProposals(t *testing.T) {
 	gateway := gitlabadapter.NewFakeAdapter()
-	links := newLinkRepoFake()
-	useCase := Sync{
-		Plans: planGetterFake{bundle: bundle},
-		Projects: projectGetterFake{values: map[string]domain.Project{
-			"project-id": {ID: "project-id", Name: "service", GitURL: &gitURL, GitLabProjectID: &projectID, DefaultBranch: "main"},
-		}},
-		TaskExecutions: attempts, Links: links, Gateway: gateway, ControlProject: "99",
+	_, err := (Sync{
+		Plans: planGetterFake{bundle: approvedBundle()}, Links: newLinkRepoFake(),
+		Gateway: gateway, ControlProject: "99",
+	}).Handle(context.Background(), "plan-id")
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("Handle() error = %v, want legacy writes disabled", err)
 	}
-
-	first, err := useCase.Handle(context.Background(), bundle.Plan.ID)
-	if err != nil {
-		t.Fatalf("first Handle() error = %v", err)
-	}
-	second, err := useCase.Handle(context.Background(), bundle.Plan.ID)
-	if err != nil {
-		t.Fatalf("second Handle() error = %v", err)
-	}
-	if first.PlanIssue.IID != second.PlanIssue.IID || first.Items[0].MergeRequest == nil ||
-		second.Items[0].MergeRequest == nil || first.Items[0].MergeRequest.IID != second.Items[0].MergeRequest.IID {
-		t.Fatalf("sync results are not stable: %#v / %#v", first, second)
-	}
-	if gateway.IssueCreates != 2 || gateway.MRCreates != 1 || gateway.BranchCreates != 1 {
-		t.Fatalf("external creates: issues=%d mrs=%d branches=%d", gateway.IssueCreates, gateway.MRCreates, gateway.BranchCreates)
-	}
-	if gateway.CommentCreates != 3 || gateway.LinkCreates != 1 {
-		t.Fatalf("idempotent metadata creates: comments=%d links=%d", gateway.CommentCreates, gateway.LinkCreates)
-	}
-	if links.saveCalls != 6 {
-		t.Fatalf("SaveGitLabLink calls = %d, want 6 idempotent upserts", links.saveCalls)
+	if gateway.IssueCreates != 0 || gateway.MRCreates != 0 || gateway.BranchCreates != 0 {
+		t.Fatalf("legacy sync performed external writes: %#v", gateway)
 	}
 }
 
@@ -95,15 +59,15 @@ func TestSyncDryRunHasNoPersistenceAndDoesNotRequireApproval(t *testing.T) {
 	}
 }
 
-func TestSyncRequiresApprovalBeforeExternalWrites(t *testing.T) {
+func TestSyncNeverUsesApprovalToBypassManagerAgents(t *testing.T) {
 	bundle := approvedBundle()
 	bundle.Approval = nil
 	_, err := (Sync{
 		Plans: planGetterFake{bundle: bundle}, Links: newLinkRepoFake(),
 		Gateway: gitlabadapter.NewFakeAdapter(), ControlProject: "control",
 	}).Handle(context.Background(), bundle.Plan.ID)
-	if !errors.Is(err, domain.ErrApprovalNeeded) {
-		t.Fatalf("Handle() error = %v, want approval required", err)
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("Handle() error = %v, want manager-agent workflow", err)
 	}
 }
 

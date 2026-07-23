@@ -22,7 +22,10 @@ func TestRouterPlanningAPI(t *testing.T) {
 	handler := &handlers.PlanningHandler{
 		CreateCommand: planningCreateCommandFake{command: command}, GetCommand: planningGetCommandFake{command: command},
 		CreatePlan: planningCreatePlanFake{bundle: bundle}, GetPlan: planningGetPlanFake{bundle: bundle},
+		CommentPlan: planningDecidePlanFake{bundle: bundle}, SubmitPlan: planningDecidePlanFake{bundle: bundle},
 		ApprovePlan: planningDecidePlanFake{bundle: bundle}, RejectPlan: planningDecidePlanFake{bundle: bundle},
+		PrepareIssues: planningIssuesFake{}, PublishIssues: planningIssuesFake{},
+		PreparePR: planningPullRequestFake{}, PublishPR: planningPullRequestFake{},
 		StartPlan: planningStartPlanFake{run: run}, GetRun: planningGetRunFake{run: run},
 		ControlRun: planningControlRunFake{run: run}, GetTask: planningGetTaskFake{task: task},
 		CancelTask: planningCancelTaskFake{task: task}, RetryTask: planningRetryTaskFake{task: task},
@@ -42,7 +45,11 @@ func TestRouterPlanningAPI(t *testing.T) {
 		{http.MethodPost, "/api/v1/commands/command-id/plan", `{}`, http.StatusCreated},
 		{http.MethodGet, "/api/v1/plans/plan-id", "", http.StatusOK},
 		{http.MethodGet, "/api/v1/plans/plan-id/tasks", "", http.StatusOK},
+		{http.MethodPost, "/api/v1/plans/plan-id/comments", `{"actor":"owner","comment":"Уточнение"}`, http.StatusOK},
+		{http.MethodPost, "/api/v1/plans/plan-id/issues/prepare", "", http.StatusCreated},
+		{http.MethodPost, "/api/v1/plans/plan-id/submit", `{"actor":"owner"}`, http.StatusOK},
 		{http.MethodPost, "/api/v1/plans/plan-id/approve", `{}`, http.StatusOK},
+		{http.MethodPost, "/api/v1/plans/plan-id/issues/publish", "", http.StatusOK},
 		{http.MethodPost, "/api/v1/plans/plan-id/reject", `{}`, http.StatusOK},
 		{http.MethodPost, "/api/v1/plans/plan-id/run", "", http.StatusAccepted},
 		{http.MethodGet, "/api/v1/runs/run-id", "", http.StatusOK},
@@ -54,6 +61,8 @@ func TestRouterPlanningAPI(t *testing.T) {
 		{http.MethodGet, "/api/v1/tasks/task-id/artifacts", "", http.StatusOK},
 		{http.MethodPost, "/api/v1/tasks/task-id/retry", "", http.StatusAccepted},
 		{http.MethodPost, "/api/v1/tasks/task-id/cancel", "", http.StatusAccepted},
+		{http.MethodPost, "/api/v1/tasks/task-id/pull-request/prepare", "", http.StatusCreated},
+		{http.MethodPost, "/api/v1/work-items/work-item-id/publish", "", http.StatusOK},
 	}
 	for _, test := range tests {
 		request := httptest.NewRequest(test.method, test.path, bytes.NewBufferString(test.body))
@@ -106,6 +115,26 @@ type planningDecidePlanFake struct{ bundle domain.PlanBundle }
 
 func (f planningDecidePlanFake) Handle(context.Context, planninguc.DecidePlanInput) (domain.PlanBundle, error) {
 	return f.bundle, nil
+}
+
+type planningIssuesFake struct{}
+
+func (planningIssuesFake) Prepare(context.Context, string) ([]domain.WorkItem, error) {
+	return []domain.WorkItem{}, nil
+}
+
+func (planningIssuesFake) Publish(context.Context, string) ([]domain.WorkItem, error) {
+	return []domain.WorkItem{}, nil
+}
+
+type planningPullRequestFake struct{}
+
+func (planningPullRequestFake) Prepare(context.Context, string) (domain.WorkItem, error) {
+	return domain.WorkItem{}, nil
+}
+
+func (planningPullRequestFake) Publish(context.Context, string) (domain.WorkItem, error) {
+	return domain.WorkItem{}, nil
 }
 
 type planningStartPlanFake struct{ run domain.PlanRun }

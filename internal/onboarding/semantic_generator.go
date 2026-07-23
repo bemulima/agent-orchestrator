@@ -24,10 +24,11 @@ const (
 )
 
 type SemanticGenerator struct {
-	Base     Generator
-	Runner   repository.AgentRunner
-	Projects repository.ProjectRepository
-	Model    string
+	Base            Generator
+	Runner          repository.AgentRunner
+	Projects        repository.ProjectRepository
+	Model           string
+	ReasoningEffort string
 }
 
 func (g SemanticGenerator) Generate(
@@ -57,7 +58,7 @@ func (g SemanticGenerator) Generate(
 	threadID := ""
 	request := domain.AgentRunRequest{
 		Role: domain.AgentRunAnalyst, WorkingDirectory: *project.LocalPath, Model: g.Model,
-		Prompt: prompt, OutputSchema: semanticOutputSchema(),
+		ReasoningEffort: g.ReasoningEffort, Prompt: prompt, OutputSchema: semanticOutputSchema(),
 	}
 	var response domain.AgentRunResponse
 	for attempt := 0; attempt < 2; attempt++ {

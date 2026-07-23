@@ -19,6 +19,11 @@ scope.
   Git, write scope, tests, lint, migrations, and contracts.
 - Plans are acyclic, always require approval in the MVP, and run at most three
   tasks concurrently by default.
+- Every execution task is backed by a reviewed issue proposal. Approval binds
+  the exact DAG and issue content fingerprint; changed requirements always
+  create a new plan version.
+- Coders never add tasks dynamically. New prerequisites pause execution and
+  return to discussion/replanning.
 - No secret, `.env` value, access token, or unredacted agent prompt is logged or
   sent to an agent.
 
@@ -217,3 +222,35 @@ Verified evidence:
 - a second GitLab sync reused every external resource;
 - cleanup assertions found no remaining fixture project, command, Telegram
   update/callback, GitLab link, or audit row.
+
+## Stage 9 — issue-backed multi-plan agent workflow
+
+Status: implemented and locally verified on 2026-07-23. Development used only
+fake/dry-run external adapters; no real issue, branch, or PR was created.
+
+Scope:
+
+- start planning from a question/idea or an existing issue in any connected
+  project;
+- discuss a plan before submission and approve only its exact fingerprint;
+- dedicated read-only issue and PR manager agents with strict Russian schemas;
+- complete labels, milestone, assignees, reviewers, issue/PR bodies, and exact
+  branch metadata;
+- GitHub work-item gateway with bounded responses, idempotency markers,
+  non-force branch push, and no redirects;
+- risk-based model and reasoning profiles for coder, analyst, reviewer,
+  issue-manager, and PR-manager roles through local ChatGPT-auth Codex CLI;
+- concurrent plans with per-plan and global agent limits;
+- hard removal of automatic required-task insertion and fail-closed legacy
+  GitLab writes.
+
+Acceptance:
+
+- plan submission fails until every task has one immutable issue proposal;
+- approval fails for a stale fingerprint, and run fails until issues are
+  published;
+- new prerequisites pause instead of changing the approved DAG;
+- fake GitHub tests verify full issue/PR metadata, idempotency, reviewers, and
+  zero dry-run requests;
+- reversible migrations `010` and `011`, integration state-machine tests,
+  runner protocol tests, and `make verify` pass.
