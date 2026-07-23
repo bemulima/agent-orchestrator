@@ -223,6 +223,10 @@ func backendAgent(hasCommands bool) string {
 func classifyCommandRisk(name, command string) (bool, string) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	command = strings.ToLower(strings.TrimSpace(command))
+	if strings.HasPrefix(name, "pre") || strings.HasPrefix(name, "post") ||
+		strings.Contains(name, ":ui") || strings.Contains(command, " --ui") {
+		return true, "lifecycle"
+	}
 	if strings.Contains(command, "../") || strings.Contains(command, `..\`) {
 		return true, "state_change"
 	}
