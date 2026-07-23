@@ -393,6 +393,44 @@ func TestValidateSemanticAnalysisRejectsCallerAllowlistAsDependency(t *testing.T
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsIndirectDownstreamDependency(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "README.md"),
+		[]byte("Downstream runtime services can send the contract directly to ms-go-validation-orchestrator.\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "ms-go-practice-task-orchestrator", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{
+		ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindBackendService,
+	}
+	content := json.RawMessage(`{
+  "summary":"Practice-task catalog service.",
+  "facts":[{
+    "category":"relation","name":"depends_on","value":"ms-go-validation-orchestrator","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"Downstream runtime services can send the contract directly to ms-go-validation-orchestrator.",
+    "explanation":"Downstream runtime services can call the validation orchestrator."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(
+		root,
+		project,
+		snapshot,
+		content,
+		[]string{"ms-go-practice-task-orchestrator", "ms-go-validation-orchestrator"},
+	)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "relation_evidence_does_not_support_relation_type" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 func TestValidateSemanticAnalysisRejectsRuntimeTopologyFromAgentInstructions(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(

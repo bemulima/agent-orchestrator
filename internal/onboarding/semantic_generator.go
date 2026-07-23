@@ -163,6 +163,7 @@ Use these category/name conventions when applicable:
 - command: stable command name; value must be the exact developer-facing command documented in Makefile, Taskfile, package/pyproject/composer manifest, README, or AGENTS.md; never classify a Dockerfile RUN or CI step as a local command
 Keep values concise, use repository-relative paths, return at most 200 facts and 30 open questions.
 For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
+depends_on must describe a direct runtime dependency of the current repository. Do not create it merely because a contract is forwarded for downstream services or because another component may call the target later.
 authenticates_through means the current project delegates authentication or token/JWT verification to the target; a caller allowlist or permission check is not authentication delegation.
 Do not infer runtime relations from Makefile, Taskfile, or package-manager command manifests. Use gateway_routes_to only when the current repository is the gateway, and frontend_consumes only when it is a frontend.
 Never use .ai/discovery/semantic-report.json itself as evidence.
@@ -443,6 +444,16 @@ func semanticRelationEvidenceSupportsName(fact domain.SemanticFact) bool {
 	for _, marker := range []string{"allowedservices", "allowed services", "allowed caller", "allowlisted caller"} {
 		if strings.Contains(evidence, marker) {
 			return false
+		}
+	}
+	if fact.Name == "depends_on" {
+		for _, marker := range []string{
+			"downstream runtime services can", "downstream services can", "downstream consumer can",
+			"downstream consumers can",
+		} {
+			if strings.Contains(evidence, marker) {
+				return false
+			}
 		}
 	}
 	if fact.Name != "authenticates_through" {
