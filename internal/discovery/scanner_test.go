@@ -509,6 +509,27 @@ func TestContainsUnexpandedCommandTemplate(t *testing.T) {
 	}
 }
 
+func TestScannerClassifiesComposeNginxTemplateAsGateway(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "docker-compose.yml"), []byte("services:\n  gateway:\n    image: nginx\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "templates"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "templates", "gateway.conf.template"), []byte("location /users { proxy_pass http://$users_upstream; }\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "ms-gateway", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Facts, "classification", "service_kind", "gateway")
+	assertFact(t, report.Facts, "relation", "gateway_routes_to", "http://$users_upstream")
+}
+
 func fixturePath(t *testing.T, name string) string {
 	t.Helper()
 	path, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "discovery", name))

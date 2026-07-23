@@ -484,14 +484,14 @@ func (s Scanner) detectDerivedFacts(state *detectorState) {
 		kind, confidence, explanation = domain.ServiceKindFrontendApplication, .96,
 			"The repository role or detected Next.js dependencies identify a frontend application."
 		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nextjs")
-	case state.project.RepositoryRole == domain.RepositoryRoleInfrastructure || state.composeDetected && !state.goDetected && !state.nodeDetected:
-		kind, confidence, explanation = domain.ServiceKindInfrastructure, .93,
-			"The repository role or Compose-only manifest identifies infrastructure."
-		sourcePath = firstSource(state.collector.facts, "stack", "orchestration", "docker_compose")
 	case state.nginxDetected || runtimeDetected && strings.Contains(state.project.Name, "gateway"):
 		kind, confidence, explanation = domain.ServiceKindGateway, .94,
 			"Nginx gateway configuration or the canonical repository name identifies a gateway."
 		sourcePath = firstSource(state.collector.facts, "stack", "framework", "nginx")
+	case state.project.RepositoryRole == domain.RepositoryRoleInfrastructure || state.composeDetected && !state.goDetected && !state.nodeDetected:
+		kind, confidence, explanation = domain.ServiceKindInfrastructure, .93,
+			"The repository role or Compose-only manifest identifies infrastructure."
+		sourcePath = firstSource(state.collector.facts, "stack", "orchestration", "docker_compose")
 	case runtimeDetected && (strings.Contains(state.project.Name, "ai-") || strings.Contains(state.project.Name, "-ai")):
 		kind, confidence, explanation = domain.ServiceKindAIService, .82,
 			"The canonical repository name and runtime manifests identify an AI-focused service."
