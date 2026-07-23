@@ -585,19 +585,30 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the AI/orchestration trees after exact tree-hash comparison as
   GitHub draft PRs: AI prompt #5, AI summary #3, and practice-task orchestrator
   #8. No PR was merged.
+- Completed reviewed onboarding applies for the platform-knowledge wave:
+  `ms-infra-messaging`, `ms-course-promts`, `ms-course-journal`, and
+  `knowledge-tree`. Infrastructure stream definitions remain distinct from
+  unknown publisher/consumer ownership; policy, archive, and content facts do
+  not create runtime topology.
+- The `knowledge-tree` proposal preserves the differing EN/RU
+  `02-generate-lesson.md` checksums as an unresolved conflict. Export, update,
+  dev, and other mutating scripts require approval; only safe check/test/
+  validation commands enter its automatic verification workflow.
+- Published the four platform-knowledge trees after exact tree-hash comparison
+  as GitHub draft PRs: messaging #3, shared policy #5, journal #1, and
+  knowledge-tree #224. No PR was merged.
 
 ## Remaining work
 
 - Review and merge the published onboarding PRs through each repository workflow
   before rescanning their approved semantic reports into the trusted topology.
-- Enrich the remaining 23 repositories in reviewed waves; do not approve or
+- Enrich the remaining 19 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the platform-knowledge wave: `ms-infra-messaging`,
-`ms-course-promts`, `ms-course-journal`, and `knowledge-tree`, applying only
-proposals whose repository role, knowledge classification, infrastructure
-ownership, and command risk gates pass review.
+Enrich and review the frontend wave: `nextjs` and `admin-nextjs`, applying only
+proposals whose consumed contracts, authentication boundaries, business rules,
+and command risk gates pass review.
