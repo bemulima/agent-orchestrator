@@ -18,7 +18,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 12
+const reportSchemaVersion = 13
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},

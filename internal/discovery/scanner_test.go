@@ -104,6 +104,28 @@ func validate(request Request) bool {
 	}
 }
 
+func TestScanner_DoesNotTreatPublishI18nKeysAsEventSubjects(t *testing.T) {
+	root := t.TempDir()
+	content := `export function View({ t }) {
+  return t('actions.publish') + t('toast.publishSuccess') + t('table.publishedAt')
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "view.tsx"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "id", Name: "frontend", RepositoryRole: domain.RepositoryRoleFrontend,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	for _, fact := range report.Facts {
+		if fact.Name == "event_subject" || fact.Name == "event_publish" || fact.Name == "event_subscribe" {
+			t.Fatalf("unexpected event fact from i18n key: %#v", fact)
+		}
+	}
+}
+
 func TestScanner_ClassifiesPythonServiceAsBackend(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.py"), []byte("print('fixture')\n"), 0o600); err != nil {

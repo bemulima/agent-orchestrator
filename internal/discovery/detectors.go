@@ -231,18 +231,20 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 	s.extractPythonHTTPRoutes(state, path, content)
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
+		publishCall := strings.Contains(lower, ".publish(") || strings.Contains(lower, "publish(")
+		subscribeCall := strings.Contains(lower, ".subscribe(") || strings.Contains(lower, "subscribe(")
 		if !strings.Contains(lower, "nats") && !strings.Contains(lower, "subject") &&
-			!strings.Contains(lower, "publish") && !strings.Contains(lower, "subscribe") {
+			!publishCall && !subscribeCall {
 			continue
 		}
 		for _, match := range subjectPattern.FindAllStringSubmatch(line, -1) {
 			state.collector.fact("capability", "event_subject", match[1], .72, path,
 				"A NATS/event-related source line references this subject.")
-			if strings.Contains(lower, "publish") {
+			if publishCall {
 				state.collector.fact("contract", "event_publish", match[1], .78, path,
 					"An event publisher emits this subject.")
 			}
-			if strings.Contains(lower, "subscribe") {
+			if subscribeCall {
 				state.collector.fact("contract", "event_subscribe", match[1], .78, path,
 					"An event subscriber consumes this subject.")
 			}
