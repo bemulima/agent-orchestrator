@@ -556,6 +556,13 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Published the identity/core trees after exact tree-hash comparison as GitHub
   draft PRs: auth #4, RBAC #8, user #11, student #30, filestorage #6, and
   statistic #6. No PR was merged.
+- Rejected the first `go-ms-ai-summary` proposal because the three-file checkout
+  contains copied/generic architecture instructions for different services but
+  no production code or manifests. Deterministic discovery now suppresses
+  runtime extraction from `docs/*.md`; semantic runtime categories reject
+  `AGENTS.md` and `prompts/**` evidence while retaining commands and working
+  rules. Discovery report schema advanced to v10 so every connected checkout is
+  rescanned under the documentation boundary before topology is rebuilt.
 
 ## Remaining work
 

@@ -199,7 +199,10 @@ func testRoutes(router Router) { router.Get("/health", handler) }
 func runCompose() {}
 `,
 		"docs/examples/postgres-runtime.json": `{"migration":"CREATE TABLE users (id UUID);"}`,
-		"tests/fixture.sql":                   `CREATE TABLE test_records (id UUID);`,
+		"docs/GOLANG_ARCHITECTURE.md": `r.Get("/users/:id", handler.Get)
+publisher.Publish("user.created", payload)
+subscriber.Subscribe("user.create", handler)`,
+		"tests/fixture.sql": `CREATE TABLE test_records (id UUID);`,
 	}
 	for name, content := range files {
 		path := filepath.Join(root, filepath.FromSlash(name))
@@ -227,6 +230,9 @@ func runCompose() {}
 		}
 		if fact.Name == "database_table" && (fact.Value == "users" || fact.Value == "test_records") {
 			t.Fatalf("example/test schema emitted ownership: %#v", fact)
+		}
+		if fact.SourcePath == "docs/GOLANG_ARCHITECTURE.md" {
+			t.Fatalf("generic documentation emitted runtime evidence: %#v", fact)
 		}
 	}
 	for _, conflict := range report.Conflicts {

@@ -393,6 +393,41 @@ func TestValidateSemanticAnalysisRejectsCallerAllowlistAsDependency(t *testing.T
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsRuntimeTopologyFromAgentInstructions(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "AGENTS.md"),
+		[]byte("The service manages courses and uses Postgres.\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "go-ms-ai-summary", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindAIService}
+	content := json.RawMessage(`{
+  "summary":"Instruction-only placeholder.",
+  "facts":[{
+    "category":"capability","name":"business capability","value":"manage courses","confidence":0.9,
+    "source_path":"AGENTS.md","evidence_quote":"The service manages courses and uses Postgres.",
+    "explanation":"The instruction file describes a capability."
+  },{
+    "category":"business_rule","name":"repository_instruction","value":"Use Postgres","confidence":0.9,
+    "source_path":"AGENTS.md","evidence_quote":"The service manages courses and uses Postgres.",
+    "explanation":"The instruction file contains a working rule."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 1 || analysis.Facts[0].Category != "business_rule" ||
+		len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "runtime_category_not_allowed_from_instruction_source" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole

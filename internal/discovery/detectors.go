@@ -17,7 +17,7 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 	base := strings.ToLower(filepath.Base(path))
 	content := string(file.content)
 	s.detectPurpose(state, path, base, content)
-	if !isNonProductionEvidencePath(path) {
+	if !isNonProductionEvidencePath(path) && !isDocumentationMarkdownPath(path) {
 		s.detectStack(state, path, base, content)
 		s.extractCapabilities(state, path, content)
 		s.extractOwnership(state, path, content)
@@ -41,6 +41,11 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 				"An existing .ai service manifest declares service kind "+match[1]+".")
 		}
 	}
+}
+
+func isDocumentationMarkdownPath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	return strings.HasPrefix(path, "docs/") && strings.HasSuffix(path, ".md")
 }
 
 func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string, content []byte) {

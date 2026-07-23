@@ -149,6 +149,7 @@ Return only facts directly supported by repository text. Every fact must include
 Use confidence between 0.50 and 0.95. Put ambiguity in open_questions instead of guessing.
 Runtime capability, ownership, relation, contract, and infrastructure facts must come from production code or authoritative runtime documentation, never tests, fixtures, examples, or testdata.
 Database-table ownership must use a checked-in .sql source; models, ORM tags, and prose may describe entities but cannot establish schema ownership.
+AGENTS.md and prompts are instructions, not runtime topology evidence. They may support commands and working rules, but not capability, ownership, relation, contract, or infrastructure facts.
 Use these category/name conventions when applicable:
 - purpose: summary
 - capability: business capability or http_route
@@ -234,6 +235,13 @@ func validateSemanticAnalysis(
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
 				Reason: "non_production_evidence_not_allowed_for_runtime_category",
+			})
+			continue
+		}
+		if isRuntimeSemanticCategory(fact.Category) && isInstructionSemanticEvidencePath(fact.SourcePath) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "runtime_category_not_allowed_from_instruction_source",
 			})
 			continue
 		}
@@ -399,6 +407,12 @@ func isOperationalSemanticRelationSource(path string) bool {
 	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(path))))
 	return base == "makefile" || base == "taskfile.yml" || base == "taskfile.yaml" ||
 		base == "package.json" || base == "pyproject.toml" || base == "composer.json"
+}
+
+func isInstructionSemanticEvidencePath(path string) bool {
+	path = strings.ToLower(filepath.ToSlash(filepath.Clean(path)))
+	return filepath.Base(path) == "agents.md" || strings.HasPrefix(path, "prompts/") ||
+		strings.Contains(path, "/prompts/")
 }
 
 func semanticRelationAllowedForSource(
