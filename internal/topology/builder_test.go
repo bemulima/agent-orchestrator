@@ -3,6 +3,7 @@ package topology
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -96,6 +97,59 @@ func TestBuilderIncludesApprovedSemanticCapabilitiesAndRelations(t *testing.T) {
 	if len(catalog.Relations) != 1 || catalog.Relations[0].RelationType != domain.RelationAuthenticatesThrough ||
 		catalog.Relations[0].TargetProjectID != "auth-id" {
 		t.Fatalf("semantic relations = %#v", catalog.Relations)
+	}
+}
+
+func TestSortCatalogUsesTotalOrdering(t *testing.T) {
+	firstContractCode := "http:get:/items/{version}"
+	secondContractCode := "http:get:/status/{version}"
+	first := domain.TopologyCatalog{
+		Ownership: []domain.ServiceOwnership{
+			{ProjectID: "service-id", ResourceType: "table", ResourceName: "items", Source: "b.sql"},
+			{ProjectID: "service-id", ResourceType: "table", ResourceName: "items", Source: "a.sql"},
+		},
+		Contracts: []domain.Contract{
+			{ProjectID: "service-id", Code: firstContractCode, Type: domain.ContractTypeHTTP, Version: "v2", Direction: domain.ContractDirectionProvides},
+			{ProjectID: "service-id", Code: firstContractCode, Type: domain.ContractTypeHTTP, Version: "v1", Direction: domain.ContractDirectionProvides},
+		},
+		Relations: []domain.ServiceRelation{
+			{SourceProjectID: "consumer-id", TargetProjectID: "service-id", RelationType: domain.RelationConsumes, ContractCode: &secondContractCode, Source: "b.ts"},
+			{SourceProjectID: "consumer-id", TargetProjectID: "service-id", RelationType: domain.RelationConsumes, ContractCode: &firstContractCode, Source: "a.ts"},
+		},
+	}
+	second := domain.TopologyCatalog{
+		Ownership: append([]domain.ServiceOwnership(nil), first.Ownership[1], first.Ownership[0]),
+		Contracts: append([]domain.Contract(nil), first.Contracts[1], first.Contracts[0]),
+		Relations: append([]domain.ServiceRelation(nil), first.Relations[1], first.Relations[0]),
+	}
+
+	sortCatalog(&first)
+	sortCatalog(&second)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("equivalent catalogs sorted differently:\nfirst:  %#v\nsecond: %#v", first, second)
+	}
+}
+
+func TestBuilderRejectsDescriptiveContractValues(t *testing.T) {
+	source := topologySource("service-id", "service", domain.RepositoryRoleService, domain.ServiceKindBackendService,
+		fact("contract", "http_produce", "ANY /health", "router.go"),
+		fact("contract", "http_produce", "GET /health returns status", ".ai/discovery/semantic-report.json"),
+		fact("contract", "event_publish", "orders.created.v1", "events.go"),
+		fact("contract", "event_publish", "created event: id, timestamp", ".ai/discovery/semantic-report.json"))
+
+	catalog, err := (Builder{}).Build(context.Background(), []domain.TopologySource{source})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(catalog.Contracts) != 2 {
+		t.Fatalf("contracts = %#v, want only the shaped HTTP and event contracts", catalog.Contracts)
+	}
+	codes := map[string]bool{}
+	for _, contract := range catalog.Contracts {
+		codes[contract.Code] = true
+	}
+	if !codes["http:any:/health"] || !codes["event:orders.created.{version}"] {
+		t.Fatalf("contract codes = %#v", codes)
 	}
 }
 

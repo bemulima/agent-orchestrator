@@ -546,6 +546,39 @@ func TestValidateSemanticAnalysisRejectsUnexpandedCommandTemplate(t *testing.T) 
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsDescriptiveContractValue(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte(
+		"GET /health returns status and service fields.\nPublishes orders.created.v1.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	result := json.RawMessage(`{
+  "summary":"fixture",
+  "facts":[{
+    "category":"contract","name":"http_produce","value":"GET /health returns status","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"GET /health returns status and service fields.",
+    "explanation":"Describes the response."
+  },{
+    "category":"contract","name":"event_publish","value":"orders.created.v1","confidence":0.9,
+    "source_path":"README.md","evidence_quote":"Publishes orders.created.v1.",
+    "explanation":"Names the runtime subject."
+  }],
+  "open_questions":[]
+}`)
+
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, result, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 1 || analysis.Facts[0].Value != "orders.created.v1" ||
+		len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "contract_reference_not_machine_readable" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole

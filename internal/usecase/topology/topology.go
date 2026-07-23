@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -139,9 +141,8 @@ func (uc ProjectQuery) Handle(ctx context.Context, identifier string) (domain.Pr
 
 func resolveProject(ctx context.Context, projects repository.ProjectRepository, identifier string) (domain.Project, error) {
 	identifier = strings.TrimSpace(identifier)
-	project, err := projects.Get(ctx, identifier)
-	if err == nil || !errors.Is(err, domain.ErrNotFound) {
-		return project, err
+	if _, err := uuid.Parse(identifier); err == nil {
+		return projects.Get(ctx, identifier)
 	}
 	return projects.GetByName(ctx, identifier)
 }

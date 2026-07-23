@@ -343,7 +343,7 @@ func TestScannerImportsApprovedSemanticReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "README.md"),
-		[]byte("Only reviewed lessons can be published.\n"), 0o640); err != nil {
+		[]byte("Only reviewed lessons can be published.\nPublishes orders.created.v1.\nGET /health returns status and service fields.\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "Taskfile.yml"), []byte("tasks:\n  test:\n    cmds:\n      - go test ./...\n"), 0o640); err != nil {
@@ -360,6 +360,14 @@ func TestScannerImportsApprovedSemanticReport(t *testing.T) {
 			Category: "command", Name: "test", Value: "go test ./...", Confidence: .9,
 			SourcePath: "Taskfile.yml", EvidenceQuote: "- go test ./...",
 			Explanation: "Taskfile documents the test command.",
+		}, {
+			Category: "contract", Name: "event_publish", Value: "orders.created.v1", Confidence: .9,
+			SourcePath: "README.md", EvidenceQuote: "Publishes orders.created.v1.",
+			Explanation: "The service publishes the subject.",
+		}, {
+			Category: "contract", Name: "http_produce", Value: "GET /health returns status", Confidence: .9,
+			SourcePath: "README.md", EvidenceQuote: "GET /health returns status and service fields.",
+			Explanation: "This is response prose, not a method/path reference.",
 		}},
 	}
 	content, err := json.Marshal(analysis)
@@ -377,6 +385,13 @@ func TestScannerImportsApprovedSemanticReport(t *testing.T) {
 	}
 	assertFact(t, report.Facts, "business_rule", "publish_reviewed_only", "Only reviewed lessons can be published")
 	assertFact(t, report.Facts, "command", "test", "go test ./...")
+	assertFact(t, report.Facts, "contract", "event_publish", "orders.created.v1")
+	for _, fact := range report.Facts {
+		if fact.Category == "contract" && fact.Name == "http_produce" && fact.Value == "GET /health returns status" {
+			t.Fatal("scanner imported descriptive HTTP response prose as a contract")
+		}
+	}
+	assertFact(t, report.Conflicts, "conflict", "invalid_semantic_fact", "contract:http_produce")
 }
 
 func TestScannerRejectsSemanticFactWithoutCurrentQuotedEvidence(t *testing.T) {

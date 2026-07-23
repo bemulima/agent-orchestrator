@@ -41,7 +41,9 @@ func (p Planner) Build(
 	if err != nil {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}
-	selected = includeRelatedProjects(selected, services, catalog.Relations)
+	if len(input.RequestedProjectIDs) == 0 {
+		selected = includeRelatedProjects(selected, services, catalog.Relations)
+	}
 
 	changesContracts := containsAny(text, "api", "contract", "контракт", "event", "событ", "endpoint", "эндпоинт")
 	requiresMigration := containsAny(text, "migration", "миграц", "database", "баз", "schema", "схем", "table", "таблиц")
