@@ -519,6 +519,33 @@ func TestValidateSemanticAnalysisRejectsRenamedPackageScript(t *testing.T) {
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsUnexpandedCommandTemplate(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("version: '3'\ntasks:\n  docker:build:\n    cmds:\n      - docker build -t {{.SERVICE_NAME}} .\n")
+	if err := os.WriteFile(filepath.Join(root, "Taskfile.yml"), content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "fixture", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	result := []byte(`{
+  "summary":"fixture",
+  "facts":[{
+    "category":"command","name":"docker_build","value":"docker build -t {{.SERVICE_NAME}} .","confidence":0.95,
+    "source_path":"Taskfile.yml","evidence_quote":"docker build -t {{.SERVICE_NAME}} .",
+    "explanation":"The Taskfile defines a templated image build command."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, result, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "unexpanded_command_template" {
+		t.Fatalf("unexpanded command template was not rejected: %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole

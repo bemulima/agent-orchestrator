@@ -69,7 +69,8 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 		if _, exists := allowed[fact.Category]; !exists || strings.TrimSpace(fact.Name) == "" ||
 			strings.TrimSpace(fact.Value) == "" || fact.Confidence < .5 || fact.Confidence > .95 ||
 			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
-			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
+			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value ||
+				containsUnexpandedCommandTemplate(fact.Value) || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
 			fact.Category == "command" && !semanticPackageCommandDeclared(fact, state.filesByPath) ||
 			fact.Category == "relation" && isSemanticSelfReference(fact.Value, state.project.Name) ||
 			!safeManifestReference(fact.SourcePath) || sourcePath == path || !sourceExists ||
@@ -88,6 +89,10 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 		}
 		state.collector.conflict("semantic_open_question", question.Question, .8, path, question.Reason)
 	}
+}
+
+func containsUnexpandedCommandTemplate(value string) bool {
+	return strings.Contains(value, "{{") || strings.Contains(value, "}}")
 }
 
 func semanticPackageCommandDeclared(fact domain.SemanticFact, files map[string][]byte) bool {

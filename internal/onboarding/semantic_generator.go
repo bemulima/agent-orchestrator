@@ -285,6 +285,13 @@ func validateSemanticAnalysis(
 			})
 			continue
 		}
+		if fact.Category == "command" && containsUnexpandedCommandTemplate(fact.Value) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "unexpanded_command_template",
+			})
+			continue
+		}
 		if fact.Category == "command" && !semanticCommandPathExists(root, fact.Value) {
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
@@ -641,6 +648,10 @@ func containsCredentialLikeCommand(value string) bool {
 		}
 	}
 	return false
+}
+
+func containsUnexpandedCommandTemplate(value string) bool {
+	return strings.Contains(value, "{{") || strings.Contains(value, "}}")
 }
 
 func semanticCommandPathExists(root, value string) bool {

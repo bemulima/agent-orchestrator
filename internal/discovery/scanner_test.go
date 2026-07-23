@@ -500,6 +500,15 @@ func TestSemanticPackageCommandDeclaredRequiresExactScriptName(t *testing.T) {
 	}
 }
 
+func TestContainsUnexpandedCommandTemplate(t *testing.T) {
+	if !containsUnexpandedCommandTemplate("docker build -t {{.SERVICE_NAME}} .") {
+		t.Fatal("Task template was not detected")
+	}
+	if containsUnexpandedCommandTemplate("docker build -t ms-ts-react-validator .") {
+		t.Fatal("literal command was treated as a template")
+	}
+}
+
 func fixturePath(t *testing.T, name string) string {
 	t.Helper()
 	path, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "discovery", name))
