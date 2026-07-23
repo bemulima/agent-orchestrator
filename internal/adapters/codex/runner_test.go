@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -67,6 +68,19 @@ func TestProcessRunnerReportsStructuredChildErrorForIncompleteProtocol(t *testin
 	require.ErrorContains(t, err, "fixture structured result was invalid")
 }
 
+func TestProcessRunnerReturnsThreadForTransientStreamFailure(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_HELPER", "transient")
+	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
+	require.NoError(t, err)
+	response, err := runner.Run(context.Background(), domain.AgentRunRequest{
+		Role: domain.AgentRunAnalyst, WorkingDirectory: t.TempDir(), Prompt: "analyze fixture",
+		OutputSchema: map[string]any{"type": "object"},
+	}, nil)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, domain.ErrTransient))
+	require.Equal(t, "thread-fixture", response.ThreadID)
+}
+
 func TestNewProcessRunnerRejectsShellSyntax(t *testing.T) {
 	_, err := NewProcessRunner("node runner.js; printenv")
 	require.Error(t, err)
@@ -91,6 +105,10 @@ func TestCodexRunnerHelper(t *testing.T) {
 	fmt.Println(`{"type":"thread_started","thread_id":"thread-fixture"}`)
 	if mode == "incomplete" {
 		fmt.Fprintln(os.Stderr, `{"type":"error","message":"fixture structured result was invalid"}`)
+		os.Exit(1)
+	}
+	if mode == "transient" {
+		fmt.Fprintln(os.Stderr, `{"type":"error","message":"stream disconnected before completion: unexpected-eof"}`)
 		os.Exit(1)
 	}
 	fmt.Println(`{"type":"result","thread_id":"thread-fixture","result":{"status":"completed"}}`)

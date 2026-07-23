@@ -3,6 +3,7 @@ package onboarding
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,31 @@ func TestSemanticGeneratorExcludesUnverifiableQuote(t *testing.T) {
 	}
 	if containsProposed(proposal, ".ai/service.yaml", "invented") {
 		t.Fatal("unverifiable semantic fact entered the service manifest")
+	}
+}
+
+func TestSemanticGeneratorResumesThreadAfterTransientFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("Documented fixture.\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc"}
+	report := domain.DiscoveryReport{
+		ProjectID: project.ID, ProjectName: project.Name, CommitSHA: snapshot.CommitSHA,
+		Facts: []domain.Evidence{{Category: "purpose", Name: "summary", Value: "fixture", SourcePath: "README.md"}},
+	}
+	runner := &semanticRunnerFake{
+		result:        json.RawMessage(`{"summary":"fixture","facts":[],"open_questions":[]}`),
+		transientOnce: true,
+	}
+	proposal, _, err := (SemanticGenerator{Base: NewGenerator(GeneratorConfig{}), Runner: runner}).
+		Generate(context.Background(), project, snapshot, report)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if proposal.Semantic == nil || runner.calls != 2 || runner.resumedThreadID != "semantic-thread" {
+		t.Fatalf("proposal = %#v, runner = %#v", proposal.Semantic, runner)
 	}
 }
 
@@ -293,8 +319,11 @@ func TestValidateSemanticAnalysisRejectsNonProductionAndOperationalRelations(t *
 }
 
 type semanticRunnerFake struct {
-	result json.RawMessage
-	role   domain.AgentRunRole
+	result          json.RawMessage
+	role            domain.AgentRunRole
+	transientOnce   bool
+	calls           int
+	resumedThreadID string
 }
 
 func (r *semanticRunnerFake) Run(
@@ -303,10 +332,17 @@ func (r *semanticRunnerFake) Run(
 	callback repository.AgentThreadCallback,
 ) (domain.AgentRunResponse, error) {
 	r.role = request.Role
+	r.calls++
+	if request.ThreadID != "" {
+		r.resumedThreadID = request.ThreadID
+	}
 	if callback != nil {
 		if err := callback(ctx, "semantic-thread"); err != nil {
 			return domain.AgentRunResponse{}, err
 		}
+	}
+	if r.transientOnce && r.calls == 1 {
+		return domain.AgentRunResponse{ThreadID: "semantic-thread"}, fmt.Errorf("fixture: %w", domain.ErrTransient)
 	}
 	return domain.AgentRunResponse{ThreadID: "semantic-thread", Result: r.result}, nil
 }

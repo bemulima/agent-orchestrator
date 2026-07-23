@@ -526,6 +526,11 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   unhelpful incomplete-protocol error and discarded the runner's structured
   stderr event. It now surfaces the bounded JSON error message while continuing
   to ignore arbitrary stderr, with regression coverage for the partial protocol.
+- The surfaced cause was a TLS unexpected-EOF after the SDK exhausted its five
+  stream reconnect attempts. Partial protocol reads now return the captured
+  thread ID, transport-like runner messages are typed as transient failures,
+  and semantic enrichment performs one bounded same-thread resume instead of
+  discarding completed analysis work or retrying indefinitely.
 
 ## Remaining work
 

@@ -77,9 +77,12 @@ func (r *ProcessRunner) Run(
 	waitErr := command.Wait()
 	if readErr != nil {
 		if message := reportedRunnerError(stderr.String()); message != "" {
-			return domain.AgentRunResponse{}, fmt.Errorf("%w: runner reported: %s", readErr, message)
+			if isTransientRunnerError(message) {
+				return response, fmt.Errorf("%w: %w: runner reported: %s", readErr, domain.ErrTransient, message)
+			}
+			return response, fmt.Errorf("%w: runner reported: %s", readErr, message)
 		}
-		return domain.AgentRunResponse{}, readErr
+		return response, readErr
 	}
 	if waitErr != nil {
 		message := strings.TrimSpace(stderr.String())
@@ -89,6 +92,19 @@ func (r *ProcessRunner) Run(
 		return domain.AgentRunResponse{}, fmt.Errorf("Codex runner failed: %s", message)
 	}
 	return response, nil
+}
+
+func isTransientRunnerError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"stream disconnected", "reconnecting", "unexpected-eof", "unexpected eof",
+		"tls close_notify", "connection reset", "connection closed", "temporarily unavailable",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func reportedRunnerError(value string) string {
@@ -158,7 +174,7 @@ func readProtocol(
 		return domain.AgentRunResponse{}, fmt.Errorf("read Codex runner protocol: %w", err)
 	}
 	if !threadSeen || !resultSeen {
-		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner protocol: %w", domain.ErrValidation)
+		return response, fmt.Errorf("incomplete Codex runner protocol: %w", domain.ErrValidation)
 	}
 	return response, nil
 }

@@ -3,6 +3,7 @@ package onboarding
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,15 +54,26 @@ func (g SemanticGenerator) Generate(
 		return domain.OnboardingProposal{}, "", err
 	}
 	threadID := ""
-	response, err := g.Runner.Run(ctx, domain.AgentRunRequest{
+	request := domain.AgentRunRequest{
 		Role: domain.AgentRunAnalyst, WorkingDirectory: *project.LocalPath, Model: g.Model,
 		Prompt: prompt, OutputSchema: semanticOutputSchema(),
-	}, func(_ context.Context, value string) error {
-		threadID = value
-		return nil
-	})
-	if err != nil {
-		return domain.OnboardingProposal{}, "", fmt.Errorf("run semantic analyst: %w", err)
+	}
+	var response domain.AgentRunResponse
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err = g.Runner.Run(ctx, request, func(_ context.Context, value string) error {
+			threadID = value
+			return nil
+		})
+		if response.ThreadID != "" {
+			threadID = response.ThreadID
+		}
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, domain.ErrTransient) || attempt == 1 || threadID == "" {
+			return domain.OnboardingProposal{}, "", fmt.Errorf("run semantic analyst: %w", err)
+		}
+		request.ThreadID = threadID
 	}
 	if threadID == "" || response.ThreadID != threadID {
 		return domain.OnboardingProposal{}, "", fmt.Errorf("semantic analyst thread was not captured: %w", domain.ErrConflict)
