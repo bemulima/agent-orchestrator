@@ -1,9 +1,10 @@
-# Current onboarding pull requests
+# Merged onboarding pull requests
 
 Last audited: 2026-07-23
 
-These are the 38 current project-context draft PRs. Superseded drafts are
-closed. None of these PRs has been merged by the orchestrator.
+These are the 38 approved project-context PRs. Superseded drafts are closed.
+All entries below were moved out of draft and merged on 2026-07-23 after an
+exact resource-level GitHub check.
 
 | Project | Draft PR |
 | --- | --- |
@@ -46,9 +47,9 @@ closed. None of these PRs has been merged by the orchestrator.
 | `ms-ts-react-validator` | [#10](https://github.com/bemulima/ms-ts-react-validator/pull/10) |
 | `nextjs` | [#52](https://github.com/bemulima/nextjs/pull/52) |
 
-The orchestrator implementation itself is tracked separately in
-[`agent-orchestrator` draft PR #1](https://github.com/bemulima/agent-orchestrator/pull/1).
+The orchestrator implementation itself was merged separately in
+[`agent-orchestrator` PR #1](https://github.com/bemulima/agent-orchestrator/pull/1).
 
-After the 38 project PRs are explicitly approved and merged, rescan every
-default branch before rebuilding topology. Do not build trusted topology from
-unmerged onboarding worktrees.
+All 38 remote default branches were then rescanned from clean managed clones.
+The trusted topology is built only from those merged defaults, never from the
+onboarding worktrees.
