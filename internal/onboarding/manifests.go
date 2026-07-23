@@ -133,7 +133,7 @@ func buildCommandsManifest(report domain.DiscoveryReport) commandsManifest {
 			entry.Run = fact.Value
 		}
 		entry.RequiresApproval, entry.Risk = classifyCommandRisk(entry.Name, entry.Run)
-		key := entry.Name + "\x00" + entry.Run
+		key := entry.Run
 		if index, exists := commandIndexes[key]; exists {
 			if commands[index].Confidence < entry.Confidence {
 				commands[index] = entry

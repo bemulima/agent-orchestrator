@@ -111,7 +111,7 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 		{Category: "command", Name: "test:watch", Value: "jest --watchAll", SourcePath: "package.json", Confidence: .95},
 	}}
 	manifest := buildCommandsManifest(report)
-	if len(manifest.Commands) != 12 {
+	if len(manifest.Commands) != 11 {
 		t.Fatalf("commands = %#v", manifest.Commands)
 	}
 	approval := make(map[string]bool, len(manifest.Commands))
@@ -136,14 +136,14 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 func TestCommandManifestDeduplicatesEquivalentDiscoveredCommands(t *testing.T) {
 	report := domain.DiscoveryReport{Facts: []domain.Evidence{
 		{Category: "command", Name: "make_target", Value: "test", SourcePath: "Makefile", Confidence: .92},
-		{Category: "command", Name: "test", Value: "make test", SourcePath: "Makefile", Confidence: .95},
+		{Category: "command", Name: "run_tests", Value: "make test", SourcePath: "Makefile", Confidence: .95},
 	}}
 	manifest := buildCommandsManifest(report)
 	if len(manifest.Commands) != 1 {
 		t.Fatalf("commands = %#v", manifest.Commands)
 	}
 	command := manifest.Commands[0]
-	if command.Name != "test" || command.Run != "make test" || command.Confidence != .95 || command.RequiresApproval {
+	if command.Name != "run_tests" || command.Run != "make test" || command.Confidence != .95 || command.RequiresApproval {
 		t.Fatalf("deduplicated command = %#v", command)
 	}
 }
