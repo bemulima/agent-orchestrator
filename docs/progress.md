@@ -615,19 +615,33 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   frontend PR #52 and admin frontend PR #77. Student PR #51 was closed as
   superseded. Both corrected trees passed exact tree-hash, isolated-worktree,
   write-scope, commit, and source-immutability checks; no PR was merged.
+- Completed reviewed data/runtime onboarding applies for
+  `ms-go-cache-search-validator`, `ms-go-db-validator`, `ms-go-tarantool`, and
+  `ms-go-image-processor`. Ephemeral validator engines are infrastructure, Lua
+  Tarantool spaces are database contracts rather than SQL table ownership, and
+  image-variant ownership is backed by a checked-in SQL migration.
+- The DB validator uses the clean orchestrator-managed remote clone; the 1,793
+  untracked files in the user's separate primary checkout were neither scanned
+  nor modified. Tarantool's stale NATS/cache documentation and image
+  processor's `ms-filestorage` versus `ms-go-filestorage` alias remain explicit
+  open questions.
+- Published the four data/runtime trees after exact tree-hash comparison as
+  GitHub draft PRs: cache/search #5, DB validator #5, Tarantool #5, and image
+  processor #5. No PR was merged.
 
 ## Remaining work
 
 - Review and merge the published onboarding PRs through each repository workflow
   before rescanning their approved semantic reports into the trusted topology.
-- Enrich the remaining 17 repositories in reviewed waves; do not approve or
+- Enrich the remaining 13 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the data/runtime wave: `ms-go-cache-search-validator`,
-`ms-go-db-validator`, `ms-go-tarantool`, and `ms-go-image-processor`, applying
-only proposals whose storage ownership, contracts, direct dependencies,
-business rules, and command risk gates pass review.
+Enrich and review the Go validator wave: `ms-go-code-validator`,
+`ms-go-docker-validator`, `ms-go-git-validator`, `ms-go-linux-validator`,
+`ms-go-php-framework-validator`, and `ms-go-php-validator`, applying only
+proposals whose validation contracts, runtime provisioning, business rules,
+and command risk gates pass review.
