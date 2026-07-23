@@ -544,6 +544,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `authenticates_through` relation now requires direct authentication/JWT/token
   evidence. Command risk matching no longer finds destructive `rm` inside words
   such as `performance`; formatting commands are explicitly state-changing.
+- Rejected the second `ms-go-student` proposal because the same inbound
+  `AllowedServices` evidence was renamed to `depends_on`. Caller allowlists are
+  now rejected as evidence for every semantic relation type; outbound
+  dependencies require outbound-client or explicit architecture evidence.
 
 ## Remaining work
 

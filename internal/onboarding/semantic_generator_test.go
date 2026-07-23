@@ -350,7 +350,7 @@ func TestValidateSemanticAnalysisRequiresSQLForDatabaseOwnership(t *testing.T) {
 	}
 }
 
-func TestValidateSemanticAnalysisRejectsCallerAllowlistAsAuthenticationDelegation(t *testing.T) {
+func TestValidateSemanticAnalysisRejectsCallerAllowlistAsDependency(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(
 		filepath.Join(root, "main.go"),
@@ -369,6 +369,10 @@ func TestValidateSemanticAnalysisRejectsCallerAllowlistAsAuthenticationDelegatio
     "category":"relation","name":"authenticates_through","value":"ms-go-sandbox","confidence":0.9,
     "source_path":"main.go","evidence_quote":"AllowedServices: []string{\"ms-go-sandbox\"}",
     "explanation":"The sandbox is an allowed caller."
+  },{
+    "category":"relation","name":"depends_on","value":"ms-go-sandbox","confidence":0.9,
+    "source_path":"main.go","evidence_quote":"AllowedServices: []string{\"ms-go-sandbox\"}",
+    "explanation":"The sandbox is an allowed caller."
   }],
   "open_questions":[]
 }`)
@@ -382,8 +386,9 @@ func TestValidateSemanticAnalysisRejectsCallerAllowlistAsAuthenticationDelegatio
 	if err != nil {
 		t.Fatalf("validateSemanticAnalysis() error = %v", err)
 	}
-	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
-		analysis.RejectedFacts[0].Reason != "relation_evidence_does_not_support_relation_type" {
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 2 ||
+		analysis.RejectedFacts[0].Reason != "relation_evidence_does_not_support_relation_type" ||
+		analysis.RejectedFacts[1].Reason != "relation_evidence_does_not_support_relation_type" {
 		t.Fatalf("analysis = %#v", analysis)
 	}
 }

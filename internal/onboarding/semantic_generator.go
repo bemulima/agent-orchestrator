@@ -418,10 +418,15 @@ func semanticRelationAllowedForSource(
 }
 
 func semanticRelationEvidenceSupportsName(fact domain.SemanticFact) bool {
+	evidence := strings.ToLower(fact.EvidenceQuote + " " + fact.Explanation)
+	for _, marker := range []string{"allowedservices", "allowed services", "allowed caller", "allowlisted caller"} {
+		if strings.Contains(evidence, marker) {
+			return false
+		}
+	}
 	if fact.Name != "authenticates_through" {
 		return true
 	}
-	evidence := strings.ToLower(fact.EvidenceQuote + " " + fact.Explanation)
 	for _, marker := range []string{"authenticat", "jwt", "verify token", "token verification", "bearer token"} {
 		if strings.Contains(evidence, marker) {
 			return true
