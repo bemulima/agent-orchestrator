@@ -19,7 +19,6 @@ type TaskExecutionRepository interface {
 	StoreArtifact(context.Context, domain.Artifact) (domain.Artifact, error)
 	ListAttempts(context.Context, string) ([]domain.TaskAttempt, error)
 	ListArtifacts(context.Context, string) ([]domain.Artifact, error)
-	AddRequiredTasks(context.Context, string, []domain.RequiredTask, int, int) (domain.RequiredTaskSchedule, error)
 	ResetTaskForRetry(context.Context, string, int) (domain.Task, error)
 }
 

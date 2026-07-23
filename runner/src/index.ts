@@ -27,6 +27,7 @@ async function main(): Promise<void> {
   });
   const options: ThreadOptions = {
     model: request.model,
+    modelReasoningEffort: request.reasoning_effort,
     sandboxMode: request.role === "coder" ? "workspace-write" : "read-only",
     workingDirectory: request.working_directory,
     skipGitRepoCheck: false,

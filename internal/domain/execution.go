@@ -40,6 +40,8 @@ type PlanStatus string
 
 const (
 	PlanStatusDraft            PlanStatus = "draft"
+	PlanStatusDiscussion       PlanStatus = "discussion"
+	PlanStatusReadyForApproval PlanStatus = "ready_for_approval"
 	PlanStatusPlanned          PlanStatus = "planned"
 	PlanStatusAwaitingApproval PlanStatus = "awaiting_approval"
 	PlanStatusApproved         PlanStatus = "approved"
@@ -51,22 +53,26 @@ const (
 )
 
 type Plan struct {
-	ID                 string          `json:"id"`
-	CommandID          string          `json:"command_id"`
-	ApprovalID         *string         `json:"approval_id,omitempty"`
-	TopologyRevisionID *string         `json:"topology_revision_id,omitempty"`
-	Status             PlanStatus      `json:"status"`
-	Version            int             `json:"version"`
-	Summary            string          `json:"summary"`
-	RiskLevel          string          `json:"risk_level"`
-	RequiresApproval   bool            `json:"requires_approval"`
-	Fingerprint        string          `json:"fingerprint"`
-	PlannerInput       json.RawMessage `json:"planner_input"`
-	PlannerOutput      json.RawMessage `json:"planner_output"`
-	ReplanCount        int             `json:"replan_count"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
-	ApprovedAt         *time.Time      `json:"approved_at,omitempty"`
+	ID                  string          `json:"id"`
+	CommandID           string          `json:"command_id"`
+	ApprovalID          *string         `json:"approval_id,omitempty"`
+	TopologyRevisionID  *string         `json:"topology_revision_id,omitempty"`
+	Status              PlanStatus      `json:"status"`
+	Version             int             `json:"version"`
+	Summary             string          `json:"summary"`
+	RiskLevel           string          `json:"risk_level"`
+	RequiresApproval    bool            `json:"requires_approval"`
+	Fingerprint         string          `json:"fingerprint"`
+	PlannerFingerprint  string          `json:"planner_fingerprint"`
+	PlannerInput        json.RawMessage `json:"planner_input"`
+	PlannerOutput       json.RawMessage `json:"planner_output"`
+	ReplanCount         int             `json:"replan_count"`
+	SourceKind          PlanSourceKind  `json:"source_kind"`
+	DiscussionRevision  int             `json:"discussion_revision"`
+	ApprovedFingerprint *string         `json:"approved_fingerprint,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+	ApprovedAt          *time.Time      `json:"approved_at,omitempty"`
 }
 
 type RiskLevel string
@@ -124,14 +130,17 @@ type TaskDependency struct {
 }
 
 type PlanRequest struct {
-	RequestedProjectIDs []string `json:"project_ids,omitempty"`
+	RequestedProjectIDs []string         `json:"project_ids,omitempty"`
+	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	AvailableProjects   []Project        `json:"-"`
 }
 
 type PlannerInput struct {
-	CommandID           string   `json:"command_id"`
-	CommandText         string   `json:"command_text"`
-	TopologyRevisionID  string   `json:"topology_revision_id"`
-	RequestedProjectIDs []string `json:"requested_project_ids,omitempty"`
+	CommandID           string           `json:"command_id"`
+	CommandText         string           `json:"command_text"`
+	TopologyRevisionID  string           `json:"topology_revision_id"`
+	RequestedProjectIDs []string         `json:"requested_project_ids,omitempty"`
+	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
 }
 
 type PlannedTask struct {
@@ -169,6 +178,8 @@ type PlanBundle struct {
 	Plan         Plan             `json:"plan"`
 	Tasks        []Task           `json:"tasks"`
 	Dependencies []TaskDependency `json:"dependencies"`
+	WorkItems    []WorkItem       `json:"work_items"`
+	Discussion   []PlanComment    `json:"discussion"`
 	Approval     *Approval        `json:"approval,omitempty"`
 	Run          *PlanRun         `json:"run,omitempty"`
 }

@@ -52,12 +52,15 @@ func (u Sync) Handle(ctx context.Context, planID string) (domain.GitLabSyncResul
 	if strings.TrimSpace(u.ControlProject) == "" {
 		return domain.GitLabSyncResult{}, fmt.Errorf("GitLab control project is not configured: %w", domain.ErrValidation)
 	}
+	if !u.Gateway.DryRun() {
+		return domain.GitLabSyncResult{}, fmt.Errorf(
+			"legacy GitLab writes are disabled; external issues and merge requests require dedicated manager-agent proposals: %w",
+			domain.ErrInvalidStatus,
+		)
+	}
 	bundle, err := u.Plans.GetPlan(ctx, strings.TrimSpace(planID))
 	if err != nil {
 		return domain.GitLabSyncResult{}, err
-	}
-	if !u.Gateway.DryRun() && (bundle.Approval == nil || bundle.Approval.Status != "approved") {
-		return domain.GitLabSyncResult{}, fmt.Errorf("plan approval is required before GitLab writes: %w", domain.ErrApprovalNeeded)
 	}
 	controlProject, err := u.Gateway.ResolveProject(ctx, u.ControlProject)
 	if err != nil {

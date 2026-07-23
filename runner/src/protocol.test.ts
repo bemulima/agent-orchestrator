@@ -14,11 +14,15 @@ test("parses a bounded coder request", () => {
   const request = parseRequest({
     role: "coder",
     working_directory: "/tmp/worktree",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "low",
     prompt: "implement the fixture",
     output_schema: { type: "object" },
   });
   assert.equal(request.role, "coder");
   assert.equal(request.working_directory, "/tmp/worktree");
+  assert.equal(request.model, "gpt-5.6-terra");
+  assert.equal(request.reasoning_effort, "low");
 });
 
 test("parses a read-only analyst request", () => {
@@ -29,6 +33,18 @@ test("parses a read-only analyst request", () => {
     output_schema: { type: "object" },
   });
   assert.equal(request.role, "analyst");
+});
+
+test("parses dedicated read-only issue and pull-request manager requests", () => {
+  for (const role of ["issue-manager", "pull-request-manager"] as const) {
+    const request = parseRequest({
+      role,
+      working_directory: "/tmp/repository",
+      prompt: "prepare Russian metadata",
+      output_schema: { type: "object" },
+    });
+    assert.equal(request.role, role);
+  }
 });
 
 test("collects thread and structured agent response", () => {
@@ -66,4 +82,18 @@ test("gives agent commands an explicit secret-free environment", () => {
 
 test("rejects an invalid structured result", () => {
   assert.throws(() => parseStructuredResult("not JSON"), /not valid JSON/);
+});
+
+test("rejects unsupported reasoning effort", () => {
+  assert.throws(
+    () =>
+      parseRequest({
+        role: "coder",
+        working_directory: "/tmp/worktree",
+        reasoning_effort: "ultra",
+        prompt: "implement",
+        output_schema: { type: "object" },
+      }),
+    /reasoning_effort is not supported/,
+  );
 });

@@ -42,8 +42,8 @@ func (r *ProcessRunner) Run(
 	request domain.AgentRunRequest,
 	onThread repository.AgentThreadCallback,
 ) (domain.AgentRunResponse, error) {
-	if len(r.command) == 0 || request.Role != domain.AgentRunCoder && request.Role != domain.AgentRunReviewer &&
-		request.Role != domain.AgentRunAnalyst ||
+	if len(r.command) == 0 || !supportedAgentRole(request.Role) ||
+		!supportedReasoningEffort(request.ReasoningEffort) || len(request.Model) > 255 ||
 		request.WorkingDirectory == "" || request.Prompt == "" || len(request.OutputSchema) == 0 {
 		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner request: %w", domain.ErrValidation)
 	}
@@ -92,6 +92,25 @@ func (r *ProcessRunner) Run(
 		return domain.AgentRunResponse{}, fmt.Errorf("Codex runner failed: %s", message)
 	}
 	return response, nil
+}
+
+func supportedReasoningEffort(value string) bool {
+	switch value {
+	case "", "minimal", "low", "medium", "high", "xhigh":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportedAgentRole(role domain.AgentRunRole) bool {
+	switch role {
+	case domain.AgentRunCoder, domain.AgentRunReviewer, domain.AgentRunAnalyst, domain.AgentRunPlanner,
+		domain.AgentRunIssueManager, domain.AgentRunPullRequestManager:
+		return true
+	default:
+		return false
+	}
 }
 
 func isTransientRunnerError(message string) bool {

@@ -67,7 +67,11 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/commands/{commandId}/plan", deps.PlanningHandler.PlanCommand)
 		root.Get("/api/v1/plans/{planId}", deps.PlanningHandler.GetPlanRequest)
 		root.Get("/api/v1/plans/{planId}/tasks", deps.PlanningHandler.GetPlanTasks)
+		root.Post("/api/v1/plans/{planId}/comments", deps.PlanningHandler.CommentPlanRequest)
+		root.Post("/api/v1/plans/{planId}/issues/prepare", deps.PlanningHandler.PreparePlanIssues)
+		root.Post("/api/v1/plans/{planId}/submit", deps.PlanningHandler.SubmitPlanRequest)
 		root.Post("/api/v1/plans/{planId}/approve", deps.PlanningHandler.ApprovePlanRequest)
+		root.Post("/api/v1/plans/{planId}/issues/publish", deps.PlanningHandler.PublishPlanIssues)
 		root.Post("/api/v1/plans/{planId}/reject", deps.PlanningHandler.RejectPlanRequest)
 		root.Post("/api/v1/plans/{planId}/run", deps.PlanningHandler.RunPlan)
 		root.Get("/api/v1/runs/{runId}", deps.PlanningHandler.GetRunRequest)
@@ -79,6 +83,8 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/tasks/{taskId}/artifacts", deps.PlanningHandler.GetTaskArtifacts)
 		root.Post("/api/v1/tasks/{taskId}/retry", deps.PlanningHandler.RetryTaskRequest)
 		root.Post("/api/v1/tasks/{taskId}/cancel", deps.PlanningHandler.CancelTaskRequest)
+		root.Post("/api/v1/tasks/{taskId}/pull-request/prepare", deps.PlanningHandler.PrepareTaskPullRequest)
+		root.Post("/api/v1/work-items/{workItemId}/publish", deps.PlanningHandler.PublishWorkItem)
 	}
 	if deps.GitLabHandler != nil {
 		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)

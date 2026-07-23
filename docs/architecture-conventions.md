@@ -71,6 +71,16 @@ and engineering conventions come from the reference service.
   immutable topology revision. A task owns exactly one project; acceptance
   criteria, write scope, verification commands, dependency depth, and risk
   flags are persisted before approval.
+- A plan may originate from a raw question/idea or an existing issue. It stays
+  in discussion until a dedicated read-only issue manager has produced one
+  complete Russian issue proposal per task and the owner submits the version.
+- `planner_fingerprint` makes repeated DAG generation idempotent. The public
+  plan `fingerprint` additionally binds the canonical issue titles, bodies,
+  labels, milestones, assignees, complexity, and model profiles; approval must
+  echo this exact value.
+- Issue and pull-request publication is available only through the bounded
+  work-item gateway. Coder, reviewer, issue-manager, and PR-manager Codex
+  threads never receive network or external write capabilities.
 - DAG validation is an application boundary. Unknown projects, incomplete
   tasks, cycles, invalid scopes/model profiles, excessive depth, and parallel
   waves above the configured limit never reach Temporal.
@@ -85,8 +95,9 @@ and engineering conventions come from the reference service.
   the same executable.
 - The service exposes unauthenticated liveness/readiness endpoints at the root
   and reserves `/api/v1` for the internal API.
-- AI model names are configuration values grouped by `fast`, `standard`,
-  `deep`, and `review`; no model name is compiled into the code.
+- AI model and reasoning settings are configuration values grouped by `fast`,
+  `standard`, `deep`, and `review`. Defaults target the current ChatGPT-auth
+  Codex recommendations and remain overridable without an API key.
 - PostgreSQL and Temporal are separate readiness dependencies. Long-running
   execution state will remain authoritative in Temporal and durable metadata
   will be stored in PostgreSQL.
@@ -100,10 +111,25 @@ and engineering conventions come from the reference service.
   independent Go code checks actual Git paths, write scope, allowlisted
   commands, artifacts, migration pairs, and contract paths before review and
   commit.
+- A newly discovered prerequisite is untrusted planning input, not a dynamic
+  task. The executor persists the blocker and Temporal pauses the run; the
+  owner must create and approve a new issue-backed plan version before any new
+  repository task can run.
+- Independent plans can execute concurrently. Each DAG has a bounded parallel
+  width, while the Temporal worker enforces a global activity limit across all
+  plans.
+- Dedicated issue and PR manager threads are read-only. They produce strict
+  JSON proposals in Russian with repository metadata; separate publishers
+  perform idempotent writes only after state/fingerprint checks. The PR manager
+  also requires a completed committed attempt and a published task issue.
+- The default work-item gateway is an in-process fake that persists only
+  `github.example.test` identities, enabling full local execution tests with no
+  external write. GitHub publication must be selected explicitly and remains
+  dry-run unless a token and write mode are both configured.
 - The SDK runner receives secrets only for its own Codex invocation. Codex
   tool subprocesses use an explicit `inherit = none` environment policy and
   receive no API key, database URL, or integration token.
-- Stage 7 treats GitLab as an external projection of approved plan/task state.
+- Stage 7 treats GitLab as a legacy external projection of approved plan/task state.
   The bounded adapter exposes project lookup, issues, notes, related-issue
   links, branch push, and merge-request create/update only; merge, deploy, and
   generic destructive REST methods do not exist.
@@ -115,6 +141,9 @@ and engineering conventions come from the reference service.
   IDs transactionally. Legacy header tokens are constant-time compared.
   External issue and MR states are stored separately and never override the
   orchestrator's authoritative task result.
+- Legacy GitLab synchronization is limited to dry-run previews. Real writes are
+  fail-closed until a GitLab gateway consumes the same dedicated manager-agent
+  proposals used by the GitHub work-item flow.
 - Stage 8 keeps Telegram transport in adapters and command/callback routing in
   the application layer. Long polling persists the next update offset, while
   webhook and polling deliveries share the same update-ID deduplication path.

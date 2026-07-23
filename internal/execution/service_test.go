@@ -27,6 +27,7 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.True(t, repo.completed)
 	require.True(t, worktrees.committed)
 	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
+	require.Equal(t, []string{"medium", "high"}, runner.reasoningEfforts)
 	require.Contains(t, runner.prompts[0], `"connected_landscape"`)
 	require.Contains(t, runner.prompts[0], "orders-service")
 	require.Contains(t, runner.prompts[1], "orders-service")
@@ -54,7 +55,7 @@ func TestServiceResumesCoderAndUsesANewReviewerThread(t *testing.T) {
 	require.Equal(t, []string{"review-thread-1", "review-thread-2"}, repo.reviewThreads)
 }
 
-func TestServiceSchedulesBoundedRequiredTask(t *testing.T) {
+func TestServiceBlocksForReapprovalWhenAgentDiscoversRequiredTask(t *testing.T) {
 	validator, err := agent.NewValidator()
 	require.NoError(t, err)
 	repo := newFakeExecutionRepository()
@@ -70,8 +71,8 @@ func TestServiceSchedulesBoundedRequiredTask(t *testing.T) {
 	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
 	require.NoError(t, err)
 	require.Equal(t, domain.TaskStatusBlocked, result.Result.Status)
-	require.NotNil(t, result.RequiredSchedule)
-	require.Equal(t, []string{"required-task"}, result.RequiredSchedule.ParentDependencies)
+	require.Nil(t, result.RequiredSchedule)
+	require.Contains(t, result.Result.Error, "требуется новый plan fingerprint")
 	require.Equal(t, domain.TaskAttemptStatusBlocked, repo.failedStatus)
 }
 
@@ -103,8 +104,8 @@ func fixtureService(
 	return Service{
 		Repository: repo, Worktrees: worktrees, Runner: runner, Validator: validator,
 		Verifier: Verifier{Worktrees: worktrees}, Models: map[string]string{"standard": "fixture-model"},
-		ReviewModel: "fixture-review", MaxTaskAttempts: 3, MaxReviewAttempts: 2,
-		MaxReplans: 2, MaxRequiredTaskDepth: 3,
+		Reasoning:   map[string]string{"standard": "medium"},
+		ReviewModel: "fixture-review", ReviewReasoning: "high", MaxTaskAttempts: 3, MaxReviewAttempts: 2,
 	}
 }
 
@@ -141,12 +142,13 @@ func changesReviewResult() json.RawMessage {
 }
 
 type sequenceRunner struct {
-	results        []json.RawMessage
-	roles          []domain.AgentRunRole
-	requestThreads []string
-	prompts        []string
-	coderThread    string
-	reviewCount    int
+	results          []json.RawMessage
+	roles            []domain.AgentRunRole
+	requestThreads   []string
+	prompts          []string
+	reasoningEfforts []string
+	coderThread      string
+	reviewCount      int
 }
 
 func (r *sequenceRunner) Run(
@@ -160,6 +162,7 @@ func (r *sequenceRunner) Run(
 	r.roles = append(r.roles, request.Role)
 	r.requestThreads = append(r.requestThreads, request.ThreadID)
 	r.prompts = append(r.prompts, request.Prompt)
+	r.reasoningEfforts = append(r.reasoningEfforts, request.ReasoningEffort)
 	threadID := request.ThreadID
 	if request.Role == domain.AgentRunCoder && threadID == "" {
 		threadID = "coder-thread"
@@ -258,11 +261,6 @@ func (r *fakeExecutionRepository) ListAttempts(context.Context, string) ([]domai
 }
 func (r *fakeExecutionRepository) ListArtifacts(context.Context, string) ([]domain.Artifact, error) {
 	return nil, nil
-}
-func (r *fakeExecutionRepository) AddRequiredTasks(context.Context, string, []domain.RequiredTask, int, int) (domain.RequiredTaskSchedule, error) {
-	return domain.RequiredTaskSchedule{
-		Tasks: []domain.ScheduledTask{{TaskID: "required-task"}}, ParentDependencies: []string{"required-task"},
-	}, nil
 }
 func (r *fakeExecutionRepository) ResetTaskForRetry(context.Context, string, int) (domain.Task, error) {
 	return domain.Task{}, nil

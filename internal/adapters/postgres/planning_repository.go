@@ -101,7 +101,7 @@ func (r PlanningRepoPG) CreatePlan(
 		return domain.PlanBundle{}, fmt.Errorf("lock plan creation: %w", err)
 	}
 	var existingID string
-	err = tx.QueryRow(ctx, `SELECT id FROM plan WHERE command_id = $1 AND fingerprint = $2`, command.ID, fingerprint).Scan(&existingID)
+	err = tx.QueryRow(ctx, `SELECT id FROM plan WHERE command_id = $1 AND planner_fingerprint = $2`, command.ID, fingerprint).Scan(&existingID)
 	if err == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return domain.PlanBundle{}, fmt.Errorf("commit reused plan: %w", err)
@@ -118,18 +118,47 @@ func (r PlanningRepoPG) CreatePlan(
 	if currentStatus == domain.CommandStatusCancelled || currentStatus == domain.CommandStatusCompleted {
 		return domain.PlanBundle{}, fmt.Errorf("command cannot be planned from status %s: %w", currentStatus, domain.ErrInvalidStatus)
 	}
+	if currentStatus == domain.CommandStatusRunning {
+		return domain.PlanBundle{}, fmt.Errorf("a running command must be paused and replanned explicitly: %w", domain.ErrInvalidStatus)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE approval SET status = 'cancelled', decided_at = now(), comment = 'Заменено новой версией плана'
+WHERE status = 'pending' AND resource_type = 'plan'
+  AND resource_id IN (SELECT id FROM plan WHERE command_id = $1)`, command.ID); err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("invalidate prior plan approvals: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE work_item SET status = 'cancelled', updated_at = now()
+WHERE status = 'proposed' AND plan_id IN (SELECT id FROM plan WHERE command_id = $1)`, command.ID); err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("invalidate prior work item proposals: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE task SET status = 'cancelled', completed_at = now()
+WHERE status NOT IN ('completed', 'failed', 'cancelled')
+  AND plan_id IN (SELECT id FROM plan WHERE command_id = $1)`, command.ID); err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("cancel prior plan tasks: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE plan SET status = 'cancelled', updated_at = now()
+WHERE command_id = $1 AND status IN ('discussion', 'ready_for_approval', 'awaiting_approval', 'approved')`, command.ID); err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("invalidate prior plan versions: %w", err)
+	}
 	var plan domain.Plan
+	sourceKind := domain.PlanSourceDiscussion
+	if len(input.SourceIssues) > 0 {
+		sourceKind = domain.PlanSourceIssue
+	}
 	err = tx.QueryRow(ctx, `
 INSERT INTO plan (
     command_id, status, version, summary, risk_level, requires_approval,
-    topology_revision_id, fingerprint, planner_input, planner_output
+	    topology_revision_id, fingerprint, planner_fingerprint, planner_input, planner_output, source_kind
 ) VALUES (
-    $1, 'awaiting_approval',
+    $1, 'discussion',
     (SELECT COALESCE(MAX(version), 0) + 1 FROM plan WHERE command_id = $1),
-    $2, $3, true, $4, $5, $6, $7
+	    $2, $3, true, $4, $5, $5, $6, $7, $8
 )
 RETURNING `+planColumns, command.ID, output.Summary, output.RiskLevel,
-		input.TopologyRevisionID, fingerprint, rawInput, rawOutput).Scan(planScanTargets(&plan)...)
+		input.TopologyRevisionID, fingerprint, rawInput, rawOutput, sourceKind).Scan(planScanTargets(&plan)...)
 	if err != nil {
 		return domain.PlanBundle{}, mapPlanningError(err)
 	}
@@ -166,16 +195,6 @@ VALUES ($1, $2, $3)`, taskID, dependsOnID, dependency.DependencyType); err != ni
 			return domain.PlanBundle{}, mapPlanningError(err)
 		}
 	}
-	var approvalID string
-	if err := tx.QueryRow(ctx, `
-INSERT INTO approval (resource_type, resource_id, action, status)
-VALUES ('plan', $1, 'run', 'pending')
-RETURNING id`, plan.ID).Scan(&approvalID); err != nil {
-		return domain.PlanBundle{}, mapPlanningError(err)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE plan SET approval_id = $2, updated_at = now() WHERE id = $1`, plan.ID, approvalID); err != nil {
-		return domain.PlanBundle{}, fmt.Errorf("attach plan approval: %w", err)
-	}
 	if _, err := tx.Exec(ctx, `UPDATE command SET status = 'planned' WHERE id = $1`, command.ID); err != nil {
 		return domain.PlanBundle{}, fmt.Errorf("mark command planned: %w", err)
 	}
@@ -203,6 +222,12 @@ func (r PlanningRepoPG) GetPlan(ctx context.Context, id string) (domain.PlanBund
 	if bundle.Dependencies, err = r.listDependencies(ctx, id); err != nil {
 		return domain.PlanBundle{}, err
 	}
+	if bundle.WorkItems, err = (WorkItemRepoPG{Pool: r.Pool}).ListPlanWorkItems(ctx, id); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if bundle.Discussion, err = r.listPlanComments(ctx, id); err != nil {
+		return domain.PlanBundle{}, err
+	}
 	if bundle.Plan.ApprovalID != nil {
 		approval, approvalErr := scanApproval(r.Pool.QueryRow(ctx, `SELECT `+approvalColumns+` FROM approval WHERE id = $1`, *bundle.Plan.ApprovalID))
 		if approvalErr != nil {
@@ -219,15 +244,91 @@ func (r PlanningRepoPG) GetPlan(ctx context.Context, id string) (domain.PlanBund
 	return bundle, nil
 }
 
-func (r PlanningRepoPG) ApprovePlan(ctx context.Context, id, actor, comment string) (domain.PlanBundle, error) {
-	return r.decidePlan(ctx, id, actor, comment, true)
+func (r PlanningRepoPG) AddPlanComment(ctx context.Context, id, author, body string) (domain.PlanBundle, error) {
+	author, body = strings.TrimSpace(author), strings.TrimSpace(body)
+	if author == "" || body == "" || len(body) > 10000 {
+		return domain.PlanBundle{}, fmt.Errorf("plan comment author and bounded body are required: %w", domain.ErrValidation)
+	}
+	command, err := r.Pool.Exec(ctx, `
+INSERT INTO plan_comment (plan_id, revision, author, body)
+SELECT id, discussion_revision, $2, $3 FROM plan
+WHERE id = $1 AND status = 'discussion'`, id, author, body)
+	if err != nil {
+		return domain.PlanBundle{}, mapPlanningError(err)
+	}
+	if command.RowsAffected() != 1 {
+		return domain.PlanBundle{}, fmt.Errorf("only a discussion plan accepts comments: %w", domain.ErrInvalidStatus)
+	}
+	return r.GetPlan(ctx, id)
+}
+
+func (r PlanningRepoPG) SubmitPlan(ctx context.Context, id, actor, comment string) (domain.PlanBundle, error) {
+	tx, err := r.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("begin plan submission: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var plan domain.Plan
+	if err := tx.QueryRow(ctx, `SELECT `+planColumns+` FROM plan WHERE id = $1 FOR UPDATE`, id).Scan(planScanTargets(&plan)...); err != nil {
+		return domain.PlanBundle{}, mapPlanningError(err)
+	}
+	if plan.Status != domain.PlanStatusDiscussion {
+		return domain.PlanBundle{}, fmt.Errorf("plan is not in discussion: %w", domain.ErrInvalidStatus)
+	}
+	var isLatest bool
+	if err := tx.QueryRow(ctx, `
+SELECT version = (SELECT max(version) FROM plan WHERE command_id = $1)
+FROM plan WHERE id = $2`, plan.CommandID, id).Scan(&isLatest); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if !isLatest {
+		return domain.PlanBundle{}, fmt.Errorf("only the latest plan version can be submitted: %w", domain.ErrConflict)
+	}
+	var taskCount, issueCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task WHERE plan_id = $1`, id).Scan(&taskCount); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM work_item
+WHERE plan_id = $1 AND kind = 'issue' AND status IN ('proposed', 'published')
+  AND plan_fingerprint = $2`, id, plan.Fingerprint).Scan(&issueCount); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if taskCount == 0 || issueCount != taskCount {
+		return domain.PlanBundle{}, fmt.Errorf("every plan task needs an issue proposal before submission: %w", domain.ErrApprovalNeeded)
+	}
+	var approvalID string
+	if err := tx.QueryRow(ctx, `
+INSERT INTO approval (resource_type, resource_id, action, status, comment)
+VALUES ('plan', $1, 'run', 'pending', NULLIF($2, ''))
+RETURNING id`, id, strings.TrimSpace(comment)).Scan(&approvalID); err != nil {
+		return domain.PlanBundle{}, mapPlanningError(err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE plan SET status = 'awaiting_approval', approval_id = $2, updated_at = now()
+WHERE id = $1`, id, approvalID); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if err := insertResourceAuditTx(ctx, tx, "plan", "plan.submitted", id, map[string]any{
+		"actor": strings.TrimSpace(actor), "fingerprint": plan.Fingerprint,
+	}); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PlanBundle{}, fmt.Errorf("commit plan submission: %w", err)
+	}
+	return r.GetPlan(ctx, id)
+}
+
+func (r PlanningRepoPG) ApprovePlan(ctx context.Context, id, expectedFingerprint, actor, comment string) (domain.PlanBundle, error) {
+	return r.decidePlan(ctx, id, expectedFingerprint, actor, comment, true)
 }
 
 func (r PlanningRepoPG) RejectPlan(ctx context.Context, id, actor, comment string) (domain.PlanBundle, error) {
-	return r.decidePlan(ctx, id, actor, comment, false)
+	return r.decidePlan(ctx, id, "", actor, comment, false)
 }
 
-func (r PlanningRepoPG) decidePlan(ctx context.Context, id, actor, comment string, approve bool) (domain.PlanBundle, error) {
+func (r PlanningRepoPG) decidePlan(ctx context.Context, id, expectedFingerprint, actor, comment string, approve bool) (domain.PlanBundle, error) {
 	tx, err := r.Pool.Begin(ctx)
 	if err != nil {
 		return domain.PlanBundle{}, fmt.Errorf("begin plan decision: %w", err)
@@ -254,6 +355,18 @@ func (r PlanningRepoPG) decidePlan(ctx context.Context, id, actor, comment strin
 	if plan.Status != domain.PlanStatusAwaitingApproval || plan.ApprovalID == nil {
 		return domain.PlanBundle{}, fmt.Errorf("plan is not awaiting approval: %w", domain.ErrInvalidStatus)
 	}
+	var isLatest bool
+	if err := tx.QueryRow(ctx, `
+SELECT version = (SELECT max(version) FROM plan WHERE command_id = $1)
+FROM plan WHERE id = $2`, plan.CommandID, id).Scan(&isLatest); err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if !isLatest {
+		return domain.PlanBundle{}, fmt.Errorf("only the latest plan version can be decided: %w", domain.ErrConflict)
+	}
+	if approve && (strings.TrimSpace(expectedFingerprint) == "" || expectedFingerprint != plan.Fingerprint) {
+		return domain.PlanBundle{}, fmt.Errorf("approval fingerprint does not match this plan version: %w", domain.ErrConflict)
+	}
 	actor = strings.TrimSpace(actor)
 	if actor == "" {
 		actor = "owner"
@@ -268,7 +381,10 @@ WHERE id = $1 AND status = 'pending'`, *plan.ApprovalID, approvalStatus, actor, 
 		return domain.PlanBundle{}, fmt.Errorf("plan approval is no longer pending: %w", domain.ErrConflict)
 	}
 	if _, err := tx.Exec(ctx, `
-UPDATE plan SET status = $2::varchar, approved_at = CASE WHEN $2::varchar = 'approved' THEN now() ELSE approved_at END, updated_at = now()
+UPDATE plan SET status = $2::varchar,
+    approved_at = CASE WHEN $2::varchar = 'approved' THEN now() ELSE approved_at END,
+    approved_fingerprint = CASE WHEN $2::varchar = 'approved' THEN fingerprint ELSE approved_fingerprint END,
+    updated_at = now()
 WHERE id = $1`, id, target); err != nil {
 		return domain.PlanBundle{}, fmt.Errorf("update plan decision: %w", err)
 	}
@@ -315,6 +431,31 @@ func (r PlanningRepoPG) PrepareRun(ctx context.Context, planID string, maxParall
 	}
 	if plan.Status != domain.PlanStatusApproved {
 		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("plan must be approved before run: %w", domain.ErrApprovalNeeded)
+	}
+	var isLatest bool
+	if err := tx.QueryRow(ctx, `
+SELECT version = (SELECT max(version) FROM plan WHERE command_id = $1)
+FROM plan WHERE id = $2`, plan.CommandID, planID).Scan(&isLatest); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if !isLatest {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("only the latest plan version can run: %w", domain.ErrConflict)
+	}
+	if plan.ApprovedFingerprint == nil || *plan.ApprovedFingerprint != plan.Fingerprint {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("plan content changed after approval: %w", domain.ErrApprovalNeeded)
+	}
+	var taskCount, publishedIssueCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task WHERE plan_id = $1`, planID).Scan(&taskCount); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM work_item
+WHERE plan_id = $1 AND kind = 'issue' AND status IN ('published', 'closed')
+  AND plan_fingerprint = $2`, planID, plan.Fingerprint).Scan(&publishedIssueCount); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if taskCount == 0 || publishedIssueCount != taskCount {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("every task needs a published issue before run: %w", domain.ErrApprovalNeeded)
 	}
 	workflowID := fmt.Sprintf("plan-%s-v%d", plan.ID, plan.Version)
 	run, err := scanPlanRun(tx.QueryRow(ctx, `
@@ -570,6 +711,25 @@ ORDER BY dependency.task_id, dependency.depends_on_task_id`, planID)
 	return result, rows.Err()
 }
 
+func (r PlanningRepoPG) listPlanComments(ctx context.Context, planID string) ([]domain.PlanComment, error) {
+	rows, err := r.Pool.Query(ctx, `
+SELECT id, plan_id, revision, author, body, created_at
+FROM plan_comment WHERE plan_id = $1 ORDER BY revision, created_at, id`, planID)
+	if err != nil {
+		return nil, fmt.Errorf("list plan discussion: %w", err)
+	}
+	defer rows.Close()
+	comments := make([]domain.PlanComment, 0)
+	for rows.Next() {
+		var comment domain.PlanComment
+		if err := rows.Scan(&comment.ID, &comment.PlanID, &comment.Revision, &comment.Author, &comment.Body, &comment.CreatedAt); err != nil {
+			return nil, err
+		}
+		comments = append(comments, comment)
+	}
+	return comments, rows.Err()
+}
+
 func validCommandSource(source domain.CommandSource) bool {
 	return source == domain.CommandSourceAPI || source == domain.CommandSourceCLI || source == domain.CommandSourceTelegram
 }
@@ -631,14 +791,17 @@ func scanCommand(row rowScanner) (domain.Command, error) {
 
 const planColumns = `id, command_id, approval_id, topology_revision_id, status, version,
 summary, risk_level, requires_approval, COALESCE(fingerprint, ''), planner_input, planner_output,
-replan_count, created_at, updated_at, approved_at`
+replan_count, source_kind, discussion_revision, approved_fingerprint, planner_fingerprint,
+created_at, updated_at, approved_at`
 
 func planScanTargets(value *domain.Plan) []any {
 	return []any{
 		&value.ID, &value.CommandID, &value.ApprovalID, &value.TopologyRevisionID,
 		&value.Status, &value.Version, &value.Summary, &value.RiskLevel,
 		&value.RequiresApproval, &value.Fingerprint, &value.PlannerInput, &value.PlannerOutput,
-		&value.ReplanCount, &value.CreatedAt, &value.UpdatedAt, &value.ApprovedAt,
+		&value.ReplanCount, &value.SourceKind, &value.DiscussionRevision,
+		&value.ApprovedFingerprint, &value.PlannerFingerprint,
+		&value.CreatedAt, &value.UpdatedAt, &value.ApprovedAt,
 	}
 }
 

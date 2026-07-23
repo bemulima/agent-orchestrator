@@ -213,33 +213,27 @@ func TestPlanWorkflowRetriesChangesRequestedTaskAfterOwnerSignal(t *testing.T) {
 	require.Equal(t, 1, retries)
 }
 
-func TestPlanWorkflowRunsRequiredTaskBeforeResumingParent(t *testing.T) {
+func TestPlanWorkflowPausesInsteadOfInjectingRequiredTasks(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	environment := suite.NewTestWorkflowEnvironment()
 	environment.RegisterActivity(&activities.PlanActivities{})
 	registerPlanStatusMocks(environment)
 	environment.OnActivity("DispatchPlanTask", mock.Anything, mock.Anything).Return(domain.Task{}, nil)
-	parentRuns := 0
-	order := make([]string, 0, 3)
+	order := make([]string, 0, 1)
 	environment.OnActivity("ExecutePlanTask", mock.Anything, mock.Anything).Return(
 		func(_ context.Context, input activities.ExecutePlanTaskInput) (domain.TaskExecutionOutcome, error) {
 			order = append(order, input.TaskID)
-			if input.TaskID == "parent" {
-				parentRuns++
-				if parentRuns == 1 {
-					return domain.TaskExecutionOutcome{
-						Result: domain.TaskResult{TaskID: "parent", Status: domain.TaskStatusBlocked},
-						RequiredSchedule: &domain.RequiredTaskSchedule{
-							Tasks:              []domain.ScheduledTask{{TaskID: "required", Priority: 2}},
-							ParentDependencies: []string{"required"},
-						},
-					}, nil
-				}
-			}
-			return domain.TaskExecutionOutcome{Result: domain.TaskResult{TaskID: input.TaskID, Status: domain.TaskStatusCompleted}}, nil
+			return domain.TaskExecutionOutcome{
+				Result: domain.TaskResult{TaskID: input.TaskID, Status: domain.TaskStatusBlocked, Error: "требуется перепланирование"},
+				RequiredSchedule: &domain.RequiredTaskSchedule{
+					Tasks: []domain.ScheduledTask{{TaskID: "required", Priority: 2}}, ParentDependencies: []string{"required"},
+				},
+			}, nil
 		},
 	)
-	environment.OnActivity("RetryPlanTask", mock.Anything, mock.Anything).Return(domain.Task{}, nil)
+	environment.RegisterDelayedCallback(func() {
+		environment.SignalWorkflow(PlanCancelSignal, true)
+	}, time.Second)
 
 	environment.ExecuteWorkflow(PlanWorkflow, domain.PlanSchedule{
 		RunID: "run", PlanID: "plan", MaxParallelTasks: 1, MaxActivityAttempts: 3, ExecuteTasks: true,
@@ -249,8 +243,8 @@ func TestPlanWorkflowRunsRequiredTaskBeforeResumingParent(t *testing.T) {
 	require.NoError(t, environment.GetWorkflowError())
 	var output PlanWorkflowOutput
 	require.NoError(t, environment.GetWorkflowResult(&output))
-	require.Equal(t, domain.PlanRunStatusCompleted, output.Status)
-	require.Equal(t, []string{"parent", "required", "parent"}, order)
+	require.Equal(t, domain.PlanRunStatusCancelled, output.Status)
+	require.Equal(t, []string{"parent"}, order)
 }
 
 func registerPlanStatusMocks(environment *testsuite.TestWorkflowEnvironment) {

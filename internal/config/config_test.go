@@ -97,12 +97,14 @@ func TestLoad_ValidatesGitLabSigningToken(t *testing.T) {
 	}
 }
 
-func TestConfig_ModelUsesProfilesWithoutCompiledDefaults(t *testing.T) {
+func TestConfig_ModelAndReasoningUseComplexityProfiles(t *testing.T) {
 	cfg := Config{
 		CodexModelFast:     "configured-fast",
 		CodexModelStandard: "configured-standard",
 		CodexModelDeep:     "configured-deep",
 		CodexModelReview:   "configured-review",
+		CodexReasoningFast: "low", CodexReasoningStandard: "medium",
+		CodexReasoningDeep: "high", CodexReasoningReview: "xhigh",
 	}
 
 	tests := map[string]string{
@@ -110,6 +112,9 @@ func TestConfig_ModelUsesProfilesWithoutCompiledDefaults(t *testing.T) {
 		ModelProfileStandard: "configured-standard",
 		ModelProfileDeep:     "configured-deep",
 		ModelProfileReview:   "configured-review",
+	}
+	reasoning := map[string]string{
+		ModelProfileFast: "low", ModelProfileStandard: "medium", ModelProfileDeep: "high", ModelProfileReview: "xhigh",
 	}
 	for profile, want := range tests {
 		got, err := cfg.Model(profile)
@@ -119,9 +124,48 @@ func TestConfig_ModelUsesProfilesWithoutCompiledDefaults(t *testing.T) {
 		if got != want {
 			t.Fatalf("Model(%q) = %q, want %q", profile, got, want)
 		}
+		gotEffort, err := cfg.ReasoningEffort(profile)
+		if err != nil || gotEffort != reasoning[profile] {
+			t.Fatalf("ReasoningEffort(%q) = %q, %v", profile, gotEffort, err)
+		}
 	}
 	if _, err := cfg.Model("unknown"); err == nil {
 		t.Fatal("Model(unknown) error = nil")
+	}
+	if _, err := cfg.ReasoningEffort("unknown"); err == nil {
+		t.Fatal("ReasoningEffort(unknown) error = nil")
+	}
+}
+
+func TestLoadUsesChatGPTCodexModelDefaults(t *testing.T) {
+	t.Setenv("REPOSITORY_ALLOWED_ROOTS", "/projects")
+	t.Setenv("REPOSITORY_STORAGE_PATH", "/data/repositories")
+	t.Setenv("WORKTREE_STORAGE_PATH", "/data/worktrees")
+	t.Setenv("CODEX_MODEL_FAST", "")
+	t.Setenv("CODEX_MODEL_STANDARD", "")
+	t.Setenv("CODEX_MODEL_DEEP", "")
+	t.Setenv("CODEX_MODEL_REVIEW", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CodexModelFast != "gpt-5.6-terra" || cfg.CodexModelDeep != "gpt-5.6" ||
+		cfg.CodexReasoningFast != "low" || cfg.CodexReasoningDeep != "high" {
+		t.Fatalf("unexpected Codex defaults: %#v", cfg.SafeSummary())
+	}
+}
+
+func TestLoadUsesFakeWorkItemsByDefaultAndGatesRealGitHub(t *testing.T) {
+	t.Setenv("WORK_ITEM_GATEWAY", "")
+	cfg, err := Load()
+	if err != nil || cfg.WorkItemGateway != "fake" {
+		t.Fatalf("default work-item gateway = %q, %v", cfg.WorkItemGateway, err)
+	}
+	t.Setenv("WORK_ITEM_GATEWAY", "github")
+	t.Setenv("GITHUB_DRY_RUN", "false")
+	t.Setenv("GITHUB_TOKEN", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted real GitHub publication without a token")
 	}
 }
 

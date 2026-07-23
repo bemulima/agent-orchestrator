@@ -3,13 +3,20 @@ import type { AgentMessageItem, ThreadEvent } from "@openai/codex-sdk";
 export const MAX_INPUT_BYTES = 1024 * 1024;
 export const MAX_RESULT_BYTES = 512 * 1024;
 
-export type RunnerRole = "coder" | "reviewer" | "analyst";
+export type RunnerRole =
+  | "coder"
+  | "reviewer"
+  | "analyst"
+  | "planner"
+  | "issue-manager"
+  | "pull-request-manager";
 
 export interface RunRequest {
   role: RunnerRole;
   thread_id?: string;
   working_directory: string;
   model?: string;
+  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   prompt: string;
   output_schema: Record<string, unknown>;
 }
@@ -23,8 +30,15 @@ export function parseRequest(value: unknown): RunRequest {
   if (!isRecord(value)) {
     throw new Error("request must be a JSON object");
   }
-  if (value.role !== "coder" && value.role !== "reviewer" && value.role !== "analyst") {
-    throw new Error("role must be coder, reviewer, or analyst");
+  if (
+    value.role !== "coder" &&
+    value.role !== "reviewer" &&
+    value.role !== "analyst" &&
+    value.role !== "planner" &&
+    value.role !== "issue-manager" &&
+    value.role !== "pull-request-manager"
+  ) {
+    throw new Error("role is not supported");
   }
   const request: RunRequest = {
     role: value.role,
@@ -37,6 +51,18 @@ export function parseRequest(value: unknown): RunRequest {
   }
   if (value.model !== undefined) {
     request.model = requiredString(value, "model");
+  }
+  if (value.reasoning_effort !== undefined) {
+    if (
+      value.reasoning_effort !== "minimal" &&
+      value.reasoning_effort !== "low" &&
+      value.reasoning_effort !== "medium" &&
+      value.reasoning_effort !== "high" &&
+      value.reasoning_effort !== "xhigh"
+    ) {
+      throw new Error("reasoning_effort is not supported");
+    }
+    request.reasoning_effort = value.reasoning_effort;
   }
   return request;
 }

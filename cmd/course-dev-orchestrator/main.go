@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +32,7 @@ import (
 	pgadapter "github.com/bemulima/agent-orchestrator/internal/adapters/postgres"
 	telegramadapter "github.com/bemulima/agent-orchestrator/internal/adapters/telegram"
 	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
+	workitemadapter "github.com/bemulima/agent-orchestrator/internal/adapters/workitem"
 	"github.com/bemulima/agent-orchestrator/internal/agent"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
@@ -49,6 +51,7 @@ import (
 	telegramuc "github.com/bemulima/agent-orchestrator/internal/usecase/telegram"
 	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
+	workitemservice "github.com/bemulima/agent-orchestrator/internal/workitem"
 )
 
 var (
@@ -105,7 +108,8 @@ func run(args []string) error {
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
-	case "plan", "plan-show", "plan-approve", "plan-reject", "plan-run",
+	case "plan", "plan-show", "plan-comment", "plan-issues", "plan-submit", "plan-approve", "plan-reject",
+		"plan-publish-issues", "plan-run", "task-pr-prepare", "task-pr-publish",
 		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-log", "task-retry", "task-cancel":
 		return runPlanningCommand(cfg, command, args[1:], os.Stdout)
 	case "gitlab-sync", "gitlab-links":
@@ -167,10 +171,17 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	planningOperations := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
 		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
 	})
+	workItemOperations, err := newWorkItemOperations(cfg, pool)
+	if err != nil {
+		return err
+	}
 	planningHandler := handlers.PlanningHandler{
 		CreateCommand: planningOperations.CreateCommand, GetCommand: planningOperations.GetCommand,
 		CreatePlan: planningOperations.CreatePlan, GetPlan: planningOperations.GetPlan,
+		CommentPlan: planningOperations.CommentPlan, SubmitPlan: planningOperations.SubmitPlan,
 		ApprovePlan: planningOperations.ApprovePlan, RejectPlan: planningOperations.RejectPlan,
+		PrepareIssues: workItemOperations.IssueManager, PublishIssues: workItemOperations.IssuePublisher,
+		PreparePR: workItemOperations.PullRequestManager, PublishPR: workItemOperations.PullRequestPublisher,
 		StartPlan: planningOperations.StartPlan, GetRun: planningOperations.GetRun,
 		ControlRun: planningOperations.ControlRun, GetTask: planningOperations.GetTask,
 		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
@@ -348,6 +359,8 @@ type planningOperations struct {
 	GetCommand    planninguc.GetCommand
 	CreatePlan    planninguc.CreatePlan
 	GetPlan       planninguc.GetPlan
+	CommentPlan   planninguc.CommentPlan
+	SubmitPlan    planninguc.SubmitPlan
 	ApprovePlan   planninguc.ApprovePlan
 	RejectPlan    planninguc.RejectPlan
 	StartPlan     planninguc.StartPlan
@@ -369,13 +382,15 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 		CreateCommand: planninguc.CreateCommand{Plans: plans},
 		GetCommand:    planninguc.GetCommand{Plans: plans},
 		CreatePlan: planninguc.CreatePlan{
-			Plans: plans, Topology: catalog,
+			Plans: plans, Topology: catalog, Projects: pgadapter.ProjectRepoPG{Pool: pool},
 			Planner: planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
 			Validator: planningengine.Validator{
 				MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
 			},
 		},
 		GetPlan:     planninguc.GetPlan{Plans: plans},
+		CommentPlan: planninguc.CommentPlan{Plans: plans},
+		SubmitPlan:  planninguc.SubmitPlan{Plans: plans},
 		ApprovePlan: planninguc.ApprovePlan{Plans: plans},
 		RejectPlan:  planninguc.RejectPlan{Plans: plans},
 		StartPlan: planninguc.StartPlan{
@@ -393,6 +408,54 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 			Plans: plans, Tasks: taskExecutions, Runner: runner, MaxAttempts: cfg.MaxTaskAttempts,
 		},
 	}
+}
+
+type workItemOperations struct {
+	IssueManager         workitemservice.IssueManager
+	IssuePublisher       workitemservice.IssuePublisher
+	PullRequestManager   workitemservice.PullRequestManager
+	PullRequestPublisher workitemservice.PullRequestPublisher
+}
+
+func newWorkItemOperations(cfg config.Config, pool *pgxpool.Pool) (workItemOperations, error) {
+	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return workItemOperations{}, err
+	}
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	projects := pgadapter.ProjectRepoPG{Pool: pool}
+	items := pgadapter.WorkItemRepoPG{Pool: pool}
+	var gateway repository.WorkItemGateway
+	if cfg.WorkItemGateway == "fake" {
+		gateway = workitemadapter.NewFakeGateway()
+	} else {
+		gateway = &workitemadapter.GitHubGateway{
+			BaseURL: cfg.GitHubBaseURL, Token: cfg.GitHubToken, DryRunMode: cfg.GitHubDryRun,
+		}
+	}
+	models := map[string]string{
+		config.ModelProfileFast: cfg.CodexModelFast, config.ModelProfileStandard: cfg.CodexModelStandard,
+		config.ModelProfileDeep: cfg.CodexModelDeep,
+	}
+	reasoning := map[string]string{
+		config.ModelProfileFast: cfg.CodexReasoningFast, config.ModelProfileStandard: cfg.CodexReasoningStandard,
+		config.ModelProfileDeep: cfg.CodexReasoningDeep,
+	}
+	issueManager := workitemservice.IssueManager{
+		Plans: plans, Projects: projects, Items: items, Gateway: gateway, Runner: runner, Models: models, Reasoning: reasoning,
+	}
+	pullRequestManager := workitemservice.PullRequestManager{
+		Plans: plans, Projects: projects, Items: items, Executions: pgadapter.TaskExecutionRepoPG{Pool: pool},
+		Gateway: gateway, Runner: runner, Models: models, Reasoning: reasoning,
+	}
+	return workItemOperations{
+		IssueManager: issueManager,
+		IssuePublisher: workitemservice.IssuePublisher{
+			Plans: plans, Projects: projects, Items: items, Gateway: gateway,
+		},
+		PullRequestManager:   pullRequestManager,
+		PullRequestPublisher: workitemservice.PullRequestPublisher{Manager: pullRequestManager},
+	}, nil
 }
 
 type topologyOperations struct {
@@ -441,6 +504,7 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) (onboardingO
 	}
 	semanticGenerator := onboardinggenerator.SemanticGenerator{
 		Base: generator, Runner: runner, Projects: projects, Model: cfg.CodexModelDeep,
+		ReasoningEffort: cfg.CodexReasoningDeep,
 	}
 	worktrees := gitadapter.OnboardingWorktree{
 		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
@@ -685,6 +749,13 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 		runner = temporaladapter.PlanRunner{Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue}
 	}
 	operations := newPlanningOperations(cfg, pool, runner)
+	var workItems workItemOperations
+	if planningCommandNeedsWorkItems(command) {
+		workItems, err = newWorkItemOperations(cfg, pool)
+		if err != nil {
+			return err
+		}
+	}
 
 	switch command {
 	case "plan":
@@ -692,6 +763,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 		flags.SetOutput(io.Discard)
 		file := flags.String("file", "", "natural-language command file")
 		projectIDs := flags.String("project-ids", "", "optional comma-separated project IDs")
+		sourceIssues := flags.String("source-issues", "", "optional provider:project-id:number list")
 		if err := flags.Parse(args); err != nil {
 			return fmt.Errorf("parse plan flags: %w", err)
 		}
@@ -708,14 +780,18 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 		if err != nil {
 			return err
 		}
+		issueReferences, err := parseIssueReferences(*sourceIssues)
+		if err != nil {
+			return err
+		}
 		bundle, err := operations.CreatePlan.Handle(ctx, created.ID, domain.PlanRequest{
-			RequestedProjectIDs: commaSeparated(*projectIDs),
+			RequestedProjectIDs: commaSeparated(*projectIDs), SourceIssues: issueReferences,
 		})
 		if err != nil {
 			return err
 		}
 		return writeJSON(output, bundle)
-	case "plan-show", "plan-approve", "plan-reject", "plan-run":
+	case "plan-show", "plan-comment", "plan-submit", "plan-reject", "plan-run":
 		planID, actor, comment, err := planCommandFlags(command, args)
 		if err != nil {
 			return err
@@ -727,12 +803,20 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 				return getErr
 			}
 			return writeJSON(output, bundle)
-		case "plan-approve":
-			bundle, approveErr := operations.ApprovePlan.Handle(ctx, planninguc.DecidePlanInput{
+		case "plan-comment":
+			bundle, commentErr := operations.CommentPlan.Handle(ctx, planninguc.DecidePlanInput{
 				PlanID: planID, Actor: actor, Comment: comment,
 			})
-			if approveErr != nil {
-				return approveErr
+			if commentErr != nil {
+				return commentErr
+			}
+			return writeJSON(output, bundle)
+		case "plan-submit":
+			bundle, submitErr := operations.SubmitPlan.Handle(ctx, planninguc.DecidePlanInput{
+				PlanID: planID, Actor: actor, Comment: comment,
+			})
+			if submitErr != nil {
+				return submitErr
 			}
 			return writeJSON(output, bundle)
 		case "plan-reject":
@@ -750,6 +834,62 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 			}
 			return writeJSON(output, run)
 		}
+	case "plan-approve":
+		planID, fingerprint, actor, comment, err := approvePlanCommandFlags(command, args)
+		if err != nil {
+			return err
+		}
+		bundle, err := operations.ApprovePlan.Handle(ctx, planninguc.DecidePlanInput{
+			PlanID: planID, Fingerprint: fingerprint, Actor: actor, Comment: comment,
+		})
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, bundle)
+	case "plan-issues", "plan-publish-issues":
+		planID, err := requiredIDFlag(command, args, "plan-id")
+		if err != nil {
+			return err
+		}
+		if command == "plan-issues" {
+			items, prepareErr := workItems.IssueManager.Prepare(ctx, planID)
+			if prepareErr != nil {
+				return prepareErr
+			}
+			return writeJSON(output, map[string]any{"work_items": items})
+		}
+		items, publishErr := workItems.IssuePublisher.Publish(ctx, planID)
+		if publishErr != nil {
+			return publishErr
+		}
+		return writeJSON(output, map[string]any{
+			"work_items": items, "gateway": cfg.WorkItemGateway,
+			"external_write": cfg.WorkItemGateway == "github" && !cfg.GitHubDryRun,
+		})
+	case "task-pr-prepare", "task-pr-publish":
+		flagName := "task-id"
+		if command == "task-pr-publish" {
+			flagName = "work-item-id"
+		}
+		identifier, err := requiredIDFlag(command, args, flagName)
+		if err != nil {
+			return err
+		}
+		if command == "task-pr-prepare" {
+			item, prepareErr := workItems.PullRequestManager.Prepare(ctx, identifier)
+			if prepareErr != nil {
+				return prepareErr
+			}
+			return writeJSON(output, item)
+		}
+		item, publishErr := workItems.PullRequestPublisher.Publish(ctx, identifier)
+		if publishErr != nil {
+			return publishErr
+		}
+		return writeJSON(output, map[string]any{
+			"work_item": item, "gateway": cfg.WorkItemGateway,
+			"external_write": cfg.WorkItemGateway == "github" && !cfg.GitHubDryRun,
+		})
 	case "run-status", "run-pause", "run-resume", "run-cancel":
 		runID, err := requiredIDFlag(command, args, "run-id")
 		if err != nil {
@@ -844,6 +984,15 @@ func planningCommandNeedsTemporal(command string) bool {
 	}
 }
 
+func planningCommandNeedsWorkItems(command string) bool {
+	switch command {
+	case "plan-issues", "plan-publish-issues", "task-pr-prepare", "task-pr-publish":
+		return true
+	default:
+		return false
+	}
+}
+
 func readCommandFile(path string) (string, error) {
 	absolute, err := filepath.Abs(strings.TrimSpace(path))
 	if err != nil {
@@ -886,6 +1035,29 @@ func commaSeparated(value string) []string {
 	return result
 }
 
+func parseIssueReferences(value string) ([]domain.IssueReference, error) {
+	parts := commaSeparated(value)
+	result := make([]domain.IssueReference, 0, len(parts))
+	for _, part := range parts {
+		fields := strings.Split(part, ":")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("source issue must be provider:project-id:number: %w", domain.ErrValidation)
+		}
+		provider := domain.IssueProvider(strings.TrimSpace(fields[0]))
+		if provider != domain.IssueProviderGitHub && provider != domain.IssueProviderGitLab {
+			return nil, fmt.Errorf("unsupported source issue provider %q: %w", provider, domain.ErrValidation)
+		}
+		number, err := strconv.ParseInt(strings.TrimSpace(fields[2]), 10, 64)
+		if err != nil || number < 1 || strings.TrimSpace(fields[1]) == "" {
+			return nil, fmt.Errorf("invalid source issue %q: %w", part, domain.ErrValidation)
+		}
+		result = append(result, domain.IssueReference{
+			Provider: provider, ProjectID: strings.TrimSpace(fields[1]), Number: number,
+		})
+	}
+	return result, nil
+}
+
 func planCommandFlags(command string, args []string) (planID, actor, comment string, err error) {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -899,6 +1071,23 @@ func planCommandFlags(command string, args []string) (planID, actor, comment str
 		return "", "", "", fmt.Errorf("--plan-id is required: %w", domain.ErrValidation)
 	}
 	return strings.TrimSpace(*planIDValue), strings.TrimSpace(*actorValue), strings.TrimSpace(*commentValue), nil
+}
+
+func approvePlanCommandFlags(command string, args []string) (planID, fingerprint, actor, comment string, err error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	planIDValue := flags.String("plan-id", "", "plan ID")
+	fingerprintValue := flags.String("fingerprint", "", "exact plan fingerprint")
+	actorValue := flags.String("actor", "owner", "decision actor")
+	commentValue := flags.String("comment", "", "decision comment")
+	if parseErr := flags.Parse(args); parseErr != nil {
+		return "", "", "", "", fmt.Errorf("parse %s flags: %w", command, parseErr)
+	}
+	if strings.TrimSpace(*planIDValue) == "" || strings.TrimSpace(*fingerprintValue) == "" || flags.NArg() != 0 {
+		return "", "", "", "", fmt.Errorf("--plan-id and --fingerprint are required: %w", domain.ErrValidation)
+	}
+	return strings.TrimSpace(*planIDValue), strings.TrimSpace(*fingerprintValue),
+		strings.TrimSpace(*actorValue), strings.TrimSpace(*commentValue), nil
 }
 
 func requiredIDFlag(command string, args []string, name string) (string, error) {
@@ -993,12 +1182,17 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 			config.ModelProfileFast: cfg.CodexModelFast, config.ModelProfileStandard: cfg.CodexModelStandard,
 			config.ModelProfileDeep: cfg.CodexModelDeep,
 		},
-		ReviewModel: cfg.CodexModelReview, MaxTaskAttempts: cfg.MaxTaskAttempts,
-		MaxReviewAttempts: cfg.MaxReviewAttempts, MaxReplans: cfg.MaxReplans,
-		MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+		Reasoning: map[string]string{
+			config.ModelProfileFast: cfg.CodexReasoningFast, config.ModelProfileStandard: cfg.CodexReasoningStandard,
+			config.ModelProfileDeep: cfg.CodexReasoningDeep,
+		},
+		ReviewModel: cfg.CodexModelReview, ReviewReasoning: cfg.CodexReasoningReview, MaxTaskAttempts: cfg.MaxTaskAttempts,
+		MaxReviewAttempts: cfg.MaxReviewAttempts,
 	}
 
-	temporalWorker := worker.New(client, cfg.TemporalTaskQueue, worker.Options{})
+	temporalWorker := worker.New(client, cfg.TemporalTaskQueue, worker.Options{
+		MaxConcurrentActivityExecutionSize: cfg.MaxGlobalAgentRuns,
+	})
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.SystemProbeWorkflow)
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.PlanWorkflow)
 	temporalWorker.RegisterActivity(&activities.SystemActivities{})
@@ -1078,10 +1272,14 @@ Commands:
   contract-drift  List producer/consumer contract drift
   dependencies    Show direct dependencies and impact for a service
   consumers       Show direct and transitive consumers for a service
-  plan            Create an approval-gated DAG from a command file
-  plan-show       Show a persisted plan, tasks, dependencies, approval, and run
-  plan-approve    Approve a plan for execution
+  plan            Create a discussion-stage DAG from a command file or source issue
+  plan-show       Show a persisted plan, discussion, work items, approval, and run
+  plan-comment    Add an owner comment while discussing a plan
+  plan-issues     Ask issue-manage-agent for complete Russian issue proposals
+  plan-submit     Freeze the issue-backed plan version for owner approval
+  plan-approve    Approve an exact plan fingerprint
   plan-reject     Reject and cancel a plan
+  plan-publish-issues Publish approved issues (or preview in GitHub dry-run mode)
   plan-run        Start or reuse the Temporal plan workflow
   run-status      Show a plan run
   run-pause       Pause new task dispatch
@@ -1091,7 +1289,9 @@ Commands:
   task-log        Show task attempts, verification results, and artifacts
   task-retry      Retry a blocked or changes-requested task
   task-cancel     Signal cancellation for a dispatched task
-  gitlab-sync     Create or update plan/task issues and completed-task MRs
+  task-pr-prepare Ask the dedicated PR agent for a complete Russian draft PR proposal
+  task-pr-publish Publish an approved work-item proposal (or preview in dry-run mode)
+  gitlab-sync     Preview legacy GitLab projection; real writes are fail-closed
   gitlab-links    Show persisted GitLab links for a plan
   version         Print build version
   help            Show this help`)

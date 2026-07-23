@@ -85,10 +85,14 @@ course-dev-orchestrator contracts
 course-dev-orchestrator contract-drift
 course-dev-orchestrator dependencies --service repository-name
 course-dev-orchestrator consumers --service repository-name
-course-dev-orchestrator plan --file command.md [--project-ids uuid,uuid]
+course-dev-orchestrator plan --file command.md [--project-ids uuid,uuid] [--source-issues github:project-uuid:number]
 course-dev-orchestrator plan-show --plan-id UUID
-course-dev-orchestrator plan-approve --plan-id UUID --actor owner [--comment text]
+course-dev-orchestrator plan-comment --plan-id UUID --actor owner --comment text
+course-dev-orchestrator plan-issues --plan-id UUID
+course-dev-orchestrator plan-submit --plan-id UUID --actor owner [--comment text]
+course-dev-orchestrator plan-approve --plan-id UUID --fingerprint HASH --actor owner [--comment text]
 course-dev-orchestrator plan-reject --plan-id UUID --actor owner [--comment text]
+course-dev-orchestrator plan-publish-issues --plan-id UUID
 course-dev-orchestrator plan-run --plan-id UUID
 course-dev-orchestrator run-status --run-id UUID
 course-dev-orchestrator run-pause --run-id UUID
@@ -98,6 +102,8 @@ course-dev-orchestrator task-show --task-id UUID
 course-dev-orchestrator task-log --task-id UUID
 course-dev-orchestrator task-retry --task-id UUID
 course-dev-orchestrator task-cancel --task-id UUID
+course-dev-orchestrator task-pr-prepare --task-id UUID
+course-dev-orchestrator task-pr-publish --work-item-id UUID
 course-dev-orchestrator gitlab-sync --plan-id UUID
 course-dev-orchestrator gitlab-links --plan-id UUID
 course-dev-orchestrator version
@@ -122,14 +128,21 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
   `ONBOARDING_MAX_TOTAL_BYTES`, `ONBOARDING_AUTHOR_NAME`,
   `ONBOARDING_AUTHOR_EMAIL`.
 - Limits: `MAX_TASK_ATTEMPTS=3`, `MAX_REVIEW_ATTEMPTS=2`,
-  `MAX_REPLANS=2`, `MAX_PARALLEL_TASKS=3`,
+  `MAX_PARALLEL_TASKS=3`, `MAX_GLOBAL_AGENT_RUNS=3`,
   `MAX_REQUIRED_TASK_DEPTH=3`.
 - Codex execution: the default is the existing ChatGPT login from local
   `codex-cli`. Run `codex login` once and `make codex-auth-sync`; `make up`
   synchronizes that login automatically when it exists. No API key is
-  required. `CODEX_MODEL_FAST`, `CODEX_MODEL_STANDARD`, `CODEX_MODEL_DEEP`,
-  and `CODEX_MODEL_REVIEW` select models by task profile and reviewer role.
-  Empty values defer model selection to Codex.
+  required. Complexity profiles select both model and reasoning effort. The
+  defaults are `gpt-5.6-terra`/low for fast work and `gpt-5.6` with
+  medium/high effort for standard, deep, and review work. Override them with
+  `CODEX_MODEL_*` and `CODEX_REASONING_*`; blank values are normalized back to
+  safe defaults.
+- Work items: `WORK_ITEM_GATEWAY=fake` is the default and supports the complete
+  local lifecycle with `github.example.test` identities but no network or Git
+  push. Real publication requires the explicit `github` backend plus
+  `GITHUB_BASE_URL`, `GITHUB_TOKEN`, and `GITHUB_DRY_RUN=false`; GitHub dry-run
+  performs no issue, branch, or PR writes.
 - GitLab: `GITLAB_BASE_URL`, `GITLAB_TOKEN`, `GITLAB_CONTROL_PROJECT`, and
   `GITLAB_DRY_RUN`. New GitLab 19+ webhooks should use
   `GITLAB_WEBHOOK_SIGNING_TOKEN=whsec_<base64-key>`; the legacy
@@ -330,16 +343,29 @@ adds project dependencies, and assigns verification commands. The validator
 rejects unknown projects, missing fields, invalid scopes/profiles, cycles,
 excessive dependency depth, and waves wider than `MAX_PARALLEL_TASKS`.
 
-Every MVP plan requires a persisted approval before it can run. Repeated plan,
-approval, and run requests reuse the same durable records and Temporal
-workflow. The workflow dispatches dependency-ready tasks with bounded
-parallelism and supports pause, resume, cancel, activity retry/heartbeat, and
-worker restart recovery.
+Every plan starts in `discussion`, either from a question/idea or from an
+existing GitHub issue. The planner may select one or many connected projects;
+explicit project IDs are never expanded implicitly. A dedicated read-only
+`issue-manage-agent` prepares exactly one complete Russian issue per task with
+labels, milestone, assignees, dependencies, risks, and acceptance criteria.
+The issue set is immutable and included in the approval fingerprint.
+
+The owner discusses the proposal, submits it, and approves the exact displayed
+fingerprint. Only then can the publisher create issues; every task must have a
+published issue before Temporal can start the plan. New prerequisites found by
+a coder pause the run. They never mutate the approved DAG: a new plan version,
+new issue proposals, discussion, and approval are required. Multiple plans may
+run concurrently, with per-plan `MAX_PARALLEL_TASKS` and process-wide
+`MAX_GLOBAL_AGENT_RUNS` limits.
 
 ```sh
 make plan FILE=change.md
 make plan-show PLAN_ID=uuid
-make plan-approve PLAN_ID=uuid ACTOR=owner COMMENT="reviewed"
+make plan-comment PLAN_ID=uuid ACTOR=owner COMMENT="уточнить критерий"
+make plan-issues PLAN_ID=uuid
+make plan-submit PLAN_ID=uuid ACTOR=owner COMMENT="готово к согласованию"
+make plan-approve PLAN_ID=uuid FINGERPRINT=hash ACTOR=owner COMMENT="одобряю точную версию"
+make plan-publish-issues PLAN_ID=uuid
 make plan-run PLAN_ID=uuid
 make run-status RUN_ID=uuid
 make run-pause RUN_ID=uuid
@@ -349,6 +375,8 @@ make task-show TASK_ID=uuid
 make task-log TASK_ID=uuid
 make task-retry TASK_ID=uuid
 make task-cancel TASK_ID=uuid
+make task-pr-prepare TASK_ID=uuid
+make task-pr-publish WORK_ITEM_ID=uuid
 ```
 
 Stage 6 extends the durable scheduler with one deterministic `ai/task-*`
@@ -369,11 +397,16 @@ The agent still verifies evidence in its own worktree and requests a bounded
 task for another connected repository instead of editing across checkouts.
 
 Reviewer changes resume the same coder thread, but each review uses a fresh
-thread. Blocked tasks can request at most three bounded cross-project tasks;
-Temporal runs them first and resumes the parent subject to replan/depth/attempt
-limits. Manual blockers and verification/review changes pause the run until
-`task-retry`. `task-log` exposes durable attempts, structured results,
-verification evidence, and artifact metadata.
+thread. A blocked task or newly discovered prerequisite pauses the run; no task
+or dependency can be injected into an approved DAG. Manual blockers and
+verification/review changes also pause until an owner action. `task-log`
+exposes durable attempts, structured results, verification evidence, and
+artifact metadata.
+
+After a completed, committed, independently reviewed task, a separate
+read-only `pull-request-manage-agent` prepares the Russian draft PR title/body,
+labels, milestone, assignees, reviewers, and exact source/target branches. The
+coder and reviewer never receive issue/PR publication capabilities.
 
 The TypeScript runner communicates with Go over bounded JSONL, disables agent
 network access and approvals, uses `workspace-write` for coders and
@@ -387,20 +420,24 @@ The Stage 5 API is available under `/api/v1`:
 
 - `POST /commands`, `GET /commands/{commandId}`, and
   `POST /commands/{commandId}/plan`;
-- `GET /plans/{planId}`, `GET /plans/{planId}/tasks`, and plan
-  `approve`, `reject`, and `run` actions;
+- `GET /plans/{planId}`, `GET /plans/{planId}/tasks`, plan comments,
+  issue prepare/publish, `submit`, exact-fingerprint `approve`, `reject`, and
+  `run` actions;
 - `GET /runs/{runId}` and run `pause`, `resume`, and `cancel` actions;
 - `GET /tasks/{taskId}`, task `attempts` and `artifacts` queries, and task
-  `retry` and `cancel` actions.
+  `retry`, `cancel`, and PR-prepare actions;
+- `POST /work-items/{workItemId}/publish` for an explicit PR publication or
+  dry-run preview.
 
-Plan lifecycle states are `draft`, `planned`, `awaiting_approval`, `approved`,
-`running`, `paused`, `completed`, `failed`, and `cancelled`. Task states are
+The issue-backed lifecycle uses `discussion`, `awaiting_approval`, `approved`,
+`running`, `paused`, `completed`, `failed`, and `cancelled` (legacy states
+remain readable for old records). Task states are
 `draft`, `planned`, `ready`, `running`, `blocked`, `verification`,
 `changes_requested`, `completed`, `failed`, and `cancelled`.
 
 ## Self-hosted GitLab synchronization
 
-Stage 7 projects an approved plan into a configurable self-hosted GitLab
+Stage 7 originally projected an approved plan into a configurable self-hosted GitLab
 instance. `GITLAB_CONTROL_PROJECT` receives the parent plan issue; every task
 gets an issue in its own connected GitLab project. The adapter maintains
 orchestrator labels, Markdown checklists, related-issue links, and
@@ -413,13 +450,12 @@ make gitlab-sync PLAN_ID=uuid
 make gitlab-links PLAN_ID=uuid
 ```
 
-`GITLAB_DRY_RUN=true` is the default. It returns deterministic issue/MR
-previews without HTTP calls, Git pushes, or `GitLabLink` writes. Real writes
-require the persisted plan approval. Repeated syncs recover by embedded
-resource markers and source/target branches, so they reuse issues, comments,
-links, branches, and merge requests. A completed task publishes only its
-verified `ai/task-*` commit and opens or updates an MR against the recorded
-default branch. No adapter method can merge or deploy.
+`GITLAB_DRY_RUN=true` returns deterministic legacy previews without HTTP calls,
+Git pushes, or `GitLabLink` writes. Real legacy GitLab sync writes are now
+disabled because they bypass dedicated issue/PR manager agents. A future
+GitLab work-item gateway must consume the same reviewed Russian proposals and
+exact fingerprint gate as the GitHub gateway. No adapter method can merge or
+deploy.
 
 The Stage 7 HTTP routes are:
 

@@ -13,10 +13,18 @@ import (
 )
 
 const (
-	ModelProfileFast     = "fast"
-	ModelProfileStandard = "standard"
-	ModelProfileDeep     = "deep"
-	ModelProfileReview   = "review"
+	ModelProfileFast              = "fast"
+	ModelProfileStandard          = "standard"
+	ModelProfileDeep              = "deep"
+	ModelProfileReview            = "review"
+	DefaultCodexModelFast         = "gpt-5.6-terra"
+	DefaultCodexModelStandard     = "gpt-5.6"
+	DefaultCodexModelDeep         = "gpt-5.6"
+	DefaultCodexModelReview       = "gpt-5.6"
+	DefaultCodexReasoningFast     = "low"
+	DefaultCodexReasoningStandard = "medium"
+	DefaultCodexReasoningDeep     = "high"
+	DefaultCodexReasoningReview   = "high"
 )
 
 // Config holds environment configuration for the orchestrator.
@@ -43,8 +51,8 @@ type Config struct {
 
 	MaxTaskAttempts      int `envconfig:"MAX_TASK_ATTEMPTS" default:"3" validate:"min=1,max=3"`
 	MaxReviewAttempts    int `envconfig:"MAX_REVIEW_ATTEMPTS" default:"2" validate:"min=1,max=2"`
-	MaxReplans           int `envconfig:"MAX_REPLANS" default:"2" validate:"min=0,max=2"`
 	MaxParallelTasks     int `envconfig:"MAX_PARALLEL_TASKS" default:"3" validate:"min=1,max=3"`
+	MaxGlobalAgentRuns   int `envconfig:"MAX_GLOBAL_AGENT_RUNS" default:"3" validate:"min=1,max=16"`
 	MaxRequiredTaskDepth int `envconfig:"MAX_REQUIRED_TASK_DEPTH" default:"3" validate:"min=1,max=10"`
 
 	GitLabBaseURL             string `envconfig:"GITLAB_BASE_URL"`
@@ -53,6 +61,10 @@ type Config struct {
 	GitLabWebhookSecret       string `envconfig:"GITLAB_WEBHOOK_SECRET"`
 	GitLabWebhookSigningToken string `envconfig:"GITLAB_WEBHOOK_SIGNING_TOKEN"`
 	GitLabDryRun              bool   `envconfig:"GITLAB_DRY_RUN" default:"true"`
+	GitHubBaseURL             string `envconfig:"GITHUB_BASE_URL" default:"https://api.github.com"`
+	GitHubToken               string `envconfig:"GITHUB_TOKEN"`
+	GitHubDryRun              bool   `envconfig:"GITHUB_DRY_RUN" default:"true"`
+	WorkItemGateway           string `envconfig:"WORK_ITEM_GATEWAY" default:"fake" validate:"oneof=fake github"`
 
 	TelegramBotToken       string  `envconfig:"TELEGRAM_BOT_TOKEN"`
 	TelegramAllowedUserIDs []int64 `envconfig:"TELEGRAM_ALLOWED_USER_IDS"`
@@ -62,11 +74,15 @@ type Config struct {
 	TelegramPollTimeout    int     `envconfig:"TELEGRAM_POLL_TIMEOUT" default:"30" validate:"min=1,max=50"`
 	TelegramCallbackTTL    int     `envconfig:"TELEGRAM_CALLBACK_TTL" default:"900" validate:"min=60,max=3600"`
 
-	CodexRunnerCommand string `envconfig:"CODEX_RUNNER_COMMAND" default:"node runner/dist/index.js" validate:"required"`
-	CodexModelFast     string `envconfig:"CODEX_MODEL_FAST"`
-	CodexModelStandard string `envconfig:"CODEX_MODEL_STANDARD"`
-	CodexModelDeep     string `envconfig:"CODEX_MODEL_DEEP"`
-	CodexModelReview   string `envconfig:"CODEX_MODEL_REVIEW"`
+	CodexRunnerCommand     string `envconfig:"CODEX_RUNNER_COMMAND" default:"node runner/dist/index.js" validate:"required"`
+	CodexModelFast         string `envconfig:"CODEX_MODEL_FAST" default:"gpt-5.6-terra" validate:"required"`
+	CodexModelStandard     string `envconfig:"CODEX_MODEL_STANDARD" default:"gpt-5.6" validate:"required"`
+	CodexModelDeep         string `envconfig:"CODEX_MODEL_DEEP" default:"gpt-5.6" validate:"required"`
+	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6" validate:"required"`
+	CodexReasoningFast     string `envconfig:"CODEX_REASONING_FAST" default:"low" validate:"oneof=minimal low medium high xhigh"`
+	CodexReasoningStandard string `envconfig:"CODEX_REASONING_STANDARD" default:"medium" validate:"oneof=minimal low medium high xhigh"`
+	CodexReasoningDeep     string `envconfig:"CODEX_REASONING_DEEP" default:"high" validate:"oneof=minimal low medium high xhigh"`
+	CodexReasoningReview   string `envconfig:"CODEX_REASONING_REVIEW" default:"high" validate:"oneof=minimal low medium high xhigh"`
 }
 
 // Load reads, normalizes, and validates environment configuration.
@@ -81,6 +97,10 @@ func Load() (Config, error) {
 	}
 	cfg.RepositoryStoragePath = filepath.Clean(strings.TrimSpace(cfg.RepositoryStoragePath))
 	cfg.WorktreeStoragePath = filepath.Clean(strings.TrimSpace(cfg.WorktreeStoragePath))
+	if strings.TrimSpace(cfg.WorkItemGateway) == "" {
+		cfg.WorkItemGateway = "fake"
+	}
+	applyCodexDefaults(&cfg)
 
 	if err := validator.New().Struct(cfg); err != nil {
 		return Config{}, fmt.Errorf("validate config: %w", err)
@@ -136,10 +156,40 @@ func Load() (Config, error) {
 			}
 		}
 	}
+	githubURL, parseErr := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.GitHubBaseURL), "/"))
+	if parseErr != nil || githubURL.Host == "" || githubURL.User != nil || githubURL.RawQuery != "" ||
+		githubURL.Fragment != "" || githubURL.Scheme != "https" && githubURL.Scheme != "http" {
+		return Config{}, fmt.Errorf("GITHUB_BASE_URL must be an HTTP(S) URL without credentials, query, or fragment")
+	}
+	cfg.GitHubBaseURL = githubURL.String()
+	if cfg.WorkItemGateway == "github" && !cfg.GitHubDryRun && strings.TrimSpace(cfg.GitHubToken) == "" {
+		return Config{}, fmt.Errorf("GITHUB_TOKEN is required when GITHUB_DRY_RUN=false")
+	}
 	if err := validateTelegram(&cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func applyCodexDefaults(cfg *Config) {
+	defaults := []struct {
+		value    *string
+		fallback string
+	}{
+		{&cfg.CodexModelFast, DefaultCodexModelFast},
+		{&cfg.CodexModelStandard, DefaultCodexModelStandard},
+		{&cfg.CodexModelDeep, DefaultCodexModelDeep},
+		{&cfg.CodexModelReview, DefaultCodexModelReview},
+		{&cfg.CodexReasoningFast, DefaultCodexReasoningFast},
+		{&cfg.CodexReasoningStandard, DefaultCodexReasoningStandard},
+		{&cfg.CodexReasoningDeep, DefaultCodexReasoningDeep},
+		{&cfg.CodexReasoningReview, DefaultCodexReasoningReview},
+	}
+	for _, item := range defaults {
+		if strings.TrimSpace(*item.value) == "" {
+			*item.value = item.fallback
+		}
+	}
 }
 
 var telegramWebhookSecretPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,256}$`)
@@ -214,6 +264,21 @@ func (c Config) Model(profile string) (string, error) {
 	}
 }
 
+func (c Config) ReasoningEffort(profile string) (string, error) {
+	switch profile {
+	case ModelProfileFast:
+		return c.CodexReasoningFast, nil
+	case ModelProfileStandard:
+		return c.CodexReasoningStandard, nil
+	case ModelProfileDeep:
+		return c.CodexReasoningDeep, nil
+	case ModelProfileReview:
+		return c.CodexReasoningReview, nil
+	default:
+		return "", fmt.Errorf("unknown reasoning profile %q", profile)
+	}
+}
+
 // Summary is a secret-free configuration view for diagnostics.
 type Summary struct {
 	HTTPPort                 string   `json:"http_port"`
@@ -232,13 +297,16 @@ type Summary struct {
 	OnboardingMaxTotalBytes  int64    `json:"onboarding_max_total_bytes"`
 	MaxTaskAttempts          int      `json:"max_task_attempts"`
 	MaxReviewAttempts        int      `json:"max_review_attempts"`
-	MaxReplans               int      `json:"max_replans"`
 	MaxParallelTasks         int      `json:"max_parallel_tasks"`
+	MaxGlobalAgentRuns       int      `json:"max_global_agent_runs"`
 	MaxRequiredTaskDepth     int      `json:"max_required_task_depth"`
 	GitLabConfigured         bool     `json:"gitlab_configured"`
 	GitLabDryRun             bool     `json:"gitlab_dry_run"`
 	GitLabWebhookConfigured  bool     `json:"gitlab_webhook_configured"`
 	GitLabWebhookSigned      bool     `json:"gitlab_webhook_signed"`
+	GitHubConfigured         bool     `json:"github_configured"`
+	GitHubDryRun             bool     `json:"github_dry_run"`
+	WorkItemGateway          string   `json:"work_item_gateway"`
 	TelegramConfigured       bool     `json:"telegram_configured"`
 	TelegramAllowedUserCount int      `json:"telegram_allowed_user_count"`
 	TelegramAllowedChatCount int      `json:"telegram_allowed_chat_count"`
@@ -279,14 +347,17 @@ func (c Config) SafeSummary() Summary {
 		OnboardingMaxTotalBytes: c.OnboardingMaxTotalBytes,
 		MaxTaskAttempts:         c.MaxTaskAttempts,
 		MaxReviewAttempts:       c.MaxReviewAttempts,
-		MaxReplans:              c.MaxReplans,
 		MaxParallelTasks:        c.MaxParallelTasks,
+		MaxGlobalAgentRuns:      c.MaxGlobalAgentRuns,
 		MaxRequiredTaskDepth:    c.MaxRequiredTaskDepth,
 		GitLabConfigured:        c.GitLabBaseURL != "" && c.GitLabToken != "",
 		GitLabDryRun:            c.GitLabDryRun,
 		GitLabWebhookConfigured: len(strings.TrimSpace(c.GitLabWebhookSecret)) >= 16 ||
 			strings.HasPrefix(strings.TrimSpace(c.GitLabWebhookSigningToken), "whsec_"),
 		GitLabWebhookSigned:      strings.HasPrefix(strings.TrimSpace(c.GitLabWebhookSigningToken), "whsec_"),
+		GitHubConfigured:         strings.TrimSpace(c.GitHubToken) != "",
+		GitHubDryRun:             c.GitHubDryRun,
+		WorkItemGateway:          c.WorkItemGateway,
 		TelegramConfigured:       c.TelegramBotToken != "",
 		TelegramAllowedUserCount: len(c.TelegramAllowedUserIDs),
 		TelegramAllowedChatCount: len(c.TelegramAllowedChatIDs),

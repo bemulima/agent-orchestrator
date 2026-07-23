@@ -62,6 +62,7 @@ ORDER BY tablename`)
 		"topology_service", "contract_drift", "plan_run", "task_review",
 		"gitlab_webhook_event",
 		"telegram_update", "telegram_callback", "telegram_poll_state",
+		"plan_comment", "work_item",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {
@@ -296,10 +297,7 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if err != nil {
 		t.Fatalf("CreatePlan() error = %v", err)
 	}
-	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, "integration", "approved")
-	if err != nil {
-		t.Fatalf("ApprovePlan() error = %v", err)
-	}
+	bundle = approveIssueBackedPlan(t, pool, bundle)
 	run, bundle, err := plans.PrepareRun(ctx, bundle.Plan.ID, 1)
 	if err != nil {
 		t.Fatalf("PrepareRun() error = %v", err)
@@ -745,6 +743,10 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if err != nil {
 		t.Fatalf("CreatePlan() error = %v", err)
 	}
+	plannerFingerprint := bundle.Plan.PlannerFingerprint
+	if plannerFingerprint == "" || plannerFingerprint != bundle.Plan.Fingerprint {
+		t.Fatalf("initial planner fingerprint is not stable: %#v", bundle.Plan)
+	}
 	reusedPlan, err := plans.CreatePlan(ctx, command, input, output)
 	if err != nil || reusedPlan.Plan.ID != bundle.Plan.ID || len(reusedPlan.Tasks) != 2 || len(reusedPlan.Dependencies) != 1 {
 		t.Fatalf("reused CreatePlan() = %#v, %v", reusedPlan, err)
@@ -752,13 +754,49 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if _, _, err := plans.PrepareRun(ctx, bundle.Plan.ID, 2); !errors.Is(err, domain.ErrApprovalNeeded) {
 		t.Fatalf("PrepareRun() before approval error = %v", err)
 	}
-	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, "integration-owner", "approved")
+	if _, err := plans.SubmitPlan(ctx, bundle.Plan.ID, "integration-owner", "ready"); !errors.Is(err, domain.ErrApprovalNeeded) {
+		t.Fatalf("SubmitPlan() without issues error = %v", err)
+	}
+	workItems := pgadapter.WorkItemRepoPG{Pool: pool}
+	drafts := integrationIssueDrafts(bundle)
+	if _, err := workItems.SaveIssueProposals(ctx, bundle, "issue-manager-thread", drafts); err != nil {
+		t.Fatalf("SaveIssueProposals() error = %v", err)
+	}
+	bundle, err = plans.SubmitPlan(ctx, bundle.Plan.ID, "integration-owner", "ready")
+	if err != nil || bundle.Plan.Status != domain.PlanStatusAwaitingApproval {
+		t.Fatalf("SubmitPlan() = %#v, %v", bundle, err)
+	}
+	if bundle.Plan.PlannerFingerprint != plannerFingerprint || bundle.Plan.Fingerprint == plannerFingerprint {
+		t.Fatalf("issue proposals were not bound to approval fingerprint: %#v", bundle.Plan)
+	}
+	for _, item := range bundle.WorkItems {
+		if item.Kind == domain.WorkItemIssue && item.PlanFingerprint != bundle.Plan.Fingerprint {
+			t.Fatalf("issue fingerprint = %q, plan = %q", item.PlanFingerprint, bundle.Plan.Fingerprint)
+		}
+	}
+	if _, err := plans.ApprovePlan(ctx, bundle.Plan.ID, "sha256:wrong", "integration-owner", "approved"); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("ApprovePlan(wrong fingerprint) error = %v", err)
+	}
+	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, bundle.Plan.Fingerprint, "integration-owner", "approved")
 	if err != nil || bundle.Plan.Status != domain.PlanStatusApproved || bundle.Approval == nil || bundle.Approval.Status != string(domain.ApprovalStatusApproved) {
 		t.Fatalf("ApprovePlan() = %#v, %v", bundle, err)
 	}
-	repeatedApproval, err := plans.ApprovePlan(ctx, bundle.Plan.ID, "integration-owner", "approved")
+	repeatedApproval, err := plans.ApprovePlan(ctx, bundle.Plan.ID, bundle.Plan.Fingerprint, "integration-owner", "approved")
 	if err != nil || repeatedApproval.Plan.Status != domain.PlanStatusApproved {
 		t.Fatalf("repeated ApprovePlan() = %#v, %v", repeatedApproval, err)
+	}
+	if _, _, err := plans.PrepareRun(ctx, bundle.Plan.ID, 2); !errors.Is(err, domain.ErrApprovalNeeded) {
+		t.Fatalf("PrepareRun() before issue publication error = %v", err)
+	}
+	for index, item := range bundle.WorkItems {
+		if item.Kind != domain.WorkItemIssue {
+			continue
+		}
+		if _, err := workItems.MarkWorkItemPublished(ctx, item.ID, domain.WorkItemPublication{
+			Number: int64(900000 + index), URL: "https://github.example.test/issues/" + item.ID, State: "open",
+		}); err != nil {
+			t.Fatalf("MarkWorkItemPublished() error = %v", err)
+		}
 	}
 	run, bundle, err = plans.PrepareRun(ctx, bundle.Plan.ID, 2)
 	if err != nil {
@@ -806,6 +844,53 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if err != nil || completed.Plan.Status != domain.PlanStatusCompleted || completed.Run == nil || completed.Run.Status != domain.PlanRunStatusCompleted {
 		t.Fatalf("completed plan = %#v, %v", completed, err)
 	}
+}
+
+func approveIssueBackedPlan(t *testing.T, pool *pgxpool.Pool, bundle domain.PlanBundle) domain.PlanBundle {
+	t.Helper()
+	ctx := context.Background()
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+	items := pgadapter.WorkItemRepoPG{Pool: pool}
+	if _, err := items.SaveIssueProposals(ctx, bundle, "issue-manager-"+uuid.NewString(), integrationIssueDrafts(bundle)); err != nil {
+		t.Fatalf("SaveIssueProposals() error = %v", err)
+	}
+	var err error
+	bundle, err = plans.SubmitPlan(ctx, bundle.Plan.ID, "integration-owner", "ready")
+	if err != nil {
+		t.Fatalf("SubmitPlan() error = %v", err)
+	}
+	bundle, err = plans.ApprovePlan(ctx, bundle.Plan.ID, bundle.Plan.Fingerprint, "integration-owner", "approved")
+	if err != nil {
+		t.Fatalf("ApprovePlan() error = %v", err)
+	}
+	for index, item := range bundle.WorkItems {
+		if item.Kind != domain.WorkItemIssue {
+			continue
+		}
+		if _, err := items.MarkWorkItemPublished(ctx, item.ID, domain.WorkItemPublication{
+			Number: int64(800000 + index), URL: "https://github.example.test/issues/" + item.ID, State: "open",
+		}); err != nil {
+			t.Fatalf("MarkWorkItemPublished() error = %v", err)
+		}
+	}
+	bundle, err = plans.GetPlan(ctx, bundle.Plan.ID)
+	if err != nil {
+		t.Fatalf("GetPlan() after publication error = %v", err)
+	}
+	return bundle
+}
+
+func integrationIssueDrafts(bundle domain.PlanBundle) []domain.IssueDraft {
+	drafts := make([]domain.IssueDraft, 0, len(bundle.Tasks))
+	for _, task := range bundle.Tasks {
+		drafts = append(drafts, domain.IssueDraft{
+			TaskKey: task.PlannerKey, ProjectID: task.ProjectID, IssueType: domain.IssueTypeTask,
+			Title: "Интеграционная задача", Body: "Интеграционное описание задачи для проверки полного цикла.",
+			Labels: []string{"тип::задача"}, Milestone: "Интеграционная проверка", Assignees: []string{"owner"},
+			Complexity: domain.TaskComplexityMedium, ModelProfile: "standard",
+		})
+	}
+	return drafts
 }
 
 func TestInitialMigrationEnforcesIdempotencyConstraints(t *testing.T) {

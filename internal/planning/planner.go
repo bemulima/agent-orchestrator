@@ -29,15 +29,37 @@ func (p Planner) Build(
 	if command.ID == "" || text == "" || catalog.Revision.ID == "" {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, fmt.Errorf("command and materialized topology are required: %w", domain.ErrValidation)
 	}
+	sourceIssues, err := normalizedIssueReferences(request.SourceIssues)
+	if err != nil {
+		return domain.PlannerInput{}, domain.PlannerOutput{}, err
+	}
 	input := domain.PlannerInput{
 		CommandID: command.ID, CommandText: text, TopologyRevisionID: catalog.Revision.ID,
 		RequestedProjectIDs: uniqueSorted(request.RequestedProjectIDs),
+		SourceIssues:        sourceIssues,
 	}
 	services := make(map[string]domain.TopologyService, len(catalog.Services))
 	for _, service := range catalog.Services {
 		services[service.ProjectID] = service
 	}
-	selected, err := selectProjects(text, input.RequestedProjectIDs, services, catalog)
+	for _, project := range request.AvailableProjects {
+		if _, exists := services[project.ID]; exists {
+			continue
+		}
+		services[project.ID] = domain.TopologyService{
+			ProjectID: project.ID, Name: project.Name,
+			RepositoryRole: project.RepositoryRole, ServiceKind: serviceKindForRole(project.RepositoryRole),
+			Purpose: "Repository " + project.Name,
+		}
+	}
+	selectionSeeds := input.RequestedProjectIDs
+	if len(selectionSeeds) == 0 && len(input.SourceIssues) > 0 {
+		for _, issue := range input.SourceIssues {
+			selectionSeeds = append(selectionSeeds, issue.ProjectID)
+		}
+		selectionSeeds = uniqueSorted(selectionSeeds)
+	}
+	selected, err := selectProjects(text, selectionSeeds, services, catalog)
 	if err != nil {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}
@@ -87,6 +109,40 @@ func (p Planner) Build(
 		RiskLevel: risk, Risks: risks, Tasks: tasks, Dependencies: dependencies,
 	}
 	return input, output, nil
+}
+
+func normalizedIssueReferences(values []domain.IssueReference) ([]domain.IssueReference, error) {
+	seen := make(map[string]domain.IssueReference, len(values))
+	for _, value := range values {
+		value.ProjectID = strings.TrimSpace(value.ProjectID)
+		value.URL = strings.TrimSpace(value.URL)
+		if value.ProjectID == "" || value.Number < 1 ||
+			value.Provider != domain.IssueProviderGitHub && value.Provider != domain.IssueProviderGitLab {
+			return nil, fmt.Errorf("invalid source issue reference: %w", domain.ErrValidation)
+		}
+		key := string(value.Provider) + "\x00" + value.ProjectID + "\x00" + fmt.Sprint(value.Number)
+		seen[key] = value
+	}
+	result := make([]domain.IssueReference, 0, len(seen))
+	for _, value := range seen {
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return string(result[i].Provider)+result[i].ProjectID+fmt.Sprint(result[i].Number) <
+			string(result[j].Provider)+result[j].ProjectID+fmt.Sprint(result[j].Number)
+	})
+	return result, nil
+}
+
+func serviceKindForRole(role domain.RepositoryRole) domain.ServiceKind {
+	switch role {
+	case domain.RepositoryRoleFrontend:
+		return domain.ServiceKindFrontendApplication
+	case domain.RepositoryRoleInfrastructure:
+		return domain.ServiceKindInfrastructure
+	default:
+		return domain.ServiceKindUnknown
+	}
 }
 
 func (p Planner) maxParallel() int {
@@ -317,6 +373,11 @@ func taskRole(service domain.TopologyService) string {
 		return "gateway-coder"
 	case service.RepositoryRole == domain.RepositoryRoleInfrastructure || service.ServiceKind == domain.ServiceKindInfrastructure:
 		return "infrastructure-coder"
+	case service.RepositoryRole == domain.RepositoryRoleContent ||
+		service.RepositoryRole == domain.RepositoryRolePolicy ||
+		service.RepositoryRole == domain.RepositoryRoleDocumentation ||
+		service.RepositoryRole == domain.RepositoryRoleArchive:
+		return "knowledge-coder"
 	default:
 		return "backend-coder"
 	}
@@ -330,6 +391,8 @@ func writeScope(service domain.TopologyService) []string {
 		return []string{"nginx.conf", "conf.d/**", "config/**", "Dockerfile"}
 	case "infrastructure-coder":
 		return []string{"docker-compose*.yml", "docker-compose*.yaml", "docker/**", "scripts/**"}
+	case "knowledge-coder":
+		return []string{"**/*.md", "docs/**", ".ai/**", "AGENTS.md", "prompts/**", "wiki/**", "journal/**"}
 	default:
 		return []string{"cmd/**", "internal/**", "db/migrations/**", "openapi/**", "proto/**", "go.mod", "go.sum"}
 	}
@@ -353,7 +416,10 @@ func modelProfile(risk domain.RiskLevel) string {
 	if risk == domain.RiskLevelHigh || risk == domain.RiskLevelCritical {
 		return config.ModelProfileDeep
 	}
-	return config.ModelProfileStandard
+	if risk == domain.RiskLevelMedium {
+		return config.ModelProfileStandard
+	}
+	return config.ModelProfileFast
 }
 
 func isBackend(service domain.TopologyService) bool {

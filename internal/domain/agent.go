@@ -164,9 +164,12 @@ type WorkspaceCheckResult struct {
 type AgentRunRole string
 
 const (
-	AgentRunCoder    AgentRunRole = "coder"
-	AgentRunReviewer AgentRunRole = "reviewer"
-	AgentRunAnalyst  AgentRunRole = "analyst"
+	AgentRunCoder              AgentRunRole = "coder"
+	AgentRunReviewer           AgentRunRole = "reviewer"
+	AgentRunAnalyst            AgentRunRole = "analyst"
+	AgentRunPlanner            AgentRunRole = "planner"
+	AgentRunIssueManager       AgentRunRole = "issue-manager"
+	AgentRunPullRequestManager AgentRunRole = "pull-request-manager"
 )
 
 type AgentRunRequest struct {
@@ -174,6 +177,7 @@ type AgentRunRequest struct {
 	ThreadID         string         `json:"thread_id,omitempty"`
 	WorkingDirectory string         `json:"working_directory"`
 	Model            string         `json:"model,omitempty"`
+	ReasoningEffort  string         `json:"reasoning_effort,omitempty"`
 	Prompt           string         `json:"prompt"`
 	OutputSchema     map[string]any `json:"output_schema"`
 }

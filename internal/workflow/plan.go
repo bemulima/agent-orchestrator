@@ -120,17 +120,10 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 			switch result.Status {
 			case domain.TaskStatusCompleted:
 			case domain.TaskStatusBlocked:
-				if completedExecution.Outcome.RequiredSchedule != nil {
-					if err := mergeRequiredSchedule(&schedule, state.TaskStatus, taskID, *completedExecution.Outcome.RequiredSchedule); err != nil {
-						return failPlanWorkflow(ctx, schedule, state, active, err.Error())
-					}
-					retryable[taskID] = true
-				} else {
-					if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusPaused, result.Error); err != nil {
-						return PlanWorkflowOutput{}, err
-					}
-					state.Status = domain.PlanRunStatusPaused
+				if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusPaused, result.Error); err != nil {
+					return PlanWorkflowOutput{}, err
 				}
+				state.Status = domain.PlanRunStatusPaused
 			case domain.TaskStatusChangesRequested:
 				if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusPaused, result.Error); err != nil {
 					return PlanWorkflowOutput{}, err
@@ -382,64 +375,6 @@ func runnableTasksForExecution(
 		return result[i].TaskID < result[j].TaskID
 	})
 	return result
-}
-
-func mergeRequiredSchedule(
-	schedule *domain.PlanSchedule,
-	status map[string]domain.TaskStatus,
-	parentTaskID string,
-	required domain.RequiredTaskSchedule,
-) error {
-	if len(required.Tasks) == 0 || len(required.ParentDependencies) == 0 || len(schedule.Tasks)+len(required.Tasks) > 100 {
-		return fmt.Errorf("invalid required-task schedule: %w", domain.ErrValidation)
-	}
-	known := make(map[string]struct{}, len(schedule.Tasks)+len(required.Tasks))
-	for _, task := range schedule.Tasks {
-		known[task.TaskID] = struct{}{}
-	}
-	for _, task := range required.Tasks {
-		if task.TaskID == "" || task.TaskID == parentTaskID {
-			return fmt.Errorf("invalid required task %q: %w", task.TaskID, domain.ErrValidation)
-		}
-		known[task.TaskID] = struct{}{}
-	}
-	for _, task := range required.Tasks {
-		for _, dependency := range task.Dependencies {
-			if _, exists := known[dependency]; !exists || dependency == task.TaskID {
-				return fmt.Errorf("invalid dynamic dependency %q: %w", dependency, domain.ErrValidation)
-			}
-		}
-		if _, exists := status[task.TaskID]; !exists {
-			schedule.Tasks = append(schedule.Tasks, task)
-			status[task.TaskID] = domain.TaskStatusPlanned
-		}
-	}
-	parentFound := false
-	for index := range schedule.Tasks {
-		if schedule.Tasks[index].TaskID != parentTaskID {
-			continue
-		}
-		parentFound = true
-		dependencies := make(map[string]struct{}, len(schedule.Tasks[index].Dependencies)+len(required.ParentDependencies))
-		for _, dependency := range schedule.Tasks[index].Dependencies {
-			dependencies[dependency] = struct{}{}
-		}
-		for _, dependency := range required.ParentDependencies {
-			if _, exists := known[dependency]; !exists || dependency == parentTaskID {
-				return fmt.Errorf("invalid parent required dependency %q: %w", dependency, domain.ErrValidation)
-			}
-			dependencies[dependency] = struct{}{}
-		}
-		schedule.Tasks[index].Dependencies = schedule.Tasks[index].Dependencies[:0]
-		for dependency := range dependencies {
-			schedule.Tasks[index].Dependencies = append(schedule.Tasks[index].Dependencies, dependency)
-		}
-		sort.Strings(schedule.Tasks[index].Dependencies)
-	}
-	if !parentFound {
-		return fmt.Errorf("required-task parent is not scheduled: %w", domain.ErrConflict)
-	}
-	return nil
 }
 
 func setRunStatus(ctx temporalworkflow.Context, runID string, status domain.PlanRunStatus, message string) error {

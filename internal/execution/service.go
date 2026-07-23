@@ -13,17 +13,17 @@ import (
 )
 
 type Service struct {
-	Repository           repository.TaskExecutionRepository
-	Worktrees            repository.TaskWorktree
-	Runner               repository.AgentRunner
-	Validator            repository.AgentResultValidator
-	Verifier             Verifier
-	Models               map[string]string
-	ReviewModel          string
-	MaxTaskAttempts      int
-	MaxReviewAttempts    int
-	MaxReplans           int
-	MaxRequiredTaskDepth int
+	Repository        repository.TaskExecutionRepository
+	Worktrees         repository.TaskWorktree
+	Runner            repository.AgentRunner
+	Validator         repository.AgentResultValidator
+	Verifier          Verifier
+	Models            map[string]string
+	Reasoning         map[string]string
+	ReviewModel       string
+	ReviewReasoning   string
+	MaxTaskAttempts   int
+	MaxReviewAttempts int
 }
 
 func (s Service) Execute(
@@ -62,7 +62,7 @@ func (s Service) Execute(
 		}
 		response, err := s.Runner.Run(ctx, domain.AgentRunRequest{
 			Role: domain.AgentRunCoder, ThreadID: threadID, WorkingDirectory: workspace.Path,
-			Model: s.Models[executionContext.Task.ModelProfile], Prompt: prompt,
+			Model: s.Models[executionContext.Task.ModelProfile], ReasoningEffort: s.Reasoning[executionContext.Task.ModelProfile], Prompt: prompt,
 			OutputSchema: s.Validator.AgentSchema(),
 		}, func(callbackContext context.Context, discoveredThreadID string) error {
 			stored, attachErr := s.Repository.AttachAgentThread(callbackContext, attempt.ID, discoveredThreadID)
@@ -85,26 +85,17 @@ func (s Service) Execute(
 
 		switch result.Status {
 		case domain.AgentResultBlocked:
-			if len(result.RequiredTasks) == 0 {
-				message := strings.Join(result.Blockers, "; ")
-				if err := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, message, result); err != nil {
-					return domain.TaskExecutionOutcome{}, err
+			message := strings.Join(result.Blockers, "; ")
+			if len(result.RequiredTasks) > 0 {
+				if message != "" {
+					message += "; "
 				}
-				return outcome(taskID, domain.TaskStatusBlocked, message), nil
+				message += "обнаружены новые обязательные задачи; требуется новый plan fingerprint, обсуждение и одобрение"
 			}
-			schedule, scheduleErr := s.Repository.AddRequiredTasks(
-				ctx, taskID, result.RequiredTasks, s.maxRequiredTaskDepth(), s.maxReplans(),
-			)
-			if scheduleErr != nil {
-				_ = s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, scheduleErr.Error(), result)
-				return outcome(taskID, domain.TaskStatusFailed, scheduleErr.Error()), nil
-			}
-			if err := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, strings.Join(result.Blockers, "; "), result); err != nil {
+			if err := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, message, result); err != nil {
 				return domain.TaskExecutionOutcome{}, err
 			}
-			blocked := outcome(taskID, domain.TaskStatusBlocked, strings.Join(result.Blockers, "; "))
-			blocked.RequiredSchedule = &schedule
-			return blocked, nil
+			return outcome(taskID, domain.TaskStatusBlocked, message), nil
 		case domain.AgentResultFailed:
 			message := result.Summary
 			if err := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, message, result); err != nil {
@@ -152,7 +143,8 @@ func (s Service) Execute(
 		reviewThreadID := ""
 		reviewResponse, err := s.Runner.Run(ctx, domain.AgentRunRequest{
 			Role: domain.AgentRunReviewer, WorkingDirectory: workspace.Path,
-			Model: s.ReviewModel, Prompt: reviewPrompt, OutputSchema: s.Validator.ReviewerSchema(),
+			Model: s.ReviewModel, ReasoningEffort: s.ReviewReasoning,
+			Prompt: reviewPrompt, OutputSchema: s.Validator.ReviewerSchema(),
 		}, func(callbackContext context.Context, discoveredThreadID string) error {
 			reviewThreadID = discoveredThreadID
 			_, beginErr := s.Repository.BeginReview(callbackContext, attempt.ID, nextReview, discoveredThreadID)
@@ -336,18 +328,4 @@ func (s Service) maxReviewAttempts() int {
 		return 2
 	}
 	return s.MaxReviewAttempts
-}
-
-func (s Service) maxReplans() int {
-	if s.MaxReplans < 0 || s.MaxReplans > 2 {
-		return 2
-	}
-	return s.MaxReplans
-}
-
-func (s Service) maxRequiredTaskDepth() int {
-	if s.MaxRequiredTaskDepth < 1 || s.MaxRequiredTaskDepth > 10 {
-		return 3
-	}
-	return s.MaxRequiredTaskDepth
 }

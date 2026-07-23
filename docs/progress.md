@@ -4,7 +4,7 @@ Last updated: 2026-07-23
 
 ## Current status
 
-Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
+Stages 1–9 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
 All 38 requested repositories now resolve through clean orchestrator-managed
@@ -29,9 +29,17 @@ open questions, and two approved Taskfile commands. The owner approved it on
 `ai/onboard-ms-go-http-runtime-validator-95482dd44a59` worktree, commit
 `5b3c99391d2379b1e9ddeb40f772a371abaf0e85` was pushed, and GitHub draft PR #6
 was opened. All 38 reviewed onboarding PRs in `docs/onboarding-prs.md` and
-orchestrator PR #1 were explicitly approved and merged on 2026-07-23. A first
-real three-project coding plan now awaits its own exact resource-level approval;
-no coding task, branch, push, merge, or deployment has been started by it.
+orchestrator PR #1 were explicitly approved and merged on 2026-07-23. Legacy
+plan `383dede3-2393-47af-b3db-e6c52bbfa4e8` was created before the issue-backed
+workflow and must not run: it has neither manager-agent issue proposals nor an
+approval fingerprint that binds them. No coding task, branch, push, merge, or
+deployment has been started by it.
+Stage 9 adds question/idea or existing-issue sources, plan discussion and
+submission, dedicated issue/PR manager agents, exact content-bound approval,
+risk-based Codex model/reasoning profiles, concurrent-plan limits, and a local
+fake work-item gateway. Migrations `010` and `011`, PostgreSQL integration
+tests, unit/HTTP/workflow tests, TypeScript runner tests, and `make verify`
+passed. No real GitHub/GitLab issue, branch, PR, or MR was created.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -683,23 +691,56 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Created the first real three-project concurrent coding plan
   `383dede3-2393-47af-b3db-e6c52bbfa4e8`; it is intentionally paused in
   `awaiting_approval` before any project mutation.
+- Added reversible issue-backed planning migrations with discussion comments,
+  immutable issue/PR work items, source kind, planner fingerprint, and an
+  approval fingerprint that binds the complete canonical issue set.
+- Added dedicated read-only `issue-manage-agent` and
+  `pull-request-manage-agent` roles with strict Russian JSON schemas. Issues
+  require context, goal, repository responsibility, scope, acceptance,
+  dependencies, risks, labels, milestone, and assignees. PRs require the linked
+  issue, completed work, components, checks, contracts/migrations, risks,
+  result verification, labels, milestone, assignees, and reviewers.
+- Added explicit discussion, issue prepare/publish, submit,
+  exact-fingerprint approval, PR prepare/publish HTTP and CLI operations.
+- Added the bounded GitHub REST gateway with idempotency markers, complete
+  metadata, reviewer assignment, redirect refusal, response limits, and
+  non-force `ai/task-*` push validation. The default fake gateway performs no
+  network or Git push and supports a complete local lifecycle.
+- Removed automatic required-task persistence and dynamic Temporal DAG
+  injection. Newly discovered prerequisites persist as blockers and pause the
+  run until a new plan version is discussed and approved.
+- Added a global Temporal activity limit across simultaneous plan workflows in
+  addition to each plan's parallelism limit.
+- Configured local ChatGPT-auth Codex profiles by complexity: fast uses
+  `gpt-5.6-terra`/low; standard uses `gpt-5.6`/medium; deep and review use
+  `gpt-5.6`/high. All values remain environment-overridable; no API key is
+  required.
+- Disabled real legacy GitLab synchronization because it bypasses dedicated
+  manager-agent proposals; its fake/dry-run preview remains available.
+- Applied migrations `010` and `011` to the local PostgreSQL instance and
+  passed the full issue proposal → submit → exact approval → publication → run
+  gate integration state machine. `make verify` passed on the final tree.
 
 ## Remaining work
 
-- Obtain exact approval for plan
-  `383dede3-2393-47af-b3db-e6c52bbfa4e8`, then execute its three independent
-  Go tasks through the locally authenticated Codex CLI.
-- Inspect the generated isolated branches and reviewer results; do not push,
-  merge, or deploy project changes without a separate explicit authorization.
-- Verify a controlled retry/resume path after the successful baseline run.
-- Add safe execution profiles for Python and Node projects before using the
-  generic planner for polyglot coding tasks.
-- Resolve the prioritized platform work items and contract-drift queue through
-  separately reviewed plans.
+- Do not approve or run legacy plan
+  `383dede3-2393-47af-b3db-e6c52bbfa4e8`; cancel it separately if the owner
+  wants the historical record closed.
+- Choose a real source issue or formulate a concrete question/idea for the
+  first Stage 9 pilot, then inspect its selected repositories, DAG, dependency
+  order, and full Russian fake issue proposals during discussion.
+- Approve only the exact displayed fingerprint, publish through the fake
+  gateway, and run the pilot through locally authenticated Codex CLI.
+- Inspect isolated task branches and independent reviewer results, then prepare
+  fake PR proposals. Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge,
+  or deploy without a separate explicit authorization.
+- Exercise two simultaneously approved fake-backed plans to verify the global
+  agent limit in a live Temporal run.
 
 ## Exact next task
 
-Receive explicit authorization for plan
-`383dede3-2393-47af-b3db-e6c52bbfa4e8`, persist that approval, start the three
-independent health-handler test tasks with maximum parallelism three, and
-monitor execution and reviewer outcomes without publishing project branches.
+Receive one concrete existing issue or question/idea from the owner. Create a
+new Stage 9 discussion plan, run `issue-manage-agent` through local Codex CLI,
+and return the exact DAG, Russian fake issue proposals, dependency order, model
+profiles, and fingerprint for discussion. Do not submit, approve, execute, or
+publish anything until the owner explicitly approves that exact version.

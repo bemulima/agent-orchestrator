@@ -44,6 +44,16 @@ func TestProcessRunnerRejectsUnsupportedProtocol(t *testing.T) {
 	require.ErrorContains(t, err, "unknown Codex runner event")
 }
 
+func TestProcessRunnerRejectsUnsupportedReasoningEffort(t *testing.T) {
+	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
+	require.NoError(t, err)
+	_, err = runner.Run(context.Background(), domain.AgentRunRequest{
+		Role: domain.AgentRunCoder, WorkingDirectory: t.TempDir(), Prompt: "fixture",
+		ReasoningEffort: "ultra", OutputSchema: map[string]any{"type": "object"},
+	}, nil)
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
 func TestProcessRunnerAcceptsReadOnlyAnalyst(t *testing.T) {
 	t.Setenv("GO_WANT_CODEX_HELPER", "success")
 	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
