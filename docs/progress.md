@@ -563,19 +563,41 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `AGENTS.md` and `prompts/**` evidence while retaining commands and working
   rules. Discovery report schema advanced to v10 so every connected checkout is
   rescanned under the documentation boundary before topology is rebuilt.
+- Rejected the second `go-ms-ai-summary` proposal because copied commands in
+  `AGENTS.md` had no corresponding Go module, Makefile, Taskfile, or Compose
+  manifest. Discovery schema v11 now leaves name-only runtime placeholders as
+  `service_kind: unknown`, and semantic commands sourced only from README or
+  AGENTS require the matching repository manifest. The corrected proposal has
+  no runtime topology, executable commands, backend coder, or feature workflow;
+  its missing source, contracts, schema, configuration, and deployment remain
+  explicit open questions.
+- Rejected the first `ms-go-pet-project-orchestrator` proposal because a README
+  statement about downstream services forwarding a contract was represented as
+  a direct dependency on `ms-go-validation-orchestrator`. Indirect downstream
+  mentions now fail the relation-evidence gate. The corrected proposal records
+  only the production-wired `ms-go-ai-prompt` and `ms-go-student` dependencies,
+  SQL-backed ownership, approval-gated state changes, and `task test` as the
+  automatic verification command.
+- Completed reviewed, dry-run-validated onboarding applies for the
+  AI/orchestration wave: `ms-go-ai-prompt`, `go-ms-ai-summary`, and
+  `ms-go-pet-project-orchestrator`. Every apply passed exact write-scope,
+  isolated-worktree, commit, and source-checkout immutability checks.
+- Published the AI/orchestration trees after exact tree-hash comparison as
+  GitHub draft PRs: AI prompt #5, AI summary #3, and practice-task orchestrator
+  #8. No PR was merged.
 
 ## Remaining work
 
-- Review and merge the published pilot PR through the repository workflow before
-  rescanning its approved semantic report into the trusted topology.
-- Enrich the remaining 26 repositories in reviewed waves; do not approve or
+- Review and merge the published onboarding PRs through each repository workflow
+  before rescanning their approved semantic reports into the trusted topology.
+- Enrich the remaining 23 repositories in reviewed waves; do not approve or
   apply proposals in bulk.
 - After the platform context is accepted, run the first real multi-project
   coding plan with independent reviewer agents.
 
 ## Exact next task
 
-Enrich and review the AI/orchestration wave: `ms-go-ai-prompt`,
-`go-ms-ai-summary`, and `ms-go-pet-project-orchestrator`, applying only
-proposals whose evidence, relation direction, ownership, and command risk gates
-pass review.
+Enrich and review the platform-knowledge wave: `ms-infra-messaging`,
+`ms-course-promts`, `ms-course-journal`, and `knowledge-tree`, applying only
+proposals whose repository role, knowledge classification, infrastructure
+ownership, and command risk gates pass review.
