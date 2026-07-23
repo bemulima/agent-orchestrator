@@ -148,6 +148,7 @@ Do not edit files, use the network, inspect .env or credential files, or report 
 Return only facts directly supported by repository text. Every fact must include an exact evidence_quote of 8 to 500 characters copied from source_path; include surrounding source context when the value itself is shorter.
 Use confidence between 0.50 and 0.95. Put ambiguity in open_questions instead of guessing.
 Runtime capability, ownership, relation, contract, and infrastructure facts must come from production code or authoritative runtime documentation, never tests, fixtures, examples, or testdata.
+Database-table ownership must use a checked-in .sql source; models, ORM tags, and prose may describe entities but cannot establish schema ownership.
 Use these category/name conventions when applicable:
 - purpose: summary
 - capability: business capability or http_route
@@ -232,6 +233,14 @@ func validateSemanticAnalysis(
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
 				Reason: "non_production_evidence_not_allowed_for_runtime_category",
+			})
+			continue
+		}
+		if fact.Category == "ownership" && fact.Name == "database_table" &&
+			!strings.HasSuffix(strings.ToLower(fact.SourcePath), ".sql") {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "database_ownership_requires_sql_source",
 			})
 			continue
 		}

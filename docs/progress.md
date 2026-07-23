@@ -535,6 +535,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   set `GOCACHE=../.gocache`, which would write outside the isolated worktree and
   contradicted repository instructions. Commands containing parent-directory
   traversal now require approval and are excluded from automatic test workflows.
+- Rejected the first `ms-go-user` proposal because semantic GORM-model facts
+  duplicated four table ownership records already discovered from production
+  migrations. Semantic `ownership/database_table` facts now require checked-in
+  `.sql` evidence; code models remain valid evidence for domain entities only.
 
 ## Remaining work
 

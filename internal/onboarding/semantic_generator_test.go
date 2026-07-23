@@ -318,6 +318,38 @@ func TestValidateSemanticAnalysisRejectsNonProductionAndOperationalRelations(t *
 	}
 }
 
+func TestValidateSemanticAnalysisRequiresSQLForDatabaseOwnership(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "model.go"),
+		[]byte("func (User) TableName() string { return \"user\" }\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "ms-go-user", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{
+		ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindBackendService,
+	}
+	content := json.RawMessage(`{
+  "summary":"User service.",
+  "facts":[{
+    "category":"ownership","name":"database_table","value":"user","confidence":0.9,
+    "source_path":"model.go","evidence_quote":"TableName() string { return \"user\" }",
+    "explanation":"The ORM model names the table."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(root, project, snapshot, content, nil)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "database_ownership_requires_sql_source" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole
