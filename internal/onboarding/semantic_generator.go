@@ -162,6 +162,7 @@ Use these category/name conventions when applicable:
 - command: stable command name; value must be the exact developer-facing command documented in Makefile, Taskfile, package/pyproject/composer manifest, README, or AGENTS.md; never classify a Dockerfile RUN or CI step as a local command
 Keep values concise, use repository-relative paths, return at most 200 facts and 30 open questions.
 For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
+authenticates_through means the current project delegates authentication or token/JWT verification to the target; a caller allowlist or permission check is not authentication delegation.
 Do not infer runtime relations from Makefile, Taskfile, or package-manager command manifests. Use gateway_routes_to only when the current repository is the gateway, and frontend_consumes only when it is a frontend.
 Never use .ai/discovery/semantic-report.json itself as evidence.
 For an open question with no specific source file, return an empty source_paths array; never use "." as a path.
@@ -255,6 +256,13 @@ func validateSemanticAnalysis(
 			rejected = append(rejected, domain.SemanticRejectedFact{
 				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
 				Reason: "relation_type_not_allowed_for_source_kind",
+			})
+			continue
+		}
+		if fact.Category == "relation" && !semanticRelationEvidenceSupportsName(fact) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "relation_evidence_does_not_support_relation_type",
 			})
 			continue
 		}
@@ -407,6 +415,19 @@ func semanticRelationAllowedForSource(
 	default:
 		return true
 	}
+}
+
+func semanticRelationEvidenceSupportsName(fact domain.SemanticFact) bool {
+	if fact.Name != "authenticates_through" {
+		return true
+	}
+	evidence := strings.ToLower(fact.EvidenceQuote + " " + fact.Explanation)
+	for _, marker := range []string{"authenticat", "jwt", "verify token", "token verification", "bearer token"} {
+		if strings.Contains(evidence, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyEvidenceQuote(root, path, quote string) error {

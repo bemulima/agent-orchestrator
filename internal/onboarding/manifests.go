@@ -227,12 +227,17 @@ func classifyCommandRisk(name, command string) (bool, string) {
 		return true, "state_change"
 	}
 	padded := " " + command + " "
+	for _, marker := range []string{" rm ", "rm -"} {
+		if strings.Contains(padded, marker) {
+			return true, "state_change"
+		}
+	}
 	for _, marker := range []string{
-		" rm ", "rm -", "delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
+		"delete", "destroy", "cleanup", "clean-up", "drop ", "truncate ",
 		"reset", "rollback", "migrate", "migration", "create", "import", "insert", "seed",
 		"compose down", " stop", "kill",
 		"deploy", "publish", "release", "git push", "docker push", "kubectl", "helm ", "terraform",
-		"curl ", "wget ", "sudo ",
+		"curl ", "wget ", "sudo ", "go fmt ", "gofmt -w", "format",
 	} {
 		if strings.Contains(padded, marker) || strings.Contains(name, strings.TrimSpace(marker)) {
 			return true, "state_change"
@@ -244,7 +249,7 @@ func classifyCommandRisk(name, command string) (bool, string) {
 	if strings.Contains(name, "integration") || strings.Contains(command, "integration") {
 		return true, "external_runtime"
 	}
-	for _, marker := range []string{"test", "lint", "verify", "validate", "check", "vet", "format", "fmt", "build", "help"} {
+	for _, marker := range []string{"test", "lint", "verify", "validate", "check", "vet", "build", "help"} {
 		if strings.Contains(name, marker) {
 			return false, "verification"
 		}

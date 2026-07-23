@@ -104,9 +104,11 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 		{Category: "command", Name: "test-integration", Value: "make test-integration", SourcePath: "Makefile", Confidence: .95},
 		{Category: "command", Name: "validate-contract", Value: "make validate-contract", SourcePath: "Makefile", Confidence: .95},
 		{Category: "command", Name: "unsafe_test_cache", Value: "GOCACHE=../.gocache go test ./...", SourcePath: "README.md", Confidence: .95},
+		{Category: "command", Name: "format_and_vet", Value: "go fmt ./... && go vet ./...", SourcePath: "AGENTS.md", Confidence: .95},
+		{Category: "command", Name: "performance_test", Value: "go test ./...", SourcePath: "Taskfile.yml", Confidence: .95},
 	}}
 	manifest := buildCommandsManifest(report)
-	if len(manifest.Commands) != 7 {
+	if len(manifest.Commands) != 9 {
 		t.Fatalf("commands = %#v", manifest.Commands)
 	}
 	approval := make(map[string]bool, len(manifest.Commands))
@@ -115,7 +117,7 @@ func TestCommandManifestRequiresApprovalForOperationalCommands(t *testing.T) {
 	}
 	if approval["test"] || approval["validate-contract"] || !approval["cleanup_exited_sandboxes"] ||
 		!approval["stop_containers"] || !approval["import-test-seeds"] || !approval["test-integration"] ||
-		!approval["unsafe_test_cache"] {
+		!approval["unsafe_test_cache"] || !approval["format_and_vet"] || approval["performance_test"] {
 		t.Fatalf("command approval classification = %#v", approval)
 	}
 	workflow := buildTestWorkflow(manifest)

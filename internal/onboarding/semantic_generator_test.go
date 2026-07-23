@@ -350,6 +350,44 @@ func TestValidateSemanticAnalysisRequiresSQLForDatabaseOwnership(t *testing.T) {
 	}
 }
 
+func TestValidateSemanticAnalysisRejectsCallerAllowlistAsAuthenticationDelegation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "main.go"),
+		[]byte(`AllowedServices: []string{"ms-go-sandbox"}`+"\n"),
+		0o640,
+	); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "project-1", Name: "ms-go-student", RepositoryRole: domain.RepositoryRoleService, LocalPath: &root}
+	snapshot := domain.ServiceSnapshot{
+		ID: "snapshot-1", ProjectID: project.ID, CommitSHA: "abc", ServiceKind: domain.ServiceKindBackendService,
+	}
+	content := json.RawMessage(`{
+  "summary":"Student service.",
+  "facts":[{
+    "category":"relation","name":"authenticates_through","value":"ms-go-sandbox","confidence":0.9,
+    "source_path":"main.go","evidence_quote":"AllowedServices: []string{\"ms-go-sandbox\"}",
+    "explanation":"The sandbox is an allowed caller."
+  }],
+  "open_questions":[]
+}`)
+	analysis, err := validateSemanticAnalysis(
+		root,
+		project,
+		snapshot,
+		content,
+		[]string{"ms-go-student", "ms-go-sandbox"},
+	)
+	if err != nil {
+		t.Fatalf("validateSemanticAnalysis() error = %v", err)
+	}
+	if len(analysis.Facts) != 0 || len(analysis.RejectedFacts) != 1 ||
+		analysis.RejectedFacts[0].Reason != "relation_evidence_does_not_support_relation_type" {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+}
+
 type semanticRunnerFake struct {
 	result          json.RawMessage
 	role            domain.AgentRunRole

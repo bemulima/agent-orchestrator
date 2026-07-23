@@ -539,6 +539,11 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   duplicated four table ownership records already discovered from production
   migrations. Semantic `ownership/database_table` facts now require checked-in
   `.sql` evidence; code models remain valid evidence for domain entities only.
+- Rejected the first `ms-go-student` proposal because a sandbox caller allowlist
+  was represented backwards as authentication delegation. The
+  `authenticates_through` relation now requires direct authentication/JWT/token
+  evidence. Command risk matching no longer finds destructive `rm` inside words
+  such as `performance`; formatting commands are explicitly state-changing.
 
 ## Remaining work
 
