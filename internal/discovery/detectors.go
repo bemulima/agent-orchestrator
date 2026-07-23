@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/bemulima/agent-orchestrator/internal/contractref"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
@@ -69,6 +70,7 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 		if _, exists := allowed[fact.Category]; !exists || strings.TrimSpace(fact.Name) == "" ||
 			strings.TrimSpace(fact.Value) == "" || fact.Confidence < .5 || fact.Confidence > .95 ||
 			len(fact.Name) > 128 || len(fact.Value) > 1000 || len(fact.Explanation) > 2000 ||
+			!validSemanticContractReference(fact) ||
 			fact.Category == "command" && (sanitizeCommand(fact.Value) != fact.Value ||
 				containsUnexpandedCommandTemplate(fact.Value) || !isApprovedSemanticCommandSource(fact.SourcePath)) ||
 			fact.Category == "command" && !semanticPackageCommandDeclared(fact, state.filesByPath) ||
@@ -89,6 +91,19 @@ func (s Scanner) analyzeApprovedSemanticReport(state *detectorState, path string
 		}
 		state.collector.conflict("semantic_open_question", question.Question, .8, path, question.Reason)
 	}
+}
+
+func validSemanticContractReference(fact domain.SemanticFact) bool {
+	if fact.Category == "capability" && fact.Name == "http_route" ||
+		fact.Category == "contract" && (fact.Name == "http_produce" || fact.Name == "http_consume") {
+		_, _, valid := contractref.HTTP(fact.Value)
+		return valid
+	}
+	if fact.Category == "contract" && (fact.Name == "event_publish" || fact.Name == "event_subscribe") {
+		_, valid := contractref.EventSubject(fact.Value)
+		return valid
+	}
+	return true
 }
 
 func containsUnexpandedCommandTemplate(value string) bool {

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bemulima/agent-orchestrator/internal/contractref"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -162,6 +163,7 @@ Use these category/name conventions when applicable:
 - infrastructure: dependency identifier
 - command: stable command name; value must be the exact developer-facing command documented in Makefile, Taskfile, package/pyproject/composer manifest, README, or AGENTS.md; never classify a Dockerfile RUN or CI step as a local command
 Keep values concise, use repository-relative paths, return at most 200 facts and 30 open questions.
+http_route, http_produce, and http_consume values must contain only an optional HTTP method plus an absolute path, for example POST /api/v1/items. event_publish and event_subscribe values must contain only a dot-delimited runtime subject, for example items.created.v1. Put payload fields, response behavior, queue-group descriptions, and prose in business rules, processes, entities, or open questions instead of contract values.
 For relation facts, value must be one exact name from connected_projects and repository text must identify that project. Networks, containers, platforms, libraries, URLs, and the current project are infrastructure facts, not relations.
 depends_on must describe a direct runtime dependency of the current repository. Do not create it merely because a contract is forwarded for downstream services or because another component may call the target later.
 authenticates_through means the current project delegates authentication or token/JWT verification to the target; a caller allowlist or permission check is not authentication delegation.
@@ -275,6 +277,13 @@ func validateSemanticAnalysis(
 			})
 			continue
 		}
+		if !validSemanticContractReference(fact) {
+			rejected = append(rejected, domain.SemanticRejectedFact{
+				Category: fact.Category, Name: fact.Name, SourcePath: fact.SourcePath,
+				Reason: "contract_reference_not_machine_readable",
+			})
+			continue
+		}
 		if fact.Category == "command" && (containsCredentialLikeCommand(fact.Value) || !isSemanticCommandSource(fact.SourcePath)) {
 			reason := "command_source_not_approved"
 			if containsCredentialLikeCommand(fact.Value) {
@@ -381,6 +390,19 @@ func validateSemanticAnalysis(
 		BaseCommit: snapshot.CommitSHA, Summary: result.Summary, Facts: validated, RejectedFacts: rejected,
 		OpenQuestions: validatedQuestions,
 	}, nil
+}
+
+func validSemanticContractReference(fact domain.SemanticFact) bool {
+	if fact.Category == "capability" && fact.Name == "http_route" ||
+		fact.Category == "contract" && (fact.Name == "http_produce" || fact.Name == "http_consume") {
+		_, _, valid := contractref.HTTP(fact.Value)
+		return valid
+	}
+	if fact.Category == "contract" && (fact.Name == "event_publish" || fact.Name == "event_subscribe") {
+		_, valid := contractref.EventSubject(fact.Value)
+		return valid
+	}
+	return true
 }
 
 func isNonRuntimeSemanticRole(role domain.RepositoryRole) bool {

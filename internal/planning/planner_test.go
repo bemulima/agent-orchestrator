@@ -70,6 +70,29 @@ func TestPlannerRequiresKnownAffectedProject(t *testing.T) {
 	}
 }
 
+func TestPlannerKeepsExplicitProjectSelectionExact(t *testing.T) {
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision-id"},
+		Services: []domain.TopologyService{
+			{ProjectID: "validator", Name: "validator", Stack: []domain.Evidence{{Name: "language", Value: "go"}}},
+			{ProjectID: "consumer", Name: "consumer", Stack: []domain.Evidence{{Name: "language", Value: "go"}}},
+		},
+		Relations: []domain.ServiceRelation{{
+			SourceProjectID: "consumer", TargetProjectID: "validator", RelationType: domain.RelationConsumes,
+		}},
+	}
+
+	_, output, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Add focused health handler tests",
+	}, catalog, domain.PlanRequest{RequestedProjectIDs: []string{"validator"}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(output.Tasks) != 1 || output.Tasks[0].ProjectID != "validator" || len(output.Dependencies) != 0 {
+		t.Fatalf("explicit selection expanded outside its scope: %#v", output)
+	}
+}
+
 func TestValidatorRejectsCyclesIncompleteTasksAndWideWaves(t *testing.T) {
 	validator := Validator{MaxParallelTasks: 2, MaxRequiredTaskDepth: 3}
 	validTask := func(key string) domain.PlannedTask {

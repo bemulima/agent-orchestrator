@@ -7,18 +7,19 @@ Last updated: 2026-07-23
 Stages 1–8 and the final cross-stage MVP rehearsal are complete and verified.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
-All 38 requested repositories are connected: 25 through orchestrator-managed
-clones of remote default branches and the original 13 through previously
-reviewed clean local checkouts. The catalog contains 31 services, two frontends, one
-infrastructure repository, and one repository in each of the policy,
-documentation, content, and archive roles. The user's primary checkouts were
-not modified. The materialized landscape currently includes 34 runtime
-services, 433 capabilities, 131 ownership records, 472 contracts, four
-explicit relations, and 12 reported contract drifts.
+All 38 requested repositories now resolve through clean orchestrator-managed
+clones of their merged remote default branches. The catalog contains 31
+services, two frontends, one infrastructure repository, and one repository in
+each of the policy, documentation, content, and archive roles. The user's 13
+original primary checkouts were neither modified nor rescanned in place. The
+trusted schema-v17 topology contains 34 runtime services, 1,030 capabilities,
+216 ownership records, 695 machine-readable contracts, 111 explicit relations,
+and 92 reported contract drifts. Five consecutive rebuilds reused revision
+`a16d1cd2-33fa-4027-90eb-945d1a62a895` and fingerprint
+`839401093020ddc53ac0f30b1aae20079f335ae0b0282185bb1a7c5ab62a2f91`.
 
 Local Codex CLI execution now uses the existing ChatGPT login by default; no
-`CODEX_API_KEY` is required. A three-project planning smoke test was completed
-without starting execution. Evidence-backed semantic enrichment is implemented
+`CODEX_API_KEY` is required. Evidence-backed semantic enrichment is implemented
 as a proposal-only analyst pass: it cannot modify a connected checkout or
 affect topology until the owner reviews, approves, applies, and rescans its
 proposal. A live pilot for `ms-go-http-runtime-validator` produced run
@@ -27,11 +28,10 @@ open questions, and two approved Taskfile commands. The owner approved it on
 2026-07-23; dry-run and real apply passed in the isolated
 `ai/onboard-ms-go-http-runtime-validator-95482dd44a59` worktree, commit
 `5b3c99391d2379b1e9ddeb40f772a371abaf0e85` was pushed, and GitHub draft PR #6
-was opened. No live coding task has yet been executed against the 38 projects.
-All 38 repositories now also have reviewed, applied, and published semantic
-onboarding proposals in isolated draft PRs. The current exact PR set is tracked
-in `docs/onboarding-prs.md`. None is merged, so the materialized topology still
-describes default branches without the approved semantic reports.
+was opened. All 38 reviewed onboarding PRs in `docs/onboarding-prs.md` and
+orchestrator PR #1 were explicitly approved and merged on 2026-07-23. A first
+real three-project coding plan now awaits its own exact resource-level approval;
+no coding task, branch, push, merge, or deployment has been started by it.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -666,21 +666,40 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   watch/UI/lifecycle commands incorrectly marked for automatic execution.
 - Confirmed exactly one current onboarding draft per connected project and
   recorded the resource-level merge set in `docs/onboarding-prs.md`.
+- Merged the exact 38 approved onboarding PRs and `agent-orchestrator` PR #1,
+  then independently confirmed that all 39 pull requests are closed and merged.
+- Moved the remaining 13 catalog entries to separate orchestrator-managed
+  clones while preserving the user's primary checkouts and their HEAD/dirty
+  state.
+- Advanced discovery to schema v17, rejected prose-shaped semantic contracts,
+  and rescanned all 38 clean merged default branches without truncation.
+- Made topology sorting total and deterministic, added independent contract
+  shape validation, and confirmed five stable rebuilds with the same revision,
+  fingerprint, and counts.
+- Added exact explicit project scope to planning and name-based topology CLI
+  lookup, with regression coverage for both behaviors.
+- Converted the reviewed platform gaps into the prioritized queue in
+  `docs/platform-work-items.md`.
+- Created the first real three-project concurrent coding plan
+  `383dede3-2393-47af-b3db-e6c52bbfa4e8`; it is intentionally paused in
+  `awaiting_approval` before any project mutation.
 
 ## Remaining work
 
-- Obtain explicit resource-level authorization to merge the 38 drafts listed
-  in `docs/onboarding-prs.md`; onboarding approval did not authorize merges.
-- After merge, rescan all default branches under schema v16 and rebuild
-  topology, contracts, relations, and drift from the now-trusted reports.
-- Turn the recorded authentication, deployment, CI, path-containment, and
-  sandbox-isolation gaps into reviewed work items.
-- Run the first real concurrent multi-project coding plan through local Codex
-  CLI with independent reviewer agents and verify retry/resume behavior.
+- Obtain exact approval for plan
+  `383dede3-2393-47af-b3db-e6c52bbfa4e8`, then execute its three independent
+  Go tasks through the locally authenticated Codex CLI.
+- Inspect the generated isolated branches and reviewer results; do not push,
+  merge, or deploy project changes without a separate explicit authorization.
+- Verify a controlled retry/resume path after the successful baseline run.
+- Add safe execution profiles for Python and Node projects before using the
+  generic planner for polyglot coding tasks.
+- Resolve the prioritized platform work items and contract-drift queue through
+  separately reviewed plans.
 
 ## Exact next task
 
-Receive explicit authorization for the exact 38 PRs in
-`docs/onboarding-prs.md`, merge only that approved set, then rescan all 38
-default branches and rebuild the trusted platform topology before executing a
-real coding task.
+Receive explicit authorization for plan
+`383dede3-2393-47af-b3db-e6c52bbfa4e8`, persist that approval, start the three
+independent health-handler test tasks with maximum parallelism three, and
+monitor execution and reviewer outcomes without publishing project branches.

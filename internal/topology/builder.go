@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bemulima/agent-orchestrator/internal/contractref"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -25,7 +26,8 @@ type Builder struct{}
 func (Builder) Build(ctx context.Context, sources []domain.TopologySource) (domain.TopologyCatalog, error) {
 	sources = append([]domain.TopologySource(nil), sources...)
 	sort.Slice(sources, func(i, j int) bool {
-		return sources[i].Project.Name+sources[i].Project.ID < sources[j].Project.Name+sources[j].Project.ID
+		return stableSortKey(sources[i].Project.Name, sources[i].Project.ID) <
+			stableSortKey(sources[j].Project.Name, sources[j].Project.ID)
 	})
 	catalog := domain.TopologyCatalog{
 		Services: []domain.TopologyService{}, Capabilities: []domain.ServiceCapability{},
@@ -136,24 +138,38 @@ func buildContracts(source domain.TopologySource) []domain.Contract {
 		switch {
 		case fact.Category == "capability" && fact.Name == "http_route",
 			fact.Category == "contract" && fact.Name == "http_produce":
-			method, path := parseHTTPReference(fact.Value)
+			method, path, valid := contractref.HTTP(fact.Value)
+			if !valid {
+				continue
+			}
 			contractType, direction = domain.ContractTypeHTTP, domain.ContractDirectionProvides
 			code, version = httpContractCode(method, path), versionFromPath(path)
 			shape.Kind, shape.Method, shape.Path = "http", method, path
 		case fact.Category == "relation" && fact.Name == "frontend_consumes",
 			fact.Category == "contract" && fact.Name == "http_consume":
-			method, path := parseHTTPReference(fact.Value)
+			method, path, valid := contractref.HTTP(fact.Value)
+			if !valid {
+				continue
+			}
 			contractType, direction = domain.ContractTypeHTTP, domain.ContractDirectionConsumes
 			code, version = httpContractCode(method, path), versionFromPath(path)
 			shape.Kind, shape.Method, shape.Path = "http", method, path
 		case fact.Category == "contract" && fact.Name == "event_publish":
+			subject, valid := contractref.EventSubject(fact.Value)
+			if !valid {
+				continue
+			}
 			contractType, direction = domain.ContractTypeEvent, domain.ContractDirectionPublishes
-			code, version = eventContractCode(fact.Value), versionFromSubject(fact.Value)
-			shape.Kind, shape.Subject = "event", fact.Value
+			code, version = eventContractCode(subject), versionFromSubject(subject)
+			shape.Kind, shape.Subject = "event", subject
 		case fact.Category == "contract" && fact.Name == "event_subscribe":
+			subject, valid := contractref.EventSubject(fact.Value)
+			if !valid {
+				continue
+			}
 			contractType, direction = domain.ContractTypeEvent, domain.ContractDirectionSubscribes
-			code, version = eventContractCode(fact.Value), versionFromSubject(fact.Value)
-			shape.Kind, shape.Subject = "event", fact.Value
+			code, version = eventContractCode(subject), versionFromSubject(subject)
+			shape.Kind, shape.Subject = "event", subject
 		case fact.Category == "ownership" && fact.Name == "database_table":
 			contractType, direction = domain.ContractTypeDatabase, domain.ContractDirectionOwns
 			code, version = stableCode("database", strings.ToLower(fact.Value), 255), "unversioned"
@@ -211,7 +227,10 @@ func buildRelations(sources []domain.TopologySource, contracts []domain.Contract
 				relationType = domain.RelationDeploys
 			case fact.Category == "relation" && fact.Name == "frontend_consumes",
 				fact.Category == "contract" && fact.Name == "http_consume":
-				method, path := parseHTTPReference(fact.Value)
+				method, path, valid := contractref.HTTP(fact.Value)
+				if !valid {
+					continue
+				}
 				code := httpContractCode(method, path)
 				for _, producer := range producers[code] {
 					if producer.ProjectID == source.Project.ID {
@@ -226,7 +245,11 @@ func buildRelations(sources []domain.TopologySource, contracts []domain.Contract
 				}
 				continue
 			case fact.Category == "contract" && fact.Name == "event_subscribe":
-				code := eventContractCode(fact.Value)
+				subject, valid := contractref.EventSubject(fact.Value)
+				if !valid {
+					continue
+				}
+				code := eventContractCode(subject)
 				for _, producer := range producers[code] {
 					if producer.ProjectID == source.Project.ID {
 						continue
@@ -312,25 +335,6 @@ func buildDrifts(contracts []domain.Contract) []domain.ContractDrift {
 	return deduplicateDrifts(drifts)
 }
 
-func parseHTTPReference(value string) (string, string) {
-	value = strings.TrimSpace(value)
-	method := "GET"
-	parts := strings.Fields(value)
-	if len(parts) > 1 && isHTTPMethod(parts[0]) {
-		method, value = strings.ToUpper(parts[0]), parts[1]
-	}
-	if parsed, err := url.Parse(value); err == nil && parsed.Path != "" {
-		value = parsed.Path
-	}
-	if index := strings.IndexByte(value, '?'); index >= 0 {
-		value = value[:index]
-	}
-	if value == "" || !strings.HasPrefix(value, "/") {
-		value = "/" + strings.TrimLeft(value, "/")
-	}
-	return method, value
-}
-
 func httpContractCode(method, path string) string {
 	canonical := versionPathPattern.ReplaceAllStringFunc(path, func(match string) string {
 		suffix := ""
@@ -362,15 +366,6 @@ func versionFromSubject(value string) string {
 		return strings.ToLower(match[1])
 	}
 	return "unversioned"
-}
-
-func isHTTPMethod(value string) bool {
-	switch strings.ToUpper(value) {
-	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD":
-		return true
-	default:
-		return false
-	}
 }
 
 func projectAliases(sources []domain.TopologySource) map[string]string {
@@ -417,7 +412,8 @@ func filterEvidence(facts []domain.Evidence, category, name string) []domain.Evi
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].Name+result[i].Value+result[i].SourcePath < result[j].Name+result[j].Value+result[j].SourcePath
+		return stableSortKey(result[i].Name, result[i].Value, result[i].SourcePath, result[i].Explanation) <
+			stableSortKey(result[j].Name, result[j].Value, result[j].SourcePath, result[j].Explanation)
 	})
 	return result
 }
@@ -450,7 +446,8 @@ func deduplicateCapabilities(values []domain.ServiceCapability) []domain.Service
 	best := make(map[string]domain.ServiceCapability)
 	for _, value := range values {
 		key := value.ProjectID + "\x00" + value.Code + "\x00" + value.Source
-		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence {
+		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence ||
+			(value.Confidence == existing.Confidence && capabilityChoiceKey(value) < capabilityChoiceKey(existing)) {
 			best[key] = value
 		}
 	}
@@ -465,7 +462,8 @@ func deduplicateOwnership(values []domain.ServiceOwnership) []domain.ServiceOwne
 	best := make(map[string]domain.ServiceOwnership)
 	for _, value := range values {
 		key := value.ProjectID + "\x00" + value.ResourceType + "\x00" + value.ResourceName + "\x00" + value.Source
-		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence {
+		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence ||
+			(value.Confidence == existing.Confidence && ownershipChoiceKey(value) < ownershipChoiceKey(existing)) {
 			best[key] = value
 		}
 	}
@@ -480,7 +478,7 @@ func deduplicateContracts(values []domain.Contract) []domain.Contract {
 	best := make(map[string]domain.Contract)
 	for _, value := range values {
 		key := value.ProjectID + "\x00" + value.Code + "\x00" + string(value.Type) + "\x00" + value.Version + "\x00" + value.Direction
-		if existing, exists := best[key]; !exists || value.SourcePath < existing.SourcePath {
+		if existing, exists := best[key]; !exists || contractChoiceKey(value) < contractChoiceKey(existing) {
 			best[key] = value
 		}
 	}
@@ -494,12 +492,10 @@ func deduplicateContracts(values []domain.Contract) []domain.Contract {
 func deduplicateRelations(values []domain.ServiceRelation) []domain.ServiceRelation {
 	best := make(map[string]domain.ServiceRelation)
 	for _, value := range values {
-		contractCode := ""
-		if value.ContractCode != nil {
-			contractCode = *value.ContractCode
-		}
+		contractCode := relationContractCode(value)
 		key := value.SourceProjectID + "\x00" + value.TargetProjectID + "\x00" + string(value.RelationType) + "\x00" + contractCode + "\x00" + value.Source
-		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence {
+		if existing, exists := best[key]; !exists || value.Confidence > existing.Confidence ||
+			(value.Confidence == existing.Confidence && relationChoiceKey(value) < relationChoiceKey(existing)) {
 			best[key] = value
 		}
 	}
@@ -521,7 +517,8 @@ func deduplicateDrifts(values []domain.ContractDrift) []domain.ContractDrift {
 			consumer = *value.ConsumerProjectID
 		}
 		key := producer + "\x00" + consumer + "\x00" + value.ContractCode
-		if existing, exists := best[key]; !exists || severityRank(value.Severity) > severityRank(existing.Severity) {
+		if existing, exists := best[key]; !exists || severityRank(value.Severity) > severityRank(existing.Severity) ||
+			(severityRank(value.Severity) == severityRank(existing.Severity) && driftChoiceKey(value) < driftChoiceKey(existing)) {
 			best[key] = value
 		}
 	}
@@ -547,19 +544,22 @@ func severityRank(value domain.DriftSeverity) int {
 
 func sortCatalog(catalog *domain.TopologyCatalog) {
 	sort.Slice(catalog.Services, func(i, j int) bool {
-		return catalog.Services[i].Name+catalog.Services[i].ProjectID < catalog.Services[j].Name+catalog.Services[j].ProjectID
+		return stableSortKey(catalog.Services[i].Name, catalog.Services[i].ProjectID) <
+			stableSortKey(catalog.Services[j].Name, catalog.Services[j].ProjectID)
 	})
 	sort.Slice(catalog.Capabilities, func(i, j int) bool {
-		return catalog.Capabilities[i].ProjectID+catalog.Capabilities[i].Code+catalog.Capabilities[i].Source < catalog.Capabilities[j].ProjectID+catalog.Capabilities[j].Code+catalog.Capabilities[j].Source
+		return stableSortKey(catalog.Capabilities[i].ProjectID, catalog.Capabilities[i].Code, catalog.Capabilities[i].Source) <
+			stableSortKey(catalog.Capabilities[j].ProjectID, catalog.Capabilities[j].Code, catalog.Capabilities[j].Source)
 	})
 	sort.Slice(catalog.Ownership, func(i, j int) bool {
-		return catalog.Ownership[i].ProjectID+catalog.Ownership[i].ResourceType+catalog.Ownership[i].ResourceName < catalog.Ownership[j].ProjectID+catalog.Ownership[j].ResourceType+catalog.Ownership[j].ResourceName
+		return stableSortKey(catalog.Ownership[i].ProjectID, catalog.Ownership[i].ResourceType, catalog.Ownership[i].ResourceName, catalog.Ownership[i].Source) <
+			stableSortKey(catalog.Ownership[j].ProjectID, catalog.Ownership[j].ResourceType, catalog.Ownership[j].ResourceName, catalog.Ownership[j].Source)
 	})
 	sort.Slice(catalog.Contracts, func(i, j int) bool {
-		return catalog.Contracts[i].Code+catalog.Contracts[i].ProjectID+catalog.Contracts[i].Direction < catalog.Contracts[j].Code+catalog.Contracts[j].ProjectID+catalog.Contracts[j].Direction
+		return contractSortKey(catalog.Contracts[i]) < contractSortKey(catalog.Contracts[j])
 	})
 	sort.Slice(catalog.Relations, func(i, j int) bool {
-		return catalog.Relations[i].SourceProjectID+catalog.Relations[i].TargetProjectID+string(catalog.Relations[i].RelationType) < catalog.Relations[j].SourceProjectID+catalog.Relations[j].TargetProjectID+string(catalog.Relations[j].RelationType)
+		return relationSortKey(catalog.Relations[i]) < relationSortKey(catalog.Relations[j])
 	})
 	sort.Slice(catalog.Drifts, func(i, j int) bool {
 		return driftSortKey(catalog.Drifts[i]) < driftSortKey(catalog.Drifts[j])
@@ -574,7 +574,50 @@ func driftSortKey(value domain.ContractDrift) string {
 	if value.ConsumerProjectID != nil {
 		consumer = *value.ConsumerProjectID
 	}
-	return fmt.Sprintf("%d:%s:%s:%s", 10-severityRank(value.Severity), value.ContractCode, producer, consumer)
+	return stableSortKey(fmt.Sprintf("%02d", 10-severityRank(value.Severity)), value.ContractCode, producer, consumer,
+		string(value.ContractType), value.ProducerVersion, value.ConsumerVersion, string(value.Difference), value.SuggestedAction)
+}
+
+func stableSortKey(fields ...string) string {
+	return strings.Join(fields, "\x00")
+}
+
+func capabilityChoiceKey(value domain.ServiceCapability) string {
+	return stableSortKey(value.SnapshotID, value.Name, value.Description, value.Source)
+}
+
+func ownershipChoiceKey(value domain.ServiceOwnership) string {
+	return stableSortKey(value.SnapshotID, value.ResourceType, value.ResourceName, value.Source)
+}
+
+func contractChoiceKey(value domain.Contract) string {
+	return stableSortKey(value.SourcePath, value.Checksum, string(value.Definition), value.SnapshotID)
+}
+
+func contractSortKey(value domain.Contract) string {
+	return stableSortKey(value.Code, value.ProjectID, value.Direction, string(value.Type), value.Version,
+		value.SourcePath, value.Checksum, value.SnapshotID)
+}
+
+func relationContractCode(value domain.ServiceRelation) string {
+	if value.ContractCode == nil {
+		return ""
+	}
+	return *value.ContractCode
+}
+
+func relationChoiceKey(value domain.ServiceRelation) string {
+	return stableSortKey(value.SnapshotID, relationContractCode(value), value.Source)
+}
+
+func relationSortKey(value domain.ServiceRelation) string {
+	return stableSortKey(value.SourceProjectID, value.TargetProjectID, string(value.RelationType),
+		relationContractCode(value), value.Source, value.SnapshotID)
+}
+
+func driftChoiceKey(value domain.ContractDrift) string {
+	return stableSortKey(string(value.ContractType), value.ProducerVersion, value.ConsumerVersion,
+		string(value.Difference), value.SuggestedAction)
 }
 
 func catalogFingerprint(catalog domain.TopologyCatalog) (string, error) {
