@@ -844,6 +844,20 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   frontend typecheck/unit/production build, four desktop Playwright flows, a
   375px mobile flow, zero npm audit vulnerabilities, Docker image builds, and
   Compose API/UI health. No orchestrator resource was mutated by UI tests.
+- Published the completed Stage 9/10 checkpoint as commit `5aa09e8` on branch
+  `agent/owner-ui-and-planning-reliability` and opened draft GitHub PR #4 after
+  explicit owner authorization.
+- Added Stage 11 project connection and plan creation wizards. Owners can now
+  connect an allowlisted path or Git URL, inspect discovery output, describe a
+  goal, explicitly select projects, and open the generated discussion plan.
+- Added immutable plan revisions through
+  `POST /api/v1/plans/{planId}/revisions`. Only a discussion plan may create a
+  successor; the correction becomes part of planner input, the same command
+  and project set are retained by default, and repository fingerprint/version
+  rules cancel stale proposals without mutating history.
+- Added focused revision use-case and HTTP route coverage plus three mocked,
+  non-mutating Playwright scenarios. All eight owner E2E flows, focused Go
+  tests, frontend typecheck/unit tests, and the production Next.js build pass.
 
 ## Remaining work
 
@@ -858,8 +872,6 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   and determines the exact affected repository set from topology evidence.
 - Keep the isolated `ms-course-promts` worktree as diagnostic evidence until a
   replacement plan is agreed; it contains no approved commit or PR proposal.
-- Commit/push the local orchestrator reliability changes and open a separate
-  orchestrator PR only after explicit publication authorization.
 - Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge, or deploy without
   separate explicit authorization.
 - Exercise two simultaneously approved fake-backed plans to verify the global

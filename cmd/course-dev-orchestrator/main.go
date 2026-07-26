@@ -181,7 +181,8 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	}
 	planningHandler := handlers.PlanningHandler{
 		CreateCommand: planningOperations.CreateCommand, GetCommand: planningOperations.GetCommand,
-		CreatePlan: planningOperations.CreatePlan, GetPlan: planningOperations.GetPlan,
+		CreatePlan: planningOperations.CreatePlan, RevisePlan: planningOperations.RevisePlan,
+		GetPlan:     planningOperations.GetPlan,
 		CommentPlan: planningOperations.CommentPlan, SubmitPlan: planningOperations.SubmitPlan,
 		ApprovePlan: planningOperations.ApprovePlan, RejectPlan: planningOperations.RejectPlan,
 		PrepareIssues: workItemOperations.IssueManager, PublishIssues: workItemOperations.IssuePublisher,
@@ -367,6 +368,7 @@ type planningOperations struct {
 	CreateCommand planninguc.CreateCommand
 	GetCommand    planninguc.GetCommand
 	CreatePlan    planninguc.CreatePlan
+	RevisePlan    planninguc.RevisePlan
 	GetPlan       planninguc.GetPlan
 	CommentPlan   planninguc.CommentPlan
 	SubmitPlan    planninguc.SubmitPlan
@@ -392,24 +394,26 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 	plans := pgadapter.PlanningRepoPG{Pool: pool}
 	taskExecutions := pgadapter.TaskExecutionRepoPG{Pool: pool}
 	catalog := pgadapter.TopologyRepoPG{Pool: pool}
+	createPlan := planninguc.CreatePlan{
+		Plans: plans, Topology: catalog, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Planner: planningengine.AgentPlanner{
+			Base:   planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
+			Runner: agentRunner, Model: cfg.CodexModelDeep, Reasoning: cfg.CodexReasoningDeep,
+		},
+		Validator: planningengine.Validator{
+			MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+		},
+	}
 	return planningOperations{
 		CreateCommand: planninguc.CreateCommand{Plans: plans},
 		GetCommand:    planninguc.GetCommand{Plans: plans},
-		CreatePlan: planninguc.CreatePlan{
-			Plans: plans, Topology: catalog, Projects: pgadapter.ProjectRepoPG{Pool: pool},
-			Planner: planningengine.AgentPlanner{
-				Base:   planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
-				Runner: agentRunner, Model: cfg.CodexModelDeep, Reasoning: cfg.CodexReasoningDeep,
-			},
-			Validator: planningengine.Validator{
-				MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
-			},
-		},
-		GetPlan:     planninguc.GetPlan{Plans: plans},
-		CommentPlan: planninguc.CommentPlan{Plans: plans},
-		SubmitPlan:  planninguc.SubmitPlan{Plans: plans},
-		ApprovePlan: planninguc.ApprovePlan{Plans: plans},
-		RejectPlan:  planninguc.RejectPlan{Plans: plans},
+		CreatePlan:    createPlan,
+		RevisePlan:    planninguc.RevisePlan{Plans: plans, Create: createPlan},
+		GetPlan:       planninguc.GetPlan{Plans: plans},
+		CommentPlan:   planninguc.CommentPlan{Plans: plans},
+		SubmitPlan:    planninguc.SubmitPlan{Plans: plans},
+		ApprovePlan:   planninguc.ApprovePlan{Plans: plans},
+		RejectPlan:    planninguc.RejectPlan{Plans: plans},
 		StartPlan: planninguc.StartPlan{
 			Plans: plans, Runner: runner, MaxParallelTasks: cfg.MaxParallelTasks,
 			MaxActivityAttempts: cfg.MaxTaskAttempts,

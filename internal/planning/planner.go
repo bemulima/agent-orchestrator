@@ -30,6 +30,13 @@ func (p Planner) Build(
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}
 	text := strings.TrimSpace(command.Text)
+	revisionInstruction := strings.TrimSpace(request.RevisionInstruction)
+	if len(revisionInstruction) > 10000 {
+		return domain.PlannerInput{}, domain.PlannerOutput{}, fmt.Errorf("revision instruction is too long: %w", domain.ErrValidation)
+	}
+	if revisionInstruction != "" {
+		text += "\n\nКорректировка новой версии плана:\n" + revisionInstruction
+	}
 	if command.ID == "" || text == "" || catalog.Revision.ID == "" {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, fmt.Errorf("command and materialized topology are required: %w", domain.ErrValidation)
 	}
@@ -41,6 +48,7 @@ func (p Planner) Build(
 		CommandID: command.ID, CommandText: text, TopologyRevisionID: catalog.Revision.ID,
 		RequestedProjectIDs: uniqueSorted(request.RequestedProjectIDs),
 		SourceIssues:        sourceIssues,
+		RevisionInstruction: revisionInstruction,
 	}
 	services := make(map[string]domain.TopologyService, len(catalog.Services))
 	projects := make(map[string]domain.Project, len(request.AvailableProjects))

@@ -27,5 +27,5 @@ export default function ProjectsPage() {
   if (query.isLoading) return <Loading />;
   if (query.error) return <Failure error={query.error} />;
   const projects = query.data!.projects.filter(item => item.name.toLowerCase().includes(search.toLowerCase()));
-  return <div className="page"><header><div><p className="eyebrow">Каталог</p><h1>Проекты</h1><p>{query.data!.projects.length} подключённых репозиториев.</p></div></header><div className="toolbar"><label>Поиск проекта<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Название" /></label></div><section className="panel"><DataTable data={projects} columns={columns} /></section></div>;
+  return <div className="page"><header><div><p className="eyebrow">Каталог</p><h1>Проекты</h1><p>{query.data!.projects.length} подключённых репозиториев.</p></div><Link className="primary action-link" href="/projects/connect">Подключить проект</Link></header><div className="toolbar"><label>Поиск проекта<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Название" /></label></div><section className="panel"><DataTable data={projects} columns={columns} /></section></div>;
 }

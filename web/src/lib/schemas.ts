@@ -21,6 +21,30 @@ export const projectSchema = z.object({
 });
 export const projectsSchema = z.object({ projects: z.array(projectSchema) });
 
+export const discoveryReportSchema = z.object({
+  id: z.string().optional(),
+  project_id: z.string().optional(),
+  status: z.string().optional(),
+  summary: z.string().optional(),
+  warnings: z.array(z.string()).optional().default([]),
+}).loose();
+
+export const connectProjectResultSchema = z.object({
+  project: projectSchema,
+  snapshot: z.object({
+    service_kind: z.string().optional(),
+    language: z.string().optional(),
+    framework: z.string().optional(),
+  }).loose(),
+  report: discoveryReportSchema,
+});
+
+export const commandSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  status: z.string(),
+}).loose();
+
 export const planSummarySchema = z.object({
   id: z.string(), command_id: z.string(), summary: z.string(), status: z.string(), version: z.number(),
   risk_level: z.string(), source_kind: z.string(), fingerprint: z.string(), task_count: z.number(),

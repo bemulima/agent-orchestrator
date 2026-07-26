@@ -68,6 +68,7 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/commands/{commandId}/plan", deps.PlanningHandler.PlanCommand)
 		root.Get("/api/v1/plans/{planId}", deps.PlanningHandler.GetPlanRequest)
 		root.Get("/api/v1/plans/{planId}/tasks", deps.PlanningHandler.GetPlanTasks)
+		root.Post("/api/v1/plans/{planId}/revisions", deps.PlanningHandler.RevisePlanRequest)
 		root.Post("/api/v1/plans/{planId}/comments", deps.PlanningHandler.CommentPlanRequest)
 		root.Post("/api/v1/plans/{planId}/issues/prepare", deps.PlanningHandler.PreparePlanIssues)
 		root.Post("/api/v1/plans/{planId}/submit", deps.PlanningHandler.SubmitPlanRequest)

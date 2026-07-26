@@ -93,6 +93,47 @@ func (uc GetPlan) Handle(ctx context.Context, id string) (domain.PlanBundle, err
 	return uc.Plans.GetPlan(ctx, strings.TrimSpace(id))
 }
 
+type planRevisionSource interface {
+	GetPlan(context.Context, string) (domain.PlanBundle, error)
+}
+
+type planVersionCreator interface {
+	Handle(context.Context, string, domain.PlanRequest) (domain.PlanBundle, error)
+}
+
+// RevisePlan creates a new immutable version for the same command. Only the
+// latest discussion version is replaceable; approved or running plans must
+// remain stable for fingerprint and execution-history integrity.
+type RevisePlan struct {
+	Plans  planRevisionSource
+	Create planVersionCreator
+}
+
+func (uc RevisePlan) Handle(ctx context.Context, planID string, request domain.PlanRequest) (domain.PlanBundle, error) {
+	request.RevisionInstruction = strings.TrimSpace(request.RevisionInstruction)
+	if request.RevisionInstruction == "" || len(request.RevisionInstruction) > 10000 {
+		return domain.PlanBundle{}, fmt.Errorf("bounded revision instruction is required: %w", domain.ErrValidation)
+	}
+	bundle, err := uc.Plans.GetPlan(ctx, strings.TrimSpace(planID))
+	if err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if bundle.Plan.Status != domain.PlanStatusDiscussion {
+		return domain.PlanBundle{}, fmt.Errorf("only a discussion plan can be revised: %w", domain.ErrInvalidStatus)
+	}
+	if len(request.RequestedProjectIDs) == 0 {
+		seen := make(map[string]struct{}, len(bundle.Tasks))
+		for _, task := range bundle.Tasks {
+			if _, exists := seen[task.ProjectID]; exists {
+				continue
+			}
+			seen[task.ProjectID] = struct{}{}
+			request.RequestedProjectIDs = append(request.RequestedProjectIDs, task.ProjectID)
+		}
+	}
+	return uc.Create.Handle(ctx, bundle.Plan.CommandID, request)
+}
+
 type DecidePlanInput struct {
 	PlanID      string `json:"-"`
 	Fingerprint string `json:"fingerprint,omitempty"`

@@ -281,3 +281,28 @@ Acceptance:
   history, and later events invalidate cached queries;
 - Go unit/HTTP/integration tests, frontend typecheck/unit/build, Playwright
   desktop/mobile flows, dependency audit, and Compose validation pass.
+
+## Stage 11 — owner project and plan authoring
+
+Status: implemented and locally verified on 2026-07-26.
+
+Scope:
+
+- project connection wizard for allowlisted local paths and Git URLs;
+- immediate discovery result, stack summary, and warning presentation;
+- plan builder with bounded owner goal and explicit connected-project choice;
+- planner progress and navigation to the generated discussion draft;
+- immutable versioned plan revisions for bounded owner corrections;
+- backend enforcement that only discussion plans can create a replacement
+  version while approved, running, and historical fingerprints remain stable.
+
+Acceptance:
+
+- project connection invokes the existing atomic connect-and-scan use case;
+- plan creation persists a command and generates a validated plan for exactly
+  the selected project IDs;
+- revision reuses the original command and current project set, incorporates
+  the correction into planner input, increments the version, and changes the
+  fingerprint;
+- focused Go tests, frontend typecheck/unit/build, and eight Playwright flows
+  pass without mutating live resources.

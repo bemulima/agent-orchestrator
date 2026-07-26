@@ -81,7 +81,7 @@ func (p AgentPlanner) Build(
 		return domain.PlannerInput{}, domain.PlannerOutput{}, fmt.Errorf("planner-agent is not configured: %w", domain.ErrInvalidStatus)
 	}
 
-	agentContext, workingDirectory, err := buildPlannerAgentContext(command.Text, baseline, catalog, request.AvailableProjects)
+	agentContext, workingDirectory, err := buildPlannerAgentContext(input.CommandText, baseline, catalog, request.AvailableProjects)
 	if err != nil {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}

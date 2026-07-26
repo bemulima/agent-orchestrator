@@ -23,5 +23,5 @@ export default function PlansPage() {
   ], []);
   if (query.isLoading) return <Loading />;
   if (query.error) return <Failure error={query.error} />;
-  return <div className="page"><header><div><p className="eyebrow">Планирование</p><h1>Планы</h1><p>Версии, согласования и прогресс задач.</p></div></header><section className="panel"><DataTable data={query.data!.items} columns={columns} /></section></div>;
+  return <div className="page"><header><div><p className="eyebrow">Планирование</p><h1>Планы</h1><p>Версии, согласования и прогресс задач.</p></div><Link className="primary action-link" href="/plans/new">Создать план</Link></header><section className="panel"><DataTable data={query.data!.items} columns={columns} /></section></div>;
 }

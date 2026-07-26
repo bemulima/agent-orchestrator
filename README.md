@@ -70,7 +70,17 @@ make ui-e2e
 ```
 
 The UI exposes overview, project catalog/details, plan list and DAG, plan runs,
-task attempts/artifacts, approvals, and backend-authorized control actions.
+task attempts/artifacts, approvals, and backend-authorized control actions. From
+the project catalog, **Connect project** accepts either a container path below
+`/projects` or a Git URL and immediately displays the read-only discovery
+result. From the plan list, **Create plan** captures the owner goal, requires an
+explicit project selection, runs the planner, and opens the generated
+discussion draft.
+
+Discussion plans can be revised with **Create new version**. A revision keeps
+the original command and selected projects, incorporates the bounded owner
+instruction, rebuilds and validates the DAG, and persists a new version and
+fingerprint. Approved, running, and historical versions cannot be mutated.
 Approve, reject, run, pause, resume, cancel, publish, and retry operations keep
 the existing Go state-machine and fingerprint gates; the browser does not
 reimplement them.
@@ -79,6 +89,9 @@ The UI read API adds `GET /api/v1/dashboard`, collection queries for plans,
 runs, tasks, approvals, and activity, plus `GET /api/v1/events` for SSE.
 Collection endpoints accept `limit`, opaque `cursor`, repeated `status`,
 `project_id`, and `plan_id` parameters where applicable.
+The management flows use the existing `POST /api/v1/projects/connect`, command
+and plan creation endpoints, plus
+`POST /api/v1/plans/{planId}/revisions` for versioned discussion changes.
 
 `make down` keeps PostgreSQL and orchestrator volumes. To delete them, the user
 must explicitly run `docker compose down -v`; no Make target hides that

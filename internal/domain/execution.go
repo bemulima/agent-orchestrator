@@ -132,6 +132,7 @@ type TaskDependency struct {
 type PlanRequest struct {
 	RequestedProjectIDs []string         `json:"project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 	AvailableProjects   []Project        `json:"-"`
 }
 
@@ -141,6 +142,7 @@ type PlannerInput struct {
 	TopologyRevisionID  string           `json:"topology_revision_id"`
 	RequestedProjectIDs []string         `json:"requested_project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 }
 
 type PlannedTask struct {
