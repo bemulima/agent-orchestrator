@@ -1,12 +1,20 @@
 # Implementation progress
 
-Last updated: 2026-07-23
+Last updated: 2026-07-26
 
 ## Current status
 
 Stages 1–9 and the final cross-stage MVP rehearsal are complete and verified.
+Stage 10 is also implemented and locally verified: a dedicated Next.js owner
+UI now provides dashboard, project, plan/DAG, run, task attempt/artifact, and
+approval views over bounded Go read models. The Compose stack exposes it only
+on `127.0.0.1:3010` by default. Backend-derived allowed actions reuse the
+existing fingerprint and state-machine gates. Audit-backed SSE provides live
+cache invalidation, with polling fallback; the initial stream establishes a
+baseline instead of replaying historical events.
 The Docker Compose stack is currently
-running with PostgreSQL, Temporal, Temporal UI, the HTTP API, and the worker.
+running with PostgreSQL, Temporal, Temporal UI, the HTTP API, worker, and owner
+UI.
 All 38 requested repositories now resolve through clean orchestrator-managed
 clones of their merged remote default branches. The catalog contains 31
 services, two frontends, one infrastructure repository, and one repository in
@@ -40,6 +48,18 @@ risk-based Codex model/reasoning profiles, concurrent-plan limits, and a local
 fake work-item gateway. Migrations `010` and `011`, PostgreSQL integration
 tests, unit/HTTP/workflow tests, TypeScript runner tests, and `make verify`
 passed. No real GitHub/GitLab issue, branch, PR, or MR was created.
+The first live Stage 9 execution pilot is plan
+`d83dc80c-4df7-4274-9b70-3b00a9683a1c`, version 4. It fixes one shared path
+containment policy first, then schedules independent Git, HTTP-runtime, and
+browser-runtime validator tasks with three parallel agents. A local
+ChatGPT-auth `issue-manage-agent` prepared four complete Russian fake issue
+proposals. The owner submitted and approved exact fingerprint
+`2a0e81e70411b63a7e55295e4d11f6af10e550fd38445b53d7f81b4f9b1faeea`;
+the fake gateway published four local-only issue records and the Temporal run
+started through ChatGPT-auth Codex CLI. The prerequisite policy task produced
+an isolated untracked contract and received independent reviewer feedback, but
+did not complete. The run is terminal `failed`; none of the three downstream
+tasks ran. No real issue/PR, push, merge, or deployment occurred.
 Stage 7 used fake/dry-run GitLab adapters, a local HTTP server, and disposable
 PostgreSQL rows; no real GitLab project, issue, branch, or MR was changed.
 Stage 8 used a fake Bot API adapter, signed local webhook requests, and
@@ -712,35 +732,151 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Added a global Temporal activity limit across simultaneous plan workflows in
   addition to each plan's parallelism limit.
 - Configured local ChatGPT-auth Codex profiles by complexity: fast uses
-  `gpt-5.6-terra`/low; standard uses `gpt-5.6`/medium; deep and review use
-  `gpt-5.6`/high. All values remain environment-overridable; no API key is
+  `gpt-5.6-luna`/low; standard uses `gpt-5.6-terra`/medium; deep and review use
+  `gpt-5.6-sol`/high. All values remain environment-overridable; no API key is
   required.
 - Disabled real legacy GitLab synchronization because it bypasses dedicated
   manager-agent proposals; its fake/dry-run preview remains available.
 - Applied migrations `010` and `011` to the local PostgreSQL instance and
   passed the full issue proposal → submit → exact approval → publication → run
   gate integration state machine. `make verify` passed on the final tree.
+- Added a read-only semantic planner-agent over the deterministic project
+  selection boundary. It produces Russian task detail and dependency intent,
+  while Go validation still owns exact project scope, DAG validity, depth,
+  parallel width, model profiles, write scope, and verification commands.
+- Verification commands are now selected from each connected repository's
+  bounded `.ai/commands.yaml`. Only canonical non-approval verification
+  commands are admitted; lifecycle, state-changing, and external-runtime
+  commands remain excluded.
+- Made topology materialization fail closed when stored revision counts do not
+  match their rows and repair an incomplete matching revision transactionally.
+  The live schema-v17 topology was restored to its expected 34 services, 1,030
+  capabilities, 216 ownership records, 695 contracts, 111 relations, and 92
+  drifts under the same deterministic fingerprint.
+- Isolated PostgreSQL integration tests in a disposable database whose name
+  must end in `_test`. The harness creates, migrates, tests, and drops only that
+  database; integration code rejects the live work database.
+- Verified the local ChatGPT login against the configured Codex aliases:
+  `gpt-5.6-luna` for fast, `gpt-5.6-terra` for standard, and `gpt-5.6-sol` for
+  deep/review, with no API key.
+- Fixed strict nullable `existing_issue` output schema compatibility for the
+  issue manager and added recursive coverage requiring every declared object
+  property in manager schemas to be listed in `required`.
+- Routed Make planning, execution, and work-item commands through the Compose
+  CLI so persisted `/data` managed clones are resolvable. Plan files can now be
+  streamed through size-bounded stdin instead of requiring a container mount.
+- Prepared four fake issue proposals for the containment pilot. Each has a
+  Russian title and required body sections, labels, milestone, assignee,
+  complexity, model profile, exact task mapping, and the immutable plan
+  fingerprint. No external issue or PR was created.
+- Submitted and approved containment plan
+  `d83dc80c-4df7-4274-9b70-3b00a9683a1c` only for its exact fingerprint, then
+  published all four work items through the fake gateway and executed the
+  prerequisite through local ChatGPT-auth Codex CLI.
+- The live run exposed and fixed three execution defects: an invalid strict
+  reviewer schema, reuse of a failed task execution identity across Temporal
+  retries, and resuming a coder thread after reviewer feedback until its
+  context was exhausted. Technical plan retry now uses `-retry-N` workflow
+  identities, preserves completed prerequisites, and starts a fresh audited
+  coder revision thread after `changes_requested`.
+- Runner failures now close one task attempt without blindly repeating the
+  same Codex call as a Temporal activity. Invalid coder/reviewer JSON is
+  persisted for diagnosis, and recursive schema tests catch missing strict
+  `required` fields before execution.
+- Coder and reviewer context now includes all approved plan tasks. Prompts
+  distinguish a strict prerequisite from later rollout work and require
+  `status=blocked` whenever `required_tasks` is non-empty.
+- The policy reviewer identified unresolved atomic no-follow mutation and
+  symlink semantics plus possible rollout work in additional repositories.
+  The last coder result was rejected because it combined `completed` with
+  non-empty `required_tasks`. The policy task and plan failed safely; Git,
+  HTTP-runtime, and browser-runtime tasks remained unexecuted.
+- Re-ran `make verify`, race tests for the affected Go packages, and the full
+  disposable PostgreSQL integration suite after the execution fixes.
+- Approved and executed the fake-backed containment plan
+  `a6f748b2-d619-4536-a308-219cfd364eb6` with exact fingerprint
+  `90edabd3326f0fd0d122c866d2fe67159895a90f207db4a22e33eb5747e60bd6`.
+  The live Temporal run respected the three-agent limit, dispatched independent
+  tasks in parallel, preserved completed prerequisites across technical plan
+  retries, and kept dependent Node/sandbox tasks gated.
+- Completed six independently verified and reviewed task branches with local
+  commits only: policy, cache/search, DB, Git, Linux, and browser-runtime. The
+  browser task exercised two rejected review rounds, a persisted task retry,
+  deterministic npm dependency preparation, independent verification, and a
+  final second-review approval before commit `6a3924f3b76fc7b91623ea80dc7e9ed6503f6233`.
+- Fixed live execution infrastructure discovered by the run: PostgreSQL
+  attempt failure typing, Go/Node/Python worker runtimes, PID 1 reaping,
+  persistent Go/npm caches, verifier-only sandbox result promotion, persisted
+  retry feedback, and deterministic `npm ci --ignore-scripts` preparation for
+  lockfile-backed Node worktrees. The task-attempt operator limit is bounded at
+  eight while the default remains three.
+- The HTTP-runtime task stopped fail closed after three task attempts and two
+  reviews per attempt. Its final reviewer found that indirect runtime imports
+  cannot be confined safely by path rewriting alone; an execution sandbox is a
+  prerequisite architecture concern. No HTTP commit was created. Node and
+  sandbox tasks were not dispatched because the approved DAG remains blocked
+  by HTTP.
+- Confirmed all nine managed source checkouts still match their planned HEAD
+  and are clean, all six task commits are absent from remote-tracking refs,
+  there are zero PR work items, and every issue URL is under
+  `github.example.test`. GitHub/GitLab tokens remain empty, dry-run is enabled,
+  and no push, merge, deployment, or external work-item write occurred.
+- Passed all Go package tests, all eight Codex-runner tests, and the disposable
+  PostgreSQL migration/integration suite after the live run fixes.
+
+- Added Stage 10 UI read models and pgx queries for dashboard counts/attention,
+  plans, runs, tasks, approvals, and audit activity with opaque keyset cursors.
+- Added backend-derived allowed actions so the browser does not duplicate plan,
+  run, or task state machines.
+- Added the audit-backed SSE endpoint with heartbeat, `Last-Event-ID` recovery,
+  initial-baseline suppression, CORS for the read-only stream, and logging
+  middleware support for `http.Flusher`.
+- Added the Next.js owner UI under `web` with TanStack Query/Table, React Flow,
+  Zod response validation, responsive desktop/mobile layout, dark mode, and
+  confirmation-gated calls to the existing mutation endpoints.
+- Added overview, projects, project detail, plans, plan DAG, runs, run detail,
+  task attempts/artifacts, and approvals screens against the live 38-project
+  database.
+- Added a non-root, capability-dropped, read-only Compose UI service bound to
+  `127.0.0.1:3010`, plus bootstrap, development, typecheck, build, unit, and
+  Playwright Make targets.
+- Verified focused Go unit/HTTP tests, real live-database read endpoints,
+  frontend typecheck/unit/production build, four desktop Playwright flows, a
+  375px mobile flow, zero npm audit vulnerabilities, Docker image builds, and
+  Compose API/UI health. No orchestrator resource was mutated by UI tests.
 
 ## Remaining work
 
 - Do not approve or run legacy plan
   `383dede3-2393-47af-b3db-e6c52bbfa4e8`; cancel it separately if the owner
   wants the historical record closed.
-- Choose a real source issue or formulate a concrete question/idea for the
-  first Stage 9 pilot, then inspect its selected repositories, DAG, dependency
-  order, and full Russian fake issue proposals during discussion.
-- Approve only the exact displayed fingerprint, publish through the fake
-  gateway, and run the pilot through locally authenticated Codex CLI.
-- Inspect isolated task branches and independent reviewer results, then prepare
-  fake PR proposals. Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge,
-  or deploy without a separate explicit authorization.
+- Do not retry plan `d83dc80c-4df7-4274-9b70-3b00a9683a1c`: its policy task has
+  reached the configured three-attempt limit and reviewer findings may change
+  repository scope, which requires a new discussion fingerprint.
+- Discuss a corrected plan that treats downstream rollout as non-blocking
+  unless it is a true prerequisite, resolves the policy contract feedback,
+  and determines the exact affected repository set from topology evidence.
+- Keep the isolated `ms-course-promts` worktree as diagnostic evidence until a
+  replacement plan is agreed; it contains no approved commit or PR proposal.
+- Commit/push the local orchestrator reliability changes and open a separate
+  orchestrator PR only after explicit publication authorization.
+- Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge, or deploy without
+  separate explicit authorization.
 - Exercise two simultaneously approved fake-backed plans to verify the global
   agent limit in a live Temporal run.
+- Do not blindly retry the HTTP-runtime task in plan
+  `a6f748b2-d619-4536-a308-219cfd364eb6`. Discuss a new plan that places the
+  sandbox isolation capability before HTTP/Node/browser runtime confinement
+  and binds the exact cross-repository contract before execution.
+- The Node and sandbox tasks from the paused plan remain unexecuted. Preserve
+  the reviewed browser commit and HTTP diagnostic worktree until the replacement
+  plan decides whether to reuse, supersede, or discard them.
 
 ## Exact next task
 
-Receive one concrete existing issue or question/idea from the owner. Create a
-new Stage 9 discussion plan, run `issue-manage-agent` through local Codex CLI,
-and return the exact DAG, Russian fake issue proposals, dependency order, model
-profiles, and fingerprint for discussion. Do not submit, approve, execute, or
-publish anything until the owner explicitly approves that exact version.
+Prepare a replacement discussion-only plan from the persisted HTTP reviewer
+findings, with sandbox isolation as an explicit prerequisite and the exact
+HTTP/Node/browser consumers derived from topology evidence. Produce Russian
+fake issue proposals and a new fingerprint, but do not submit, approve,
+execute, publish externally, push, merge, or deploy it without a new exact
+owner approval.

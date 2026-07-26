@@ -73,11 +73,22 @@ test("gives agent commands an explicit secret-free environment", () => {
   const environment = agentCommandEnvironment({
     PATH: "/bin",
     HOME: "/tmp/home",
+    GOPATH: "/data/cache/go",
+    GOCACHE: "/data/cache/go-build",
+    GOMODCACHE: "/data/cache/go-mod",
+    npm_config_cache: "/data/cache/npm",
     CODEX_HOME: "/data/codex",
     OPENAI_API_KEY: "secret",
     DATABASE_URL: "secret",
   });
-  assert.deepEqual(environment, { PATH: "/bin", HOME: "/tmp/home" });
+  assert.deepEqual(environment, {
+    PATH: "/bin",
+    HOME: "/tmp/home",
+    GOPATH: "/data/cache/go",
+    GOCACHE: "/data/cache/go-build",
+    GOMODCACHE: "/data/cache/go-mod",
+    npm_config_cache: "/data/cache/npm",
+  });
 });
 
 test("rejects an invalid structured result", () => {

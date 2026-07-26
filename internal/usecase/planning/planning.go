@@ -140,6 +140,33 @@ type StartPlan struct {
 	MaxActivityAttempts int
 }
 
+type failedRunPreparer interface {
+	PrepareRunRetry(context.Context, string, int) (domain.PlanRun, domain.PlanBundle, error)
+	AttachTemporalRun(context.Context, string, string) (domain.PlanRun, error)
+}
+
+type RetryPlanRun struct {
+	Plans               failedRunPreparer
+	Runner              repository.PlanRunner
+	MaxParallelTasks    int
+	MaxActivityAttempts int
+}
+
+func (uc RetryPlanRun) Handle(ctx context.Context, planID string) (domain.PlanRun, error) {
+	run, bundle, err := uc.Plans.PrepareRunRetry(ctx, strings.TrimSpace(planID), uc.MaxParallelTasks)
+	if err != nil {
+		return domain.PlanRun{}, err
+	}
+	if run.TemporalRunID != nil {
+		return run, nil
+	}
+	temporalRunID, err := uc.Runner.Start(ctx, run, buildSchedule(run, bundle, uc.MaxActivityAttempts))
+	if err != nil {
+		return domain.PlanRun{}, err
+	}
+	return uc.Plans.AttachTemporalRun(ctx, run.ID, temporalRunID)
+}
+
 func (uc StartPlan) Handle(ctx context.Context, planID string) (domain.PlanRun, error) {
 	run, bundle, err := uc.Plans.PrepareRun(ctx, strings.TrimSpace(planID), uc.MaxParallelTasks)
 	if err != nil {
@@ -231,16 +258,21 @@ func buildSchedule(run domain.PlanRun, bundle domain.PlanBundle, maxAttempts int
 	}
 	tasks := make([]domain.ScheduledTask, 0, len(bundle.Tasks))
 	for _, task := range bundle.Tasks {
+		initialStatus := domain.TaskStatusPlanned
+		if task.Status == domain.TaskStatusCompleted {
+			initialStatus = domain.TaskStatusCompleted
+		}
 		tasks = append(tasks, domain.ScheduledTask{
 			TaskID: task.ID, Priority: task.Priority,
-			Dependencies: append([]string(nil), dependencies[task.ID]...),
+			Dependencies:  append([]string(nil), dependencies[task.ID]...),
+			InitialStatus: initialStatus,
 		})
 	}
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 	return domain.PlanSchedule{
-		RunID: run.ID, PlanID: run.PlanID, MaxParallelTasks: run.MaxParallelTasks,
+		RunID: run.ID, PlanID: run.PlanID, WorkflowID: run.WorkflowID, MaxParallelTasks: run.MaxParallelTasks,
 		MaxActivityAttempts: maxAttempts, ExecuteTasks: true, Tasks: tasks,
 	}
 }

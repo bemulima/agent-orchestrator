@@ -21,15 +21,7 @@ import (
 )
 
 func TestInitialMigrationCreatesCoreTables(t *testing.T) {
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for integration tests")
-	}
-
-	pool, err := pgxpool.New(context.Background(), databaseURL)
-	if err != nil {
-		t.Fatalf("connect postgres: %v", err)
-	}
+	pool := integrationPool(t)
 	defer pool.Close()
 
 	rows, err := pool.Query(context.Background(), `
@@ -260,7 +252,7 @@ func TestTaskExecutionRepositoryPersistsThreadsVerificationReviewAndArtifacts(t 
 INSERT INTO topology_revision (
     fingerprint, project_count, service_count, capability_count,
     ownership_count, contract_count, relation_count, drift_count
-) VALUES ($1, 1, 1, 0, 0, 0, 0, 0) RETURNING id`, strings.Repeat("e", 64)).Scan(&revisionID); err != nil {
+) VALUES ($1, 1, 0, 0, 0, 0, 0, 0) RETURNING id`, strings.Repeat("e", 64)).Scan(&revisionID); err != nil {
 		t.Fatalf("insert topology revision: %v", err)
 	}
 	command, err := plans.CreateCommand(ctx, domain.Command{
@@ -310,11 +302,12 @@ DELETE FROM audit_event WHERE resource_id IN (
 		t.Fatalf("MarkTaskReady() error = %v", err)
 	}
 	executionContext, err := executions.GetExecutionContext(ctx, task.ID)
-	if err != nil || executionContext.Project.ID != project.ID || executionContext.Command.ID != command.ID {
+	if err != nil || executionContext.Project.ID != project.ID || executionContext.Command.ID != command.ID ||
+		len(executionContext.PlanTasks) != 1 || executionContext.PlanTasks[0].ID != task.ID {
 		t.Fatalf("GetExecutionContext() = %#v, %v", executionContext, err)
 	}
 	workspace := domain.TaskWorkspace{Path: "/worktrees/fixture", BranchName: "ai/task-fixture", BaseCommit: project.HeadCommit}
-	attempt, err := executions.BeginAttempt(ctx, task.ID, "workflow:"+uuid.NewString(), workspace, 3)
+	attempt, err := executions.BeginAttempt(ctx, task.ID, "workflow:"+uuid.NewString(), workspace, 4)
 	if err != nil {
 		t.Fatalf("BeginAttempt() error = %v", err)
 	}
@@ -322,7 +315,8 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if err != nil || reused.ID != attempt.ID {
 		t.Fatalf("reused BeginAttempt() = %#v, %v", reused, err)
 	}
-	attempt, err = executions.AttachAgentThread(ctx, attempt.ID, "coder-thread-"+uuid.NewString())
+	coderThread := "coder-thread-" + uuid.NewString()
+	attempt, err = executions.AttachAgentThread(ctx, attempt.ID, coderThread)
 	if err != nil || attempt.AgentThreadID == nil {
 		t.Fatalf("AttachAgentThread() = %#v, %v", attempt, err)
 	}
@@ -334,10 +328,32 @@ DELETE FROM audit_event WHERE resource_id IN (
 		t.Fatalf("BeginReview() error = %v", err)
 	}
 	if _, err := executions.CreateReview(ctx, attempt.ID, 1, reviewerThread, domain.ReviewerResult{
-		Status: domain.ReviewApproved, Summary: "approved", BlockingIssues: []domain.ReviewIssue{},
+		Status: domain.ReviewChangesRequested, Summary: "change", BlockingIssues: []domain.ReviewIssue{{Path: "internal/fixture.go", Line: 1, Message: "fix"}},
 		NonBlockingIssues: []domain.ReviewIssue{}, Risks: []string{}, SuggestedChecks: []string{},
 	}); err != nil {
 		t.Fatalf("CreateReview() error = %v", err)
+	}
+	if err := executions.SetAttemptStatus(ctx, attempt.ID, domain.TaskAttemptStatusChangesRequested); err != nil {
+		t.Fatalf("SetAttemptStatus(changes requested) error = %v", err)
+	}
+	replacementThread := "coder-thread-" + uuid.NewString()
+	attempt, err = executions.ReplaceAgentThread(ctx, attempt.ID, coderThread, replacementThread)
+	if err != nil || attempt.AgentThreadID == nil || *attempt.AgentThreadID != replacementThread {
+		t.Fatalf("ReplaceAgentThread() = %#v, %v", attempt, err)
+	}
+	if err := executions.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusChangesRequested,
+		"integration reviewer feedback", map[string]any{"reason": "regression"}); err != nil {
+		t.Fatalf("FailAttempt(changes requested) error = %v", err)
+	}
+	reviewerThread = "review-thread-" + uuid.NewString()
+	if _, err := executions.BeginReview(ctx, attempt.ID, 2, reviewerThread); err != nil {
+		t.Fatalf("BeginReview(second) error = %v", err)
+	}
+	if _, err := executions.CreateReview(ctx, attempt.ID, 2, reviewerThread, domain.ReviewerResult{
+		Status: domain.ReviewApproved, Summary: "approved", BlockingIssues: []domain.ReviewIssue{},
+		NonBlockingIssues: []domain.ReviewIssue{}, Risks: []string{}, SuggestedChecks: []string{},
+	}); err != nil {
+		t.Fatalf("CreateReview(second) error = %v", err)
 	}
 	storedArtifact, err := executions.StoreArtifact(ctx, domain.Artifact{
 		TaskID: task.ID, Type: "report", Name: "fixture", URI: "task-worktree://fixture/report.json",
@@ -349,7 +365,7 @@ DELETE FROM audit_event WHERE resource_id IN (
 	completed, err := executions.CompleteAttempt(ctx, attempt.ID, domain.AgentResult{
 		Status: domain.AgentResultCompleted, Summary: "done", FilesChanged: []string{"internal/fixture.go"},
 	}, domain.VerificationReport{Status: "passed", ChangedFiles: []string{"internal/fixture.go"}, VerifiedAt: time.Now().UTC()}, strings.Repeat("b", 40))
-	if err != nil || completed.Status != domain.TaskAttemptStatusCompleted || completed.ReviewCount != 1 {
+	if err != nil || completed.Status != domain.TaskAttemptStatusCompleted || completed.ReviewCount != 2 {
 		t.Fatalf("CompleteAttempt() = %#v, %v", completed, err)
 	}
 	attempts, err := executions.ListAttempts(ctx, task.ID)
@@ -639,6 +655,19 @@ func TestTopologyRepositoryReplacesCatalogIdempotently(t *testing.T) {
 	if reused.Revision.ID != first.Revision.ID || len(reused.Services) != 2 || len(reused.Drifts) != 1 {
 		t.Fatalf("reused catalog = %#v", reused)
 	}
+	if _, err := pool.Exec(ctx, `DELETE FROM service_relation WHERE revision_id = $1`, first.Revision.ID); err != nil {
+		t.Fatalf("damage materialized topology: %v", err)
+	}
+	if _, err := topologies.Get(ctx); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("Get(damaged topology) error = %v", err)
+	}
+	repaired, err := topologies.Replace(ctx, catalog)
+	if err != nil {
+		t.Fatalf("repair Replace() error = %v", err)
+	}
+	if repaired.Revision.ID != first.Revision.ID || len(repaired.Relations) != 1 {
+		t.Fatalf("repaired catalog = %#v", repaired)
+	}
 	catalog.Revision.Fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	second, err = topologies.Replace(ctx, catalog)
 	if err != nil {
@@ -827,11 +856,36 @@ DELETE FROM audit_event WHERE resource_id IN (
 	if _, err := plans.MarkTaskReady(ctx, run.ID, consumerTask.ID); err != nil {
 		t.Fatalf("MarkTaskReady(consumer) error = %v", err)
 	}
-	if _, err := plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusPaused, ""); err != nil {
-		t.Fatalf("pause run error = %v", err)
+	run, err = plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusFailed, "reviewer runner failed")
+	if err != nil || run.Status != domain.PlanRunStatusFailed {
+		t.Fatalf("fail run = %#v, %v", run, err)
 	}
-	if _, err := plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusRunning, ""); err != nil {
-		t.Fatalf("resume run error = %v", err)
+	run, bundle, err = plans.PrepareRunRetry(ctx, bundle.Plan.ID, 2)
+	if err != nil {
+		t.Fatalf("PrepareRunRetry() error = %v", err)
+	}
+	if run.Status != domain.PlanRunStatusPending || run.WorkflowID != "plan-"+bundle.Plan.ID+"-v1-retry-2" || run.TemporalRunID != nil {
+		t.Fatalf("retried run = %#v", run)
+	}
+	for _, task := range bundle.Tasks {
+		want := domain.TaskStatusPlanned
+		if task.ID == producerTask.ID {
+			want = domain.TaskStatusCompleted
+		}
+		if task.Status != want {
+			t.Fatalf("retried task %s status = %s, want %s", task.ID, task.Status, want)
+		}
+	}
+	run, err = plans.AttachTemporalRun(ctx, run.ID, "temporal-retry-run-id")
+	if err != nil || run.TemporalRunID == nil || *run.TemporalRunID != "temporal-retry-run-id" {
+		t.Fatalf("AttachTemporalRun(retry) = %#v, %v", run, err)
+	}
+	run, err = plans.UpdateRunStatus(ctx, run.ID, domain.PlanRunStatusRunning, "")
+	if err != nil {
+		t.Fatalf("UpdateRunStatus(retry running) error = %v", err)
+	}
+	if _, err := plans.MarkTaskReady(ctx, run.ID, consumerTask.ID); err != nil {
+		t.Fatalf("MarkTaskReady(retried consumer) error = %v", err)
 	}
 	if _, err := plans.RecordTaskResult(ctx, run.ID, domain.TaskResult{TaskID: consumerTask.ID, Status: domain.TaskStatusCompleted}); err != nil {
 		t.Fatalf("RecordTaskResult(consumer) error = %v", err)
@@ -942,7 +996,14 @@ func integrationPool(t *testing.T) *pgxpool.Pool {
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required for integration tests")
 	}
-	pool, err := pgxpool.New(context.Background(), databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatalf("parse DATABASE_URL: %v", err)
+	}
+	if !strings.HasSuffix(config.ConnConfig.Database, "_test") {
+		t.Fatalf("integration database %q must have the _test suffix", config.ConnConfig.Database)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		t.Fatalf("connect postgres: %v", err)
 	}

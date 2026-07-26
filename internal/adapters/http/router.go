@@ -19,6 +19,7 @@ type RouterDependencies struct {
 	OnboardingHandler *handlers.OnboardingHandler
 	TopologyHandler   *handlers.TopologyHandler
 	PlanningHandler   *handlers.PlanningHandler
+	UIHandler         *handlers.UIHandler
 	GitLabHandler     *handlers.GitLabHandler
 	TelegramHandler   *handlers.TelegramHandler
 	Logger            *zap.Logger
@@ -85,6 +86,15 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/tasks/{taskId}/cancel", deps.PlanningHandler.CancelTaskRequest)
 		root.Post("/api/v1/tasks/{taskId}/pull-request/prepare", deps.PlanningHandler.PrepareTaskPullRequest)
 		root.Post("/api/v1/work-items/{workItemId}/publish", deps.PlanningHandler.PublishWorkItem)
+	}
+	if deps.UIHandler != nil {
+		root.Get("/api/v1/dashboard", deps.UIHandler.Dashboard)
+		root.Get("/api/v1/plans", deps.UIHandler.ListPlans)
+		root.Get("/api/v1/runs", deps.UIHandler.ListRuns)
+		root.Get("/api/v1/tasks", deps.UIHandler.ListTasks)
+		root.Get("/api/v1/approvals", deps.UIHandler.ListApprovals)
+		root.Get("/api/v1/activity", deps.UIHandler.ListActivity)
+		root.Get("/api/v1/events", deps.UIHandler.Events)
 	}
 	if deps.GitLabHandler != nil {
 		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)

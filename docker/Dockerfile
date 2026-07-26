@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25.1-alpine AS builder
 
 WORKDIR /app
 ARG VERSION=dev
@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /out/course-dev-orchestrator ./cmd/course-dev-orchestrator
 
-FROM node:22-alpine AS runner-builder
+FROM node:24-alpine AS runner-builder
 
 WORKDIR /runner
 COPY runner/package.json runner/package-lock.json ./
@@ -20,9 +20,12 @@ COPY runner/src ./src
 RUN npm run build \
     && npm prune --omit=dev
 
-FROM alpine:3.21
+FROM node:24-alpine
 
-RUN apk add --no-cache bubblewrap ca-certificates git nodejs npm openssh-client \
+COPY --from=builder /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+RUN apk add --no-cache bubblewrap ca-certificates git openssh-client python3 \
     && addgroup -S orchestrator \
     && adduser -S -G orchestrator orchestrator \
     && mkdir -p /data/repositories /data/worktrees /data/codex /projects \

@@ -83,7 +83,45 @@ func (w TaskWorktree) Prepare(
 	if _, err := manager.run(ctx, worktreePath, "merge-base", "--is-ancestor", project.HeadCommit, "HEAD"); err != nil {
 		return domain.TaskWorkspace{}, fmt.Errorf("task branch does not descend from planned base: %w", domain.ErrConflict)
 	}
+	if err := prepareNodeDependencies(ctx, worktreePath, task.VerificationCommands); err != nil {
+		return domain.TaskWorkspace{}, err
+	}
 	return domain.TaskWorkspace{Path: worktreePath, BranchName: branchName, BaseCommit: project.HeadCommit}, nil
+}
+
+func prepareNodeDependencies(ctx context.Context, worktreePath string, verificationCommands []string) error {
+	needsNPM := false
+	for _, command := range verificationCommands {
+		if strings.HasPrefix(strings.TrimSpace(command), "npm ") {
+			needsNPM = true
+			break
+		}
+	}
+	if !needsNPM {
+		return nil
+	}
+	if info, err := os.Stat(filepath.Join(worktreePath, "node_modules", ".package-lock.json")); err == nil && info.Mode().IsRegular() {
+		return nil
+	}
+	lockPath := filepath.Join(worktreePath, "package-lock.json")
+	lockInfo, err := os.Lstat(lockPath)
+	if err != nil {
+		return fmt.Errorf("npm verification requires package-lock.json: %w", domain.ErrValidation)
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("npm package-lock.json must be a regular file: %w", domain.ErrValidation)
+	}
+	command := exec.CommandContext(ctx, "npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund")
+	command.Dir = worktreePath
+	command.Env = safeCommandEnvironment(os.Environ())
+	var output limitedBuffer
+	output.limit = maxVerificationOutput
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("prepare deterministic npm dependencies: %w: %s", err, strings.TrimSpace(output.String()))
+	}
+	return nil
 }
 
 func (w TaskWorktree) Inspect(
@@ -300,12 +338,16 @@ func allowedVerificationCommand(command string) (string, []string, bool) {
 		return "git", []string{"-c", "core.hooksPath=/dev/null", "diff", "--check"}, true
 	case "go test ./...":
 		return "go", []string{"test", "./..."}, true
+	case "go test ./... -count=1":
+		return "go", []string{"test", "./...", "-count=1"}, true
 	case "go vet ./...":
 		return "go", []string{"vet", "./..."}, true
 	case "npm test":
 		return "npm", []string{"test"}, true
 	case "npm run lint":
 		return "npm", []string{"run", "lint"}, true
+	case "npm run build":
+		return "npm", []string{"run", "build"}, true
 	default:
 		return "", nil, false
 	}

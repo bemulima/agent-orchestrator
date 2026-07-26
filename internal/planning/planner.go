@@ -3,6 +3,9 @@ package planning
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
@@ -10,6 +13,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	"gopkg.in/yaml.v3"
 )
 
 type Planner struct {
@@ -39,6 +43,10 @@ func (p Planner) Build(
 		SourceIssues:        sourceIssues,
 	}
 	services := make(map[string]domain.TopologyService, len(catalog.Services))
+	projects := make(map[string]domain.Project, len(request.AvailableProjects))
+	for _, project := range request.AvailableProjects {
+		projects[project.ID] = project
+	}
 	for _, service := range catalog.Services {
 		services[service.ProjectID] = service
 	}
@@ -82,6 +90,10 @@ func (p Planner) Build(
 	tasks := make([]domain.PlannedTask, 0, len(projectIDs))
 	for index, projectID := range projectIDs {
 		service := services[projectID]
+		checks, err := verificationCommands(projects[projectID])
+		if err != nil {
+			return domain.PlannerInput{}, domain.PlannerOutput{}, err
+		}
 		taskRisk := risk
 		if taskRisk == domain.RiskLevelCritical {
 			taskRisk = domain.RiskLevelHigh
@@ -98,7 +110,7 @@ func (p Planner) Build(
 			WriteScope: writeScope(service), ModelProfile: modelProfile(taskRisk),
 			Priority: len(projectIDs) - index, RiskLevel: taskRisk,
 			RequiresMigration: requiresMigration && isBackend(service),
-			ChangesContracts:  changesContracts, VerificationCommands: verificationCommands(service),
+			ChangesContracts:  changesContracts, VerificationCommands: checks,
 			Depth: 0,
 		})
 	}
@@ -336,11 +348,11 @@ func planRisk(
 	risks := make([]string, 0)
 	if changesContracts {
 		risk = domain.RiskLevelMedium
-		risks = append(risks, "The request may change public HTTP or event contracts.")
+		risks = append(risks, "Запрос может изменить публичные HTTP- или event-контракты.")
 	}
 	if requiresMigration {
 		risk = domain.RiskLevelHigh
-		risks = append(risks, "The request may require a database migration and compatibility review.")
+		risks = append(risks, "Запрос может потребовать миграцию базы данных и проверку совместимости.")
 	}
 	for _, drift := range drifts {
 		producer, consumer := "", ""
@@ -355,7 +367,7 @@ func planRisk(
 				continue
 			}
 		}
-		risks = append(risks, "Existing "+string(drift.Severity)+" contract drift: "+drift.ContractCode)
+		risks = append(risks, "Существующий contract drift уровня "+string(drift.Severity)+": "+drift.ContractCode)
 		if drift.Severity == domain.DriftSeverityCritical {
 			risk = domain.RiskLevelCritical
 		} else if drift.Severity == domain.DriftSeverityError && risk != domain.RiskLevelCritical {
@@ -393,23 +405,163 @@ func writeScope(service domain.TopologyService) []string {
 		return []string{"docker-compose*.yml", "docker-compose*.yaml", "docker/**", "scripts/**"}
 	case "knowledge-coder":
 		return []string{"**/*.md", "docs/**", ".ai/**", "AGENTS.md", "prompts/**", "wiki/**", "journal/**"}
-	default:
-		return []string{"cmd/**", "internal/**", "db/migrations/**", "openapi/**", "proto/**", "go.mod", "go.sum"}
+	}
+	if stackContains(service, "node", "nextjs", "typescript", "javascript") {
+		return []string{
+			"src/**", "lib/**", "app/**", "test/**", "tests/**", "__tests__/**",
+			"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+			"tsconfig*.json", ".ai/**", "AGENTS.md",
+		}
+	}
+	if stackContains(service, "python") {
+		return []string{
+			"src/**", "app/**", "tests/**", "pyproject.toml", "poetry.lock", "requirements*.txt",
+			".ai/**", "AGENTS.md",
+		}
+	}
+	if stackContains(service, "php") {
+		return []string{
+			"src/**", "app/**", "tests/**", "composer.json", "composer.lock", ".ai/**", "AGENTS.md",
+		}
+	}
+	return []string{
+		"cmd/**", "internal/**", "pkg/**", "tests/**", "db/migrations/**", "openapi/**", "proto/**",
+		"go.mod", "go.sum", ".ai/**", "AGENTS.md",
 	}
 }
 
-func verificationCommands(service domain.TopologyService) []string {
-	commands := []string{"git diff --check"}
-	for _, evidence := range service.Stack {
-		value := strings.ToLower(evidence.Value)
-		if value == "go" {
-			commands = append(commands, "go test ./...", "go vet ./...")
+func verificationCommands(project domain.Project) ([]string, error) {
+	manifestCommands, found, err := approvedManifestVerificationCommands(project)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return uniqueSorted(append([]string{"git diff --check"}, manifestCommands...)), nil
+	}
+	return []string{"git diff --check"}, nil
+}
+
+type commandManifest struct {
+	SchemaVersion int                    `yaml:"schema_version"`
+	Commands      []commandManifestEntry `yaml:"commands"`
+}
+
+type commandManifestEntry struct {
+	Name             string `yaml:"name"`
+	Run              string `yaml:"run"`
+	RequiresApproval bool   `yaml:"requires_approval"`
+	Risk             string `yaml:"risk"`
+}
+
+func approvedManifestVerificationCommands(project domain.Project) ([]string, bool, error) {
+	if project.LocalPath == nil || strings.TrimSpace(*project.LocalPath) == "" {
+		return nil, false, nil
+	}
+	root := filepath.Clean(strings.TrimSpace(*project.LocalPath))
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve %s checkout: %w", project.Name, err)
+	}
+	aiPath := filepath.Join(resolvedRoot, ".ai")
+	aiInfo, err := os.Lstat(aiPath)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect %s command directory: %w", project.Name, err)
+	}
+	if !aiInfo.IsDir() || aiInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, false, fmt.Errorf("unsafe %s command directory: %w", project.Name, domain.ErrValidation)
+	}
+	path := filepath.Join(aiPath, "commands.yaml")
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect %s command manifest: %w", project.Name, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 256<<10 {
+		return nil, false, fmt.Errorf("unsafe or oversized %s command manifest: %w", project.Name, domain.ErrValidation)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve %s command manifest: %w", project.Name, err)
+	}
+	relative, err := filepath.Rel(resolvedRoot, resolvedPath)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, false, fmt.Errorf("command manifest escapes %s checkout: %w", project.Name, domain.ErrValidation)
+	}
+	file, err := os.Open(resolvedPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s command manifest: %w", project.Name, err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() > 256<<10 || !os.SameFile(info, openedInfo) {
+		return nil, false, fmt.Errorf("command manifest changed while opening %s checkout: %w", project.Name, domain.ErrConflict)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, (256<<10)+1))
+	if err != nil || len(content) > 256<<10 {
+		return nil, false, fmt.Errorf("read bounded %s command manifest: %w", project.Name, domain.ErrValidation)
+	}
+	var manifest commandManifest
+	if err := yaml.Unmarshal(content, &manifest); err != nil || manifest.SchemaVersion != 1 {
+		return nil, false, fmt.Errorf("decode %s command manifest: %w", project.Name, domain.ErrValidation)
+	}
+	commands := make([]string, 0, len(manifest.Commands))
+	for _, entry := range manifest.Commands {
+		if entry.RequiresApproval || !manifestEntryIsVerification(entry) {
+			continue
 		}
-		if value == "node" || value == "nextjs" || value == "typescript" {
-			commands = append(commands, "npm test", "npm run lint")
+		command := canonicalVerificationCommand(entry.Run)
+		if command != "" {
+			commands = append(commands, command)
 		}
 	}
-	return uniqueSorted(commands)
+	return uniqueSorted(commands), true, nil
+}
+
+func manifestEntryIsVerification(entry commandManifestEntry) bool {
+	if strings.EqualFold(strings.TrimSpace(entry.Risk), "verification") {
+		return true
+	}
+	name := strings.ToLower(strings.TrimSpace(entry.Name))
+	for _, marker := range []string{"test", "lint", "check", "verify", "build"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalVerificationCommand(value string) string {
+	switch strings.Join(strings.Fields(strings.TrimSpace(value)), " ") {
+	case "go test ./...":
+		return "go test ./..."
+	case "go test ./... -count=1":
+		return "go test ./... -count=1"
+	case "npm test", "npm run test":
+		return "npm test"
+	case "npm run build":
+		return "npm run build"
+	case "npm run lint":
+		return "npm run lint"
+	default:
+		return ""
+	}
+}
+
+func stackContains(service domain.TopologyService, values ...string) bool {
+	for _, evidence := range service.Stack {
+		value := strings.ToLower(strings.TrimSpace(evidence.Value))
+		for _, candidate := range values {
+			if value == candidate || strings.Contains(value, candidate) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func modelProfile(risk domain.RiskLevel) string {

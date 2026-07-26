@@ -87,6 +87,11 @@ and engineering conventions come from the reference service.
 - PostgreSQL stores queryable plan/run/task state and audit history. Temporal
   owns durable scheduling, dependency release, pause/resume/cancel signals,
   bounded parallel dispatch, retry, and restart recovery.
+- The owner UI is a separate Next.js process under `web`. It consumes bounded
+  read models from Go and never owns state transitions. PostgreSQL query
+  aggregation stays in a pgx read adapter; allowed actions are derived in the
+  Go application layer. SSE projects committed audit events and polling remains
+  the fallback when the stream is unavailable.
 
 ## Deliberate extensions required by this service
 
@@ -158,6 +163,15 @@ and engineering conventions come from the reference service.
   API and worker at the stable `/projects` path. Persisted local paths always
   use that container namespace so discovery and later worker execution resolve
   the same checkout.
+- Make wrappers for planning, execution, and work-item management invoke the
+  CLI inside Compose, where persisted `/data/repositories` and `/data/worktrees`
+  paths exist. Natural-language plan input is streamed through bounded stdin;
+  host-side planning must not dereference container-only checkout paths.
+- A technical plan retry keeps the exact approved DAG and issue fingerprint but
+  receives a new `-retry-N` Temporal identity. Completed prerequisites remain
+  complete; unfinished tasks alone return to `planned`. After reviewer
+  `changes_requested`, the next coder revision uses a fresh, audited thread
+  with persisted feedback instead of resuming an exhausted context.
 
 ## Dependency direction
 

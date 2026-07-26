@@ -68,7 +68,7 @@ func (uc RetryTask) Handle(ctx context.Context, taskID string) (domain.Task, err
 		return domain.Task{}, err
 	}
 	maxAttempts := uc.MaxAttempts
-	if maxAttempts < 1 || maxAttempts > 3 {
+	if maxAttempts < 1 || maxAttempts > 8 {
 		maxAttempts = 3
 	}
 	if len(attempts) >= maxAttempts {

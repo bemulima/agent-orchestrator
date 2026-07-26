@@ -137,6 +137,10 @@ export function agentCommandEnvironment(source: NodeJS.ProcessEnv): Record<strin
     "LC_ALL",
     "TERM",
     "CI",
+    "GOPATH",
+    "GOCACHE",
+    "GOMODCACHE",
+    "npm_config_cache",
   ];
   const environment: Record<string, string> = {};
   for (const key of allowed) {

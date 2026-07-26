@@ -17,10 +17,10 @@ const (
 	ModelProfileStandard          = "standard"
 	ModelProfileDeep              = "deep"
 	ModelProfileReview            = "review"
-	DefaultCodexModelFast         = "gpt-5.6-terra"
-	DefaultCodexModelStandard     = "gpt-5.6"
-	DefaultCodexModelDeep         = "gpt-5.6"
-	DefaultCodexModelReview       = "gpt-5.6"
+	DefaultCodexModelFast         = "gpt-5.6-luna"
+	DefaultCodexModelStandard     = "gpt-5.6-terra"
+	DefaultCodexModelDeep         = "gpt-5.6-sol"
+	DefaultCodexModelReview       = "gpt-5.6-sol"
 	DefaultCodexReasoningFast     = "low"
 	DefaultCodexReasoningStandard = "medium"
 	DefaultCodexReasoningDeep     = "high"
@@ -49,7 +49,7 @@ type Config struct {
 	OnboardingAuthorName    string   `envconfig:"ONBOARDING_AUTHOR_NAME" default:"Course Dev Orchestrator" validate:"required"`
 	OnboardingAuthorEmail   string   `envconfig:"ONBOARDING_AUTHOR_EMAIL" default:"orchestrator@local.invalid" validate:"required,email"`
 
-	MaxTaskAttempts      int `envconfig:"MAX_TASK_ATTEMPTS" default:"3" validate:"min=1,max=3"`
+	MaxTaskAttempts      int `envconfig:"MAX_TASK_ATTEMPTS" default:"3" validate:"min=1,max=8"`
 	MaxReviewAttempts    int `envconfig:"MAX_REVIEW_ATTEMPTS" default:"2" validate:"min=1,max=2"`
 	MaxParallelTasks     int `envconfig:"MAX_PARALLEL_TASKS" default:"3" validate:"min=1,max=3"`
 	MaxGlobalAgentRuns   int `envconfig:"MAX_GLOBAL_AGENT_RUNS" default:"3" validate:"min=1,max=16"`
@@ -75,10 +75,10 @@ type Config struct {
 	TelegramCallbackTTL    int     `envconfig:"TELEGRAM_CALLBACK_TTL" default:"900" validate:"min=60,max=3600"`
 
 	CodexRunnerCommand     string `envconfig:"CODEX_RUNNER_COMMAND" default:"node runner/dist/index.js" validate:"required"`
-	CodexModelFast         string `envconfig:"CODEX_MODEL_FAST" default:"gpt-5.6-terra" validate:"required"`
-	CodexModelStandard     string `envconfig:"CODEX_MODEL_STANDARD" default:"gpt-5.6" validate:"required"`
-	CodexModelDeep         string `envconfig:"CODEX_MODEL_DEEP" default:"gpt-5.6" validate:"required"`
-	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6" validate:"required"`
+	CodexModelFast         string `envconfig:"CODEX_MODEL_FAST" default:"gpt-5.6-luna" validate:"required"`
+	CodexModelStandard     string `envconfig:"CODEX_MODEL_STANDARD" default:"gpt-5.6-terra" validate:"required"`
+	CodexModelDeep         string `envconfig:"CODEX_MODEL_DEEP" default:"gpt-5.6-sol" validate:"required"`
+	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6-sol" validate:"required"`
 	CodexReasoningFast     string `envconfig:"CODEX_REASONING_FAST" default:"low" validate:"oneof=minimal low medium high xhigh"`
 	CodexReasoningStandard string `envconfig:"CODEX_REASONING_STANDARD" default:"medium" validate:"oneof=minimal low medium high xhigh"`
 	CodexReasoningDeep     string `envconfig:"CODEX_REASONING_DEEP" default:"high" validate:"oneof=minimal low medium high xhigh"`

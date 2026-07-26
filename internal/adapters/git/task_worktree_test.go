@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -64,4 +65,30 @@ func TestTaskWorktreeRejectsEscapingArtifactSymlink(t *testing.T) {
 	require.NoError(t, os.Symlink(outside, filepath.Join(workspace.Path, "result.txt")))
 	_, err := (TaskWorktree{}).ReadArtifact(context.Background(), workspace, "result.txt", 1024)
 	require.Error(t, err)
+}
+
+func TestPrepareNodeDependenciesUsesLockfileAndDisablesScripts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses a POSIX shell script")
+	}
+	root := t.TempDir()
+	binPath := filepath.Join(root, "bin")
+	worktreePath := filepath.Join(root, "worktree")
+	require.NoError(t, os.MkdirAll(binPath, 0o750))
+	require.NoError(t, os.MkdirAll(worktreePath, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(worktreePath, "package-lock.json"), []byte("{}\n"), 0o640))
+	fakeNPM := "#!/bin/sh\n/bin/mkdir -p node_modules\nprintf '%s\\n' \"$*\" > node_modules/.package-lock.json\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binPath, "npm"), []byte(fakeNPM), 0o750))
+	t.Setenv("PATH", binPath)
+
+	require.NoError(t, prepareNodeDependencies(context.Background(), worktreePath, []string{"npm test"}))
+	arguments, err := os.ReadFile(filepath.Join(worktreePath, "node_modules", ".package-lock.json"))
+	require.NoError(t, err)
+	require.Equal(t, "ci --ignore-scripts --no-audit --no-fund\n", string(arguments))
+}
+
+func TestPrepareNodeDependenciesRequiresRegularLockfile(t *testing.T) {
+	root := t.TempDir()
+	require.Error(t, prepareNodeDependencies(context.Background(), root, []string{"npm run build"}))
+	require.NoError(t, prepareNodeDependencies(context.Background(), root, []string{"go test ./..."}))
 }

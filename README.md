@@ -13,7 +13,8 @@ with contract drift and impact queries, and Stage 5 approval-gated planning
 with a durable Temporal DAG scheduler, and Stage 6 isolated Codex execution
 with independent verification and review, Stage 7 self-hosted GitLab issue/MR
 synchronization and signed webhooks, and the Stage 8 Telegram owner interface
-with polling/webhook delivery and replay-safe inline approvals.
+with polling/webhook delivery and replay-safe inline approvals. Stage 9 adds
+issue-backed multi-plan execution, and Stage 10 adds the dedicated owner web UI.
 
 ## Architecture
 
@@ -35,6 +36,7 @@ with polling/webhook delivery and replay-safe inline approvals.
 - `internal/workflow`: deterministic Temporal workflows.
 - `internal/activities`: side-effecting Temporal activities.
 - `db/migrations`: tracked PostgreSQL schema migrations.
+- `web`: Next.js owner interface with validated API DTOs and live updates.
 
 The precise conventions inherited from `ms-go-course` are documented in
 [docs/architecture-conventions.md](docs/architecture-conventions.md).
@@ -42,7 +44,7 @@ The precise conventions inherited from `ms-go-course` are documented in
 ## Quick start
 
 Requirements: Docker with Compose, Go 1.23+ (the module selects toolchain
-1.24.4), and Node.js 18+ for local runner tests.
+1.24.4), and Node.js 24+ for local UI and runner tests.
 
 ```sh
 make bootstrap
@@ -55,6 +57,28 @@ make workflow-probe
 
 Temporal UI is available at `http://localhost:8233` by default. Run
 `make temporal-ui` to print the configured address.
+
+The owner UI is available at `http://127.0.0.1:3010` after `make up`. It is
+bound to loopback by default. For local development, run `make ui`; the UI
+proxies ordinary API requests to the Go service and receives audit-backed live
+updates over SSE. Useful checks are:
+
+```sh
+make ui-test
+make ui-build
+make ui-e2e
+```
+
+The UI exposes overview, project catalog/details, plan list and DAG, plan runs,
+task attempts/artifacts, approvals, and backend-authorized control actions.
+Approve, reject, run, pause, resume, cancel, publish, and retry operations keep
+the existing Go state-machine and fingerprint gates; the browser does not
+reimplement them.
+
+The UI read API adds `GET /api/v1/dashboard`, collection queries for plans,
+runs, tasks, approvals, and activity, plus `GET /api/v1/events` for SSE.
+Collection endpoints accept `limit`, opaque `cursor`, repeated `status`,
+`project_id`, and `plan_id` parameters where applicable.
 
 `make down` keeps PostgreSQL and orchestrator volumes. To delete them, the user
 must explicitly run `docker compose down -v`; no Make target hides that
@@ -86,6 +110,7 @@ course-dev-orchestrator contract-drift
 course-dev-orchestrator dependencies --service repository-name
 course-dev-orchestrator consumers --service repository-name
 course-dev-orchestrator plan --file command.md [--project-ids uuid,uuid] [--source-issues github:project-uuid:number]
+course-dev-orchestrator plan --file - [--project-ids uuid,uuid] [--source-issues github:project-uuid:number]
 course-dev-orchestrator plan-show --plan-id UUID
 course-dev-orchestrator plan-comment --plan-id UUID --actor owner --comment text
 course-dev-orchestrator plan-issues --plan-id UUID
@@ -94,6 +119,7 @@ course-dev-orchestrator plan-approve --plan-id UUID --fingerprint HASH --actor o
 course-dev-orchestrator plan-reject --plan-id UUID --actor owner [--comment text]
 course-dev-orchestrator plan-publish-issues --plan-id UUID
 course-dev-orchestrator plan-run --plan-id UUID
+course-dev-orchestrator plan-retry-run --plan-id UUID
 course-dev-orchestrator run-status --run-id UUID
 course-dev-orchestrator run-pause --run-id UUID
 course-dev-orchestrator run-resume --run-id UUID
@@ -134,8 +160,8 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
   `codex-cli`. Run `codex login` once and `make codex-auth-sync`; `make up`
   synchronizes that login automatically when it exists. No API key is
   required. Complexity profiles select both model and reasoning effort. The
-  defaults are `gpt-5.6-terra`/low for fast work and `gpt-5.6` with
-  medium/high effort for standard, deep, and review work. Override them with
+  defaults are `gpt-5.6-luna`/low for fast work, `gpt-5.6-terra`/medium for
+  standard work, and `gpt-5.6-sol`/high for deep and review work. Override them with
   `CODEX_MODEL_*` and `CODEX_REASONING_*`; blank values are normalized back to
   safe defaults.
 - Work items: `WORK_ITEM_GATEWAY=fake` is the default and supports the complete
@@ -358,6 +384,11 @@ new issue proposals, discussion, and approval are required. Multiple plans may
 run concurrently, with per-plan `MAX_PARALLEL_TASKS` and process-wide
 `MAX_GLOBAL_AGENT_RUNS` limits.
 
+The Make planning/task wrappers run the CLI inside the Compose service because
+managed clones and worktrees use the stable `/data` container namespace. The
+`plan` target streams `FILE` through bounded standard input, so the command
+file itself does not need to be mounted into the container.
+
 ```sh
 make plan FILE=change.md
 make plan-show PLAN_ID=uuid
@@ -367,6 +398,7 @@ make plan-submit PLAN_ID=uuid ACTOR=owner COMMENT="готово к соглас�
 make plan-approve PLAN_ID=uuid FINGERPRINT=hash ACTOR=owner COMMENT="одобряю точную версию"
 make plan-publish-issues PLAN_ID=uuid
 make plan-run PLAN_ID=uuid
+make plan-retry-run PLAN_ID=uuid
 make run-status RUN_ID=uuid
 make run-pause RUN_ID=uuid
 make run-resume RUN_ID=uuid
@@ -378,6 +410,11 @@ make task-cancel TASK_ID=uuid
 make task-pr-prepare TASK_ID=uuid
 make task-pr-publish WORK_ITEM_ID=uuid
 ```
+
+`plan-retry-run` is restricted to a technically failed, still-current plan
+whose approved fingerprint and published issue set remain unchanged. It starts
+a new Temporal workflow identity, preserves completed prerequisites, resets
+only unfinished tasks, and never bypasses the original approval gate.
 
 Stage 6 extends the durable scheduler with one deterministic `ai/task-*`
 worktree, branch, and coder thread per task. The worker persists a new thread

@@ -59,6 +59,37 @@ func TestPlanWorkflowRespectsDependenciesAndParallelLimit(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestPlanWorkflowRetryPreservesCompletedPrerequisites(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	environment := suite.NewTestWorkflowEnvironment()
+	environment.RegisterActivity(&activities.PlanActivities{})
+	registerPlanStatusMocks(environment)
+	dispatched := make([]string, 0)
+	environment.OnActivity("DispatchPlanTask", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, input activities.DispatchPlanTaskInput) (domain.Task, error) {
+			dispatched = append(dispatched, input.TaskID)
+			return domain.Task{ID: input.TaskID, Status: domain.TaskStatusReady}, nil
+		},
+	)
+	environment.RegisterDelayedCallback(func() {
+		environment.SignalWorkflow(PlanTaskResultSignal, domain.TaskResult{TaskID: "consumer", Status: domain.TaskStatusCompleted})
+	}, time.Second)
+
+	environment.ExecuteWorkflow(PlanWorkflow, domain.PlanSchedule{
+		RunID: "run", PlanID: "plan", MaxParallelTasks: 1, MaxActivityAttempts: 3,
+		Tasks: []domain.ScheduledTask{
+			{TaskID: "producer", Priority: 2, InitialStatus: domain.TaskStatusCompleted},
+			{TaskID: "consumer", Priority: 1, Dependencies: []string{"producer"}, InitialStatus: domain.TaskStatusPlanned},
+		},
+	})
+
+	require.NoError(t, environment.GetWorkflowError())
+	var output PlanWorkflowOutput
+	require.NoError(t, environment.GetWorkflowResult(&output))
+	require.Equal(t, domain.PlanRunStatusCompleted, output.Status)
+	require.Equal(t, []string{"consumer"}, dispatched)
+}
+
 func TestPlanWorkflowPauseResumeAndCancel(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	environment := suite.NewTestWorkflowEnvironment()
@@ -156,12 +187,17 @@ func TestPlanWorkflowExecutesTasksWithoutExternalResultSignal(t *testing.T) {
 	environment.RegisterActivity(&activities.PlanActivities{})
 	registerPlanStatusMocks(environment)
 	environment.OnActivity("DispatchPlanTask", mock.Anything, mock.Anything).Return(domain.Task{}, nil)
+	executionWorkflowID := ""
 	environment.OnActivity("ExecutePlanTask", mock.Anything, mock.Anything).Return(
-		domain.TaskExecutionOutcome{Result: domain.TaskResult{TaskID: "task", Status: domain.TaskStatusCompleted}}, nil,
+		func(_ context.Context, input activities.ExecutePlanTaskInput) (domain.TaskExecutionOutcome, error) {
+			executionWorkflowID = input.WorkflowID
+			return domain.TaskExecutionOutcome{Result: domain.TaskResult{TaskID: "task", Status: domain.TaskStatusCompleted}}, nil
+		},
 	)
 
 	environment.ExecuteWorkflow(PlanWorkflow, domain.PlanSchedule{
-		RunID: "run", PlanID: "plan", MaxParallelTasks: 1, MaxActivityAttempts: 3, ExecuteTasks: true,
+		RunID: "run", PlanID: "plan", WorkflowID: "plan-plan-v1-retry-2",
+		MaxParallelTasks: 1, MaxActivityAttempts: 3, ExecuteTasks: true,
 		Tasks: []domain.ScheduledTask{{TaskID: "task"}},
 	})
 
@@ -170,6 +206,7 @@ func TestPlanWorkflowExecutesTasksWithoutExternalResultSignal(t *testing.T) {
 	require.NoError(t, environment.GetWorkflowResult(&output))
 	require.Equal(t, domain.PlanRunStatusCompleted, output.Status)
 	require.Equal(t, domain.TaskStatusCompleted, output.TaskStatus["task"])
+	require.Equal(t, "plan-plan-v1-retry-2:task:1", executionWorkflowID)
 }
 
 func TestPlanWorkflowRetriesChangesRequestedTaskAfterOwnerSignal(t *testing.T) {

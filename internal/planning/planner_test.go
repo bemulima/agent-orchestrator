@@ -3,6 +3,8 @@ package planning
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/bemulima/agent-orchestrator/internal/config"
@@ -54,6 +56,98 @@ func TestPlannerBuildsDeterministicMultiRepositoryDAG(t *testing.T) {
 	}
 	if output.Summary != rebuilt.Summary || dependencyKey(output.Dependencies[0]) != dependencyKey(rebuilt.Dependencies[0]) {
 		t.Fatalf("planner output is not deterministic: %#v != %#v", output, rebuilt)
+	}
+}
+
+func TestPlannerUsesOnlyApprovedManifestVerificationCommands(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ai"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `schema_version: 1
+commands:
+  - name: build
+    run: npm run build
+    risk: verification
+  - name: lint
+    run: npm run lint
+    requires_approval: true
+    risk: verification
+  - name: test
+    run: npm run test
+    risk: verification
+  - name: dev
+    run: npm run dev
+    risk: lifecycle
+`
+	if err := os.WriteFile(filepath.Join(root, ".ai", "commands.yaml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "browser", Name: "browser", LocalPath: &root}
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision-id"},
+		Services: []domain.TopologyService{{
+			ProjectID: "browser", Name: "browser", Stack: []domain.Evidence{{Name: "language", Value: "typescript"}},
+		}},
+	}
+	_, output, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Исправить browser validator",
+	}, catalog, domain.PlanRequest{RequestedProjectIDs: []string{"browser"}, AvailableProjects: []domain.Project{project}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	want := []string{"git diff --check", "npm run build", "npm test"}
+	if len(output.Tasks) != 1 || len(output.Tasks[0].VerificationCommands) != len(want) {
+		t.Fatalf("verification commands = %#v", output.Tasks)
+	}
+	for _, command := range want {
+		if !containsValue(output.Tasks[0].VerificationCommands, command) {
+			t.Fatalf("verification commands = %#v, missing %q", output.Tasks[0].VerificationCommands, command)
+		}
+	}
+	if containsValue(output.Tasks[0].VerificationCommands, "npm run lint") {
+		t.Fatalf("approval-gated command leaked into plan: %#v", output.Tasks[0].VerificationCommands)
+	}
+}
+
+func TestPlannerRejectsSymlinkedCommandManifestDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "commands.yaml"), []byte("schema_version: 1\ncommands: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, ".ai")); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.Project{ID: "service", Name: "service", LocalPath: &root}
+	_, _, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Исправить сервис",
+	}, domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision"},
+		Services: []domain.TopologyService{{ProjectID: "service", Name: "service"}},
+	}, domain.PlanRequest{RequestedProjectIDs: []string{"service"}, AvailableProjects: []domain.Project{project}})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Build() error = %v, want validation", err)
+	}
+}
+
+func TestPlannerDoesNotInventVerificationCommandsWithoutManifest(t *testing.T) {
+	root := t.TempDir()
+	project := domain.Project{ID: "service", Name: "service", LocalPath: &root}
+	_, output, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Исправить сервис",
+	}, domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision"},
+		Services: []domain.TopologyService{{
+			ProjectID: "service", Name: "service", Stack: []domain.Evidence{{Name: "language", Value: "go"}},
+		}},
+	}, domain.PlanRequest{RequestedProjectIDs: []string{"service"}, AvailableProjects: []domain.Project{project}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(output.Tasks) != 1 || len(output.Tasks[0].VerificationCommands) != 1 ||
+		output.Tasks[0].VerificationCommands[0] != "git diff --check" {
+		t.Fatalf("verification commands = %#v", output.Tasks)
 	}
 }
 

@@ -37,6 +37,11 @@ func (s Service) Execute(
 	if err != nil {
 		return domain.TaskExecutionOutcome{}, err
 	}
+	attempts, err := s.Repository.ListAttempts(ctx, taskID)
+	if err != nil {
+		return domain.TaskExecutionOutcome{}, err
+	}
+	retryFeedback := retryFeedbackFromAttempts(attempts)
 	workspace, err := s.Worktrees.Prepare(ctx, executionContext.Project, executionContext.Task)
 	if err != nil {
 		return domain.TaskExecutionOutcome{}, err
@@ -53,7 +58,8 @@ func (s Service) Execute(
 	if attempt.AgentThreadID != nil {
 		threadID = *attempt.AgentThreadID
 	}
-	feedback := ""
+	feedback := retryFeedback
+	replaceThreadID := ""
 	nextReview := attempt.ReviewCount + 1
 	for {
 		prompt, err := coderPrompt(executionContext, feedback)
@@ -65,22 +71,39 @@ func (s Service) Execute(
 			Model: s.Models[executionContext.Task.ModelProfile], ReasoningEffort: s.Reasoning[executionContext.Task.ModelProfile], Prompt: prompt,
 			OutputSchema: s.Validator.AgentSchema(),
 		}, func(callbackContext context.Context, discoveredThreadID string) error {
-			stored, attachErr := s.Repository.AttachAgentThread(callbackContext, attempt.ID, discoveredThreadID)
+			var stored domain.TaskAttempt
+			var attachErr error
+			if replaceThreadID != "" {
+				stored, attachErr = s.Repository.ReplaceAgentThread(callbackContext, attempt.ID, replaceThreadID, discoveredThreadID)
+			} else {
+				stored, attachErr = s.Repository.AttachAgentThread(callbackContext, attempt.ID, discoveredThreadID)
+			}
 			if attachErr == nil && stored.AgentThreadID != nil {
 				threadID = *stored.AgentThreadID
+				replaceThreadID = ""
 			}
 			return attachErr
 		})
 		if err != nil {
-			return domain.TaskExecutionOutcome{}, err
+			message := "coder runner failed: " + err.Error()
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, message, nil); failErr != nil {
+				return domain.TaskExecutionOutcome{}, failErr
+			}
+			return outcome(taskID, domain.TaskStatusFailed, message), nil
 		}
 		if threadID == "" || response.ThreadID != threadID {
 			return domain.TaskExecutionOutcome{}, fmt.Errorf("coder thread was not durably attached: %w", domain.ErrConflict)
 		}
 		result, err := s.Validator.ValidateAgentResult(response.Result)
 		if err != nil {
-			_ = s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, err.Error(), nil)
+			structured := map[string]any{"raw_agent_result": json.RawMessage(response.Result)}
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, err.Error(), structured); failErr != nil {
+				return domain.TaskExecutionOutcome{}, fmt.Errorf("persist invalid coder result after %v: %w", err, failErr)
+			}
 			return outcome(taskID, domain.TaskStatusFailed, err.Error()), nil
+		}
+		if promoted, ok := promoteVerifiableBlockedResult(result, executionContext.Task); ok {
+			result = promoted
 		}
 
 		switch result.Status {
@@ -151,14 +174,21 @@ func (s Service) Execute(
 			return beginErr
 		})
 		if err != nil {
-			return domain.TaskExecutionOutcome{}, err
+			message := "reviewer runner failed: " + err.Error()
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, message, result); failErr != nil {
+				return domain.TaskExecutionOutcome{}, failErr
+			}
+			return outcome(taskID, domain.TaskStatusFailed, message), nil
 		}
 		if reviewThreadID == "" || reviewThreadID == threadID || reviewResponse.ThreadID != reviewThreadID {
 			return domain.TaskExecutionOutcome{}, fmt.Errorf("reviewer did not use a separate durable thread: %w", domain.ErrConflict)
 		}
 		review, err := s.Validator.ValidateReviewerResult(reviewResponse.Result)
 		if err != nil {
-			_ = s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, err.Error(), result)
+			structured := map[string]any{"agent_result": result, "raw_reviewer_result": json.RawMessage(reviewResponse.Result)}
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusFailed, err.Error(), structured); failErr != nil {
+				return domain.TaskExecutionOutcome{}, fmt.Errorf("persist invalid reviewer result after %v: %w", err, failErr)
+			}
 			return outcome(taskID, domain.TaskStatusFailed, err.Error()), nil
 		}
 		if _, err := s.Repository.CreateReview(ctx, attempt.ID, nextReview, reviewThreadID, review); err != nil {
@@ -177,6 +207,8 @@ func (s Service) Execute(
 			}
 			feedbackContent, _ := json.Marshal(review)
 			feedback = "A separate reviewer requested changes. Address every blocking issue, re-run the allowed checks, and return the complete coder result again:\n" + string(feedbackContent)
+			replaceThreadID = threadID
+			threadID = ""
 			nextReview++
 			continue
 		}
@@ -193,6 +225,74 @@ func (s Service) Execute(
 		}
 		return outcome(taskID, domain.TaskStatusCompleted, ""), nil
 	}
+}
+
+func retryFeedbackFromAttempts(attempts []domain.TaskAttempt) string {
+	for index := len(attempts) - 1; index >= 0; index-- {
+		attempt := attempts[index]
+		if attempt.Status == domain.TaskAttemptStatusRunning ||
+			attempt.Status == domain.TaskAttemptStatusVerification ||
+			attempt.Status == domain.TaskAttemptStatusReview ||
+			attempt.Status == domain.TaskAttemptStatusCompleted {
+			continue
+		}
+		structured := strings.TrimSpace(string(attempt.StructuredResult))
+		if structured != "" && structured != "{}" && structured != "null" {
+			return fmt.Sprintf(
+				"A previous task attempt ended with status %q. Address its persisted result before returning the complete coder result again:\n%s",
+				attempt.Status,
+				structured,
+			)
+		}
+		if attempt.Error != nil && strings.TrimSpace(*attempt.Error) != "" {
+			return fmt.Sprintf(
+				"A previous task attempt ended with status %q. Re-check and address this persisted failure before returning the complete coder result again:\n%s",
+				attempt.Status,
+				strings.TrimSpace(*attempt.Error),
+			)
+		}
+	}
+	return ""
+}
+
+func promoteVerifiableBlockedResult(result domain.AgentResult, task domain.Task) (domain.AgentResult, bool) {
+	if result.Status != domain.AgentResultBlocked && result.Status != domain.AgentResultFailed {
+		return result, false
+	}
+	if len(result.RequiredTasks) != 0 ||
+		len(result.FilesChanged) == 0 || len(result.Blockers) == 0 {
+		return result, false
+	}
+	allowed := map[string]struct{}{"git diff --check": {}}
+	for _, command := range task.VerificationCommands {
+		allowed[command] = struct{}{}
+	}
+	hasUnsuccessfulCheck := false
+	for _, check := range result.Checks {
+		if check.Status == domain.AgentCheckPassed {
+			continue
+		}
+		if _, ok := allowed[check.Name]; !ok {
+			return result, false
+		}
+		hasUnsuccessfulCheck = true
+	}
+	if !hasUnsuccessfulCheck {
+		return result, false
+	}
+
+	blockers := append([]string(nil), result.Blockers...)
+	result.Status = domain.AgentResultCompleted
+	result.Blockers = nil
+	for index := range result.Checks {
+		if result.Checks[index].Status != domain.AgentCheckPassed {
+			result.Checks[index].Status = domain.AgentCheckSkipped
+			result.Checks[index].Details = "Coder sandbox could not complete this check; the independent verifier must decide it: " + result.Checks[index].Details
+		}
+	}
+	result.NotesForReviewer = append(result.NotesForReviewer,
+		"The coder reported a verification-only sandbox blocker. The orchestrator promoted the result only for independent verification: "+strings.Join(blockers, "; "))
+	return result, true
 }
 
 func (s Service) storeArtifacts(
@@ -225,12 +325,14 @@ func coderPrompt(executionContext domain.TaskExecutionContext, feedback string) 
 		PlanSummary  string                             `json:"plan_summary"`
 		Project      domain.Project                     `json:"current_project"`
 		Task         domain.Task                        `json:"task"`
+		PlanTasks    []domain.Task                      `json:"approved_plan_tasks"`
 		Projects     []domain.ConnectedProjectKnowledge `json:"connected_projects"`
 		Topology     agentLandscape                     `json:"connected_landscape"`
 		Dependencies []domain.TaskDependencyRef         `json:"dependencies"`
 	}{
 		Command: executionContext.Command.Text, PlanSummary: executionContext.Plan.Summary,
-		Project: executionContext.Project, Task: executionContext.Task, Projects: executionContext.ConnectedProjects,
+		Project: executionContext.Project, Task: executionContext.Task, PlanTasks: executionContext.PlanTasks,
+		Projects:     executionContext.ConnectedProjects,
 		Topology:     landscapeForAgent(executionContext.Topology),
 		Dependencies: executionContext.Dependencies,
 	}
@@ -248,6 +350,8 @@ Run only task.verification_commands and "git diff --check". Inspect actual Git s
 Return only JSON matching the supplied schema. files_changed must exactly match actual changed and untracked files.
 For each independently reproducible check, use its exact command as checks[].name. Do not claim checks you did not run.
 If another repository must change first, return status blocked and a minimal required_tasks entry for that connected service.
+required_tasks means strict prerequisites without which this current task cannot satisfy its acceptance criteria. It does not mean later rollout work.
+If required_tasks is non-empty, status MUST be blocked. Never return completed together with required_tasks.
 
 Persisted context:
 ` + string(content)
@@ -269,12 +373,13 @@ func reviewerPrompt(
 	payload := struct {
 		Project      domain.Project                     `json:"current_project"`
 		Task         domain.Task                        `json:"task"`
+		PlanTasks    []domain.Task                      `json:"approved_plan_tasks"`
 		Projects     []domain.ConnectedProjectKnowledge `json:"connected_projects"`
 		Topology     agentLandscape                     `json:"connected_landscape"`
 		CoderResult  domain.AgentResult                 `json:"coder_result"`
 		Verification domain.VerificationReport          `json:"verification"`
 		GitState     domain.WorkspaceState              `json:"git_state"`
-	}{executionContext.Project, executionContext.Task, executionContext.ConnectedProjects,
+	}{executionContext.Project, executionContext.Task, executionContext.PlanTasks, executionContext.ConnectedProjects,
 		landscapeForAgent(executionContext.Topology), result, report, state}
 	content, err := json.Marshal(payload)
 	if err != nil {
@@ -284,6 +389,8 @@ func reviewerPrompt(
 Do not edit files and do not accept the coder's claims without checking the actual worktree.
 Review the Git diff, untracked files, acceptance criteria, write scope, tests, migration safety, and contract changes.
 Cross-check affected services and contracts against connected_landscape; require a bounded cross-project task when another repository must change.
+Treat a new task as blocking only when it is a prerequisite for the current task's acceptance criteria. Do not block on later rollout work,
+and do not request work that is already represented in approved_plan_tasks.
 Return only JSON matching the supplied reviewer schema. Approve only when no blocking issue remains.
 
 Review context:
@@ -317,7 +424,7 @@ func errorValue(value *string) string {
 }
 
 func (s Service) maxTaskAttempts() int {
-	if s.MaxTaskAttempts < 1 || s.MaxTaskAttempts > 3 {
+	if s.MaxTaskAttempts < 1 || s.MaxTaskAttempts > 8 {
 		return 3
 	}
 	return s.MaxTaskAttempts

@@ -66,7 +66,11 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 		TaskStatus: make(map[string]domain.TaskStatus, len(schedule.Tasks)), ActiveTasks: []string{},
 	}
 	for _, task := range schedule.Tasks {
-		state.TaskStatus[task.TaskID] = domain.TaskStatusPlanned
+		status := task.InitialStatus
+		if status == "" {
+			status = domain.TaskStatusPlanned
+		}
+		state.TaskStatus[task.TaskID] = status
 	}
 	if err := temporalworkflow.SetQueryHandler(ctx, PlanStateQuery, func() (PlanWorkflowState, error) {
 		return copyPlanState(state), nil
@@ -258,7 +262,7 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 						activeCancels[taskID] = cancel
 						activeFutures[taskID] = temporalworkflow.ExecuteActivity(taskCtx, "ExecutePlanTask", activities.ExecutePlanTaskInput{
 							RunID: schedule.RunID, PlanID: schedule.PlanID, TaskID: taskID,
-							WorkflowID: fmt.Sprintf("%s:%s:%d", schedule.RunID, taskID, attemptSequence[taskID]),
+							WorkflowID: fmt.Sprintf("%s:%s:%d", scheduleExecutionID(schedule), taskID, attemptSequence[taskID]),
 						})
 						state.TaskStatus[taskID] = domain.TaskStatusRunning
 					}
@@ -314,6 +318,13 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 		}
 		selector.Select(ctx)
 	}
+}
+
+func scheduleExecutionID(schedule domain.PlanSchedule) string {
+	if schedule.WorkflowID != "" {
+		return schedule.WorkflowID
+	}
+	return schedule.RunID
 }
 
 type taskExecutionCompletion struct {
@@ -432,6 +443,9 @@ func validateSchedule(schedule domain.PlanSchedule) error {
 	for _, task := range schedule.Tasks {
 		if task.TaskID == "" {
 			return fmt.Errorf("scheduled task ID is required: %w", domain.ErrValidation)
+		}
+		if task.InitialStatus != "" && task.InitialStatus != domain.TaskStatusPlanned && task.InitialStatus != domain.TaskStatusCompleted {
+			return fmt.Errorf("invalid initial status %q for scheduled task: %w", task.InitialStatus, domain.ErrValidation)
 		}
 		if _, exists := seen[task.TaskID]; exists {
 			return fmt.Errorf("duplicate scheduled task %q: %w", task.TaskID, domain.ErrConflict)
