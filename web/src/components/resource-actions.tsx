@@ -24,16 +24,20 @@ function request(resourceType: "plan" | "run" | "task", resourceID: string, acti
   return apiPost(`/api/v1/${resourceType === "run" ? "runs" : "tasks"}/${resourceID}/${action}`);
 }
 
-export function ResourceActions({ resourceType, resourceID, actions, fingerprint }: {
+export function ResourceActions({ resourceType, resourceID, actions, fingerprint, onCompleted }: {
   resourceType: "plan" | "run" | "task";
   resourceID: string;
   actions: ResourceAction[];
   fingerprint?: string;
+  onCompleted?: (action: string) => void | Promise<void>;
 }) {
   const client = useQueryClient();
   const mutation = useMutation({
     mutationFn: (action: string) => request(resourceType, resourceID, action, fingerprint),
-    onSuccess: () => client.invalidateQueries(),
+    onSuccess: async (_, action) => {
+      await onCompleted?.(action);
+      await client.invalidateQueries();
+    },
   });
   if (!actions.length) return null;
   return (

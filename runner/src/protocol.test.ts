@@ -47,6 +47,16 @@ test("parses dedicated read-only issue and pull-request manager requests", () =>
   }
 });
 
+test("parses a read-only operator request", () => {
+  const request = parseRequest({
+    role: "operator",
+    working_directory: "/tmp/repository",
+    prompt: "explain current state",
+    output_schema: { type: "object" },
+  });
+  assert.equal(request.role, "operator");
+});
+
 test("collects thread and structured agent response", () => {
   const state: StreamState = {};
   consumeEvent(state, { type: "thread.started", thread_id: "thread-1" });

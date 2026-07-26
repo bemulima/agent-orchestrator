@@ -93,6 +93,22 @@ The management flows use the existing `POST /api/v1/projects/connect`, command
 and plan creation endpoints, plus
 `POST /api/v1/plans/{planId}/revisions` for versioned discussion changes.
 
+The **Control center** at `/control` adds persistent owner conversations over
+workspace, project, or plan scope. Each conversation resumes one read-only
+operator thread and receives only bounded persisted platform context. Answers
+may link to verified projects/plans/runs/tasks and may propose an action only
+when that action is currently returned by the Go read model. Confirming a
+proposal calls the existing resource endpoint, including its normal browser
+confirmation and fingerprint/state checks, before the proposal is marked as
+confirmed.
+
+Conversation API routes are `GET/POST /api/v1/conversations`,
+`GET /api/v1/conversations/{conversationId}`,
+`POST /api/v1/conversations/{conversationId}/messages`, and
+`POST /api/v1/action-proposals/{proposalId}/decision`. The initial turn is
+synchronous; persisted pending/failed states prevent overlapping turns and
+retain diagnostic state if the operator runner fails.
+
 `make down` keeps PostgreSQL and orchestrator volumes. To delete them, the user
 must explicitly run `docker compose down -v`; no Make target hides that
 destructive action.

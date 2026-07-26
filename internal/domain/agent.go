@@ -171,6 +171,7 @@ const (
 	AgentRunPlanner            AgentRunRole = "planner"
 	AgentRunIssueManager       AgentRunRole = "issue-manager"
 	AgentRunPullRequestManager AgentRunRole = "pull-request-manager"
+	AgentRunOperator           AgentRunRole = "operator"
 )
 
 type AgentRunRequest struct {

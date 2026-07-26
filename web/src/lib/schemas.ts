@@ -45,6 +45,28 @@ export const commandSchema = z.object({
   status: z.string(),
 }).loose();
 
+export const conversationSchema = z.object({
+  id: z.string(), title: z.string(), scope_type: z.string(), scope_id: z.string().nullable().optional(),
+  agent_thread_id: z.string().nullable().optional(), message_count: z.number(), created_at: z.string(), updated_at: z.string(),
+});
+export const conversationsSchema = z.object({ items: z.array(conversationSchema) });
+export const resourceReferenceSchema = z.object({ resource_type: z.string(), resource_id: z.string(), label: z.string() });
+export const conversationMessageSchema = z.object({
+  id: z.string(), conversation_id: z.string(), role: z.string(), status: z.string(), content: z.string(),
+  references: z.array(resourceReferenceSchema), error: z.string().nullable().optional(), created_at: z.string(),
+  completed_at: z.string().nullable().optional(),
+});
+export const actionProposalSchema = z.object({
+  id: z.string(), conversation_id: z.string(), message_id: z.string(), action: z.string(), resource_type: z.string(),
+  resource_id: z.string(), title: z.string(), description: z.string(), risk_level: z.string(), fingerprint: z.string().nullable().optional(),
+  status: z.string(), created_at: z.string(), decided_at: z.string().nullable().optional(),
+});
+export const conversationDetailSchema = z.object({
+  conversation: conversationSchema,
+  messages: z.array(conversationMessageSchema),
+  proposals: z.array(actionProposalSchema),
+});
+
 export const planSummarySchema = z.object({
   id: z.string(), command_id: z.string(), summary: z.string(), status: z.string(), version: z.number(),
   risk_level: z.string(), source_kind: z.string(), fingerprint: z.string(), task_count: z.number(),
@@ -112,3 +134,5 @@ export type ResourceAction = z.infer<typeof actionSchema>;
 export type PlanSummary = z.infer<typeof planSummarySchema>;
 export type RunSummary = z.infer<typeof runSummarySchema>;
 export type TaskSummary = z.infer<typeof taskSummarySchema>;
+export type Conversation = z.infer<typeof conversationSchema>;
+export type ActionProposal = z.infer<typeof actionProposalSchema>;

@@ -10,6 +10,7 @@ export const metadata: Metadata = {
 
 const navigation = [
   ["/", "Обзор"],
+  ["/control", "Центр управления"],
   ["/projects", "Проекты"],
   ["/plans", "Планы"],
   ["/runs", "Выполнение"],

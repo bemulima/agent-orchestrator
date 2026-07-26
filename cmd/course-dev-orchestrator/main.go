@@ -42,6 +42,7 @@ import (
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
+	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
@@ -192,7 +193,16 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
 		GetArtifacts: planningOperations.GetArtifacts, RetryTask: planningOperations.RetryTask,
 	}
-	uiHandler := handlers.UIHandler{Queries: uiuc.QueryService{Reads: pgadapter.UIReadRepoPG{Pool: pool}}}
+	ownerQueries := uiuc.QueryService{Reads: pgadapter.UIReadRepoPG{Pool: pool}}
+	uiHandler := handlers.UIHandler{Queries: ownerQueries}
+	operatorRunner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return err
+	}
+	conversationHandler := handlers.ConversationHandler{Service: conversationuc.Service{
+		Store: pgadapter.ConversationRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Queries: ownerQueries, Runner: operatorRunner, Model: cfg.CodexModelStandard, Reasoning: cfg.CodexReasoningStandard,
+	}}
 	gitLabOperations := newGitLabOperations(cfg, pool)
 	gitLabHandler := handlers.GitLabHandler{
 		Sync: gitLabOperations.Sync, Links: gitLabOperations.Links, Webhook: gitLabOperations.Webhook,
@@ -208,15 +218,16 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		telegramHandler = &handlers.TelegramHandler{Processor: telegramService, Secret: cfg.TelegramWebhookSecret}
 	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
-		HealthHandler:     healthHandler,
-		ProjectHandler:    &projectHandler,
-		OnboardingHandler: &onboardingHandler,
-		TopologyHandler:   &topologyHandler,
-		PlanningHandler:   &planningHandler,
-		UIHandler:         &uiHandler,
-		GitLabHandler:     &gitLabHandler,
-		TelegramHandler:   telegramHandler,
-		Logger:            logger,
+		HealthHandler:       healthHandler,
+		ProjectHandler:      &projectHandler,
+		OnboardingHandler:   &onboardingHandler,
+		TopologyHandler:     &topologyHandler,
+		PlanningHandler:     &planningHandler,
+		UIHandler:           &uiHandler,
+		ConversationHandler: &conversationHandler,
+		GitLabHandler:       &gitLabHandler,
+		TelegramHandler:     telegramHandler,
+		Logger:              logger,
 	})
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,

@@ -12,6 +12,12 @@ on `127.0.0.1:3010` by default. Backend-derived allowed actions reuse the
 existing fingerprint and state-machine gates. Audit-backed SSE provides live
 cache invalidation, with polling fallback; the initial stream establishes a
 baseline instead of replaying historical events.
+Stages 11 and 12 are implemented locally. The UI now supports project
+connection, explicit-project plan authoring, immutable plan revisions, and a
+persistent conversational control center. Operator conversations resume one
+read-only Codex thread, cite only verified resources, and can propose only
+actions currently exposed by backend `allowed_actions`; existing confirmation,
+fingerprint, and state-machine gates still execute every mutation.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, worker, and owner
 UI.
@@ -858,6 +864,22 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Added focused revision use-case and HTTP route coverage plus three mocked,
   non-mutating Playwright scenarios. All eight owner E2E flows, focused Go
   tests, frontend typecheck/unit tests, and the production Next.js build pass.
+- Added reversible migration `012_owner_conversations` and PostgreSQL
+  persistence for conversation scope/history, resumable operator thread IDs,
+  message references, structured action proposals, decisions, and audit.
+- Added the read-only `operator` runner role and strict output schema. Its
+  bounded context contains persisted dashboard, project, plan, run, task, and
+  approval state; unknown references or proposals outside current
+  `allowed_actions` fail closed, while plan approval proposals bind the exact
+  displayed fingerprint.
+- Added `/api/v1/conversations` create/list/detail/message APIs and proposal
+  decisions with thin HTTP handlers and application-layer validation.
+- Added the responsive `/control` UI: scoped conversation creation, persistent
+  timeline, resource links, pending proposal queue, and explicit execution via
+  the existing confirmation-gated resource actions.
+- Verified focused Go tests, nine runner protocol tests, frontend
+  typecheck/unit/build, nine non-mutating Playwright flows, and the disposable
+  PostgreSQL integration suite including conversation lifecycle and migration.
 
 ## Remaining work
 

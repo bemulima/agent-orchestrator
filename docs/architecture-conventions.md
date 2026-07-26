@@ -92,6 +92,12 @@ and engineering conventions come from the reference service.
   aggregation stays in a pgx read adapter; allowed actions are derived in the
   Go application layer. SSE projects committed audit events and polling remains
   the fallback when the stream is unavailable.
+- Owner conversations are a separate persisted aggregate, not an extension of
+  one-shot planning commands or plan comments. One conversation may resume one
+  read-only operator thread. The operator receives bounded persisted read
+  models, never mutation tools, and may emit only resource references and
+  proposals that match backend-derived `allowed_actions`. Existing use cases,
+  fingerprints, explicit confirmation, and audit events remain authoritative.
 
 ## Deliberate extensions required by this service
 

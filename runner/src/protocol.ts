@@ -9,7 +9,8 @@ export type RunnerRole =
   | "analyst"
   | "planner"
   | "issue-manager"
-  | "pull-request-manager";
+  | "pull-request-manager"
+  | "operator";
 
 export interface RunRequest {
   role: RunnerRole;
@@ -36,7 +37,8 @@ export function parseRequest(value: unknown): RunRequest {
     value.role !== "analyst" &&
     value.role !== "planner" &&
     value.role !== "issue-manager" &&
-    value.role !== "pull-request-manager"
+    value.role !== "pull-request-manager" &&
+    value.role !== "operator"
   ) {
     throw new Error("role is not supported");
   }

@@ -14,15 +14,16 @@ import (
 
 // RouterDependencies collects HTTP handlers and cross-cutting dependencies.
 type RouterDependencies struct {
-	HealthHandler     handlers.HealthHandler
-	ProjectHandler    *handlers.ProjectHandler
-	OnboardingHandler *handlers.OnboardingHandler
-	TopologyHandler   *handlers.TopologyHandler
-	PlanningHandler   *handlers.PlanningHandler
-	UIHandler         *handlers.UIHandler
-	GitLabHandler     *handlers.GitLabHandler
-	TelegramHandler   *handlers.TelegramHandler
-	Logger            *zap.Logger
+	HealthHandler       handlers.HealthHandler
+	ProjectHandler      *handlers.ProjectHandler
+	OnboardingHandler   *handlers.OnboardingHandler
+	TopologyHandler     *handlers.TopologyHandler
+	PlanningHandler     *handlers.PlanningHandler
+	UIHandler           *handlers.UIHandler
+	ConversationHandler *handlers.ConversationHandler
+	GitLabHandler       *handlers.GitLabHandler
+	TelegramHandler     *handlers.TelegramHandler
+	Logger              *zap.Logger
 }
 
 // NewRouter builds the chi router.
@@ -96,6 +97,13 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/approvals", deps.UIHandler.ListApprovals)
 		root.Get("/api/v1/activity", deps.UIHandler.ListActivity)
 		root.Get("/api/v1/events", deps.UIHandler.Events)
+	}
+	if deps.ConversationHandler != nil {
+		root.Get("/api/v1/conversations", deps.ConversationHandler.List)
+		root.Post("/api/v1/conversations", deps.ConversationHandler.Create)
+		root.Get("/api/v1/conversations/{conversationId}", deps.ConversationHandler.Get)
+		root.Post("/api/v1/conversations/{conversationId}/messages", deps.ConversationHandler.Send)
+		root.Post("/api/v1/action-proposals/{proposalId}/decision", deps.ConversationHandler.DecideProposal)
 	}
 	if deps.GitLabHandler != nil {
 		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)

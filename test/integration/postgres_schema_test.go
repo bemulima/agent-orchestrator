@@ -55,6 +55,7 @@ ORDER BY tablename`)
 		"gitlab_webhook_event",
 		"telegram_update", "telegram_callback", "telegram_poll_state",
 		"plan_comment", "work_item",
+		"conversation", "conversation_message", "action_proposal",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {

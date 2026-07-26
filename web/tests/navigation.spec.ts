@@ -82,6 +82,34 @@ test("owner can create an immutable plan revision", async ({ page }) => {
   await expect(page.getByText("версия 2", { exact: false }).first()).toBeVisible();
 });
 
+test("owner can discuss platform state and reject an action proposal", async ({ page }) => {
+  const conversation = { id: "conversation-1", title: "Состояние платформы", scope_type: "workspace", scope_id: null, agent_thread_id: "thread-1", message_count: 0, created_at: "2026-07-26T10:00:00Z", updated_at: "2026-07-26T10:00:00Z" };
+  const ownerMessage = { id: "message-owner", conversation_id: conversation.id, role: "owner", status: "completed", content: "Почему план остановлен?", references: [], created_at: "2026-07-26T10:01:00Z", completed_at: "2026-07-26T10:01:00Z" };
+  const assistantMessage = { id: "message-assistant", conversation_id: conversation.id, role: "assistant", status: "completed", content: "План приостановлен после исчерпания review.", references: [{ resource_type: "run", resource_id: "run-1", label: "Остановленный run" }], created_at: "2026-07-26T10:01:01Z", completed_at: "2026-07-26T10:01:02Z" };
+  const proposal = { id: "proposal-1", conversation_id: conversation.id, message_id: assistantMessage.id, action: "resume", resource_type: "run", resource_id: "run-1", title: "Продолжить run", description: "Возобновить после проверки причины.", risk_level: "high", fingerprint: null, status: "pending", created_at: "2026-07-26T10:01:02Z", decided_at: null };
+  let detail: { conversation: typeof conversation; messages: Array<Record<string, unknown>>; proposals: Array<Record<string, unknown>> } = { conversation, messages: [], proposals: [] };
+  await page.route("**/api/v1/conversations", async route => {
+    if (route.request().method() === "GET") await route.fulfill({ json: { items: [conversation] } });
+    else await route.continue();
+  });
+  await page.route("**/api/v1/conversations/conversation-1", route => route.fulfill({ json: detail }));
+  await page.route("**/api/v1/conversations/conversation-1/messages", route => {
+    detail = { conversation: { ...conversation, message_count: 2 }, messages: [ownerMessage, assistantMessage], proposals: [proposal] };
+    return route.fulfill({ json: detail });
+  });
+  await page.route("**/api/v1/action-proposals/proposal-1/decision", route => {
+    detail = { ...detail, proposals: [{ ...proposal, status: "rejected", decided_at: "2026-07-26T10:02:00Z" }] };
+    return route.fulfill({ json: detail.proposals[0] });
+  });
+  await page.goto("/control/conversation-1");
+  await page.getByLabel("Сообщение владельца").fill("Почему план остановлен?");
+  await page.getByRole("button", { name: "Отправить" }).click();
+  await expect(page.getByText("План приостановлен после исчерпания review.")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Остановленный run" })).toBeVisible();
+  await page.getByRole("button", { name: "Отклонить предложение" }).click();
+  await expect(page.getByText("rejected")).toBeVisible();
+});
+
 const projectFixture = {
   id: "project-orders", name: "orders", status: "connected", repository_role: "service",
   default_branch: "main", current_branch: "main", head_commit: "0123456789abcdef", is_dirty: false,

@@ -306,3 +306,33 @@ Acceptance:
   fingerprint;
 - focused Go tests, frontend typecheck/unit/build, and eight Playwright flows
   pass without mutating live resources.
+
+## Stage 12 — conversational control center
+
+Status: implemented and locally verified on 2026-07-26.
+
+Scope:
+
+- persistent workspace/project/plan-scoped owner conversations;
+- one resumable, read-only operator Codex thread per conversation;
+- bounded platform context assembled from projects and owner read models;
+- strict operator output with Russian answer, verified resource references,
+  and structured action proposals;
+- proposal validation against the current backend `allowed_actions` and exact
+  approval fingerprint binding;
+- explicit owner confirmation through existing plan/run/task mutation APIs;
+- responsive three-column UI with conversation history, chat timeline, context
+  links, and pending proposal queue.
+
+Acceptance:
+
+- conversation turns, agent thread IDs, references, proposals, decisions, and
+  audit events persist through reversible migration `012`;
+- only one assistant turn may be pending in a conversation;
+- the operator has read-only filesystem access, no network, no mutation API,
+  and no orchestrator secrets;
+- unknown resources and actions not currently permitted by Go are rejected;
+- a confirmed proposal still passes the existing resource state machine and
+  browser confirmation before it is marked confirmed;
+- Go unit/HTTP/integration tests, runner protocol tests, frontend build, and
+  nine Playwright flows pass.
