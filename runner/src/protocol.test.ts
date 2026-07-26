@@ -47,6 +47,16 @@ test("parses dedicated read-only issue and pull-request manager requests", () =>
   }
 });
 
+test("parses a read-only operator request", () => {
+  const request = parseRequest({
+    role: "operator",
+    working_directory: "/tmp/repository",
+    prompt: "explain current state",
+    output_schema: { type: "object" },
+  });
+  assert.equal(request.role, "operator");
+});
+
 test("collects thread and structured agent response", () => {
   const state: StreamState = {};
   consumeEvent(state, { type: "thread.started", thread_id: "thread-1" });
@@ -73,11 +83,22 @@ test("gives agent commands an explicit secret-free environment", () => {
   const environment = agentCommandEnvironment({
     PATH: "/bin",
     HOME: "/tmp/home",
+    GOPATH: "/data/cache/go",
+    GOCACHE: "/data/cache/go-build",
+    GOMODCACHE: "/data/cache/go-mod",
+    npm_config_cache: "/data/cache/npm",
     CODEX_HOME: "/data/codex",
     OPENAI_API_KEY: "secret",
     DATABASE_URL: "secret",
   });
-  assert.deepEqual(environment, { PATH: "/bin", HOME: "/tmp/home" });
+  assert.deepEqual(environment, {
+    PATH: "/bin",
+    HOME: "/tmp/home",
+    GOPATH: "/data/cache/go",
+    GOCACHE: "/data/cache/go-build",
+    GOMODCACHE: "/data/cache/go-mod",
+    npm_config_cache: "/data/cache/npm",
+  });
 });
 
 test("rejects an invalid structured result", () => {

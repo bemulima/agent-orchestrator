@@ -83,6 +83,7 @@ type PlanningHandler struct {
 	CreateCommand createCommandUseCase
 	GetCommand    getCommandUseCase
 	CreatePlan    createPlanUseCase
+	RevisePlan    createPlanUseCase
 	GetPlan       getPlanUseCase
 	CommentPlan   decidePlanUseCase
 	SubmitPlan    decidePlanUseCase
@@ -144,6 +145,20 @@ func (h PlanningHandler) PlanCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plan, err := h.CreatePlan.Handle(r.Context(), chi.URLParam(r, "commandId"), request)
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, plan)
+}
+
+func (h PlanningHandler) RevisePlanRequest(w http.ResponseWriter, r *http.Request) {
+	var request domain.PlanRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	plan, err := h.RevisePlan.Handle(r.Context(), chi.URLParam(r, "planId"), request)
 	if err != nil {
 		WriteDomainError(w, err)
 		return

@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -29,6 +30,8 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
 	require.Equal(t, []string{"medium", "high"}, runner.reasoningEfforts)
 	require.Contains(t, runner.prompts[0], `"connected_landscape"`)
+	require.Contains(t, runner.prompts[0], `"approved_plan_tasks"`)
+	require.Contains(t, runner.prompts[1], "downstream task")
 	require.Contains(t, runner.prompts[0], "orders-service")
 	require.Contains(t, runner.prompts[1], "orders-service")
 	require.Contains(t, runner.prompts[0], "course-wiki")
@@ -38,7 +41,7 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.NotEqual(t, repo.coderThread, repo.reviewThreads[0])
 }
 
-func TestServiceResumesCoderAndUsesANewReviewerThread(t *testing.T) {
+func TestServiceStartsFreshCoderRevisionAndUsesANewReviewerThread(t *testing.T) {
 	validator, err := agent.NewValidator()
 	require.NoError(t, err)
 	repo := newFakeExecutionRepository()
@@ -51,8 +54,73 @@ func TestServiceResumesCoderAndUsesANewReviewerThread(t *testing.T) {
 	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
 	require.NoError(t, err)
 	require.Equal(t, domain.TaskStatusCompleted, result.Result.Status)
-	require.Equal(t, []string{"", "", "coder-thread", ""}, runner.requestThreads)
+	require.Equal(t, []string{"", "", "", ""}, runner.requestThreads)
+	require.Equal(t, []string{"coder-thread", "coder-thread-2"}, repo.coderThreads)
 	require.Equal(t, []string{"review-thread-1", "review-thread-2"}, repo.reviewThreads)
+}
+
+func TestServicePassesPersistedReviewerFeedbackToANewAttempt(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	repo.attempt.AttemptNumber = 2
+	repo.attempts = []domain.TaskAttempt{{
+		ID:               "attempt-1",
+		TaskID:           "task-1",
+		AttemptNumber:    1,
+		Status:           domain.TaskAttemptStatusChangesRequested,
+		StructuredResult: changesReviewResult(),
+	}}
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{completedCoderResult(), approvedReviewResult()}}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-2")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusCompleted, result.Result.Status)
+	require.Contains(t, runner.prompts[0], "A previous task attempt ended")
+	require.Contains(t, runner.prompts[0], "handle empty input")
+}
+
+func TestServiceUsesIndependentVerifierForCoderSandboxOnlyBlocker(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{json.RawMessage(`{
+  "status":"blocked","summary":"implemented but sandbox blocks loopback","files_changed":["internal/order.go"],
+  "checks":[{"name":"go test ./...","status":"failed","details":"listen tcp 127.0.0.1:0: operation not permitted"}],
+  "artifacts":[],"blockers":["sandbox blocks loopback sockets"],"required_tasks":[],"risks":[],"notes_for_reviewer":[]
+}`), approvedReviewResult()}}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusCompleted, result.Result.Status)
+	require.True(t, repo.completed)
+	require.True(t, worktrees.committed)
+	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
+	require.Contains(t, runner.prompts[1], "independent verifier")
+}
+
+func TestServiceUsesIndependentVerifierForFailedCoderVerificationOnlyResult(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{json.RawMessage(`{
+  "status":"failed","summary":"implemented but dependencies were unavailable","files_changed":["internal/order.go"],
+  "checks":[{"name":"go test ./...","status":"failed","details":"tool unavailable"}],
+  "artifacts":[],"blockers":["verification environment is incomplete"],"required_tasks":[],"risks":[],"notes_for_reviewer":[]
+}`), approvedReviewResult()}}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusCompleted, result.Result.Status)
+	require.True(t, repo.completed)
+	require.True(t, worktrees.committed)
+	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
 }
 
 func TestServiceBlocksForReapprovalWhenAgentDiscoversRequiredTask(t *testing.T) {
@@ -93,6 +161,58 @@ func TestServiceStopsAfterMaximumReviewerChanges(t *testing.T) {
 	require.False(t, repo.completed)
 	require.False(t, worktrees.committed)
 	require.Len(t, repo.reviewThreads, 2)
+}
+
+func TestServiceFailsAttemptWithoutRerunningCoderWhenReviewerRunnerFails(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &reviewerFailingRunner{}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusFailed, result.Result.Status)
+	require.Equal(t, domain.TaskAttemptStatusFailed, repo.failedStatus)
+	require.Equal(t, []domain.AgentRunRole{domain.AgentRunCoder, domain.AgentRunReviewer}, runner.roles)
+	require.False(t, repo.completed)
+	require.False(t, worktrees.committed)
+}
+
+func TestServiceFailsAttemptWithoutTemporalRetryWhenCoderRunnerFails(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &coderFailingRunner{}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusFailed, result.Result.Status)
+	require.Equal(t, domain.TaskAttemptStatusFailed, repo.failedStatus)
+	require.Equal(t, 1, runner.calls)
+	require.False(t, repo.completed)
+}
+
+func TestServicePersistsInvalidCoderResultAsFailedAttempt(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{json.RawMessage(`{
+  "status":"completed","summary":"inconsistent","files_changed":[],"checks":[],"artifacts":[],"blockers":[],
+  "required_tasks":[{"service":"orders","role":"coder","title":"dependency","description":"needed","reason":"blocked","acceptance_criteria":["done"]}],
+  "risks":[],"notes_for_reviewer":[]
+}`)}}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusFailed, result.Result.Status)
+	require.Equal(t, domain.TaskAttemptStatusFailed, repo.failedStatus)
+	require.NotNil(t, repo.failedStructured)
 }
 
 func fixtureService(
@@ -148,7 +268,43 @@ type sequenceRunner struct {
 	prompts          []string
 	reasoningEfforts []string
 	coderThread      string
+	coderCount       int
 	reviewCount      int
+}
+
+type reviewerFailingRunner struct {
+	roles []domain.AgentRunRole
+}
+
+type coderFailingRunner struct {
+	calls int
+}
+
+func (r *coderFailingRunner) Run(
+	context.Context,
+	domain.AgentRunRequest,
+	repository.AgentThreadCallback,
+) (domain.AgentRunResponse, error) {
+	r.calls++
+	return domain.AgentRunResponse{}, errors.New("context window exhausted")
+}
+
+func (r *reviewerFailingRunner) Run(
+	ctx context.Context,
+	request domain.AgentRunRequest,
+	callback repository.AgentThreadCallback,
+) (domain.AgentRunResponse, error) {
+	r.roles = append(r.roles, request.Role)
+	if request.Role == domain.AgentRunCoder {
+		if err := callback(ctx, "coder-thread"); err != nil {
+			return domain.AgentRunResponse{}, err
+		}
+		return domain.AgentRunResponse{ThreadID: "coder-thread", Result: completedCoderResult()}, nil
+	}
+	if err := callback(ctx, "reviewer-thread"); err != nil {
+		return domain.AgentRunResponse{}, err
+	}
+	return domain.AgentRunResponse{ThreadID: "reviewer-thread"}, errors.New("reviewer schema rejected")
 }
 
 func (r *sequenceRunner) Run(
@@ -165,7 +321,11 @@ func (r *sequenceRunner) Run(
 	r.reasoningEfforts = append(r.reasoningEfforts, request.ReasoningEffort)
 	threadID := request.ThreadID
 	if request.Role == domain.AgentRunCoder && threadID == "" {
+		r.coderCount++
 		threadID = "coder-thread"
+		if r.coderCount > 1 {
+			threadID = fmt.Sprintf("coder-thread-%d", r.coderCount)
+		}
 		r.coderThread = threadID
 	}
 	if request.Role == domain.AgentRunReviewer {
@@ -184,9 +344,12 @@ type fakeExecutionRepository struct {
 	executionContext domain.TaskExecutionContext
 	attempt          domain.TaskAttempt
 	coderThread      string
+	coderThreads     []string
 	reviewThreads    []string
 	completed        bool
 	failedStatus     domain.TaskAttemptStatus
+	failedStructured any
+	attempts         []domain.TaskAttempt
 }
 
 func newFakeExecutionRepository() *fakeExecutionRepository {
@@ -200,6 +363,10 @@ func newFakeExecutionRepository() *fakeExecutionRepository {
 			Project: domain.Project{ID: "project-1", Name: "fixture", HeadCommit: "base"},
 			Plan:    domain.Plan{ID: "plan-1", Summary: "fixture plan"},
 			Command: domain.Command{ID: "command-1", Text: "change fixture"},
+			PlanTasks: []domain.Task{
+				{ID: "task-1", Title: "fixture task"},
+				{ID: "task-2", Title: "downstream task"},
+			},
 			Topology: domain.TopologyCatalog{
 				Revision: domain.TopologyRevision{ID: "topology-1"},
 				Services: []domain.TopologyService{{ProjectID: "project-2", Name: "orders-service"}},
@@ -225,6 +392,16 @@ func (r *fakeExecutionRepository) BeginAttempt(context.Context, string, string, 
 }
 func (r *fakeExecutionRepository) AttachAgentThread(_ context.Context, _, threadID string) (domain.TaskAttempt, error) {
 	r.coderThread = threadID
+	r.coderThreads = append(r.coderThreads, threadID)
+	r.attempt.AgentThreadID = &r.coderThread
+	return r.attempt, nil
+}
+func (r *fakeExecutionRepository) ReplaceAgentThread(_ context.Context, _, previousThreadID, threadID string) (domain.TaskAttempt, error) {
+	if previousThreadID != r.coderThread || threadID == previousThreadID {
+		return domain.TaskAttempt{}, fmt.Errorf("invalid coder thread replacement")
+	}
+	r.coderThread = threadID
+	r.coderThreads = append(r.coderThreads, threadID)
 	r.attempt.AgentThreadID = &r.coderThread
 	return r.attempt, nil
 }
@@ -238,8 +415,9 @@ func (r *fakeExecutionRepository) CompleteAttempt(context.Context, string, domai
 	r.attempt.Status = domain.TaskAttemptStatusCompleted
 	return r.attempt, nil
 }
-func (r *fakeExecutionRepository) FailAttempt(_ context.Context, _ string, status domain.TaskAttemptStatus, _ string, _ any) error {
+func (r *fakeExecutionRepository) FailAttempt(_ context.Context, _ string, status domain.TaskAttemptStatus, _ string, structured any) error {
 	r.failedStatus = status
+	r.failedStructured = structured
 	r.attempt.Status = status
 	return nil
 }
@@ -257,7 +435,7 @@ func (r *fakeExecutionRepository) StoreArtifact(context.Context, domain.Artifact
 	return domain.Artifact{}, nil
 }
 func (r *fakeExecutionRepository) ListAttempts(context.Context, string) ([]domain.TaskAttempt, error) {
-	return nil, nil
+	return r.attempts, nil
 }
 func (r *fakeExecutionRepository) ListArtifacts(context.Context, string) ([]domain.Artifact, error) {
 	return nil, nil

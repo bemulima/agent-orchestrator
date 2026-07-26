@@ -132,6 +132,7 @@ type TaskDependency struct {
 type PlanRequest struct {
 	RequestedProjectIDs []string         `json:"project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 	AvailableProjects   []Project        `json:"-"`
 }
 
@@ -141,6 +142,7 @@ type PlannerInput struct {
 	TopologyRevisionID  string           `json:"topology_revision_id"`
 	RequestedProjectIDs []string         `json:"requested_project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 }
 
 type PlannedTask struct {
@@ -212,14 +214,16 @@ type PlanRun struct {
 }
 
 type ScheduledTask struct {
-	TaskID       string   `json:"task_id"`
-	Priority     int      `json:"priority"`
-	Dependencies []string `json:"dependencies"`
+	TaskID        string     `json:"task_id"`
+	Priority      int        `json:"priority"`
+	Dependencies  []string   `json:"dependencies"`
+	InitialStatus TaskStatus `json:"initial_status,omitempty"`
 }
 
 type PlanSchedule struct {
 	RunID               string          `json:"run_id"`
 	PlanID              string          `json:"plan_id"`
+	WorkflowID          string          `json:"workflow_id,omitempty"`
 	MaxParallelTasks    int             `json:"max_parallel_tasks"`
 	MaxActivityAttempts int             `json:"max_activity_attempts"`
 	ExecuteTasks        bool            `json:"execute_tasks"`

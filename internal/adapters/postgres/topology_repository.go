@@ -31,39 +31,53 @@ func (r TopologyRepoPG) Replace(ctx context.Context, catalog domain.TopologyCata
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('course-dev-orchestrator:topology'))`); err != nil {
 		return domain.TopologyCatalog{}, fmt.Errorf("lock topology rebuild: %w", err)
 	}
-	var existingID string
+	var existing domain.TopologyRevision
+	repairExisting := false
 	err = tx.QueryRow(ctx, `
-SELECT id FROM topology_revision
+SELECT id, fingerprint, project_count, service_count, capability_count,
+       ownership_count, contract_count, relation_count, drift_count, built_at
+FROM topology_revision
 ORDER BY built_at DESC, id DESC
-LIMIT 1`).Scan(&existingID)
+	LIMIT 1`).Scan(
+		&existing.ID, &existing.Fingerprint, &existing.ProjectCount, &existing.ServiceCount,
+		&existing.CapabilityCount, &existing.OwnershipCount, &existing.ContractCount,
+		&existing.RelationCount, &existing.DriftCount, &existing.BuiltAt,
+	)
 	if err == nil {
-		var fingerprint string
-		if err := tx.QueryRow(ctx, `SELECT fingerprint FROM topology_revision WHERE id = $1`, existingID).Scan(&fingerprint); err != nil {
-			return domain.TopologyCatalog{}, fmt.Errorf("read current topology fingerprint: %w", err)
-		}
-		if fingerprint == catalog.Revision.Fingerprint {
-			if err := tx.Commit(ctx); err != nil {
-				return domain.TopologyCatalog{}, fmt.Errorf("commit reused topology transaction: %w", err)
+		if existing.Fingerprint == catalog.Revision.Fingerprint {
+			matches, countErr := topologyMaterializationMatchesTx(ctx, tx, existing)
+			if countErr != nil {
+				return domain.TopologyCatalog{}, countErr
 			}
-			return r.Get(ctx)
+			if matches {
+				if err := tx.Commit(ctx); err != nil {
+					return domain.TopologyCatalog{}, fmt.Errorf("commit reused topology transaction: %w", err)
+				}
+				return r.Get(ctx)
+			}
+			repairExisting = true
 		}
 	} else if err != pgx.ErrNoRows {
 		return domain.TopologyCatalog{}, fmt.Errorf("find current topology revision: %w", err)
 	}
 
 	revision := catalog.Revision
-	err = tx.QueryRow(ctx, `
+	if repairExisting {
+		revision = existing
+	} else {
+		err = tx.QueryRow(ctx, `
 INSERT INTO topology_revision (
     fingerprint, project_count, service_count, capability_count,
     ownership_count, contract_count, relation_count, drift_count
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id, built_at`,
-		revision.Fingerprint, revision.ProjectCount, revision.ServiceCount,
-		revision.CapabilityCount, revision.OwnershipCount, revision.ContractCount,
-		revision.RelationCount, revision.DriftCount,
-	).Scan(&revision.ID, &revision.BuiltAt)
-	if err != nil {
-		return domain.TopologyCatalog{}, fmt.Errorf("insert topology revision: %w", err)
+			revision.Fingerprint, revision.ProjectCount, revision.ServiceCount,
+			revision.CapabilityCount, revision.OwnershipCount, revision.ContractCount,
+			revision.RelationCount, revision.DriftCount,
+		).Scan(&revision.ID, &revision.BuiltAt)
+		if err != nil {
+			return domain.TopologyCatalog{}, fmt.Errorf("insert topology revision: %w", err)
+		}
 	}
 
 	for _, statement := range []string{
@@ -154,7 +168,11 @@ INSERT INTO contract_drift (
 			return domain.TopologyCatalog{}, fmt.Errorf("insert contract drift: %w", err)
 		}
 	}
-	if err := insertResourceAuditTx(ctx, tx, "topology_revision", "topology.rebuilt", revision.ID, map[string]any{
+	auditAction := "topology.rebuilt"
+	if repairExisting {
+		auditAction = "topology.repaired"
+	}
+	if err := insertResourceAuditTx(ctx, tx, "topology_revision", auditAction, revision.ID, map[string]any{
 		"fingerprint": revision.Fingerprint,
 		"projects":    revision.ProjectCount,
 		"services":    revision.ServiceCount,
@@ -204,7 +222,49 @@ LIMIT 1`).Scan(
 	if catalog.Drifts, err = r.readDrifts(ctx, revisionID); err != nil {
 		return domain.TopologyCatalog{}, err
 	}
+	if !topologyMaterializationMatchesCatalog(catalog) {
+		return domain.TopologyCatalog{}, fmt.Errorf(
+			"materialized topology does not match revision metadata: %w", domain.ErrConflict,
+		)
+	}
 	return catalog, nil
+}
+
+func topologyMaterializationMatchesTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	revision domain.TopologyRevision,
+) (bool, error) {
+	var services, capabilities, ownership, contracts, relations, drifts int
+	err := tx.QueryRow(ctx, `
+SELECT
+    (SELECT count(*) FROM topology_service WHERE revision_id = $1),
+    (SELECT count(*) FROM service_capability WHERE revision_id = $1),
+    (SELECT count(*) FROM service_ownership WHERE revision_id = $1),
+    (SELECT count(*) FROM contract WHERE revision_id = $1),
+    (SELECT count(*) FROM service_relation WHERE revision_id = $1),
+    (SELECT count(*) FROM contract_drift WHERE revision_id = $1)`, revision.ID).Scan(
+		&services, &capabilities, &ownership, &contracts, &relations, &drifts,
+	)
+	if err != nil {
+		return false, fmt.Errorf("count materialized topology: %w", err)
+	}
+	return services == revision.ServiceCount &&
+		capabilities == revision.CapabilityCount &&
+		ownership == revision.OwnershipCount &&
+		contracts == revision.ContractCount &&
+		relations == revision.RelationCount &&
+		drifts == revision.DriftCount, nil
+}
+
+func topologyMaterializationMatchesCatalog(catalog domain.TopologyCatalog) bool {
+	revision := catalog.Revision
+	return len(catalog.Services) == revision.ServiceCount &&
+		len(catalog.Capabilities) == revision.CapabilityCount &&
+		len(catalog.Ownership) == revision.OwnershipCount &&
+		len(catalog.Contracts) == revision.ContractCount &&
+		len(catalog.Relations) == revision.RelationCount &&
+		len(catalog.Drifts) == revision.DriftCount
 }
 
 func (r TopologyRepoPG) readServices(ctx context.Context, revisionID string) ([]domain.TopologyService, error) {

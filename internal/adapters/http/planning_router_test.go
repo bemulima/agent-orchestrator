@@ -21,7 +21,8 @@ func TestRouterPlanningAPI(t *testing.T) {
 	bundle := domain.PlanBundle{Plan: plan, Tasks: []domain.Task{task}, Run: &run}
 	handler := &handlers.PlanningHandler{
 		CreateCommand: planningCreateCommandFake{command: command}, GetCommand: planningGetCommandFake{command: command},
-		CreatePlan: planningCreatePlanFake{bundle: bundle}, GetPlan: planningGetPlanFake{bundle: bundle},
+		CreatePlan: planningCreatePlanFake{bundle: bundle}, RevisePlan: planningCreatePlanFake{bundle: bundle},
+		GetPlan:     planningGetPlanFake{bundle: bundle},
 		CommentPlan: planningDecidePlanFake{bundle: bundle}, SubmitPlan: planningDecidePlanFake{bundle: bundle},
 		ApprovePlan: planningDecidePlanFake{bundle: bundle}, RejectPlan: planningDecidePlanFake{bundle: bundle},
 		PrepareIssues: planningIssuesFake{}, PublishIssues: planningIssuesFake{},
@@ -45,6 +46,7 @@ func TestRouterPlanningAPI(t *testing.T) {
 		{http.MethodPost, "/api/v1/commands/command-id/plan", `{}`, http.StatusCreated},
 		{http.MethodGet, "/api/v1/plans/plan-id", "", http.StatusOK},
 		{http.MethodGet, "/api/v1/plans/plan-id/tasks", "", http.StatusOK},
+		{http.MethodPost, "/api/v1/plans/plan-id/revisions", `{"revision_instruction":"Уточнить критерии"}`, http.StatusCreated},
 		{http.MethodPost, "/api/v1/plans/plan-id/comments", `{"actor":"owner","comment":"Уточнение"}`, http.StatusOK},
 		{http.MethodPost, "/api/v1/plans/plan-id/issues/prepare", "", http.StatusCreated},
 		{http.MethodPost, "/api/v1/plans/plan-id/submit", `{"actor":"owner"}`, http.StatusOK},

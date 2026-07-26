@@ -2,6 +2,7 @@ package workitem
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,6 +11,48 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
+
+func TestManagerSchemasRequireEveryDeclaredObjectProperty(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"issue":        issueManagerSchemaJSON,
+		"pull_request": pullRequestManagerSchemaJSON,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var schema any
+			require.NoError(t, json.Unmarshal(raw, &schema))
+			assertStrictObjectRequirements(t, schema, "$")
+		})
+	}
+}
+
+func assertStrictObjectRequirements(t *testing.T, value any, path string) {
+	t.Helper()
+	switch typed := value.(type) {
+	case map[string]any:
+		if properties, ok := typed["properties"].(map[string]any); ok {
+			required := make(map[string]struct{})
+			if values, ok := typed["required"].([]any); ok {
+				for _, value := range values {
+					if name, ok := value.(string); ok {
+						required[name] = struct{}{}
+					}
+				}
+			}
+			for name := range properties {
+				if _, ok := required[name]; !ok {
+					t.Fatalf("%s property %q is not required", path, name)
+				}
+			}
+		}
+		for key, child := range typed {
+			assertStrictObjectRequirements(t, child, path+"."+key)
+		}
+	case []any:
+		for index, child := range typed {
+			assertStrictObjectRequirements(t, child, fmt.Sprintf("%s[%d]", path, index))
+		}
+	}
+}
 
 func TestIssueManagerResultRequiresOneCompleteRussianIssuePerTask(t *testing.T) {
 	task := domain.Task{

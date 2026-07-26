@@ -93,6 +93,47 @@ func (uc GetPlan) Handle(ctx context.Context, id string) (domain.PlanBundle, err
 	return uc.Plans.GetPlan(ctx, strings.TrimSpace(id))
 }
 
+type planRevisionSource interface {
+	GetPlan(context.Context, string) (domain.PlanBundle, error)
+}
+
+type planVersionCreator interface {
+	Handle(context.Context, string, domain.PlanRequest) (domain.PlanBundle, error)
+}
+
+// RevisePlan creates a new immutable version for the same command. Only the
+// latest discussion version is replaceable; approved or running plans must
+// remain stable for fingerprint and execution-history integrity.
+type RevisePlan struct {
+	Plans  planRevisionSource
+	Create planVersionCreator
+}
+
+func (uc RevisePlan) Handle(ctx context.Context, planID string, request domain.PlanRequest) (domain.PlanBundle, error) {
+	request.RevisionInstruction = strings.TrimSpace(request.RevisionInstruction)
+	if request.RevisionInstruction == "" || len(request.RevisionInstruction) > 10000 {
+		return domain.PlanBundle{}, fmt.Errorf("bounded revision instruction is required: %w", domain.ErrValidation)
+	}
+	bundle, err := uc.Plans.GetPlan(ctx, strings.TrimSpace(planID))
+	if err != nil {
+		return domain.PlanBundle{}, err
+	}
+	if bundle.Plan.Status != domain.PlanStatusDiscussion {
+		return domain.PlanBundle{}, fmt.Errorf("only a discussion plan can be revised: %w", domain.ErrInvalidStatus)
+	}
+	if len(request.RequestedProjectIDs) == 0 {
+		seen := make(map[string]struct{}, len(bundle.Tasks))
+		for _, task := range bundle.Tasks {
+			if _, exists := seen[task.ProjectID]; exists {
+				continue
+			}
+			seen[task.ProjectID] = struct{}{}
+			request.RequestedProjectIDs = append(request.RequestedProjectIDs, task.ProjectID)
+		}
+	}
+	return uc.Create.Handle(ctx, bundle.Plan.CommandID, request)
+}
+
 type DecidePlanInput struct {
 	PlanID      string `json:"-"`
 	Fingerprint string `json:"fingerprint,omitempty"`
@@ -138,6 +179,33 @@ type StartPlan struct {
 	Runner              repository.PlanRunner
 	MaxParallelTasks    int
 	MaxActivityAttempts int
+}
+
+type failedRunPreparer interface {
+	PrepareRunRetry(context.Context, string, int) (domain.PlanRun, domain.PlanBundle, error)
+	AttachTemporalRun(context.Context, string, string) (domain.PlanRun, error)
+}
+
+type RetryPlanRun struct {
+	Plans               failedRunPreparer
+	Runner              repository.PlanRunner
+	MaxParallelTasks    int
+	MaxActivityAttempts int
+}
+
+func (uc RetryPlanRun) Handle(ctx context.Context, planID string) (domain.PlanRun, error) {
+	run, bundle, err := uc.Plans.PrepareRunRetry(ctx, strings.TrimSpace(planID), uc.MaxParallelTasks)
+	if err != nil {
+		return domain.PlanRun{}, err
+	}
+	if run.TemporalRunID != nil {
+		return run, nil
+	}
+	temporalRunID, err := uc.Runner.Start(ctx, run, buildSchedule(run, bundle, uc.MaxActivityAttempts))
+	if err != nil {
+		return domain.PlanRun{}, err
+	}
+	return uc.Plans.AttachTemporalRun(ctx, run.ID, temporalRunID)
 }
 
 func (uc StartPlan) Handle(ctx context.Context, planID string) (domain.PlanRun, error) {
@@ -231,16 +299,21 @@ func buildSchedule(run domain.PlanRun, bundle domain.PlanBundle, maxAttempts int
 	}
 	tasks := make([]domain.ScheduledTask, 0, len(bundle.Tasks))
 	for _, task := range bundle.Tasks {
+		initialStatus := domain.TaskStatusPlanned
+		if task.Status == domain.TaskStatusCompleted {
+			initialStatus = domain.TaskStatusCompleted
+		}
 		tasks = append(tasks, domain.ScheduledTask{
 			TaskID: task.ID, Priority: task.Priority,
-			Dependencies: append([]string(nil), dependencies[task.ID]...),
+			Dependencies:  append([]string(nil), dependencies[task.ID]...),
+			InitialStatus: initialStatus,
 		})
 	}
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 	return domain.PlanSchedule{
-		RunID: run.ID, PlanID: run.PlanID, MaxParallelTasks: run.MaxParallelTasks,
+		RunID: run.ID, PlanID: run.PlanID, WorkflowID: run.WorkflowID, MaxParallelTasks: run.MaxParallelTasks,
 		MaxActivityAttempts: maxAttempts, ExecuteTasks: true, Tasks: tasks,
 	}
 }

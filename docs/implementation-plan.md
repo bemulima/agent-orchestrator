@@ -254,3 +254,85 @@ Acceptance:
   zero dry-run requests;
 - reversible migrations `010` and `011`, integration state-machine tests,
   runner protocol tests, and `make verify` pass.
+
+## Stage 10 — dedicated owner web interface
+
+Status: implemented and locally verified on 2026-07-26. The UI used only the
+existing local API and database state; no plan mutation, external publication,
+push, merge, or deployment was performed during verification.
+
+Scope:
+
+- separate Next.js/TypeScript owner UI with responsive navigation;
+- dashboard, projects, plans, runs, approvals, and task detail screens;
+- TanStack Query/Table, React Flow DAGs, Zod DTO validation, and Playwright;
+- bounded cursor-paginated read models for plans, runs, tasks, approvals, and
+  audit activity;
+- backend-derived allowed actions and confirmation-gated existing mutations;
+- audit-backed SSE with reconnect and ten-second polling fallback;
+- non-root, read-only UI container bound to loopback by default.
+
+Acceptance:
+
+- all read-model endpoints query the real PostgreSQL schema successfully;
+- the production UI renders the current 38-project catalog and persisted plans;
+- plan DAG, run tasks, task attempts/artifacts, and approvals are navigable;
+- initial SSE connection establishes a baseline without replaying the audit
+  history, and later events invalidate cached queries;
+- Go unit/HTTP/integration tests, frontend typecheck/unit/build, Playwright
+  desktop/mobile flows, dependency audit, and Compose validation pass.
+
+## Stage 11 — owner project and plan authoring
+
+Status: implemented and locally verified on 2026-07-26.
+
+Scope:
+
+- project connection wizard for allowlisted local paths and Git URLs;
+- immediate discovery result, stack summary, and warning presentation;
+- plan builder with bounded owner goal and explicit connected-project choice;
+- planner progress and navigation to the generated discussion draft;
+- immutable versioned plan revisions for bounded owner corrections;
+- backend enforcement that only discussion plans can create a replacement
+  version while approved, running, and historical fingerprints remain stable.
+
+Acceptance:
+
+- project connection invokes the existing atomic connect-and-scan use case;
+- plan creation persists a command and generates a validated plan for exactly
+  the selected project IDs;
+- revision reuses the original command and current project set, incorporates
+  the correction into planner input, increments the version, and changes the
+  fingerprint;
+- focused Go tests, frontend typecheck/unit/build, and eight Playwright flows
+  pass without mutating live resources.
+
+## Stage 12 — conversational control center
+
+Status: implemented and locally verified on 2026-07-26.
+
+Scope:
+
+- persistent workspace/project/plan-scoped owner conversations;
+- one resumable, read-only operator Codex thread per conversation;
+- bounded platform context assembled from projects and owner read models;
+- strict operator output with Russian answer, verified resource references,
+  and structured action proposals;
+- proposal validation against the current backend `allowed_actions` and exact
+  approval fingerprint binding;
+- explicit owner confirmation through existing plan/run/task mutation APIs;
+- responsive three-column UI with conversation history, chat timeline, context
+  links, and pending proposal queue.
+
+Acceptance:
+
+- conversation turns, agent thread IDs, references, proposals, decisions, and
+  audit events persist through reversible migration `012`;
+- only one assistant turn may be pending in a conversation;
+- the operator has read-only filesystem access, no network, no mutation API,
+  and no orchestrator secrets;
+- unknown resources and actions not currently permitted by Go are rejected;
+- a confirmed proposal still passes the existing resource state machine and
+  browser confirmation before it is marked confirmed;
+- Go unit/HTTP/integration tests, runner protocol tests, frontend build, and
+  nine Playwright flows pass.

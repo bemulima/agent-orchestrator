@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -481,6 +482,127 @@ RETURNING `+planRunColumns, plan.ID, workflowID, maxParallel))
 	}
 	bundle, err := r.GetPlan(ctx, planID)
 	return run, bundle, err
+}
+
+// PrepareRunRetry creates a new Temporal execution identity for an approved
+// plan whose previous workflow failed for an operational reason. The approved
+// DAG and published issue set remain immutable; completed tasks stay complete,
+// while every unfinished task is returned to planned state.
+func (r PlanningRepoPG) PrepareRunRetry(
+	ctx context.Context,
+	planID string,
+	maxParallel int,
+) (domain.PlanRun, domain.PlanBundle, error) {
+	if maxParallel < 1 || maxParallel > 3 {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("max parallel tasks must be between 1 and 3: %w", domain.ErrValidation)
+	}
+	tx, err := r.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("begin plan run retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var plan domain.Plan
+	if err := tx.QueryRow(ctx, `SELECT `+planColumns+` FROM plan WHERE id = $1 FOR UPDATE`, planID).Scan(planScanTargets(&plan)...); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, mapPlanningError(err)
+	}
+	run, err := scanPlanRun(tx.QueryRow(ctx, `SELECT `+planRunColumns+` FROM plan_run WHERE plan_id = $1 FOR UPDATE`, planID))
+	if err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, mapPlanningError(err)
+	}
+	if run.Status != domain.PlanRunStatusFailed {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("plan run cannot be retried from %s: %w", run.Status, domain.ErrInvalidStatus)
+	}
+	if plan.ApprovedFingerprint == nil || *plan.ApprovedFingerprint != plan.Fingerprint {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("plan content changed after approval: %w", domain.ErrApprovalNeeded)
+	}
+	var isLatest bool
+	if err := tx.QueryRow(ctx, `
+SELECT version = (SELECT max(version) FROM plan WHERE command_id = $1)
+FROM plan WHERE id = $2`, plan.CommandID, planID).Scan(&isLatest); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if !isLatest {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("only the latest plan version can retry: %w", domain.ErrConflict)
+	}
+	var taskCount, publishedIssueCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task WHERE plan_id = $1`, planID).Scan(&taskCount); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM work_item
+WHERE plan_id = $1 AND kind = 'issue' AND status IN ('published', 'closed')
+  AND plan_fingerprint = $2`, planID, plan.Fingerprint).Scan(&publishedIssueCount); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if taskCount == 0 || publishedIssueCount != taskCount {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("every task needs its approved published issue before retry: %w", domain.ErrApprovalNeeded)
+	}
+
+	previousWorkflowID := run.WorkflowID
+	previousTemporalRunID := run.TemporalRunID
+	previousError := run.Error
+	workflowID, err := nextPlanRetryWorkflowID(plan, previousWorkflowID)
+	if err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE task_attempt SET
+    status = 'failed', error = COALESCE(error, 'superseded by approved plan run retry'),
+    heartbeat_at = now(), finished_at = COALESCE(finished_at, now()), updated_at = now()
+WHERE task_id IN (SELECT id FROM task WHERE plan_id = $1)
+  AND status NOT IN ('completed', 'failed', 'cancelled')`, planID); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("close unfinished task attempts before retry: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE task SET status = 'planned', started_at = NULL, completed_at = NULL
+WHERE plan_id = $1 AND status <> 'completed'`, planID); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("reset unfinished plan tasks: %w", err)
+	}
+	run, err = scanPlanRun(tx.QueryRow(ctx, `
+UPDATE plan_run SET
+    status = 'pending', workflow_id = $2, temporal_run_id = NULL,
+    idempotency_key = $2, max_parallel_tasks = $3, error = NULL,
+    started_at = NULL, paused_at = NULL, completed_at = NULL, updated_at = now()
+WHERE id = $1
+RETURNING `+planRunColumns, run.ID, workflowID, maxParallel))
+	if err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, mapPlanningError(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE plan SET status = 'running', updated_at = now() WHERE id = $1`, planID); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("mark retried plan running: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE command SET status = 'running' WHERE id = $1`, plan.CommandID); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("mark retried command running: %w", err)
+	}
+	if err := insertResourceAuditTx(ctx, tx, "plan_run", "plan_run.retried", run.ID, map[string]any{
+		"plan_id": planID, "previous_workflow_id": previousWorkflowID,
+		"previous_temporal_run_id": previousTemporalRunID, "previous_error": previousError,
+		"workflow_id": workflowID,
+	}); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PlanRun{}, domain.PlanBundle{}, fmt.Errorf("commit plan run retry: %w", err)
+	}
+	bundle, err := r.GetPlan(ctx, planID)
+	return run, bundle, err
+}
+
+func nextPlanRetryWorkflowID(plan domain.Plan, current string) (string, error) {
+	base := fmt.Sprintf("plan-%s-v%d", plan.ID, plan.Version)
+	if current == base {
+		return base + "-retry-2", nil
+	}
+	prefix := base + "-retry-"
+	if !strings.HasPrefix(current, prefix) {
+		return "", fmt.Errorf("unexpected plan workflow ID %q: %w", current, domain.ErrConflict)
+	}
+	value, err := strconv.Atoi(strings.TrimPrefix(current, prefix))
+	if err != nil || value < 2 || value >= 100 {
+		return "", fmt.Errorf("invalid plan retry workflow ID %q: %w", current, domain.ErrConflict)
+	}
+	return prefix + strconv.Itoa(value+1), nil
 }
 
 func (r PlanningRepoPG) AttachTemporalRun(ctx context.Context, runID, temporalRunID string) (domain.PlanRun, error) {

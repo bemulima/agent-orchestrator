@@ -42,6 +42,7 @@ import (
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
+	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
 	healthuc "github.com/bemulima/agent-orchestrator/internal/usecase/health"
@@ -50,6 +51,7 @@ import (
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
 	telegramuc "github.com/bemulima/agent-orchestrator/internal/usecase/telegram"
 	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
+	uiuc "github.com/bemulima/agent-orchestrator/internal/usecase/ui"
 	orchestratorworkflow "github.com/bemulima/agent-orchestrator/internal/workflow"
 	workitemservice "github.com/bemulima/agent-orchestrator/internal/workitem"
 )
@@ -109,9 +111,9 @@ func run(args []string) error {
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
 	case "plan", "plan-show", "plan-comment", "plan-issues", "plan-submit", "plan-approve", "plan-reject",
-		"plan-publish-issues", "plan-run", "task-pr-prepare", "task-pr-publish",
+		"plan-publish-issues", "plan-run", "plan-retry-run", "task-pr-prepare", "task-pr-publish",
 		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-log", "task-retry", "task-cancel":
-		return runPlanningCommand(cfg, command, args[1:], os.Stdout)
+		return runPlanningCommand(cfg, command, args[1:], os.Stdin, os.Stdout)
 	case "gitlab-sync", "gitlab-links":
 		return runGitLabCommand(cfg, command, args[1:], os.Stdout)
 	default:
@@ -168,16 +170,20 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("connect temporal plan client: %w", err)
 	}
 	defer temporalClient.Close()
-	planningOperations := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
+	planningOperations, err := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
 		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
 	})
+	if err != nil {
+		return err
+	}
 	workItemOperations, err := newWorkItemOperations(cfg, pool)
 	if err != nil {
 		return err
 	}
 	planningHandler := handlers.PlanningHandler{
 		CreateCommand: planningOperations.CreateCommand, GetCommand: planningOperations.GetCommand,
-		CreatePlan: planningOperations.CreatePlan, GetPlan: planningOperations.GetPlan,
+		CreatePlan: planningOperations.CreatePlan, RevisePlan: planningOperations.RevisePlan,
+		GetPlan:     planningOperations.GetPlan,
 		CommentPlan: planningOperations.CommentPlan, SubmitPlan: planningOperations.SubmitPlan,
 		ApprovePlan: planningOperations.ApprovePlan, RejectPlan: planningOperations.RejectPlan,
 		PrepareIssues: workItemOperations.IssueManager, PublishIssues: workItemOperations.IssuePublisher,
@@ -187,6 +193,16 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
 		GetArtifacts: planningOperations.GetArtifacts, RetryTask: planningOperations.RetryTask,
 	}
+	ownerQueries := uiuc.QueryService{Reads: pgadapter.UIReadRepoPG{Pool: pool}}
+	uiHandler := handlers.UIHandler{Queries: ownerQueries}
+	operatorRunner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return err
+	}
+	conversationHandler := handlers.ConversationHandler{Service: conversationuc.Service{
+		Store: pgadapter.ConversationRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Queries: ownerQueries, Runner: operatorRunner, Model: cfg.CodexModelStandard, Reasoning: cfg.CodexReasoningStandard,
+	}}
 	gitLabOperations := newGitLabOperations(cfg, pool)
 	gitLabHandler := handlers.GitLabHandler{
 		Sync: gitLabOperations.Sync, Links: gitLabOperations.Links, Webhook: gitLabOperations.Webhook,
@@ -202,14 +218,16 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		telegramHandler = &handlers.TelegramHandler{Processor: telegramService, Secret: cfg.TelegramWebhookSecret}
 	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
-		HealthHandler:     healthHandler,
-		ProjectHandler:    &projectHandler,
-		OnboardingHandler: &onboardingHandler,
-		TopologyHandler:   &topologyHandler,
-		PlanningHandler:   &planningHandler,
-		GitLabHandler:     &gitLabHandler,
-		TelegramHandler:   telegramHandler,
-		Logger:            logger,
+		HealthHandler:       healthHandler,
+		ProjectHandler:      &projectHandler,
+		OnboardingHandler:   &onboardingHandler,
+		TopologyHandler:     &topologyHandler,
+		PlanningHandler:     &planningHandler,
+		UIHandler:           &uiHandler,
+		ConversationHandler: &conversationHandler,
+		GitLabHandler:       &gitLabHandler,
+		TelegramHandler:     telegramHandler,
+		Logger:              logger,
 	})
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
@@ -315,9 +333,12 @@ func runTelegram(cfg config.Config, logger *zap.Logger) error {
 		return err
 	}
 	topology := newTopologyOperations(pool)
-	planning := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
+	planning, err := newPlanningOperations(cfg, pool, temporaladapter.PlanRunner{
 		Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue,
 	})
+	if err != nil {
+		return err
+	}
 	gitLab := newGitLabOperations(cfg, pool)
 	service := newTelegramService(cfg, pool, client, projects, onboarding, topology, planning, gitLab)
 	logger.Info("starting Telegram long polling")
@@ -358,12 +379,14 @@ type planningOperations struct {
 	CreateCommand planninguc.CreateCommand
 	GetCommand    planninguc.GetCommand
 	CreatePlan    planninguc.CreatePlan
+	RevisePlan    planninguc.RevisePlan
 	GetPlan       planninguc.GetPlan
 	CommentPlan   planninguc.CommentPlan
 	SubmitPlan    planninguc.SubmitPlan
 	ApprovePlan   planninguc.ApprovePlan
 	RejectPlan    planninguc.RejectPlan
 	StartPlan     planninguc.StartPlan
+	RetryPlanRun  planninguc.RetryPlanRun
 	GetRun        planninguc.GetRun
 	ControlRun    planninguc.ControlRun
 	GetTask       planninguc.GetTask
@@ -374,26 +397,39 @@ type planningOperations struct {
 	RetryTask     executionuc.RetryTask
 }
 
-func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner repository.PlanRunner) planningOperations {
+func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner repository.PlanRunner) (planningOperations, error) {
+	agentRunner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return planningOperations{}, err
+	}
 	plans := pgadapter.PlanningRepoPG{Pool: pool}
 	taskExecutions := pgadapter.TaskExecutionRepoPG{Pool: pool}
 	catalog := pgadapter.TopologyRepoPG{Pool: pool}
+	createPlan := planninguc.CreatePlan{
+		Plans: plans, Topology: catalog, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Planner: planningengine.AgentPlanner{
+			Base:   planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
+			Runner: agentRunner, Model: cfg.CodexModelDeep, Reasoning: cfg.CodexReasoningDeep,
+		},
+		Validator: planningengine.Validator{
+			MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+		},
+	}
 	return planningOperations{
 		CreateCommand: planninguc.CreateCommand{Plans: plans},
 		GetCommand:    planninguc.GetCommand{Plans: plans},
-		CreatePlan: planninguc.CreatePlan{
-			Plans: plans, Topology: catalog, Projects: pgadapter.ProjectRepoPG{Pool: pool},
-			Planner: planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
-			Validator: planningengine.Validator{
-				MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
-			},
-		},
-		GetPlan:     planninguc.GetPlan{Plans: plans},
-		CommentPlan: planninguc.CommentPlan{Plans: plans},
-		SubmitPlan:  planninguc.SubmitPlan{Plans: plans},
-		ApprovePlan: planninguc.ApprovePlan{Plans: plans},
-		RejectPlan:  planninguc.RejectPlan{Plans: plans},
+		CreatePlan:    createPlan,
+		RevisePlan:    planninguc.RevisePlan{Plans: plans, Create: createPlan},
+		GetPlan:       planninguc.GetPlan{Plans: plans},
+		CommentPlan:   planninguc.CommentPlan{Plans: plans},
+		SubmitPlan:    planninguc.SubmitPlan{Plans: plans},
+		ApprovePlan:   planninguc.ApprovePlan{Plans: plans},
+		RejectPlan:    planninguc.RejectPlan{Plans: plans},
 		StartPlan: planninguc.StartPlan{
+			Plans: plans, Runner: runner, MaxParallelTasks: cfg.MaxParallelTasks,
+			MaxActivityAttempts: cfg.MaxTaskAttempts,
+		},
+		RetryPlanRun: planninguc.RetryPlanRun{
 			Plans: plans, Runner: runner, MaxParallelTasks: cfg.MaxParallelTasks,
 			MaxActivityAttempts: cfg.MaxTaskAttempts,
 		},
@@ -407,7 +443,7 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 		RetryTask: executionuc.RetryTask{
 			Plans: plans, Tasks: taskExecutions, Runner: runner, MaxAttempts: cfg.MaxTaskAttempts,
 		},
-	}
+	}, nil
 }
 
 type workItemOperations struct {
@@ -730,7 +766,7 @@ func runTopologyCommand(cfg config.Config, command string, args []string, output
 	}
 }
 
-func runPlanningCommand(cfg config.Config, command string, args []string, output io.Writer) error {
+func runPlanningCommand(cfg config.Config, command string, args []string, input io.Reader, output io.Writer) error {
 	ctx := context.Background()
 	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -748,7 +784,10 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 		defer temporalClient.Close()
 		runner = temporaladapter.PlanRunner{Client: temporalClient, TaskQueue: cfg.TemporalTaskQueue}
 	}
-	operations := newPlanningOperations(cfg, pool, runner)
+	operations, err := newPlanningOperations(cfg, pool, runner)
+	if err != nil {
+		return err
+	}
 	var workItems workItemOperations
 	if planningCommandNeedsWorkItems(command) {
 		workItems, err = newWorkItemOperations(cfg, pool)
@@ -770,7 +809,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 		if strings.TrimSpace(*file) == "" || flags.NArg() != 0 {
 			return fmt.Errorf("--file is required: %w", domain.ErrValidation)
 		}
-		text, err := readCommandFile(*file)
+		text, err := readCommandFile(*file, input)
 		if err != nil {
 			return err
 		}
@@ -791,7 +830,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 			return err
 		}
 		return writeJSON(output, bundle)
-	case "plan-show", "plan-comment", "plan-submit", "plan-reject", "plan-run":
+	case "plan-show", "plan-comment", "plan-submit", "plan-reject", "plan-run", "plan-retry-run":
 		planID, actor, comment, err := planCommandFlags(command, args)
 		if err != nil {
 			return err
@@ -827,6 +866,12 @@ func runPlanningCommand(cfg config.Config, command string, args []string, output
 				return rejectErr
 			}
 			return writeJSON(output, bundle)
+		case "plan-retry-run":
+			run, retryErr := operations.RetryPlanRun.Handle(ctx, planID)
+			if retryErr != nil {
+				return retryErr
+			}
+			return writeJSON(output, run)
 		default:
 			run, runErr := operations.StartPlan.Handle(ctx, planID)
 			if runErr != nil {
@@ -977,7 +1022,7 @@ func runGitLabCommand(cfg config.Config, command string, args []string, output i
 
 func planningCommandNeedsTemporal(command string) bool {
 	switch command {
-	case "plan-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
+	case "plan-run", "plan-retry-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
 		return true
 	default:
 		return false
@@ -993,8 +1038,12 @@ func planningCommandNeedsWorkItems(command string) bool {
 	}
 }
 
-func readCommandFile(path string) (string, error) {
-	absolute, err := filepath.Abs(strings.TrimSpace(path))
+func readCommandFile(path string, input io.Reader) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "-" {
+		return readCommandText(input)
+	}
+	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve command file: %w", err)
 	}
@@ -1010,9 +1059,19 @@ func readCommandFile(path string) (string, error) {
 		return "", fmt.Errorf("open command file: %w", err)
 	}
 	defer file.Close()
-	content, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	return readCommandText(file)
+}
+
+func readCommandText(input io.Reader) (string, error) {
+	if input == nil {
+		return "", fmt.Errorf("command input is unavailable: %w", domain.ErrValidation)
+	}
+	content, err := io.ReadAll(io.LimitReader(input, (1<<20)+1))
 	if err != nil {
-		return "", fmt.Errorf("read command file: %w", err)
+		return "", fmt.Errorf("read command input: %w", err)
+	}
+	if len(content) > 1<<20 {
+		return "", fmt.Errorf("command input must be no larger than 1 MiB: %w", domain.ErrValidation)
 	}
 	text := strings.TrimSpace(string(content))
 	if text == "" {
@@ -1281,6 +1340,7 @@ Commands:
   plan-reject     Reject and cancel a plan
   plan-publish-issues Publish approved issues (or preview in GitHub dry-run mode)
   plan-run        Start or reuse the Temporal plan workflow
+  plan-retry-run  Retry a technically failed approved plan in a new Temporal run
   run-status      Show a plan run
   run-pause       Pause new task dispatch
   run-resume      Resume task dispatch

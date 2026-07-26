@@ -13,6 +13,7 @@ DB_USER ?= postgres
 POSTGRES_PORT ?= 5434
 HTTP_PORT ?= 8080
 TEMPORAL_UI_PORT ?= 8233
+UI_PORT ?= 3010
 DATABASE_URL ?= postgres://$(DB_USER):$(or $(POSTGRES_PASSWORD),postgres)@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable
 CODEX_HOST_AUTH_FILE ?= $(HOME)/.codex/auth.json
 GO_ENV := XDG_CACHE_HOME=$(CURDIR)/.cache GOCACHE=$(CURDIR)/.cache/go-build GOMODCACHE=$(CURDIR)/.cache/gomod GOBIN=$(CURDIR)/.cache/bin
@@ -24,7 +25,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -35,6 +36,7 @@ bootstrap: ## Prepare local configuration and download Go dependencies
 	@mkdir -p .cache/go-build .cache/gomod .cache/bin
 	$(GO_ENV) go mod download
 	cd runner && npm ci
+	cd web && npm ci
 
 up: ## Start PostgreSQL, Temporal, API, worker, and Temporal UI
 	$(COMPOSE) up -d --build
@@ -67,6 +69,18 @@ migrate-status: ## Show applied PostgreSQL migrations
 
 temporal-ui: ## Print the Temporal UI address
 	@echo "Temporal UI: http://localhost:$(TEMPORAL_UI_PORT)"
+
+ui: ## Run the owner UI locally against the API on localhost
+	cd web && ORCHESTRATOR_API_URL=http://localhost:$(HTTP_PORT) npm run dev
+
+ui-test: ## Type-check and test the owner UI
+	cd web && npm run typecheck && npm test
+
+ui-build: ## Build the production owner UI
+	cd web && ORCHESTRATOR_API_URL=http://localhost:$(HTTP_PORT) npm run build
+
+ui-e2e: ## Run Playwright owner UI scenarios against the local API
+	cd web && npm run test:e2e
 
 serve: ## Run the HTTP API locally
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator serve
@@ -152,81 +166,85 @@ consumers: ## Show direct and transitive consumers for SERVICE=id-or-name
 
 plan: ## Create discussion plan from FILE (optional PROJECT_IDS and SOURCE_ISSUES=github:id:number)
 	@test -n "$(FILE)" || (echo "Set FILE=path-to-command.md"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan --file "$(FILE)" $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",) $(if $(SOURCE_ISSUES),--source-issues "$(SOURCE_ISSUES)",)
+	$(ORCHESTRATOR_CLI) plan --file - $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",) $(if $(SOURCE_ISSUES),--source-issues "$(SOURCE_ISSUES)",) < "$(FILE)"
 
 plan-show: ## Show PLAN_ID=uuid with tasks and dependencies
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-show --plan-id "$(PLAN_ID)"
+	$(ORCHESTRATOR_CLI) plan-show --plan-id "$(PLAN_ID)"
 
 plan-comment: ## Add COMMENT to discussion of PLAN_ID=uuid
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	@test -n "$(COMMENT)" || (echo "Set COMMENT=text"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-comment --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" --comment "$(COMMENT)"
+	$(ORCHESTRATOR_CLI) plan-comment --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" --comment "$(COMMENT)"
 
 plan-issues: ## Ask issue-manage-agent to prepare Russian issue proposals for PLAN_ID=uuid
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-issues --plan-id "$(PLAN_ID)"
+	$(ORCHESTRATOR_CLI) plan-issues --plan-id "$(PLAN_ID)"
 
 plan-submit: ## Freeze PLAN_ID=uuid issue-backed version for approval
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-submit --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	$(ORCHESTRATOR_CLI) plan-submit --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 plan-approve: ## Approve exact PLAN_ID=uuid FINGERPRINT=sha256:... (optional ACTOR/COMMENT)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	@test -n "$(FINGERPRINT)" || (echo "Set FINGERPRINT=sha256:..."; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-approve --plan-id "$(PLAN_ID)" --fingerprint "$(FINGERPRINT)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	$(ORCHESTRATOR_CLI) plan-approve --plan-id "$(PLAN_ID)" --fingerprint "$(FINGERPRINT)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 plan-reject: ## Reject PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-reject --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+	$(ORCHESTRATOR_CLI) plan-reject --plan-id "$(PLAN_ID)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
 
 plan-publish-issues: ## Publish approved PLAN_ID issues (preview while GITHUB_DRY_RUN=true)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-publish-issues --plan-id "$(PLAN_ID)"
+	$(ORCHESTRATOR_CLI) plan-publish-issues --plan-id "$(PLAN_ID)"
 
 plan-run: ## Start or reuse the Temporal workflow for PLAN_ID=uuid
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator plan-run --plan-id "$(PLAN_ID)"
+	$(ORCHESTRATOR_CLI) plan-run --plan-id "$(PLAN_ID)"
+
+plan-retry-run: ## Retry a technically failed approved plan in a new Temporal run
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(ORCHESTRATOR_CLI) plan-retry-run --plan-id "$(PLAN_ID)"
 
 run-status: ## Show RUN_ID=uuid
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-status --run-id "$(RUN_ID)"
+	$(ORCHESTRATOR_CLI) run-status --run-id "$(RUN_ID)"
 
 run-pause: ## Pause new task dispatch for RUN_ID=uuid
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-pause --run-id "$(RUN_ID)"
+	$(ORCHESTRATOR_CLI) run-pause --run-id "$(RUN_ID)"
 
 run-resume: ## Resume task dispatch for RUN_ID=uuid
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-resume --run-id "$(RUN_ID)"
+	$(ORCHESTRATOR_CLI) run-resume --run-id "$(RUN_ID)"
 
 run-cancel: ## Cancel RUN_ID=uuid and unfinished tasks
 	@test -n "$(RUN_ID)" || (echo "Set RUN_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator run-cancel --run-id "$(RUN_ID)"
+	$(ORCHESTRATOR_CLI) run-cancel --run-id "$(RUN_ID)"
 
 task-show: ## Show TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-show --task-id "$(TASK_ID)"
+	$(ORCHESTRATOR_CLI) task-show --task-id "$(TASK_ID)"
 
 task-pr-prepare: ## Ask PR manager to prepare a Russian draft PR proposal for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-pr-prepare --task-id "$(TASK_ID)"
+	$(ORCHESTRATOR_CLI) task-pr-prepare --task-id "$(TASK_ID)"
 
 task-pr-publish: ## Publish WORK_ITEM_ID=uuid (preview while GITHUB_DRY_RUN=true)
 	@test -n "$(WORK_ITEM_ID)" || (echo "Set WORK_ITEM_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-pr-publish --work-item-id "$(WORK_ITEM_ID)"
+	$(ORCHESTRATOR_CLI) task-pr-publish --work-item-id "$(WORK_ITEM_ID)"
 
 task-log: ## Show attempts and artifacts for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-log --task-id "$(TASK_ID)"
+	$(ORCHESTRATOR_CLI) task-log --task-id "$(TASK_ID)"
 
 task-retry: ## Retry blocked or changes-requested TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-retry --task-id "$(TASK_ID)"
+	$(ORCHESTRATOR_CLI) task-retry --task-id "$(TASK_ID)"
 
 task-cancel: ## Signal cancellation for TASK_ID=uuid
 	@test -n "$(TASK_ID)" || (echo "Set TASK_ID=uuid"; exit 2)
-	$(GO_ENV) go run ./cmd/course-dev-orchestrator task-cancel --task-id "$(TASK_ID)"
+	$(ORCHESTRATOR_CLI) task-cancel --task-id "$(TASK_ID)"
 
 gitlab-sync: ## Preview legacy GitLab synchronization (real writes are disabled)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
@@ -250,8 +268,8 @@ test: test-unit ## Run the default test suite
 test-unit: ## Run unit and Temporal workflow tests
 	$(GO_ENV) go test ./...
 
-test-integration: ## Run PostgreSQL integration tests against the local stack
-	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" $(GO_ENV) go test -count=1 -tags=integration ./test/integration/...
+test-integration: ## Run PostgreSQL integration tests in a disposable _test database
+	COMPOSE_COMMAND="$(COMPOSE)" DB_CONTAINER=$(DB_CONTAINER) DB_USER=$(DB_USER) POSTGRES_PORT=$(POSTGRES_PORT) $(GO_ENV) ./scripts/test-integration.sh
 
 mvp-rehearsal: ## Run the disposable full-lifecycle MVP rehearsal (requires an empty project database)
 	DATABASE_URL="$${INTEGRATION_DATABASE_URL:-postgres://$(DB_USER):$${POSTGRES_PASSWORD:-postgres}@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable}" \
@@ -267,4 +285,4 @@ runner-test: ## Build and test the pinned Codex SDK runner
 compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet
 
-verify: fmt-check lint test-unit runner-test compose-check ## Run all non-destructive checks
+verify: fmt-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks

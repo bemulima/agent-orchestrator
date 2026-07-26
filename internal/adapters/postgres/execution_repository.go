@@ -40,6 +40,24 @@ func (r TaskExecutionRepoPG) GetExecutionContext(
 	if err != nil {
 		return domain.TaskExecutionContext{}, mapPlanningError(err)
 	}
+	rows, err := r.Pool.Query(ctx, `
+SELECT `+taskColumns+` FROM task WHERE plan_id = $1 ORDER BY priority DESC, id`, result.Plan.ID)
+	if err != nil {
+		return domain.TaskExecutionContext{}, fmt.Errorf("list approved plan tasks for execution: %w", err)
+	}
+	for rows.Next() {
+		planTask, scanErr := scanTask(rows)
+		if scanErr != nil {
+			rows.Close()
+			return domain.TaskExecutionContext{}, fmt.Errorf("scan approved plan task for execution: %w", scanErr)
+		}
+		result.PlanTasks = append(result.PlanTasks, planTask)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return domain.TaskExecutionContext{}, fmt.Errorf("iterate approved plan tasks for execution: %w", err)
+	}
+	rows.Close()
 	result.Topology, err = (TopologyRepoPG{Pool: r.Pool}).Get(ctx)
 	if err != nil {
 		return domain.TaskExecutionContext{}, fmt.Errorf("load task execution topology: %w", err)
@@ -48,7 +66,7 @@ func (r TaskExecutionRepoPG) GetExecutionContext(
 	if err != nil {
 		return domain.TaskExecutionContext{}, err
 	}
-	rows, err := r.Pool.Query(ctx, `
+	rows, err = r.Pool.Query(ctx, `
 SELECT `+prefixedTaskColumns("prerequisite")+`
 FROM task_dependency dependency
 JOIN task prerequisite ON prerequisite.id = dependency.depends_on_task_id
@@ -152,7 +170,7 @@ func (r TaskExecutionRepoPG) BeginAttempt(
 	maxAttempts int,
 ) (domain.TaskAttempt, error) {
 	if taskID == "" || strings.TrimSpace(workflowID) == "" || workspace.Path == "" || workspace.BranchName == "" ||
-		maxAttempts < 1 || maxAttempts > 3 {
+		maxAttempts < 1 || maxAttempts > 8 {
 		return domain.TaskAttempt{}, fmt.Errorf("invalid task attempt request: %w", domain.ErrValidation)
 	}
 	tx, err := r.Pool.Begin(ctx)
@@ -187,7 +205,9 @@ SELECT `+taskAttemptColumns+` FROM task_attempt WHERE workflow_id = $1`, workflo
 	var count int
 	var previousThreadID *string
 	if err := tx.QueryRow(ctx, `
-SELECT count(*), (array_agg(agent_thread_id ORDER BY attempt_number DESC) FILTER (WHERE agent_thread_id IS NOT NULL))[1]
+SELECT count(*), (array_agg(agent_thread_id ORDER BY attempt_number DESC) FILTER (
+    WHERE agent_thread_id IS NOT NULL AND status IN ('blocked', 'changes_requested')
+))[1]
 FROM task_attempt WHERE task_id = $1`, taskID).Scan(&count, &previousThreadID); err != nil {
 		return domain.TaskAttempt{}, fmt.Errorf("count task attempts: %w", err)
 	}
@@ -237,6 +257,41 @@ RETURNING `+taskAttemptColumns, attemptID, threadID))
 		return domain.TaskAttempt{}, fmt.Errorf("attempt thread cannot be replaced: %w", domain.ErrConflict)
 	}
 	return attempt, mapPlanningError(err)
+}
+
+func (r TaskExecutionRepoPG) ReplaceAgentThread(
+	ctx context.Context,
+	attemptID, previousThreadID, threadID string,
+) (domain.TaskAttempt, error) {
+	previousThreadID = strings.TrimSpace(previousThreadID)
+	threadID = strings.TrimSpace(threadID)
+	if previousThreadID == "" || threadID == "" || previousThreadID == threadID {
+		return domain.TaskAttempt{}, fmt.Errorf("distinct previous and replacement agent thread IDs are required: %w", domain.ErrValidation)
+	}
+	tx, err := r.Pool.Begin(ctx)
+	if err != nil {
+		return domain.TaskAttempt{}, fmt.Errorf("begin agent thread replacement: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	attempt, err := scanTaskAttempt(tx.QueryRow(ctx, `
+UPDATE task_attempt SET agent_thread_id = $3, heartbeat_at = now(), updated_at = now()
+WHERE id = $1 AND agent_thread_id = $2 AND status = 'changes_requested'
+RETURNING `+taskAttemptColumns, attemptID, previousThreadID, threadID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TaskAttempt{}, fmt.Errorf("attempt thread cannot be replaced from its current state: %w", domain.ErrConflict)
+	}
+	if err != nil {
+		return domain.TaskAttempt{}, mapPlanningError(err)
+	}
+	if err := insertResourceAuditTx(ctx, tx, "task_attempt", "task_attempt.agent_thread_replaced", attempt.ID, map[string]any{
+		"previous_thread_id": previousThreadID, "thread_id": threadID,
+	}); err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TaskAttempt{}, fmt.Errorf("commit agent thread replacement: %w", err)
+	}
+	return attempt, nil
 }
 
 func (r TaskExecutionRepoPG) HeartbeatAttempt(ctx context.Context, attemptID string) error {
@@ -350,15 +405,15 @@ func (r TaskExecutionRepoPG) FailAttempt(
 	defer func() { _ = tx.Rollback(ctx) }()
 	var taskID string
 	if err := tx.QueryRow(ctx, `
-UPDATE task_attempt SET status = $2, structured_result = $3, error = NULLIF($4, ''),
-    heartbeat_at = now(), finished_at = CASE WHEN $2 IN ('failed', 'blocked', 'cancelled') THEN now() ELSE finished_at END,
+UPDATE task_attempt SET status = $2::varchar, structured_result = $3, error = NULLIF($4, ''),
+    heartbeat_at = now(), finished_at = CASE WHEN $2::varchar IN ('failed', 'blocked', 'cancelled') THEN now() ELSE finished_at END,
     updated_at = now()
 WHERE id = $1 RETURNING task_id`, attemptID, status, raw, strings.TrimSpace(errorMessage)).Scan(&taskID); err != nil {
 		return mapPlanningError(err)
 	}
 	if _, err := tx.Exec(ctx, `
-UPDATE task SET status = $2,
-    completed_at = CASE WHEN $2 IN ('failed', 'cancelled') THEN now() ELSE NULL END
+UPDATE task SET status = $2::varchar,
+    completed_at = CASE WHEN $2::varchar IN ('failed', 'cancelled') THEN now() ELSE NULL END
 WHERE id = $1`, taskID, taskStatus); err != nil {
 		return fmt.Errorf("update failed task: %w", err)
 	}
@@ -517,7 +572,7 @@ func (r TaskExecutionRepoPG) ResetTaskForRetry(
 	taskID string,
 	maxAttempts int,
 ) (domain.Task, error) {
-	if maxAttempts < 1 || maxAttempts > 3 {
+	if maxAttempts < 1 || maxAttempts > 8 {
 		return domain.Task{}, fmt.Errorf("invalid maximum attempts: %w", domain.ErrValidation)
 	}
 	tx, err := r.Pool.Begin(ctx)

@@ -120,6 +120,7 @@ type TaskExecutionContext struct {
 	Project           Project                     `json:"project"`
 	Plan              Plan                        `json:"plan"`
 	Command           Command                     `json:"command"`
+	PlanTasks         []Task                      `json:"plan_tasks"`
 	Topology          TopologyCatalog             `json:"topology"`
 	ConnectedProjects []ConnectedProjectKnowledge `json:"connected_projects"`
 	Dependencies      []TaskDependencyRef         `json:"dependencies"`
@@ -170,6 +171,7 @@ const (
 	AgentRunPlanner            AgentRunRole = "planner"
 	AgentRunIssueManager       AgentRunRole = "issue-manager"
 	AgentRunPullRequestManager AgentRunRole = "pull-request-manager"
+	AgentRunOperator           AgentRunRole = "operator"
 )
 
 type AgentRunRequest struct {

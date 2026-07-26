@@ -106,7 +106,7 @@ func supportedReasoningEffort(value string) bool {
 func supportedAgentRole(role domain.AgentRunRole) bool {
 	switch role {
 	case domain.AgentRunCoder, domain.AgentRunReviewer, domain.AgentRunAnalyst, domain.AgentRunPlanner,
-		domain.AgentRunIssueManager, domain.AgentRunPullRequestManager:
+		domain.AgentRunIssueManager, domain.AgentRunPullRequestManager, domain.AgentRunOperator:
 		return true
 	default:
 		return false

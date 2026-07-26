@@ -13,6 +13,12 @@ type responseRecorder struct {
 	status int
 }
 
+func (w *responseRecorder) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func (w *responseRecorder) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)

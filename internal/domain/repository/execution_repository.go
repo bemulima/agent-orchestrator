@@ -10,6 +10,7 @@ type TaskExecutionRepository interface {
 	GetExecutionContext(context.Context, string) (domain.TaskExecutionContext, error)
 	BeginAttempt(context.Context, string, string, domain.TaskWorkspace, int) (domain.TaskAttempt, error)
 	AttachAgentThread(context.Context, string, string) (domain.TaskAttempt, error)
+	ReplaceAgentThread(context.Context, string, string, string) (domain.TaskAttempt, error)
 	HeartbeatAttempt(context.Context, string) error
 	SetAttemptStatus(context.Context, string, domain.TaskAttemptStatus) error
 	CompleteAttempt(context.Context, string, domain.AgentResult, domain.VerificationReport, string) (domain.TaskAttempt, error)
