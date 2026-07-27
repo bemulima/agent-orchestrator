@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 ## Current status
 
@@ -901,6 +901,10 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Applied migration 013 to the local stack and rebuilt the API, worker, and UI.
   `make verify`, disposable PostgreSQL integration tests, health/readiness/API
   probes, and all ten non-mutating Playwright scenarios passed.
+- Fixed the empty-conversation API contract: PostgreSQL now returns
+  `messages: []` and `proposals: []` instead of JSON `null`, so a newly created
+  `/control` conversation passes the strict UI schema. Disposable PostgreSQL
+  integration coverage asserts both collections are non-nil and empty.
 - Prepared replacement discussion plan
   `0436da42-b1cf-45de-a538-95f546f4ba9a` from the persisted HTTP reviewer
   findings and topology revision `a16d1cd2-33fa-4027-90eb-945d1a62a895`.

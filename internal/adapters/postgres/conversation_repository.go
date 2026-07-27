@@ -59,7 +59,11 @@ FROM conversation c WHERE id = $1`, id))
 	if err != nil {
 		return domain.ConversationDetail{}, mapPlanningError(err)
 	}
-	result := domain.ConversationDetail{Conversation: conversation}
+	result := domain.ConversationDetail{
+		Conversation: conversation,
+		Messages:     []domain.ConversationMessage{},
+		Proposals:    []domain.ActionProposal{},
+	}
 	rows, err := r.Pool.Query(ctx, `
 SELECT `+conversationMessageColumns+` FROM conversation_message
 WHERE conversation_id = $1 ORDER BY created_at, id LIMIT 400`, id)
