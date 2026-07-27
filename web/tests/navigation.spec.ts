@@ -12,8 +12,14 @@ test("owner can inspect a plan DAG", async ({ page }) => {
   await page.goto("/plans");
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.locator("tbody tr").first().getByRole("link").click();
-  await expect(page.getByRole("heading", { name: "DAG задач" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Порядок выполнения" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "От цели до выполнения" })).toBeVisible();
+  await expect(page.getByText("Стрелка идёт от обязательной задачи", { exact: false })).toBeVisible();
   await expect(page.locator(".graph")).toBeVisible();
+  const graphTask = page.locator(".graph-task-card").first();
+  await expect(graphTask).toHaveAttribute("href", /\/tasks\//);
+  await graphTask.click();
+  await expect(page).toHaveURL(/\/tasks\//);
 });
 
 test("owner can inspect run tasks and task attempts", async ({ page }) => {
@@ -66,7 +72,8 @@ test("owner can generate a plan for selected projects", async ({ page }) => {
   await page.getByText("orders", { exact: true }).click();
   await page.getByRole("button", { name: "Сгенерировать черновик" }).click();
   await expect(page).toHaveURL(/\/plans\/plan-new$/);
-  await expect(page.getByRole("heading", { name: "Проверенный план" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "План изменений" })).toBeVisible();
+  await expect(page.getByText("Проверенный план", { exact: true })).toBeVisible();
 });
 
 test("owner can create an immutable plan revision", async ({ page }) => {

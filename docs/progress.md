@@ -931,6 +931,23 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `bde0a209-24fe-4d61-b3f7-eb1455bd90fd`; all four work items remain
   `proposed`, and no issue/PR publication, Temporal run, task execution, push,
   merge, or deployment occurred.
+- Redesigned the owner plan detail screen after a live readability review. A
+  bounded page title now separates the immutable plan summary from heading
+  typography; an explicit three-step guide explains task generation,
+  prerequisite direction, parallel waves, versioning, and the absence of
+  direct task editing.
+- Replaced the default React Flow nodes and raw `prerequisite` labels with
+  dark-mode-safe linked task cards, left-to-right arrow edges, centered wave
+  layout, localized visible controls, and a plain-language legend. The task
+  list now mirrors graph numbering and names each prerequisite by task number;
+  technical fingerprint and work-item fields include owner-facing context.
+- Verified the plan UI change with frontend typecheck, unit tests, production
+  build, all ten Playwright owner flows, a rebuilt healthy loopback UI
+  container, and live browser measurements at
+  `/plans/0436da42-b1cf-45de-a538-95f546f4ba9a`. All four graph titles render
+  without clipping, the three persisted edges are visible, and the page has no
+  horizontal overflow. No plan, approval, work item, run, or external resource
+  was mutated.
 
 ## Remaining work
 
