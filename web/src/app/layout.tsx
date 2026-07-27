@@ -15,6 +15,7 @@ const navigation = [
   ["/plans", "Планы"],
   ["/runs", "Выполнение"],
   ["/approvals", "Согласования"],
+  ["/usage", "Модели и лимиты"],
 ] as const;
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

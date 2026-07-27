@@ -64,7 +64,12 @@ test("collects thread and structured agent response", () => {
     type: "item.completed",
     item: { id: "message-1", type: "agent_message", text: '{"status":"completed"}' },
   });
+  consumeEvent(state, {
+    type: "turn.completed",
+    usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 30, reasoning_output_tokens: 10 },
+  });
   assert.equal(state.threadId, "thread-1");
+  assert.equal(state.usage?.reasoning_output_tokens, 10);
   assert.deepEqual(parseStructuredResult(state.finalResponse), { status: "completed" });
 });
 

@@ -21,6 +21,7 @@ type RouterDependencies struct {
 	PlanningHandler     *handlers.PlanningHandler
 	UIHandler           *handlers.UIHandler
 	ConversationHandler *handlers.ConversationHandler
+	AgentUsageHandler   *handlers.AgentUsageHandler
 	GitLabHandler       *handlers.GitLabHandler
 	TelegramHandler     *handlers.TelegramHandler
 	Logger              *zap.Logger
@@ -104,6 +105,9 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/conversations/{conversationId}", deps.ConversationHandler.Get)
 		root.Post("/api/v1/conversations/{conversationId}/messages", deps.ConversationHandler.Send)
 		root.Post("/api/v1/action-proposals/{proposalId}/decision", deps.ConversationHandler.DecideProposal)
+	}
+	if deps.AgentUsageHandler != nil {
+		root.Get("/api/v1/agent-usage", deps.AgentUsageHandler.Dashboard)
 	}
 	if deps.GitLabHandler != nil {
 		root.Post("/api/v1/plans/{planId}/gitlab/sync", deps.GitLabHandler.SyncPlan)

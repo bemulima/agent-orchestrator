@@ -1,4 +1,4 @@
-import type { AgentMessageItem, ThreadEvent } from "@openai/codex-sdk";
+import type { AgentMessageItem, ThreadEvent, Usage } from "@openai/codex-sdk";
 
 export const MAX_INPUT_BYTES = 1024 * 1024;
 export const MAX_RESULT_BYTES = 512 * 1024;
@@ -25,6 +25,7 @@ export interface RunRequest {
 export interface StreamState {
   threadId?: string;
   finalResponse?: string;
+  usage?: Usage;
 }
 
 export function parseRequest(value: unknown): RunRequest {
@@ -76,6 +77,10 @@ export function consumeEvent(state: StreamState, event: ThreadEvent): void {
   }
   if (event.type === "item.completed" && event.item.type === "agent_message") {
     state.finalResponse = (event.item as AgentMessageItem).text;
+    return;
+  }
+  if (event.type === "turn.completed") {
+    state.usage = event.usage;
     return;
   }
   if (event.type === "turn.failed") {

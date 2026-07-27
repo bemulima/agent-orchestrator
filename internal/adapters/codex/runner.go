@@ -159,9 +159,10 @@ func readProtocol(
 			return domain.AgentRunResponse{}, err
 		}
 		var event struct {
-			Type     string          `json:"type"`
-			ThreadID string          `json:"thread_id"`
-			Result   json.RawMessage `json:"result"`
+			Type     string                 `json:"type"`
+			ThreadID string                 `json:"thread_id"`
+			Result   json.RawMessage        `json:"result"`
+			Usage    domain.AgentTokenUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			return domain.AgentRunResponse{}, fmt.Errorf("invalid Codex runner protocol event: %w", domain.ErrValidation)
@@ -180,11 +181,12 @@ func readProtocol(
 			}
 		case "result":
 			if !threadSeen || resultSeen || event.ThreadID != response.ThreadID ||
-				len(event.Result) == 0 || len(event.Result) > maxRunnerResult || !json.Valid(event.Result) {
+				len(event.Result) == 0 || len(event.Result) > maxRunnerResult || !json.Valid(event.Result) || !validTokenUsage(event.Usage) {
 				return domain.AgentRunResponse{}, fmt.Errorf("invalid Codex result event: %w", domain.ErrValidation)
 			}
 			resultSeen = true
 			response.Result = append(json.RawMessage(nil), event.Result...)
+			response.Usage = event.Usage
 		default:
 			return domain.AgentRunResponse{}, fmt.Errorf("unknown Codex runner event %q: %w", event.Type, domain.ErrValidation)
 		}
@@ -196,6 +198,11 @@ func readProtocol(
 		return response, fmt.Errorf("incomplete Codex runner protocol: %w", domain.ErrValidation)
 	}
 	return response, nil
+}
+
+func validTokenUsage(value domain.AgentTokenUsage) bool {
+	return value.InputTokens >= 0 && value.CachedInputTokens >= 0 && value.OutputTokens >= 0 && value.ReasoningOutputTokens >= 0 &&
+		value.CachedInputTokens <= value.InputTokens
 }
 
 type boundedBuffer struct {

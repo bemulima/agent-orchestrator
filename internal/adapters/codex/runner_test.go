@@ -31,6 +31,10 @@ func TestProcessRunnerPersistsThreadBeforeReturningResult(t *testing.T) {
 	require.True(t, callbackCalled)
 	require.Equal(t, "thread-fixture", response.ThreadID)
 	require.JSONEq(t, `{"status":"completed"}`, string(response.Result))
+	require.EqualValues(t, 120, response.Usage.InputTokens)
+	require.EqualValues(t, 15, response.Usage.CachedInputTokens)
+	require.EqualValues(t, 30, response.Usage.OutputTokens)
+	require.EqualValues(t, 10, response.Usage.ReasoningOutputTokens)
 }
 
 func TestProcessRunnerRejectsUnsupportedProtocol(t *testing.T) {
@@ -121,6 +125,6 @@ func TestCodexRunnerHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, `{"type":"error","message":"stream disconnected before completion: unexpected-eof"}`)
 		os.Exit(1)
 	}
-	fmt.Println(`{"type":"result","thread_id":"thread-fixture","result":{"status":"completed"}}`)
+	fmt.Println(`{"type":"result","thread_id":"thread-fixture","result":{"status":"completed"},"usage":{"input_tokens":120,"cached_input_tokens":15,"output_tokens":30,"reasoning_output_tokens":10}}`)
 	os.Exit(0)
 }

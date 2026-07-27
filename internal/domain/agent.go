@@ -175,18 +175,20 @@ const (
 )
 
 type AgentRunRequest struct {
-	Role             AgentRunRole   `json:"role"`
-	ThreadID         string         `json:"thread_id,omitempty"`
-	WorkingDirectory string         `json:"working_directory"`
-	Model            string         `json:"model,omitempty"`
-	ReasoningEffort  string         `json:"reasoning_effort,omitempty"`
-	Prompt           string         `json:"prompt"`
-	OutputSchema     map[string]any `json:"output_schema"`
+	Role             AgentRunRole       `json:"role"`
+	ThreadID         string             `json:"thread_id,omitempty"`
+	WorkingDirectory string             `json:"working_directory"`
+	Model            string             `json:"model,omitempty"`
+	ReasoningEffort  string             `json:"reasoning_effort,omitempty"`
+	Prompt           string             `json:"prompt"`
+	OutputSchema     map[string]any     `json:"output_schema"`
+	UsageContext     *AgentUsageContext `json:"-"`
 }
 
 type AgentRunResponse struct {
 	ThreadID string          `json:"thread_id"`
 	Result   json.RawMessage `json:"result"`
+	Usage    AgentTokenUsage `json:"usage"`
 }
 
 type RequiredTaskSchedule struct {

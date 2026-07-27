@@ -12,12 +12,16 @@ on `127.0.0.1:3010` by default. Backend-derived allowed actions reuse the
 existing fingerprint and state-machine gates. Audit-backed SSE provides live
 cache invalidation, with polling fallback; the initial stream establishes a
 baseline instead of replaying historical events.
-Stages 11 and 12 are implemented locally. The UI now supports project
+Stages 11, 12, and 13 are implemented and locally verified. The UI now supports project
 connection, explicit-project plan authoring, immutable plan revisions, and a
 persistent conversational control center. Operator conversations resume one
 read-only Codex thread, cite only verified resources, and can propose only
 actions currently exposed by backend `allowed_actions`; existing confirmation,
 fingerprint, and state-machine gates still execute every mutation.
+Coder turns now stay on GPT-5.3-Codex-Spark, routine review uses Terra, status
+lookups and manager fallback use Luna, and Sol is reserved for critical review
+or explicitly difficult analysis. SDK token usage is persisted without prompts
+and visible in `/usage`; deterministic issue/PR templates spend no model quota.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, worker, and owner
 UI.
@@ -880,6 +884,49 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Verified focused Go tests, nine runner protocol tests, frontend
   typecheck/unit/build, nine non-mutating Playwright flows, and the disposable
   PostgreSQL integration suite including conversation lifecycle and migration.
+- Added reversible migration `013_agent_usage_and_routing`, SDK usage protocol
+  forwarding, PostgreSQL aggregation, and rolling 5-hour/7-day/30-day usage
+  read models.
+- Added deterministic role routing: Spark-only coder, risk-aware Terra/Sol
+  reviewer, Luna/Terra/Sol planner and operator selection, Terra onboarding,
+  and Luna manager fallback.
+- Added an enforced five-hour Sol run cap, disabled xhigh by default, and kept
+  Fast service tier disabled. A running reservation is persisted before each
+  Sol call so concurrent workers cannot overshoot the configured cap.
+- Replaced issue and PR agent calls with validated deterministic Russian
+  templates by default; `WORK_ITEM_DRAFT_MODE=agent` retains the bounded Luna
+  fallback.
+- Added `/api/v1/agent-usage` and the `/usage` owner screen with model/role
+  breakdowns, token counters, failures, and budget utilization.
+- Applied migration 013 to the local stack and rebuilt the API, worker, and UI.
+  `make verify`, disposable PostgreSQL integration tests, health/readiness/API
+  probes, and all ten non-mutating Playwright scenarios passed.
+- Prepared replacement discussion plan
+  `0436da42-b1cf-45de-a538-95f546f4ba9a` from the persisted HTTP reviewer
+  findings and topology revision `a16d1cd2-33fa-4027-90eb-945d1a62a895`.
+  Its development DAG has ms-go-sandbox at depth zero and exactly three
+  prerequisite edges to the HTTP, Node, and browser validators at depth one;
+  there are no reverse runtime-topology or artificial parallelism edges.
+- Fixed three planning defects exposed by the live discussion rehearsal:
+  explicit owner prerequisites now override reverse runtime relations without
+  creating a cycle, parallelism bounds operate on actually runnable waves, and
+  keyword detection no longer treats `immutable` as a database `table` signal.
+  Focused regression tests cover all three cases and preserve explicit database
+  migration detection.
+- Generated four complete Russian fake issue proposals through the deterministic
+  issue-manager role. Every proposal is `proposed`, has a label, milestone,
+  assignee, high complexity, and deep model profile; all external numbers and
+  URLs remain empty. The resulting exact plan fingerprint is
+  `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6`.
+- Confirmed the replacement plan remained in `discussion` with zero approvals
+  and zero runs before submission, and passed `make verify`.
+- After exact owner authorization, submitted plan
+  `0436da42-b1cf-45de-a538-95f546f4ba9a` with unchanged fingerprint
+  `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6`.
+  It is now `awaiting_approval` with pending approval
+  `bde0a209-24fe-4d61-b3f7-eb1455bd90fd`; all four work items remain
+  `proposed`, and no issue/PR publication, Temporal run, task execution, push,
+  merge, or deployment occurred.
 
 ## Remaining work
 
@@ -905,12 +952,16 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - The Node and sandbox tasks from the paused plan remain unexecuted. Preserve
   the reviewed browser commit and HTTP diagnostic worktree until the replacement
   plan decides whether to reuse, supersede, or discard them.
+- Decide pending approval `bde0a209-24fe-4d61-b3f7-eb1455bd90fd` for plan
+  `0436da42-b1cf-45de-a538-95f546f4ba9a`. Bind any approval to exact
+  fingerprint
+  `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6`;
+  approval alone must not publish work items or start a run.
 
 ## Exact next task
 
-Prepare a replacement discussion-only plan from the persisted HTTP reviewer
-findings, with sandbox isolation as an explicit prerequisite and the exact
-HTTP/Node/browser consumers derived from topology evidence. Produce Russian
-fake issue proposals and a new fingerprint, but do not submit, approve,
-execute, publish externally, push, merge, or deploy it without a new exact
-owner approval.
+Present pending approval `bde0a209-24fe-4d61-b3f7-eb1455bd90fd` and unchanged
+fingerprint `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6` to
+the owner. Run `plan-approve` only after a new exact authorization. Do not
+publish issues/PR, start the plan, push, merge, or deploy without their own
+subsequent explicit authorizations.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -22,6 +23,7 @@ type Service struct {
 	Reasoning         map[string]string
 	ReviewModel       string
 	ReviewReasoning   string
+	Router            agentpolicy.Router
 	MaxTaskAttempts   int
 	MaxReviewAttempts int
 }
@@ -66,10 +68,15 @@ func (s Service) Execute(
 		if err != nil {
 			return domain.TaskExecutionOutcome{}, err
 		}
+		coderRoute := s.Router.Coder(executionContext.Task)
+		if coderRoute.Model == "" {
+			coderRoute = agentpolicy.Decision{Model: s.Models[executionContext.Task.ModelProfile], Reasoning: s.Reasoning[executionContext.Task.ModelProfile], Reason: "legacy task profile"}
+		}
 		response, err := s.Runner.Run(ctx, domain.AgentRunRequest{
 			Role: domain.AgentRunCoder, ThreadID: threadID, WorkingDirectory: workspace.Path,
-			Model: s.Models[executionContext.Task.ModelProfile], ReasoningEffort: s.Reasoning[executionContext.Task.ModelProfile], Prompt: prompt,
+			Model: coderRoute.Model, ReasoningEffort: coderRoute.Reasoning, Prompt: prompt,
 			OutputSchema: s.Validator.AgentSchema(),
+			UsageContext: &domain.AgentUsageContext{ResourceType: "task", ResourceID: executionContext.Task.ID, RouteReason: coderRoute.Reason},
 		}, func(callbackContext context.Context, discoveredThreadID string) error {
 			var stored domain.TaskAttempt
 			var attachErr error
@@ -164,10 +171,15 @@ func (s Service) Execute(
 			return domain.TaskExecutionOutcome{}, err
 		}
 		reviewThreadID := ""
+		reviewRoute := s.Router.Reviewer(executionContext.Task)
+		if reviewRoute.Model == "" {
+			reviewRoute = agentpolicy.Decision{Model: s.ReviewModel, Reasoning: s.ReviewReasoning, Reason: "legacy review profile"}
+		}
 		reviewResponse, err := s.Runner.Run(ctx, domain.AgentRunRequest{
 			Role: domain.AgentRunReviewer, WorkingDirectory: workspace.Path,
-			Model: s.ReviewModel, ReasoningEffort: s.ReviewReasoning,
+			Model: reviewRoute.Model, ReasoningEffort: reviewRoute.Reasoning,
 			Prompt: reviewPrompt, OutputSchema: s.Validator.ReviewerSchema(),
+			UsageContext: &domain.AgentUsageContext{ResourceType: "task", ResourceID: executionContext.Task.ID, RouteReason: reviewRoute.Reason},
 		}, func(callbackContext context.Context, discoveredThreadID string) error {
 			reviewThreadID = discoveredThreadID
 			_, beginErr := s.Repository.BeginReview(callbackContext, attempt.ID, nextReview, discoveredThreadID)

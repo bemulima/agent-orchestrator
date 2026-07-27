@@ -98,6 +98,16 @@ and engineering conventions come from the reference service.
   models, never mutation tools, and may emit only resource references and
   proposals that match backend-derived `allowed_actions`. Existing use cases,
   fingerprints, explicit confirmation, and audit events remain authoritative.
+- Agent model selection is deterministic application policy. Spark owns all
+  code generation, Terra owns routine independent review, Luna handles bounded
+  high-volume work, and Sol is reserved for critical review or explicitly hard
+  analysis. The SDK token report is persisted without prompts or secrets.
+  Budget enforcement happens before a deep-model call so a denied call cannot
+  consume quota, and a metering failure never retries an already consumed turn.
+- Issue and pull-request prose is deterministic by default. Repository
+  metadata, approved tasks, verification evidence, and fixed Russian sections
+  produce complete drafts without an agent call; the bounded manager-agent
+  path remains an explicit configuration fallback.
 
 ## Deliberate extensions required by this service
 
@@ -106,9 +116,9 @@ and engineering conventions come from the reference service.
   the same executable.
 - The service exposes unauthenticated liveness/readiness endpoints at the root
   and reserves `/api/v1` for the internal API.
-- AI model and reasoning settings are configuration values grouped by `fast`,
-  `standard`, `deep`, and `review`. Defaults target the current ChatGPT-auth
-  Codex recommendations and remain overridable without an API key.
+- AI model and reasoning settings are explicit configuration values for
+  `fast`, `standard`, `deep`, `coder`, and `review`. Defaults target the
+  economic ChatGPT-auth policy and remain overridable without an API key.
 - PostgreSQL and Temporal are separate readiness dependencies. Long-running
   execution state will remain authoritative in Temporal and durable metadata
   will be stored in PostgreSQL.

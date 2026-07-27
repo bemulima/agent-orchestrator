@@ -299,17 +299,53 @@ func planDependencies(
 
 func boundParallelism(projectIDs []string, dependencies []domain.PlannedDependency, limit int) []domain.PlannedDependency {
 	result := append([]domain.PlannedDependency(nil), dependencies...)
-	for index := limit; index < len(projectIDs); index++ {
-		taskKey, dependsOn := projectIDs[index], projectIDs[index-limit]
-		if hasDependency(result, taskKey, dependsOn) || pathExists(result, dependsOn, taskKey) {
-			continue
+	for {
+		ready := firstParallelOverflow(projectIDs, result, limit)
+		if len(ready) <= limit {
+			break
 		}
-		result = append(result, domain.PlannedDependency{
-			TaskKey: taskKey, DependsOnTaskKey: dependsOn, DependencyType: "parallelism_limit",
-		})
+		for index := limit; index < len(ready); index++ {
+			taskKey, dependsOn := ready[index], ready[index-limit]
+			if hasDependency(result, taskKey, dependsOn) || pathExists(result, dependsOn, taskKey) {
+				continue
+			}
+			result = append(result, domain.PlannedDependency{
+				TaskKey: taskKey, DependsOnTaskKey: dependsOn, DependencyType: "parallelism_limit",
+			})
+		}
 	}
 	sort.Slice(result, func(i, j int) bool { return dependencyKey(result[i]) < dependencyKey(result[j]) })
 	return result
+}
+
+func firstParallelOverflow(projectIDs []string, dependencies []domain.PlannedDependency, limit int) []string {
+	indegree := make(map[string]int, len(projectIDs))
+	dependents := make(map[string][]string, len(projectIDs))
+	for _, projectID := range projectIDs {
+		indegree[projectID] = 0
+	}
+	for _, dependency := range dependencies {
+		indegree[dependency.TaskKey]++
+		dependents[dependency.DependsOnTaskKey] = append(dependents[dependency.DependsOnTaskKey], dependency.TaskKey)
+	}
+	processed := make(map[string]struct{}, len(projectIDs))
+	for {
+		ready := make([]string, 0, len(projectIDs))
+		for _, projectID := range projectIDs {
+			if _, done := processed[projectID]; !done && indegree[projectID] == 0 {
+				ready = append(ready, projectID)
+			}
+		}
+		if len(ready) == 0 || len(ready) > limit {
+			return ready
+		}
+		for _, projectID := range ready {
+			processed[projectID] = struct{}{}
+			for _, dependent := range dependents[projectID] {
+				indegree[dependent]--
+			}
+		}
+	}
 }
 
 func pathExists(dependencies []domain.PlannedDependency, from, to string) bool {
@@ -617,10 +653,14 @@ func commandTokens(value string) []string {
 }
 
 func containsAny(value string, signals ...string) bool {
-	value = strings.ToLower(value)
-	for _, signal := range signals {
-		if strings.Contains(value, signal) {
-			return true
+	words := strings.FieldsFunc(strings.ToLower(value), func(character rune) bool {
+		return !unicode.IsLetter(character) && !unicode.IsDigit(character)
+	})
+	for _, word := range words {
+		for _, signal := range signals {
+			if strings.HasPrefix(word, strings.ToLower(strings.TrimSpace(signal))) {
+				return true
+			}
 		}
 	}
 	return false

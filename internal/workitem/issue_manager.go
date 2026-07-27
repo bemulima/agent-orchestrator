@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -22,13 +23,15 @@ type planGetter interface {
 }
 
 type IssueManager struct {
-	Plans     planGetter
-	Projects  repository.ProjectRepository
-	Items     repository.WorkItemRepository
-	Gateway   repository.WorkItemGateway
-	Runner    repository.AgentRunner
-	Models    map[string]string
-	Reasoning map[string]string
+	Plans         planGetter
+	Projects      repository.ProjectRepository
+	Items         repository.WorkItemRepository
+	Gateway       repository.WorkItemGateway
+	Runner        repository.AgentRunner
+	Models        map[string]string
+	Reasoning     map[string]string
+	Router        agentpolicy.Router
+	Deterministic bool
 }
 
 type issueManagerContext struct {
@@ -45,7 +48,7 @@ type issueManagerProjectContext struct {
 }
 
 func (m IssueManager) Prepare(ctx context.Context, planID string) ([]domain.WorkItem, error) {
-	if m.Plans == nil || m.Projects == nil || m.Items == nil || m.Gateway == nil || m.Runner == nil {
+	if m.Plans == nil || m.Projects == nil || m.Items == nil || m.Gateway == nil || m.Runner == nil && !m.Deterministic {
 		return nil, fmt.Errorf("issue manager is incomplete: %w", domain.ErrInvalidStatus)
 	}
 	bundle, err := m.Plans.GetPlan(ctx, strings.TrimSpace(planID))
@@ -62,11 +65,33 @@ func (m IssueManager) Prepare(ctx context.Context, planID string) ([]domain.Work
 	if err != nil {
 		return nil, err
 	}
+	if m.Deterministic {
+		result, buildErr := deterministicIssues(bundle, contextValue)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		raw, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		validated, validateErr := validateIssueManagerResult(raw, bundle, contextValue)
+		if validateErr != nil {
+			return nil, validateErr
+		}
+		if resolveErr := m.resolveExistingIssues(ctx, contextValue, validated.Issues); resolveErr != nil {
+			return nil, resolveErr
+		}
+		return m.Items.SaveIssueProposals(ctx, bundle, "template-issue-"+bundle.Plan.Fingerprint, validated.Issues)
+	}
 	rawContext, err := json.Marshal(contextValue)
 	if err != nil {
 		return nil, fmt.Errorf("encode issue-manager context: %w", err)
 	}
 	profile := managerProfile(bundle.Tasks)
+	route := m.Router.Manager()
+	if route.Model == "" {
+		route = agentpolicy.Decision{Model: m.Models[profile], Reasoning: m.Reasoning[profile], Reason: "legacy manager profile"}
+	}
 	workingDirectory := ""
 	if len(contextValue.Projects) > 0 && contextValue.Projects[0].Project.LocalPath != nil {
 		workingDirectory = strings.TrimSpace(*contextValue.Projects[0].Project.LocalPath)
@@ -96,9 +121,10 @@ func (m IssueManager) Prepare(ctx context.Context, planID string) ([]domain.Work
 ` + string(rawContext)
 	threadID := ""
 	response, err := m.Runner.Run(ctx, domain.AgentRunRequest{
-		Role: domain.AgentRunIssueManager, WorkingDirectory: workingDirectory, Model: m.Models[profile],
-		ReasoningEffort: m.Reasoning[profile],
+		Role: domain.AgentRunIssueManager, WorkingDirectory: workingDirectory, Model: route.Model,
+		ReasoningEffort: route.Reasoning,
 		Prompt:          prompt, OutputSchema: schema,
+		UsageContext: &domain.AgentUsageContext{ResourceType: "plan", ResourceID: bundle.Plan.ID, RouteReason: route.Reason},
 	}, func(_ context.Context, value string) error {
 		threadID = value
 		return nil

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/google/uuid"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -32,6 +33,7 @@ type Service struct {
 	Runner    repository.AgentRunner
 	Model     string
 	Reasoning string
+	Router    agentpolicy.Router
 }
 
 type CreateInput struct {
@@ -106,9 +108,14 @@ func (s Service) Send(ctx context.Context, conversationID string, input SendInpu
 	if detail.Conversation.AgentThreadID != nil {
 		threadID = *detail.Conversation.AgentThreadID
 	}
+	route := s.Router.Operator(input.Content)
+	if route.Model == "" {
+		route = agentpolicy.Decision{Model: s.Model, Reasoning: s.Reasoning, Reason: "legacy operator profile"}
+	}
 	response, err := s.Runner.Run(ctx, domain.AgentRunRequest{
 		Role: domain.AgentRunOperator, ThreadID: threadID, WorkingDirectory: workingDirectory,
-		Model: s.Model, ReasoningEffort: s.Reasoning, Prompt: prompt, OutputSchema: schema,
+		Model: route.Model, ReasoningEffort: route.Reasoning, Prompt: prompt, OutputSchema: schema,
+		UsageContext: &domain.AgentUsageContext{ResourceType: "conversation", ResourceID: detail.Conversation.ID, RouteReason: route.Reason},
 	}, func(callbackCtx context.Context, value string) error {
 		_, callbackErr := s.Store.AttachConversationThread(callbackCtx, detail.Conversation.ID, value)
 		return callbackErr

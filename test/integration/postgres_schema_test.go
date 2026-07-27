@@ -56,6 +56,7 @@ ORDER BY tablename`)
 		"telegram_update", "telegram_callback", "telegram_poll_state",
 		"plan_comment", "work_item",
 		"conversation", "conversation_message", "action_proposal",
+		"agent_run_usage",
 	}
 	missing := make([]string, 0)
 	for _, table := range expected {

@@ -110,6 +110,19 @@ test("owner can discuss platform state and reject an action proposal", async ({ 
   await expect(page.getByText("rejected")).toBeVisible();
 });
 
+test("owner can inspect economic model routing and budget", async ({ page }) => {
+  const emptyWindow = { since: "2026-07-26T00:00:00Z", runs: 0, failed_runs: 0, by_model: [], by_role: [] };
+  await page.route("**/api/v1/agent-usage", route => route.fulfill({ json: {
+    generated_at: "2026-07-26T12:00:00Z", five_hours: emptyWindow, seven_days: emptyWindow, thirty_days: emptyWindow,
+    budget: { mode: "enforce", deep_model: "gpt-5.6-sol", deep_runs_five_hours: 2, deep_run_limit: 20, utilization_percent: 10, xhigh_allowed: false },
+    routing: { coder_model: "gpt-5.3-codex-spark", routine_review_model: "gpt-5.6-terra", fast_model: "gpt-5.6-luna", standard_model: "gpt-5.6-terra", deep_model: "gpt-5.6-sol", work_item_draft_mode: "template" },
+  } }));
+  await page.goto("/usage");
+  await expect(page.getByRole("heading", { name: "Модели и лимиты" })).toBeVisible();
+  await expect(page.getByText("gpt-5.3-codex-spark")).toBeVisible();
+  await expect(page.getByText("2/20")).toBeVisible();
+});
+
 const projectFixture = {
   id: "project-orders", name: "orders", status: "connected", repository_role: "service",
   default_branch: "main", current_branch: "main", head_commit: "0123456789abcdef", is_dirty: false,

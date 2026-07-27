@@ -59,6 +59,71 @@ func TestPlannerBuildsDeterministicMultiRepositoryDAG(t *testing.T) {
 	}
 }
 
+func TestBoundParallelismUsesRunnableWaves(t *testing.T) {
+	projectIDs := []string{"http", "browser", "sandbox", "node"}
+	dependencies := []domain.PlannedDependency{
+		{TaskKey: "http", DependsOnTaskKey: "sandbox", DependencyType: "prerequisite"},
+		{TaskKey: "browser", DependsOnTaskKey: "sandbox", DependencyType: "prerequisite"},
+		{TaskKey: "node", DependsOnTaskKey: "sandbox", DependencyType: "prerequisite"},
+	}
+
+	bounded := boundParallelism(projectIDs, dependencies, 3)
+	if len(bounded) != len(dependencies) {
+		t.Fatalf("dependencies = %#v, want only explicit prerequisite edges", bounded)
+	}
+	for _, dependency := range bounded {
+		if dependency.DependencyType == "parallelism_limit" {
+			t.Fatalf("unexpected parallelism edge = %#v", dependency)
+		}
+	}
+}
+
+func TestBoundParallelismLimitsActuallyConcurrentTasks(t *testing.T) {
+	bounded := boundParallelism([]string{"one", "two", "three", "four"}, nil, 3)
+	if len(bounded) != 1 || bounded[0].TaskKey != "four" || bounded[0].DependsOnTaskKey != "one" ||
+		bounded[0].DependencyType != "parallelism_limit" {
+		t.Fatalf("dependencies = %#v", bounded)
+	}
+}
+
+func TestPlannerDoesNotTreatImmutableAsDatabaseMigration(t *testing.T) {
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision-id"},
+		Services: []domain.TopologyService{{
+			ProjectID: "sandbox", Name: "sandbox", ServiceKind: domain.ServiceKindBackendService,
+		}},
+	}
+
+	_, output, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Создать immutable workspace snapshot с безопасным lifecycle",
+	}, catalog, domain.PlanRequest{RequestedProjectIDs: []string{"sandbox"}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(output.Tasks) != 1 || output.Tasks[0].RequiresMigration {
+		t.Fatalf("tasks = %#v, immutable must not imply a database migration", output.Tasks)
+	}
+}
+
+func TestPlannerRecognizesExplicitDatabaseMigration(t *testing.T) {
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision-id"},
+		Services: []domain.TopologyService{{
+			ProjectID: "service", Name: "service", ServiceKind: domain.ServiceKindBackendService,
+		}},
+	}
+
+	_, output, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Подготовить миграцию схемы базы данных",
+	}, catalog, domain.PlanRequest{RequestedProjectIDs: []string{"service"}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(output.Tasks) != 1 || !output.Tasks[0].RequiresMigration {
+		t.Fatalf("tasks = %#v, explicit migration must be preserved", output.Tasks)
+	}
+}
+
 func TestPlannerUsesOnlyApprovedManifestVerificationCommands(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".ai"), 0o755); err != nil {

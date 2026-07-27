@@ -20,11 +20,12 @@ const (
 	DefaultCodexModelFast         = "gpt-5.6-luna"
 	DefaultCodexModelStandard     = "gpt-5.6-terra"
 	DefaultCodexModelDeep         = "gpt-5.6-sol"
-	DefaultCodexModelReview       = "gpt-5.6-sol"
+	DefaultCodexModelCoder        = "gpt-5.3-codex-spark"
+	DefaultCodexModelReview       = "gpt-5.6-terra"
 	DefaultCodexReasoningFast     = "low"
 	DefaultCodexReasoningStandard = "medium"
 	DefaultCodexReasoningDeep     = "high"
-	DefaultCodexReasoningReview   = "high"
+	DefaultCodexReasoningReview   = "medium"
 )
 
 // Config holds environment configuration for the orchestrator.
@@ -78,11 +79,16 @@ type Config struct {
 	CodexModelFast         string `envconfig:"CODEX_MODEL_FAST" default:"gpt-5.6-luna" validate:"required"`
 	CodexModelStandard     string `envconfig:"CODEX_MODEL_STANDARD" default:"gpt-5.6-terra" validate:"required"`
 	CodexModelDeep         string `envconfig:"CODEX_MODEL_DEEP" default:"gpt-5.6-sol" validate:"required"`
-	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6-sol" validate:"required"`
+	CodexModelCoder        string `envconfig:"CODEX_MODEL_CODER" default:"gpt-5.3-codex-spark" validate:"required"`
+	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6-terra" validate:"required"`
 	CodexReasoningFast     string `envconfig:"CODEX_REASONING_FAST" default:"low" validate:"oneof=minimal low medium high xhigh"`
 	CodexReasoningStandard string `envconfig:"CODEX_REASONING_STANDARD" default:"medium" validate:"oneof=minimal low medium high xhigh"`
 	CodexReasoningDeep     string `envconfig:"CODEX_REASONING_DEEP" default:"high" validate:"oneof=minimal low medium high xhigh"`
-	CodexReasoningReview   string `envconfig:"CODEX_REASONING_REVIEW" default:"high" validate:"oneof=minimal low medium high xhigh"`
+	CodexReasoningReview   string `envconfig:"CODEX_REASONING_REVIEW" default:"medium" validate:"oneof=minimal low medium high xhigh"`
+	CodexBudgetMode        string `envconfig:"CODEX_BUDGET_MODE" default:"enforce" validate:"oneof=observe enforce"`
+	CodexSolMaxRuns5Hours  int    `envconfig:"CODEX_SOL_MAX_RUNS_5H" default:"20" validate:"min=1,max=1000"`
+	CodexAllowXHigh        bool   `envconfig:"CODEX_ALLOW_XHIGH" default:"false"`
+	WorkItemDraftMode      string `envconfig:"WORK_ITEM_DRAFT_MODE" default:"template" validate:"oneof=template agent"`
 }
 
 // Load reads, normalizes, and validates environment configuration.
@@ -179,6 +185,7 @@ func applyCodexDefaults(cfg *Config) {
 		{&cfg.CodexModelFast, DefaultCodexModelFast},
 		{&cfg.CodexModelStandard, DefaultCodexModelStandard},
 		{&cfg.CodexModelDeep, DefaultCodexModelDeep},
+		{&cfg.CodexModelCoder, DefaultCodexModelCoder},
 		{&cfg.CodexModelReview, DefaultCodexModelReview},
 		{&cfg.CodexReasoningFast, DefaultCodexReasoningFast},
 		{&cfg.CodexReasoningStandard, DefaultCodexReasoningStandard},
@@ -312,6 +319,11 @@ type Summary struct {
 	TelegramAllowedChatCount int      `json:"telegram_allowed_chat_count"`
 	TelegramMode             string   `json:"telegram_mode"`
 	ConfiguredModelProfiles  []string `json:"configured_model_profiles"`
+	CoderModelConfigured     bool     `json:"coder_model_configured"`
+	CodexBudgetMode          string   `json:"codex_budget_mode"`
+	CodexSolMaxRuns5Hours    int      `json:"codex_sol_max_runs_5h"`
+	CodexXHighAllowed        bool     `json:"codex_xhigh_allowed"`
+	WorkItemDraftMode        string   `json:"work_item_draft_mode"`
 }
 
 // SafeSummary omits all credentials and connection strings.
@@ -363,5 +375,10 @@ func (c Config) SafeSummary() Summary {
 		TelegramAllowedChatCount: len(c.TelegramAllowedChatIDs),
 		TelegramMode:             telegramMode,
 		ConfiguredModelProfiles:  profiles,
+		CoderModelConfigured:     strings.TrimSpace(c.CodexModelCoder) != "",
+		CodexBudgetMode:          c.CodexBudgetMode,
+		CodexSolMaxRuns5Hours:    c.CodexSolMaxRuns5Hours,
+		CodexXHighAllowed:        c.CodexAllowXHigh,
+		WorkItemDraftMode:        c.WorkItemDraftMode,
 	}
 }
