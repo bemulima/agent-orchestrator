@@ -60,6 +60,12 @@ async function main(): Promise<void> {
     type: "result",
     thread_id: state.threadId,
     result: parseStructuredResult(state.finalResponse),
+    usage: state.usage ?? {
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+    },
   });
 }
 

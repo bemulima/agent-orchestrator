@@ -67,6 +67,54 @@ func TestAgentPlannerBuildsRussianScopedDependencyDAG(t *testing.T) {
 	}
 }
 
+func TestAgentPlannerOwnerPrerequisiteOverridesReverseRuntimeTopology(t *testing.T) {
+	catalog, request := plannerAgentFixture(t)
+	catalog.Relations = []domain.ServiceRelation{
+		{SourceProjectID: "policy", TargetProjectID: "git", RelationType: domain.RelationConsumes},
+		{SourceProjectID: "policy", TargetProjectID: "http", RelationType: domain.RelationConsumes},
+		{SourceProjectID: "policy", TargetProjectID: "browser", RelationType: domain.RelationDependsOn},
+	}
+	result := plannerAgentResult{
+		Summary:   "Сначала реализовать безопасный handoff, затем параллельно изменить три валидатора.",
+		RiskLevel: domain.RiskLevelHigh,
+		Risks:     []string{"Runtime-связи направлены противоположно порядку разработки контракта."},
+		Tasks: []plannerAgentTask{
+			plannerAgentTaskFixture("policy", "Реализовать безопасный handoff рабочего пространства", domain.RiskLevelHigh),
+			plannerAgentTaskFixture("git", "Применить handoff в первом валидаторе", domain.RiskLevelHigh),
+			plannerAgentTaskFixture("http", "Применить handoff в HTTP-валидаторе", domain.RiskLevelHigh),
+			plannerAgentTaskFixture("browser", "Применить handoff в browser-валидаторе", domain.RiskLevelHigh),
+		},
+		Dependencies: []domain.PlannedDependency{
+			{TaskKey: "git", DependsOnTaskKey: "policy", DependencyType: "prerequisite"},
+			{TaskKey: "http", DependsOnTaskKey: "policy", DependencyType: "prerequisite"},
+			{TaskKey: "browser", DependsOnTaskKey: "policy", DependencyType: "prerequisite"},
+		},
+	}
+	planner := AgentPlanner{
+		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
+		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+	}
+
+	_, output, err := planner.Build(context.Background(), domain.Command{
+		ID: "command", Text: "Сначала создать handoff, затем изменить его runtime-потребителей.",
+	}, catalog, request)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(output.Dependencies) != 3 {
+		t.Fatalf("dependencies = %#v", output.Dependencies)
+	}
+	for _, dependency := range output.Dependencies {
+		if dependency.DependsOnTaskKey != "policy" || dependency.TaskKey == "policy" ||
+			dependency.DependencyType != "prerequisite" {
+			t.Fatalf("dependency = %#v", dependency)
+		}
+	}
+	if err := (Validator{MaxParallelTasks: 3, MaxRequiredTaskDepth: 3}).Validate(context.Background(), output); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
 func TestAgentPlannerRejectsMissingOrForeignTasks(t *testing.T) {
 	catalog, request := plannerAgentFixture(t)
 	result := plannerAgentResult{

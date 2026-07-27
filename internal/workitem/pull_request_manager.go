@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -24,24 +25,41 @@ type attemptLister interface {
 }
 
 type PullRequestManager struct {
-	Plans      planTaskGetter
-	Projects   repository.ProjectRepository
-	Items      repository.WorkItemRepository
-	Executions attemptLister
-	Gateway    repository.WorkItemGateway
-	Runner     repository.AgentRunner
-	Models     map[string]string
-	Reasoning  map[string]string
+	Plans         planTaskGetter
+	Projects      repository.ProjectRepository
+	Items         repository.WorkItemRepository
+	Executions    attemptLister
+	Gateway       repository.WorkItemGateway
+	Runner        repository.AgentRunner
+	Models        map[string]string
+	Reasoning     map[string]string
+	Router        agentpolicy.Router
+	Deterministic bool
 }
 
 func (m PullRequestManager) Prepare(ctx context.Context, taskID string) (domain.WorkItem, error) {
 	if m.Plans == nil || m.Projects == nil || m.Items == nil || m.Executions == nil ||
-		m.Gateway == nil || m.Runner == nil {
+		m.Gateway == nil || m.Runner == nil && !m.Deterministic {
 		return domain.WorkItem{}, fmt.Errorf("pull-request manager is incomplete: %w", domain.ErrInvalidStatus)
 	}
 	task, bundle, project, attempt, issue, metadata, err := m.context(ctx, taskID)
 	if err != nil {
 		return domain.WorkItem{}, err
+	}
+	if m.Deterministic {
+		result, buildErr := deterministicPullRequest(task, project, attempt, issue, metadata)
+		if buildErr != nil {
+			return domain.WorkItem{}, buildErr
+		}
+		raw, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			return domain.WorkItem{}, marshalErr
+		}
+		validated, validateErr := validatePullRequestManagerResult(raw, task, project, attempt, metadata)
+		if validateErr != nil {
+			return domain.WorkItem{}, validateErr
+		}
+		return m.Items.SavePullRequestProposal(ctx, bundle, task, "template-pr-"+attempt.ID, validated.PullRequest)
 	}
 	rawContext, err := json.Marshal(map[string]any{
 		"plan": bundle.Plan, "task": task, "project": project, "issue": issue,
@@ -55,6 +73,10 @@ func (m PullRequestManager) Prepare(ctx context.Context, taskID string) (domain.
 		return domain.WorkItem{}, err
 	}
 	profile := profileForTask(task)
+	route := m.Router.Manager()
+	if route.Model == "" {
+		route = agentpolicy.Decision{Model: m.Models[profile], Reasoning: m.Reasoning[profile], Reason: "legacy manager profile"}
+	}
 	prompt := `Ты pull-request-manage-agent. Подготовь полноценный draft PR на русском языке для уже реализованной и проверенной задачи.
 Ты не изменяешь код, не создаёшь issue и не выполняешь merge/deploy. Верни только JSON по схеме.
 
@@ -68,7 +90,8 @@ source_branch и target_branch должны точно совпадать с к�
 	threadID := ""
 	response, err := m.Runner.Run(ctx, domain.AgentRunRequest{
 		Role: domain.AgentRunPullRequestManager, WorkingDirectory: attempt.WorktreePath,
-		Model: m.Models[profile], ReasoningEffort: m.Reasoning[profile], Prompt: prompt, OutputSchema: schema,
+		Model: route.Model, ReasoningEffort: route.Reasoning, Prompt: prompt, OutputSchema: schema,
+		UsageContext: &domain.AgentUsageContext{ResourceType: "task", ResourceID: task.ID, RouteReason: route.Reason},
 	}, func(_ context.Context, value string) error {
 		threadID = value
 		return nil

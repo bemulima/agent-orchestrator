@@ -67,6 +67,20 @@ export const conversationDetailSchema = z.object({
   proposals: z.array(actionProposalSchema),
 });
 
+const usageBreakdownSchema = z.object({
+  key: z.string(), runs: z.number(), failed_runs: z.number(), input_tokens: z.number(),
+  cached_input_tokens: z.number(), output_tokens: z.number(), reasoning_output_tokens: z.number(),
+});
+const usageWindowSchema = z.object({
+  since: z.string(), runs: z.number(), failed_runs: z.number(),
+  by_model: z.array(usageBreakdownSchema), by_role: z.array(usageBreakdownSchema),
+});
+export const agentUsageDashboardSchema = z.object({
+  generated_at: z.string(), five_hours: usageWindowSchema, seven_days: usageWindowSchema, thirty_days: usageWindowSchema,
+  budget: z.object({ mode: z.string(), deep_model: z.string(), deep_runs_five_hours: z.number(), deep_run_limit: z.number(), utilization_percent: z.number(), xhigh_allowed: z.boolean() }),
+  routing: z.object({ coder_model: z.string(), routine_review_model: z.string(), fast_model: z.string(), standard_model: z.string(), deep_model: z.string(), work_item_draft_mode: z.string() }),
+});
+
 export const planSummarySchema = z.object({
   id: z.string(), command_id: z.string(), summary: z.string(), status: z.string(), version: z.number(),
   risk_level: z.string(), source_kind: z.string(), fingerprint: z.string(), task_count: z.number(),

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
@@ -20,6 +21,7 @@ type AgentPlanner struct {
 	Runner    repository.AgentRunner
 	Model     string
 	Reasoning string
+	Router    agentpolicy.Router
 }
 
 type plannerAgentResult struct {
@@ -101,8 +103,11 @@ func (p AgentPlanner) Build(
 - сохрани ровно по одной задаче на каждый baseline key; не добавляй и не удаляй проекты;
 - заголовок, описание, критерии приёмки, summary и риски пиши полностью на русском;
 - описание каждой задачи должно касаться только ответственности её репозитория;
-- явно отрази все prerequisite-зависимости из запроса владельца и topology;
+- явно отрази prerequisite-зависимости из запроса владельца; runtime topology
+  используй как evidence состава и интеграций, но не считай её автоматически порядком разработки;
 - task_key — зависимая задача, depends_on_task_key — задача, которая обязана завершиться первой;
+- явный prerequisite владельца имеет приоритет над направленной в обратную сторону runtime relation;
+- никогда не добавляй обе стороны одной зависимости и не создавай цикл;
 - независимые задачи не связывай искусственно;
 - security-sensitive реализацию оценивай как high, обычную реализацию как medium,
   документационную или исследовательскую задачу без изменения runtime — как low/medium;
@@ -112,10 +117,15 @@ func (p AgentPlanner) Build(
 Контекст:
 ` + string(rawContext)
 	threadID := ""
+	route := p.Router.Planner(baseline.Tasks)
+	if route.Model == "" {
+		route = agentpolicy.Decision{Model: p.Model, Reasoning: p.Reasoning, Reason: "legacy deep planner profile"}
+	}
 	response, err := p.Runner.Run(ctx, domain.AgentRunRequest{
 		Role: domain.AgentRunPlanner, WorkingDirectory: workingDirectory,
-		Model: p.Model, ReasoningEffort: p.Reasoning,
+		Model: route.Model, ReasoningEffort: route.Reasoning,
 		Prompt: prompt, OutputSchema: schema,
+		UsageContext: &domain.AgentUsageContext{ResourceType: "command", ResourceID: command.ID, RouteReason: route.Reason},
 	}, func(_ context.Context, value string) error {
 		threadID = value
 		return nil
@@ -269,11 +279,6 @@ func refinePlannerOutput(
 	}
 
 	dependencies := make([]domain.PlannedDependency, 0, len(baseline.Dependencies)+len(result.Dependencies))
-	for _, dependency := range baseline.Dependencies {
-		if dependency.DependencyType != "parallelism_limit" {
-			dependencies = append(dependencies, dependency)
-		}
-	}
 	for _, dependency := range result.Dependencies {
 		dependency.TaskKey = strings.TrimSpace(dependency.TaskKey)
 		dependency.DependsOnTaskKey = strings.TrimSpace(dependency.DependsOnTaskKey)
@@ -287,6 +292,14 @@ func refinePlannerOutput(
 		if !hasDependency(dependencies, dependency.TaskKey, dependency.DependsOnTaskKey) {
 			dependencies = append(dependencies, dependency)
 		}
+	}
+	for _, dependency := range baseline.Dependencies {
+		if dependency.DependencyType == "parallelism_limit" ||
+			hasDependency(dependencies, dependency.TaskKey, dependency.DependsOnTaskKey) ||
+			pathExists(dependencies, dependency.DependsOnTaskKey, dependency.TaskKey) {
+			continue
+		}
+		dependencies = append(dependencies, dependency)
 	}
 	projectIDs := make([]string, 0, len(baseline.Tasks))
 	for _, task := range baseline.Tasks {

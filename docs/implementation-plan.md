@@ -336,3 +336,30 @@ Acceptance:
   browser confirmation before it is marked confirmed;
 - Go unit/HTTP/integration tests, runner protocol tests, frontend build, and
   nine Playwright flows pass.
+
+## Stage 13 — economic model routing and usage control
+
+Status: implemented and locally verified on 2026-07-26. Migration 013 was
+applied to the local stack; `make verify`, disposable PostgreSQL integration
+tests, and all ten non-mutating Playwright owner flows passed.
+
+Scope:
+
+- persist per-turn model, role, reasoning, latency, status, and SDK token usage
+  without prompts or secrets;
+- deterministic routing with Spark-only coding, Terra routine review, Luna
+  high-volume work, and Sol limited to critical review or difficult analysis;
+- deterministic issue and pull-request templates with an explicit agent-mode
+  fallback;
+- rolling five-hour Sol guard and owner-only xhigh opt-in;
+- owner UI usage dashboard for five-hour, seven-day, and thirty-day windows.
+
+Acceptance:
+
+- coder routing never silently escalates from Spark;
+- routine reviewer, manager, onboarding, and operator flows do not use Sol;
+- migrations/contracts/high-risk review still receives Sol/high;
+- every completed SDK turn records all four token counters, while denied calls
+  record no false usage;
+- migration 013, unit/HTTP/integration tests, runner protocol, frontend build,
+  and Compose validation pass.

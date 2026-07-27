@@ -188,11 +188,16 @@ Copy `.env.dist` to `.env` (or run `make bootstrap`). Important groups:
 - Codex execution: the default is the existing ChatGPT login from local
   `codex-cli`. Run `codex login` once and `make codex-auth-sync`; `make up`
   synchronizes that login automatically when it exists. No API key is
-  required. Complexity profiles select both model and reasoning effort. The
-  defaults are `gpt-5.6-luna`/low for fast work, `gpt-5.6-terra`/medium for
-  standard work, and `gpt-5.6-sol`/high for deep and review work. Override them with
-  `CODEX_MODEL_*` and `CODEX_REASONING_*`; blank values are normalized back to
-  safe defaults.
+  required. The economic router uses `gpt-5.3-codex-spark` for every coder,
+  `gpt-5.6-terra` for routine review and normal discussion,
+  `gpt-5.6-luna` for lookups/high-volume drafting, and reserves
+  `gpt-5.6-sol`/high for critical review or difficult analysis. Issue and PR
+  drafts use deterministic templates by default and consume no model turn.
+  `CODEX_BUDGET_MODE=enforce` limits Sol to 20 runs per rolling five hours;
+  xhigh is disabled unless `CODEX_ALLOW_XHIGH=true`. Override model, reasoning,
+  budget, and `WORK_ITEM_DRAFT_MODE` values explicitly; blank model values are
+  normalized back to safe defaults. Fast service tier is never enabled by the
+  runner.
 - Work items: `WORK_ITEM_GATEWAY=fake` is the default and supports the complete
   local lifecycle with `github.example.test` identities but no network or Git
   push. Real publication requires the explicit `github` backend plus

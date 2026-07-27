@@ -34,6 +34,7 @@ import (
 	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
 	workitemadapter "github.com/bemulima/agent-orchestrator/internal/adapters/workitem"
 	"github.com/bemulima/agent-orchestrator/internal/agent"
+	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -42,6 +43,7 @@ import (
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
+	agentusageuc "github.com/bemulima/agent-orchestrator/internal/usecase/agentusage"
 	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
@@ -60,6 +62,17 @@ var (
 	version = "dev"
 	commit  = "none"
 )
+
+func newAgentRunner(cfg config.Config, pool *pgxpool.Pool) (repository.AgentRunner, error) {
+	base, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	if err != nil {
+		return nil, err
+	}
+	return agentusageuc.TrackedRunner{
+		Base: base, Usage: pgadapter.AgentUsageRepoPG{Pool: pool}, BudgetMode: cfg.CodexBudgetMode,
+		DeepModel: cfg.CodexModelDeep, DeepRunLimit: int64(cfg.CodexSolMaxRuns5Hours), XHighAllowed: cfg.CodexAllowXHigh,
+	}, nil
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -195,13 +208,21 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	}
 	ownerQueries := uiuc.QueryService{Reads: pgadapter.UIReadRepoPG{Pool: pool}}
 	uiHandler := handlers.UIHandler{Queries: ownerQueries}
-	operatorRunner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	operatorRunner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return err
 	}
 	conversationHandler := handlers.ConversationHandler{Service: conversationuc.Service{
 		Store: pgadapter.ConversationRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
 		Queries: ownerQueries, Runner: operatorRunner, Model: cfg.CodexModelStandard, Reasoning: cfg.CodexReasoningStandard,
+		Router: agentpolicy.FromConfig(cfg),
+	}}
+	agentUsageHandler := handlers.AgentUsageHandler{Service: agentusageuc.Service{
+		Usage: pgadapter.AgentUsageRepoPG{Pool: pool}, BudgetMode: cfg.CodexBudgetMode, DeepModel: cfg.CodexModelDeep,
+		DeepRunLimit: int64(cfg.CodexSolMaxRuns5Hours), XHighAllowed: cfg.CodexAllowXHigh,
+		Routing: domain.AgentRoutingPolicy{CoderModel: cfg.CodexModelCoder, RoutineReviewModel: cfg.CodexModelReview,
+			FastModel: cfg.CodexModelFast, StandardModel: cfg.CodexModelStandard, DeepModel: cfg.CodexModelDeep,
+			WorkItemDraftMode: cfg.WorkItemDraftMode},
 	}}
 	gitLabOperations := newGitLabOperations(cfg, pool)
 	gitLabHandler := handlers.GitLabHandler{
@@ -224,6 +245,7 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		TopologyHandler:     &topologyHandler,
 		PlanningHandler:     &planningHandler,
 		UIHandler:           &uiHandler,
+		AgentUsageHandler:   &agentUsageHandler,
 		ConversationHandler: &conversationHandler,
 		GitLabHandler:       &gitLabHandler,
 		TelegramHandler:     telegramHandler,
@@ -398,7 +420,7 @@ type planningOperations struct {
 }
 
 func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner repository.PlanRunner) (planningOperations, error) {
-	agentRunner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	agentRunner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return planningOperations{}, err
 	}
@@ -410,6 +432,7 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 		Planner: planningengine.AgentPlanner{
 			Base:   planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
 			Runner: agentRunner, Model: cfg.CodexModelDeep, Reasoning: cfg.CodexReasoningDeep,
+			Router: agentpolicy.FromConfig(cfg),
 		},
 		Validator: planningengine.Validator{
 			MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
@@ -454,7 +477,7 @@ type workItemOperations struct {
 }
 
 func newWorkItemOperations(cfg config.Config, pool *pgxpool.Pool) (workItemOperations, error) {
-	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	runner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return workItemOperations{}, err
 	}
@@ -479,10 +502,14 @@ func newWorkItemOperations(cfg config.Config, pool *pgxpool.Pool) (workItemOpera
 	}
 	issueManager := workitemservice.IssueManager{
 		Plans: plans, Projects: projects, Items: items, Gateway: gateway, Runner: runner, Models: models, Reasoning: reasoning,
+		Router:        agentpolicy.FromConfig(cfg),
+		Deterministic: cfg.WorkItemDraftMode == "template",
 	}
 	pullRequestManager := workitemservice.PullRequestManager{
 		Plans: plans, Projects: projects, Items: items, Executions: pgadapter.TaskExecutionRepoPG{Pool: pool},
 		Gateway: gateway, Runner: runner, Models: models, Reasoning: reasoning,
+		Router:        agentpolicy.FromConfig(cfg),
+		Deterministic: cfg.WorkItemDraftMode == "template",
 	}
 	return workItemOperations{
 		IssueManager: issueManager,
@@ -534,13 +561,13 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) (onboardingO
 	generator := onboardinggenerator.NewGenerator(onboardinggenerator.GeneratorConfig{
 		MaxFileBytes: cfg.OnboardingMaxFileBytes, MaxTotalBytes: cfg.OnboardingMaxTotalBytes,
 	})
-	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	runner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return onboardingOperations{}, err
 	}
 	semanticGenerator := onboardinggenerator.SemanticGenerator{
-		Base: generator, Runner: runner, Projects: projects, Model: cfg.CodexModelDeep,
-		ReasoningEffort: cfg.CodexReasoningDeep,
+		Base: generator, Runner: runner, Projects: projects, Model: cfg.CodexModelStandard,
+		ReasoningEffort: cfg.CodexReasoningStandard,
 	}
 	worktrees := gitadapter.OnboardingWorktree{
 		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
@@ -1222,7 +1249,7 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("connect temporal: %w", err)
 	}
 	defer client.Close()
-	runner, err := codexadapter.NewProcessRunner(cfg.CodexRunnerCommand)
+	runner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return err
 	}
@@ -1247,6 +1274,7 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 		},
 		ReviewModel: cfg.CodexModelReview, ReviewReasoning: cfg.CodexReasoningReview, MaxTaskAttempts: cfg.MaxTaskAttempts,
 		MaxReviewAttempts: cfg.MaxReviewAttempts,
+		Router:            agentpolicy.FromConfig(cfg),
 	}
 
 	temporalWorker := worker.New(client, cfg.TemporalTaskQueue, worker.Options{
