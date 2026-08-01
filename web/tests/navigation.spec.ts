@@ -10,8 +10,11 @@ test("owner can navigate from dashboard to projects", async ({ page }) => {
 
 test("owner can inspect a plan DAG", async ({ page }) => {
   await page.goto("/plans");
-  await expect(page.locator("tbody tr").first()).toBeVisible();
-  await page.locator("tbody tr").first().getByRole("link").click();
+  await expect(page.getByRole("heading", { name: "История текущей локальной базы orchestrator" })).toBeVisible();
+  await expect(page.getByText("Технический риск ≠ важность")).toBeVisible();
+  await expect(page.getByText("Без внешних записей", { exact: true })).toBeVisible();
+  await expect(page.locator(".plan-list-card").first()).toBeVisible();
+  await page.locator(".plan-list-card").first().getByRole("link").click();
   await expect(page.getByRole("heading", { name: "Порядок выполнения" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "От цели до выполнения" })).toBeVisible();
   await expect(page.getByText("Стрелка идёт от обязательной задачи", { exact: false })).toBeVisible();
@@ -64,6 +67,9 @@ test("owner can connect a project and inspect discovery result", async ({ page }
 test("owner can generate a plan for selected projects", async ({ page }) => {
   const draft = planFixture("plan-new", 1, "discussion");
   await page.route("**/api/v1/projects", route => route.fulfill({ json: { projects: [projectFixture] } }));
+  await page.route("**/api/v1/plans?limit=100", route => route.fulfill({ json: {
+    items: [], has_more: false, work_item_gateway: "fake", external_writes_enabled: false,
+  } }));
   await page.route("**/api/v1/commands", route => route.fulfill({ status: 201, json: { id: "command-new", text: "Создать безопасный план", status: "received" } }));
   await page.route("**/api/v1/commands/command-new/plan", route => route.fulfill({ status: 201, json: draft }));
   await page.route("**/api/v1/plans/plan-new", route => route.fulfill({ json: draft }));
