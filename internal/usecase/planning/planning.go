@@ -121,6 +121,7 @@ func (uc RevisePlan) Handle(ctx context.Context, planID string, request domain.P
 	if bundle.Plan.Status != domain.PlanStatusDiscussion {
 		return domain.PlanBundle{}, fmt.Errorf("only a discussion plan can be revised: %w", domain.ErrInvalidStatus)
 	}
+	request.SupersedesPlanID = bundle.Plan.ID
 	if len(request.RequestedProjectIDs) == 0 {
 		seen := make(map[string]struct{}, len(bundle.Tasks))
 		for _, task := range bundle.Tasks {
