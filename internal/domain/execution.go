@@ -55,6 +55,7 @@ const (
 type Plan struct {
 	ID                  string          `json:"id"`
 	CommandID           string          `json:"command_id"`
+	SupersedesPlanID    *string         `json:"supersedes_plan_id,omitempty"`
 	ApprovalID          *string         `json:"approval_id,omitempty"`
 	TopologyRevisionID  *string         `json:"topology_revision_id,omitempty"`
 	Status              PlanStatus      `json:"status"`
@@ -132,6 +133,7 @@ type TaskDependency struct {
 type PlanRequest struct {
 	RequestedProjectIDs []string         `json:"project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	SupersedesPlanID    string           `json:"supersedes_plan_id,omitempty"`
 	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 	AvailableProjects   []Project        `json:"-"`
 }
@@ -142,6 +144,7 @@ type PlannerInput struct {
 	TopologyRevisionID  string           `json:"topology_revision_id"`
 	RequestedProjectIDs []string         `json:"requested_project_ids,omitempty"`
 	SourceIssues        []IssueReference `json:"source_issues,omitempty"`
+	SupersedesPlanID    string           `json:"supersedes_plan_id,omitempty"`
 	RevisionInstruction string           `json:"revision_instruction,omitempty"`
 }
 

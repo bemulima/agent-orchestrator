@@ -48,6 +48,7 @@ func (p Planner) Build(
 		CommandID: command.ID, CommandText: text, TopologyRevisionID: catalog.Revision.ID,
 		RequestedProjectIDs: uniqueSorted(request.RequestedProjectIDs),
 		SourceIssues:        sourceIssues,
+		SupersedesPlanID:    strings.TrimSpace(request.SupersedesPlanID),
 		RevisionInstruction: revisionInstruction,
 	}
 	services := make(map[string]domain.TopologyService, len(catalog.Services))

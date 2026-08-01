@@ -85,7 +85,9 @@ export const planSummarySchema = z.object({
   id: z.string(), command_id: z.string(), summary: z.string(), status: z.string(), version: z.number(),
   risk_level: z.string(), source_kind: z.string(), fingerprint: z.string(), task_count: z.number(),
   completed_tasks: z.number(), attention_tasks: z.number(), issue_count: z.number(), published_issues: z.number(),
-  run_id: z.string().nullable().optional(), run_status: z.string().nullable().optional(), updated_at: z.string(),
+  issue_publication: z.enum(["none", "draft", "simulation", "external"]),
+  run_id: z.string().nullable().optional(), run_status: z.string().nullable().optional(), run_error: z.string().nullable().optional(),
+  supersedes_plan_id: z.string().nullable().optional(), superseded_by_plan_id: z.string().nullable().optional(), updated_at: z.string(),
   allowed_actions: z.array(actionSchema),
 });
 
@@ -111,7 +113,9 @@ export const approvalSchema = z.object({
 });
 
 const page = <T extends z.ZodType>(schema: T) => z.object({ items: z.array(schema), next_cursor: z.string().optional(), has_more: z.boolean() });
-export const plansPageSchema = page(planSummarySchema);
+export const plansPageSchema = page(planSummarySchema).extend({
+  work_item_gateway: z.string(), external_writes_enabled: z.boolean(),
+});
 export const runsPageSchema = page(runSummarySchema);
 export const tasksPageSchema = page(taskSummarySchema);
 export const approvalsPageSchema = page(approvalSchema);

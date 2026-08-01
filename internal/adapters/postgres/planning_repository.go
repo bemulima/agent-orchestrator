@@ -122,6 +122,44 @@ func (r PlanningRepoPG) CreatePlan(
 	if currentStatus == domain.CommandStatusRunning {
 		return domain.PlanBundle{}, fmt.Errorf("a running command must be paused and replanned explicitly: %w", domain.ErrInvalidStatus)
 	}
+	if input.SupersedesPlanID != "" {
+		var replacedStatus domain.PlanStatus
+		if err := tx.QueryRow(ctx, `
+SELECT status FROM plan WHERE id = $1 FOR UPDATE`, input.SupersedesPlanID).Scan(&replacedStatus); err != nil {
+			return domain.PlanBundle{}, mapPlanningError(err)
+		}
+		switch replacedStatus {
+		case domain.PlanStatusRunning, domain.PlanStatusPaused, domain.PlanStatusCompleted, domain.PlanStatusCancelled:
+			return domain.PlanBundle{}, fmt.Errorf("plan in status %s cannot be replaced: %w", replacedStatus, domain.ErrInvalidStatus)
+		}
+		var hasSuccessor bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM plan WHERE supersedes_plan_id = $1)`, input.SupersedesPlanID).Scan(&hasSuccessor); err != nil {
+			return domain.PlanBundle{}, fmt.Errorf("check replacement plan: %w", err)
+		}
+		if hasSuccessor {
+			return domain.PlanBundle{}, fmt.Errorf("plan already has an explicit replacement: %w", domain.ErrConflict)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE approval SET status = 'cancelled', decided_at = now(), comment = 'Заменено явно выбранным новым планом'
+WHERE status = 'pending' AND resource_type = 'plan' AND resource_id = $1`, input.SupersedesPlanID); err != nil {
+			return domain.PlanBundle{}, fmt.Errorf("cancel replaced plan approval: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE work_item SET status = 'cancelled', updated_at = now()
+WHERE status = 'proposed' AND plan_id = $1`, input.SupersedesPlanID); err != nil {
+			return domain.PlanBundle{}, fmt.Errorf("cancel replaced plan proposals: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE task SET status = 'cancelled', completed_at = now()
+WHERE status NOT IN ('completed', 'failed', 'cancelled') AND plan_id = $1`, input.SupersedesPlanID); err != nil {
+			return domain.PlanBundle{}, fmt.Errorf("cancel replaced plan tasks: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE plan SET status = 'cancelled', updated_at = now()
+WHERE id = $1 AND status IN ('discussion', 'ready_for_approval', 'awaiting_approval', 'approved')`, input.SupersedesPlanID); err != nil {
+			return domain.PlanBundle{}, fmt.Errorf("cancel replaced plan: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `
 UPDATE approval SET status = 'cancelled', decided_at = now(), comment = 'Заменено новой версией плана'
 WHERE status = 'pending' AND resource_type = 'plan'
@@ -152,14 +190,15 @@ WHERE command_id = $1 AND status IN ('discussion', 'ready_for_approval', 'awaiti
 	err = tx.QueryRow(ctx, `
 INSERT INTO plan (
     command_id, status, version, summary, risk_level, requires_approval,
-	    topology_revision_id, fingerprint, planner_fingerprint, planner_input, planner_output, source_kind
+	    topology_revision_id, fingerprint, planner_fingerprint, planner_input, planner_output, source_kind,
+	    supersedes_plan_id
 ) VALUES (
     $1, 'discussion',
     (SELECT COALESCE(MAX(version), 0) + 1 FROM plan WHERE command_id = $1),
-	    $2, $3, true, $4, $5, $5, $6, $7, $8
+	    $2, $3, true, $4, $5, $5, $6, $7, $8, NULLIF($9, '')::uuid
 )
 RETURNING `+planColumns, command.ID, output.Summary, output.RiskLevel,
-		input.TopologyRevisionID, fingerprint, rawInput, rawOutput, sourceKind).Scan(planScanTargets(&plan)...)
+		input.TopologyRevisionID, fingerprint, rawInput, rawOutput, sourceKind, input.SupersedesPlanID).Scan(planScanTargets(&plan)...)
 	if err != nil {
 		return domain.PlanBundle{}, mapPlanningError(err)
 	}
@@ -911,14 +950,14 @@ func scanCommand(row rowScanner) (domain.Command, error) {
 	return value, err
 }
 
-const planColumns = `id, command_id, approval_id, topology_revision_id, status, version,
+const planColumns = `id, command_id, supersedes_plan_id, approval_id, topology_revision_id, status, version,
 summary, risk_level, requires_approval, COALESCE(fingerprint, ''), planner_input, planner_output,
 replan_count, source_kind, discussion_revision, approved_fingerprint, planner_fingerprint,
 created_at, updated_at, approved_at`
 
 func planScanTargets(value *domain.Plan) []any {
 	return []any{
-		&value.ID, &value.CommandID, &value.ApprovalID, &value.TopologyRevisionID,
+		&value.ID, &value.CommandID, &value.SupersedesPlanID, &value.ApprovalID, &value.TopologyRevisionID,
 		&value.Status, &value.Version, &value.Summary, &value.RiskLevel,
 		&value.RequiresApproval, &value.Fingerprint, &value.PlannerInput, &value.PlannerOutput,
 		&value.ReplanCount, &value.SourceKind, &value.DiscussionRevision,

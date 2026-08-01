@@ -948,6 +948,60 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   without clipping, the three persisted edges are visible, and the page has no
   horizontal overflow. No plan, approval, work item, run, or external resource
   was mutated.
+- Audited all ten plan rows in the live local database. Eight have no external
+  publication, while the paused and failed pilot plans contain only simulated
+  `github.example.test` issues; there are zero real external issue
+  publications in the current plan history. The second awaiting-approval row
+  is a legacy pre-issue-backed plan without issue proposals.
+- Extended the plan summary read model with a persisted-effect classification:
+  no issues, local issue drafts, fake-gateway simulation, or external
+  publication. The classification is derived from stored work-item state and
+  URLs, including previously published and later closed issues, rather than
+  inferred from the current runtime configuration.
+- Redesigned `/plans` into explicit owner-decision, preparation, approved,
+  execution-history, and collapsed archive sections. The page now explains record provenance,
+  separates automated test databases from the durable local database, labels
+  legacy plans and fake publications, and states that `critical` is the maximum
+  technical task risk rather than urgency or business priority.
+- Verified the plan-list change with `make verify`, the disposable PostgreSQL
+  integration suite, all ten Playwright owner flows, rebuilt healthy API/UI
+  containers, and a live in-app browser inspection of the legacy, simulation,
+  and external-publication labels. No plan, approval, work item, run, or
+  external resource was mutated.
+- Made the lifecycle executable and visible as four separate stages:
+  preparation, exact-fingerprint owner decision, issue publication, and local
+  execution. The page reports the configured publication mode (`fake`, GitHub
+  dry-run, or real external writes) before any action, and action confirmations
+  state the precise effect of approval, publication, and run creation.
+- Replaced wide plan tables with responsive lifecycle cards. Each card keeps
+  the plan identity, persisted publication contour, next step, technical risk,
+  progress, status, and allowed actions together. At a 1280 px browser viewport
+  all ten cards have zero horizontal overflow and the page has no document-wide
+  horizontal scroll.
+- Tightened backend plan actions: an approved plan exposes publication only
+  when every task has exactly one current issue proposal. Legacy plan
+  `383dede3-2393-47af-b3db-e6c52bbfa4e8` now has no impossible publication
+  action, while partially published plan `0436da42-b1cf-45de-a538-95f546f4ba9a`
+  correctly offers only the three remaining fake issues.
+- Made the fake gateway restart-idempotent by deriving stable positive external
+  numbers from project, work-item kind, and idempotency key. Publication now
+  preflights the complete proposal set, preserves per-item progress, reports
+  partial progress in errors, and refreshes the UI even after a partial failure.
+- Added explicit owner-selected plan supersession for future plans through
+  migration `014_plan_supersession`. The create-plan form defaults to an
+  independent plan and can instead name one eligible predecessor; only an
+  explicit selection archives that predecessor. Existing similar plans were
+  intentionally not linked or rewritten by text inference.
+- Added persisted run errors to plan summaries and translated the two known
+  local-run failures into owner-facing explanations. Action components now
+  refresh after success or failure, and list/card identity is stable so an
+  error cannot drift to another plan after regrouping.
+- Applied migration `014_plan_supersession` to the local database, rebuilt the
+  healthy API, UI, and worker containers, and verified the result with
+  `make verify`, the disposable PostgreSQL integration suite, all ten
+  Playwright owner flows, and live in-app browser inspection. Existing plan,
+  approval, work-item, and run rows were not normalized or otherwise changed;
+  no real external resource was created.
 
 ## Remaining work
 
@@ -973,16 +1027,19 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - The Node and sandbox tasks from the paused plan remain unexecuted. Preserve
   the reviewed browser commit and HTTP diagnostic worktree until the replacement
   plan decides whether to reuse, supersede, or discard them.
-- Decide pending approval `bde0a209-24fe-4d61-b3f7-eb1455bd90fd` for plan
-  `0436da42-b1cf-45de-a538-95f546f4ba9a`. Bind any approval to exact
-  fingerprint
-  `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6`;
-  approval alone must not publish work items or start a run.
+- Plans `b0e7f8ff-c596-465b-b338-23e16aee6f9a`,
+  `edfb110c-9d44-4a0a-b57e-3bb298232b05`, and
+  `0436da42-b1cf-45de-a538-95f546f4ba9a` predate explicit supersession and
+  remain independent historical records. Do not guess which is current from
+  summary text; normalize them only after the owner names the canonical plan.
+- Plan `0436da42-b1cf-45de-a538-95f546f4ba9a` has one of four fake issues
+  persisted. The repaired publication path can safely resume the remaining
+  three, but do not invoke it without a separate explicit owner action.
 
 ## Exact next task
 
-Present pending approval `bde0a209-24fe-4d61-b3f7-eb1455bd90fd` and unchanged
-fingerprint `df6af246f25cb44c4b5cac8b85d3b42812d56e6be69957fb8affb5d899a1b7e6` to
-the owner. Run `plan-approve` only after a new exact authorization. Do not
-publish issues/PR, start the plan, push, merge, or deploy without their own
-subsequent explicit authorizations.
+Let the owner inspect the rebuilt `/plans` lifecycle and cards. Do not normalize
+the three pre-migration replacement records or publish the remaining three fake
+issues for plan `0436da42-b1cf-45de-a538-95f546f4ba9a` unless the owner names
+that exact action. Do not publish real issues/PR, start a plan, push, merge, or
+deploy without their own subsequent explicit authorizations.

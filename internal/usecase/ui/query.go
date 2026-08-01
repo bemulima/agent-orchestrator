@@ -23,7 +23,9 @@ type ListInput struct {
 }
 
 type QueryService struct {
-	Reads repository.UIReadRepository
+	Reads                 repository.UIReadRepository
+	WorkItemGateway       string
+	ExternalWritesEnabled bool
 }
 
 func (s QueryService) Dashboard(ctx context.Context) (domain.Dashboard, error) {
@@ -49,7 +51,10 @@ func (s QueryService) Plans(ctx context.Context, input ListInput) (domain.PlanSu
 	for index := range items {
 		items[index].AllowedActions = planActions(items[index])
 	}
-	return domain.PlanSummaryPage{Items: items, PageInfo: pageInfo(more, lastPlan(items))}, nil
+	return domain.PlanSummaryPage{
+		Items: items, PageInfo: pageInfo(more, lastPlan(items)),
+		WorkItemGateway: s.WorkItemGateway, ExternalWritesEnabled: s.ExternalWritesEnabled,
+	}, nil
 }
 
 func (s QueryService) Runs(ctx context.Context, input ListInput) (domain.RunSummaryPage, error) {
@@ -218,6 +223,9 @@ func action(name string, fingerprint bool) domain.ResourceAction {
 }
 
 func planActions(plan domain.PlanSummary) []domain.ResourceAction {
+	if plan.SupersededByPlanID != nil {
+		return []domain.ResourceAction{}
+	}
 	switch plan.Status {
 	case domain.PlanStatusDiscussion:
 		if plan.IssueCount < plan.TaskCount {
@@ -229,7 +237,13 @@ func planActions(plan domain.PlanSummary) []domain.ResourceAction {
 	case domain.PlanStatusAwaitingApproval:
 		return []domain.ResourceAction{action("approve", true), action("reject", false)}
 	case domain.PlanStatusApproved:
-		if plan.PublishedIssues < plan.TaskCount {
+		// Publication is safe only when every task has one current proposal.
+		// Legacy plans without proposals must be revised instead of receiving a
+		// button that can only fail (or silently do nothing) in the publisher.
+		if plan.TaskCount == 0 || plan.IssueCount != plan.TaskCount {
+			return []domain.ResourceAction{}
+		}
+		if plan.PublishedIssues < plan.IssueCount {
 			return []domain.ResourceAction{action("publish_issues", false)}
 		}
 		return []domain.ResourceAction{action("run", false)}

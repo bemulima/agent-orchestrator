@@ -680,6 +680,80 @@ func TestTopologyRepositoryReplacesCatalogIdempotently(t *testing.T) {
 	}
 }
 
+func TestPlanningRepositoryOnlySupersedesExplicitlySelectedPlan(t *testing.T) {
+	pool := integrationPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	plans := pgadapter.PlanningRepoPG{Pool: pool}
+
+	var topologyRevisionID string
+	if err := pool.QueryRow(ctx, `
+INSERT INTO topology_revision (
+    fingerprint, project_count, service_count, capability_count,
+    ownership_count, contract_count, relation_count, drift_count
+) VALUES ($1, 0, 0, 0, 0, 0, 0, 0)
+RETURNING id`, strings.Repeat("f", 64)).Scan(&topologyRevisionID); err != nil {
+		t.Fatalf("insert topology revision: %v", err)
+	}
+
+	commands := make([]domain.Command, 0, 3)
+	createdPlans := make([]domain.PlanBundle, 0, 3)
+	defer func() {
+		for _, bundle := range createdPlans {
+			_, _ = pool.Exec(ctx, `UPDATE plan SET supersedes_plan_id = NULL WHERE id = $1`, bundle.Plan.ID)
+			_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, bundle.Plan.ID)
+		}
+		for _, command := range commands {
+			_, _ = pool.Exec(ctx, `DELETE FROM audit_event WHERE resource_id = $1`, command.ID)
+			_, _ = pool.Exec(ctx, `DELETE FROM command WHERE id = $1`, command.ID)
+		}
+		_, _ = pool.Exec(ctx, `DELETE FROM topology_revision WHERE id = $1`, topologyRevisionID)
+	}()
+
+	create := func(idempotencySuffix, supersedesPlanID string) domain.PlanBundle {
+		t.Helper()
+		command, err := plans.CreateCommand(ctx, domain.Command{
+			Source: domain.CommandSourceAPI, Text: "same owner request", Status: domain.CommandStatusReceived,
+			IdempotencyKey: "integration:supersession:" + idempotencySuffix + ":" + uuid.NewString(),
+		})
+		if err != nil {
+			t.Fatalf("CreateCommand(%s) error = %v", idempotencySuffix, err)
+		}
+		commands = append(commands, command)
+		bundle, err := plans.CreatePlan(ctx, command, domain.PlannerInput{
+			CommandID: command.ID, CommandText: command.Text, TopologyRevisionID: topologyRevisionID,
+			SupersedesPlanID: supersedesPlanID,
+		}, domain.PlannerOutput{
+			Summary: "plan " + idempotencySuffix, RiskLevel: domain.RiskLevelLow,
+		})
+		if err != nil {
+			t.Fatalf("CreatePlan(%s) error = %v", idempotencySuffix, err)
+		}
+		createdPlans = append(createdPlans, bundle)
+		return bundle
+	}
+
+	predecessor := create("predecessor", "")
+	independent := create("independent", "")
+	predecessorBeforeReplacement, err := plans.GetPlan(ctx, predecessor.Plan.ID)
+	if err != nil || predecessorBeforeReplacement.Plan.Status != domain.PlanStatusDiscussion {
+		t.Fatalf("same text inferred replacement: %#v, %v", predecessorBeforeReplacement.Plan, err)
+	}
+
+	successor := create("successor", predecessor.Plan.ID)
+	if successor.Plan.SupersedesPlanID == nil || *successor.Plan.SupersedesPlanID != predecessor.Plan.ID {
+		t.Fatalf("successor link = %#v", successor.Plan.SupersedesPlanID)
+	}
+	predecessorAfterReplacement, err := plans.GetPlan(ctx, predecessor.Plan.ID)
+	if err != nil || predecessorAfterReplacement.Plan.Status != domain.PlanStatusCancelled {
+		t.Fatalf("explicit predecessor status = %#v, %v", predecessorAfterReplacement.Plan, err)
+	}
+	independentAfterReplacement, err := plans.GetPlan(ctx, independent.Plan.ID)
+	if err != nil || independentAfterReplacement.Plan.Status != domain.PlanStatusDiscussion {
+		t.Fatalf("unselected plan changed = %#v, %v", independentAfterReplacement.Plan, err)
+	}
+}
+
 func TestPlanningRepositoryStateMachineAndIdempotency(t *testing.T) {
 	pool := integrationPool(t)
 	defer pool.Close()
