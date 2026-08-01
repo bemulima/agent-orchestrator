@@ -2,7 +2,10 @@ package workitem
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -53,38 +56,59 @@ func (f *FakeGateway) GetIssue(_ context.Context, project domain.Project, number
 	return domain.WorkItemPublication{}, domain.ErrNotFound
 }
 
-func (f *FakeGateway) PublishIssue(_ context.Context, _ domain.Project, item domain.WorkItem) (domain.WorkItemPublication, error) {
+func (f *FakeGateway) PublishIssue(_ context.Context, project domain.Project, item domain.WorkItem) (domain.WorkItemPublication, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if value, ok := f.Published[item.IdempotencyKey]; ok {
+	key := publicationKey(project.ID, item)
+	if value, ok := f.Published[key]; ok {
 		return value, nil
 	}
 	if f.DryRunMode {
 		return domain.WorkItemPublication{Number: 1, URL: "https://example.invalid/dry-run/issue", State: "preview"}, nil
 	}
 	f.IssueCreates++
+	number := stablePublicationNumber(project.ID, string(item.Kind), item.IdempotencyKey)
 	value := domain.WorkItemPublication{
-		Number: int64(f.IssueCreates), URL: fmt.Sprintf("https://github.example.test/issues/%d", f.IssueCreates), State: "open",
+		Number: number, URL: fmt.Sprintf("https://github.example.test/issues/%d", number), State: "open",
 	}
-	f.Published[item.IdempotencyKey] = value
+	f.Published[key] = value
 	return value, nil
 }
 
-func (f *FakeGateway) PublishPullRequest(_ context.Context, _ domain.Project, item domain.WorkItem) (domain.WorkItemPublication, error) {
+func (f *FakeGateway) PublishPullRequest(_ context.Context, project domain.Project, item domain.WorkItem) (domain.WorkItemPublication, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if value, ok := f.Published[item.IdempotencyKey]; ok {
+	key := publicationKey(project.ID, item)
+	if value, ok := f.Published[key]; ok {
 		return value, nil
 	}
 	if f.DryRunMode {
 		return domain.WorkItemPublication{Number: 1, URL: "https://example.invalid/dry-run/pull", State: "preview"}, nil
 	}
 	f.PullCreates++
+	number := stablePublicationNumber(project.ID, string(item.Kind), item.IdempotencyKey)
 	value := domain.WorkItemPublication{
-		Number: int64(f.PullCreates), URL: fmt.Sprintf("https://github.example.test/pull/%d", f.PullCreates), State: "open",
+		Number: number, URL: fmt.Sprintf("https://github.example.test/pull/%d", number), State: "open",
 	}
-	f.Published[item.IdempotencyKey] = value
+	f.Published[key] = value
 	return value, nil
+}
+
+// stablePublicationNumber makes the fake gateway idempotent across process
+// restarts. Sequential in-memory counters reused numbers after a restart and
+// collided with persisted work items, leaving a partially published plan
+// impossible to resume.
+func stablePublicationNumber(projectID, kind, idempotencyKey string) int64 {
+	sum := sha256.Sum256([]byte(projectID + "\x00" + kind + "\x00" + idempotencyKey))
+	number := int64(binary.BigEndian.Uint64(sum[:8]) & math.MaxInt64)
+	if number == 0 {
+		return 1
+	}
+	return number
+}
+
+func publicationKey(projectID string, item domain.WorkItem) string {
+	return projectID + "\x00" + string(item.Kind) + "\x00" + item.IdempotencyKey
 }
 
 func (f *FakeGateway) PublishBranch(_ context.Context, _ domain.Project, _, _ string) error {
