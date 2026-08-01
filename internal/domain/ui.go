@@ -52,6 +52,15 @@ type Dashboard struct {
 	RecentActivity []ActivityEvent `json:"recent_activity"`
 }
 
+type IssuePublication string
+
+const (
+	IssuePublicationNone       IssuePublication = "none"
+	IssuePublicationDraft      IssuePublication = "draft"
+	IssuePublicationSimulation IssuePublication = "simulation"
+	IssuePublicationExternal   IssuePublication = "external"
+)
+
 type PlanSummary struct {
 	ID                  string           `json:"id"`
 	CommandID           string           `json:"command_id"`
@@ -67,14 +76,20 @@ type PlanSummary struct {
 	AttentionTasks      int              `json:"attention_tasks"`
 	IssueCount          int              `json:"issue_count"`
 	PublishedIssues     int              `json:"published_issues"`
+	IssuePublication    IssuePublication `json:"issue_publication"`
 	RunID               *string          `json:"run_id,omitempty"`
 	RunStatus           *PlanRunStatus   `json:"run_status,omitempty"`
+	RunError            *string          `json:"run_error,omitempty"`
+	SupersedesPlanID    *string          `json:"supersedes_plan_id,omitempty"`
+	SupersededByPlanID  *string          `json:"superseded_by_plan_id,omitempty"`
 	UpdatedAt           time.Time        `json:"updated_at"`
 	AllowedActions      []ResourceAction `json:"allowed_actions"`
 }
 
 type PlanSummaryPage struct {
-	Items []PlanSummary `json:"items"`
+	Items                 []PlanSummary `json:"items"`
+	WorkItemGateway       string        `json:"work_item_gateway"`
+	ExternalWritesEnabled bool          `json:"external_writes_enabled"`
 	PageInfo
 }
 

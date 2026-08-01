@@ -206,7 +206,10 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		CancelTask: planningOperations.CancelTask, GetAttempts: planningOperations.GetAttempts,
 		GetArtifacts: planningOperations.GetArtifacts, RetryTask: planningOperations.RetryTask,
 	}
-	ownerQueries := uiuc.QueryService{Reads: pgadapter.UIReadRepoPG{Pool: pool}}
+	ownerQueries := uiuc.QueryService{
+		Reads: pgadapter.UIReadRepoPG{Pool: pool}, WorkItemGateway: cfg.WorkItemGateway,
+		ExternalWritesEnabled: cfg.WorkItemGateway == "github" && !cfg.GitHubDryRun,
+	}
 	uiHandler := handlers.UIHandler{Queries: ownerQueries}
 	operatorRunner, err := newAgentRunner(cfg, pool)
 	if err != nil {

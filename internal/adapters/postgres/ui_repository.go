@@ -96,15 +96,23 @@ SELECT p.id, p.command_id, p.summary, p.status, p.version, p.risk_level,
        count(DISTINCT t.id) FILTER (WHERE t.status = 'completed')::int,
        count(DISTINCT t.id) FILTER (WHERE t.status IN ('blocked', 'changes_requested', 'failed'))::int,
        count(DISTINCT wi.id) FILTER (WHERE wi.kind = 'issue' AND wi.status <> 'cancelled')::int,
-       count(DISTINCT wi.id) FILTER (WHERE wi.kind = 'issue' AND wi.status = 'published')::int,
-       pr.id, pr.status, p.updated_at
+       count(DISTINCT wi.id) FILTER (WHERE wi.kind = 'issue' AND wi.status IN ('published', 'closed'))::int,
+       CASE
+         WHEN count(DISTINCT wi.id) FILTER (WHERE wi.kind = 'issue' AND wi.status <> 'cancelled') = 0 THEN 'none'
+         WHEN count(DISTINCT wi.id) FILTER (WHERE wi.kind = 'issue' AND wi.status IN ('published', 'closed')) = 0 THEN 'draft'
+         WHEN bool_and(wi.external_url LIKE 'https://github.example.test/%')
+              FILTER (WHERE wi.kind = 'issue' AND wi.status IN ('published', 'closed')) THEN 'simulation'
+         ELSE 'external'
+       END,
+       pr.id, pr.status, pr.error, p.supersedes_plan_id, successor.id, p.updated_at
 FROM plan p
 LEFT JOIN task t ON t.plan_id = p.id
 LEFT JOIN work_item wi ON wi.plan_id = p.id
 LEFT JOIN plan_run pr ON pr.plan_id = p.id
+LEFT JOIN plan successor ON successor.supersedes_plan_id = p.id
 WHERE ($1::text[] IS NULL OR p.status = ANY($1))
   AND ($2::timestamptz IS NULL OR (p.updated_at, p.id) < ($2, $3::uuid))
-GROUP BY p.id, pr.id
+GROUP BY p.id, pr.id, successor.id
 ORDER BY p.updated_at DESC, p.id DESC
 LIMIT $4`, statuses, beforeAt, beforeID, limit+1)
 	if err != nil {
@@ -116,8 +124,9 @@ LIMIT $4`, statuses, beforeAt, beforeID, limit+1)
 		var item domain.PlanSummary
 		if err := rows.Scan(&item.ID, &item.CommandID, &item.Summary, &item.Status, &item.Version, &item.RiskLevel,
 			&item.SourceKind, &item.Fingerprint, &item.ApprovedFingerprint, &item.TaskCount, &item.CompletedTasks,
-			&item.AttentionTasks, &item.IssueCount, &item.PublishedIssues,
-			&item.RunID, &item.RunStatus, &item.UpdatedAt); err != nil {
+			&item.AttentionTasks, &item.IssueCount, &item.PublishedIssues, &item.IssuePublication,
+			&item.RunID, &item.RunStatus, &item.RunError, &item.SupersedesPlanID, &item.SupersededByPlanID,
+			&item.UpdatedAt); err != nil {
 			return nil, false, fmt.Errorf("scan plan summary: %w", err)
 		}
 		items = append(items, item)
