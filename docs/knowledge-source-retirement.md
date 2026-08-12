@@ -65,6 +65,40 @@ archive only when all applicable items pass:
   agent architecture.
 - Project archive/restore is implemented without deleting history or discovery
   snapshots.
+- All 37 code/provisioning repositories in the approved scope now own a
+  self-contained agent architecture and repository-local documentation. Their
+  agent rules do not depend on sibling `prompts`, `journal`, or `wiki` paths.
+- The only journal result marked partial was re-triaged. Its two remaining
+  checks are intentional external integration suites now owned by the target
+  repositories: PostgreSQL integration for `ms-go-student` and opt-in HTTP/NATS
+  integration for `ms-ts-html-validator`. Both are documented alongside their
+  current commands; no open task depends on the journal copy.
+- The operational onboarding runbook no longer instructs operators to connect,
+  scan, or provision the three source repositories. Historical source names and
+  reviewed revisions remain only as provenance.
 - No source repository has been remotely archived or deleted.
-- Project-specific `prompts` and `wiki` content migration remains pending and
-  must proceed repository by repository under the gate above.
+- The remaining `prompts`/`journal` gates are operational: create final source
+  tags/backups, archive their catalog entries, rehearse restore, archive the
+  entries again, and obtain separate authorization before any GitHub or
+  filesystem archive/deletion. `wiki` remains frozen and is not part of this
+  retirement action.
+
+## Journal retirement index
+
+The journal contains no canonical task state. Issues, repository history,
+tests, and repository-owned documentation supersede these ten task directories:
+
+| Journal directory | Retirement decision |
+|---|---|
+| `2025/12/11/legacy` | Historical lifecycle evidence; current student, sandbox, and gateway tests own executable coverage |
+| `2025/12/12/legacy` | Completed commit reports; Git history is canonical |
+| `2025/12/14/refactor-ts-architecture` | Completed; current TypeScript repository architecture and tests are canonical |
+| `2025/12/14/test-refactor-all-services` | Re-triaged; external integration gates are explicitly owned by `ms-go-student` and `ms-ts-html-validator` |
+| `2025/12/15/analysis-business-rules` | Superseded by verified project-local business and contract documentation |
+| `2025/12/15/docs-split-hoppscotch-gateway` | Completed; gateway docs and collections are canonical |
+| `2025/12/16/feature-ms-getway-split-admin-client` | Completed under the corrected `ms-gateway` name; current routing docs are canonical |
+| `2025/12/16/test-e2e-wiki-gateway` | Historical run only; repository-local E2E suites own executable checks |
+| `2025/12/21/refactor-rbac-postgres` | Completed; RBAC migrations, tests, and docs are canonical |
+| `2025/12/22/feature-admin-user-list` | Completed; user-service API/tests and admin UI docs are canonical |
+
+This index is a disposition record, not a request to modify the journal.

@@ -1,6 +1,6 @@
 # Repository onboarding runbook
 
-Inventory snapshot: 2026-07-21, last operational update: 2026-07-22. The
+Inventory snapshot: 2026-07-21, last operational update: 2026-08-12. The
 original local-checkout audit below is retained as the safety record that led
 to the selected connection strategy. All 38 requested repositories are now
 connected: the first 13 through reviewed clean local checkouts and the other
@@ -9,10 +9,18 @@ user's primary checkouts and issue worktrees were not modified.
 No onboarding proposal has been approved or applied, and no live coding task,
 GitLab write, or Telegram operation has been started.
 
+The connection inventory and branch tables below are historical. Agent-policy
+and project-knowledge migration is now complete for all 37 code/provisioning
+repositories in scope. Do not reconnect, rescan, onboard, or provision the
+legacy `prompts`, `journal`, or `wiki` sources. `prompts` and `journal` are
+retirement candidates; archive their existing catalog entries only by an
+explicit owner command and rehearse restore before final archive. `wiki`
+remains frozen for a later, separately approved redesign.
+
 ## Safety boundary
 
 - The host repository root is mounted into the API and worker at `/projects`.
-  Set `PROJECTS_HOST_ROOT=/Users/marat/Developments` only in the ignored `.env`
+  Set `PROJECTS_HOST_ROOT=/path/to/repositories` only in the ignored `.env`
   file before recreating those two services.
 - Use container paths in every persisted project record. Do not connect the
   same checkout once by `/Users/...` and again by `/projects/...`.
@@ -57,21 +65,23 @@ connected `ms-go-cache-search-validator`, `ms-go-docker-validator`,
 The completed third wave connected local `prompts` and `journal` using their
 canonical remote names `ms-course-promts` and `ms-course-journal`.
 
-`journal`, `prompts`, and `wiki` are not loose generated directories. They are
-clean repositories with remotes and contain respectively 149, 20, and 32
-tracked files with no untracked files. Keep them independent and connect them
-as `archive`, `policy`, and `documentation`; do not copy their files into
-service repositories. `wiki` remains deferred: its current non-default branch
-is one commit behind the live remote `main`.
+`journal`, `prompts`, and `wiki` are not loose generated directories. At the
+inventory snapshot they were clean repositories with remotes and contained
+respectively 149, 20, and 32 tracked files with no untracked files. They were
+connected as `archive`, `policy`, and `documentation` for analysis only. Do not
+connect them again or provision agent architecture into them. Useful policy,
+contracts, and business knowledge now live in the orchestrator templates and
+owning code repositories. `wiki` remains frozen rather than retired.
 
 The parent `microservices/infra` is not a repository and must not be connected.
 Its `messaging` child is a clean repository with ten tracked NATS configuration,
 stream, script, prompt, and documentation files and should be connected using
 the nested path with role `infrastructure`.
 
-`/Users/marat/Developments/knowlege` does not exist. The likely intended path is
-`/Users/marat/Developments/knowledge-tree`, but that assumption requires owner
-confirmation. `knowledge-tree` belongs to role `content`; it is currently on
+The originally supplied `knowlege` path did not exist. The likely intended path
+was `${PROJECTS_HOST_ROOT}/knowledge-tree`, but that assumption requires owner
+confirmation. `knowledge-tree` belongs to role `content`; at the inventory
+snapshot it was on
 `fix/issue-159`, 55 commits behind the live remote `main`, and that current
 branch is absent from the remote. It also has one modified registry file and
 29 untracked `.DS_Store` files. Do not connect it until the intended path,
@@ -141,9 +151,11 @@ The same rule applies to the `knowledge-tree-issue-*` worktrees outside the
 requested microservices tree: only the primary `knowledge-tree` checkout can
 become a project.
 
-## Recommended connection order
+## Historical connection order
 
-Steps 1–5 are complete:
+Steps 1–5 record the completed 2026-07 onboarding audit. They are not the
+current retirement procedure and must not be rerun for `prompts`, `journal`,
+or `wiki`:
 
 1. Recreated only the API and worker with the reviewed host-root mount.
 2. Ran the three-repository discovery pilot: one Go service, one TypeScript
@@ -155,9 +167,10 @@ Steps 1–5 are complete:
    Go/Python route evidence exposed two additional discovery gaps; the reports
    were regenerated as schema v4 and verified idempotent.
 5. Connected `prompts` and `journal` as non-runtime `policy` and `archive`
-   repositories. Discovery schema v6 suppresses runtime evidence from their
-   documentation/examples, records root policy Markdown by checksum, and
-   leaves runtime topology at 11 services.
+   repositories for source analysis. Discovery schema v6 suppressed runtime
+   evidence from their documentation/examples, recorded root policy Markdown
+   by checksum, and left runtime topology at 11 services. This source-analysis
+   step is complete and must not be repeated.
 
 The follow-up branch-hygiene audit is also complete. Continue only with a new
 owner command:
@@ -180,7 +193,7 @@ owner command:
 First edit the ignored `.env` file manually:
 
 ```dotenv
-PROJECTS_HOST_ROOT=/Users/marat/Developments
+PROJECTS_HOST_ROOT=/path/to/repositories
 REPOSITORY_ALLOWED_ROOTS=/projects
 ```
 
@@ -249,22 +262,12 @@ Connected-catalog result after the validator waves and corrections:
 - the database contains no onboarding runs, commands, GitLab links/events,
   Telegram updates, plans, or plan runs.
 
-The third wave used these read-only commands. Report lookup uses canonical
-remote names rather than local directory names:
+The historical third wave connected `prompts` and `journal` for read-only
+source analysis under their canonical remote names. Those commands are
+deliberately omitted because reconnecting or rescanning retirement sources is
+no longer a valid operational action.
 
-```sh
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
-  --path /projects/microservices/prompts --role policy
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-connect \
-  --path /projects/microservices/journal --role archive
-
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-course-promts
-docker compose exec -T orchestrator /app/course-dev-orchestrator project-report --service ms-course-journal
-docker compose exec -T orchestrator /app/course-dev-orchestrator topology
-docker compose exec -T orchestrator /app/course-dev-orchestrator contract-drift
-```
-
-Current result after the non-runtime wave and discovery schema v6:
+Historical result after the non-runtime wave and discovery schema v6:
 
 - all 13 projects are `analyzed`, on clean `main` checkouts, with unchanged
   source HEADs;
