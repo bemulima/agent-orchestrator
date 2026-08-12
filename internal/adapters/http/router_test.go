@@ -28,7 +28,10 @@ func TestRouter_ProjectAPI(t *testing.T) {
 		Connect: connectProjectFake{result: projectuc.ConnectResult{Project: project}},
 		Get:     getProjectFake{project: project},
 		List:    listProjectsFake{projects: []domain.Project{project}},
+		ListAll: listProjectsFake{projects: []domain.Project{project}},
 		Scan:    scanProjectFake{result: projectuc.ScanResult{Project: project}},
+		Archive: projectLifecycleFake{project: project},
+		Restore: projectLifecycleFake{project: project},
 		LatestReport: latestReportFake{result: projectuc.LatestDiscoveryResult{
 			Snapshot: domain.ServiceSnapshot{ID: "snapshot-id", ProjectID: project.ID},
 		}},
@@ -45,8 +48,11 @@ func TestRouter_ProjectAPI(t *testing.T) {
 	}{
 		{method: http.MethodPost, path: "/api/v1/projects/connect", body: `{"path":"/projects/fixture"}`},
 		{method: http.MethodGet, path: "/api/v1/projects"},
+		{method: http.MethodGet, path: "/api/v1/projects?include_archived=true"},
 		{method: http.MethodGet, path: "/api/v1/projects/project-id"},
 		{method: http.MethodPost, path: "/api/v1/projects/project-id/scan"},
+		{method: http.MethodPost, path: "/api/v1/projects/project-id/archive"},
+		{method: http.MethodPost, path: "/api/v1/projects/project-id/restore"},
 		{method: http.MethodGet, path: "/api/v1/projects/project-id/reports/latest"},
 	}
 	for _, test := range tests {
@@ -266,6 +272,15 @@ func (f scanProjectFake) Handle(context.Context, string) (projectuc.ScanResult, 
 type latestReportFake struct {
 	result projectuc.LatestDiscoveryResult
 	err    error
+}
+
+type projectLifecycleFake struct {
+	project domain.Project
+	err     error
+}
+
+func (f projectLifecycleFake) Handle(context.Context, string) (domain.Project, error) {
+	return f.project, f.err
 }
 
 func (f latestReportFake) Handle(context.Context, string) (projectuc.LatestDiscoveryResult, error) {

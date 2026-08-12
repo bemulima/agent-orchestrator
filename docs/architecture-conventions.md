@@ -1,9 +1,9 @@
 # Architecture conventions
 
-This project follows the technical architecture of
-`/Users/marat/Developments/microservices/ms-go-course`. Business entities and
-orchestrator workflows are specific to this repository; only the organization
-and engineering conventions come from the reference service.
+This project originally adopted the technical organization of
+`ms-go-course`, but this document is now self-contained. Business entities,
+orchestrator workflows, safety boundaries, and all normative conventions are
+owned by this repository.
 
 ## Adopted conventions
 
@@ -34,6 +34,11 @@ and engineering conventions come from the reference service.
 - Repository role and runtime `ServiceKind` are separate concepts. Content,
   policy, documentation, and archive repositories never become runtime
   topology nodes merely because they contain executable tooling.
+- Project archival is a reversible lifecycle state, not a repository role and
+  not deletion. Archived projects retain snapshots, plans, tasks, artifacts,
+  and audit history; active-list queries exclude them from new planning,
+  discovery, onboarding, conversations, and topology rebuilds. Restore returns
+  the exact status captured at archive time.
 - Discovery removes runtime-only capability, contract, infrastructure,
   ownership, and relation evidence from content, policy, documentation, and
   archive reports. Language/tooling, purpose, commands, configuration, and
@@ -57,6 +62,16 @@ and engineering conventions come from the reference service.
 - Onboarding proposals are deterministic artifacts stored before approval.
   User-authored YAML/Markdown wins on conflict, while every difference remains
   visible in the proposal and unified diff.
+- Shared agent delivery policy is versioned in
+  `internal/onboarding/templates/v1`. Generated `.ai/rules/common.md` owns only
+  cross-project workflow and safety rules. Business behavior, service
+  architecture, commands, and contracts remain repository-specific evidence
+  in `.ai/service.yaml`, `.ai/architecture.yaml`, `.ai/contracts/**`, and the
+  owning repository's linked documentation.
+- Agent onboarding is limited to code/content/infrastructure targets.
+  Repositories classified as policy, documentation, or archive are knowledge
+  sources and do not receive `AGENTS.md`/`.ai` architecture from the
+  orchestrator.
 - Approved onboarding writes are confined to `AGENTS.md` and `.ai/**` in a
   dedicated Git worktree. The connected source checkout is treated as an
   immutable clean base and verified again after apply.

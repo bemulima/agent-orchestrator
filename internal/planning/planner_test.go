@@ -124,6 +124,22 @@ func TestPlannerRecognizesExplicitDatabaseMigration(t *testing.T) {
 	}
 }
 
+func TestPlannerRejectsCatalogProjectMissingFromActiveProjects(t *testing.T) {
+	catalog := domain.TopologyCatalog{
+		Revision: domain.TopologyRevision{ID: "revision-id"},
+		Services: []domain.TopologyService{{
+			ProjectID: "archived-service", Name: "archived-service", ServiceKind: domain.ServiceKindBackendService,
+		}},
+	}
+
+	_, _, err := (Planner{MaxParallelTasks: 3}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Исправить архивный сервис",
+	}, catalog, domain.PlanRequest{RequestedProjectIDs: []string{"archived-service"}, AvailableProjects: []domain.Project{}})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Build() error = %v, want validation", err)
+	}
+}
+
 func TestPlannerUsesOnlyApprovedManifestVerificationCommands(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".ai"), 0o755); err != nil {

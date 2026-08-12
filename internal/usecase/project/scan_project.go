@@ -29,6 +29,9 @@ func (uc ScanProject) Handle(ctx context.Context, projectID string) (ScanResult,
 	if err != nil {
 		return ScanResult{}, err
 	}
+	if project.Status == domain.ProjectStatusArchived {
+		return ScanResult{}, fmt.Errorf("archived project cannot be scanned; restore it first: %w", domain.ErrInvalidStatus)
+	}
 	if project.LocalPath == nil || strings.TrimSpace(*project.LocalPath) == "" {
 		return ScanResult{}, fmt.Errorf("project has no local checkout: %w", domain.ErrInvalidStatus)
 	}
@@ -49,6 +52,10 @@ func (uc ScanProject) handleSource(
 	project domain.Project,
 	source domain.RepositorySource,
 ) (domain.Project, domain.ServiceSnapshot, domain.DiscoveryReport, error) {
+	if project.Status == domain.ProjectStatusArchived {
+		return domain.Project{}, domain.ServiceSnapshot{}, domain.DiscoveryReport{},
+			fmt.Errorf("archived project cannot be scanned; restore it first: %w", domain.ErrInvalidStatus)
+	}
 	project, err := uc.Projects.UpdateSourceState(ctx, project.ID, domain.ProjectStatusScanning, source)
 	if err != nil {
 		return domain.Project{}, domain.ServiceSnapshot{}, domain.DiscoveryReport{}, err

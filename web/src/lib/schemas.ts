@@ -18,6 +18,7 @@ export const projectSchema = z.object({
   id: z.string(), name: z.string(), status: z.string(), repository_role: z.string(),
   default_branch: z.string(), current_branch: z.string(), head_commit: z.string(), is_dirty: z.boolean(),
   updated_at: z.string(), local_path: z.string().nullable().optional(), git_url: z.string().nullable().optional(),
+  archived_at: z.string().nullable().optional(), archived_from_status: z.string().nullable().optional(),
 });
 export const projectsSchema = z.object({ projects: z.array(projectSchema) });
 

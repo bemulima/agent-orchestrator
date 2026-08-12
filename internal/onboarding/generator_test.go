@@ -64,8 +64,16 @@ func TestGeneratorBuildsEvidenceBackedProposalWithoutWritingSource(t *testing.T)
 	}
 	assertProposed(t, proposal, ".ai/contracts/http.yaml")
 	assertProposed(t, proposal, ".ai/contracts/database.yaml")
+	assertProposed(t, proposal, ".ai/manifest.yaml")
+	assertProposed(t, proposal, ".ai/template.yaml")
+	assertProposed(t, proposal, ".ai/rules/common.md")
+	assertProposed(t, proposal, ".ai/agents/coder.md")
 	assertProposed(t, proposal, ".ai/agents/backend-coder.md")
 	assertProposed(t, proposal, ".ai/agents/migration-agent.md")
+	assertProposed(t, proposal, ".ai/workflows/bugfix.yaml")
+	assertProposed(t, proposal, ".ai/workflows/refactor.yaml")
+	assertProposed(t, proposal, ".ai/workflows/review.yaml")
+	assertProposed(t, proposal, ".ai/workflows/issue-delivery.yaml")
 	if hasProposed(proposal, ".ai/commands.yaml") || hasProposed(proposal, ".ai/workflows/test.yaml") {
 		t.Fatal("generator invented commands without command evidence")
 	}

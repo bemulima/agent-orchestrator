@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-07-27
+Last updated: 2026-08-12
 
 ## Current status
 
@@ -25,6 +25,13 @@ and visible in `/usage`; deterministic issue/PR templates spend no model quota.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, worker, and owner
 UI.
+Project lifecycle and agent-policy extraction are now implemented locally.
+Projects can be archived without deleting snapshots or history and restored to
+their exact pre-archive status. Active queries exclude archived sources from
+new planning, topology, discovery, and onboarding, while the owner catalog can
+still display and restore them. Canonical shared agent policy is versioned in
+the orchestrator and generated separately from repository-specific business,
+architecture, contract, command, and documentation evidence.
 All 38 requested repositories now resolve through clean orchestrator-managed
 clones of their merged remote default branches. The catalog contains 31
 services, two frontends, one infrastructure repository, and one repository in
@@ -1002,6 +1009,45 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   Playwright owner flows, and live in-app browser inspection. Existing plan,
   approval, work-item, and run rows were not normalized or otherwise changed;
   no real external resource was created.
+
+- Added reversible migration `015_project_lifecycle` with archive timestamp and
+  pre-archive status, a consistency constraint, and an active-project index.
+- Added transactional, audited, idempotent project archive and exact-status
+  restore operations. Archiving is rejected during scanning; scan and
+  onboarding fail closed for archived projects.
+- Default project listing now returns active projects only, which removes
+  archived sources from planning, conversations, and topology rebuilds. The
+  explicit `include_archived=true` catalog view keeps them visible to the owner.
+- Added CLI, Make, HTTP, and owner-UI archive/restore operations without remote
+  repository mutation or deletion.
+- Extracted reusable policy from reviewed `ms-course-promts` revision
+  `2a16785` into canonical template bundle `v1`, excluding journal state,
+  static repository inventory, unsafe copy-paste recipes, and unsupported
+  framework prescriptions.
+- Deterministic onboarding now separates `.ai/rules/common.md` and template
+  metadata from repository-specific service, architecture, contract, command,
+  and linked-document evidence. It includes coder/reviewer roles and explicit
+  bugfix, feature, refactor, review, and issue-delivery workflows.
+- Added `agent-template-check`, bundle checksum/validation tests, lifecycle use
+  case and HTTP tests, and owner UI schema/type coverage.
+- Added `docs/knowledge-source-retirement.md` with reviewed source revisions,
+  ownership rules, migration gates, and an explicit statement that no remote
+  source repository has been archived or deleted.
+- Verified the change with `make verify`, canonical template validation, and
+  the complete migration plus PostgreSQL integration suite in a disposable
+  `_test` database. Temporary database and role resources were removed.
+- Added the repository's own self-contained agent bundle with the same
+  byte-identical common rules and bundle checksum used by generated code-repo
+  onboarding, plus project-specific architecture, command, project-lifecycle,
+  onboarding, runtime, role, and task-workflow contracts.
+- Completed generator parity: every eligible target receives an exact
+  `.ai/manifest.yaml` plus bugfix, feature, refactor, review, and issue-delivery
+  workflows even when runtime classification is unknown. Policy,
+  documentation, and archive repositories are now explicitly rejected by
+  onboarding so central knowledge sources do not acquire agent architecture.
+- Added a documentation index, repository policy validator, and GitHub CI for
+  the complete non-destructive `make verify` path. Canonical project docs no
+  longer depend on an absolute path to the original architecture reference.
 
 ## Remaining work
 

@@ -41,6 +41,21 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.NotEqual(t, repo.coderThread, repo.reviewThreads[0])
 }
 
+func TestServiceRejectsArchivedProjectBeforePreparingWorktree(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	repo.executionContext.Project.Status = domain.ProjectStatusArchived
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{completedCoderResult(), approvedReviewResult()}}
+	service := fixtureService(repo, worktrees, runner, validator)
+
+	_, err = service.Execute(context.Background(), "task-1", "workflow-1")
+	require.ErrorIs(t, err, domain.ErrInvalidStatus)
+	require.Empty(t, worktrees.workspace.Path)
+	require.Empty(t, runner.roles)
+}
+
 func TestServiceStartsFreshCoderRevisionAndUsesANewReviewerThread(t *testing.T) {
 	validator, err := agent.NewValidator()
 	require.NoError(t, err)

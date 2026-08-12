@@ -30,6 +30,12 @@ func (uc Prepare) Handle(ctx context.Context, input PrepareInput) (domain.Onboar
 	if err != nil {
 		return domain.OnboardingRun{}, err
 	}
+	if project.Status == domain.ProjectStatusArchived {
+		return domain.OnboardingRun{}, fmt.Errorf("archived project cannot be onboarded; restore it first: %w", domain.ErrInvalidStatus)
+	}
+	if !supportsAgentArchitecture(project.RepositoryRole) {
+		return domain.OnboardingRun{}, fmt.Errorf("repository role %q does not receive agent architecture: %w", project.RepositoryRole, domain.ErrInvalidStatus)
+	}
 	if project.LocalPath == nil || strings.TrimSpace(*project.LocalPath) == "" {
 		return domain.OnboardingRun{}, fmt.Errorf("project has no local checkout: %w", domain.ErrInvalidStatus)
 	}
@@ -148,6 +154,12 @@ func (uc Apply) Handle(ctx context.Context, input ApplyInput) (ApplyOutput, erro
 	if err != nil {
 		return ApplyOutput{}, err
 	}
+	if project.Status == domain.ProjectStatusArchived {
+		return ApplyOutput{}, fmt.Errorf("archived project onboarding cannot be applied; restore it first: %w", domain.ErrInvalidStatus)
+	}
+	if !supportsAgentArchitecture(project.RepositoryRole) {
+		return ApplyOutput{}, fmt.Errorf("repository role %q cannot apply agent architecture: %w", project.RepositoryRole, domain.ErrInvalidStatus)
+	}
 	if input.DryRun {
 		result, dryRunErr := uc.Worktree.DryRun(ctx, project, run)
 		return ApplyOutput{Run: run, Result: result}, dryRunErr
@@ -188,6 +200,15 @@ func (uc Apply) Handle(ctx context.Context, input ApplyInput) (ApplyOutput, erro
 		return ApplyOutput{}, err
 	}
 	return ApplyOutput{Run: run, Result: result}, nil
+}
+
+func supportsAgentArchitecture(role domain.RepositoryRole) bool {
+	switch role {
+	case domain.RepositoryRolePolicy, domain.RepositoryRoleDocumentation, domain.RepositoryRoleArchive:
+		return false
+	default:
+		return true
+	}
 }
 
 func validatedRunID(value string) (string, error) {

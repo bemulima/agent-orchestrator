@@ -18,11 +18,12 @@ import (
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
+	"github.com/bemulima/agent-orchestrator/internal/onboarding/templates"
 )
 
 const (
 	proposalSchemaVersion = 1
-	generatorVersion      = "stage3-v1"
+	generatorVersion      = "stage3-v2"
 	managedStart          = "<!-- agent-orchestrator:start -->"
 	managedEnd            = "<!-- agent-orchestrator:end -->"
 )
@@ -187,6 +188,10 @@ func (g Generator) buildGeneratedFiles(
 	if err != nil {
 		return nil, fmt.Errorf("marshal commands manifest: %w", err)
 	}
+	templateProfileContent, err := yaml.Marshal(buildTemplateProfileManifest())
+	if err != nil {
+		return nil, fmt.Errorf("marshal template profile manifest: %w", err)
+	}
 	portableReport := report
 	portableReport.RepositoryPath = "."
 	reportContent, err := json.MarshalIndent(portableReport, "", "  ")
@@ -202,6 +207,12 @@ func (g Generator) buildGeneratedFiles(
 			explanation: "Store the exact discovery report used to generate this proposal.", evidencePaths: allEvidence},
 		{path: ".ai/agents/reviewer.md", content: reviewerAgent(), format: formatMarkdown,
 			explanation: "Add repository-scoped review instructions based on the generated manifest.", evidencePaths: allEvidence},
+		{path: ".ai/agents/coder.md", content: templates.Coder(), format: formatMarkdown,
+			explanation: "Add the shared implementation role while deferring architecture and business rules to repository evidence.", evidencePaths: allEvidence},
+		{path: ".ai/rules/common.md", content: templates.CommonRules(), format: formatMarkdown,
+			explanation: "Install the versioned shared delivery policy extracted from the retired prompts repository.", evidencePaths: allEvidence},
+		{path: ".ai/template.yaml", content: string(templateProfileContent), format: formatYAML,
+			explanation: "Separate shared policy metadata from repository-specific service, architecture, contract, and documentation rules.", evidencePaths: allEvidence},
 	}
 	architecturePaths := architectureEvidencePaths(report)
 	if len(architecturePaths) > 0 {
@@ -238,14 +249,30 @@ func (g Generator) buildGeneratedFiles(
 		files = append(files, generatedFile{path: ".ai/workflows/test.yaml", content: string(content), format: formatYAML,
 			explanation: "Run discovered verification commands.", evidencePaths: commandEvidencePaths(report)})
 	}
-	if snapshot.ServiceKind != domain.ServiceKindUnknown {
-		content, marshalErr := yaml.Marshal(buildFeatureWorkflow())
-		if marshalErr != nil {
-			return nil, fmt.Errorf("marshal feature workflow: %w", marshalErr)
-		}
-		files = append(files, generatedFile{path: ".ai/workflows/implement-feature.yaml", content: string(content), format: formatYAML,
-			explanation: "Provide an approval-aware feature workflow for the detected runtime service.", evidencePaths: allEvidence})
+	content, marshalErr := yaml.Marshal(buildFeatureWorkflow())
+	if marshalErr != nil {
+		return nil, fmt.Errorf("marshal feature workflow: %w", marshalErr)
 	}
+	files = append(files, generatedFile{path: ".ai/workflows/implement-feature.yaml", content: string(content), format: formatYAML,
+		explanation: "Provide an approval-aware feature workflow constrained by repository-specific evidence.", evidencePaths: allEvidence})
+	for path, workflow := range map[string]workflowManifest{
+		".ai/workflows/bugfix.yaml":         buildBugfixWorkflow(),
+		".ai/workflows/refactor.yaml":       buildRefactorWorkflow(),
+		".ai/workflows/issue-delivery.yaml": buildIssueDeliveryWorkflow(),
+	} {
+		workflowContent, marshalErr := yaml.Marshal(workflow)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("marshal %s: %w", path, marshalErr)
+		}
+		files = append(files, generatedFile{path: path, content: string(workflowContent), format: formatYAML,
+			explanation: "Provide a versioned shared delivery workflow constrained by repository-specific rules.", evidencePaths: allEvidence})
+	}
+	reviewContent, err := yaml.Marshal(buildReviewWorkflow())
+	if err != nil {
+		return nil, fmt.Errorf("marshal review workflow: %w", err)
+	}
+	files = append(files, generatedFile{path: ".ai/workflows/review.yaml", content: string(reviewContent), format: formatYAML,
+		explanation: "Provide an independent evidence-based review workflow.", evidencePaths: allEvidence})
 	if len(contractGroups) > 0 {
 		content, marshalErr := yaml.Marshal(buildContractWorkflow())
 		if marshalErr != nil {
@@ -254,6 +281,12 @@ func (g Generator) buildGeneratedFiles(
 		files = append(files, generatedFile{path: ".ai/workflows/change-contract.yaml", content: string(content), format: formatYAML,
 			explanation: "Require drift and consumer checks before contract changes.", evidencePaths: contractEvidencePaths(report)})
 	}
+	manifestContent, err := yaml.Marshal(buildAgentArchitectureManifest(project.Name, files))
+	if err != nil {
+		return nil, fmt.Errorf("marshal agent architecture manifest: %w", err)
+	}
+	files = append(files, generatedFile{path: ".ai/manifest.yaml", content: string(manifestContent), format: formatYAML,
+		explanation: "Index the exact shared and repository-specific agent architecture proposed for this repository.", evidencePaths: allEvidence})
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	return files, nil
 }

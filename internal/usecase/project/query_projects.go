@@ -26,6 +26,14 @@ type ListProjects struct {
 	Projects repository.ProjectRepository
 }
 
+type ListAllProjects struct {
+	Projects repository.ProjectLifecycleRepository
+}
+
+func (uc ListAllProjects) Handle(ctx context.Context) ([]domain.Project, error) {
+	return uc.Projects.ListAll(ctx)
+}
+
 func (uc ListProjects) Handle(ctx context.Context) ([]domain.Project, error) {
 	return uc.Projects.List(ctx)
 }

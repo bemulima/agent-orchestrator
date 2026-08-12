@@ -41,6 +41,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 	executionengine "github.com/bemulima/agent-orchestrator/internal/execution"
 	onboardinggenerator "github.com/bemulima/agent-orchestrator/internal/onboarding"
+	agenttemplates "github.com/bemulima/agent-orchestrator/internal/onboarding/templates"
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	agentusageuc "github.com/bemulima/agent-orchestrator/internal/usecase/agentusage"
@@ -94,6 +95,14 @@ func run(args []string) error {
 		fmt.Printf("course-dev-orchestrator %s (%s)\n", version, commit)
 		return nil
 	}
+	if command == "agent-template-check" {
+		if err := agenttemplates.Validate(); err != nil {
+			return fmt.Errorf("validate agent template bundle: %w", err)
+		}
+		return writeJSON(os.Stdout, map[string]string{
+			"status": "ok", "version": agenttemplates.Version, "checksum": agenttemplates.Checksum(),
+		})
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -119,7 +128,7 @@ func run(args []string) error {
 	case "telegram":
 		return runTelegram(cfg, logger)
 	case "project-connect", "project-list", "project-show", "project-scan", "project-report",
-		"project-onboard", "project-enrich", "project-diff", "project-approve", "project-reject", "project-apply":
+		"project-archive", "project-restore", "project-onboard", "project-enrich", "project-diff", "project-approve", "project-reject", "project-apply":
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
@@ -156,8 +165,11 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Connect:      projectOperations.Connect,
 		Get:          projectOperations.Get,
 		List:         projectOperations.List,
+		ListAll:      projectOperations.ListAll,
 		Scan:         projectOperations.Scan,
 		LatestReport: projectOperations.Latest,
+		Archive:      projectOperations.Archive,
+		Restore:      projectOperations.Restore,
 	}
 	onboardingOperations, err := newOnboardingOperations(cfg, pool)
 	if err != nil {
@@ -594,8 +606,11 @@ type projectOperations struct {
 	Connect projectuc.ConnectProject
 	Get     projectuc.GetProject
 	List    projectuc.ListProjects
+	ListAll projectuc.ListAllProjects
 	Scan    projectuc.ScanProject
 	Latest  projectuc.GetLatestDiscoveryReport
+	Archive projectuc.ArchiveProject
+	Restore projectuc.RestoreProject
 }
 
 func newProjectOperations(cfg config.Config, pool *pgxpool.Pool) projectOperations {
@@ -615,8 +630,11 @@ func newProjectOperations(cfg config.Config, pool *pgxpool.Pool) projectOperatio
 		Connect: projectuc.ConnectProject{Projects: projects, Sources: sources, Scan: scan},
 		Get:     projectuc.GetProject{Projects: projects},
 		List:    projectuc.ListProjects{Projects: projects},
+		ListAll: projectuc.ListAllProjects{Projects: projects},
 		Scan:    scan,
 		Latest:  projectuc.GetLatestDiscoveryReport{Projects: projects},
+		Archive: projectuc.ArchiveProject{Projects: projects},
+		Restore: projectuc.RestoreProject{Projects: projects},
 	}
 }
 
@@ -661,7 +679,7 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 			return err
 		}
 		return writeJSON(output, map[string]any{"projects": projects})
-	case "project-show", "project-scan", "project-report", "project-onboard", "project-enrich":
+	case "project-show", "project-scan", "project-report", "project-archive", "project-restore", "project-onboard", "project-enrich":
 		identifier, err := projectIdentifier(command, args)
 		if err != nil {
 			return err
@@ -683,6 +701,18 @@ func runProjectCommand(cfg config.Config, command string, args []string, output 
 			result, reportErr := operations.Latest.Handle(ctx, project.ID)
 			if reportErr != nil {
 				return reportErr
+			}
+			return writeJSON(output, result)
+		case "project-archive":
+			result, archiveErr := operations.Archive.Handle(ctx, project.ID)
+			if archiveErr != nil {
+				return archiveErr
+			}
+			return writeJSON(output, result)
+		case "project-restore":
+			result, restoreErr := operations.Restore.Handle(ctx, project.ID)
+			if restoreErr != nil {
+				return restoreErr
 			}
 			return writeJSON(output, result)
 		case "project-onboard":
@@ -1351,6 +1381,9 @@ Commands:
   project-show    Show a project by ID or unique name
   project-scan    Run read-only discovery for a project
   project-report  Show the latest discovery report
+  project-archive Archive a project without deleting history or snapshots
+  project-restore Restore a project to its pre-archive status
+  agent-template-check Validate the canonical shared agent template bundle
   project-onboard Prepare an evidence-backed onboarding proposal
   project-enrich  Prepare a Codex semantic onboarding proposal with quoted evidence
   project-diff    Print an onboarding proposal diff

@@ -2,6 +2,8 @@
 
 ## Before changing files
 
+- Read `.ai/rules/common.md`, `.ai/service.yaml`, `.ai/commands.yaml`, and
+  `docs/README.md` before selecting project-specific documentation.
 - Read `docs/architecture-conventions.md`, `docs/implementation-plan.md`, and
   `docs/progress.md`.
 - Update `docs/progress.md` after each completed implementation stage.
@@ -22,6 +24,8 @@
 ## Security invariants
 
 - Discovery is read-only until a persisted approval exists.
+- Repositories classified as policy, documentation, or archive are knowledge
+  sources and must not receive generated agent architecture.
 - Never read `.env` files from managed repositories or log secret values.
 - Validate canonical repository paths against all configured allowed roots.
 - One task uses one repository, worktree, branch, and Codex thread.
@@ -37,3 +41,5 @@
   `GOMODCACHE=$PWD/.cache/gomod`, `GOBIN=$PWD/.cache/bin`.
 - Run `make verify` before handoff. Integration tests must use fixtures, never
   real user repositories.
+- Run only commands declared in `.ai/commands.yaml`; commands marked
+  `requires_approval: true` need a separate owner gate.

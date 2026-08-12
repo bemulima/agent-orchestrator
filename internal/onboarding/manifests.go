@@ -5,7 +5,80 @@ import (
 	"strings"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
+	"github.com/bemulima/agent-orchestrator/internal/onboarding/templates"
 )
+
+type templateProfileManifest struct {
+	SchemaVersion        int      `yaml:"schema_version"`
+	BundleVersion        string   `yaml:"bundle_version"`
+	BundleChecksum       string   `yaml:"bundle_checksum"`
+	CommonRules          string   `yaml:"common_rules"`
+	ProjectSpecificRules []string `yaml:"project_specific_rules"`
+}
+
+type projectSpecificManifest struct {
+	Service      string   `yaml:"service"`
+	Architecture string   `yaml:"architecture,omitempty"`
+	Commands     string   `yaml:"commands,omitempty"`
+	Contracts    []string `yaml:"contracts,omitempty"`
+}
+
+type agentArchitectureManifest struct {
+	SchemaVersion   int                     `yaml:"schema_version"`
+	Project         string                  `yaml:"project"`
+	Template        string                  `yaml:"template"`
+	Entrypoint      string                  `yaml:"entrypoint"`
+	CommonRules     string                  `yaml:"common_rules"`
+	Agents          []string                `yaml:"agents"`
+	Workflows       []string                `yaml:"workflows"`
+	ProjectSpecific projectSpecificManifest `yaml:"project_specific"`
+}
+
+func buildAgentArchitectureManifest(projectName string, files []generatedFile) agentArchitectureManifest {
+	manifest := agentArchitectureManifest{
+		SchemaVersion: 1,
+		Project:       projectName,
+		Template:      ".ai/template.yaml",
+		Entrypoint:    "AGENTS.md",
+		CommonRules:   ".ai/rules/common.md",
+		ProjectSpecific: projectSpecificManifest{
+			Service: ".ai/service.yaml",
+		},
+	}
+	for _, file := range files {
+		switch {
+		case strings.HasPrefix(file.path, ".ai/agents/"):
+			manifest.Agents = append(manifest.Agents, file.path)
+		case strings.HasPrefix(file.path, ".ai/workflows/"):
+			manifest.Workflows = append(manifest.Workflows, file.path)
+		case strings.HasPrefix(file.path, ".ai/contracts/"):
+			manifest.ProjectSpecific.Contracts = append(manifest.ProjectSpecific.Contracts, file.path)
+		case file.path == ".ai/architecture.yaml":
+			manifest.ProjectSpecific.Architecture = file.path
+		case file.path == ".ai/commands.yaml":
+			manifest.ProjectSpecific.Commands = file.path
+		}
+	}
+	sort.Strings(manifest.Agents)
+	sort.Strings(manifest.Workflows)
+	sort.Strings(manifest.ProjectSpecific.Contracts)
+	return manifest
+}
+
+func buildTemplateProfileManifest() templateProfileManifest {
+	return templateProfileManifest{
+		SchemaVersion:  1,
+		BundleVersion:  templates.Version,
+		BundleChecksum: templates.Checksum(),
+		CommonRules:    ".ai/rules/common.md",
+		ProjectSpecificRules: []string{
+			".ai/service.yaml",
+			".ai/architecture.yaml when generated from repository evidence",
+			".ai/contracts/** when generated from repository evidence",
+			"instruction files linked by .ai/service.yaml",
+		},
+	}
+}
 
 type manifestFact struct {
 	Name        string  `yaml:"name" json:"name"`
@@ -213,12 +286,32 @@ func buildContractWorkflow() workflowManifest {
 		Steps: []string{"identify producers and consumers", "update versioned contract evidence", "check compatibility and drift", "run repository verification", "request independent review"}}
 }
 
+func buildBugfixWorkflow() workflowManifest {
+	return workflowManifest{SchemaVersion: 1, Name: "bugfix", RequiresApproval: true,
+		Steps: []string{"read the issue and repository rules", "reproduce or characterize the failure", "identify the root cause and affected contract", "implement the smallest safe fix", "add or update a regression test", "run repository verification", "request independent review"}}
+}
+
+func buildRefactorWorkflow() workflowManifest {
+	return workflowManifest{SchemaVersion: 1, Name: "refactor", RequiresApproval: true,
+		Steps: []string{"read the issue and repository rules", "state preserved behavior and establish a passing baseline", "change structure within approved scope", "verify public contracts and configuration remain compatible", "run repository verification", "request independent review"}}
+}
+
+func buildReviewWorkflow() workflowManifest {
+	return workflowManifest{SchemaVersion: 1, Name: "review", RequiresApproval: false,
+		Steps: []string{"read the issue and repository rules", "inspect the real diff independently", "check correctness, security, data, contracts, migrations, tests, and scope", "report actionable findings with exact locations before summary"}}
+}
+
+func buildIssueDeliveryWorkflow() workflowManifest {
+	return workflowManifest{SchemaVersion: 1, Name: "issue-delivery", RequiresApproval: true,
+		Steps: []string{"confirm issue acceptance criteria and repository ownership", "use an isolated worktree and branch", "implement within approved write scope", "run discovered verification", "request independent review", "prepare a linked pull or merge request", "publish only with owner authorization"}}
+}
+
 func agentsManagedBlock() string {
-	return "## Agent Orchestrator (Managed)\n\nRead `.ai/service.yaml` before repository work. Follow every linked repository instruction and prompt. Do not edit files outside an explicitly approved write scope."
+	return templates.AgentsManagedBlock()
 }
 
 func reviewerAgent() string {
-	return "# Reviewer\n\nReview the real Git diff independently. Verify write scope, discovered commands, contracts, migrations, and evidence-backed acceptance criteria. Do not reuse the coder thread."
+	return templates.Reviewer()
 }
 
 func backendAgent(hasCommands bool) string {
@@ -226,7 +319,7 @@ func backendAgent(hasCommands bool) string {
 	if hasCommands {
 		verification = "Run only commands listed in `.ai/commands.yaml` with `requires_approval: false`. Request explicit owner approval before any command marked `requires_approval: true`."
 	}
-	return "# Backend Coder\n\nRead `.ai/service.yaml`, linked instructions, and relevant contracts before implementation. Keep domain, use-case, and adapter boundaries intact. " + verification
+	return templates.BackendCoder(verification)
 }
 
 func classifyCommandRisk(name, command string) (bool, string) {
@@ -272,7 +365,7 @@ func classifyCommandRisk(name, command string) (bool, string) {
 }
 
 func migrationAgent() string {
-	return "# Migration Agent\n\nTreat migrations as versioned contracts. Provide a reversible migration, preserve existing data, validate ordering, and run the repository's discovered migration checks."
+	return templates.MigrationAgent()
 }
 
 func isBackendKind(kind domain.ServiceKind) bool {

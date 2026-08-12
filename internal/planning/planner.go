@@ -57,6 +57,11 @@ func (p Planner) Build(
 		projects[project.ID] = project
 	}
 	for _, service := range catalog.Services {
+		if request.AvailableProjects != nil {
+			if _, active := projects[service.ProjectID]; !active {
+				continue
+			}
+		}
 		services[service.ProjectID] = service
 	}
 	for _, project := range request.AvailableProjects {

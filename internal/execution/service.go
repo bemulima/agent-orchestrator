@@ -39,6 +39,9 @@ func (s Service) Execute(
 	if err != nil {
 		return domain.TaskExecutionOutcome{}, err
 	}
+	if executionContext.Project.Status == domain.ProjectStatusArchived {
+		return domain.TaskExecutionOutcome{}, fmt.Errorf("archived project task cannot execute; restore it first: %w", domain.ErrInvalidStatus)
+	}
 	attempts, err := s.Repository.ListAttempts(ctx, taskID)
 	if err != nil {
 		return domain.TaskExecutionOutcome{}, err

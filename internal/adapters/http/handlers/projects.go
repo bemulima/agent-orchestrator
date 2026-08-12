@@ -36,12 +36,37 @@ type latestDiscoveryUseCase interface {
 	Handle(context.Context, string) (projectuc.LatestDiscoveryResult, error)
 }
 
+type projectLifecycleUseCase interface {
+	Handle(context.Context, string) (domain.Project, error)
+}
+
 type ProjectHandler struct {
 	Connect      connectProjectUseCase
 	Get          getProjectUseCase
 	List         listProjectsUseCase
+	ListAll      listProjectsUseCase
 	Scan         scanProjectUseCase
 	LatestReport latestDiscoveryUseCase
+	Archive      projectLifecycleUseCase
+	Restore      projectLifecycleUseCase
+}
+
+func (h ProjectHandler) ArchiveProject(w http.ResponseWriter, r *http.Request) {
+	project, err := h.Archive.Handle(r.Context(), chi.URLParam(r, "projectId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, project)
+}
+
+func (h ProjectHandler) RestoreProject(w http.ResponseWriter, r *http.Request) {
+	project, err := h.Restore.Handle(r.Context(), chi.URLParam(r, "projectId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, project)
 }
 
 func (h ProjectHandler) ConnectProject(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +84,11 @@ func (h ProjectHandler) ConnectProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
-	projects, err := h.List.Handle(r.Context())
+	useCase := h.List
+	if r.URL.Query().Get("include_archived") == "true" {
+		useCase = h.ListAll
+	}
+	projects, err := useCase.Handle(r.Context())
 	if err != nil {
 		WriteDomainError(w, err)
 		return

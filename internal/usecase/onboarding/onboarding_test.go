@@ -64,6 +64,32 @@ func TestPrepareUsesSemanticGeneratorOnlyWhenRequested(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsKnowledgeRepositoryRoles(t *testing.T) {
+	path := "/projects/knowledge"
+	for _, role := range []domain.RepositoryRole{
+		domain.RepositoryRolePolicy,
+		domain.RepositoryRoleDocumentation,
+		domain.RepositoryRoleArchive,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			generator := &generatorFake{}
+			useCase := Prepare{
+				Projects: &projectRepositoryFake{project: domain.Project{
+					ID: "project-id", LocalPath: &path, RepositoryRole: role,
+				}},
+				Generator: generator,
+			}
+			_, err := useCase.Handle(context.Background(), PrepareInput{ProjectID: "project-id"})
+			if !errors.Is(err, domain.ErrInvalidStatus) {
+				t.Fatalf("Handle() error = %v, want invalid status", err)
+			}
+			if generator.calls != 0 {
+				t.Fatal("generator ran for a knowledge repository")
+			}
+		})
+	}
+}
+
 func TestApplyEnforcesApprovalButAllowsReadOnlyDryRun(t *testing.T) {
 	path := "/projects/orders"
 	project := domain.Project{ID: "project-id", LocalPath: &path}
@@ -100,6 +126,25 @@ func TestApplyEnforcesApprovalButAllowsReadOnlyDryRun(t *testing.T) {
 	if worktrees.applyCalls != 1 || publisher.calls != 1 || runs.publicationCalls != 1 ||
 		runs.completeCalls != 1 || output.Run.Status != domain.OnboardingStatusCompleted || !output.Result.Publication.Published {
 		t.Fatalf("approved apply was not completed: output=%#v", output)
+	}
+}
+
+func TestApplyRejectsKnowledgeRepositoryRole(t *testing.T) {
+	path := "/projects/journal"
+	run := domain.OnboardingRun{ID: "00000000-0000-4000-8000-000000000001", ProjectID: "project-id"}
+	worktrees := &worktreeFake{}
+	useCase := Apply{
+		Projects: &projectRepositoryFake{project: domain.Project{
+			ID: run.ProjectID, LocalPath: &path, RepositoryRole: domain.RepositoryRoleArchive,
+		}},
+		Runs: &onboardingRepositoryFake{run: run}, Worktree: worktrees,
+	}
+	_, err := useCase.Handle(context.Background(), ApplyInput{RunID: run.ID, DryRun: true})
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("Handle() error = %v, want invalid status", err)
+	}
+	if worktrees.dryRunCalls != 0 || worktrees.applyCalls != 0 {
+		t.Fatal("knowledge repository reached worktree adapter")
 	}
 }
 

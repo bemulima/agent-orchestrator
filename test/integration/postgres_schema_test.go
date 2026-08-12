@@ -557,6 +557,54 @@ func TestProjectRepositoryPersistsIdempotentDiscovery(t *testing.T) {
 	if !json.Valid(latest.RawReport) {
 		t.Fatalf("raw report is invalid JSON: %s", latest.RawReport)
 	}
+	archived, err := repository.Archive(context.Background(), project.ID)
+	if err != nil {
+		t.Fatalf("Archive() error = %v", err)
+	}
+	if archived.Status != domain.ProjectStatusArchived || archived.ArchivedAt == nil ||
+		archived.ArchivedFrom == nil || *archived.ArchivedFrom != domain.ProjectStatusAnalyzed {
+		t.Fatalf("archived project = %#v", archived)
+	}
+	reconnectInput := projectInput
+	reconnectInput.HeadCommit = "unexpected-new-head"
+	reconnected, err := repository.Upsert(context.Background(), reconnectInput)
+	if err != nil {
+		t.Fatalf("archived Upsert() error = %v", err)
+	}
+	if reconnected.Status != domain.ProjectStatusArchived || reconnected.HeadCommit != archived.HeadCommit {
+		t.Fatalf("archived Upsert() mutated project = %#v", reconnected)
+	}
+	active, err := repository.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, item := range active {
+		if item.ID == project.ID {
+			t.Fatalf("archived project leaked into active list: %#v", item)
+		}
+	}
+	all, err := repository.ListAll(context.Background())
+	if err != nil {
+		t.Fatalf("ListAll() error = %v", err)
+	}
+	foundArchived := false
+	for _, item := range all {
+		foundArchived = foundArchived || item.ID == project.ID && item.Status == domain.ProjectStatusArchived
+	}
+	if !foundArchived {
+		t.Fatalf("archived project missing from complete catalog")
+	}
+	restored, err := repository.Restore(context.Background(), project.ID)
+	if err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	if restored.Status != domain.ProjectStatusAnalyzed || restored.ArchivedAt != nil || restored.ArchivedFrom != nil {
+		t.Fatalf("restored project = %#v", restored)
+	}
+	latestAfterRestore, _, err := repository.GetLatestDiscovery(context.Background(), project.ID)
+	if err != nil || latestAfterRestore.ID != latest.ID {
+		t.Fatalf("discovery snapshot changed across archive/restore: %#v, error = %v", latestAfterRestore, err)
+	}
 }
 
 func TestTopologyRepositoryReplacesCatalogIdempotently(t *testing.T) {

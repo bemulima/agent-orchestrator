@@ -44,6 +44,8 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Post("/api/v1/projects/connect", deps.ProjectHandler.ConnectProject)
 		root.Get("/api/v1/projects/{projectId}", deps.ProjectHandler.GetProject)
 		root.Post("/api/v1/projects/{projectId}/scan", deps.ProjectHandler.ScanProject)
+		root.Post("/api/v1/projects/{projectId}/archive", deps.ProjectHandler.ArchiveProject)
+		root.Post("/api/v1/projects/{projectId}/restore", deps.ProjectHandler.RestoreProject)
 		root.Get("/api/v1/projects/{projectId}/reports/latest", deps.ProjectHandler.LatestDiscoveryReport)
 	}
 	if deps.OnboardingHandler != nil {

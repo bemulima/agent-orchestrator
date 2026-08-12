@@ -121,12 +121,15 @@ course-dev-orchestrator worker
 course-dev-orchestrator workflow-probe
 course-dev-orchestrator telegram
 course-dev-orchestrator config-check
+course-dev-orchestrator agent-template-check
 course-dev-orchestrator project-connect --path /absolute/repository --role service
 course-dev-orchestrator project-connect --git-url https://git.example/group/repository.git --role service
 course-dev-orchestrator project-list
 course-dev-orchestrator project-show --service repository-name
 course-dev-orchestrator project-scan --service repository-name
 course-dev-orchestrator project-report --service repository-name
+course-dev-orchestrator project-archive --service repository-name
+course-dev-orchestrator project-restore --service repository-name
 course-dev-orchestrator project-onboard --service repository-name [--dry-run]
 course-dev-orchestrator project-enrich --service repository-name
 course-dev-orchestrator project-diff --run-id UUID
@@ -249,6 +252,9 @@ make project-list
 make project-show SERVICE=repository-name
 make project-scan SERVICE=repository-name
 make project-report SERVICE=repository-name
+make project-archive SERVICE=repository-name
+make project-restore SERVICE=repository-name
+make agent-template-check
 ```
 
 `PROJECT_PATH` is also accepted instead of `PATH`. The latter is preserved for
@@ -261,9 +267,17 @@ The Stage 2 HTTP API is synchronous and available under `/api/v1`:
 - `GET /api/v1/projects`;
 - `GET /api/v1/projects/{projectId}`;
 - `POST /api/v1/projects/{projectId}/scan`;
+- `POST /api/v1/projects/{projectId}/archive`;
+- `POST /api/v1/projects/{projectId}/restore`;
 - `GET /api/v1/projects/{projectId}/reports/latest`.
 
 Connecting the same source and retrying an unchanged scan are idempotent.
+The default project list contains only active projects, so archived projects
+cannot enter new plans, topology rebuilds, scans, or onboarding runs. The owner
+catalog uses `GET /api/v1/projects?include_archived=true` to keep archived
+records discoverable. Archive preserves snapshots and history and records the
+previous status; restore returns to that exact status. A project cannot be
+archived while its discovery scan is running.
 
 For the Docker Compose stack, `PROJECTS_HOST_ROOT` is the host directory bound
 into both the API and worker at `/projects`. Persist container paths such as
@@ -282,11 +296,22 @@ explicit conflicts. Prompt/instruction files are linked by path and checksum,
 never copied or rewritten automatically. Generated repository paths are
 portable and do not embed an absolute local checkout path.
 
-Only files supported by discovery evidence are proposed. Depending on the
-evidence, this can include `AGENTS.md`, `.ai/service.yaml`, architecture,
-commands, HTTP/event/database contracts, specialized agent instructions,
-workflows, and `.ai/discovery/latest-report.json`. Missing evidence means the
-corresponding file is omitted.
+Every eligible code/content/infrastructure proposal includes the versioned shared policy profile:
+`AGENTS.md`, `.ai/template.yaml`, `.ai/rules/common.md`, the coder/reviewer
+roles, and issue-delivery, bugfix, feature, refactor, and review workflows.
+These shared rules explicitly use issues rather than a separate journal and
+cover Git, issue, pull/merge request, coding, review, testing, migration, and
+contract safety. Repository-specific business and architecture truth remains
+in `.ai/service.yaml`, evidence-backed architecture/contracts, and linked local
+documentation. Optional commands, contracts, migration guidance, and test
+workflows are still generated only when repository evidence supports them.
+Run `make agent-template-check` to validate and checksum the canonical bundle;
+use `project-onboard` plus `project-diff` to check a repository for generated
+policy drift without changing its checkout.
+Repositories connected as `policy`, `documentation`, or `archive` are
+knowledge sources rather than agent-runtime targets and are rejected by
+onboarding. Their useful content must be migrated into owning code repositories
+before the source project is archived.
 
 The normal owner flow is:
 

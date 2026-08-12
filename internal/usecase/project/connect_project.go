@@ -74,6 +74,9 @@ func (uc ConnectProject) Handle(ctx context.Context, input ConnectInput) (Connec
 	if err != nil {
 		return ConnectResult{}, err
 	}
+	if project.Status == domain.ProjectStatusArchived {
+		return ConnectResult{}, fmt.Errorf("project is archived; restore it before reconnecting: %w", domain.ErrInvalidStatus)
+	}
 	project, snapshot, report, err := uc.Scan.handleSource(ctx, project, source)
 	if err != nil {
 		return ConnectResult{}, err

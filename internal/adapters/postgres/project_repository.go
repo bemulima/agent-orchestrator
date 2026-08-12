@@ -24,6 +24,16 @@ func (r ProjectRepoPG) Upsert(ctx context.Context, project domain.Project) (doma
 		return domain.Project{}, fmt.Errorf("begin project transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	existing, err := scanProject(tx.QueryRow(ctx, `SELECT `+projectColumns+` FROM project WHERE source_identity = $1 FOR UPDATE`, project.SourceIdentity))
+	if err == nil && existing.Status == domain.ProjectStatusArchived {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.Project{}, fmt.Errorf("commit archived project lookup transaction: %w", err)
+		}
+		return existing, nil
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return domain.Project{}, mapProjectError(err)
+	}
 	row := tx.QueryRow(ctx, `
 INSERT INTO project (
     name, status, repository_role, source_identity, local_path, git_url,
@@ -101,7 +111,19 @@ func (r ProjectRepoPG) GetByName(ctx context.Context, name string) (domain.Proje
 }
 
 func (r ProjectRepoPG) List(ctx context.Context) ([]domain.Project, error) {
-	rows, err := r.Pool.Query(ctx, `SELECT `+projectColumns+` FROM project ORDER BY name, id`)
+	return r.list(ctx, false)
+}
+
+func (r ProjectRepoPG) ListAll(ctx context.Context) ([]domain.Project, error) {
+	return r.list(ctx, true)
+}
+
+func (r ProjectRepoPG) list(ctx context.Context, includeArchived bool) ([]domain.Project, error) {
+	query := `SELECT ` + projectColumns + ` FROM project WHERE status <> 'archived' ORDER BY name, id`
+	if includeArchived {
+		query = `SELECT ` + projectColumns + ` FROM project ORDER BY name, id`
+	}
+	rows, err := r.Pool.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
 	}
@@ -136,10 +158,85 @@ UPDATE project SET
     is_dirty = $7,
     updated_at = now()
 WHERE id = $1
+  AND status <> 'archived'
 RETURNING `+projectColumns,
 		id, status, source.GitURL, source.DefaultBranch, source.CurrentBranch, source.HeadCommit, source.IsDirty,
 	))
 	return project, mapProjectError(err)
+}
+
+func (r ProjectRepoPG) Archive(ctx context.Context, id string) (domain.Project, error) {
+	tx, err := r.Pool.Begin(ctx)
+	if err != nil {
+		return domain.Project{}, fmt.Errorf("begin project archive transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	current, err := scanProject(tx.QueryRow(ctx, `SELECT `+projectColumns+` FROM project WHERE id = $1 FOR UPDATE`, id))
+	if err != nil {
+		return domain.Project{}, mapProjectError(err)
+	}
+	if current.Status == domain.ProjectStatusArchived {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.Project{}, fmt.Errorf("commit idempotent project archive transaction: %w", err)
+		}
+		return current, nil
+	}
+	if current.Status == domain.ProjectStatusScanning {
+		return domain.Project{}, fmt.Errorf("project is currently scanning: %w", domain.ErrInvalidStatus)
+	}
+
+	archived, err := scanProject(tx.QueryRow(ctx, `
+UPDATE project SET
+    status = 'archived', archived_from_status = status, archived_at = now(), updated_at = now()
+WHERE id = $1
+RETURNING `+projectColumns, id))
+	if err != nil {
+		return domain.Project{}, mapProjectError(err)
+	}
+	if err := insertAuditTx(ctx, tx, "project.archived", archived.ID, map[string]any{
+		"archived_from_status": current.Status,
+	}); err != nil {
+		return domain.Project{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Project{}, fmt.Errorf("commit project archive transaction: %w", err)
+	}
+	return archived, nil
+}
+
+func (r ProjectRepoPG) Restore(ctx context.Context, id string) (domain.Project, error) {
+	tx, err := r.Pool.Begin(ctx)
+	if err != nil {
+		return domain.Project{}, fmt.Errorf("begin project restore transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	current, err := scanProject(tx.QueryRow(ctx, `SELECT `+projectColumns+` FROM project WHERE id = $1 FOR UPDATE`, id))
+	if err != nil {
+		return domain.Project{}, mapProjectError(err)
+	}
+	if current.Status != domain.ProjectStatusArchived || current.ArchivedFrom == nil {
+		return domain.Project{}, fmt.Errorf("project is not archived: %w", domain.ErrInvalidStatus)
+	}
+	restoredStatus := *current.ArchivedFrom
+	restored, err := scanProject(tx.QueryRow(ctx, `
+UPDATE project SET
+    status = archived_from_status, archived_from_status = NULL, archived_at = NULL, updated_at = now()
+WHERE id = $1
+RETURNING `+projectColumns, id))
+	if err != nil {
+		return domain.Project{}, mapProjectError(err)
+	}
+	if err := insertAuditTx(ctx, tx, "project.restored", restored.ID, map[string]any{
+		"restored_status": restoredStatus,
+	}); err != nil {
+		return domain.Project{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Project{}, fmt.Errorf("commit project restore transaction: %w", err)
+	}
+	return restored, nil
 }
 
 func (r ProjectRepoPG) UpdateStatus(ctx context.Context, id string, status domain.ProjectStatus) error {
@@ -308,7 +405,7 @@ LIMIT 1`, projectID).Scan(
 
 const projectColumns = `id, name, status, repository_role, source_identity,
 local_path, git_url, default_branch, current_branch, head_commit, is_dirty,
-gitlab_project_id, created_at, updated_at`
+gitlab_project_id, archived_at, archived_from_status, created_at, updated_at`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -329,6 +426,8 @@ func scanProject(row rowScanner) (domain.Project, error) {
 		&project.HeadCommit,
 		&project.IsDirty,
 		&project.GitLabProjectID,
+		&project.ArchivedAt,
+		&project.ArchivedFrom,
 		&project.CreatedAt,
 		&project.UpdatedAt,
 	)

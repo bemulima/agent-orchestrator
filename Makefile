@@ -25,7 +25,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check agent-policy agent-template-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-archive project-restore project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -97,6 +97,12 @@ telegram: ## Run Telegram long polling, or configure the webhook when TELEGRAM_W
 config-check: ## Validate environment and print a secret-free summary
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator config-check
 
+agent-policy: ## Validate repository-local agent architecture and canonical bundle parity
+	./scripts/check-agent-policy.sh
+
+agent-template-check: ## Validate and checksum the canonical shared agent policy bundle
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator agent-template-check
+
 codex-auth-sync: ## Copy the existing local codex-cli ChatGPT login into the worker volume
 	COMPOSE_COMMAND="$(COMPOSE)" ./scripts/sync-codex-auth.sh "$(CODEX_HOST_AUTH_FILE)"
 
@@ -122,6 +128,14 @@ project-scan: ## Run read-only discovery for SERVICE=id-or-name
 project-report: ## Show latest discovery report for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
 	$(ORCHESTRATOR_CLI) project-report --service "$(SERVICE)"
+
+project-archive: ## Archive SERVICE=id-or-name without deleting history
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(ORCHESTRATOR_CLI) project-archive --service "$(SERVICE)"
+
+project-restore: ## Restore SERVICE=id-or-name to its pre-archive status
+	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
+	$(ORCHESTRATOR_CLI) project-restore --service "$(SERVICE)"
 
 project-onboard: ## Prepare onboarding proposal for SERVICE=id-or-name (optional DRY_RUN=true)
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
@@ -285,4 +299,4 @@ runner-test: ## Build and test the pinned Codex SDK runner
 compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet
 
-verify: fmt-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks
+verify: agent-policy fmt-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks

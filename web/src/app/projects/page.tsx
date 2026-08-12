@@ -15,7 +15,7 @@ type Project = z.infer<typeof projectSchema>;
 
 export default function ProjectsPage() {
   const [search, setSearch] = useState("");
-  const query = useQuery({ queryKey: ["projects"], queryFn: () => apiGet("/api/v1/projects", projectsSchema) });
+  const query = useQuery({ queryKey: ["projects", "catalog"], queryFn: () => apiGet("/api/v1/projects?include_archived=true", projectsSchema) });
   const columns = useMemo<ColumnDef<Project>[]>(() => [
     { header: "Проект", accessorKey: "name", cell: ({ row }) => <Link className="row-link" href={`/projects/${row.original.id}`}>{row.original.name}<small>{shortID(row.original.id)}</small></Link> },
     { header: "Роль", accessorKey: "repository_role" },
@@ -27,5 +27,7 @@ export default function ProjectsPage() {
   if (query.isLoading) return <Loading />;
   if (query.error) return <Failure error={query.error} />;
   const projects = query.data!.projects.filter(item => item.name.toLowerCase().includes(search.toLowerCase()));
-  return <div className="page"><header><div><p className="eyebrow">Каталог</p><h1>Проекты</h1><p>{query.data!.projects.length} подключённых репозиториев.</p></div><Link className="primary action-link" href="/projects/connect">Подключить проект</Link></header><div className="toolbar"><label>Поиск проекта<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Название" /></label></div><section className="panel"><DataTable data={projects} columns={columns} /></section></div>;
+  const activeCount = query.data!.projects.filter(item => item.status !== "archived").length;
+  const archivedCount = query.data!.projects.length - activeCount;
+  return <div className="page"><header><div><p className="eyebrow">Каталог</p><h1>Проекты</h1><p>{activeCount} активных репозиториев{archivedCount ? ` · ${archivedCount} в архиве` : ""}.</p></div><Link className="primary action-link" href="/projects/connect">Подключить проект</Link></header><div className="toolbar"><label>Поиск проекта<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Название" /></label></div><section className="panel"><DataTable data={projects} columns={columns} /></section></div>;
 }

@@ -84,6 +84,73 @@ func TestScanProject_MarksFailedWhenScannerFails(t *testing.T) {
 	}
 }
 
+func TestProjectLifecycle_ArchivesAndRestoresPreviousStatus(t *testing.T) {
+	repository := newMemoryProjectRepository()
+	path := "/allowed/fixture"
+	created, err := repository.Upsert(context.Background(), domain.Project{
+		Name: "fixture", SourceIdentity: "local:fixture", LocalPath: &path,
+		Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	archived, err := (ArchiveProject{Projects: repository}).Handle(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("ArchiveProject.Handle() error = %v", err)
+	}
+	if archived.Status != domain.ProjectStatusArchived || archived.ArchivedAt == nil ||
+		archived.ArchivedFrom == nil || *archived.ArchivedFrom != domain.ProjectStatusAnalyzed {
+		t.Fatalf("archived project = %#v", archived)
+	}
+	if projects, listErr := repository.List(context.Background()); listErr != nil || len(projects) != 0 {
+		t.Fatalf("active projects after archive = %#v, error = %v", projects, listErr)
+	}
+	if _, scanErr := (ScanProject{Projects: repository}).Handle(context.Background(), created.ID); !errors.Is(scanErr, domain.ErrInvalidStatus) {
+		t.Fatalf("archived scan error = %v, want invalid status", scanErr)
+	}
+	sources := &fakeProjectSource{source: domain.RepositorySource{
+		Name: "fixture", Identity: "local:fixture", LocalPath: path, HeadCommit: "unexpected-new-head",
+	}}
+	connect := ConnectProject{Projects: repository, Sources: sources, Scan: ScanProject{Projects: repository}}
+	if _, connectErr := connect.Handle(context.Background(), ConnectInput{LocalPath: path}); !errors.Is(connectErr, domain.ErrInvalidStatus) {
+		t.Fatalf("archived reconnect error = %v, want invalid status", connectErr)
+	}
+	unchanged, err := repository.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get() archived project error = %v", err)
+	}
+	if unchanged.HeadCommit != created.HeadCommit {
+		t.Fatalf("archived reconnect changed head commit to %q", unchanged.HeadCommit)
+	}
+
+	restored, err := (RestoreProject{Projects: repository}).Handle(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("RestoreProject.Handle() error = %v", err)
+	}
+	if restored.Status != domain.ProjectStatusAnalyzed || restored.ArchivedAt != nil || restored.ArchivedFrom != nil {
+		t.Fatalf("restored project = %#v", restored)
+	}
+}
+
+func TestProjectLifecycle_RejectsScanningArchiveAndActiveRestore(t *testing.T) {
+	repository := newMemoryProjectRepository()
+	path := "/allowed/fixture"
+	created, err := repository.Upsert(context.Background(), domain.Project{
+		Name: "fixture", SourceIdentity: "local:fixture", LocalPath: &path,
+		Status: domain.ProjectStatusScanning, RepositoryRole: domain.RepositoryRoleService,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, archiveErr := (ArchiveProject{Projects: repository}).Handle(context.Background(), created.ID); !errors.Is(archiveErr, domain.ErrInvalidStatus) {
+		t.Fatalf("scanning archive error = %v, want invalid status", archiveErr)
+	}
+	if _, restoreErr := (RestoreProject{Projects: repository}).Handle(context.Background(), created.ID); !errors.Is(restoreErr, domain.ErrInvalidStatus) {
+		t.Fatalf("active restore error = %v, want invalid status", restoreErr)
+	}
+}
+
 func TestSnapshotFromReport(t *testing.T) {
 	report := domain.DiscoveryReport{
 		CommitSHA: "abc", Branch: "feature", IsDirty: true,
@@ -181,6 +248,9 @@ func newMemoryProjectRepository() *memoryProjectRepository {
 func (r *memoryProjectRepository) Upsert(_ context.Context, project domain.Project) (domain.Project, error) {
 	if id, exists := r.identities[project.SourceIdentity]; exists {
 		existing := r.projects[id]
+		if existing.Status == domain.ProjectStatusArchived {
+			return existing, nil
+		}
 		existing.HeadCommit = project.HeadCommit
 		existing.CurrentBranch = project.CurrentBranch
 		existing.IsDirty = project.IsDirty
@@ -229,15 +299,64 @@ func (r *memoryProjectRepository) GetByName(_ context.Context, name string) (dom
 func (r *memoryProjectRepository) List(context.Context) ([]domain.Project, error) {
 	projects := make([]domain.Project, 0, len(r.projects))
 	for _, project := range r.projects {
+		if project.Status == domain.ProjectStatusArchived {
+			continue
+		}
 		projects = append(projects, project)
 	}
 	return projects, nil
+}
+
+func (r *memoryProjectRepository) ListAll(context.Context) ([]domain.Project, error) {
+	projects := make([]domain.Project, 0, len(r.projects))
+	for _, project := range r.projects {
+		projects = append(projects, project)
+	}
+	return projects, nil
+}
+
+func (r *memoryProjectRepository) Archive(_ context.Context, id string) (domain.Project, error) {
+	project, exists := r.projects[id]
+	if !exists {
+		return domain.Project{}, domain.ErrNotFound
+	}
+	if project.Status == domain.ProjectStatusArchived {
+		return project, nil
+	}
+	if project.Status == domain.ProjectStatusScanning {
+		return domain.Project{}, domain.ErrInvalidStatus
+	}
+	now := time.Now()
+	previous := project.Status
+	project.Status = domain.ProjectStatusArchived
+	project.ArchivedAt = &now
+	project.ArchivedFrom = &previous
+	r.projects[id] = project
+	return project, nil
+}
+
+func (r *memoryProjectRepository) Restore(_ context.Context, id string) (domain.Project, error) {
+	project, exists := r.projects[id]
+	if !exists {
+		return domain.Project{}, domain.ErrNotFound
+	}
+	if project.Status != domain.ProjectStatusArchived || project.ArchivedFrom == nil {
+		return domain.Project{}, domain.ErrInvalidStatus
+	}
+	project.Status = *project.ArchivedFrom
+	project.ArchivedAt = nil
+	project.ArchivedFrom = nil
+	r.projects[id] = project
+	return project, nil
 }
 
 func (r *memoryProjectRepository) UpdateSourceState(_ context.Context, id string, status domain.ProjectStatus, source domain.RepositorySource) (domain.Project, error) {
 	project, err := r.Get(context.Background(), id)
 	if err != nil {
 		return domain.Project{}, err
+	}
+	if project.Status == domain.ProjectStatusArchived {
+		return domain.Project{}, domain.ErrNotFound
 	}
 	project.Status = status
 	project.CurrentBranch = source.CurrentBranch

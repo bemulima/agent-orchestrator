@@ -18,3 +18,11 @@ type ProjectRepository interface {
 	SaveDiscovery(context.Context, domain.Project, domain.ServiceSnapshot, domain.DiscoveryReport) (domain.ServiceSnapshot, error)
 	GetLatestDiscovery(context.Context, string) (domain.ServiceSnapshot, domain.DiscoveryReport, error)
 }
+
+// ProjectLifecycleRepository changes project availability without deleting
+// the project, its discovery snapshots, or its execution history.
+type ProjectLifecycleRepository interface {
+	ListAll(context.Context) ([]domain.Project, error)
+	Archive(context.Context, string) (domain.Project, error)
+	Restore(context.Context, string) (domain.Project, error)
+}

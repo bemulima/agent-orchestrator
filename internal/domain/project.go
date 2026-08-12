@@ -12,6 +12,7 @@ const (
 	ProjectStatusScanning  ProjectStatus = "scanning"
 	ProjectStatusAnalyzed  ProjectStatus = "analyzed"
 	ProjectStatusFailed    ProjectStatus = "failed"
+	ProjectStatusArchived  ProjectStatus = "archived"
 )
 
 // RepositoryRole describes how a Git repository participates in the
@@ -45,6 +46,8 @@ type Project struct {
 	HeadCommit      string         `json:"head_commit"`
 	IsDirty         bool           `json:"is_dirty"`
 	GitLabProjectID *int64         `json:"gitlab_project_id,omitempty"`
+	ArchivedAt      *time.Time     `json:"archived_at,omitempty"`
+	ArchivedFrom    *ProjectStatus `json:"archived_from_status,omitempty"`
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
 }
