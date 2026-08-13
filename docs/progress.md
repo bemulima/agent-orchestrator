@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 ## Current status
 
@@ -1085,6 +1085,17 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   snapshot tags remain readable, and neither repository had an open issue or
   pull request. No local checkout, managed clone, database history, or remote
   repository was deleted.
+- Audited every `course-wiki` subject page against repository-owned canonical
+  documentation. All 31 subject pages are accounted for; thirteen destinations
+  from the initial plan were renamed or consolidated, and remote commits after
+  the reviewed source revision add only generated onboarding files.
+- Created and verified complete Git bundles for `ms-course-journal`,
+  `ms-course-promts`, and `course-wiki` outside their source directories. After
+  the owner narrowed the cleanup to local files only, moved the three primary
+  local directories to the macOS Trash. GitHub repositories, orchestrator
+  managed clones, database history, and snapshots remain intact. The attempted
+  GitHub scope escalation was cancelled; `delete_repo` was not granted and no
+  remote repository was deleted.
 
 ## Remaining work
 
@@ -1098,8 +1109,8 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   unless it is a true prerequisite, resolves the policy contract feedback,
   and determines the exact affected repository set from topology evidence.
 - Do not use the archived `ms-course-promts` source or any historical isolated
-  worktree as an execution base. Retain it only as recoverable diagnostic
-  evidence until a separately approved cleanup removes it.
+  worktree as an execution base. Use the verified offline bundle or retained
+  GitHub repository only for historical diagnostics.
 - Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge, or deploy without
   separate explicit authorization.
 - Exercise two simultaneously approved fake-backed plans to verify the global

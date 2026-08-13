@@ -1,8 +1,8 @@
 # Knowledge source retirement
 
-This manifest governs the staged retirement of the legacy `prompts` and
-`journal` repositories and the temporary freeze of `wiki`. It does not
-authorize remote archive, deletion, push, merge, or publication.
+This manifest records the staged retirement of the legacy `prompts`,
+`journal`, and `wiki` checkouts. Remote repository deletion is explicitly out
+of scope: the owner chose to retain all three GitHub repositories.
 
 ## Source revisions
 
@@ -10,7 +10,7 @@ authorize remote archive, deletion, push, merge, or publication.
 |---|---:|---|
 | `ms-course-promts` | `2a16785` | Extract reusable policy, then archive after project-local migration and reference checks |
 | `ms-course-journal` | `dd74102` | Do not migrate task state; issues are canonical, retain only unique durable knowledge |
-| `course-wiki` | `6cd12cd` on `agent/rename-practice-task-docs` | Freeze as a migration source; keep until owned docs/contracts are complete and a separate wiki design is approved |
+| `course-wiki` | `6cd12cd` on `agent/rename-practice-task-docs` | Project-owned docs/contracts are complete; retain the GitHub repository for possible future wiki redesign |
 
 ## Ownership rules
 
@@ -96,11 +96,23 @@ archive only when all applicable items pass:
 - Both catalog entries completed `analyzed -> archived -> analyzed -> archived`.
   Each has two `project.archived` audit events, one `project.restored` event,
   final status `archived`, and preserved `archived_from_status: analyzed`.
-- Catalog and GitHub retirement are complete for `prompts` and `journal`.
-  Physical deletion of either GitHub repository, local checkout, orchestrator
-  managed clone, database history, or snapshot remains out of scope without a
-  new explicit authorization. `wiki` remains active but frozen and is not part
-  of this retirement action.
+- Catalog and GitHub archive are complete for `prompts` and `journal`.
+- A final path-by-path audit confirmed that all 31 subject documents from
+  `course-wiki` have project-local canonical owners. Thirteen target names from
+  the initial plan were consolidated or renamed rather than omitted; the
+  corresponding repository-local documents are present. The later remote-main
+  wiki commits add only generated agent onboarding files and no new subject
+  contracts.
+- Before local cleanup, complete Git bundles for all refs were created outside
+  the source directories and verified. On 2026-08-13 the primary local
+  `journal`, `prompts`, and `wiki` directories were moved to the macOS Trash.
+  Orchestrator-managed clones, catalog/database audit history, and snapshots
+  were not removed.
+- GitHub repositories `bemulima/ms-course-journal`,
+  `bemulima/ms-course-promts`, and `bemulima/course-wiki` remain present. The
+  first two remain archived; `course-wiki` remains active for possible future
+  redesign. A pending request for GitHub `delete_repo` scope was cancelled and
+  the scope was not granted.
 
 ## Journal retirement index
 
