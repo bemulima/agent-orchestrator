@@ -76,12 +76,19 @@ archive only when all applicable items pass:
 - The operational onboarding runbook no longer instructs operators to connect,
   scan, or provision the three source repositories. Historical source names and
   reviewed revisions remain only as provenance.
+- Annotated tag `archive/pre-retirement-2026-08-13` is published for both
+  source repositories and resolves to the reviewed revisions above: `2a16785`
+  for `ms-course-promts` and `dd74102` for `ms-course-journal`.
 - No source repository has been remotely archived or deleted.
 - The remaining `prompts`/`journal` gates are operational: create final source
   tags/backups, archive their catalog entries, rehearse restore, archive the
   entries again, and obtain separate authorization before any GitHub or
-  filesystem archive/deletion. `wiki` remains frozen and is not part of this
-  retirement action.
+  filesystem archive/deletion. The tag/remote-backup gate is complete. The
+  catalog rehearsal did not begin because the local Docker API was unresponsive
+  and PostgreSQL rejected the initial read with an I/O error opening
+  `global/pg_filenode.map`; no catalog row was mutated. Recover and verify the
+  local Docker/PostgreSQL environment before retrying. `wiki` remains frozen
+  and is not part of this retirement action.
 
 ## Journal retirement index
 

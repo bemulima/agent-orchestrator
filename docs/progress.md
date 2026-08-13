@@ -1058,6 +1058,13 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Declared read-only project catalog inspection and approval-gated reversible
   project archive/restore in `.ai/commands.yaml`, closing the policy gap between
   the implemented CLI/Make lifecycle and the repository command allowlist.
+- Published annotated pre-retirement tags for `ms-course-promts` revision
+  `2a16785` and `ms-course-journal` revision `dd74102`, both named
+  `archive/pre-retirement-2026-08-13`, and verified their peeled remote targets.
+- Stopped the catalog archive/restore rehearsal before any mutation: Docker API
+  calls were unresponsive and the existing PostgreSQL port returned an I/O
+  error for `global/pg_filenode.map` during the initial project list. Docker
+  Desktop was not restarted because that can affect unrelated local containers.
 
 ## Remaining work
 
