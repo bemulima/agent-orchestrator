@@ -1048,6 +1048,16 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Added a documentation index, repository policy validator, and GitHub CI for
   the complete non-destructive `make verify` path. Canonical project docs no
   longer depend on an absolute path to the original architecture reference.
+- Re-triaged the only partial journal result and recorded a retirement index
+  for all ten historical task directories. Its external PostgreSQL and
+  HTTP/NATS integration checks are now explicitly owned by `ms-go-student` and
+  `ms-ts-html-validator`; no active task depends on the journal copy.
+- Updated the historical onboarding runbook so it no longer instructs an
+  operator to reconnect or rescan `prompts`, `journal`, or `wiki`, and removed
+  machine-specific development paths from live examples.
+- Declared read-only project catalog inspection and approval-gated reversible
+  project archive/restore in `.ai/commands.yaml`, closing the policy gap between
+  the implemented CLI/Make lifecycle and the repository command allowlist.
 
 ## Remaining work
 
