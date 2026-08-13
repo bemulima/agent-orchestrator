@@ -86,16 +86,21 @@ archive only when all applicable items pass:
   `ms-course-journal` commit `0c858b8`; the source policy and journal content
   was preserved. Annotated tag `archive/final-pre-retirement-2026-08-13`
   resolves to those final revisions.
-- No source repository has been remotely archived or deleted.
+- GitHub repositories `bemulima/ms-course-promts` and
+  `bemulima/ms-course-journal` are archived and therefore read-only. Both retain
+  `main`, the final annotated snapshot tag, and complete Git history; neither
+  had an open issue or pull request at archive time.
 - Docker/PostgreSQL recovery completed without deleting or recreating the
   durable volume. Migration `015_project_lifecycle` was the only pending
   migration and was applied transactionally before the rehearsal.
 - Both catalog entries completed `analyzed -> archived -> analyzed -> archived`.
   Each has two `project.archived` audit events, one `project.restored` event,
   final status `archived`, and preserved `archived_from_status: analyzed`.
-- The remaining `prompts`/`journal` gates require separate authorization:
-  GitHub repository archive and any later remote/local filesystem deletion.
-  `wiki` remains active but frozen and is not part of this retirement action.
+- Catalog and GitHub retirement are complete for `prompts` and `journal`.
+  Physical deletion of either GitHub repository, local checkout, orchestrator
+  managed clone, database history, or snapshot remains out of scope without a
+  new explicit authorization. `wiki` remains active but frozen and is not part
+  of this retirement action.
 
 ## Journal retirement index
 

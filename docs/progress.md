@@ -1079,6 +1079,12 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Completed catalog archive/restore rehearsals for both sources. Each now has
   two archive audit events and one restore audit event and finishes archived
   with its prior `analyzed` status retained for any future restore.
+- After separate owner authorization, archived the private GitHub repositories
+  `bemulima/ms-course-promts` and `bemulima/ms-course-journal`. GitHub reports
+  `isArchived: true` for both; their final `main` revisions and annotated
+  snapshot tags remain readable, and neither repository had an open issue or
+  pull request. No local checkout, managed clone, database history, or remote
+  repository was deleted.
 
 ## Remaining work
 
@@ -1091,8 +1097,9 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 - Discuss a corrected plan that treats downstream rollout as non-blocking
   unless it is a true prerequisite, resolves the policy contract feedback,
   and determines the exact affected repository set from topology evidence.
-- Keep the isolated `ms-course-promts` worktree as diagnostic evidence until a
-  replacement plan is agreed; it contains no approved commit or PR proposal.
+- Do not use the archived `ms-course-promts` source or any historical isolated
+  worktree as an execution base. Retain it only as recoverable diagnostic
+  evidence until a separately approved cleanup removes it.
 - Do not switch `WORK_ITEM_GATEWAY` to `github`, push, merge, or deploy without
   separate explicit authorization.
 - Exercise two simultaneously approved fake-backed plans to verify the global
