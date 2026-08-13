@@ -79,16 +79,23 @@ archive only when all applicable items pass:
 - Annotated tag `archive/pre-retirement-2026-08-13` is published for both
   source repositories and resolves to the reviewed revisions above: `2a16785`
   for `ms-course-promts` and `dd74102` for `ms-course-journal`.
+- A final remote-main check found that historical onboarding PRs had later
+  added `AGENTS.md` and generated `.ai` discovery/service files to both source
+  repositories, contrary to their retirement roles. Only those onboarding
+  files were removed in `ms-course-promts` commit `b12d5a6` and
+  `ms-course-journal` commit `0c858b8`; the source policy and journal content
+  was preserved. Annotated tag `archive/final-pre-retirement-2026-08-13`
+  resolves to those final revisions.
 - No source repository has been remotely archived or deleted.
-- The remaining `prompts`/`journal` gates are operational: create final source
-  tags/backups, archive their catalog entries, rehearse restore, archive the
-  entries again, and obtain separate authorization before any GitHub or
-  filesystem archive/deletion. The tag/remote-backup gate is complete. The
-  catalog rehearsal did not begin because the local Docker API was unresponsive
-  and PostgreSQL rejected the initial read with an I/O error opening
-  `global/pg_filenode.map`; no catalog row was mutated. Recover and verify the
-  local Docker/PostgreSQL environment before retrying. `wiki` remains frozen
-  and is not part of this retirement action.
+- Docker/PostgreSQL recovery completed without deleting or recreating the
+  durable volume. Migration `015_project_lifecycle` was the only pending
+  migration and was applied transactionally before the rehearsal.
+- Both catalog entries completed `analyzed -> archived -> analyzed -> archived`.
+  Each has two `project.archived` audit events, one `project.restored` event,
+  final status `archived`, and preserved `archived_from_status: analyzed`.
+- The remaining `prompts`/`journal` gates require separate authorization:
+  GitHub repository archive and any later remote/local filesystem deletion.
+  `wiki` remains active but frozen and is not part of this retirement action.
 
 ## Journal retirement index
 

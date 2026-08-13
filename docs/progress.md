@@ -1065,6 +1065,20 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   calls were unresponsive and the existing PostgreSQL port returned an I/O
   error for `global/pg_filenode.map` during the initial project list. Docker
   Desktop was not restarted because that can affect unrelated local containers.
+- After explicit owner authorization, force-restarted only the hung Docker
+  Desktop processes. The engine recovered, PostgreSQL completed crash recovery
+  on the existing durable volume, and no volume or container data was deleted.
+- Applied the sole pending durable-database migration,
+  `015_project_lifecycle`, transactionally; migrations `001` through `014`
+  remained unchanged.
+- A fresh remote-main check found historical onboarding PRs had added agent
+  files to the two retirement sources. Removed only those generated
+  `AGENTS.md`/`.ai` files in `ms-course-promts` commit `b12d5a6` and
+  `ms-course-journal` commit `0c858b8`, then published final annotated snapshot
+  tag `archive/final-pre-retirement-2026-08-13` for both repositories.
+- Completed catalog archive/restore rehearsals for both sources. Each now has
+  two archive audit events and one restore audit event and finishes archived
+  with its prior `analyzed` status retained for any future restore.
 
 ## Remaining work
 
