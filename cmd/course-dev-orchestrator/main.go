@@ -35,6 +35,7 @@ import (
 	workitemadapter "github.com/bemulima/agent-orchestrator/internal/adapters/workitem"
 	"github.com/bemulima/agent-orchestrator/internal/agent"
 	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
+	architectureprojection "github.com/bemulima/agent-orchestrator/internal/architecture"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -45,6 +46,7 @@ import (
 	planningengine "github.com/bemulima/agent-orchestrator/internal/planning"
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	agentusageuc "github.com/bemulima/agent-orchestrator/internal/usecase/agentusage"
+	architectureuc "github.com/bemulima/agent-orchestrator/internal/usecase/architecture"
 	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
@@ -188,6 +190,8 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		Services: topologyOperations.Services, Contracts: topologyOperations.Contracts,
 		Drift: topologyOperations.Drift, ProjectQuery: topologyOperations.Project,
 	}
+	architectureOperations := newArchitectureOperations(pool)
+	architectureHandler := handlers.ArchitectureHandler{Current: architectureOperations.Current, Service: architectureOperations.Service, Contracts: architectureOperations.Contracts}
 	temporalClient, err := temporalclient.Dial(temporalclient.Options{
 		HostPort: cfg.TemporalHostPort, Namespace: cfg.TemporalNamespace, Logger: temporaladapter.NewLogger(logger),
 	})
@@ -258,6 +262,7 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		ProjectHandler:      &projectHandler,
 		OnboardingHandler:   &onboardingHandler,
 		TopologyHandler:     &topologyHandler,
+		ArchitectureHandler: &architectureHandler,
 		PlanningHandler:     &planningHandler,
 		UIHandler:           &uiHandler,
 		AgentUsageHandler:   &agentUsageHandler,
@@ -545,6 +550,17 @@ type topologyOperations struct {
 	Project   topologyuc.ProjectQuery
 }
 
+type architectureOperations struct {
+	Current   architectureuc.Current
+	Service   architectureuc.Service
+	Contracts architectureuc.Contracts
+}
+
+func newArchitectureOperations(pool *pgxpool.Pool) architectureOperations {
+	current := architectureuc.Current{Catalog: pgadapter.TopologyRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool}, Projector: architectureprojection.Projector{}}
+	return architectureOperations{Current: current, Service: architectureuc.Service{Current: current}, Contracts: architectureuc.Contracts{Current: current}}
+}
+
 func newTopologyOperations(pool *pgxpool.Pool) topologyOperations {
 	projects := pgadapter.ProjectRepoPG{Pool: pool}
 	catalog := pgadapter.TopologyRepoPG{Pool: pool}
@@ -575,7 +591,7 @@ func newOnboardingOperations(cfg config.Config, pool *pgxpool.Pool) (onboardingO
 	}
 	generator := onboardinggenerator.NewGenerator(onboardinggenerator.GeneratorConfig{
 		MaxFileBytes: cfg.OnboardingMaxFileBytes, MaxTotalBytes: cfg.OnboardingMaxTotalBytes,
-	})
+	}).WithArchitectureCatalog(pgadapter.TopologyRepoPG{Pool: pool})
 	runner, err := newAgentRunner(cfg, pool)
 	if err != nil {
 		return onboardingOperations{}, err

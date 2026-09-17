@@ -4,7 +4,7 @@ These rules are shared delivery policy. Repository-local business, architecture,
 
 ## Source of truth and task state
 
-- Read the current issue, `AGENTS.md`, `.ai/service.yaml`, and relevant repository documentation before changing code.
+- Read the current issue, `AGENTS.md`, `.ai/service.yaml`, and relevant repository documentation before changing code. Before an architecturally significant change, also read `.ai/architecture/service.mmd`, `.ai/architecture/dependencies.mmd`, and `.ai/architecture/contracts.mmd` when present. Generated diagrams are CURRENT projections, not stronger evidence than source code or contracts; report architecture drift when they conflict instead of changing code to fit the diagram.
 - Use the issue and its linked plan or pull/merge request as the durable task record. Do not create a parallel journal inside another repository.
 - Derive runtime facts from code, manifests, migrations, and versioned contracts. Never invent endpoints, commands, dependencies, or behavior from a prompt.
 - Keep canonical business rules, contracts, runbooks, and architecture decisions in the repository that owns them.

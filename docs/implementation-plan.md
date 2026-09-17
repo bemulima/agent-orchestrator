@@ -1,5 +1,10 @@
 # Course development orchestrator implementation plan
 
+## Phase 1 — Architecture Control Center / CURRENT
+
+Implemented as a read-only projection over `TopologyCatalog`: `Discovery → Topology → Architecture CURRENT → API/UI/Mermaid`. It adds no target state, direct repository writes, proposal editing, plan execution, merge, or deploy path. Generated repository diagrams remain onboarding-proposal artifacts and never become a source of truth.
+
+
 ## Goal
 
 Deliver an internal, single-owner orchestrator that can discover a service

@@ -22,6 +22,13 @@ export const projectSchema = z.object({
 });
 export const projectsSchema = z.object({ projects: z.array(projectSchema) });
 
+const architectureEvidenceSchema = z.object({ source_path: z.string().optional().default(""), explanation: z.string().optional().default(""), confidence: z.number().optional().default(0) }).passthrough();
+export const architectureServiceSchema = z.object({ project_id: z.string(), name: z.string(), repository_role: z.string(), service_kind: z.string(), purpose: z.string(), stack: z.array(architectureEvidenceSchema).default([]), capabilities: z.array(z.object({ name: z.string(), description: z.string(), source: z.string(), confidence: z.number() })).default([]), ownership: z.array(z.object({ resource_type: z.string(), resource_name: z.string(), source: z.string(), confidence: z.number() })).default([]), contract_count: z.number(), dependency_count: z.number(), consumer_count: z.number(), drift_status: z.string() });
+export const architectureRelationSchema = z.object({ id: z.string(), source_project_id: z.string(), target_project_id: z.string(), relation_type: z.string(), contract_code: z.string().optional(), protocol: z.string().optional(), direction: z.string().optional(), version: z.string().optional(), evidence: architectureEvidenceSchema });
+export const architectureContractSchema = z.object({ id: z.string(), project_id: z.string(), code: z.string(), type: z.string(), direction: z.string(), version: z.string().optional(), method: z.string().optional(), path: z.string().optional(), subject: z.string().optional(), resource: z.string().optional(), schema_discovered: z.boolean(), evidence: architectureEvidenceSchema, providers: z.array(z.object({ project_id: z.string(), name: z.string() })).default([]), consumers: z.array(z.object({ project_id: z.string(), name: z.string() })).default([]) });
+export const architectureCurrentSchema = z.object({ mode: z.literal("CURRENT"), topology_revision_id: z.string(), topology_fingerprint: z.string(), generated_at: z.string(), topology_stale: z.boolean(), services: z.array(architectureServiceSchema), relations: z.array(architectureRelationSchema), contracts: z.array(architectureContractSchema), contract_drift: z.array(z.record(z.string(), z.unknown())).default([]) });
+export type ArchitectureCurrent = z.infer<typeof architectureCurrentSchema>;
+
 export const discoveryReportSchema = z.object({
   id: z.string().optional(),
   project_id: z.string().optional(),

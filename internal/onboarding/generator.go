@@ -16,6 +16,7 @@ import (
 	"github.com/pmezard/go-difflib/difflib"
 	"gopkg.in/yaml.v3"
 
+	architectureprojection "github.com/bemulima/agent-orchestrator/internal/architecture"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 	"github.com/bemulima/agent-orchestrator/internal/onboarding/templates"
@@ -35,7 +36,8 @@ type GeneratorConfig struct {
 }
 
 type Generator struct {
-	config GeneratorConfig
+	config              GeneratorConfig
+	architectureCatalog repository.TopologyRepository
 }
 
 func NewGenerator(config GeneratorConfig) Generator {
@@ -49,6 +51,13 @@ func NewGenerator(config GeneratorConfig) Generator {
 		config.Now = time.Now
 	}
 	return Generator{config: config}
+}
+
+// WithArchitectureCatalog keeps architecture artifacts inside the existing
+// onboarding proposal path. It never writes a connected checkout directly.
+func (g Generator) WithArchitectureCatalog(catalog repository.TopologyRepository) Generator {
+	g.architectureCatalog = catalog
+	return g
 }
 
 func (g Generator) Generate(
@@ -74,6 +83,20 @@ func (g Generator) Generate(
 	generated, err := g.buildGeneratedFiles(project, snapshot, report)
 	if err != nil {
 		return domain.OnboardingProposal{}, "", err
+	}
+	if g.architectureCatalog != nil {
+		catalog, catalogErr := g.architectureCatalog.Get(ctx)
+		if catalogErr == nil {
+			current := architectureprojection.Projector{Now: g.config.Now}.Current(catalog, false)
+			if detail, detailErr := (architectureprojection.Projector{}).Service(current, project.ID); detailErr == nil && detail.Service.ProjectID == project.ID && topologySnapshotMatches(catalog, project.ID, snapshot.ID) {
+				evidence := evidencePaths(report.Facts)
+				generated = append(generated,
+					generatedFile{path: ".ai/architecture/service.mmd", content: architectureprojection.ServiceMermaid(detail), format: formatPlain, explanation: "Render the approved CURRENT topology projection for this service.", evidencePaths: evidence},
+					generatedFile{path: ".ai/architecture/dependencies.mmd", content: architectureprojection.ServiceMermaid(detail), format: formatPlain, explanation: "Render actual CURRENT inbound and outbound topology relations.", evidencePaths: evidence},
+					generatedFile{path: ".ai/architecture/contracts.mmd", content: architectureprojection.ContractsMermaid(detail), format: formatPlain, explanation: "Render only CURRENT discovered contract references without payload inference.", evidencePaths: evidence},
+				)
+			}
+		}
 	}
 	proposal := domain.OnboardingProposal{
 		SchemaVersion: proposalSchemaVersion,
@@ -153,12 +176,22 @@ func (g Generator) Generate(
 	return proposal, unifiedDiff, nil
 }
 
+func topologySnapshotMatches(catalog domain.TopologyCatalog, projectID, snapshotID string) bool {
+	for _, service := range catalog.Services {
+		if service.ProjectID == projectID {
+			return service.SnapshotID == snapshotID
+		}
+	}
+	return false
+}
+
 type fileFormat int
 
 const (
 	formatYAML fileFormat = iota
 	formatMarkdown
 	formatJSON
+	formatPlain
 )
 
 type generatedFile struct {

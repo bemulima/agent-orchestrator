@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-08-13
+Last updated: 2026-09-15
 
 ## Current status
 
@@ -83,6 +83,8 @@ Stage 8 used a fake Bot API adapter, signed local webhook requests, and
 disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Completed
+
+- Implemented Phase 1 Architecture Control Center as a read-only CURRENT projection over the persisted topology catalog. Added `/api/v1/architecture/current`, per-service and per-service-contract endpoints, deterministic Mermaid renderers, onboarding-proposal-only `.ai/architecture/*.mmd` artifacts, canonical agent guidance, and the owner `/architecture` map. No TARGET state, source-code mutation, plan execution, merge, or deploy path was added.
 
 - Read the complete product specification.
 - Inspected the reference repository instructions, documentation, module

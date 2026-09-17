@@ -620,3 +620,6 @@ It synchronizes twice through the fake GitLab boundary and proves that issues,
 the MR, branch, plan run, attempt, and review were not duplicated. Fixture
 database rows and temporary repositories are removed before success. No Codex,
 GitLab, Telegram, or user repository is contacted.
+# Architecture Control Center
+
+`/architecture` visualizes the evidence-backed CURRENT topology through the owner UI. It is read-only: dragging nodes changes only the browser presentation, and no UI operation creates relations, edits contracts, starts plans, or changes application code. Repository-local Mermaid files are generated only as onboarding proposal files under `.ai/architecture/` and still require the existing approval/worktree flow.

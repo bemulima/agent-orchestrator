@@ -211,3 +211,6 @@ owned by this repository.
 The domain never imports adapters. Use cases depend on domain repository
 contracts, and adapters implement those contracts. Temporal workflows remain
 deterministic and call side-effecting code only through activities.
+# Architecture CURRENT projection
+
+The `architecture` module is a read-only projection boundary: discovery snapshots feed topology, and the current `TopologyCatalog` feeds Architecture CURRENT, the architecture HTTP API, owner UI, and deterministic Mermaid. It has no tables and no mutation commands. `CURRENT` is explicitly versioned by topology revision and fingerprint; a future TARGET architecture is a separate concern and must not change topology semantics.

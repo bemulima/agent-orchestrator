@@ -18,6 +18,7 @@ type RouterDependencies struct {
 	ProjectHandler      *handlers.ProjectHandler
 	OnboardingHandler   *handlers.OnboardingHandler
 	TopologyHandler     *handlers.TopologyHandler
+	ArchitectureHandler *handlers.ArchitectureHandler
 	PlanningHandler     *handlers.PlanningHandler
 	UIHandler           *handlers.UIHandler
 	ConversationHandler *handlers.ConversationHandler
@@ -65,6 +66,11 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/projects/{projectId}/dependencies", deps.TopologyHandler.ProjectDependencies)
 		root.Get("/api/v1/projects/{projectId}/contracts", deps.TopologyHandler.ProjectContracts)
 		root.Get("/api/v1/projects/{projectId}/consumers", deps.TopologyHandler.ProjectConsumers)
+	}
+	if deps.ArchitectureHandler != nil {
+		root.Get("/api/v1/architecture/current", deps.ArchitectureHandler.GetCurrent)
+		root.Get("/api/v1/architecture/services/{projectId}", deps.ArchitectureHandler.GetService)
+		root.Get("/api/v1/architecture/services/{projectId}/contracts", deps.ArchitectureHandler.GetContracts)
 	}
 	if deps.PlanningHandler != nil {
 		root.Post("/api/v1/commands", deps.PlanningHandler.CreateCommandRequest)
