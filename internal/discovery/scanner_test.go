@@ -481,6 +481,198 @@ proxy_pass http://users:8080;
 	}
 }
 
+func TestScannerInventoriesObservedHTTPSeparatelyFromArchitectureManifests(t *testing.T) {
+	root := t.TempDir()
+	writeDiscoveryFile(t, root, "internal/routes.go", `package api
+func routes(router Router) { router.Get("/api/v1/orders", handler) }
+`)
+	writeDiscoveryFile(t, root, ".ai/architecture/service.yaml", architectureServiceYAML("orders", "endpoints/orders.list.yaml"))
+	writeDiscoveryFile(t, root, ".ai/architecture/endpoints/orders.list.yaml", architectureHTTPOperationYAML("orders-list", "orders", "GET", "/api/v1/orders", "List open orders"))
+
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "orders-project", Name: "orders", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(report.Operations) != 1 {
+		t.Fatalf("operations = %#v, want one code-observed HTTP operation", report.Operations)
+	}
+	operation := report.Operations[0]
+	if operation.Type != domain.ArchitectureOperationHTTP || operation.Protocol != "http" ||
+		operation.Method != "GET" || operation.Path != "/api/v1/orders" || operation.SourcePath != "internal/routes.go" {
+		t.Fatalf("operation = %#v", operation)
+	}
+	if len(report.ArchitectureManifests) != 2 {
+		t.Fatalf("architecture manifests = %#v, want service and endpoint metadata", report.ArchitectureManifests)
+	}
+	for _, manifest := range report.ArchitectureManifests {
+		if manifest.Checksum == "" || manifest.Schema != domain.ArchitectureManifestSchemaV1 ||
+			manifest.ID == "" || manifest.ManifestRevision != 1 {
+			t.Fatalf("unsafe or incomplete manifest metadata = %#v", manifest)
+		}
+	}
+	if report.ArchitectureService == nil || report.ArchitectureService.Purpose.Value != "Service purpose" ||
+		len(report.ArchitectureService.Responsibilities) != 1 ||
+		report.ArchitectureService.Responsibilities[0].Value != "Own order lookup" {
+		t.Fatalf("service semantics were not retained in the snapshot: %#v", report.ArchitectureService)
+	}
+	if len(report.ArchitectureOperations) != 1 || report.ArchitectureOperations[0].BusinessTask.Value != "List open orders" ||
+		len(report.ArchitectureOperations[0].BusinessProcess) != 1 ||
+		report.ArchitectureOperations[0].BusinessProcess[0].ID != "lookup" ||
+		len(report.ArchitectureOperations[0].Evidence) != 1 {
+		t.Fatalf("operation semantics were not retained in the snapshot: %#v", report.ArchitectureOperations)
+	}
+	for _, fact := range report.Facts {
+		if fact.SourcePath == ".ai/architecture/endpoints/orders.list.yaml" &&
+			(fact.Category == "capability" || fact.Category == "contract" || fact.Category == "relation") {
+			t.Fatalf("manifest claim became a topology fact: %#v", fact)
+		}
+	}
+	for _, conflict := range report.Conflicts {
+		if strings.HasPrefix(conflict.Name, "architecture_") {
+			t.Fatalf("matching manifest unexpectedly conflicted: %#v", conflict)
+		}
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "business_task:\n") || strings.Contains(string(raw), "identity:\n") {
+		t.Fatalf("report persisted raw YAML rather than its validated typed projection: %s", raw)
+	}
+}
+
+func TestScannerIngestsNonHTTPOperationLayoutAndIgnoresMermaid(t *testing.T) {
+	root := t.TempDir()
+	writeDiscoveryFile(t, root, ".ai/architecture/service.yaml", architectureServiceYAML("orders", "operations/orders.consume.yaml"))
+	writeDiscoveryFile(t, root, ".ai/architecture/operations/orders.consume.yaml", architectureNATSOperationYAML("orders-consume", "orders"))
+	writeDiscoveryFile(t, root, ".ai/architecture/operations/orders.consume.mmd", "flowchart TD\n")
+
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "orders-project", Name: "orders", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(report.ArchitectureManifests) != 2 {
+		t.Fatalf("architecture manifests = %#v, want service and operation metadata only", report.ArchitectureManifests)
+	}
+	if len(report.ArchitectureOperations) != 1 || report.ArchitectureOperations[0].Type != domain.ArchitectureOperationNATSEventSubscriber ||
+		report.ArchitectureOperations[0].Identity.NATS == nil || report.ArchitectureOperations[0].Identity.NATS.Subject != "orders.created.v1" {
+		t.Fatalf("architecture operations = %#v", report.ArchitectureOperations)
+	}
+	for _, manifest := range report.ArchitectureManifests {
+		if manifest.Path == ".ai/architecture/operations/orders.consume.mmd" {
+			t.Fatalf("generated Mermaid was ingested as a manifest: %#v", manifest)
+		}
+	}
+	for _, conflict := range report.Conflicts {
+		if strings.HasPrefix(conflict.Name, "architecture_") {
+			t.Fatalf("valid non-HTTP operation unexpectedly conflicted: %#v", conflict)
+		}
+	}
+}
+
+func TestScannerReportsArchitectureManifestErrorsAndHTTPMismatchesWithoutLeakingValues(t *testing.T) {
+	root := t.TempDir()
+	writeDiscoveryFile(t, root, "routes.go", `package api
+func routes(router Router) { router.Get("/api/v1/orders", handler) }
+`)
+	writeDiscoveryFile(t, root, ".ai/architecture/service.yaml", architectureServiceYAML("orders", "endpoints/orders.list.yaml"))
+	writeDiscoveryFile(t, root, ".ai/architecture/endpoints/orders.list.yaml", architectureHTTPOperationYAML("orders-list", "orders", "POST", "/api/v1/orders", "safe text"))
+	writeDiscoveryFile(t, root, ".ai/architecture/endpoints/unsafe.yaml", "api_token: PLACEHOLDER_VALUE_THAT_MUST_NOT_LEAK\n")
+	writeDiscoveryFile(t, root, ".ai/architecture/endpoints/nested/ignored.yaml", "api_token: NESTED_PLACEHOLDER\n")
+
+	report, err := NewScanner(Config{}).Scan(context.Background(), domain.Project{
+		ID: "orders-project", Name: "orders", RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{LocalPath: root, HeadCommit: "commit", CurrentBranch: "main"})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	assertFact(t, report.Conflicts, "conflict", "architecture_http_operation_mismatch", "POST /api/v1/orders")
+	assertFact(t, report.Conflicts, "conflict", "invalid_architecture_manifest", ".ai/architecture/endpoints/unsafe.yaml")
+	for _, manifest := range report.ArchitectureManifests {
+		if manifest.Path == ".ai/architecture/endpoints/unsafe.yaml" || manifest.Path == ".ai/architecture/endpoints/nested/ignored.yaml" {
+			t.Fatalf("invalid or nested manifest was ingested: %#v", manifest)
+		}
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "PLACEHOLDER_VALUE_THAT_MUST_NOT_LEAK") || strings.Contains(string(raw), "NESTED_PLACEHOLDER") {
+		t.Fatalf("report leaked invalid manifest content: %s", raw)
+	}
+}
+
+func writeDiscoveryFile(t *testing.T, root, name, content string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func architectureServiceYAML(id, operationPath string) string {
+	return "schema: architecture/v1\nkind: service\nid: " + id + `
+manifest_revision: 1
+identity: {name: ` + id + `, kind: backend_service}
+purpose: {value: Service purpose, confidence: 0.8, evidence: [{source_path: README.md}]}
+responsibilities: [{value: Own order lookup, confidence: 0.8, evidence: [{source_path: internal/handler.go}]}]
+operation_manifests: [` + operationPath + `]
+evidence: [{source_path: README.md}]
+confidence: 0.8
+`
+}
+
+func architectureHTTPOperationYAML(id, serviceID, method, path, businessTask string) string {
+	return "schema: architecture/v1\nkind: operation\nid: " + id + "\nmanifest_revision: 1\nservice_id: " + serviceID + `
+type: http
+identity:
+  transport: http
+  http: {method: ` + method + `, path: ` + path + `}
+access:
+  audience: {value: internal, confidence: 0.8, evidence: [{source_path: internal/routes.go}]}
+  authentication: {value: unknown, confidence: 0.8, evidence: [{source_path: internal/routes.go}]}
+  authorization: {value: unknown, confidence: 0.8, evidence: [{source_path: internal/routes.go}]}
+  idempotency: {value: unknown, confidence: 0.8, evidence: [{source_path: internal/routes.go}]}
+trigger:
+  description: {value: HTTP request, confidence: 0.8, evidence: [{source_path: internal/routes.go}]}
+business_task:
+  value: ` + businessTask + `
+  confidence: 0.8
+  evidence: [{source_path: internal/handler.go}]
+business_process:
+  - id: lookup
+    description: {value: Find open orders, confidence: 0.8, evidence: [{source_path: internal/handler.go}]}
+evidence: [{source_path: internal/routes.go}]
+confidence: 0.8
+`
+}
+
+func architectureNATSOperationYAML(id, serviceID string) string {
+	return "schema: architecture/v1\nkind: operation\nid: " + id + "\nmanifest_revision: 1\nservice_id: " + serviceID + `
+type: nats_event_subscriber
+identity:
+  transport: nats
+  nats: {subject: orders.created.v1, role: event_subscriber}
+access:
+  audience: {value: internal, confidence: 0.8, evidence: [{source_path: internal/consumer.go}]}
+  authentication: {value: unknown, confidence: 0, evidence: [{source_path: internal/consumer.go}]}
+  authorization: {value: unknown, confidence: 0, evidence: [{source_path: internal/consumer.go}]}
+  idempotency: {value: unknown, confidence: 0, evidence: [{source_path: internal/consumer.go}]}
+trigger:
+  description: {value: NATS event, confidence: 0.8, evidence: [{source_path: internal/consumer.go}]}
+business_task: {value: Consume created order, confidence: 0.8, evidence: [{source_path: internal/consumer.go}]}
+evidence: [{source_path: internal/consumer.go}]
+confidence: 0.8
+`
+}
+
 func TestScanner_EnforcesInventoryLimits(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"one.md", "two.md", "three.md"} {

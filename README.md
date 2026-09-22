@@ -622,4 +622,17 @@ database rows and temporary repositories are removed before success. No Codex,
 GitLab, Telegram, or user repository is contacted.
 # Architecture Control Center
 
-`/architecture` visualizes the evidence-backed CURRENT topology through the owner UI. It is read-only: dragging nodes changes only the browser presentation, and no UI operation creates relations, edits contracts, starts plans, or changes application code. Repository-local Mermaid files are generated only as onboarding proposal files under `.ai/architecture/` and still require the existing approval/worktree flow.
+`/architecture` visualizes two evidence-backed CURRENT views through the owner
+UI: the existing interactive XYFlow topology map and the manifest-backed
+`PLATFORM → SERVICE → OPERATION` drill-down. Both are read-only: dragging
+nodes changes only browser presentation, and no UI operation creates
+relations, edits contracts, starts plans, or changes application code.
+
+Architecture Manifest v1 is documented in
+[`docs/architecture-manifest-v1.md`](docs/architecture-manifest-v1.md). The
+manifest catalog and Mermaid endpoints are immutable CURRENT evidence.
+Following completed rollout and global verification, the UI also provides a
+separate, fingerprint-bound TARGET/proposal workflow with diff, impact,
+approval, local issue/project-plan preparation, and a pure
+CURRENT-versus-TARGET verification. TARGET never mutates CURRENT manifests or
+source code.

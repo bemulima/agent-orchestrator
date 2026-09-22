@@ -36,7 +36,10 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/agent"
 	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	architectureprojection "github.com/bemulima/agent-orchestrator/internal/architecture"
+	architecturecatalog "github.com/bemulima/agent-orchestrator/internal/architecturecatalog"
+	architecturemanifest "github.com/bemulima/agent-orchestrator/internal/architecturemanifest"
 	"github.com/bemulima/agent-orchestrator/internal/config"
+	currentverification "github.com/bemulima/agent-orchestrator/internal/currentverification"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -47,6 +50,8 @@ import (
 	topologybuilder "github.com/bemulima/agent-orchestrator/internal/topology"
 	agentusageuc "github.com/bemulima/agent-orchestrator/internal/usecase/agentusage"
 	architectureuc "github.com/bemulima/agent-orchestrator/internal/usecase/architecture"
+	architecturecataloguc "github.com/bemulima/agent-orchestrator/internal/usecase/architecturecatalog"
+	architecturetargetuc "github.com/bemulima/agent-orchestrator/internal/usecase/architecturetarget"
 	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
@@ -105,6 +110,21 @@ func run(args []string) error {
 			"status": "ok", "version": agenttemplates.Version, "checksum": agenttemplates.Checksum(),
 		})
 	}
+	if command == "architecture-render" {
+		return runArchitectureRender(args[1:], os.Stdout)
+	}
+	if command == "architecture-scaffold" {
+		return runArchitectureScaffold(args[1:], os.Stdout)
+	}
+	if command == "architecture-reconcile" {
+		return runArchitectureReconcile(args[1:], os.Stdout)
+	}
+	if command == "architecture-audit" {
+		return runArchitectureAudit(args[1:], os.Stdout)
+	}
+	if command == "architecture-verify-current" {
+		return runArchitectureVerifyCurrent(args[1:], os.Stdout)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -144,6 +164,141 @@ func run(args []string) error {
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func runArchitectureRender(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("architecture-render", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	repositoryRoot := flags.String("root", "", "repository root containing .ai/architecture")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse architecture-render arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*repositoryRoot) == "" {
+		return fmt.Errorf("usage: architecture-render --root <repository-root>")
+	}
+	result, err := architecturemanifest.GenerateFiles(*repositoryRoot)
+	if err != nil {
+		return fmt.Errorf("generate architecture Mermaid files: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+func runArchitectureScaffold(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("architecture-scaffold", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	repositoryRoot := flags.String("root", "", "repository root to scan and scaffold")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse architecture-scaffold arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*repositoryRoot) == "" {
+		return fmt.Errorf("usage: architecture-scaffold --root <repository-root>")
+	}
+	root, err := filepath.Abs(*repositoryRoot)
+	if err != nil {
+		return fmt.Errorf("resolve architecture-scaffold root: %w", err)
+	}
+	report, err := discoverArchitectureRoot(root)
+	if err != nil {
+		return fmt.Errorf("discover architecture-scaffold operations: %w", err)
+	}
+	result, err := architecturemanifest.ScaffoldHTTPManifests(root, report)
+	if err != nil {
+		return fmt.Errorf("scaffold HTTP architecture manifests: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+func runArchitectureReconcile(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("architecture-reconcile", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	repositoryRoot := flags.String("root", "", "repository root to discover and reconcile")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse architecture-reconcile arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*repositoryRoot) == "" {
+		return fmt.Errorf("usage: architecture-reconcile --root <repository-root>")
+	}
+	root, err := filepath.Abs(*repositoryRoot)
+	if err != nil {
+		return fmt.Errorf("resolve architecture-reconcile root: %w", err)
+	}
+	report, err := discoverArchitectureRoot(root)
+	if err != nil {
+		return fmt.Errorf("discover architecture-reconcile operations: %w", err)
+	}
+	result, err := architecturemanifest.ReconcileHTTPManifests(root, report)
+	if err != nil {
+		return fmt.Errorf("reconcile HTTP architecture manifests: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+type architectureAuditRoots []string
+
+func (values *architectureAuditRoots) String() string { return strings.Join(*values, ",") }
+
+func (values *architectureAuditRoots) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("architecture audit root is empty")
+	}
+	*values = append(*values, value)
+	return nil
+}
+
+func runArchitectureAudit(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("architecture-audit", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var roots architectureAuditRoots
+	flags.Var(&roots, "root", "backend repository root (repeat for every service)")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse architecture-audit arguments: %w", err)
+	}
+	if flags.NArg() != 0 || len(roots) == 0 {
+		return fmt.Errorf("usage: architecture-audit --root <repository-root> [--root <repository-root> ...]")
+	}
+	inputs := make([]architecturemanifest.AuditInput, 0, len(roots))
+	for _, value := range roots {
+		root, err := filepath.Abs(value)
+		if err != nil {
+			return fmt.Errorf("resolve architecture-audit root: %w", err)
+		}
+		report, err := discoverArchitectureRoot(root)
+		if err != nil {
+			return fmt.Errorf("discover architecture-audit operations for %q: %w", root, err)
+		}
+		inputs = append(inputs, architecturemanifest.AuditInput{ServiceRoot: root, Report: report})
+	}
+	result, err := architecturemanifest.Audit(inputs)
+	if err != nil {
+		return fmt.Errorf("audit architecture completeness: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+func runArchitectureVerifyCurrent(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("architecture-verify-current", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var roots architectureAuditRoots
+	flags.Var(&roots, "root", "backend repository root (repeat for every service)")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse architecture-verify-current arguments: %w", err)
+	}
+	if flags.NArg() != 0 || len(roots) == 0 {
+		return fmt.Errorf("usage: architecture-verify-current --root <repository-root> [--root <repository-root> ...]")
+	}
+	result, err := currentverification.Verify(context.Background(), roots)
+	if err != nil {
+		return fmt.Errorf("verify architecture CURRENT: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+func discoverArchitectureRoot(root string) (domain.DiscoveryReport, error) {
+	name := filepath.Base(filepath.Clean(root))
+	return discovery.NewScanner(discovery.Config{}).Scan(context.Background(), domain.Project{
+		ID: name, Name: name, RepositoryRole: domain.RepositoryRoleService,
+	}, domain.RepositorySource{Name: name, Identity: root, LocalPath: root})
 }
 
 func runServer(cfg config.Config, logger *zap.Logger) error {
@@ -192,6 +347,28 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	}
 	architectureOperations := newArchitectureOperations(pool)
 	architectureHandler := handlers.ArchitectureHandler{Current: architectureOperations.Current, Service: architectureOperations.Service, Contracts: architectureOperations.Contracts}
+	architectureCatalogOperations := newArchitectureCatalogOperations(pool)
+	architectureCatalogHandler := handlers.ArchitectureCatalogHandler{
+		Current:          architectureCatalogOperations.Current,
+		Service:          architectureCatalogOperations.Service,
+		Operation:        architectureCatalogOperations.Operation,
+		PlatformMermaid:  architectureCatalogOperations.PlatformMermaid,
+		ServiceMermaid:   architectureCatalogOperations.ServiceMermaid,
+		OperationMermaid: architectureCatalogOperations.OperationMermaid,
+	}
+	architectureTargetRepo := pgadapter.ArchitectureTargetRepoPG{Pool: pool}
+	architectureTargetHandler := handlers.ArchitectureTargetHandler{
+		Current:        architectureCatalogOperations.Current,
+		List:           architecturetargetuc.List{Store: architectureTargetRepo},
+		Create:         architecturetargetuc.Create{Store: architectureTargetRepo},
+		Get:            architecturetargetuc.Get{Store: architectureTargetRepo},
+		Revise:         architecturetargetuc.Revise{Store: architectureTargetRepo},
+		Submit:         architecturetargetuc.Submit{Store: architectureTargetRepo},
+		Approve:        architecturetargetuc.Approve{Store: architectureTargetRepo},
+		Reject:         architecturetargetuc.Reject{Store: architectureTargetRepo},
+		RequestChanges: architecturetargetuc.RequestChanges{Store: architectureTargetRepo},
+		Verify:         architecturetargetuc.VerifyApprovedTarget{},
+	}
 	temporalClient, err := temporalclient.Dial(temporalclient.Options{
 		HostPort: cfg.TemporalHostPort, Namespace: cfg.TemporalNamespace, Logger: temporaladapter.NewLogger(logger),
 	})
@@ -208,6 +385,11 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 	workItemOperations, err := newWorkItemOperations(cfg, pool)
 	if err != nil {
 		return err
+	}
+	architectureTargetHandler.Integrate = architecturetargetuc.IntegrateApprovedTarget{
+		Commands: architectureTargetCommandAdapter{Create: planningOperations.CreateCommand},
+		Plans:    architectureTargetPlanAdapter{Create: planningOperations.CreatePlan},
+		Issues:   architectureTargetIssueAdapter{Prepare: workItemOperations.IssueManager},
 	}
 	planningHandler := handlers.PlanningHandler{
 		CreateCommand: planningOperations.CreateCommand, GetCommand: planningOperations.GetCommand,
@@ -258,18 +440,20 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		telegramHandler = &handlers.TelegramHandler{Processor: telegramService, Secret: cfg.TelegramWebhookSecret}
 	}
 	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
-		HealthHandler:       healthHandler,
-		ProjectHandler:      &projectHandler,
-		OnboardingHandler:   &onboardingHandler,
-		TopologyHandler:     &topologyHandler,
-		ArchitectureHandler: &architectureHandler,
-		PlanningHandler:     &planningHandler,
-		UIHandler:           &uiHandler,
-		AgentUsageHandler:   &agentUsageHandler,
-		ConversationHandler: &conversationHandler,
-		GitLabHandler:       &gitLabHandler,
-		TelegramHandler:     telegramHandler,
-		Logger:              logger,
+		HealthHandler:              healthHandler,
+		ProjectHandler:             &projectHandler,
+		OnboardingHandler:          &onboardingHandler,
+		TopologyHandler:            &topologyHandler,
+		ArchitectureHandler:        &architectureHandler,
+		ArchitectureCatalogHandler: &architectureCatalogHandler,
+		ArchitectureTargetHandler:  &architectureTargetHandler,
+		PlanningHandler:            &planningHandler,
+		UIHandler:                  &uiHandler,
+		AgentUsageHandler:          &agentUsageHandler,
+		ConversationHandler:        &conversationHandler,
+		GitLabHandler:              &gitLabHandler,
+		TelegramHandler:            telegramHandler,
+		Logger:                     logger,
 	})
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
@@ -554,6 +738,55 @@ type architectureOperations struct {
 	Current   architectureuc.Current
 	Service   architectureuc.Service
 	Contracts architectureuc.Contracts
+}
+
+type architectureCatalogOperations struct {
+	Current          architecturecataloguc.Current
+	Service          architecturecataloguc.Service
+	Operation        architecturecataloguc.Operation
+	PlatformMermaid  architecturecataloguc.PlatformMermaid
+	ServiceMermaid   architecturecataloguc.ServiceMermaid
+	OperationMermaid architecturecataloguc.OperationMermaid
+}
+
+// architectureTargetCommandAdapter keeps S7 on the existing command and
+// planning workflow while translating its narrow, target-specific boundary.
+// It has no execution or publication capability.
+type architectureTargetCommandAdapter struct{ Create planninguc.CreateCommand }
+
+func (a architectureTargetCommandAdapter) CreateCommand(ctx context.Context, request architecturetargetuc.CommandRequest) (domain.Command, error) {
+	return a.Create.Handle(ctx, planninguc.CreateCommandInput{
+		Source: request.Source, SourceUserID: request.SourceUserID,
+		Text: request.Text, IdempotencyKey: request.IdempotencyKey,
+	})
+}
+
+type architectureTargetPlanAdapter struct{ Create planninguc.CreatePlan }
+
+func (a architectureTargetPlanAdapter) CreatePlan(ctx context.Context, commandID string, request domain.PlanRequest) (domain.PlanBundle, error) {
+	return a.Create.Handle(ctx, commandID, request)
+}
+
+type architectureTargetIssueAdapter struct{ Prepare workitemservice.IssueManager }
+
+func (a architectureTargetIssueAdapter) PrepareIssueDrafts(ctx context.Context, planID string) ([]domain.WorkItem, error) {
+	return a.Prepare.Prepare(ctx, planID)
+}
+
+func newArchitectureCatalogOperations(pool *pgxpool.Pool) architectureCatalogOperations {
+	current := architecturecataloguc.Current{
+		Topology: pgadapter.TopologyRepoPG{Pool: pool},
+		Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Builder:  architecturecatalog.Builder{},
+	}
+	service := architecturecataloguc.Service{Current: current}
+	operation := architecturecataloguc.Operation{Service: service}
+	return architectureCatalogOperations{
+		Current: current, Service: service, Operation: operation,
+		PlatformMermaid:  architecturecataloguc.PlatformMermaid{Current: current},
+		ServiceMermaid:   architecturecataloguc.ServiceMermaid{Service: service},
+		OperationMermaid: architecturecataloguc.OperationMermaid{Operation: operation},
+	}
 }
 
 func newArchitectureOperations(pool *pgxpool.Pool) architectureOperations {
@@ -1392,6 +1625,11 @@ Commands:
   workflow-probe  Run a Temporal workflow/activity smoke test
   telegram        Run long polling or configure the signed webhook
   config-check    Validate configuration and print a secret-free summary
+  architecture-scaffold Create only missing HTTP manifests with explicit unknown semantics
+  architecture-reconcile Reconcile generated HTTP manifests against current discovery
+  architecture-render Generate .ai/architecture/*.mmd from validated local manifests
+  architecture-audit  Audit manifests, operations, and Mermaid coverage for repeated roots
+  architecture-verify-current Rescan and prove CURRENT for repeated local backend roots
   project-connect Connect a local path or Git URL and run read-only discovery
   project-list    List connected projects
   project-show    Show a project by ID or unique name

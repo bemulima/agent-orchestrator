@@ -14,18 +14,20 @@ import (
 
 // RouterDependencies collects HTTP handlers and cross-cutting dependencies.
 type RouterDependencies struct {
-	HealthHandler       handlers.HealthHandler
-	ProjectHandler      *handlers.ProjectHandler
-	OnboardingHandler   *handlers.OnboardingHandler
-	TopologyHandler     *handlers.TopologyHandler
-	ArchitectureHandler *handlers.ArchitectureHandler
-	PlanningHandler     *handlers.PlanningHandler
-	UIHandler           *handlers.UIHandler
-	ConversationHandler *handlers.ConversationHandler
-	AgentUsageHandler   *handlers.AgentUsageHandler
-	GitLabHandler       *handlers.GitLabHandler
-	TelegramHandler     *handlers.TelegramHandler
-	Logger              *zap.Logger
+	HealthHandler              handlers.HealthHandler
+	ProjectHandler             *handlers.ProjectHandler
+	OnboardingHandler          *handlers.OnboardingHandler
+	TopologyHandler            *handlers.TopologyHandler
+	ArchitectureHandler        *handlers.ArchitectureHandler
+	ArchitectureCatalogHandler *handlers.ArchitectureCatalogHandler
+	ArchitectureTargetHandler  *handlers.ArchitectureTargetHandler
+	PlanningHandler            *handlers.PlanningHandler
+	UIHandler                  *handlers.UIHandler
+	ConversationHandler        *handlers.ConversationHandler
+	AgentUsageHandler          *handlers.AgentUsageHandler
+	GitLabHandler              *handlers.GitLabHandler
+	TelegramHandler            *handlers.TelegramHandler
+	Logger                     *zap.Logger
 }
 
 // NewRouter builds the chi router.
@@ -71,6 +73,26 @@ func NewRouter(deps RouterDependencies) http.Handler {
 		root.Get("/api/v1/architecture/current", deps.ArchitectureHandler.GetCurrent)
 		root.Get("/api/v1/architecture/services/{projectId}", deps.ArchitectureHandler.GetService)
 		root.Get("/api/v1/architecture/services/{projectId}/contracts", deps.ArchitectureHandler.GetContracts)
+	}
+	if deps.ArchitectureCatalogHandler != nil {
+		root.Get("/api/v1/architecture/platform", deps.ArchitectureCatalogHandler.GetPlatform)
+		root.Get("/api/v1/architecture/platform/mermaid", deps.ArchitectureCatalogHandler.GetPlatformMermaid)
+		root.Get("/api/v1/architecture/platform/services/{projectId}", deps.ArchitectureCatalogHandler.GetService)
+		root.Get("/api/v1/architecture/platform/services/{projectId}/operations/{operationId}", deps.ArchitectureCatalogHandler.GetOperation)
+		root.Get("/api/v1/architecture/platform/services/{projectId}/mermaid", deps.ArchitectureCatalogHandler.GetServiceMermaid)
+		root.Get("/api/v1/architecture/platform/services/{projectId}/operations/{operationId}/mermaid", deps.ArchitectureCatalogHandler.GetOperationMermaid)
+	}
+	if deps.ArchitectureTargetHandler != nil {
+		root.Get("/api/v1/architecture/targets", deps.ArchitectureTargetHandler.ListTargets)
+		root.Post("/api/v1/architecture/targets", deps.ArchitectureTargetHandler.CreateTarget)
+		root.Get("/api/v1/architecture/targets/{targetId}", deps.ArchitectureTargetHandler.GetTarget)
+		root.Post("/api/v1/architecture/targets/{targetId}/changes", deps.ArchitectureTargetHandler.ReviseTarget)
+		root.Post("/api/v1/architecture/targets/{targetId}/submit", deps.ArchitectureTargetHandler.SubmitTarget)
+		root.Post("/api/v1/architecture/targets/{targetId}/approve", deps.ArchitectureTargetHandler.ApproveTarget)
+		root.Post("/api/v1/architecture/targets/{targetId}/reject", deps.ArchitectureTargetHandler.RejectTarget)
+		root.Post("/api/v1/architecture/targets/{targetId}/request-changes", deps.ArchitectureTargetHandler.RequestTargetChanges)
+		root.Post("/api/v1/architecture/targets/{targetId}/implementation-plan", deps.ArchitectureTargetHandler.CreateTargetImplementationPlan)
+		root.Get("/api/v1/architecture/targets/{targetId}/verification", deps.ArchitectureTargetHandler.VerifyTarget)
 	}
 	if deps.PlanningHandler != nil {
 		root.Post("/api/v1/commands", deps.PlanningHandler.CreateCommandRequest)

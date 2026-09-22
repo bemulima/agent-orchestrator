@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Current status
 
@@ -83,6 +83,58 @@ Stage 8 used a fake Bot API adapter, signed local webhook requests, and
 disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
 
 ## Completed
+
+- Completed S1 Architecture Manifest v1 foundation for the next Architecture
+  Control Center rollout. It introduces validated evidence-backed service and
+  operation manifests; five operation kinds (HTTP, NATS request/reply, NATS
+  event subscriber, worker, scheduled); immutable snapshot persistence without
+  raw YAML; deterministic service/operation Mermaid; a separate CURRENT
+  catalog with explicit completeness counters; read-only platform/service/
+  operation and Mermaid API endpoints; and the owner UI drill-down while
+  preserving the existing XYFlow topology map. At this S1 milestone, S2
+  remained the `ms-go-teacher-agent` reference implementation, S3 remained the
+  mandatory full backend rollout, and TARGET/proposal editing had not yet been
+  added.
+
+- Completed S3 full CURRENT rollout and platform-wide completeness remediation
+  on 2026-09-22. All 37 runtime backend services under `microservices/*` now
+  provide a validated `.ai/architecture/service.yaml` and generated
+  `service.mmd`; all 866 statically discovered operations provide a validated
+  manifest and generated Mermaid (812 HTTP, 2 NATS request/reply, 31 event
+  subscribers, and 21 scheduled operations). The final schema-v21 audit
+  reports `validation_errors=0`, `operations_missing_manifests=0`, and
+  `operations_blocked=0`. It also records 26 evidence-bounded `unknown` areas
+  instead of inventing static facts. At this S3 milestone, S4 CURRENT
+  verification was still required before TARGET, proposal, approval, or
+  work-item implementation.
+
+- Completed S4 global CURRENT verification on 2026-09-22. The new read-only
+  `architecture-verify-current` command performs a fresh bounded scan,
+  verifies Git/source stability across that scan, validates manifests and
+  generated Mermaid, and reports per-service evidence without treating the
+  intentionally untracked generated architecture artifacts as stale source.
+  The final run is `verified` for 37/37 services: 866/866 operations (812
+  HTTP, 2 NATS request/reply, 31 event subscribers, 21 scheduled), 37 service
+  Mermaid, and 891 operation Mermaid; no missing, blocked, or validation
+  failures. Five discovery-conflict classes and 26 unprovable manifest-to-code
+  identities remain explicit attention evidence, not invented graph edges.
+  CURRENT now also derives deterministic manifest-only cross-service relations
+  and global Mermaid, exposed read-only in the API and Control Center UI with
+  search/filter, drill-down/deep links, graph navigation, Mermaid preview and
+  export.
+
+- Completed S5–S8 Architecture Control Center lifecycle on 2026-09-22. TARGET
+  is a separate fingerprint-bound, evidence-preserving proposal model with
+  deterministic diff and graph impact; S6 requires an explicit revision- and
+  fingerprint-bound approve/reject/request-changes decision. An approved
+  target may only prepare existing local command, issue-draft, or Project Plan
+  artifacts—there is no external publication or execution side effect. The
+  final pure verification API compares a fresh CURRENT with the approved
+  TARGET and returns `MATCHED`, `PARTIALLY_IMPLEMENTED`, `DRIFT`,
+  `NOT_IMPLEMENTED`, or `VERIFICATION_PENDING` per change. The owner
+  `/architecture` UI now exposes the complete PLATFORM → SERVICE → OPERATION
+  read-only drill-down and TARGET editing, decision, planning, and verification
+  workflow.
 
 - Implemented Phase 1 Architecture Control Center as a read-only CURRENT projection over the persisted topology catalog. Added `/api/v1/architecture/current`, per-service and per-service-contract endpoints, deterministic Mermaid renderers, onboarding-proposal-only `.ai/architecture/*.mmd` artifacts, canonical agent guidance, and the owner `/architecture` map. No TARGET state, source-code mutation, plan execution, merge, or deploy path was added.
 

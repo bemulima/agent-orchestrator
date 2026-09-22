@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/bemulima/agent-orchestrator/internal/architecturemanifest"
 	"github.com/bemulima/agent-orchestrator/internal/contractref"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
@@ -30,18 +31,76 @@ func (s Scanner) detectFile(state *detectorState, file analyzedFile) {
 	}
 	s.analyzePrompts(state, path, file.content)
 	s.analyzeApprovedSemanticReport(state, path, file.content)
+	s.analyzeArchitectureManifest(state, path, file.content)
 
 	if strings.Contains(path, "/") && (base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb") ||
 		base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || base == "bun.lockb" {
 		state.lockFiles = append(state.lockFiles, path)
 	}
-	if strings.HasPrefix(path, ".ai/") && (base == "service.yaml" || base == "service.yml") {
+	if path == ".ai/service.yaml" || path == ".ai/service.yml" {
 		if match := aiServiceKindPattern.FindStringSubmatch(content); match != nil {
 			state.aiKind = match[1]
 			state.collector.fact("instruction", "existing_service_manifest", path, 1, path,
 				"An existing .ai service manifest declares service kind "+match[1]+".")
 		}
 	}
+}
+
+func (s Scanner) analyzeArchitectureManifest(state *detectorState, path string, content []byte) {
+	if isArchitectureServiceManifest(path) {
+		manifest, err := architecturemanifest.ParseService(content)
+		if err != nil {
+			state.collector.conflict("invalid_architecture_manifest", path, 1, path,
+				"The architecture service manifest is invalid or contains unsupported data.")
+			return
+		}
+		state.architectureService = &manifest
+		state.architectureManifests = append(state.architectureManifests, domain.ArchitectureManifestMetadata{
+			Path: path, Checksum: checksum(content), Schema: manifest.Schema, Kind: manifest.Kind,
+			ID: manifest.ID, ManifestRevision: manifest.ManifestRevision,
+		})
+		return
+	}
+	if !isArchitectureOperationManifest(path) {
+		return
+	}
+	manifest, err := architecturemanifest.ParseOperation(content)
+	if err != nil {
+		state.collector.conflict("invalid_architecture_manifest", path, 1, path,
+			"The architecture operation manifest is invalid or contains unsupported data.")
+		return
+	}
+	metadata := domain.ArchitectureManifestMetadata{
+		Path: path, Checksum: checksum(content), Schema: manifest.Schema, Kind: manifest.Kind,
+		ID: manifest.ID, ManifestRevision: manifest.ManifestRevision, ServiceID: manifest.ServiceID,
+		OperationType: manifest.Type,
+	}
+	if manifest.Type == domain.ArchitectureOperationHTTP && manifest.Identity.HTTP != nil {
+		metadata.HTTPMethod = manifest.Identity.HTTP.Method
+		metadata.HTTPPath = manifest.Identity.HTTP.Path
+	}
+	state.architectureManifests = append(state.architectureManifests, metadata)
+	state.architectureOperations = append(state.architectureOperations, manifest)
+}
+
+func isArchitectureServiceManifest(path string) bool {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	return path == ".ai/architecture/service.yaml" || path == ".ai/architecture/service.yml"
+}
+
+func isArchitectureOperationManifest(path string) bool {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	const prefix = ".ai/architecture/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	relative := strings.TrimPrefix(path, prefix)
+	if !(strings.HasPrefix(relative, "endpoints/") || strings.HasPrefix(relative, "operations/")) {
+		return false
+	}
+	filename := strings.TrimPrefix(strings.TrimPrefix(relative, "endpoints/"), "operations/")
+	return filename != "" && !strings.Contains(filename, "/") &&
+		(strings.HasSuffix(filename, ".yaml") || strings.HasSuffix(filename, ".yml"))
 }
 
 func isDocumentationMarkdownPath(path string) bool {
@@ -261,13 +320,15 @@ func (s Scanner) detectPurpose(state *detectorState, path, base, content string)
 }
 
 func (s Scanner) extractCapabilities(state *detectorState, path, content string) {
-	for _, match := range httpRoutePattern.FindAllStringSubmatch(content, -1) {
-		method := strings.ToUpper(match[1])
-		route := match[2]
-		collectHTTPRoute(state, method, route, .84, path,
-			"A route registration or controller decorator exposes this HTTP operation.")
+	// Go registrations are resolved across router mounts after all files are read.
+	if !strings.HasSuffix(strings.ToLower(path), ".go") {
+		for _, match := range httpRoutePattern.FindAllStringSubmatch(content, -1) {
+			method := strings.ToUpper(match[1])
+			route := match[2]
+			collectHTTPRoute(state, method, route, .84, path,
+				"A route registration or controller decorator exposes this HTTP operation.")
+		}
 	}
-	s.extractGoHTTPRoutes(state, path, content)
 	s.extractPythonHTTPRoutes(state, path, content)
 	for _, line := range strings.Split(content, "\n") {
 		lower := strings.ToLower(line)
@@ -289,33 +350,6 @@ func (s Scanner) extractCapabilities(state *detectorState, path, content string)
 					"An event subscriber consumes this subject.")
 			}
 		}
-	}
-}
-
-func (s Scanner) extractGoHTTPRoutes(state *detectorState, path, content string) {
-	if !strings.HasSuffix(strings.ToLower(path), ".go") {
-		return
-	}
-	matches := goHandleFuncPattern.FindAllStringSubmatchIndex(content, -1)
-	for index, match := range matches {
-		route := content[match[2]:match[3]]
-		end := len(content)
-		if index+1 < len(matches) {
-			end = matches[index+1][0]
-		}
-		block := content[match[0]:end]
-		method := "ANY"
-		confidence := .72
-		explanation := "A net/http HandleFunc registration exposes this route without a single-method guard."
-		if methodMatch := goHTTPMethodPattern.FindStringSubmatch(block); methodMatch != nil {
-			method = strings.ToUpper(methodMatch[1])
-			confidence = .86
-			explanation = "A net/http HandleFunc registration and method guard expose this HTTP operation."
-		} else if isHealthRoute(route) {
-			method = "GET"
-			explanation = "An unrestricted net/http health handler exposes the conventional GET health operation."
-		}
-		collectHTTPRoute(state, method, route, confidence, path, explanation)
 	}
 }
 
@@ -350,6 +384,14 @@ func collectHTTPRoute(
 		return
 	}
 	value := method + " " + route
+	state.operation(domain.DiscoveredOperation{
+		Type:       domain.ArchitectureOperationHTTP,
+		Protocol:   "http",
+		Method:     method,
+		Path:       route,
+		SourcePath: path,
+		Confidence: confidence,
+	})
 	state.collector.fact("capability", "http_route", value, confidence, path, explanation)
 	state.collector.fact("contract", "http_produce", value, confidence, path,
 		"The service implementation provides this HTTP contract.")
@@ -552,6 +594,51 @@ func (s Scanner) detectConflicts(state *detectorState) {
 		if inferred != "" && inferred != state.aiKind {
 			state.collector.conflict("service_kind_mismatch", state.aiKind+" != "+inferred, .92, ".ai/service.yaml",
 				"The existing .ai manifest conflicts with read-only service-kind discovery.")
+		}
+	}
+	s.detectArchitectureManifestConflicts(state)
+}
+
+func (s Scanner) detectArchitectureManifestConflicts(state *detectorState) {
+	operationsByHTTP := make(map[string]struct{}, len(state.operations))
+	for _, operation := range state.operations {
+		if operation.Type == domain.ArchitectureOperationHTTP {
+			operationsByHTTP[operation.Method+" "+operation.Path] = struct{}{}
+		}
+	}
+
+	declaredPaths := make(map[string]struct{})
+	serviceID := ""
+	if state.architectureService != nil {
+		serviceID = state.architectureService.ID
+		for _, relative := range state.architectureService.OperationManifests {
+			declaredPaths[".ai/architecture/"+relative] = struct{}{}
+		}
+	}
+	for _, manifest := range state.architectureManifests {
+		if manifest.Kind != "operation" {
+			continue
+		}
+		if state.architectureService == nil {
+			state.collector.conflict("architecture_operation_without_service", manifest.Path, 1, manifest.Path,
+				"An architecture operation manifest requires a valid local service manifest.")
+			continue
+		}
+		if manifest.ServiceID != serviceID {
+			state.collector.conflict("architecture_operation_service_mismatch", manifest.ID, 1, manifest.Path,
+				"The operation manifest belongs to a different service than the local service manifest.")
+		}
+		if _, declared := declaredPaths[manifest.Path]; !declared {
+			state.collector.conflict("architecture_operation_not_listed", manifest.Path, .95, manifest.Path,
+				"The operation manifest is not listed by the local service manifest.")
+		}
+		if manifest.OperationType != domain.ArchitectureOperationHTTP {
+			continue
+		}
+		identity := manifest.HTTPMethod + " " + manifest.HTTPPath
+		if _, observed := operationsByHTTP[identity]; !observed {
+			state.collector.conflict("architecture_http_operation_mismatch", identity, .95, manifest.Path,
+				"The declared HTTP operation was not observed by deterministic route discovery.")
 		}
 	}
 }

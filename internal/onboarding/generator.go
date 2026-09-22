@@ -91,7 +91,11 @@ func (g Generator) Generate(
 			if detail, detailErr := (architectureprojection.Projector{}).Service(current, project.ID); detailErr == nil && detail.Service.ProjectID == project.ID && topologySnapshotMatches(catalog, project.ID, snapshot.ID) {
 				evidence := evidencePaths(report.Facts)
 				generated = append(generated,
-					generatedFile{path: ".ai/architecture/service.mmd", content: architectureprojection.ServiceMermaid(detail), format: formatPlain, explanation: "Render the approved CURRENT topology projection for this service.", evidencePaths: evidence},
+					// `service.mmd` is reserved for the deterministic rendering of the
+					// repository-owned Architecture Manifest v1. Keep this older
+					// topology-only onboarding artifact separate so it can never replace
+					// a richer local service architecture document.
+					generatedFile{path: ".ai/architecture/topology.mmd", content: architectureprojection.ServiceMermaid(detail), format: formatPlain, explanation: "Render the approved CURRENT topology projection for this service.", evidencePaths: evidence},
 					generatedFile{path: ".ai/architecture/dependencies.mmd", content: architectureprojection.ServiceMermaid(detail), format: formatPlain, explanation: "Render actual CURRENT inbound and outbound topology relations.", evidencePaths: evidence},
 					generatedFile{path: ".ai/architecture/contracts.mmd", content: architectureprojection.ContractsMermaid(detail), format: formatPlain, explanation: "Render only CURRENT discovered contract references without payload inference.", evidencePaths: evidence},
 				)

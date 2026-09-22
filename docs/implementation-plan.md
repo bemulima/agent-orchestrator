@@ -1,8 +1,48 @@
 # Course development orchestrator implementation plan
 
-## Phase 1 — Architecture Control Center / CURRENT
+## Architecture Control Center roadmap
 
-Implemented as a read-only projection over `TopologyCatalog`: `Discovery → Topology → Architecture CURRENT → API/UI/Mermaid`. It adds no target state, direct repository writes, proposal editing, plan execution, merge, or deploy path. Generated repository diagrams remain onboarding-proposal artifacts and never become a source of truth.
+The Architecture Control Center is delivered in this strict order. `CURRENT`
+must be complete and evidence-backed before the product allows a user to model
+or approve a `TARGET` state.
+
+1. **S1 — Architecture Manifest v1 + catalog/API/UI foundation.** Repository
+   manifests, deterministic Mermaid, immutable discovery projection, and a
+   read-only `PLATFORM → SERVICE → OPERATION` CURRENT view.
+2. **S2 — `ms-go-teacher-agent` reference implementation.** Produce one
+   complete, reviewed example without treating it as platform completion.
+3. **S3 — full platform rollout and completeness remediation.** Cover every
+   backend service under `microservices/*`: Go, Node.js/TypeScript, PHP when
+   present, Python, Nginx/nonstandard runtimes, then audit the totals.
+4. **S4 — global CURRENT verification.** Prove completeness and rescan
+   consistency across the entire backend platform.
+5. **S5 — TARGET / Proposal / Diff / Impact.** This begins only after S4.
+6. **S6 — approval workflow.**
+7. **S7 — issue and project-plan creation.**
+8. **S8 — implementation rescan and CURRENT-versus-TARGET verification.**
+
+Status: S1–S8 completed and locally verified on 2026-09-22. S3 has 37 backend
+services and 866 discovered Architecture Operations, all with local manifest
+and generated Mermaid coverage. S4 verifies a fresh CURRENT; S5–S8 preserve
+the separate TARGET lifecycle, explicit approval, prepared local
+issue/project-plan drafts, and pure CURRENT-versus-TARGET verification.
+
+S1 is intentionally read-only. It does not add a target state, direct
+repository writes, proposal editing, plan execution, merge, or deploy path.
+Repository-local diagrams are generated from the manifest; Mermaid is a
+presentation and never becomes stronger evidence than the source manifest and
+its cited code.
+
+### S1 acceptance contract
+
+- Manifest v1 defines `service` plus the five `Architecture Operation` types:
+  HTTP, NATS request/reply, NATS event subscriber, worker, and scheduled.
+- Discovery snapshots retain validated typed manifests and independently
+  discovered operations, never raw YAML or parser diagnostics.
+- The catalog reports explicit discovered/manifest/missing/blocked counts,
+  including HTTP, event, worker, and scheduled subtotals.
+- The API and UI expose read-only CURRENT hierarchy and on-demand Mermaid;
+  unknown and uncovered states remain explicit.
 
 
 ## Goal

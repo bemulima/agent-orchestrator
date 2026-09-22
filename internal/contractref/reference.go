@@ -58,7 +58,7 @@ func HTTP(value string) (string, string, bool) {
 
 func HTTPMethod(value string) bool {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
-	case "ANY", "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD":
+	case "ANY", "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "SET":
 		return true
 	default:
 		return false

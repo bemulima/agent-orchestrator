@@ -18,7 +18,10 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
 )
 
-const reportSchemaVersion = 17
+// v21 changes canonical operation semantics: startup-scoped scheduled work is
+// separated from request timers and bounded NATS literal collections/callbacks
+// are resolved. Existing snapshots must therefore be rescanned.
+const reportSchemaVersion = 21
 
 var excludedDirectories = map[string]struct{}{
 	".git": {}, ".cache": {}, ".gocache": {}, ".idea": {}, ".vscode": {},
@@ -28,8 +31,6 @@ var excludedDirectories = map[string]struct{}{
 
 var (
 	httpRoutePattern      = regexp.MustCompile(`(?i)(?:\.|@)(get|post|put|patch|delete|options|head)\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
-	goHandleFuncPattern   = regexp.MustCompile(`(?m)(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?HandleFunc\s*\(\s*["` + "`" + `']([^"` + "`" + `']+)["` + "`" + `']`)
-	goHTTPMethodPattern   = regexp.MustCompile(`(?i)\.Method\s*!=\s*http\.Method(Get|Post|Put|Patch|Delete|Options|Head)`)
 	pythonHandlerPattern  = regexp.MustCompile(`(?m)^\s*def\s+do_(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s*\(`)
 	pythonPathPattern     = regexp.MustCompile(`self\.path\s*(?:==|!=)\s*["']([^"']+)["']`)
 	databaseTablePattern  = regexp.MustCompile(`(?i)create\s+table\s+(?:if\s+not\s+exists\s+)?(?:["` + "`" + `]?[a-zA-Z0-9_-]+["` + "`" + `]?\.)?["` + "`" + `]?([a-zA-Z][a-zA-Z0-9_-]*)`)
@@ -89,12 +90,13 @@ func (s Scanner) Scan(
 		filesByPath[filepath.ToSlash(file.path)] = file.content
 	}
 	state := detectorState{
-		project:         project,
-		source:          source,
-		collector:       collector,
-		filesByPath:     filesByPath,
-		promptChecksums: make(map[string][]promptChecksum),
-		lockFiles:       make([]string, 0),
+		project:          project,
+		source:           source,
+		collector:        collector,
+		filesByPath:      filesByPath,
+		promptChecksums:  make(map[string][]promptChecksum),
+		lockFiles:        make([]string, 0),
+		operationIndexes: make(map[string]struct{}),
 	}
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
@@ -102,27 +104,37 @@ func (s Scanner) Scan(
 		}
 		s.detectFile(&state, file)
 	}
+	s.extractMountedGoHTTPRoutes(&state)
+	s.extractNonHTTPOperations(&state)
 	s.detectDerivedFacts(&state)
 	s.detectConflicts(&state)
 	if isNonRuntimeRepositoryRole(project.RepositoryRole) {
 		collector.removeFactCategories("capability", "contract", "infrastructure", "ownership", "relation")
+		state.operations = nil
 	}
 	collector.sort()
+	sortOperations(state.operations)
+	sortArchitectureManifests(state.architectureManifests)
+	sortArchitectureOperationManifests(state.architectureOperations)
 	return domain.DiscoveryReport{
-		SchemaVersion:   reportSchemaVersion,
-		ProjectID:       project.ID,
-		ProjectName:     project.Name,
-		RepositoryRole:  project.RepositoryRole,
-		RepositoryPath:  source.LocalPath,
-		CommitSHA:       source.HeadCommit,
-		Branch:          source.CurrentBranch,
-		IsDirty:         source.IsDirty,
-		ContentChecksum: inventory.ContentChecksum,
-		StartedAt:       startedAt,
-		CompletedAt:     s.config.Now().UTC(),
-		Inventory:       inventory,
-		Facts:           collector.facts,
-		Conflicts:       collector.conflicts,
+		SchemaVersion:          reportSchemaVersion,
+		ProjectID:              project.ID,
+		ProjectName:            project.Name,
+		RepositoryRole:         project.RepositoryRole,
+		RepositoryPath:         source.LocalPath,
+		CommitSHA:              source.HeadCommit,
+		Branch:                 source.CurrentBranch,
+		IsDirty:                source.IsDirty,
+		ContentChecksum:        inventory.ContentChecksum,
+		StartedAt:              startedAt,
+		CompletedAt:            s.config.Now().UTC(),
+		Inventory:              inventory,
+		Facts:                  collector.facts,
+		Operations:             state.operations,
+		ArchitectureManifests:  state.architectureManifests,
+		ArchitectureService:    state.architectureService,
+		ArchitectureOperations: state.architectureOperations,
+		Conflicts:              collector.conflicts,
 	}, nil
 }
 
@@ -408,21 +420,58 @@ type promptChecksum struct {
 }
 
 type detectorState struct {
-	project         domain.Project
-	source          domain.RepositorySource
-	collector       *collector
-	filesByPath     map[string][]byte
-	promptChecksums map[string][]promptChecksum
-	lockFiles       []string
-	readmePurpose   string
-	goDetected      bool
-	nodeDetected    bool
-	pythonDetected  bool
-	phpDetected     bool
-	nextDetected    bool
-	nginxDetected   bool
-	composeDetected bool
-	aiKind          string
+	project                domain.Project
+	source                 domain.RepositorySource
+	collector              *collector
+	filesByPath            map[string][]byte
+	promptChecksums        map[string][]promptChecksum
+	lockFiles              []string
+	operations             []domain.DiscoveredOperation
+	operationIndexes       map[string]struct{}
+	architectureManifests  []domain.ArchitectureManifestMetadata
+	architectureService    *domain.ArchitectureServiceManifest
+	architectureOperations []domain.ArchitectureOperationManifest
+	readmePurpose          string
+	goDetected             bool
+	nodeDetected           bool
+	pythonDetected         bool
+	phpDetected            bool
+	nextDetected           bool
+	nginxDetected          bool
+	composeDetected        bool
+	aiKind                 string
+}
+
+func (s *detectorState) operation(value domain.DiscoveredOperation) {
+	key := strings.Join([]string{string(value.Type), value.Protocol, value.Method, value.Path,
+		value.Subject, value.Name, value.Schedule, value.SourcePath}, "\x00")
+	if _, exists := s.operationIndexes[key]; exists {
+		return
+	}
+	s.operationIndexes[key] = struct{}{}
+	s.operations = append(s.operations, value)
+}
+
+func sortOperations(values []domain.DiscoveredOperation) {
+	sort.Slice(values, func(i, j int) bool {
+		left := strings.Join([]string{string(values[i].Type), values[i].Protocol, values[i].Method,
+			values[i].Path, values[i].Subject, values[i].Name, values[i].Schedule, values[i].SourcePath}, "\x00")
+		right := strings.Join([]string{string(values[j].Type), values[j].Protocol, values[j].Method,
+			values[j].Path, values[j].Subject, values[j].Name, values[j].Schedule, values[j].SourcePath}, "\x00")
+		return left < right
+	})
+}
+
+func sortArchitectureManifests(values []domain.ArchitectureManifestMetadata) {
+	sort.Slice(values, func(i, j int) bool {
+		return values[i].Path+"\x00"+values[i].ID < values[j].Path+"\x00"+values[j].ID
+	})
+}
+
+func sortArchitectureOperationManifests(values []domain.ArchitectureOperationManifest) {
+	sort.Slice(values, func(i, j int) bool {
+		return values[i].ID < values[j].ID
+	})
 }
 
 func isNonRuntimeRepositoryRole(role domain.RepositoryRole) bool {
