@@ -38,6 +38,7 @@ import (
 	architectureprojection "github.com/bemulima/agent-orchestrator/internal/architecture"
 	architecturecatalog "github.com/bemulima/agent-orchestrator/internal/architecturecatalog"
 	architecturemanifest "github.com/bemulima/agent-orchestrator/internal/architecturemanifest"
+	"github.com/bemulima/agent-orchestrator/internal/architecturepresentation"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	currentverification "github.com/bemulima/agent-orchestrator/internal/currentverification"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
@@ -355,6 +356,8 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		PlatformMermaid:  architectureCatalogOperations.PlatformMermaid,
 		ServiceMermaid:   architectureCatalogOperations.ServiceMermaid,
 		OperationMermaid: architectureCatalogOperations.OperationMermaid,
+		ProcessRoot:      currentArchitectureProcessRoot(cfg),
+		Presentation:     architecturepresentation.NewProjector(architecturepresentation.DefaultClassificationRules()),
 	}
 	architectureTargetRepo := pgadapter.ArchitectureTargetRepoPG{Pool: pool}
 	architectureTargetHandler := handlers.ArchitectureTargetHandler{
@@ -487,6 +490,19 @@ func runServer(cfg config.Config, logger *zap.Logger) error {
 		return fmt.Errorf("shutdown http server: %w", err)
 	}
 	return nil
+}
+
+// currentArchitectureProcessRoot resolves the orchestrator-owned,
+// version-controlled process manifests from the same allowlisted workspace
+// that is mounted into the runtime. Local development falls back to cwd.
+func currentArchitectureProcessRoot(cfg config.Config) string {
+	for _, root := range cfg.RepositoryAllowedRoots {
+		candidate := filepath.Join(root, "course-dev-orchestrator")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return "."
 }
 
 func newTelegramService(

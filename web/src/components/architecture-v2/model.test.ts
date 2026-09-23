@@ -1,0 +1,9 @@
+import { describe, expect, it } from "vitest";
+import { classification, groupOperations, operationFlow, visibleServices, type V2Service } from "./model";
+const operation = (id: string, type = "http") => ({ manifest: { id, type, identity: type === "http" ? { http: { method: "GET", path: `/${id}` } } : { scheduled: { name: id, schedule: "* * * * *" } }, business_task: { value: "task" }, business_rules: [], access: {}, data_access: [], implementation: { repositories: [] }, external_interactions: [], output: { responses: [], emitted_events: [] } } });
+const service = (name: string, groups: any[] = []): V2Service => ({ source: { project_id: name, project_name: name }, manifest: { identity: { name }, purpose: { value: "purpose" } }, groups, ungrouped_operations: [operation("one"), operation("job", "scheduled")] });
+describe("Architecture V2 presentation model", () => {
+  it("uses only explicit/reliable rules and preserves Unclassified", () => { expect(classification(service("ms-gateway"))).toBe("technical"); expect(classification(service("course-service"))).toBe("unclassified"); expect(visibleServices([service("ms-gateway"), service("course-service")], "hideTechnical")).toHaveLength(1); expect(visibleServices([service("ms-gateway"), service("course-service")], "all")).toHaveLength(2); });
+  it("groups operations by transport and manifest capability", () => { const value = service("course", [{ name: "Read", operations: [operation("one")] }]); expect(groupOperations(value, "capability").map(item => item.name)).toEqual(["Read", "Unclassified capability"]); expect(groupOperations(value, "transport").map(item => item.name)).toEqual(["HTTP", "Scheduled"]); });
+  it("uses semantic, not endpoint, node types for an operation flow", () => { expect(operationFlow(operation("one")).map(item => item.type)).toContain("inputOutput"); expect(operationFlow(operation("one")).some(item => item.type === "startEnd")).toBe(true); });
+});

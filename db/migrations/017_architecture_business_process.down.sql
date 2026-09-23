@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS architecture_business_process_candidate;
+DROP TABLE IF EXISTS architecture_business_process_index;
+DROP TABLE IF EXISTS architecture_business_process_snapshot;

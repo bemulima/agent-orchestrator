@@ -76,9 +76,13 @@ func NewRouter(deps RouterDependencies) http.Handler {
 	}
 	if deps.ArchitectureCatalogHandler != nil {
 		root.Get("/api/v1/architecture/platform", deps.ArchitectureCatalogHandler.GetPlatform)
+		root.Get("/api/v1/architecture/platform/presentation", deps.ArchitectureCatalogHandler.GetPlatformPresentation)
+		root.Get("/api/v1/architecture/processes", deps.ArchitectureCatalogHandler.ListProcesses)
 		root.Get("/api/v1/architecture/platform/mermaid", deps.ArchitectureCatalogHandler.GetPlatformMermaid)
 		root.Get("/api/v1/architecture/platform/services/{projectId}", deps.ArchitectureCatalogHandler.GetService)
+		root.Get("/api/v1/architecture/platform/services/{projectId}/presentation", deps.ArchitectureCatalogHandler.GetServicePresentation)
 		root.Get("/api/v1/architecture/platform/services/{projectId}/operations/{operationId}", deps.ArchitectureCatalogHandler.GetOperation)
+		root.Get("/api/v1/architecture/platform/services/{projectId}/operations/{operationId}/presentation", deps.ArchitectureCatalogHandler.GetOperationPresentation)
 		root.Get("/api/v1/architecture/platform/services/{projectId}/mermaid", deps.ArchitectureCatalogHandler.GetServiceMermaid)
 		root.Get("/api/v1/architecture/platform/services/{projectId}/operations/{operationId}/mermaid", deps.ArchitectureCatalogHandler.GetOperationMermaid)
 	}

@@ -6,6 +6,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/bemulima/agent-orchestrator/internal/architecturepresentation"
+	"github.com/bemulima/agent-orchestrator/internal/architectureprocess"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
@@ -38,10 +40,60 @@ type ArchitectureCatalogHandler struct {
 	PlatformMermaid  architectureCatalogPlatformMermaidUseCase
 	ServiceMermaid   architectureCatalogServiceMermaidUseCase
 	OperationMermaid architectureCatalogOperationMermaidUseCase
+	ProcessRoot      string
+	Presentation     architecturepresentation.Projector
 }
 
 func (h ArchitectureCatalogHandler) GetPlatform(w http.ResponseWriter, r *http.Request) {
 	result, err := h.Current.Handle(r.Context())
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetPlatformPresentation provides the additive V2 service-only graph model.
+// It is deliberately separate from the canonical catalog response.
+func (h ArchitectureCatalogHandler) GetPlatformPresentation(w http.ResponseWriter, r *http.Request) {
+	catalog, err := h.Current.Handle(r.Context())
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	view := architecturepresentation.PlatformViewMode(r.URL.Query().Get("view"))
+	if view == "" {
+		view = architecturepresentation.PlatformViewBusiness
+	}
+	result, err := h.Presentation.Platform(r.Context(), catalog, view)
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h ArchitectureCatalogHandler) GetServicePresentation(w http.ResponseWriter, r *http.Request) {
+	catalog, err := h.Current.Handle(r.Context())
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	result, err := h.Presentation.Service(r.Context(), catalog, chi.URLParam(r, "projectId"))
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h ArchitectureCatalogHandler) GetOperationPresentation(w http.ResponseWriter, r *http.Request) {
+	catalog, err := h.Current.Handle(r.Context())
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	result, err := h.Presentation.Operation(r.Context(), catalog, chi.URLParam(r, "projectId"), chi.URLParam(r, "operationId"))
 	if err != nil {
 		WriteDomainError(w, err)
 		return
@@ -65,6 +117,20 @@ func (h ArchitectureCatalogHandler) GetOperation(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// ListProcesses returns only version-controlled, confirmed CURRENT processes.
+// Candidate/unverified processes are never elevated to CURRENT by this route.
+func (h ArchitectureCatalogHandler) ListProcesses(w http.ResponseWriter, r *http.Request) {
+	processes, err := architectureprocess.LoadCurrent(h.ProcessRoot)
+	if err != nil {
+		WriteDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Mode      string                         `json:"mode"`
+		Processes []architectureprocess.Manifest `json:"processes"`
+	}{Mode: domain.ArchitectureCatalogModeCurrent, Processes: processes})
 }
 
 // GetPlatformMermaid returns the deterministic Mermaid projection of the

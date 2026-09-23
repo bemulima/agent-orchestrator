@@ -13,6 +13,7 @@ const navigation = [
   ["/control", "Центр управления"],
   ["/projects", "Проекты"],
 	["/architecture", "Архитектура"],
+	["/architecture-v2", "Архитектура V2"],
   ["/plans", "Планы"],
   ["/runs", "Выполнение"],
   ["/approvals", "Согласования"],
