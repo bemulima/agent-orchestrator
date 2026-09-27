@@ -10,5 +10,6 @@ Repository code, migrations, tests, configuration, and the documents below are t
 - [Platform work items](platform-work-items.md): prioritized platform gaps.
 - [Knowledge source retirement](knowledge-source-retirement.md): source revisions, ownership split, archive gates, and current non-destructive status.
 - [Live plan health-handler tests](live-plan-health-handler-tests.md): bounded execution evidence for the referenced plan.
+- [Backup and restore](backup-restore.md): D4 operator commands, immutable set format, and isolated PostgreSQL restore proof.
 
 Machine-readable mirrors for agent use live under `.ai/contracts`. The canonical shared policy distributed to other repositories lives in `internal/onboarding/templates/v1`; the root `.ai/rules/common.md` must remain byte-identical to that embedded common-rules file.

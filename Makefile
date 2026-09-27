@@ -14,6 +14,10 @@ POSTGRES_PORT ?= 5434
 HTTP_PORT ?= 8080
 TEMPORAL_UI_PORT ?= 8233
 UI_PORT ?= 3010
+BACKUP_ROOT ?= /Volumes/ZX10/platform-backups
+BACKUP_COMPONENT ?= orchestrator-postgres
+BACKUP_SET ?=
+RESTORE_TARGET ?=
 DATABASE_URL ?= postgres://$(DB_USER):$(or $(POSTGRES_PASSWORD),postgres)@localhost:$(POSTGRES_PORT)/$(DB_NAME)?sslmode=disable
 CODEX_HOST_AUTH_FILE ?= $(HOME)/.codex/auth.json
 GO_ENV := XDG_CACHE_HOME=$(CURDIR)/.cache GOCACHE=$(CURDIR)/.cache/go-build GOMODCACHE=$(CURDIR)/.cache/gomod GOBIN=$(CURDIR)/.cache/bin
@@ -25,7 +29,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check agent-policy agent-template-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-archive project-restore project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check backup backup-status restore-check agent-policy agent-template-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-archive project-restore project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -57,6 +61,17 @@ ps: ## Show local stack status
 
 logs: ## Follow local stack logs
 	$(COMPOSE) logs -f --tail=200
+
+backup: ## Create an explicit online backup (BACKUP_COMPONENT=orchestrator-postgres|all-active)
+	@BACKUP_ROOT="$(BACKUP_ROOT)" python3 ./scripts/backup-orchestrator-postgres.py backup --component "$(BACKUP_COMPONENT)"
+
+backup-status: ## List orchestrator PostgreSQL backup-set metadata without contacting Docker
+	@BACKUP_ROOT="$(BACKUP_ROOT)" python3 ./scripts/backup-orchestrator-postgres.py status
+
+restore-check: ## Restore BACKUP_SET only into explicit RESTORE_TARGET=d4-restore-postgres-... and verify it
+	@test -n "$(BACKUP_SET)" || (echo "Set BACKUP_SET=/Volumes/ZX10/platform-backups/course-dev-orchestrator/postgres/<timestamp>"; exit 2)
+	@test -n "$(RESTORE_TARGET)" || (echo "Set RESTORE_TARGET=d4-restore-postgres-<unique-id>"; exit 2)
+	@BACKUP_ROOT="$(BACKUP_ROOT)" python3 ./scripts/restore-check-orchestrator-postgres.py --backup-set "$(BACKUP_SET)" --target "$(RESTORE_TARGET)"
 
 migrate: ## Apply pending PostgreSQL migrations transactionally
 	COMPOSE_COMMAND="$(COMPOSE)" DB_CONTAINER=$(DB_CONTAINER) DB_USER=$(DB_USER) DB_NAME=$(DB_NAME) ./scripts/migrate.sh

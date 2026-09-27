@@ -1,6 +1,6 @@
 # Implementation progress
 
-Last updated: 2026-09-22
+Last updated: 2026-09-24
 
 ## Current status
 
@@ -25,6 +25,11 @@ and visible in `/usage`; deterministic issue/PR templates spend no model quota.
 The Docker Compose stack is currently
 running with PostgreSQL, Temporal, Temporal UI, the HTTP API, worker, and owner
 UI.
+
+The D2 development storage pass adds explicit `json-file` rotation to all six
+Compose services (`20m` per file, three files). Compose validation passed; the
+six already-running containers were left untouched and keep their prior
+logging configuration until a normal Compose recreation.
 Project lifecycle and agent-policy extraction are now implemented locally.
 Projects can be archived without deleting snapshots or history and restored to
 their exact pre-archive status. Active queries exclude archived sources from
@@ -1150,6 +1155,31 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   managed clones, database history, and snapshots remain intact. The attempted
   GitHub scope escalation was cancelled; `delete_repo` was not granted and no
   remote repository was deleted.
+
+## D4 — persistent data safety, backup, and restore proof
+
+- Added explicit `make backup`, `make backup-status`, and `make restore-check`
+  commands for the orchestrator PostgreSQL instance. The backup uses online
+  logical dumps of every non-template database plus roles without role
+  passwords; it does not stop the six-container control-plane stack or copy
+  live `PGDATA`.
+- Added an immutable set manifest, SHA-256 payload verification, source
+  volume/image metadata, catalog snapshots, no-secret restore information, and
+  strict Docker-context, mounted-volume, free-space, source-label, set-format,
+  checksum, and isolated-target guards.
+- Created `/Volumes/ZX10/platform-backups/course-dev-orchestrator/postgres/2026-09-24T150415Z` and restored it only into
+  `d4-restore-postgres-20260924t1516` with a distinct temporary volume. The
+  proof recorded database/catalog counts of `course_dev_orchestrator=37`,
+  `postgres=0`, `temporal=37`, and `temporal_visibility=3`; it then removed only
+  that exact D4-labeled container and volume.
+- Added the cross-platform inventory and documented deferred methods for
+  inactive PostgreSQL, Tarantool, JetStream, MinIO, ClickHouse, sandbox, and
+  workspace state. `orchestrator_data` is intentionally not blanket-archived:
+  its actual repositories/worktrees are empty and its Codex area includes auth
+  and caches.
+- Verified the repository with `make verify`. The separate infrastructure
+  `make plan` passed; `make config` remains blocked by the unrelated missing
+  `/Volumes/ZX10/Developments/nextjs/.env.example` contract.
 
 ## Remaining work
 
