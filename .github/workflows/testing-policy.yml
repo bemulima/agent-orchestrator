@@ -1,0 +1,122 @@
+name: Testing Policy Canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testing-policy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up policy Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.5
+
+      - name: Check frozen policy bundle identity
+        run: |
+          node <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { readFileSync } = require('node:fs');
+          const lock = JSON.parse(readFileSync('.ai/testing/policy/policy-lock.json', 'utf8'));
+          const expected = {
+            policy_source_commit: '0c8a8f6e96eadf2bdc027d1b76134a1166624273',
+            policy_semantics_sha: '1307491f9fd5dc7a0596becdf51ebfb411209d3e',
+            bundle_sha256: 'c57196953cb1807a26c6351deeaa0d5565fefe39ae4fd8b548b959e283d4c531',
+            node_runtime_requirement: '>=20 <21',
+          };
+          if (Number(process.versions.node.split('.')[0]) !== 20) {
+            throw new Error(`Policy runner requires Node 20; got ${process.versions.node}`);
+          }
+          for (const [key, value] of Object.entries(expected)) {
+            if (lock[key] !== value) throw new Error(`Policy lock identity mismatch: ${key}`);
+          }
+          const actual = createHash('sha256')
+            .update(readFileSync('.ai/testing/policy/policy-runner.cjs'))
+            .digest('hex');
+          if (actual !== lock.bundle_sha256) throw new Error('Policy bundle checksum mismatch');
+          console.log(`Policy bundle checksum PASS sha256=${actual}`);
+          NODE
+          node .ai/testing/policy/policy-runner.cjs --version
+          node .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json
+
+      - name: Validate repository manifest
+        run: node .ai/testing/policy/policy-runner.cjs validate --repo .
+
+      - name: Run frozen verify:fast selector
+        id: policy_run
+        continue-on-error: true
+        env:
+          POLICY_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: >-
+          node .ai/testing/policy/policy-runner.cjs verify
+          --repo . --command verify:fast --output-dir . --run-id "$POLICY_RUN_ID"
+
+      - name: Validate test-result.v1 artifacts
+        id: validate_results
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d test-results ]]; then
+            echo 'No test-results directory was produced.' >&2
+            exit 1
+          fi
+          mapfile -d '' result_files < <(find test-results -type f -name test-result.v1.json -print0)
+          if ((${#result_files[@]} == 0)); then
+            echo 'No test-result.v1.json files were produced.' >&2
+            exit 1
+          fi
+          for result in "${result_files[@]}"; do
+            node .ai/testing/policy/policy-runner.cjs validate-result --repo . --result "$result"
+          done
+
+      - name: Upload testing-policy-results artifact
+        id: upload_results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testing-policy-results
+          path: test-results/**/test-result.v1.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce policy result after artifact upload
+        if: always()
+        env:
+          POLICY_OUTCOME: ${{ steps.policy_run.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validate_results.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_results.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$VALIDATION_OUTCOME" != success ]]; then
+            echo "Result validation did not succeed: $VALIDATION_OUTCOME" >&2
+            exit 1
+          fi
+          if [[ "$UPLOAD_OUTCOME" != success ]]; then
+            echo "Required result artifact upload did not succeed: $UPLOAD_OUTCOME" >&2
+            exit 1
+          fi
+          mapfile -d '' result_files < <(find test-results -type f -name test-result.v1.json -print0)
+          if ((${#result_files[@]} == 0)); then
+            echo 'No test-result.v1.json files are available for final enforcement.' >&2
+            exit 1
+          fi
+          for result in "${result_files[@]}"; do
+            node .ai/testing/policy/policy-runner.cjs enforce-result --repo . --result "$result"
+          done
+          if [[ "$POLICY_OUTCOME" != success ]]; then
+            echo "Policy runner command did not succeed: $POLICY_OUTCOME" >&2
+            exit 1
+          fi
