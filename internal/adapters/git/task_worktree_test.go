@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -54,6 +55,31 @@ func TestTaskWorktreeIsolatesVerifiesAndCommitsFixture(t *testing.T) {
 	repeatedCommit, err := worktrees.Commit(context.Background(), project, task, repeated, state.ChangedFiles)
 	require.NoError(t, err)
 	require.Equal(t, commit, repeatedCommit)
+}
+
+func TestTestingPolicyRunnerCommandsAreExactAndArgumentBound(t *testing.T) {
+	runID := "123e4567-e89b-12d3-a456-426614174000"
+	base := strings.Repeat("a", 40)
+	head := strings.Repeat("b", 40)
+	commands := []string{
+		"node .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json",
+		"node .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id " + runID + " --base " + base + " --head " + head,
+		"node .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance not-required --output test-results/" + runID + "/agent-dod.v1.json",
+	}
+	for _, requested := range commands {
+		name, arguments, ok := allowedTestingPolicyCommand(requested)
+		require.True(t, ok, requested)
+		require.Equal(t, "node", name)
+		require.NotEmpty(t, arguments)
+	}
+
+	for _, requested := range []string{
+		"node .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id " + runID + " --base " + base + " --head " + head + " ; touch /tmp/not-allowed",
+		"node .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/../verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance not-required --output test-results/" + runID + "/agent-dod.v1.json",
+	} {
+		_, _, ok := allowedTestingPolicyCommand(requested)
+		require.False(t, ok, requested)
+	}
 }
 
 func TestTaskWorktreeRejectsEscapingArtifactSymlink(t *testing.T) {

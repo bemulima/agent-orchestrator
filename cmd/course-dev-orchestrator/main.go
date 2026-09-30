@@ -1562,6 +1562,9 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 	executor := &executionengine.Service{
 		Repository: taskExecutions, Worktrees: worktrees, Runner: runner, Validator: resultValidator,
 		Verifier: executionengine.Verifier{Worktrees: worktrees},
+		TestingPolicy: executionengine.BundleTestingPolicyGate{
+			Worktrees: worktrees,
+		},
 		Models: map[string]string{
 			config.ModelProfileFast: cfg.CodexModelFast, config.ModelProfileStandard: cfg.CodexModelStandard,
 			config.ModelProfileDeep: cfg.CodexModelDeep,

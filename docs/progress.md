@@ -1222,3 +1222,19 @@ the three pre-migration replacement records or publish the remaining three fake
 issues for plan `0436da42-b1cf-45de-a538-95f546f4ba9a` unless the owner names
 that exact action. Do not publish real issues/PR, start a plan, push, merge, or
 deploy without their own subsequent explicit authorizations.
+
+## Testing Policy task completion gate — 2026-09-30
+
+- The execution worker now requires a pinned Testing Policy bundle, runs
+  `verify:pr`, and evaluates task-bound `agent-dod.v1` evidence before it can
+  complete an attempt. Missing, failed, blocked, or identity-mismatched
+  evidence blocks completion.
+- The consumer bundle is pinned to Verification source
+  `26dce0ab38970457931a9f2ab9273918329192f9`, semantics
+  `5a0422683ae97659d8f152df5a2b60d45d1893f9`, bundle SHA-256
+  `bdd510d44c9467715ca85a1b95744db2d57390095c70bdc972a08748783f5d58`.
+- Full `make verify` passed after the code and focused tests were updated.
+- The task model does not yet provide a trusted Business Acceptance scope
+  signal; the worker currently supplies `not-required`. In-scope business
+  acceptance therefore remains an integration gap, and this slice does not
+  establish the full program completion criterion.

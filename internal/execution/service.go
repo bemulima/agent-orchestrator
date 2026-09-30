@@ -19,6 +19,7 @@ type Service struct {
 	Runner            repository.AgentRunner
 	Validator         repository.AgentResultValidator
 	Verifier          Verifier
+	TestingPolicy     TestingPolicyGate
 	Models            map[string]string
 	Reasoning         map[string]string
 	ReviewModel       string
@@ -32,7 +33,7 @@ func (s Service) Execute(
 	ctx context.Context,
 	taskID, workflowID string,
 ) (domain.TaskExecutionOutcome, error) {
-	if s.Repository == nil || s.Worktrees == nil || s.Runner == nil || s.Validator == nil {
+	if s.Repository == nil || s.Worktrees == nil || s.Runner == nil || s.Validator == nil || s.TestingPolicy == nil {
 		return domain.TaskExecutionOutcome{}, fmt.Errorf("task execution service is incomplete: %w", domain.ErrInvalidStatus)
 	}
 	executionContext, err := s.Repository.GetExecutionContext(ctx, taskID)
@@ -231,6 +232,36 @@ func (s Service) Execute(
 		commitSHA, err := s.Worktrees.Commit(ctx, executionContext.Project, executionContext.Task, workspace, state.ChangedFiles)
 		if err != nil {
 			return domain.TaskExecutionOutcome{}, err
+		}
+		testingPolicy, err := s.TestingPolicy.VerifyTask(ctx, workspace, attempt.ID, workspace.BaseCommit, commitSHA)
+		report.Checks = append(report.Checks, testingPolicy.Checks...)
+		if err != nil {
+			report.Status = "failed"
+			message := "Testing Policy DoD verification could not complete: " + err.Error()
+			structured := map[string]any{"agent_result": result, "verification": report, "testing_policy_error": err.Error()}
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, message, structured); failErr != nil {
+				return domain.TaskExecutionOutcome{}, failErr
+			}
+			return outcome(taskID, domain.TaskStatusBlocked, message), nil
+		}
+		if len(testingPolicy.ReportBytes) > 0 && testingPolicy.ReportPath != "" {
+			result.Artifacts = append(result.Artifacts, domain.AgentArtifactClaim{
+				Type: "testing_policy", Name: "agent-dod.v1", Path: testingPolicy.ReportPath,
+			})
+		}
+		if testingPolicy.LifecycleState != "DONE" || len(testingPolicy.ReportBytes) == 0 || testingPolicy.ReportPath == "" {
+			report.Status = "failed"
+			message := "Testing Policy DoD did not report DONE with a saved agent-dod.v1 artifact."
+			structured := map[string]any{"agent_result": result, "verification": report, "testing_policy_lifecycle_state": testingPolicy.LifecycleState, "testing_policy_report_path": testingPolicy.ReportPath}
+			if testingPolicy.ReportPath != "" && len(testingPolicy.ReportBytes) > 0 {
+				if storeErr := s.storeArtifacts(ctx, attempt, workspace, result.Artifacts); storeErr != nil {
+					return domain.TaskExecutionOutcome{}, storeErr
+				}
+			}
+			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, message, structured); failErr != nil {
+				return domain.TaskExecutionOutcome{}, failErr
+			}
+			return outcome(taskID, domain.TaskStatusBlocked, message), nil
 		}
 		if err := s.storeArtifacts(ctx, attempt, workspace, result.Artifacts); err != nil {
 			return domain.TaskExecutionOutcome{}, err

@@ -37,7 +37,7 @@ func TestFixtureExecutionProducesRealIsolatedDiffAndStructuredResult(t *testing.
 	runner := &fileChangingRunner{responses: []json.RawMessage{fixtureCoderResult(), approvedReviewResult()}}
 	service := Service{
 		Repository: repo, Worktrees: worktrees, Runner: runner, Validator: validator,
-		Verifier: Verifier{Worktrees: worktrees}, MaxTaskAttempts: 3, MaxReviewAttempts: 2,
+		Verifier: Verifier{Worktrees: worktrees}, TestingPolicy: fileTestingPolicyGate{}, MaxTaskAttempts: 3, MaxReviewAttempts: 2,
 	}
 
 	outcome, err := service.Execute(context.Background(), "task-1", "workflow-1")
@@ -47,6 +47,26 @@ func TestFixtureExecutionProducesRealIsolatedDiffAndStructuredResult(t *testing.
 	require.Empty(t, runFixtureGit(t, sourcePath, "status", "--porcelain=v1"))
 	require.NotEqual(t, baseCommit, runFixtureGit(t, runner.worktreePath, "rev-parse", "HEAD"))
 	require.Equal(t, "after\n", readFixtureFile(t, filepath.Join(runner.worktreePath, "internal", "value.txt")))
+}
+
+type fileTestingPolicyGate struct{}
+
+func (fileTestingPolicyGate) VerifyTask(_ context.Context, workspace domain.TaskWorkspace, _ string, _, _ string) (TestingPolicyOutcome, error) {
+	path := "test-results/attempt-1/agent-dod.v1.json"
+	bytes := []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE"}`)
+	fullPath := filepath.Join(workspace.Path, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o750); err != nil {
+		return TestingPolicyOutcome{}, err
+	}
+	if err := os.WriteFile(fullPath, bytes, 0o640); err != nil {
+		return TestingPolicyOutcome{}, err
+	}
+	return TestingPolicyOutcome{
+		LifecycleState: "DONE",
+		ReportPath:     path,
+		ReportBytes:    bytes,
+		Checks:         []domain.VerificationCheck{{Name: "agent_definition_of_done", Status: "passed"}},
+	}, nil
 }
 
 func fixtureCoderResult() json.RawMessage {

@@ -41,6 +41,24 @@ func TestServiceCompletesFixtureWithSeparateReviewerThread(t *testing.T) {
 	require.NotEqual(t, repo.coderThread, repo.reviewThreads[0])
 }
 
+func TestServiceBlocksCompletionWhenTestingPolicyDoDIsNotDone(t *testing.T) {
+	validator, err := agent.NewValidator()
+	require.NoError(t, err)
+	repo := newFakeExecutionRepository()
+	worktrees := successfulExecutionWorktree()
+	runner := &sequenceRunner{results: []json.RawMessage{completedCoderResult(), approvedReviewResult()}}
+	service := fixtureService(repo, worktrees, runner, validator)
+	service.TestingPolicy = fixedTestingPolicyGate{state: "BLOCKED"}
+
+	result, err := service.Execute(context.Background(), "task-1", "workflow-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.TaskStatusBlocked, result.Result.Status)
+	require.Equal(t, domain.TaskAttemptStatusBlocked, repo.failedStatus)
+	require.False(t, repo.completed)
+	require.True(t, worktrees.committed)
+	require.Contains(t, repo.failedStructured, "testing_policy_lifecycle_state")
+}
+
 func TestServiceRejectsArchivedProjectBeforePreparingWorktree(t *testing.T) {
 	validator, err := agent.NewValidator()
 	require.NoError(t, err)
@@ -238,10 +256,23 @@ func fixtureService(
 ) Service {
 	return Service{
 		Repository: repo, Worktrees: worktrees, Runner: runner, Validator: validator,
-		Verifier: Verifier{Worktrees: worktrees}, Models: map[string]string{"standard": "fixture-model"},
+		Verifier: Verifier{Worktrees: worktrees}, TestingPolicy: fixedTestingPolicyGate{state: "DONE"}, Models: map[string]string{"standard": "fixture-model"},
 		Reasoning:   map[string]string{"standard": "medium"},
 		ReviewModel: "fixture-review", ReviewReasoning: "high", MaxTaskAttempts: 3, MaxReviewAttempts: 2,
 	}
+}
+
+type fixedTestingPolicyGate struct {
+	state string
+}
+
+func (g fixedTestingPolicyGate) VerifyTask(context.Context, domain.TaskWorkspace, string, string, string) (TestingPolicyOutcome, error) {
+	return TestingPolicyOutcome{
+		LifecycleState: g.state,
+		ReportPath:     "test-results/attempt-1/agent-dod.v1.json",
+		ReportBytes:    []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"` + g.state + `"}`),
+		Checks:         []domain.VerificationCheck{{Name: "agent_definition_of_done", Status: map[bool]string{true: "passed", false: "failed"}[g.state == "DONE"]}},
+	}, nil
 }
 
 func successfulExecutionWorktree() *fakeWorktree {
