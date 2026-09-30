@@ -20,7 +20,11 @@ COPY runner/src ./src
 RUN npm run build \
     && npm prune --omit=dev
 
+FROM node:20.19.5-alpine AS policy-runtime
+
 FROM node:24-alpine
+COPY --from=policy-runtime /usr/local/bin/node /usr/local/bin/node20
+RUN node20 --version
 
 COPY --from=builder /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:${PATH}"

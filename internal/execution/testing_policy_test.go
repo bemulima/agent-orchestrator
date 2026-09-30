@@ -59,9 +59,9 @@ func TestBundleTestingPolicyGateRequiresDoneReportAndExactEvidenceCommands(t *te
 	require.Equal(t, report, outcome.ReportBytes)
 	require.Len(t, outcome.Checks, 3)
 	require.Equal(t, []string{
-		"node .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json",
-		fmt.Sprintf("node .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id run-1 --base %s --head %s", baseSHA, headSHA),
-		fmt.Sprintf("node .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --business-acceptance not-required --output test-results/run-1/agent-dod.v1.json", baseSHA, headSHA),
+		"node20 .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json",
+		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id run-1 --base %s --head %s", baseSHA, headSHA),
+		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --business-acceptance not-required --output test-results/run-1/agent-dod.v1.json", baseSHA, headSHA),
 	}, worktrees.commands)
 }
 

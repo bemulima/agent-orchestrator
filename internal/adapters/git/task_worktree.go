@@ -358,25 +358,25 @@ func allowedVerificationCommand(command string) (string, []string, bool) {
 
 func allowedTestingPolicyCommand(command string) (string, []string, bool) {
 	parts := strings.Fields(command)
-	if len(parts) == 5 && parts[0] == "node" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
+	if len(parts) == 5 && parts[0] == "node20" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
 		parts[2] == "verify-lock" && parts[3] == "--lock" && parts[4] == ".ai/testing/policy/policy-lock.json" {
-		return "node", parts[1:], true
+		return "/usr/local/bin/node20", parts[1:], true
 	}
-	if len(parts) == 15 && parts[0] == "node" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
+	if len(parts) == 15 && parts[0] == "node20" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
 		parts[2] == "verify" && parts[3] == "--repo" && parts[4] == "." &&
 		parts[5] == "--command" && parts[6] == "verify:pr" && parts[7] == "--output-dir" && parts[8] == "." &&
 		parts[9] == "--run-id" && safePolicyRunID(parts[10]) && parts[11] == "--base" && fullGitSHA(parts[12]) &&
 		parts[13] == "--head" && fullGitSHA(parts[14]) {
-		return "node", parts[1:], true
+		return "/usr/local/bin/node20", parts[1:], true
 	}
-	if len(parts) == 15 && parts[0] == "node" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
+	if len(parts) == 15 && parts[0] == "node20" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
 		parts[2] == "agent-dod-from-run" && parts[3] == "--repo" && parts[4] == "." && parts[5] == "--aggregate" {
 		runID := safePolicyRunIDValue(parts[6])
 		if safePolicyRunID(runID) && parts[6] == fmt.Sprintf("test-results/%s/verify/pr/test-result.v1.json", runID) &&
 			parts[7] == "--base" && fullGitSHA(parts[8]) && parts[9] == "--head" && fullGitSHA(parts[10]) &&
 			parts[11] == "--business-acceptance" && parts[12] == "not-required" && parts[13] == "--output" &&
 			parts[14] == fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID) {
-			return "node", parts[1:], true
+			return "/usr/local/bin/node20", parts[1:], true
 		}
 	}
 	return "", nil, false

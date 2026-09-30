@@ -111,14 +111,14 @@ func (g BundleTestingPolicyGate) VerifyTask(
 	}
 
 	var outcome TestingPolicyOutcome
-	verifyLock := "node .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json"
+	verifyLock := "node20 .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json"
 	check, err := g.Worktrees.RunCheck(ctx, workspace, verifyLock)
 	if err != nil || check.ExitCode != 0 {
 		return TestingPolicyOutcome{}, fmt.Errorf("Testing Policy bundle preflight failed: %s: %w", check.Output, domain.ErrValidation)
 	}
 	outcome.Checks = append(outcome.Checks, domain.VerificationCheck{Name: "testing_policy:bundle", Status: "passed", Details: "reviewed policy bundle checksum and identity validated", ExitCode: intPointer(check.ExitCode)})
 
-	verifyCommand := fmt.Sprintf("node .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id %s --base %s --head %s", runID, baseSHA, headSHA)
+	verifyCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id %s --base %s --head %s", runID, baseSHA, headSHA)
 	policyCheck, policyErr := g.Worktrees.RunCheck(ctx, workspace, verifyCommand)
 	policyStatus := "passed"
 	if policyErr != nil || policyCheck.ExitCode != 0 {
@@ -132,7 +132,7 @@ func (g BundleTestingPolicyGate) VerifyTask(
 
 	aggregatePath := fmt.Sprintf("test-results/%s/verify/pr/test-result.v1.json", runID)
 	outcome.ReportPath = fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID)
-	dodCommand := fmt.Sprintf("node .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s --business-acceptance not-required --output %s", aggregatePath, baseSHA, headSHA, outcome.ReportPath)
+	dodCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s --business-acceptance not-required --output %s", aggregatePath, baseSHA, headSHA, outcome.ReportPath)
 	dodCheck, dodErr := g.Worktrees.RunCheck(ctx, workspace, dodCommand)
 	if dodErr != nil {
 		return outcome, fmt.Errorf("agent Definition of Done evaluation could not run: %w", dodErr)

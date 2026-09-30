@@ -1233,6 +1233,8 @@ deploy without their own subsequent explicit authorizations.
   `26dce0ab38970457931a9f2ab9273918329192f9`, semantics
   `5a0422683ae97659d8f152df5a2b60d45d1893f9`, bundle SHA-256
   `bdd510d44c9467715ca85a1b95744db2d57390095c70bdc972a08748783f5d58`.
+- The worker image includes the policy runtime's Node 20.19.5 executable as
+  `/usr/local/bin/node20`; native CI builds the image without publishing it.
 - Full `make verify` passed after the code and focused tests were updated.
 - The task model does not yet provide a trusted Business Acceptance scope
   signal; the worker currently supplies `not-required`. In-scope business
