@@ -270,7 +270,7 @@ func (g fixedTestingPolicyGate) VerifyTask(context.Context, domain.TaskWorkspace
 	return TestingPolicyOutcome{
 		LifecycleState: g.state,
 		ReportPath:     "test-results/attempt-1/agent-dod.v1.json",
-		ReportBytes:    []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"` + g.state + `"}`),
+		ReportBytes:    []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"` + g.state + `","dispositions":{"business_acceptance":"NOT_REQUIRED"}}`),
 		Checks:         []domain.VerificationCheck{{Name: "agent_definition_of_done", Status: map[bool]string{true: "passed", false: "failed"}[g.state == "DONE"]}},
 	}, nil
 }

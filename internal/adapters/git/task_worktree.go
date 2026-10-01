@@ -369,17 +369,37 @@ func allowedTestingPolicyCommand(command string) (string, []string, bool) {
 		parts[13] == "--head" && fullGitSHA(parts[14]) {
 		return "/usr/local/bin/node20", parts[1:], true
 	}
-	if len(parts) == 15 && parts[0] == "node20" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
+	if (len(parts) == 13 || len(parts) == 15) && parts[0] == "node20" && parts[1] == ".ai/testing/policy/policy-runner.cjs" &&
 		parts[2] == "agent-dod-from-run" && parts[3] == "--repo" && parts[4] == "." && parts[5] == "--aggregate" {
 		runID := safePolicyRunIDValue(parts[6])
 		if safePolicyRunID(runID) && parts[6] == fmt.Sprintf("test-results/%s/verify/pr/test-result.v1.json", runID) &&
-			parts[7] == "--base" && fullGitSHA(parts[8]) && parts[9] == "--head" && fullGitSHA(parts[10]) &&
-			parts[11] == "--business-acceptance" && parts[12] == "not-required" && parts[13] == "--output" &&
-			parts[14] == fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID) {
-			return "/usr/local/bin/node20", parts[1:], true
+			parts[7] == "--base" && fullGitSHA(parts[8]) && parts[9] == "--head" && fullGitSHA(parts[10]) {
+			outputIndex := 11
+			if len(parts) == 15 {
+				if parts[11] != "--business-acceptance-evidence" || !safePolicyEvidenceValue(parts[12]) {
+					return "", nil, false
+				}
+				outputIndex = 13
+			}
+			if parts[outputIndex] == "--output" && parts[outputIndex+1] == fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID) {
+				return "/usr/local/bin/node20", parts[1:], true
+			}
 		}
 	}
 	return "", nil, false
+}
+
+func safePolicyEvidenceValue(value string) bool {
+	if len(value) == 0 || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || strings.ContainsRune("._:/#?=&%-", character)) {
+			return false
+		}
+	}
+	return true
 }
 
 func safePolicyRunID(value string) bool {

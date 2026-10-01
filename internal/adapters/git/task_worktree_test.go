@@ -64,7 +64,8 @@ func TestTestingPolicyRunnerCommandsAreExactAndArgumentBound(t *testing.T) {
 	commands := []string{
 		"node20 .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json",
 		"node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id " + runID + " --base " + base + " --head " + head,
-		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance not-required --output test-results/" + runID + "/agent-dod.v1.json",
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --output test-results/" + runID + "/agent-dod.v1.json",
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance-evidence acceptance-ref:ticket-123 --output test-results/" + runID + "/agent-dod.v1.json",
 	}
 	for _, requested := range commands {
 		name, arguments, ok := allowedTestingPolicyCommand(requested)
@@ -75,7 +76,9 @@ func TestTestingPolicyRunnerCommandsAreExactAndArgumentBound(t *testing.T) {
 
 	for _, requested := range []string{
 		"node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id " + runID + " --base " + base + " --head " + head + " ; touch /tmp/not-allowed",
-		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/../verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance not-required --output test-results/" + runID + "/agent-dod.v1.json",
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/../verify/pr/test-result.v1.json --base " + base + " --head " + head + " --output test-results/" + runID + "/agent-dod.v1.json",
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance not-required --output test-results/" + runID + "/agent-dod.v1.json",
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/" + runID + "/verify/pr/test-result.v1.json --base " + base + " --head " + head + " --business-acceptance-evidence accepted ticket 123 --output test-results/" + runID + "/agent-dod.v1.json",
 	} {
 		_, _, ok := allowedTestingPolicyCommand(requested)
 		require.False(t, ok, requested)

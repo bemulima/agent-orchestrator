@@ -15,9 +15,9 @@ import (
 
 const (
 	// These pins are refreshed only with the reviewed central Testing Policy bundle rollout.
-	TestingPolicySourceCommit = "a4c3854a7e1ca66467e222e94dd58ca5ac57b470"
-	TestingPolicySemanticsSHA = "5a0422683ae97659d8f152df5a2b60d45d1893f9"
-	TestingPolicyBundleSHA256 = "2e80dcdab2c566d3f2bfac1cd176632a161ab9364f168a703218c9dc4ca7f281"
+	TestingPolicySourceCommit = "8c30579e2b3de3f58656601f43c387ebd5515873"
+	TestingPolicySemanticsSHA = "3a374a116118d07311dab69513fdb271b82ec7a91e07d966c3515a80ff408241"
+	TestingPolicyBundleSHA256 = "25693b66744bc55c27bb953314dccec2210ea020bb0c6e087a9e87fd6b7333c4"
 )
 
 var taskRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
@@ -57,6 +57,9 @@ type testingPolicyDodReport struct {
 		BaseSHA string `json:"base_sha"`
 		HeadSHA string `json:"head_sha"`
 	} `json:"identity"`
+	Dispositions *struct {
+		BusinessAcceptance *string `json:"business_acceptance"`
+	} `json:"dispositions"`
 	Blockers []struct {
 		Code     string `json:"code"`
 		Severity string `json:"severity"`
@@ -132,7 +135,7 @@ func (g BundleTestingPolicyGate) VerifyTask(
 
 	aggregatePath := fmt.Sprintf("test-results/%s/verify/pr/test-result.v1.json", runID)
 	outcome.ReportPath = fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID)
-	dodCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s --business-acceptance not-required --output %s", aggregatePath, baseSHA, headSHA, outcome.ReportPath)
+	dodCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s --output %s", aggregatePath, baseSHA, headSHA, outcome.ReportPath)
 	dodCheck, dodErr := g.Worktrees.RunCheck(ctx, workspace, dodCommand)
 	if dodErr != nil {
 		return outcome, fmt.Errorf("agent Definition of Done evaluation could not run: %w", dodErr)
@@ -145,8 +148,7 @@ func (g BundleTestingPolicyGate) VerifyTask(
 		return outcome, fmt.Errorf("agent Definition of Done report is unavailable: %w", domain.ErrValidation)
 	}
 	var report testingPolicyDodReport
-	if err := json.Unmarshal(bytes, &report); err != nil || report.SchemaVersion != "agent-dod.v1" || report.LifecycleState == "" ||
-		report.Identity == nil || report.Identity.BaseSHA != baseSHA || report.Identity.HeadSHA != headSHA {
+	if err := json.Unmarshal(bytes, &report); err != nil || validateTestingPolicyDodReport(report, baseSHA, headSHA) != nil {
 		return outcome, fmt.Errorf("agent Definition of Done report is invalid: %w", domain.ErrValidation)
 	}
 	outcome.ReportBytes = bytes
@@ -164,6 +166,56 @@ func (g BundleTestingPolicyGate) VerifyTask(
 	}
 	outcome.Checks = append(outcome.Checks, domain.VerificationCheck{Name: "agent_definition_of_done", Status: "failed", Details: boundedDetails(details), ExitCode: intPointer(dodCheck.ExitCode)})
 	return outcome, nil
+}
+
+func validateTestingPolicyDodReport(report testingPolicyDodReport, baseSHA, headSHA string) error {
+	if report.SchemaVersion != "agent-dod.v1" || report.Identity == nil ||
+		report.Identity.BaseSHA != baseSHA || report.Identity.HeadSHA != headSHA {
+		return fmt.Errorf("report schema or identity is invalid")
+	}
+	switch report.LifecycleState {
+	case "IMPLEMENTATION_IN_PROGRESS", "IMPLEMENTATION_COMPLETE", "VERIFICATION_PENDING", "DONE", "BLOCKED", "BUSINESS_ACCEPTANCE_PENDING":
+	default:
+		return fmt.Errorf("report lifecycle state is invalid")
+	}
+	if report.Dispositions == nil || report.Dispositions.BusinessAcceptance == nil {
+		return fmt.Errorf("business acceptance disposition is missing")
+	}
+	acceptance := *report.Dispositions.BusinessAcceptance
+	switch acceptance {
+	case "NOT_REQUIRED", "EVIDENCE_PRESENT", "PENDING":
+	default:
+		return fmt.Errorf("business acceptance disposition is invalid")
+	}
+
+	hasAcceptancePendingBlocker := false
+	hasOtherPendingBlocker := false
+	hasBlockingBlocker := false
+	for _, blocker := range report.Blockers {
+		if blocker.Code == "DOD_BUSINESS_ACCEPTANCE_PENDING" {
+			hasAcceptancePendingBlocker = true
+			if blocker.Severity != "PENDING" {
+				return fmt.Errorf("business acceptance blocker has an invalid severity")
+			}
+		}
+		if blocker.Severity == "PENDING" && blocker.Code != "DOD_BUSINESS_ACCEPTANCE_PENDING" {
+			hasOtherPendingBlocker = true
+		}
+		if blocker.Severity == "BLOCKING" {
+			hasBlockingBlocker = true
+		}
+	}
+	if hasAcceptancePendingBlocker && acceptance != "PENDING" {
+		return fmt.Errorf("business acceptance blocker conflicts with its disposition")
+	}
+	if report.LifecycleState == "DONE" && acceptance == "PENDING" {
+		return fmt.Errorf("DONE conflicts with pending business acceptance")
+	}
+	if report.LifecycleState == "BUSINESS_ACCEPTANCE_PENDING" &&
+		(acceptance != "PENDING" || !hasAcceptancePendingBlocker || hasOtherPendingBlocker || hasBlockingBlocker) {
+		return fmt.Errorf("business acceptance lifecycle conflicts with its disposition or blockers")
+	}
+	return nil
 }
 
 func fullSHA(value string) bool { return regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(value) }

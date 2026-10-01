@@ -63,7 +63,7 @@ func TestBundleTestingPolicyGateRequiresDoneReportAndExactEvidenceCommands(t *te
 		BundleSHA256:      bundleSHA,
 	})
 	require.NoError(t, err)
-	report := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"blockers":[]}`, baseSHA, headSHA))
+	report := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[]}`, baseSHA, headSHA))
 	worktrees := &testingPolicyWorktreeFixture{bundle: bundle, lock: lock, report: report}
 	gate := BundleTestingPolicyGate{
 		Worktrees:            worktrees,
@@ -79,8 +79,51 @@ func TestBundleTestingPolicyGateRequiresDoneReportAndExactEvidenceCommands(t *te
 	require.Equal(t, []string{
 		"node20 .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json",
 		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id run-1 --base %s --head %s", baseSHA, headSHA),
-		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --business-acceptance not-required --output test-results/run-1/agent-dod.v1.json", baseSHA, headSHA),
+		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --output test-results/run-1/agent-dod.v1.json", baseSHA, headSHA),
 	}, worktrees.commands)
+}
+
+func TestBundleTestingPolicyGateRejectsMissingInvalidAndImpossibleBusinessAcceptance(t *testing.T) {
+	bundle := []byte("trusted runner bundle")
+	digest := sha256.Sum256(bundle)
+	bundleSHA := hex.EncodeToString(digest[:])
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	lock, err := json.Marshal(testingPolicyLock{
+		LockSchemaVersion: "testing-policy-bundle.v2",
+		PolicyVersion:     "testing-policy.v1",
+		MatrixSchema:      "required-test-matrix.v1",
+		SourceRepository:  "bemulima/learning-platform-verification",
+		SourceCommit:      sourceSHA,
+		SemanticsSHA:      semanticsSHA,
+		BundleSHA256:      bundleSHA,
+	})
+	require.NoError(t, err)
+	gate := BundleTestingPolicyGate{
+		ExpectedSourceCommit: sourceSHA,
+		ExpectedSemanticsSHA: semanticsSHA,
+		ExpectedBundleSHA256: bundleSHA,
+	}
+	for _, report := range []string{
+		fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{},"blockers":[]}`, baseSHA, headSHA),
+		fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"UNKNOWN"},"blockers":[]}`, baseSHA, headSHA),
+		fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"PENDING"},"blockers":[]}`, baseSHA, headSHA),
+		fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"BUSINESS_ACCEPTANCE_PENDING","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[]}`, baseSHA, headSHA),
+		fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"BUSINESS_ACCEPTANCE_PENDING","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"PENDING"},"blockers":[]}`, baseSHA, headSHA),
+	} {
+		worktrees := &testingPolicyWorktreeFixture{bundle: bundle, lock: lock, report: []byte(report)}
+		gate.Worktrees = worktrees
+		_, err := gate.VerifyTask(context.Background(), domain.TaskWorkspace{}, "run-1", baseSHA, headSHA)
+		require.Error(t, err)
+	}
+}
+
+func TestValidateTestingPolicyDodReportAcceptsConsistentBusinessAcceptancePending(t *testing.T) {
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	bytes := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"BUSINESS_ACCEPTANCE_PENDING","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"PENDING"},"blockers":[{"code":"DOD_BUSINESS_ACCEPTANCE_PENDING","severity":"PENDING","subject":"business_acceptance","message":"evidence pending"}]}`, baseSHA, headSHA))
+	var report testingPolicyDodReport
+	require.NoError(t, json.Unmarshal(bytes, &report))
+	require.NoError(t, validateTestingPolicyDodReport(report, baseSHA, headSHA))
 }
 
 func TestBundleTestingPolicyGateRejectsDoneWithMismatchedIdentityOrBlockers(t *testing.T) {
@@ -109,8 +152,8 @@ func TestBundleTestingPolicyGateRejectsDoneWithMismatchedIdentityOrBlockers(t *t
 		report  string
 		wantErr bool
 	}{
-		{report: fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"blockers":[{"code":"pending","severity":"PENDING"}]}`, baseSHA, headSHA)},
-		{report: fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"blockers":[]}`, strings.Repeat("f", 40), headSHA), wantErr: true},
+		{report: fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[{"code":"pending","severity":"PENDING"}]}`, baseSHA, headSHA)},
+		{report: fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[]}`, strings.Repeat("f", 40), headSHA), wantErr: true},
 	} {
 		worktrees := &testingPolicyWorktreeFixture{bundle: bundle, lock: lock, report: []byte(test.report)}
 		gate.Worktrees = worktrees

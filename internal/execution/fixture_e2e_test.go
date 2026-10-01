@@ -53,7 +53,7 @@ type fileTestingPolicyGate struct{}
 
 func (fileTestingPolicyGate) VerifyTask(_ context.Context, workspace domain.TaskWorkspace, _ string, _, _ string) (TestingPolicyOutcome, error) {
 	path := "test-results/attempt-1/agent-dod.v1.json"
-	bytes := []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE"}`)
+	bytes := []byte(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","dispositions":{"business_acceptance":"NOT_REQUIRED"}}`)
 	fullPath := filepath.Join(workspace.Path, filepath.FromSlash(path))
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o750); err != nil {
 		return TestingPolicyOutcome{}, err
