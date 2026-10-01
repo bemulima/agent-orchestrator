@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,6 +15,22 @@ import (
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
+
+func TestDefaultTestingPolicyPinMatchesBundledArtifact(t *testing.T) {
+	lockBytes, err := os.ReadFile(filepath.Join("..", "..", ".ai", "testing", "policy", "policy-lock.json"))
+	require.NoError(t, err)
+	var lock testingPolicyLock
+	require.NoError(t, json.Unmarshal(lockBytes, &lock))
+
+	bundle, err := os.ReadFile(filepath.Join("..", "..", ".ai", "testing", "policy", "policy-runner.cjs"))
+	require.NoError(t, err)
+	digest := sha256.Sum256(bundle)
+
+	require.Equal(t, lock.SourceCommit, TestingPolicySourceCommit)
+	require.Equal(t, lock.SemanticsSHA, TestingPolicySemanticsSHA)
+	require.Equal(t, lock.BundleSHA256, TestingPolicyBundleSHA256)
+	require.Equal(t, lock.BundleSHA256, hex.EncodeToString(digest[:]))
+}
 
 func TestBundleTestingPolicyGateRejectsUntrustedBundleBeforeExecution(t *testing.T) {
 	worktrees := &testingPolicyWorktreeFixture{bundle: []byte("runner")}
