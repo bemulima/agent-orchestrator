@@ -113,7 +113,7 @@ func TestServiceAndOperationReturnNotFoundForMissingCanonicalIDs(t *testing.T) {
 }
 
 func catalogFixture(projectID, snapshotID string) (domain.Project, domain.ServiceSnapshot, domain.DiscoveryReport) {
-	project := domain.Project{ID: projectID, Name: projectID, Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService, HeadCommit: "commit"}
+	project := domain.Project{ID: projectID, Name: projectID, SourceIdentity: "git:github.com/example/" + projectID, Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService, HeadCommit: "commit"}
 	snapshot := domain.ServiceSnapshot{ID: snapshotID, ProjectID: projectID, Status: "complete", CommitSHA: "commit", Branch: "main", ContentChecksum: "checksum"}
 	service := &domain.ArchitectureServiceManifest{
 		Schema: domain.ArchitectureManifestSchemaV1, Kind: "service", ID: "teacher-service", ManifestRevision: 1,

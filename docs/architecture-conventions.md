@@ -1,5 +1,26 @@
 # Architecture conventions
 
+## Stable platform graph identities
+
+Architecture CURRENT exposes stable `reference_id` values for repository and
+service references and stable `edge_id` values for owner-declared relations.
+Reference identity is derived from the persisted canonical source identity and
+the owner-authored service manifest ID (or `repository` when a manifest is
+absent). Edge identity is derived from the source reference, relation type,
+target reference or literal unresolved target, and the relation's operation,
+transport, contract, and direction. The algorithm is implemented by
+`internal/architecturecatalog.StableReferenceID` and
+`StableEdgeID`; it is domain-separated as
+`course-dev-orchestrator/architecture-graph.v1` and uses length-delimited
+SHA-256 inputs.
+
+Database project IDs, topology revision IDs, discovery snapshot IDs, and array
+positions are transient implementation details and must not be used as graph
+identity. Unresolved relation targets keep the literal authored target and do
+not resolve by similar names. A platform gate report additionally requires a
+pinned authoritative topology export and immutable source-file blob pins; a
+partial local discovery view is not a substitute for that report.
+
 This project originally adopted the technical organization of
 `ms-go-course`, but this document is now self-contained. Business entities,
 orchestrator workflows, safety boundaries, and all normative conventions are

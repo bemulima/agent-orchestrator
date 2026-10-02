@@ -204,6 +204,63 @@ func TestBuilderProjectsOnlyEvidenceBackedManifestRelations(t *testing.T) {
 	}
 }
 
+func TestGraphIDsDoNotDependOnTransientProjectOrSnapshotIDs(t *testing.T) {
+	providerManifest := serviceManifest("provider-service", nil, nil)
+	consumerManifest := serviceManifest("consumer-service", nil, nil)
+	consumerManifest.OutboundDependencies = []domain.ArchitectureExternalInteraction{{
+		ID: "course-call", Transport: "http", Target: "provider-service", Direction: "outbound",
+		Description: statementWithEvidence("calls the provider", "internal/client.go"),
+	}}
+	provider := catalogSource("provider-db-id-a", "provider", providerManifest, nil)
+	consumer := catalogSource("consumer-db-id-a", "consumer", consumerManifest, nil)
+	provider.Topology.Project.SourceIdentity = "git:github.com/example/provider"
+	consumer.Topology.Project.SourceIdentity = "git:github.com/example/consumer"
+
+	first, err := (Builder{}).Build(context.Background(), []domain.ArchitectureCatalogSource{provider, consumer})
+	if err != nil {
+		t.Fatalf("Build(first) error = %v", err)
+	}
+	if len(first.Platform.Relations) != 1 {
+		t.Fatalf("first relation count = %d, want 1", len(first.Platform.Relations))
+	}
+	firstReferences := make(map[string]string, len(first.Platform.Services))
+	for _, service := range first.Platform.Services {
+		firstReferences[service.Source.ProjectName] = service.Source.ReferenceID
+	}
+	firstEdge := first.Platform.Relations[0]
+	if firstEdge.EdgeID == "" || firstEdge.SourceReferenceID != firstReferences["consumer"] || firstEdge.TargetReferenceID != firstReferences["provider"] {
+		t.Fatalf("first stable edge identity = %#v", firstEdge)
+	}
+
+	provider.Topology.Project.ID = "provider-db-id-b"
+	provider.Topology.Snapshot.ID = "snapshot-provider-db-id-b"
+	provider.Topology.Snapshot.ProjectID = provider.Topology.Project.ID
+	provider.Topology.Report.ProjectID = provider.Topology.Project.ID
+	consumer.Topology.Project.ID = "consumer-db-id-b"
+	consumer.Topology.Snapshot.ID = "snapshot-consumer-db-id-b"
+	consumer.Topology.Snapshot.ProjectID = consumer.Topology.Project.ID
+	consumer.Topology.Report.ProjectID = consumer.Topology.Project.ID
+	second, err := (Builder{}).Build(context.Background(), []domain.ArchitectureCatalogSource{consumer, provider})
+	if err != nil {
+		t.Fatalf("Build(second) error = %v", err)
+	}
+	secondReferences := make(map[string]string, len(second.Platform.Services))
+	for _, service := range second.Platform.Services {
+		secondReferences[service.Source.ProjectName] = service.Source.ReferenceID
+	}
+	secondEdge := second.Platform.Relations[0]
+	if !reflect.DeepEqual(firstReferences, secondReferences) || firstEdge.EdgeID != secondEdge.EdgeID {
+		t.Fatalf("graph IDs changed with database identities: refs %v != %v, edges %q != %q", firstReferences, secondReferences, firstEdge.EdgeID, secondEdge.EdgeID)
+	}
+	if err := ValidateStableGraphIDs(second); err != nil {
+		t.Fatalf("ValidateStableGraphIDs() error = %v", err)
+	}
+	second.Platform.Relations[0].EdgeID += "-tampered"
+	if err := ValidateStableGraphIDs(second); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("ValidateStableGraphIDs(tampered) error = %v, want ErrValidation", err)
+	}
+}
+
 func TestBuilderRejectsInconsistentOrUnsupportedSources(t *testing.T) {
 	validManifest := serviceManifest("teacher-service", nil, nil)
 	for name, source := range map[string]domain.ArchitectureCatalogSource{
@@ -261,7 +318,7 @@ func TestBuilderCompletenessRetainsUncoveredAndAmbiguousDiscovery(t *testing.T) 
 func catalogSource(id, name string, manifest domain.ArchitectureServiceManifest, operations []domain.ArchitectureOperationManifest) domain.ArchitectureCatalogSource {
 	return domain.ArchitectureCatalogSource{
 		Topology: domain.TopologySource{
-			Project:  domain.Project{ID: id, Name: name, Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService, HeadCommit: "commit-" + id},
+			Project:  domain.Project{ID: id, Name: name, SourceIdentity: "git:github.com/example/" + id, Status: domain.ProjectStatusAnalyzed, RepositoryRole: domain.RepositoryRoleService, HeadCommit: "commit-" + id},
 			Snapshot: domain.ServiceSnapshot{ID: "snapshot-" + id, ProjectID: id, Status: "complete", CommitSHA: "commit-" + id, Branch: "main", ContentChecksum: "checksum-" + id},
 			Report:   domain.DiscoveryReport{SchemaVersion: 3, ProjectID: id, CommitSHA: "commit-" + id, ContentChecksum: "checksum-" + id},
 		},

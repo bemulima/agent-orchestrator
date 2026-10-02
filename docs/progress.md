@@ -1240,3 +1240,33 @@ deploy without their own subsequent explicit authorizations.
   signal; the worker currently supplies `not-required`. In-scope business
   acceptance therefore remains an integration gap, and this slice does not
   establish the full program completion criterion.
+
+## Testing Policy final wave — CDO provisioner and graph identity — 2026-10-02
+
+- Bound `test:integration:deps` to the owner’s existing PostgreSQL lifecycle.
+  The integration script creates a random, isolated Compose project, waits for
+  Postgres health, checks `current_database()`, creates and migrates the `_test`
+  database, runs the integration suite, and removes only that project and its
+  volumes from an EXIT cleanup trap. The Postgres image is digest-pinned.
+- Pinned the GitHub `ubuntu-24.04` provisioner toolchain to the image’s
+  Docker Engine 28.0.4 and Docker Compose 2.38.2. CI compares the observed
+  versions with the descriptor and uploads a machine-readable runtime identity
+  record. The local desktop engine differs (29.2.1 / Compose 5.0.2), so a
+  local dependency-backed policy run correctly cannot claim the pinned runtime.
+- Added CDO-owned stable `reference_id` and `edge_id` fields to the existing
+  Architecture CURRENT catalog. Their SHA-256 identities use canonical source
+  identity, service manifest identity, and the owner-declared relation tuple;
+  catalog validation rejects missing, duplicate, tampered, or inconsistent
+  identities. Tests prove identities are invariant to database project and
+  snapshot IDs and input ordering.
+- `make verify`, the real-artifact Testing Policy DoD E2E, focused graph
+  catalog tests, and manifest/provisioner validation pass. The Docker-backed
+  integration command and exact hosted Actions result still require the
+  published CI run.
+- The platform `architecture-graph.v1.json` report remains blocked. The CDO
+  checkout and CI do not contain a versioned CURRENT topology export or exact
+  blob pins for each referenced service architecture file. Publishing a
+  partial graph would omit authoritative nodes, edges, owners, or source pins.
+  The required source is a versioned CDO topology/catalog export plus exact
+  per-service commit, path, Git blob OID, and SHA-256 evidence for the
+  owner-authored architecture files.

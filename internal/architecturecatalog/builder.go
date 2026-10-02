@@ -63,6 +63,9 @@ func (Builder) Build(ctx context.Context, sources []domain.ArchitectureCatalogSo
 	})
 	catalog.Platform.Completeness.OperationKinds = operationKindCounts(catalog.Platform.Completeness.OperationKinds)
 	catalog.Platform.Relations = buildRelations(catalog.Platform.Services)
+	if err := ValidateStableGraphIDs(catalog); err != nil {
+		return domain.ArchitectureCatalog{}, err
+	}
 
 	fingerprint, err := fingerprint(catalog)
 	if err != nil {
@@ -74,11 +77,11 @@ func (Builder) Build(ctx context.Context, sources []domain.ArchitectureCatalogSo
 
 func validateSource(source domain.ArchitectureCatalogSource) error {
 	topology := source.Topology
-	if topology.Project.ID == "" || topology.Snapshot.ID == "" ||
+	if topology.Project.ID == "" || strings.TrimSpace(topology.Project.SourceIdentity) == "" || topology.Snapshot.ID == "" ||
 		topology.Snapshot.ProjectID != topology.Project.ID ||
 		topology.Report.ProjectID != topology.Project.ID ||
 		topology.Report.CommitSHA != topology.Snapshot.CommitSHA {
-		return fmt.Errorf("architecture catalog source does not match project snapshot: %w", domain.ErrConflict)
+		return fmt.Errorf("architecture catalog source does not match project snapshot or has no canonical source identity: %w", domain.ErrConflict)
 	}
 	if source.ServiceManifest.Schema == "" {
 		if len(source.Operations) != 0 {
@@ -101,7 +104,7 @@ func validateSource(source domain.ArchitectureCatalogSource) error {
 }
 
 func buildService(source domain.ArchitectureCatalogSource) (domain.ArchitectureCatalogService, error) {
-	status := sourceStatus(source.Topology)
+	status := sourceStatus(source.Topology, source.ServiceManifest.ID)
 	result := domain.ArchitectureCatalogService{
 		Source:       status,
 		Groups:       []domain.ArchitectureCatalogEndpointGroup{},
@@ -192,7 +195,7 @@ func buildService(source domain.ArchitectureCatalogSource) (domain.ArchitectureC
 	return result, nil
 }
 
-func sourceStatus(source domain.TopologySource) domain.ArchitectureCatalogSourceStatus {
+func sourceStatus(source domain.TopologySource, serviceManifestID string) domain.ArchitectureCatalogSourceStatus {
 	project, snapshot, report := source.Project, source.Snapshot, source.Report
 	// CURRENT is bound to the immutable persisted snapshot and its discovery
 	// checksum. A local source may be dirty because generated architecture
@@ -205,7 +208,8 @@ func sourceStatus(source domain.TopologySource) domain.ArchitectureCatalogSource
 		current = current && project.HeadCommit == snapshot.CommitSHA
 	}
 	return domain.ArchitectureCatalogSourceStatus{
-		ProjectID: project.ID, ProjectName: project.Name, ProjectStatus: project.Status, RepositoryRole: project.RepositoryRole,
+		ProjectID: project.ID, ReferenceID: StableReferenceID(project.SourceIdentity, serviceManifestID),
+		ProjectName: project.Name, ProjectStatus: project.Status, RepositoryRole: project.RepositoryRole,
 		SnapshotID: snapshot.ID, SnapshotStatus: snapshot.Status, CommitSHA: snapshot.CommitSHA, Branch: snapshot.Branch,
 		ContentChecksum: snapshot.ContentChecksum, DiscoverySchemaVersion: report.SchemaVersion,
 		SourceCurrent: current, IsDirty: project.IsDirty || snapshot.IsDirty || report.IsDirty,
@@ -447,6 +451,10 @@ func isOperationKind(value domain.ArchitectureOperationType) bool {
 // target is internal only when it exactly identifies one catalog service, and
 // a contract/event is paired only on its exact transport/code tuple.
 func buildRelations(services []domain.ArchitectureCatalogService) []domain.ArchitectureCatalogRelation {
+	referenceIDs := make(map[string]string, len(services))
+	for _, service := range services {
+		referenceIDs[service.Source.ProjectID] = service.Source.ReferenceID
+	}
 	identities := make(map[string]map[string]struct{}, len(services)*4)
 	produced := make(map[string][]manifestReference)
 	consumed := make(map[string][]manifestReference)
@@ -501,6 +509,12 @@ func buildRelations(services []domain.ArchitectureCatalogService) []domain.Archi
 			relation.Evidence = uniqueEvidence(relation.Description.Evidence)
 		}
 		relation.Confidence = relation.Description.Confidence
+		relation.SourceReferenceID = referenceIDs[relation.SourceProjectID]
+		relation.TargetReferenceID = referenceIDs[relation.TargetProjectID]
+		relation.EdgeID = StableEdgeID(
+			relation.SourceReferenceID, string(relation.Type), relation.TargetReferenceID,
+			relation.ExternalTarget, relation.OperationID, relation.Transport, relation.Contract, relation.Direction,
+		)
 		key := relationKey(relation)
 		if index, exists := seen[key]; exists {
 			relations[index].Evidence = uniqueEvidence(append(relations[index].Evidence, relation.Evidence...))

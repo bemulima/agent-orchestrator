@@ -59,18 +59,24 @@ const (
 // Direction describes the actual edge direction relative to SourceProjectID:
 // "outbound" means source -> target and "inbound" means target -> source.
 type ArchitectureCatalogRelation struct {
-	ID              string                          `json:"id"`
-	Type            ArchitectureCatalogRelationType `json:"type"`
-	SourceProjectID string                          `json:"source_project_id"`
-	TargetProjectID string                          `json:"target_project_id,omitempty"`
-	ExternalTarget  string                          `json:"external_target,omitempty"`
-	OperationID     string                          `json:"operation_id,omitempty"`
-	Transport       string                          `json:"transport"`
-	Contract        string                          `json:"contract,omitempty"`
-	Direction       string                          `json:"direction"`
-	Description     ArchitectureStatement           `json:"description"`
-	Evidence        []ArchitectureEvidence          `json:"evidence"`
-	Confidence      float64                         `json:"confidence"`
+	ID string `json:"id"`
+	// EdgeID is independent of transient topology/project database IDs. It is
+	// derived from the authoritative source and target reference identities and
+	// the owner-declared relationship tuple.
+	EdgeID            string                          `json:"edge_id"`
+	SourceReferenceID string                          `json:"source_reference_id"`
+	TargetReferenceID string                          `json:"target_reference_id,omitempty"`
+	Type              ArchitectureCatalogRelationType `json:"type"`
+	SourceProjectID   string                          `json:"source_project_id"`
+	TargetProjectID   string                          `json:"target_project_id,omitempty"`
+	ExternalTarget    string                          `json:"external_target,omitempty"`
+	OperationID       string                          `json:"operation_id,omitempty"`
+	Transport         string                          `json:"transport"`
+	Contract          string                          `json:"contract,omitempty"`
+	Direction         string                          `json:"direction"`
+	Description       ArchitectureStatement           `json:"description"`
+	Evidence          []ArchitectureEvidence          `json:"evidence"`
+	Confidence        float64                         `json:"confidence"`
 }
 
 // ArchitectureCatalogService preserves a source's CURRENT status and, where
@@ -90,7 +96,10 @@ type ArchitectureCatalogService struct {
 // material. SourceCurrent only evaluates source agreement and cleanliness; a
 // caller can use ProjectStatus to apply lifecycle policy independently.
 type ArchitectureCatalogSourceStatus struct {
-	ProjectID              string         `json:"project_id"`
+	ProjectID string `json:"project_id"`
+	// ReferenceID is the stable graph identity derived from the persisted
+	// canonical source identity and owner-authored service manifest identity.
+	ReferenceID            string         `json:"reference_id"`
 	ProjectName            string         `json:"project_name"`
 	ProjectStatus          ProjectStatus  `json:"project_status"`
 	RepositoryRole         RepositoryRole `json:"repository_role"`
