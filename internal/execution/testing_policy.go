@@ -15,9 +15,9 @@ import (
 
 const (
 	// These pins are refreshed only with the reviewed central Testing Policy bundle rollout.
-	TestingPolicySourceCommit = "8c30579e2b3de3f58656601f43c387ebd5515873"
+	TestingPolicySourceCommit = "d31f717d9ba5222524c7e2dec69e9d3d4377e0b7"
 	TestingPolicySemanticsSHA = "3a374a116118d07311dab69513fdb271b82ec7a91e07d966c3515a80ff408241"
-	TestingPolicyBundleSHA256 = "25693b66744bc55c27bb953314dccec2210ea020bb0c6e087a9e87fd6b7333c4"
+	TestingPolicyBundleSHA256 = "60e6a182728d92d9497ec1134b47b22ec1a7412ba85ffa2bf4bbeb1b5ac56818"
 )
 
 var taskRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
@@ -88,7 +88,7 @@ func (g BundleTestingPolicyGate) VerifyTask(
 	if expectedSemanticsSHA == "" {
 		expectedSemanticsSHA = TestingPolicySemanticsSHA
 	}
-	if !fullSHA(expectedSourceCommit) || !fullSHA(expectedSemanticsSHA) || !fullDigest(expectedBundleSHA) ||
+	if !fullSHA(expectedSourceCommit) || !fullDigest(expectedSemanticsSHA) || !fullDigest(expectedBundleSHA) ||
 		strings.HasPrefix(expectedSourceCommit, "REPLACE_") || strings.HasPrefix(expectedSemanticsSHA, "REPLACE_") || strings.HasPrefix(expectedBundleSHA, "REPLACE_") {
 		return TestingPolicyOutcome{}, fmt.Errorf("trusted Testing Policy bundle pin is not configured: %w", domain.ErrInvalidStatus)
 	}

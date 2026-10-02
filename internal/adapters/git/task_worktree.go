@@ -47,11 +47,19 @@ func (w TaskWorktree) Prepare(
 	}
 	shortID := compactID(task.ID, 12)
 	branchName := "ai/task-" + sanitizeName(project.Name) + "-" + shortID
-	worktreePath := filepath.Join(storage, sanitizeName(project.Name)+"-task-"+shortID)
+	worktreeDirectory := sanitizeName(project.Name) + "-task-" + shortID
+	repositoryDirectory := filepath.Base(filepath.Clean(*project.LocalPath))
+	if repositoryDirectory == "" || repositoryDirectory == "." || repositoryDirectory == string(filepath.Separator) {
+		return domain.TaskWorkspace{}, fmt.Errorf("source checkout has no repository directory name: %w", domain.ErrValidation)
+	}
+	worktreePath := filepath.Join(storage, worktreeDirectory, repositoryDirectory)
 	if !pathWithin(storage, worktreePath) {
 		return domain.TaskWorkspace{}, fmt.Errorf("task worktree escaped configured storage: %w", domain.ErrForbidden)
 	}
 	if _, statErr := os.Stat(worktreePath); errors.Is(statErr, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(worktreePath), 0o750); err != nil {
+			return domain.TaskWorkspace{}, fmt.Errorf("create task worktree directory: %w", err)
+		}
 		if _, branchErr := manager.run(ctx, *project.LocalPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName); branchErr == nil {
 			if _, err := manager.run(ctx, *project.LocalPath, "worktree", "add", worktreePath, branchName); err != nil {
 				return domain.TaskWorkspace{}, fmt.Errorf("restore task worktree: %w", err)

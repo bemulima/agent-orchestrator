@@ -37,7 +37,7 @@ func TestBundleTestingPolicyGateRejectsUntrustedBundleBeforeExecution(t *testing
 	gate := BundleTestingPolicyGate{
 		Worktrees:            worktrees,
 		ExpectedSourceCommit: strings.Repeat("a", 40),
-		ExpectedSemanticsSHA: strings.Repeat("b", 40),
+		ExpectedSemanticsSHA: strings.Repeat("b", 64),
 		ExpectedBundleSHA256: strings.Repeat("c", 64),
 	}
 
@@ -51,7 +51,7 @@ func TestBundleTestingPolicyGateRequiresDoneReportAndExactEvidenceCommands(t *te
 	digest := sha256.Sum256(bundle)
 	bundleSHA := hex.EncodeToString(digest[:])
 	sourceSHA := strings.Repeat("a", 40)
-	semanticsSHA := strings.Repeat("b", 40)
+	semanticsSHA := strings.Repeat("b", 64)
 	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
 	lock, err := json.Marshal(testingPolicyLock{
 		LockSchemaVersion: "testing-policy-bundle.v2",
@@ -87,7 +87,7 @@ func TestBundleTestingPolicyGateRejectsMissingInvalidAndImpossibleBusinessAccept
 	bundle := []byte("trusted runner bundle")
 	digest := sha256.Sum256(bundle)
 	bundleSHA := hex.EncodeToString(digest[:])
-	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 64)
 	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
 	lock, err := json.Marshal(testingPolicyLock{
 		LockSchemaVersion: "testing-policy-bundle.v2",
@@ -130,7 +130,7 @@ func TestBundleTestingPolicyGateRejectsDoneWithMismatchedIdentityOrBlockers(t *t
 	bundle := []byte("trusted runner bundle")
 	digest := sha256.Sum256(bundle)
 	bundleSHA := hex.EncodeToString(digest[:])
-	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 64)
 	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
 	lock, err := json.Marshal(testingPolicyLock{
 		LockSchemaVersion: "testing-policy-bundle.v2",

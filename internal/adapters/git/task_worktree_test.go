@@ -29,6 +29,7 @@ func TestTaskWorktreeIsolatesVerifiesAndCommitsFixture(t *testing.T) {
 
 	workspace, err := worktrees.Prepare(context.Background(), project, task)
 	require.NoError(t, err)
+	require.Equal(t, filepath.Base(sourcePath), filepath.Base(workspace.Path))
 	require.NoError(t, os.WriteFile(filepath.Join(workspace.Path, "README.md"), []byte("after\n"), 0o640))
 	require.NoError(t, os.WriteFile(filepath.Join(workspace.Path, "result.txt"), []byte("artifact\n"), 0o640))
 
