@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -22,15 +24,22 @@ const (
 
 var taskRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+const (
+	businessAcceptanceEvidencePath = "test-results/business-acceptance-evidence.v1.json"
+	businessAcceptanceEvidenceType = "business_acceptance_evidence"
+	businessAcceptanceEvidenceName = "business-acceptance-evidence.v1"
+)
+
 type TestingPolicyGate interface {
 	VerifyTask(context.Context, domain.TaskWorkspace, string, string, string) (TestingPolicyOutcome, error)
 }
 
 type TestingPolicyOutcome struct {
-	LifecycleState string
-	ReportPath     string
-	ReportBytes    []byte
-	Checks         []domain.VerificationCheck
+	LifecycleState                 string
+	ReportPath                     string
+	ReportBytes                    []byte
+	BusinessAcceptanceEvidencePath string
+	Checks                         []domain.VerificationCheck
 }
 
 type BundleTestingPolicyGate struct {
@@ -133,9 +142,22 @@ func (g BundleTestingPolicyGate) VerifyTask(
 	}
 	outcome.Checks = append(outcome.Checks, domain.VerificationCheck{Name: "testing_policy:verify:pr", Status: policyStatus, Details: boundedDetails(policyDetails), ExitCode: intPointer(policyCheck.ExitCode)})
 
+	_, evidenceErr := g.Worktrees.ReadArtifact(ctx, workspace, businessAcceptanceEvidencePath, maxArtifactBytes)
+	hasBusinessAcceptanceEvidence := evidenceErr == nil
+	if evidenceErr != nil && !errors.Is(evidenceErr, os.ErrNotExist) {
+		return outcome, fmt.Errorf("business acceptance evidence artifact is unsafe or unavailable: %w", domain.ErrValidation)
+	}
+	if hasBusinessAcceptanceEvidence {
+		outcome.BusinessAcceptanceEvidencePath = businessAcceptanceEvidencePath
+	}
+
 	aggregatePath := fmt.Sprintf("test-results/%s/verify/pr/test-result.v1.json", runID)
 	outcome.ReportPath = fmt.Sprintf("test-results/%s/agent-dod.v1.json", runID)
-	dodCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s --output %s", aggregatePath, baseSHA, headSHA, outcome.ReportPath)
+	dodCommand := fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate %s --base %s --head %s", aggregatePath, baseSHA, headSHA)
+	if hasBusinessAcceptanceEvidence {
+		dodCommand += " --business-acceptance-evidence " + businessAcceptanceEvidencePath
+	}
+	dodCommand += " --output " + outcome.ReportPath
 	dodCheck, dodErr := g.Worktrees.RunCheck(ctx, workspace, dodCommand)
 	if dodErr != nil {
 		return outcome, fmt.Errorf("agent Definition of Done evaluation could not run: %w", dodErr)

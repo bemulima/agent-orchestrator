@@ -389,6 +389,7 @@ func (r *sequenceRunner) Run(
 type fakeExecutionRepository struct {
 	executionContext domain.TaskExecutionContext
 	attempt          domain.TaskAttempt
+	artifacts        []domain.Artifact
 	coderThread      string
 	coderThreads     []string
 	reviewThreads    []string
@@ -477,8 +478,9 @@ func (r *fakeExecutionRepository) BeginReview(_ context.Context, _ string, numbe
 func (r *fakeExecutionRepository) CreateReview(_ context.Context, _ string, number int, threadID string, result domain.ReviewerResult) (domain.TaskReview, error) {
 	return domain.TaskReview{ID: fmt.Sprintf("review-%d", number), AgentThreadID: threadID, Status: result.Status}, nil
 }
-func (r *fakeExecutionRepository) StoreArtifact(context.Context, domain.Artifact) (domain.Artifact, error) {
-	return domain.Artifact{}, nil
+func (r *fakeExecutionRepository) StoreArtifact(_ context.Context, artifact domain.Artifact) (domain.Artifact, error) {
+	r.artifacts = append(r.artifacts, artifact)
+	return artifact, nil
 }
 func (r *fakeExecutionRepository) ListAttempts(context.Context, string) ([]domain.TaskAttempt, error) {
 	return r.attempts, nil

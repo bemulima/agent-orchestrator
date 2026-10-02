@@ -84,6 +84,75 @@ func TestBundleTestingPolicyGateRequiresDoneReportAndExactEvidenceCommands(t *te
 		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs verify --repo . --command verify:pr --output-dir . --run-id run-1 --base %s --head %s", baseSHA, headSHA),
 		fmt.Sprintf("node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --output test-results/run-1/agent-dod.v1.json", baseSHA, headSHA),
 	}, worktrees.commands)
+	require.Empty(t, outcome.BusinessAcceptanceEvidencePath)
+}
+
+func TestBundleTestingPolicyGateForwardsFixedStructuredBusinessAcceptanceEvidencePath(t *testing.T) {
+	bundle := []byte("trusted runner bundle")
+	digest := sha256.Sum256(bundle)
+	bundleSHA := hex.EncodeToString(digest[:])
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 64)
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	lock, err := json.Marshal(testingPolicyLock{
+		LockSchemaVersion: "testing-policy-bundle.v2",
+		PolicyVersion:     "testing-policy.v1",
+		MatrixSchema:      "required-test-matrix.v1",
+		SourceRepository:  "bemulima/learning-platform-verification",
+		SourceCommit:      sourceSHA,
+		SemanticsSHA:      semanticsSHA,
+		BundleSHA256:      bundleSHA,
+	})
+	require.NoError(t, err)
+	report := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"EVIDENCE_PRESENT"},"blockers":[]}`, baseSHA, headSHA))
+	worktrees := &testingPolicyWorktreeFixture{
+		bundle: bundle, lock: lock, report: report,
+		businessAcceptanceEvidence: []byte(`{"schema_version":"business-acceptance-evidence.v1"}`),
+	}
+	gate := BundleTestingPolicyGate{
+		Worktrees:            worktrees,
+		ExpectedSourceCommit: sourceSHA,
+		ExpectedSemanticsSHA: semanticsSHA,
+		ExpectedBundleSHA256: bundleSHA,
+	}
+	outcome, err := gate.VerifyTask(context.Background(), domain.TaskWorkspace{}, "run-1", baseSHA, headSHA)
+	require.NoError(t, err)
+	require.Equal(t, businessAcceptanceEvidencePath, outcome.BusinessAcceptanceEvidencePath)
+	require.Equal(t, fmt.Sprintf(
+		"node20 .ai/testing/policy/policy-runner.cjs agent-dod-from-run --repo . --aggregate test-results/run-1/verify/pr/test-result.v1.json --base %s --head %s --business-acceptance-evidence %s --output test-results/run-1/agent-dod.v1.json",
+		baseSHA, headSHA, businessAcceptanceEvidencePath,
+	), worktrees.commands[2])
+}
+
+func TestBundleTestingPolicyGateFailsClosedWhenBusinessAcceptanceEvidencePathIsUnsafe(t *testing.T) {
+	bundle := []byte("trusted runner bundle")
+	digest := sha256.Sum256(bundle)
+	bundleSHA := hex.EncodeToString(digest[:])
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 64)
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	lock, err := json.Marshal(testingPolicyLock{
+		LockSchemaVersion: "testing-policy-bundle.v2",
+		PolicyVersion:     "testing-policy.v1",
+		MatrixSchema:      "required-test-matrix.v1",
+		SourceRepository:  "bemulima/learning-platform-verification",
+		SourceCommit:      sourceSHA,
+		SemanticsSHA:      semanticsSHA,
+		BundleSHA256:      bundleSHA,
+	})
+	require.NoError(t, err)
+	worktrees := &testingPolicyWorktreeFixture{
+		bundle: bundle, lock: lock,
+		report:                        []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"BLOCKED","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"PENDING"},"blockers":[{"code":"DOD_BUSINESS_ACCEPTANCE_INVALID","severity":"PENDING","subject":"business_acceptance","message":"unsafe artifact path"}]}`, baseSHA, headSHA)),
+		businessAcceptanceEvidenceErr: fmt.Errorf("evidence resolves outside worktree: %w", domain.ErrForbidden),
+	}
+	gate := BundleTestingPolicyGate{
+		Worktrees:            worktrees,
+		ExpectedSourceCommit: sourceSHA,
+		ExpectedSemanticsSHA: semanticsSHA,
+		ExpectedBundleSHA256: bundleSHA,
+	}
+	_, err = gate.VerifyTask(context.Background(), domain.TaskWorkspace{}, "run-1", baseSHA, headSHA)
+	require.ErrorIs(t, err, domain.ErrValidation)
+	require.NotContains(t, strings.Join(worktrees.commands, "\n"), "agent-dod-from-run")
 }
 
 func TestBundleTestingPolicyGateRejectsMissingInvalidAndImpossibleBusinessAcceptance(t *testing.T) {
@@ -171,10 +240,12 @@ func TestBundleTestingPolicyGateRejectsDoneWithMismatchedIdentityOrBlockers(t *t
 }
 
 type testingPolicyWorktreeFixture struct {
-	bundle   []byte
-	lock     []byte
-	report   []byte
-	commands []string
+	bundle                        []byte
+	lock                          []byte
+	report                        []byte
+	businessAcceptanceEvidence    []byte
+	businessAcceptanceEvidenceErr error
+	commands                      []string
 }
 
 func (*testingPolicyWorktreeFixture) Prepare(context.Context, domain.Project, domain.Task) (domain.TaskWorkspace, error) {
@@ -198,6 +269,14 @@ func (f *testingPolicyWorktreeFixture) ReadArtifact(_ context.Context, _ domain.
 		return f.bundle, nil
 	case "test-results/run-1/agent-dod.v1.json":
 		return f.report, nil
+	case businessAcceptanceEvidencePath:
+		if f.businessAcceptanceEvidenceErr != nil {
+			return nil, f.businessAcceptanceEvidenceErr
+		}
+		if len(f.businessAcceptanceEvidence) == 0 {
+			return nil, os.ErrNotExist
+		}
+		return f.businessAcceptanceEvidence, nil
 	default:
 		return nil, fmt.Errorf("unexpected artifact path %q", path)
 	}

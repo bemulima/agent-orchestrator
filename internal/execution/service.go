@@ -235,10 +235,24 @@ func (s Service) Execute(
 		}
 		testingPolicy, err := s.TestingPolicy.VerifyTask(ctx, workspace, attempt.ID, workspace.BaseCommit, commitSHA)
 		report.Checks = append(report.Checks, testingPolicy.Checks...)
+		var businessAcceptanceEvidenceClaim *domain.AgentArtifactClaim
+		if testingPolicy.BusinessAcceptanceEvidencePath != "" {
+			claim := domain.AgentArtifactClaim{
+				Type: businessAcceptanceEvidenceType, Name: businessAcceptanceEvidenceName,
+				Path: testingPolicy.BusinessAcceptanceEvidencePath,
+			}
+			businessAcceptanceEvidenceClaim = &claim
+			result.Artifacts = append(result.Artifacts, claim)
+		}
 		if err != nil {
 			report.Status = "failed"
 			message := "Testing Policy DoD verification could not complete: " + err.Error()
 			structured := map[string]any{"agent_result": result, "verification": report, "testing_policy_error": err.Error()}
+			if businessAcceptanceEvidenceClaim != nil {
+				if storeErr := s.storeArtifacts(ctx, attempt, workspace, []domain.AgentArtifactClaim{*businessAcceptanceEvidenceClaim}); storeErr != nil {
+					return domain.TaskExecutionOutcome{}, storeErr
+				}
+			}
 			if failErr := s.Repository.FailAttempt(ctx, attempt.ID, domain.TaskAttemptStatusBlocked, message, structured); failErr != nil {
 				return domain.TaskExecutionOutcome{}, failErr
 			}

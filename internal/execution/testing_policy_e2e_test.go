@@ -2,6 +2,7 @@ package execution
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -34,35 +35,74 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 	node20 := testingPolicyNode20(t)
 
 	for _, test := range []struct {
-		name         string
-		changedFile  string
-		wantMatrixBA string
-		wantDodBA    string
-		wantDoD      string
-		wantTask     domain.TaskStatus
-		wantDone     bool
+		name                 string
+		changedFile          string
+		businessEvidenceMode string
+		wantMatrixBA         string
+		wantResolution       string
+		wantDodBA            string
+		wantDoD              string
+		wantTask             domain.TaskStatus
+		wantDone             bool
+		wantBlocker          string
+		wantBlockerMessage   string
 	}{
 		{
-			name:         "test-only change can complete",
-			changedFile:  "internal/dod_fixture_test.go",
-			wantMatrixBA: "NOT_REQUIRED",
-			wantDodBA:    "NOT_REQUIRED",
-			wantDoD:      "DONE",
-			wantTask:     domain.TaskStatusCompleted,
-			wantDone:     true,
+			name:           "test-only change can complete",
+			changedFile:    "internal/dod_fixture_test.go",
+			wantMatrixBA:   "NOT_REQUIRED",
+			wantResolution: "NOT_REQUIRED",
+			wantDodBA:      "NOT_REQUIRED",
+			wantDoD:        "DONE",
+			wantTask:       domain.TaskStatusCompleted,
+			wantDone:       true,
 		},
 		{
-			name:         "unmapped functional change stays blocked",
-			changedFile:  "internal/dod_fixture.go",
-			wantMatrixBA: "UNKNOWN",
-			wantDodBA:    "PENDING",
-			wantDoD:      "BLOCKED",
-			wantTask:     domain.TaskStatusBlocked,
-			wantDone:     false,
+			name:           "unmapped functional change stays blocked",
+			changedFile:    "internal/dod_fixture.go",
+			wantMatrixBA:   "UNKNOWN",
+			wantResolution: "UNKNOWN",
+			wantDodBA:      "PENDING",
+			wantDoD:        "BLOCKED",
+			wantTask:       domain.TaskStatusBlocked,
+			wantDone:       false,
+		},
+		{
+			name:                 "current pinned bundle fails closed on archive evidence requiring the newer schema",
+			changedFile:          "internal/business/dod_fixture.go",
+			businessEvidenceMode: "valid",
+			wantMatrixBA:         "REQUIRED",
+			wantResolution:       "MAPPED",
+			wantDodBA:            "PENDING",
+			wantDoD:              "BLOCKED",
+			wantTask:             domain.TaskStatusBlocked,
+			wantBlocker:          "DOD_BUSINESS_ACCEPTANCE_INVALID",
+			wantBlockerMessage:   "archive_path: unknown property",
+		},
+		{
+			name:           "mapped required capability without evidence remains pending",
+			changedFile:    "internal/business/dod_fixture.go",
+			wantMatrixBA:   "REQUIRED",
+			wantResolution: "MAPPED",
+			wantDodBA:      "PENDING",
+			wantDoD:        "BLOCKED",
+			wantTask:       domain.TaskStatusBlocked,
+			wantBlocker:    "DOD_BUSINESS_ACCEPTANCE_PENDING",
+		},
+		{
+			name:                 "mapped required capability with invalid evidence remains pending",
+			changedFile:          "internal/business/dod_fixture.go",
+			businessEvidenceMode: "invalid",
+			wantMatrixBA:         "REQUIRED",
+			wantResolution:       "MAPPED",
+			wantDodBA:            "PENDING",
+			wantDoD:              "BLOCKED",
+			wantTask:             domain.TaskStatusBlocked,
+			wantBlocker:          "DOD_BUSINESS_ACCEPTANCE_INVALID",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := prepareTestingPolicyFixture(t, test.changedFile, node20)
+			fixture := prepareTestingPolicyFixture(t, test.changedFile, test.businessEvidenceMode, node20)
 			outcome, err := fixture.service.Execute(context.Background(), fixture.taskID, "workflow-e2e")
 			require.NoError(t, err)
 			fixture.headSHA = runFixtureGit(t, fixture.workspace, "rev-parse", "HEAD")
@@ -89,14 +129,20 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 			require.Equal(t, fixture.baseSHA, matrix.BaseSHA)
 			require.Equal(t, fixture.headSHA, matrix.HeadSHA)
 			require.Equal(t, test.wantMatrixBA, matrix.BusinessAcceptanceRequired)
+			require.Equal(t, test.wantResolution, matrix.BusinessAcceptanceResolution.Disposition)
 			require.Equal(t, []string{test.changedFile}, testingPolicyE2EChangedPathNames(matrix.ChangedPaths))
 			if test.wantMatrixBA == "NOT_REQUIRED" {
 				require.Equal(t, "unit-test", matrix.ChangedPaths[0].Classification)
 				require.Equal(t, []string{"impact-unit-test-v1"}, matrix.ChangedPaths[0].RuleIDs)
-			} else {
+			} else if test.wantMatrixBA == "UNKNOWN" {
 				require.Equal(t, "source-code-unmapped", matrix.ChangedPaths[0].Classification)
 				require.Equal(t, []string{"impact-source-unmapped-v1"}, matrix.ChangedPaths[0].RuleIDs)
 				require.Contains(t, matrix.Uncertainty, "UNKNOWN_OR_AMBIGUOUS_PATH:"+test.changedFile)
+			} else {
+				require.Equal(t, "domain-usecase-or-state-transition", matrix.ChangedPaths[0].Classification)
+				require.Equal(t, []string{"impact-domain-usecase-v1"}, matrix.ChangedPaths[0].RuleIDs)
+				require.Equal(t, []string{"learning_content_discovery"}, matrix.BusinessAcceptanceResolution.RequiredCapabilityIDs)
+				require.Empty(t, matrix.BusinessAcceptanceResolution.UnmappedPaths)
 			}
 
 			for _, command := range aggregate.Selection.SelectedCommands {
@@ -118,6 +164,15 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 			require.NoError(t, validateTestingPolicyDodReport(dod, fixture.baseSHA, fixture.headSHA))
 			require.Equal(t, test.wantDoD, dod.LifecycleState)
 			require.Equal(t, test.wantDodBA, *dod.Dispositions.BusinessAcceptance)
+			if test.wantBlocker != "" {
+				blocker := testingPolicyE2EBlockerByCode(t, dod.Blockers, test.wantBlocker)
+				require.Equal(t, "PENDING", blocker.Severity)
+				if test.wantBlockerMessage != "" {
+					require.Contains(t, blocker.Message, test.wantBlockerMessage)
+				}
+			} else if matrix.BusinessAcceptanceRequired != "UNKNOWN" {
+				require.Empty(t, dod.Blockers)
+			}
 
 			if matrix.BusinessAcceptanceRequired == "UNKNOWN" {
 				scopeBlocker := testingPolicyE2EBlockerByCode(t, dod.Blockers, "DOD_BUSINESS_SCOPE_UNKNOWN")
@@ -125,9 +180,26 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 				require.Contains(t, scopeBlocker.Message, "cannot prove whether central business acceptance applies")
 				require.Contains(t, testingPolicyE2EBlockerCodes(dod.Blockers), "DOD_IMPACT_UNRESOLVED")
 				require.Equal(t, domain.TaskAttemptStatusBlocked, fixture.repo.failedStatus)
-			} else {
-				require.Empty(t, dod.Blockers)
+			} else if test.wantBlocker == "" {
 				require.Equal(t, domain.TaskAttemptStatusCompleted, fixture.repo.attempt.Status)
+			} else {
+				require.Equal(t, domain.TaskAttemptStatusBlocked, fixture.repo.failedStatus)
+			}
+			if test.businessEvidenceMode == "missing" || test.businessEvidenceMode == "" {
+				require.NotContains(t, strings.Join(fixture.worktrees.commands, "\n"), "--business-acceptance-evidence")
+			} else {
+				require.Contains(t, strings.Join(fixture.worktrees.commands, "\n"), "--business-acceptance-evidence "+businessAcceptanceEvidencePath)
+			}
+			if test.businessEvidenceMode == "valid" || test.businessEvidenceMode == "invalid" {
+				storedEvidence := false
+				for _, artifact := range fixture.repo.artifacts {
+					if artifact.TaskID == fixture.taskID && artifact.Type == businessAcceptanceEvidenceType &&
+						artifact.Name == businessAcceptanceEvidenceName && strings.HasSuffix(artifact.URI, "/"+businessAcceptanceEvidencePath) {
+						storedEvidence = true
+						require.Len(t, artifact.Checksum, 64)
+					}
+				}
+				require.True(t, storedEvidence, "business evidence artifact should be stored for audit")
 			}
 		})
 	}
@@ -136,13 +208,14 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 type testingPolicyE2EFixture struct {
 	service   Service
 	repo      *fakeExecutionRepository
+	worktrees *policyNode20Worktree
 	baseSHA   string
 	headSHA   string
 	taskID    string
 	workspace string
 }
 
-func prepareTestingPolicyFixture(t *testing.T, changedFile, node20 string) testingPolicyE2EFixture {
+func prepareTestingPolicyFixture(t *testing.T, changedFile, businessEvidenceMode, node20 string) testingPolicyE2EFixture {
 	t.Helper()
 	root := t.TempDir()
 	repositoryRoot := filepath.Join(root, "course-dev-orchestrator")
@@ -152,6 +225,7 @@ func prepareTestingPolicyFixture(t *testing.T, changedFile, node20 string) testi
 	const taskID = "e2e-task-1"
 	const projectName = "policy-e2e"
 	rewriteTestingPolicyFixtureManifest(t, repositoryRoot)
+	writeTestingPolicyFixtureBusinessCapabilityMap(t, repositoryRoot)
 
 	binPath := filepath.Join(root, "node20-bin")
 	require.NoError(t, os.MkdirAll(binPath, 0o750))
@@ -175,10 +249,11 @@ func prepareTestingPolicyFixture(t *testing.T, changedFile, node20 string) testi
 	repo.executionContext.Project.HeadCommit = baseSHA
 
 	worktreeStore := filepath.Join(root, "task-worktrees")
-	worktrees := policyNode20Worktree{
-		TaskWorktree: gitadapter.TaskWorktree{StoragePath: worktreeStore},
-		node20:       node20,
-		path:         binPath + string(os.PathListSeparator) + os.Getenv("PATH"),
+	worktrees := &policyNode20Worktree{
+		TaskWorktree:         gitadapter.TaskWorktree{StoragePath: worktreeStore},
+		node20:               node20,
+		path:                 binPath + string(os.PathListSeparator) + os.Getenv("PATH"),
+		businessEvidenceMode: businessEvidenceMode,
 	}
 	runner := &testingPolicyE2EAgentRunner{changedFile: changedFile}
 	service := Service{
@@ -191,8 +266,27 @@ func prepareTestingPolicyFixture(t *testing.T, changedFile, node20 string) testi
 	require.Equal(t, filepath.Base(repositoryRoot), filepath.Base(workspacePath))
 
 	return testingPolicyE2EFixture{
-		service: service, repo: repo, baseSHA: baseSHA, taskID: taskID, workspace: workspacePath,
+		service: service, repo: repo, worktrees: worktrees, baseSHA: baseSHA, taskID: taskID, workspace: workspacePath,
 	}
+}
+
+func writeTestingPolicyFixtureBusinessCapabilityMap(t *testing.T, repositoryRoot string) {
+	t.Helper()
+	mapPath := filepath.Join(repositoryRoot, ".ai", "testing", "business-capability-map.v1.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(mapPath), 0o750))
+	capabilityMap := map[string]any{
+		"schema_version": "business-capability-map.v1",
+		"repository_id":  "course-dev-orchestrator",
+		"mappings": []any{map[string]any{
+			"mapping_id":     "dod-fixture-business",
+			"match":          "PREFIX",
+			"path":           "internal/business",
+			"capability_ids": []string{"learning_content_discovery"},
+		}},
+	}
+	bytes, err := json.Marshal(capabilityMap)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(mapPath, bytes, 0o640))
 }
 
 func copyCommittedTestingPolicyFixture(t *testing.T, destination string) {
@@ -396,11 +490,14 @@ func testingPolicyNode20(t *testing.T) string {
 
 type policyNode20Worktree struct {
 	gitadapter.TaskWorktree
-	node20 string
-	path   string
+	node20               string
+	path                 string
+	businessEvidenceMode string
+	commands             []string
 }
 
-func (w policyNode20Worktree) RunCheck(ctx context.Context, workspace domain.TaskWorkspace, requested string) (domain.WorkspaceCheckResult, error) {
+func (w *policyNode20Worktree) RunCheck(ctx context.Context, workspace domain.TaskWorkspace, requested string) (domain.WorkspaceCheckResult, error) {
+	w.commands = append(w.commands, requested)
 	if !strings.HasPrefix(requested, "node20 .ai/testing/policy/policy-runner.cjs ") {
 		return w.TaskWorktree.RunCheck(ctx, workspace, requested)
 	}
@@ -423,7 +520,152 @@ func (w policyNode20Worktree) RunCheck(ctx context.Context, workspace domain.Tas
 		}
 		exitCode = exitError.ExitCode()
 	}
+	if parts[2] == "verify" && w.businessEvidenceMode != "" {
+		if err := writeTestingPolicyE2EBusinessEvidence(workspace.Path, w.businessEvidenceMode); err != nil {
+			return domain.WorkspaceCheckResult{}, err
+		}
+	}
 	return domain.WorkspaceCheckResult{Command: requested, ExitCode: exitCode, Output: output.String()}, nil
+}
+
+func writeTestingPolicyE2EBusinessEvidence(repositoryRoot, mode string) error {
+	// The hosted run and artifact identifiers below are synthetic test inputs.
+	// This fixture exercises path forwarding and parser behavior; it does not
+	// establish GitHub Actions run or artifact API authenticity.
+	if mode == "invalid" {
+		path := filepath.Join(repositoryRoot, filepath.FromSlash(businessAcceptanceEvidencePath))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			return err
+		}
+		return os.WriteFile(path, []byte("{invalid structured evidence"), 0o640)
+	}
+	if mode != "valid" {
+		return fmt.Errorf("unsupported business evidence fixture mode %q", mode)
+	}
+	matrixPaths, err := filepath.Glob(filepath.Join(repositoryRoot, "test-results", "required-test-matrix", "*.json"))
+	if err != nil {
+		return err
+	}
+	if len(matrixPaths) != 1 {
+		return fmt.Errorf("expected one generated Required Test Matrix, got %d", len(matrixPaths))
+	}
+	matrixBytes, err := os.ReadFile(matrixPaths[0])
+	if err != nil {
+		return err
+	}
+	var matrix testingPolicyE2EMatrix
+	if err := json.Unmarshal(matrixBytes, &matrix); err != nil {
+		return err
+	}
+	if matrix.BusinessAcceptanceRequired != "REQUIRED" || matrix.BusinessAcceptanceResolution.Disposition != "MAPPED" ||
+		len(matrix.BusinessAcceptanceResolution.RequiredCapabilityIDs) != 1 || matrix.BusinessAcceptanceResolution.RequiredCapabilityIDs[0] != "learning_content_discovery" {
+		return fmt.Errorf("fixture matrix did not resolve the expected mapped business capability")
+	}
+	const verificationRunID = 1
+	const verificationRunAttempt = 1
+	const verificationRepository = "bemulima/learning-platform-verification"
+	verificationCommit := matrix.Policy.Identity.SourceCommit
+	if !fullSHA(verificationCommit) {
+		return fmt.Errorf("fixture matrix policy identity has no exact Verification source commit")
+	}
+	runURL := fmt.Sprintf("https://github.com/%s/actions/runs/%d", verificationRepository, verificationRunID)
+	resultPath := "test-results/business-acceptance/course-outline-test-result.json"
+	result := map[string]any{
+		"schema_version":          "test-result.v1",
+		"repository":              map[string]any{"id": "learning-platform-verification", "commit_sha": verificationCommit},
+		"manifest_schema_version": "test-manifest.v1",
+		"manifest_version":        matrix.Manifest.Version,
+		"policy_version":          "testing-policy.v1",
+		"tier":                    matrix.Tier,
+		"command":                 "test:unit",
+		"categories":              []string{"unit.domain"},
+		"started_at":              "2026-01-01T00:00:00.000Z",
+		"completed_at":            "2026-01-01T00:00:00.000Z",
+		"duration_ms":             0,
+		"native_exit_code":        0,
+		"exit_code":               0,
+		"status":                  "PASS",
+		"status_counts": map[string]int{
+			"PASS": 1, "FAIL": 0, "SKIP_EXPECTED": 0, "BLOCKED": 0, "NOT_APPLICABLE": 0,
+		},
+		"selection": map[string]any{"selector": "required-test-matrix.v1", "selected_commands": []string{"test:unit"}},
+		"checks": []any{map[string]any{
+			"logical_command": "test:unit", "categories": []string{"unit.domain"}, "status": "PASS", "duration_ms": 0, "native_exit_code": 0,
+		}},
+		"artifacts": []any{},
+		"ci":        map[string]any{"provider": "github-actions", "run_id": fmt.Sprint(verificationRunID), "run_attempt": verificationRunAttempt, "run_url": runURL},
+	}
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	matrixHash := sha256.Sum256(matrixBytes)
+	archivePath := "test-results/business-acceptance/acceptance-results.zip"
+	var archiveBytes bytes.Buffer
+	archiveWriter := zip.NewWriter(&archiveBytes)
+	archiveEntry, err := archiveWriter.Create(resultPath)
+	if err != nil {
+		return err
+	}
+	if _, err := archiveEntry.Write(resultBytes); err != nil {
+		return err
+	}
+	if err := archiveWriter.Close(); err != nil {
+		return err
+	}
+	archiveHash := sha256.Sum256(archiveBytes.Bytes())
+	resultHash := sha256.Sum256(resultBytes)
+	evidence := map[string]any{
+		"schema_version": "business-acceptance-evidence.v1",
+		"subject": map[string]any{
+			"repository_id": matrix.Repository.ID, "base_sha": matrix.BaseSHA, "head_sha": matrix.HeadSHA,
+			"matrix_sha256":           hex.EncodeToString(matrixHash[:]),
+			"required_capability_ids": matrix.BusinessAcceptanceResolution.RequiredCapabilityIDs,
+		},
+		"policy": map[string]any{
+			"source_repository": matrix.Policy.Identity.SourceRepository,
+			"source_commit_sha": verificationCommit,
+			"semantics_sha256":  matrix.Policy.Identity.SemanticsSHA,
+			"bundle_sha256":     matrix.Policy.Identity.BundleSHA256,
+		},
+		"verification": map[string]any{"repository_id": verificationRepository, "commit_sha": verificationCommit},
+		"run": map[string]any{
+			"provider": "github-actions", "repository": verificationRepository, "run_id": verificationRunID,
+			"run_attempt": verificationRunAttempt, "run_url": runURL,
+		},
+		"artifact": map[string]any{
+			"name": "business-acceptance-e2e-fixture", "artifact_id": 1,
+			"archive_sha256": hex.EncodeToString(archiveHash[:]), "archive_path": archivePath,
+		},
+		"results": []any{map[string]any{
+			"capability_id": "learning_content_discovery", "feature_id": "course_public_outline", "scenario_id": "course_outline_visible",
+			"evidence_type": "test-result.v1", "status": "PASS", "result_path": resultPath, "result_sha256": hex.EncodeToString(resultHash[:]),
+		}},
+		"status": "PASS",
+	}
+	evidenceBytes, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	evidenceFile := filepath.Join(repositoryRoot, filepath.FromSlash(resultPath))
+	if err := os.MkdirAll(filepath.Dir(evidenceFile), 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(evidenceFile, resultBytes, 0o640); err != nil {
+		return err
+	}
+	archiveFile := filepath.Join(repositoryRoot, filepath.FromSlash(archivePath))
+	if err := os.MkdirAll(filepath.Dir(archiveFile), 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(archiveFile, archiveBytes.Bytes(), 0o640); err != nil {
+		return err
+	}
+	evidencePath := filepath.Join(repositoryRoot, filepath.FromSlash(businessAcceptanceEvidencePath))
+	if err := os.MkdirAll(filepath.Dir(evidencePath), 0o750); err != nil {
+		return err
+	}
+	return os.WriteFile(evidencePath, evidenceBytes, 0o640)
 }
 
 func testingPolicyE2EPathEnvironment(source []string, path string) []string {
@@ -488,11 +730,31 @@ type testingPolicyE2EAggregate struct {
 }
 
 type testingPolicyE2EMatrix struct {
-	BaseSHA                    string                        `json:"base_sha"`
-	HeadSHA                    string                        `json:"head_sha"`
-	BusinessAcceptanceRequired string                        `json:"business_acceptance_required"`
-	Uncertainty                []string                      `json:"uncertainty"`
-	ChangedPaths               []testingPolicyE2EChangedPath `json:"changed_paths"`
+	BaseSHA                    string `json:"base_sha"`
+	HeadSHA                    string `json:"head_sha"`
+	BusinessAcceptanceRequired string `json:"business_acceptance_required"`
+	Repository                 struct {
+		ID string `json:"id"`
+	} `json:"repository"`
+	Manifest struct {
+		Version string `json:"version"`
+	} `json:"manifest"`
+	Policy struct {
+		Identity struct {
+			SourceRepository string `json:"source_repository"`
+			SourceCommit     string `json:"source_commit"`
+			SemanticsSHA     string `json:"semantics_sha"`
+			BundleSHA256     string `json:"bundle_sha256"`
+		} `json:"identity"`
+	} `json:"policy"`
+	Tier                         string `json:"tier"`
+	BusinessAcceptanceResolution struct {
+		Disposition           string   `json:"disposition"`
+		RequiredCapabilityIDs []string `json:"required_capability_ids"`
+		UnmappedPaths         []string `json:"unmapped_paths"`
+	} `json:"business_acceptance_resolution"`
+	Uncertainty  []string                      `json:"uncertainty"`
+	ChangedPaths []testingPolicyE2EChangedPath `json:"changed_paths"`
 }
 
 type testingPolicyE2EChangedPath = struct {
