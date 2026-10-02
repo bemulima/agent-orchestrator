@@ -15,9 +15,9 @@ import (
 
 const (
 	// These pins are refreshed only with the reviewed central Testing Policy bundle rollout.
-	TestingPolicySourceCommit = "d31f717d9ba5222524c7e2dec69e9d3d4377e0b7"
+	TestingPolicySourceCommit = "e56b38fb0d01cc70be7ca55360788736b6af06f4"
 	TestingPolicySemanticsSHA = "3a374a116118d07311dab69513fdb271b82ec7a91e07d966c3515a80ff408241"
-	TestingPolicyBundleSHA256 = "60e6a182728d92d9497ec1134b47b22ec1a7412ba85ffa2bf4bbeb1b5ac56818"
+	TestingPolicyBundleSHA256 = "506ac48d5cc1a6c4a0ee88ba20a313ec6f55fe7aa7caaa0fc20d90a3c13fa059"
 )
 
 var taskRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
