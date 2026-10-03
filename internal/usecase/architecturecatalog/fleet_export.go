@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path"
 
 	projection "github.com/bemulima/agent-orchestrator/internal/architecturecatalog"
 	manifests "github.com/bemulima/agent-orchestrator/internal/architecturemanifest"
@@ -44,6 +45,7 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 		}}
 		paths := map[string]bool{}
 		serviceCount := 0
+		serviceDeclarationPath := ""
 		for _, declaration := range repo.Declarations {
 			pin, raw, e := uc.Resolver.Read(ctx, root, repo.SourceIdentity, repo.CommitSHA, declaration.Path)
 			if e != nil {
@@ -61,6 +63,7 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 			if e == nil {
 				serviceCount++
 				source.ServiceManifest = service
+				serviceDeclarationPath = declaration.Path
 			} else {
 				operation, oe := manifests.ParseOperation(raw)
 				if oe != nil {
@@ -77,7 +80,9 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 			return domain.ArchitectureGraph{}, fmt.Errorf("locked service declaration bundle mismatch: %w", domain.ErrConflict)
 		}
 		for _, file := range source.ServiceManifest.OperationManifests {
-			if !paths[file] {
+			// ParseService already enforces safe, relative operation paths. Resolve
+			// those paths against the exact pinned service declaration directory.
+			if !paths[path.Join(path.Dir(serviceDeclarationPath), file)] {
 				return domain.ArchitectureGraph{}, fmt.Errorf("unlocked operation declaration: %w", domain.ErrConflict)
 			}
 		}
