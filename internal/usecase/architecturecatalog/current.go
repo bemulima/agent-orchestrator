@@ -30,37 +30,46 @@ type Current struct {
 }
 
 func (uc Current) Handle(ctx context.Context) (domain.ArchitectureCatalog, error) {
+	sources, err := uc.Sources(ctx)
+	if err != nil {
+		return domain.ArchitectureCatalog{}, err
+	}
+	return uc.Builder.Build(ctx, sources)
+}
+
+// Sources captures the same immutable records selected by CURRENT without mutation.
+func (uc Current) Sources(ctx context.Context) ([]domain.ArchitectureCatalogSource, error) {
 	if uc.Topology == nil || uc.Projects == nil || uc.Builder == nil {
-		return domain.ArchitectureCatalog{}, fmt.Errorf("architecture catalog dependencies are not configured: %w", domain.ErrValidation)
+		return nil, fmt.Errorf("architecture catalog dependencies are not configured: %w", domain.ErrValidation)
 	}
 	topology, err := uc.Topology.Get(ctx)
 	if err != nil {
-		return domain.ArchitectureCatalog{}, err
+		return nil, err
 	}
 	sources := make([]domain.ArchitectureCatalogSource, 0, len(topology.Services))
 	seen := make(map[string]struct{}, len(topology.Services))
 	for _, service := range topology.Services {
 		if err := ctx.Err(); err != nil {
-			return domain.ArchitectureCatalog{}, err
+			return nil, err
 		}
 		if _, exists := seen[service.ProjectID]; exists {
-			return domain.ArchitectureCatalog{}, fmt.Errorf("topology contains duplicate project %q: %w", service.ProjectID, domain.ErrConflict)
+			return nil, fmt.Errorf("topology contains duplicate project %q: %w", service.ProjectID, domain.ErrConflict)
 		}
 		seen[service.ProjectID] = struct{}{}
 
 		project, err := uc.Projects.Get(ctx, service.ProjectID)
 		if err != nil {
-			return domain.ArchitectureCatalog{}, err
+			return nil, err
 		}
 		snapshot, report, err := uc.Projects.GetLatestDiscovery(ctx, service.ProjectID)
 		if err != nil {
-			return domain.ArchitectureCatalog{}, err
+			return nil, err
 		}
 		if snapshot.ID != service.SnapshotID {
-			return domain.ArchitectureCatalog{}, fmt.Errorf("topology snapshot %q for project %q is stale against latest discovery snapshot %q; rebuild topology is required before reading Architecture CURRENT: %w", service.SnapshotID, service.ProjectID, snapshot.ID, domain.ErrConflict)
+			return nil, fmt.Errorf("topology snapshot %q for project %q is stale against latest discovery snapshot %q; rebuild topology is required before reading Architecture CURRENT: %w", service.SnapshotID, service.ProjectID, snapshot.ID, domain.ErrConflict)
 		}
 		if snapshot.ProjectID != project.ID || report.ProjectID != project.ID || report.CommitSHA != snapshot.CommitSHA {
-			return domain.ArchitectureCatalog{}, fmt.Errorf("discovery snapshot does not match topology project %q: %w", project.ID, domain.ErrConflict)
+			return nil, fmt.Errorf("discovery snapshot does not match topology project %q: %w", project.ID, domain.ErrConflict)
 		}
 
 		source := domain.ArchitectureCatalogSource{
@@ -74,7 +83,7 @@ func (uc Current) Handle(ctx context.Context) (domain.ArchitectureCatalog, error
 		}
 		sources = append(sources, source)
 	}
-	return uc.Builder.Build(ctx, sources)
+	return sources, nil
 }
 
 // Service selects one service from CURRENT by canonical project ID.

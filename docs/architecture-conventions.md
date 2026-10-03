@@ -235,3 +235,13 @@ deterministic and call side-effecting code only through activities.
 # Architecture CURRENT projection
 
 The `architecture` module is a read-only projection boundary: discovery snapshots feed topology, and the current `TopologyCatalog` feeds Architecture CURRENT, the architecture HTTP API, owner UI, and deterministic Mermaid. It has no tables and no mutation commands. `CURRENT` is explicitly versioned by topology revision and fingerprint; a future TARGET architecture is a separate concern and must not change topology semantics.
+
+## Portable CURRENT graph artifact
+
+CDO owns `architecture-graph.v1` as documented in
+[Portable Architecture CURRENT graph](architecture-graph-v1.md). The separate
+read-only exporter preserves stable IDs and literal unresolved targets,
+uses exact owner Git blobs, and separates producer code provenance from
+artifact storage identity. Authority requires a verified matching CDO-owned
+inventory and all required source evidence; partial local roots and canaries
+cannot establish fleet completeness.

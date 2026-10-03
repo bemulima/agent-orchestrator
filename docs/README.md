@@ -2,6 +2,7 @@
 
 Repository code, migrations, tests, configuration, and the documents below are the source of truth for `course-dev-orchestrator`.
 
+- [Portable CURRENT graph](architecture-graph-v1.md): deterministic exporter, immutable declaration pins and independently declared fleet scope.
 - [Architecture conventions](architecture-conventions.md): dependency direction, safety invariants, persistence, workflows, agents, publication, and project lifecycle.
 - [Implementation plan](implementation-plan.md): staged scope, acceptance criteria, and explicit non-goals.
 - [Progress](progress.md): verified implementation history, current state, remaining work, and exact next task.

@@ -315,3 +315,16 @@ compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet
 
 verify: agent-policy fmt-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks
+
+.PHONY: architecture-export architecture-export-build architecture-export-test architecture-export-format
+architecture-export: architecture-export-build ## Export persisted CURRENT graph using a clean, committed producer binary
+	.cache/bin/architecture-export $(ARCHITECTURE_EXPORT_ARGS)
+
+architecture-export-build: ## Build the independent read-only graph exporter with VCS provenance
+	$(GO_ENV) go build -buildvcs=true -o .cache/bin/architecture-export ./cmd/architecture-export
+
+architecture-export-test: ## Verify portable graph, owner inventory, immutable pins and exporter provenance
+	$(GO_ENV) go test ./internal/architecturecatalog ./internal/usecase/architecturecatalog ./internal/adapters/git ./cmd/architecture-export
+
+architecture-export-format: ## Format only the portable architecture graph exporter files
+	gofmt -w internal/domain/architecture_graph.go internal/architecturecatalog/export.go internal/architecturecatalog/export_test.go internal/usecase/architecturecatalog/current.go internal/usecase/architecturecatalog/export.go internal/usecase/architecturecatalog/export_test.go internal/adapters/git/architecture_blob.go internal/adapters/git/architecture_blob_test.go cmd/architecture-export/main.go cmd/architecture-export/main_test.go

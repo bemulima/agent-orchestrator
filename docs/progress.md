@@ -1270,3 +1270,46 @@ deploy without their own subsequent explicit authorizations.
   The required source is a versioned CDO topology/catalog export plus exact
   per-service commit, path, Git blob OID, and SHA-256 evidence for the
   owner-authored architecture files.
+
+## Testing System — portable CURRENT graph producer — 2026-10-03
+
+- Added CDO-owned `architecture-graph.v1` DTO and JSON Schema plus the
+  separate read-only `cmd/architecture-export` producer. It uses the same
+  captured persisted topology/discovery source selection as CURRENT, checks
+  the catalog against the owner declarations, preserves stable IDs,
+  parallel relation tuples and unresolved literal targets, and removes
+  transient database identities from portable output.
+- Added bounded immutable Git object resolution with canonical source/root
+  checks, full commit/object validation, regular-file-only reads, raw-byte
+  SHA-256 and Git blob digest verification, replacement-ref/environment
+  isolation, and secret-file path rejection. Missing/untracked declarations
+  stay diagnostic and never acquire fabricated pins.
+- Added optional independently verified CDO-owned
+  `architecture-graph-inventory.v1` scope metadata. Exact immutable inventory
+  bytes must belong to the clean producer commit, contain sorted unique
+  canonical source IDs and match the exported source set. Missing or
+  mismatching inventory emits BLOCKED scope diagnoses; a populated local
+  topology cannot assert fleet completeness. Producer build Git provenance
+  remains independent from the eventual report storage commit.
+- Added deterministic compact recursive key ordering and a semantic SHA-256,
+  a synthetic shared-consumer fixture, schema/fixture tests, transient-ID
+  invariance and parallel/unresolved-edge checks, missing/drifted-pin and
+  matching/mismatching-inventory cases, forged catalog rejection, immutable
+  read/path/symlink/environment checks, and producer provenance tests.
+- `make architecture-export-test`, `make architecture-export-build`, and
+  `make verify` pass. No live graph export, actual full-fleet inventory,
+  source commit publication or downstream authoritative lock was produced.
+  Prior local 37-root verification and canary evidence remain insufficient
+  to populate the fleet graph lock. The checked-in graph is explicitly
+  synthetic test data; the source tree is currently dirty and cannot be
+  labeled as a clean independently pinned producer revision.
+
+- Independent graph-producer review repairs: every sanitized Git invocation
+  now explicitly disables lazy promisor fetching with `GIT_NO_LAZY_FETCH=1`.
+  The inventory parser rejects repeated decoded keys, escaped duplicates,
+  unknown fields and case variants rather than accepting last-value-wins
+  JSON semantics. Matching raw SHA/blob regression fixtures prove strict
+  duplicate rejection, and the Git subprocess environment regression proves
+  inherited lazy-fetch overrides are removed. Focused exporter tests, binary
+  build and full `make verify` pass after these repairs. No authoritative
+  full-fleet artifact was produced.
