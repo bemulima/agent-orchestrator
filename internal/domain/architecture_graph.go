@@ -5,15 +5,18 @@ const ArchitectureGraphSchemaV1 = "architecture-graph.v1"
 // ArchitectureGraph is a portable projection of the supplied CURRENT sources.
 // Its scope is the captured topology, never an inferred complete fleet.
 type ArchitectureGraph struct {
-	SchemaVersion string                          `json:"schema_version"`
-	Mode          string                          `json:"mode"`
-	Producer      ArchitectureGraphProducer       `json:"producer"`
-	References    []ArchitectureGraphReference    `json:"references"`
-	Edges         []ArchitectureGraphEdge         `json:"edges"`
-	Completeness  ArchitectureCatalogCompleteness `json:"completeness"`
-	Diagnostics   []ArchitectureGraphDiagnostic   `json:"diagnostics"`
-	Inventory     *ArchitectureGraphInventory     `json:"inventory,omitempty"`
-	ContentSHA256 string                          `json:"content_sha256,omitempty"`
+	ExcludedInterfaceMetadata int                             `json:"excluded_interface_metadata,omitempty"`
+	OperationSemanticDebt     int                             `json:"operation_semantic_debt,omitempty"`
+	SchemaVersion             string                          `json:"schema_version"`
+	Mode                      string                          `json:"mode"`
+	Producer                  ArchitectureGraphProducer       `json:"producer"`
+	References                []ArchitectureGraphReference    `json:"references"`
+	Edges                     []ArchitectureGraphEdge         `json:"edges"`
+	Completeness              ArchitectureCatalogCompleteness `json:"completeness"`
+	Diagnostics               []ArchitectureGraphDiagnostic   `json:"diagnostics"`
+	FleetInputs               *ArchitectureGraphFleetInputs   `json:"fleet_inputs,omitempty"`
+	Inventory                 *ArchitectureGraphInventory     `json:"inventory,omitempty"`
+	ContentSHA256             string                          `json:"content_sha256,omitempty"`
 }
 type ArchitectureGraphProducer struct {
 	RepositoryID string `json:"repository_id"`
@@ -27,6 +30,7 @@ type ArchitectureGraphPin struct {
 	ContentSHA256  string `json:"content_sha256"`
 }
 type ArchitectureGraphReference struct {
+	ReferenceKind   string                 `json:"reference_kind,omitempty"`
 	ReferenceID     string                 `json:"reference_id"`
 	SourceIdentity  string                 `json:"source_identity"`
 	ManifestID      string                 `json:"manifest_id"`

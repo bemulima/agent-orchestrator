@@ -1313,3 +1313,25 @@ deploy without their own subsequent explicit authorizations.
   inherited lazy-fetch overrides are removed. Focused exporter tests, binary
   build and full `make verify` pass after these repairs. No authoritative
   full-fleet artifact was produced.
+
+## Exact pinned owner fleet producer — 2026-10-03
+
+- Added architecture-fleet-inputs.v1 with exactly 42 sorted canonical Git owners,
+  full source commits, declaration blob/digest locks, profiles and service IDs.
+  `architecture-export --fleet-inputs --fleet-roots` reads immutable Git objects
+  without a database and reuses architecture/v1 parsing, stable graph IDs and
+  canonical serialization. The graph binds the normalized fleet lock digest.
+- Pinned owner mode excludes invented provider-only consumer/subscriber edges,
+  records fully unknown operation scaffold interaction count as semantic debt,
+  and resolves only reviewed evidence-backed direct external resource literals.
+  Partly known and unresolved declared dependencies remain BLOCKED. The existing
+  persisted CURRENT export remains available.
+- Focused exporter tests and binary build pass. Two full make verify runs passed
+  during implementation; the latest rerun stopped at fmt-check on concurrent
+  unrelated `internal/usecase/shardexecution/red_setup_test.go`. That file was
+  preserved. After owner schema repairs, all 42 service/operation declaration bundles
+  pass canonical validation; the candidate relation audit retains 24 unresolved
+  outbound assertions after reviewed external resolution and opaque interface
+  descriptor separation. These temporary
+  reports are UNPUBLISHED working declaration diagnostics, not immutable fleet
+  graph evidence. No authoritative graph, commit or publication was performed.

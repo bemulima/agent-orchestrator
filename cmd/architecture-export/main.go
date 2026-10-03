@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -28,15 +29,20 @@ func main() {
 }
 func run(args []string, out io.Writer) error {
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
-		_, err := fmt.Fprintln(out, "architecture-export: read persisted CURRENT and exact owner Git blobs; write architecture-graph.v1 JSON to stdout. DATABASE_URL and REPOSITORY_ALLOWED_ROOTS/REPOSITORY_STORAGE_PATH configure read access. No arguments; no topology rebuild.")
+		_, err := fmt.Fprintln(out, "architecture-export: read persisted CURRENT and exact owner Git blobs; write architecture-graph.v1 JSON to stdout. DATABASE_URL and REPOSITORY_ALLOWED_ROOTS/REPOSITORY_STORAGE_PATH configure read access. Use --fleet-inputs <lock.json> --fleet-roots <roots.json> for pinned owner CURRENT without DATABASE_URL; optional inventory flags apply to persisted mode.")
 		return err
 	}
 	flags := flag.NewFlagSet("architecture-export", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	fleetPath := flags.String("fleet-inputs", "", "normalized pinned owner fleet lock")
+	fleetRoots := flags.String("fleet-roots", "", "local source identity to object store JSON map")
 	inventoryRoot := flags.String("inventory-root", "", "CDO object store containing pinned inventory")
 	inventoryPath := flags.String("inventory-path", "", "CDO owner inventory path at producer commit")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if (*fleetPath == "") != (*fleetRoots == "") {
+		return fmt.Errorf("use paired --fleet-inputs and --fleet-roots with optional paired inventory flags")
 	}
 	if flags.NArg() != 0 || (*inventoryRoot == "") != (*inventoryPath == "") {
 		return fmt.Errorf("use paired --inventory-root and --inventory-path, with no positional arguments")
@@ -48,6 +54,47 @@ func run(args []string, out io.Writer) error {
 	producer, err := producerFromBuild(info)
 	if err != nil {
 		return err
+	}
+	if *fleetPath != "" {
+		for _, file := range []string{*fleetPath, *fleetRoots} {
+			for _, component := range strings.Split(file, "/") {
+				if component == "test-results" || component == ".env" || strings.HasPrefix(component, ".env.") {
+					return fmt.Errorf("forbidden fleet input path")
+				}
+			}
+		}
+		raw, e := os.ReadFile(*fleetPath)
+		if e != nil {
+			return fmt.Errorf("fleet lock unavailable")
+		}
+		rootBytes, e := os.ReadFile(*fleetRoots)
+		if e != nil {
+			return fmt.Errorf("fleet roots unavailable")
+		}
+		var roots map[string]string
+		if e = json.Unmarshal(rootBytes, &roots); e != nil {
+			return fmt.Errorf("invalid fleet roots")
+		}
+		allowed := strings.Split(os.Getenv("REPOSITORY_ALLOWED_ROOTS"), ",")
+		if storage := os.Getenv("REPOSITORY_STORAGE_PATH"); storage != "" {
+			allowed = append(allowed, storage)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		operation := uc.FleetExport{Inputs: raw, Roots: roots, Producer: producer, Resolver: gitadapter.ArchitectureBlobResolver{AllowedRoots: allowed}}
+		if *inventoryRoot != "" {
+			operation.Inventory = &uc.InventoryRequest{Root: *inventoryRoot, Path: *inventoryPath, SourceIdentity: "git:github.com/" + producer.RepositoryID, CommitSHA: producer.CommitSHA}
+		}
+		graph, e := operation.Handle(ctx)
+		if e != nil {
+			return e
+		}
+		data, e := projection.CanonicalGraphJSON(graph)
+		if e != nil {
+			return e
+		}
+		_, e = out.Write(append(data, '\n'))
+		return e
 	}
 	cfg, err := config.Load()
 	if err != nil {

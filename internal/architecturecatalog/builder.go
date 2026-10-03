@@ -62,7 +62,11 @@ func (Builder) Build(ctx context.Context, sources []domain.ArchitectureCatalogSo
 		return stableKey(left.ProjectName, left.ProjectID) < stableKey(right.ProjectName, right.ProjectID)
 	})
 	catalog.Platform.Completeness.OperationKinds = operationKindCounts(catalog.Platform.Completeness.OperationKinds)
-	catalog.Platform.Relations = buildRelations(catalog.Platform.Services)
+	explicitOnly := len(sources) > 0
+	for _, source := range sources {
+		explicitOnly = explicitOnly && source.PinnedDeclarations
+	}
+	catalog.Platform.Relations = buildRelations(catalog.Platform.Services, explicitOnly)
 	if err := ValidateStableGraphIDs(catalog); err != nil {
 		return domain.ArchitectureCatalog{}, err
 	}
@@ -450,7 +454,8 @@ func isOperationKind(value domain.ArchitectureOperationType) bool {
 // hierarchy. In particular, it does not use fuzzy service-name matching: a
 // target is internal only when it exactly identifies one catalog service, and
 // a contract/event is paired only on its exact transport/code tuple.
-func buildRelations(services []domain.ArchitectureCatalogService) []domain.ArchitectureCatalogRelation {
+func buildRelations(services []domain.ArchitectureCatalogService, explicitModes ...bool) []domain.ArchitectureCatalogRelation {
+	explicitOnly := len(explicitModes) == 1 && explicitModes[0]
 	referenceIDs := make(map[string]string, len(services))
 	for _, service := range services {
 		referenceIDs[service.Source.ProjectID] = service.Source.ReferenceID
@@ -538,25 +543,34 @@ func buildRelations(services []domain.ArchitectureCatalogService) []domain.Archi
 		}
 		for _, operation := range serviceOperations(service) {
 			for _, interaction := range operation.Manifest.ExternalInteractions {
+				if explicitOnly && IsUnassertedInteraction(interaction) {
+					continue
+				}
 				add(directManifestRelation(service, operation.Manifest.ID, domain.ArchitectureCatalogRelationOperationInteraction, interaction, identities))
 			}
 			for _, event := range operation.Manifest.Output.EmittedEvents {
-				addEventProducerRelations(add, service, operation.Manifest.ID, event, subscribed)
+				if !explicitOnly || len(subscribed[referenceKey(event)]) > 0 {
+					addEventProducerRelations(add, service, operation.Manifest.ID, event, subscribed)
+				}
 			}
 		}
 		for _, reference := range manifest.ConsumedContracts {
-			addConsumerRelations(add, serviceReference(service, reference, ""), produced, domain.ArchitectureCatalogRelationContract, "provider")
+			if !explicitOnly || len(produced[referenceKey(reference)]) > 0 {
+				addConsumerRelations(add, serviceReference(service, reference, ""), produced, domain.ArchitectureCatalogRelationContract, "provider")
+			}
 		}
 		for _, reference := range manifest.ProducedContracts {
-			if len(consumed[referenceKey(reference)]) == 0 {
+			if !explicitOnly && len(consumed[referenceKey(reference)]) == 0 {
 				addProducerUnknownRelation(add, serviceReference(service, reference, ""), domain.ArchitectureCatalogRelationContract, "consumer")
 			}
 		}
 		for _, reference := range manifest.SubscribedEvents {
-			addConsumerRelations(add, serviceReference(service, reference, ""), published, domain.ArchitectureCatalogRelationEvent, "publisher")
+			if !explicitOnly || len(published[referenceKey(reference)]) > 0 {
+				addConsumerRelations(add, serviceReference(service, reference, ""), published, domain.ArchitectureCatalogRelationEvent, "publisher")
+			}
 		}
 		for _, reference := range manifest.PublishedEvents {
-			if len(subscribed[referenceKey(reference)]) == 0 {
+			if !explicitOnly && len(subscribed[referenceKey(reference)]) == 0 {
 				addProducerUnknownRelation(add, serviceReference(service, reference, ""), domain.ArchitectureCatalogRelationEvent, "subscriber")
 			}
 		}
@@ -797,4 +811,11 @@ func cloneManifest(value, target any) error {
 		return fmt.Errorf("copy architecture catalog manifest: %w", err)
 	}
 	return nil
+}
+
+// IsUnassertedInteraction identifies the fully unknown scaffold marker. Any
+// named target, transport, direction or positive confidence remains an assertion.
+func IsUnassertedInteraction(v domain.ArchitectureExternalInteraction) bool {
+	unknown := func(s string) bool { return strings.TrimSpace(s) == "unknown" }
+	return unknown(v.ID) && unknown(v.Target) && unknown(v.Transport) && unknown(v.Direction) && (v.Contract == "" || unknown(v.Contract)) && unknown(v.Description.Value) && v.Description.Confidence == 0
 }

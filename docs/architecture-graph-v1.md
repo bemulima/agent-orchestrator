@@ -72,3 +72,59 @@ does not prove commit/blob pins. Capture an owner-reviewed CDO topology/source
 set with each exact owner SHA, resolve declarations from immutable objects,
 and explicitly review the resulting inventory and downstream Central lock
 update before claiming authoritative platform gate evidence.
+
+## Exact owner fleet inputs
+
+The separate `--fleet-inputs <lock.json> --fleet-roots <roots.json>` mode uses
+[architecture-fleet-inputs.v1.schema.json](schemas/architecture-fleet-inputs.v1.schema.json).
+The normalized lock contains exactly 42 repositories sorted by canonical
+`source_identity`; each supplies `repository_id`, canonical HTTPS `remote_url`,
+full published `commit_sha`, owner `profile`, `service_id`, `repository_role`
+and declarations sorted by path with exact `blob_oid` and `content_sha256`.
+The root map contains exactly the same source identities mapped to local Git
+object stores. `REPOSITORY_ALLOWED_ROOTS` (comma separated) and optional
+`REPOSITORY_STORAGE_PATH` constrain access. No DATABASE_URL is required.
+
+Every service and operation is parsed by the existing architecture/v1 validator
+from its locked regular-file Git blob. Each service has exactly one declaration,
+and its complete operation list must match the lock. Dirty working-tree files,
+branch tips and database selections do not affect this mode. Duplicate JSON keys,
+unknown fields, incomplete inventories, mutable revision names, forbidden paths
+(including every test-results component), blob drift, and missing objects fail
+export. The producer still requires clean committed build provenance.
+
+The graph retains architecture-graph.v1 IDs, relation semantics and canonical
+serialization. Its `fleet_inputs` field binds the canonical semantic lock digest
+and all 42 source identities; local roots and input whitespace do not enter the
+digest. Owner declarations at those exact commits select CURRENT in this mode.
+The persisted exporter remains available for database CURRENT snapshots. Explicit
+unresolved owner targets remain BLOCKED until authoritative endpoint evidence
+resolves them. The lock is input evidence, independent of graph artifact storage.
+
+Pinned projection does not manufacture unknown consumers for provider-only
+contracts or unknown subscribers for published events. Fully unknown operation
+scaffold interactions with zero confidence remain unasserted semantic metadata;
+`operation_semantic_debt` records their count. Any named or partly known outbound
+assertion remains an edge and stays BLOCKED when unresolved. Reviewed exact
+external resource literals can resolve only direct relations with positive
+confidence and owner evidence. Such references carry `reference_kind: external`,
+identity `external:<transport>:<literal>`, stable IDs and the union of the owning
+committed declaration pins. The reference commit is the first canonical owner
+pin commit, rather than an invented commit in an external repository. Repository
+inventory continues to contain exactly 42 Git source identities independently
+of those external references.
+
+Opaque provided/consumed interface labels and published/subscribed event labels
+without an exact counterpart do not assert an unknown endpoint in pinned mode.
+`excluded_interface_metadata` counts those unmatched descriptors; their original
+owner declaration pins remain attached to repository references. Exact matched
+contract/event tuples still produce relations. Explicit outbound interactions
+with unknown targets stay BLOCKED. Fleet-specific compatibility checks account
+for concrete client calls and event operations independently of these labels.
+
+Fleet mode can additionally use paired `--inventory-root` and `--inventory-path`
+to bind the independently committed architecture-graph-inventory.v1 document at
+the clean producer revision. The inventory contains only the sorted 42 owner
+source identities, so it can be committed before reading owner source SHAs and
+storing the graph elsewhere. An unavailable, invalid or mismatching supplied
+inventory fails or remains BLOCKED; external references do not expand that scope.
