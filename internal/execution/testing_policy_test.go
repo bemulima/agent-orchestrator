@@ -285,3 +285,35 @@ func (f *testingPolicyWorktreeFixture) ReadArtifact(_ context.Context, _ domain.
 func (*testingPolicyWorktreeFixture) Commit(context.Context, domain.Project, domain.Task, domain.TaskWorkspace, []string) (string, error) {
 	panic("not used")
 }
+
+func TestValidateTestingPolicyDodReportInvalidAcceptanceStaysPendingWithoutWeakeningBlockers(t *testing.T) {
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	for _, test := range []struct {
+		code, severity, otherCode, otherSeverity, disposition string
+		wantError                                             bool
+	}{
+		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "", "", "PENDING", false},
+		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "BLOCKING", "", "", "PENDING", true},
+		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "", "", "EVIDENCE_PRESENT", true},
+		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "DOD_COMMAND_RESULT_MISSING", "PENDING", "PENDING", true},
+		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "DOD_IDENTITY_MISMATCH", "BLOCKING", "PENDING", true},
+	} {
+		raw := fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"BUSINESS_ACCEPTANCE_PENDING","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":%q},"blockers":[{"code":%q,"severity":%q}]}`, baseSHA, headSHA, test.disposition, test.code, test.severity)
+		var report testingPolicyDodReport
+		require.NoError(t, json.Unmarshal([]byte(raw), &report))
+		if test.otherCode != "" {
+			report.Blockers = append(report.Blockers, struct {
+				Code     string `json:"code"`
+				Severity string `json:"severity"`
+				Subject  string `json:"subject"`
+				Message  string `json:"message"`
+			}{Code: test.otherCode, Severity: test.otherSeverity})
+		}
+		err := validateTestingPolicyDodReport(report, baseSHA, headSHA)
+		if test.wantError {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+		}
+	}
+}

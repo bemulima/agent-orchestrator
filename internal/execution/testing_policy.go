@@ -214,13 +214,13 @@ func validateTestingPolicyDodReport(report testingPolicyDodReport, baseSHA, head
 	hasOtherPendingBlocker := false
 	hasBlockingBlocker := false
 	for _, blocker := range report.Blockers {
-		if blocker.Code == "DOD_BUSINESS_ACCEPTANCE_PENDING" {
+		if blocker.Code == "DOD_BUSINESS_ACCEPTANCE_PENDING" || blocker.Code == "DOD_BUSINESS_ACCEPTANCE_INVALID" {
 			hasAcceptancePendingBlocker = true
 			if blocker.Severity != "PENDING" {
 				return fmt.Errorf("business acceptance blocker has an invalid severity")
 			}
 		}
-		if blocker.Severity == "PENDING" && blocker.Code != "DOD_BUSINESS_ACCEPTANCE_PENDING" {
+		if blocker.Severity == "PENDING" && blocker.Code != "DOD_BUSINESS_ACCEPTANCE_PENDING" && blocker.Code != "DOD_BUSINESS_ACCEPTANCE_INVALID" {
 			hasOtherPendingBlocker = true
 		}
 		if blocker.Severity == "BLOCKING" {
