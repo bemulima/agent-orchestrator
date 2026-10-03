@@ -28,17 +28,37 @@ func ParseFleetInputs(raw []byte) (domain.ArchitectureFleetInputs, string, error
 		return result, "", fmt.Errorf("versioned exact 42 repository fleet required: %w", domain.ErrValidation)
 	}
 	services := map[string]bool{}
-	for i, repo := range result.Repositories {
-		if !graphRepositoryID.MatchString(repo.RepositoryID) || repo.SourceIdentity != "git:github.com/"+repo.RepositoryID || repo.RemoteURL != "https://github.com/"+repo.RepositoryID+".git" || !graphGitSHA.MatchString(repo.CommitSHA) || strings.TrimSpace(repo.Profile) == "" || strings.TrimSpace(repo.ServiceID) == "" || services[repo.ServiceID] || (repo.RepositoryRole != domain.RepositoryRoleService && repo.RepositoryRole != domain.RepositoryRoleFrontend && repo.RepositoryRole != domain.RepositoryRoleInfrastructure && repo.RepositoryRole != domain.RepositoryRolePolicy && repo.RepositoryRole != domain.RepositoryRoleContent && repo.RepositoryRole != domain.RepositoryRoleDocumentation && repo.RepositoryRole != domain.RepositoryRoleArchive) || len(repo.Declarations) == 0 || (i > 0 && result.Repositories[i-1].SourceIdentity >= repo.SourceIdentity) {
-			return result, "", fmt.Errorf("invalid normalized fleet repository: %w", domain.ErrValidation)
+	identities := map[string]bool{}
+	validate := func(repo domain.ArchitectureFleetRepository, previous string, requireProfile bool) error {
+		if !graphRepositoryID.MatchString(repo.RepositoryID) || repo.SourceIdentity != "git:github.com/"+repo.RepositoryID || repo.RemoteURL != "https://github.com/"+repo.RepositoryID+".git" || !graphGitSHA.MatchString(repo.CommitSHA) || (requireProfile && strings.TrimSpace(repo.Profile) == "") || strings.TrimSpace(repo.ServiceID) == "" || services[repo.ServiceID] || identities[repo.SourceIdentity] || (repo.RepositoryRole != domain.RepositoryRoleService && repo.RepositoryRole != domain.RepositoryRoleFrontend && repo.RepositoryRole != domain.RepositoryRoleInfrastructure && repo.RepositoryRole != domain.RepositoryRolePolicy && repo.RepositoryRole != domain.RepositoryRoleContent && repo.RepositoryRole != domain.RepositoryRoleDocumentation && repo.RepositoryRole != domain.RepositoryRoleArchive) || len(repo.Declarations) == 0 || (previous != "" && previous >= repo.SourceIdentity) {
+			return fmt.Errorf("invalid normalized fleet owner: %w", domain.ErrValidation)
 		}
 		services[repo.ServiceID] = true
+		identities[repo.SourceIdentity] = true
 		for j, declaration := range repo.Declarations {
 			pin := domain.ArchitectureGraphPin{SourceIdentity: repo.SourceIdentity, CommitSHA: repo.CommitSHA, Path: declaration.Path, BlobOID: declaration.BlobOID, ContentSHA256: declaration.ContentSHA256}
 			if !ValidGraphPin(pin) || forbiddenFleetPath(declaration.Path) || (j > 0 && repo.Declarations[j-1].Path >= declaration.Path) {
-				return result, "", fmt.Errorf("invalid sorted declaration pin: %w", domain.ErrValidation)
+				return fmt.Errorf("invalid sorted declaration pin: %w", domain.ErrValidation)
 			}
 		}
+		return nil
+	}
+	previous := ""
+	for _, repo := range result.Repositories {
+		if err := validate(repo, previous, true); err != nil {
+			return result, "", err
+		}
+		previous = repo.SourceIdentity
+	}
+	previous = ""
+	for _, owner := range result.ExternalOwners {
+		if owner.Classification != domain.ArchitectureFleetExternalOwnerClassification || (owner.Profile != nil && strings.TrimSpace(*owner.Profile) == "") {
+			return result, "", fmt.Errorf("classified pinned external owner required: %w", domain.ErrValidation)
+		}
+		if err := validate(owner.ArchitectureFleetRepository, previous, false); err != nil {
+			return result, "", err
+		}
+		previous = owner.SourceIdentity
 	}
 	canonical, err := CanonicalGraphJSON(result)
 	if err != nil {
@@ -63,8 +83,10 @@ func strictFleetJSON(d *json.Decoder, depth int) error {
 		return err
 	}
 	switch token {
+	case nil:
+		return fmt.Errorf("fleet fields must not be null: %w", domain.ErrValidation)
 	case json.Delim('{'):
-		allowed := map[int]string{0: "schema_version repositories", 2: "repository_id source_identity remote_url commit_sha profile service_id repository_role declarations", 4: "path blob_oid content_sha256"}
+		allowed := map[int]string{0: "schema_version repositories external_owners", 2: "repository_id source_identity remote_url commit_sha profile service_id repository_role declarations classification", 4: "path blob_oid content_sha256"}
 		seen := map[string]bool{}
 		for d.More() {
 			t, e := d.Token()

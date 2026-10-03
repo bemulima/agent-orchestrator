@@ -265,3 +265,43 @@ func TestVerifyInventoryRejectsDuplicateOrNonexactKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestExportSchemaRequiresExternalOwnerClassification(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/schemas/architecture-graph.v1.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("architecture-graph.v1.schema.json", value); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := compiler.Compile("architecture-graph.v1.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile("testdata/architecture-graph.v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err = json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	ref := document["references"].([]any)[0].(map[string]any)
+	ref["reference_kind"] = "external_owner"
+	if err = schema.Validate(document); err == nil {
+		t.Fatal("unclassified external owner accepted")
+	}
+	ref["classification"] = domain.ArchitectureFleetExternalOwnerClassification
+	if err = schema.Validate(document); err != nil {
+		t.Fatal(err)
+	}
+	ref["reference_kind"] = "external"
+	if err = schema.Validate(document); err == nil {
+		t.Fatal("resource external accepted owner classification")
+	}
+}

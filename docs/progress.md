@@ -1335,3 +1335,14 @@ deploy without their own subsequent explicit authorizations.
   descriptor separation. These temporary
   reports are UNPUBLISHED working declaration diagnostics, not immutable fleet
   graph evidence. No authoritative graph, commit or publication was performed.
+
+
+### Pinned external architecture owners
+
+- Added classified `external_owners` to the fleet lock and `external_owner`
+  graph references with exact Git declaration pins and exact service ID matching.
+- Kept inventory, completeness and semantic debt denominators scoped to the
+  42 repositories; an external testing profile is optional.
+- Focused exporter checks passed for deterministic output, immutable pin drift,
+  missing roots, classification, duplicate identities and services, unchanged
+  fleet counts, and retained explicit unknown dependencies.

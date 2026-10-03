@@ -186,3 +186,141 @@ func TestFleetExportRejectsMissingUndeclaredAndEscapedOperations(t *testing.T) {
 		})
 	}
 }
+
+func externalOperationFleetFixture(t *testing.T) (domain.ArchitectureFleetInputs, fleetTestReader, map[string]string) {
+	t.Helper()
+	fleet, reader, roots := operationFleetFixture(t, "endpoints/health.yaml")
+	repo := fleet.Repositories[0]
+	repo.RepositoryID = "example/external-owner"
+	repo.SourceIdentity = "git:github.com/" + repo.RepositoryID
+	repo.RemoteURL = "https://github.com/" + repo.RepositoryID + ".git"
+	repo.ServiceID = "external-owner"
+	repo.Profile = ""
+	repo.Declarations = nil
+	var service domain.ArchitectureServiceManifest
+	_ = json.Unmarshal(reader.bytes[fleet.Repositories[0].SourceIdentity], &service)
+	service.ID = repo.ServiceID
+	service.Identity.Name = repo.ServiceID
+	dependency := domain.ArchitectureExternalInteraction{ID: "fleet-target", Transport: "http", Target: fleet.Repositories[1].ServiceID, Direction: "outbound", Description: domain.ArchitectureStatement{Value: "Known fleet dependency", Confidence: 1, Evidence: service.Evidence}}
+	service.OutboundDependencies = []domain.ArchitectureExternalInteraction{dependency}
+	service.ProducedContracts = []domain.ArchitectureContractReference{{Code: "external-opaque", Transport: "http", Description: service.Purpose}}
+	raw, _ := json.Marshal(service)
+	reader.bytes[repo.SourceIdentity] = raw
+	var op domain.ArchitectureOperationManifest
+	_ = json.Unmarshal(reader.bytes[fleet.Repositories[0].SourceIdentity+"\x00.ai/architecture/endpoints/health.yaml"], &op)
+	op.ServiceID = repo.ServiceID
+	op.ExternalInteractions = []domain.ArchitectureExternalInteraction{{ID: "unknown", Transport: "unknown", Target: "unknown", Direction: "unknown", Description: domain.ArchitectureStatement{Value: "unknown", Evidence: service.Evidence}}}
+	raw, _ = json.Marshal(op)
+	reader.bytes[repo.SourceIdentity+"\x00.ai/architecture/endpoints/health.yaml"] = raw
+	for _, file := range []string{".ai/architecture/endpoints/health.yaml", ".ai/architecture/service.yaml"} {
+		pin, _, _ := reader.Read(context.Background(), "fixture", repo.SourceIdentity, repo.CommitSHA, file)
+		repo.Declarations = append(repo.Declarations, domain.ArchitectureFleetDeclaration{Path: file, BlobOID: pin.BlobOID, ContentSHA256: pin.ContentSHA256})
+	}
+	fleet.ExternalOwners = []domain.ArchitectureFleetExternalOwner{{ArchitectureFleetRepository: repo, Classification: domain.ArchitectureFleetExternalOwnerClassification}}
+	roots[repo.SourceIdentity] = "external-fixture"
+	// The fleet owner explicitly identifies the outside provider by exact ID.
+	entry := &fleet.Repositories[0]
+	_ = json.Unmarshal(reader.bytes[entry.SourceIdentity], &service)
+	dependency.Target = repo.ServiceID
+	service.OutboundDependencies = []domain.ArchitectureExternalInteraction{dependency}
+	raw, _ = json.Marshal(service)
+	reader.bytes[entry.SourceIdentity] = raw
+	for i := range entry.Declarations {
+		pin, _, _ := reader.Read(context.Background(), "fixture", entry.SourceIdentity, entry.CommitSHA, entry.Declarations[i].Path)
+		entry.Declarations[i].BlobOID = pin.BlobOID
+		entry.Declarations[i].ContentSHA256 = pin.ContentSHA256
+	}
+	return fleet, reader, roots
+}
+func TestFleetExportExternalOwnerPreservesFleetDenominatorsAndExactPins(t *testing.T) {
+	fleet, reader, roots := externalOperationFleetFixture(t)
+	graph, err := exportOperationFleet(fleet, reader, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Completeness.SourceCount != 42 || graph.Completeness.CoveredServiceCount != 42 || graph.Completeness.ParsedOperationManifestCount != 42 || graph.Completeness.DeclaredOperationManifestCount != 42 || graph.OperationSemanticDebt != 0 || graph.ExcludedInterfaceMetadata != 0 {
+		t.Fatalf("outside owner inflated fleet completeness/debt: %#v", graph)
+	}
+	if len(graph.References) != 43 || len(graph.Diagnostics) != 0 || len(graph.FleetInputs.SourceIdentities) != 42 || len(graph.FleetInputs.ExternalSourceIdentities) != 1 {
+		t.Fatalf("external projection incomplete: %#v", graph.Diagnostics)
+	}
+	externalID := ""
+	for _, ref := range graph.References {
+		if ref.SourceIdentity == fleet.ExternalOwners[0].SourceIdentity {
+			if ref.ReferenceKind != "external_owner" || ref.Classification != domain.ArchitectureFleetExternalOwnerClassification || len(ref.DeclarationPins) != 2 {
+				t.Fatal("external owner lost classification/pins")
+			}
+			externalID = ref.ReferenceID
+		}
+	}
+	if len(graph.Edges) != 2 {
+		t.Fatalf("expected exact two authored edges: %d", len(graph.Edges))
+	}
+	for _, edge := range graph.Edges {
+		if edge.TargetReferenceID == "" {
+			t.Fatal("known exact target unresolved")
+		}
+		if edge.SourceReferenceID != externalID && edge.TargetReferenceID != externalID {
+			t.Fatal("external relationship missing")
+		}
+	}
+	repeat, err := exportOperationFleet(fleet, reader, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := projection.CanonicalGraphJSON(graph)
+	b, _ := projection.CanonicalGraphJSON(repeat)
+	if string(a) != string(b) {
+		t.Fatal("external graph nondeterministic")
+	}
+	identities := []string{}
+	for _, repo := range fleet.Repositories {
+		identities = append(identities, repo.SourceIdentity)
+	}
+	reader.bytes["git:github.com/example/producer"], _ = json.Marshal(map[string]any{"schema_version": "architecture-graph-inventory.v1", "source_identities": identities})
+	raw, _ := json.Marshal(fleet)
+	uc := FleetExport{Inputs: raw, Roots: roots, Resolver: reader, Producer: domain.ArchitectureGraphProducer{RepositoryID: "example/producer", CommitSHA: strings.Repeat("b", 40)}, Inventory: &InventoryRequest{Root: "fixture", SourceIdentity: "git:github.com/example/producer", CommitSHA: strings.Repeat("b", 40), Path: ".ai/architecture/fleet-inventory.v1.json"}}
+	verified, err := uc.Handle(context.Background())
+	if err != nil || len(verified.Diagnostics) != 0 {
+		t.Fatalf("42 inventory contaminated by external owner: %v %#v", err, verified.Diagnostics)
+	}
+}
+func TestFleetExportExternalOwnerMissingRootAndTamperRejected(t *testing.T) {
+	fleet, reader, roots := externalOperationFleetFixture(t)
+	delete(roots, fleet.ExternalOwners[0].SourceIdentity)
+	if _, err := exportOperationFleet(fleet, reader, roots); err == nil {
+		t.Fatal("missing external root accepted")
+	}
+	fleet, reader, roots = externalOperationFleetFixture(t)
+	reader.bytes[fleet.ExternalOwners[0].SourceIdentity] = []byte("tampered declaration")
+	if _, err := exportOperationFleet(fleet, reader, roots); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("tampered external bytes accepted: %v", err)
+	}
+}
+func TestFleetExportExternalOwnerUnknownDependencyRemainsBlocked(t *testing.T) {
+	fleet, reader, roots := externalOperationFleetFixture(t)
+	owner := &fleet.ExternalOwners[0]
+	var service domain.ArchitectureServiceManifest
+	_ = json.Unmarshal(reader.bytes[owner.SourceIdentity], &service)
+	service.OutboundDependencies[0].Target = "unknown"
+	raw, _ := json.Marshal(service)
+	reader.bytes[owner.SourceIdentity] = raw
+	for i := range owner.Declarations {
+		pin, _, _ := reader.Read(context.Background(), "fixture", owner.SourceIdentity, owner.CommitSHA, owner.Declarations[i].Path)
+		owner.Declarations[i].BlobOID = pin.BlobOID
+		owner.Declarations[i].ContentSHA256 = pin.ContentSHA256
+	}
+	graph, err := exportOperationFleet(fleet, reader, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range graph.Diagnostics {
+		if d.Code == "EDGE_TARGET_UNRESOLVED" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("external owner unknown target erased")
+	}
+}

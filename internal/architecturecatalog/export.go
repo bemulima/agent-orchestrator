@@ -67,8 +67,14 @@ func Export(catalog domain.ArchitectureCatalog, sources []domain.ArchitectureCat
 		}
 		pinByKey[key] = pin
 	}
+	repositoryCompleteness := emptyCompleteness()
+	for _, service := range catalog.Platform.Services {
+		if !byProject[service.Source.ProjectID].PinnedExternalOwner {
+			addCompleteness(&repositoryCompleteness, service.Completeness)
+		}
+	}
 	result := domain.ArchitectureGraph{SchemaVersion: domain.ArchitectureGraphSchemaV1, Mode: catalog.Mode, Producer: producer,
-		References: []domain.ArchitectureGraphReference{}, Edges: []domain.ArchitectureGraphEdge{}, Completeness: catalog.Platform.Completeness,
+		References: []domain.ArchitectureGraphReference{}, Edges: []domain.ArchitectureGraphEdge{}, Completeness: repositoryCompleteness,
 		Diagnostics: append([]domain.ArchitectureGraphDiagnostic{}, diagnostics...)}
 	bundles := make(map[string][]domain.ArchitectureGraphPin)
 	for _, service := range catalog.Platform.Services {
@@ -87,6 +93,10 @@ func Export(catalog domain.ArchitectureCatalog, sources []domain.ArchitectureCat
 		ref := domain.ArchitectureGraphReference{ReferenceID: service.Source.ReferenceID, SourceIdentity: identity, ManifestID: manifestID,
 			RepositoryRole: service.Source.RepositoryRole, CommitSHA: service.Source.CommitSHA, Covered: service.Covered,
 			SourceCurrent: service.Source.SourceCurrent, IsDirty: service.Source.IsDirty, DeclarationPins: []domain.ArchitectureGraphPin{}}
+		if source.PinnedExternalOwner {
+			ref.ReferenceKind = "external_owner"
+			ref.Classification = domain.ArchitectureFleetExternalOwnerClassification
+		}
 		add := func(code, message, file string) {
 			result.Diagnostics = append(result.Diagnostics, domain.ArchitectureGraphDiagnostic{Severity: "BLOCKED", Code: code, ReferenceID: ref.ReferenceID, Path: file, Message: message})
 		}
@@ -167,7 +177,9 @@ func Export(catalog domain.ArchitectureCatalog, sources []domain.ArchitectureCat
 		candidate := inventories[0].inventory
 		actual := make([]string, 0, len(result.References))
 		for _, ref := range result.References {
-			actual = append(actual, ref.SourceIdentity)
+			if ref.ReferenceKind != "external_owner" {
+				actual = append(actual, ref.SourceIdentity)
+			}
 		}
 		sort.Strings(actual)
 		if strings.Join(actual, "\x00") == strings.Join(candidate.SourceIdentities, "\x00") {

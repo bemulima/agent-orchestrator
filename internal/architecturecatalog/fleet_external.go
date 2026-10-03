@@ -88,24 +88,41 @@ func CountUnmatchedInterfaceMetadata(sources []domain.ArchitectureCatalogSource)
 		}
 	}
 	count := 0
-	for k, n := range produced {
-		if consumed[k] == 0 {
-			count += n
+	for _, source := range sources {
+		if source.PinnedExternalOwner {
+			continue
 		}
-	}
-	for k, n := range consumed {
-		if produced[k] == 0 {
-			count += n
+		for _, r := range source.ServiceManifest.ProducedContracts {
+			if consumed[referenceKey(r)] == 0 {
+				count++
+			}
 		}
-	}
-	for k, n := range published {
-		if subscribed[k] == 0 {
-			count += n
+		for _, r := range source.ServiceManifest.ConsumedContracts {
+			if produced[referenceKey(r)] == 0 {
+				count++
+			}
 		}
-	}
-	for k, n := range subscribed {
-		if published[k] == 0 {
-			count += n
+		for _, r := range source.ServiceManifest.PublishedEvents {
+			if subscribed[referenceKey(r)] == 0 {
+				count++
+			}
+		}
+		for _, r := range source.ServiceManifest.SubscribedEvents {
+			if published[referenceKey(r)] == 0 {
+				count++
+			}
+		}
+		for _, op := range source.Operations {
+			for _, r := range op.Output.EmittedEvents {
+				if subscribed[referenceKey(r)] == 0 {
+					count++
+				}
+			}
+			if op.Type == domain.ArchitectureOperationNATSEventSubscriber && op.Identity.NATS != nil {
+				if published[referenceKey(domain.ArchitectureContractReference{Transport: "nats", Code: op.Identity.NATS.Subject})] == 0 {
+					count++
+				}
+			}
 		}
 	}
 	return count

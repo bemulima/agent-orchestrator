@@ -52,3 +52,18 @@ func TestExternalResolutionAllowsReviewedLiteralOnly(t *testing.T) {
 		t.Fatal("unknown target promoted")
 	}
 }
+
+func TestExternalOwnerMetadataUsesAllCounterpartsButFleetDebtOnly(t *testing.T) {
+	fleet := catalogSource("fleet", "fleet", serviceManifest("fleet", nil, nil), nil)
+	external := catalogSource("external", "external", serviceManifest("external", nil, nil), nil)
+	external.PinnedExternalOwner = true
+	fleet.ServiceManifest.ConsumedContracts = []domain.ArchitectureContractReference{{Transport: "http", Code: "shared"}}
+	external.ServiceManifest.ProducedContracts = []domain.ArchitectureContractReference{{Transport: "http", Code: "shared"}, {Transport: "http", Code: "external-only"}}
+	if got := CountUnmatchedInterfaceMetadata([]domain.ArchitectureCatalogSource{fleet, external}); got != 0 {
+		t.Fatalf("external metadata inflated fleet debt: %d", got)
+	}
+	external.ServiceManifest.ProducedContracts = nil
+	if got := CountUnmatchedInterfaceMetadata([]domain.ArchitectureCatalogSource{fleet, external}); got != 1 {
+		t.Fatalf("fleet descriptor vanished: %d", got)
+	}
+}

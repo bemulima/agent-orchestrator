@@ -27,18 +27,26 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 	if err != nil {
 		return domain.ArchitectureGraph{}, err
 	}
-	if uc.Resolver == nil || len(uc.Roots) != len(fleet.Repositories) {
+	if uc.Resolver == nil || len(uc.Roots) != (len(fleet.Repositories)+len(fleet.ExternalOwners)) {
 		return domain.ArchitectureGraph{}, fmt.Errorf("exact fleet object stores required: %w", domain.ErrValidation)
 	}
 	sources := []domain.ArchitectureCatalogSource{}
 	pins := []domain.ArchitectureGraphPin{}
 	identities := []string{}
-	for _, repo := range fleet.Repositories {
+	externalIdentities := []string{}
+	externalSources := map[string]bool{}
+	owners := append([]domain.ArchitectureFleetRepository{}, fleet.Repositories...)
+	for _, owner := range fleet.ExternalOwners {
+		owners = append(owners, owner.ArchitectureFleetRepository)
+		externalSources[owner.SourceIdentity] = true
+		externalIdentities = append(externalIdentities, owner.SourceIdentity)
+	}
+	for _, repo := range owners {
 		root, ok := uc.Roots[repo.SourceIdentity]
 		if !ok || root == "" {
 			return domain.ArchitectureGraph{}, fmt.Errorf("fleet object store missing: %w", domain.ErrValidation)
 		}
-		source := domain.ArchitectureCatalogSource{PinnedDeclarations: true, Topology: domain.TopologySource{
+		source := domain.ArchitectureCatalogSource{PinnedDeclarations: true, PinnedExternalOwner: externalSources[repo.SourceIdentity], Topology: domain.TopologySource{
 			Project:  domain.Project{ID: repo.SourceIdentity, Name: repo.ServiceID, SourceIdentity: repo.SourceIdentity, RepositoryRole: repo.RepositoryRole, HeadCommit: repo.CommitSHA, Status: domain.ProjectStatusAnalyzed},
 			Snapshot: domain.ServiceSnapshot{ID: repo.CommitSHA, ProjectID: repo.SourceIdentity, Status: "complete", CommitSHA: repo.CommitSHA, ContentChecksum: digest},
 			Report:   domain.DiscoveryReport{SchemaVersion: 3, ProjectID: repo.SourceIdentity, CommitSHA: repo.CommitSHA, ContentChecksum: digest},
@@ -87,7 +95,9 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 			}
 		}
 		sources = append(sources, source)
-		identities = append(identities, repo.SourceIdentity)
+		if !externalSources[repo.SourceIdentity] {
+			identities = append(identities, repo.SourceIdentity)
+		}
 	}
 	catalog, err := (projection.Builder{}).Build(ctx, sources)
 	if err != nil {
@@ -119,6 +129,9 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 	}
 	graph.Diagnostics = diagnostics
 	for _, source := range sources {
+		if source.PinnedExternalOwner {
+			continue
+		}
 		for _, operation := range source.Operations {
 			for _, interaction := range operation.ExternalInteractions {
 				if projection.IsUnassertedInteraction(interaction) {
@@ -128,7 +141,7 @@ func (uc FleetExport) Handle(ctx context.Context) (domain.ArchitectureGraph, err
 		}
 	}
 	graph.ExcludedInterfaceMetadata = projection.CountUnmatchedInterfaceMetadata(sources)
-	graph.FleetInputs = &domain.ArchitectureGraphFleetInputs{SchemaVersion: fleet.SchemaVersion, ContentSHA256: digest, SourceIdentities: identities}
+	graph.FleetInputs = &domain.ArchitectureGraphFleetInputs{SchemaVersion: fleet.SchemaVersion, ContentSHA256: digest, SourceIdentities: identities, ExternalSourceIdentities: externalIdentities}
 	graph.ContentSHA256 = ""
 	canonical, err := projection.CanonicalGraphJSON(graph)
 	if err != nil {

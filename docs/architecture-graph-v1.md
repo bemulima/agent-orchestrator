@@ -128,3 +128,28 @@ the clean producer revision. The inventory contains only the sorted 42 owner
 source identities, so it can be committed before reading owner source SHAs and
 storing the graph elsewhere. An unavailable, invalid or mismatching supplied
 inventory fails or remains BLOCKED; external references do not expand that scope.
+
+
+### Pinned owners outside the fleet
+
+A reviewed outside owner can be supplied in optional `external_owners`, sorted
+by real Git `source_identity`. These rows use the same exact published commit
+and service/operation declaration pin bundle as repository rows, with required
+`classification: PINNED_EXTERNAL_OWNER_INPUT`. An external owner's `profile` is
+optional; the 42 repository profiles remain required. Source identities and
+service IDs must be unique across both cohorts. The root map contains exactly
+both cohorts. The canonical fleet digest includes the external owner rows.
+
+The exporter resolves an explicitly authored target only by the exact outside
+service ID and emits its reference as `reference_kind: external_owner` with the
+required classification and real immutable declaration pins. This is distinct
+from resource references (`reference_kind: external`).
+`fleet_inputs.external_source_identities` records the sorted outside cohort.
+Inventory, completeness and semantic debt counts continue to describe only the
+42 fleet repositories. Outside declarations participate in exact relationship
+matching and retain their explicit unresolved dependency diagnostics.
+
+Provider compatibility and ancestor source/document evidence are independently
+verified inputs to the compatibility gate. They are not service/operation
+declarations and are not included in graph declaration bundles. Supplying an
+outside owner does not imply successful compatibility or readiness.

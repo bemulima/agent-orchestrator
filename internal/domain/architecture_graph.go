@@ -30,6 +30,7 @@ type ArchitectureGraphPin struct {
 	ContentSHA256  string `json:"content_sha256"`
 }
 type ArchitectureGraphReference struct {
+	Classification  string                 `json:"classification,omitempty"`
 	ReferenceKind   string                 `json:"reference_kind,omitempty"`
 	ReferenceID     string                 `json:"reference_id"`
 	SourceIdentity  string                 `json:"source_identity"`

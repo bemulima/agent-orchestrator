@@ -52,3 +52,69 @@ func TestFleetInputsStrictNormalizedLock(t *testing.T) {
 		}
 	}
 }
+
+func classifiedTestExternalOwner() domain.ArchitectureFleetExternalOwner {
+	repo := normalizedTestFleet().Repositories[0]
+	repo.RepositoryID = "example/external-owner"
+	repo.SourceIdentity = "git:github.com/" + repo.RepositoryID
+	repo.RemoteURL = "https://github.com/" + repo.RepositoryID + ".git"
+	repo.ServiceID = "external-owner"
+	repo.Profile = ""
+	return domain.ArchitectureFleetExternalOwner{ArchitectureFleetRepository: repo, Classification: domain.ArchitectureFleetExternalOwnerClassification}
+}
+func TestFleetInputsClassifiedExternalOwners(t *testing.T) {
+	base := normalizedTestFleet()
+	raw, _ := json.Marshal(base)
+	_, baseDigest, _ := ParseFleetInputs(raw)
+	nullExternal := bytes.Replace(raw, []byte(`"repositories":`), []byte(`"external_owners":null,"repositories":`), 1)
+	if _, _, err := ParseFleetInputs(nullExternal); err == nil {
+		t.Fatal("null external owner cohort accepted")
+	}
+	base.ExternalOwners = []domain.ArchitectureFleetExternalOwner{classifiedTestExternalOwner()}
+	raw, _ = json.Marshal(base)
+	if bytes.Contains(raw, []byte(`"profile":""`)) {
+		t.Fatal("absent external profile invented")
+	}
+	withNullProfile := bytes.Replace(raw, []byte(`"classification":"PINNED_EXTERNAL_OWNER_INPUT"`), []byte(`"profile":null,"classification":"PINNED_EXTERNAL_OWNER_INPUT"`), 1)
+	if _, _, err := ParseFleetInputs(withNullProfile); err == nil {
+		t.Fatal("explicit null external profile accepted")
+	}
+	parsed, digest, err := ParseFleetInputs(raw)
+	if err != nil || parsed.ExternalOwners[0].Profile != nil || digest == baseDigest {
+		t.Fatalf("external digest/profile: %v", err)
+	}
+	var pretty bytes.Buffer
+	_ = json.Indent(&pretty, raw, "", "  ")
+	if _, got, err := ParseFleetInputs(pretty.Bytes()); err != nil || got != digest {
+		t.Fatal("external digest nondeterministic")
+	}
+	cases := map[string]func(*domain.ArchitectureFleetInputs){
+		"classification":       func(f *domain.ArchitectureFleetInputs) { f.ExternalOwners[0].Classification = "" },
+		"wrong-classification": func(f *domain.ArchitectureFleetInputs) { f.ExternalOwners[0].Classification = "external" },
+		"mutable-commit":       func(f *domain.ArchitectureFleetInputs) { f.ExternalOwners[0].CommitSHA = "main" },
+		"empty-profile":        func(f *domain.ArchitectureFleetInputs) { s := ""; f.ExternalOwners[0].Profile = &s },
+		"repository-overlap": func(f *domain.ArchitectureFleetInputs) {
+			f.ExternalOwners[0].ArchitectureFleetRepository = f.Repositories[0]
+		},
+		"service-overlap": func(f *domain.ArchitectureFleetInputs) { f.ExternalOwners[0].ServiceID = f.Repositories[0].ServiceID },
+		"duplicate-external": func(f *domain.ArchitectureFleetInputs) {
+			f.ExternalOwners = append(f.ExternalOwners, f.ExternalOwners[0])
+		},
+		"forbidden-path": func(f *domain.ArchitectureFleetInputs) {
+			f.ExternalOwners[0].Declarations[0].Path = "test-results/private.yaml"
+		},
+		"missing-declarations":         func(f *domain.ArchitectureFleetInputs) { f.ExternalOwners[0].Declarations = nil },
+		"fleet-profile-still-required": func(f *domain.ArchitectureFleetInputs) { f.Repositories[0].Profile = "" },
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := normalizedTestFleet()
+			f.ExternalOwners = []domain.ArchitectureFleetExternalOwner{classifiedTestExternalOwner()}
+			change(&f)
+			b, _ := json.Marshal(f)
+			if _, _, err := ParseFleetInputs(b); err == nil {
+				t.Fatal("invalid external owner accepted")
+			}
+		})
+	}
+}

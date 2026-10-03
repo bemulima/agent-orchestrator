@@ -1,10 +1,12 @@
 package domain
 
 const ArchitectureFleetInputsSchemaV1 = "architecture-fleet-inputs.v1"
+const ArchitectureFleetExternalOwnerClassification = "PINNED_EXTERNAL_OWNER_INPUT"
 
 type ArchitectureFleetInputs struct {
-	SchemaVersion string                        `json:"schema_version"`
-	Repositories  []ArchitectureFleetRepository `json:"repositories"`
+	SchemaVersion  string                           `json:"schema_version"`
+	Repositories   []ArchitectureFleetRepository    `json:"repositories"`
+	ExternalOwners []ArchitectureFleetExternalOwner `json:"external_owners,omitempty"`
 }
 type ArchitectureFleetRepository struct {
 	RepositoryID   string                         `json:"repository_id"`
@@ -16,13 +18,19 @@ type ArchitectureFleetRepository struct {
 	RepositoryRole RepositoryRole                 `json:"repository_role"`
 	Declarations   []ArchitectureFleetDeclaration `json:"declarations"`
 }
+type ArchitectureFleetExternalOwner struct {
+	ArchitectureFleetRepository
+	Profile        *string `json:"profile,omitempty"`
+	Classification string  `json:"classification"`
+}
 type ArchitectureFleetDeclaration struct {
 	Path          string `json:"path"`
 	BlobOID       string `json:"blob_oid"`
 	ContentSHA256 string `json:"content_sha256"`
 }
 type ArchitectureGraphFleetInputs struct {
-	SchemaVersion    string   `json:"schema_version"`
-	ContentSHA256    string   `json:"content_sha256"`
-	SourceIdentities []string `json:"source_identities"`
+	SchemaVersion            string   `json:"schema_version"`
+	ContentSHA256            string   `json:"content_sha256"`
+	SourceIdentities         []string `json:"source_identities"`
+	ExternalSourceIdentities []string `json:"external_source_identities,omitempty"`
 }

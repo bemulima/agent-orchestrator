@@ -10,6 +10,7 @@ const ArchitectureCatalogModeCurrent = "CURRENT"
 // ServiceManifest is intentional: the catalog must retain projects whose
 // architecture manifests have not yet been supplied.
 type ArchitectureCatalogSource struct {
+	PinnedExternalOwner  bool                            `json:"-"`
 	PinnedDeclarations   bool                            `json:"-"`
 	Topology             TopologySource                  `json:"-"`
 	ServiceManifest      ArchitectureServiceManifest     `json:"service_manifest"`
