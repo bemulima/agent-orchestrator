@@ -122,3 +122,59 @@ func TestPrepareNodeDependenciesRequiresRegularLockfile(t *testing.T) {
 	require.Error(t, prepareNodeDependencies(context.Background(), root, []string{"npm run build"}))
 	require.NoError(t, prepareNodeDependencies(context.Background(), root, []string{"go test ./..."}))
 }
+
+func TestTaskWorktreeReadArtifactBoundsReviewedPolicyBundleSeparately(t *testing.T) {
+	const bundlePath = ".ai/testing/policy/policy-runner.cjs"
+	for _, test := range []struct {
+		name, path  string
+		size, limit int64
+		wantError   bool
+	}{
+		{name: "canonical bundle at 32 MiB", path: bundlePath, size: 32 << 20, limit: 32 << 20},
+		{name: "normalized canonical bundle", path: "./.ai/testing/policy/sub/../policy-runner.cjs", size: 16, limit: 32 << 20},
+		{name: "canonical bundle above 32 MiB", path: bundlePath, size: (32 << 20) + 1, limit: 32 << 20, wantError: true},
+		{name: "canonical limit above 32 MiB", path: bundlePath, size: 16, limit: (32 << 20) + 1, wantError: true},
+		{name: "generic artifact limit stays 10 MiB", path: "result.txt", size: 16, limit: (10 << 20) + 1, wantError: true},
+		{name: "generic artifact bytes stay bounded", path: "result.txt", size: (10 << 20) + 1, limit: 10 << 20, wantError: true},
+		{name: "zero limit rejected", path: bundlePath, size: 16, limit: 0, wantError: true},
+		{name: "negative limit rejected", path: bundlePath, size: 16, limit: -1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			canonicalRoot, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			workspace := domain.TaskWorkspace{Path: canonicalRoot}
+			relative, err := taskRelativePath(test.path)
+			require.NoError(t, err)
+			target := filepath.Join(workspace.Path, relative)
+			require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o750))
+			file, err := os.Create(target)
+			require.NoError(t, err)
+			require.NoError(t, file.Truncate(test.size))
+			require.NoError(t, file.Close())
+			content, err := (TaskWorktree{}).ReadArtifact(context.Background(), workspace, test.path, test.limit)
+			if test.wantError {
+				require.ErrorIs(t, err, domain.ErrValidation)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, content, int(test.size))
+			}
+		})
+	}
+}
+
+func TestTaskWorktreeReviewedPolicyBundlePreservesPathContainment(t *testing.T) {
+	canonicalRoot, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	workspace := domain.TaskWorkspace{Path: canonicalRoot}
+	for _, path := range []string{"../policy-runner.cjs", "/tmp/policy-runner.cjs", "\x00policy-runner.cjs"} {
+		_, err := (TaskWorktree{}).ReadArtifact(context.Background(), workspace, path, 32<<20)
+		require.ErrorIs(t, err, domain.ErrWriteScope)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.cjs")
+	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o640))
+	canonical := filepath.Join(workspace.Path, ".ai", "testing", "policy", "policy-runner.cjs")
+	require.NoError(t, os.MkdirAll(filepath.Dir(canonical), 0o750))
+	require.NoError(t, os.Symlink(outside, canonical))
+	_, err = (TaskWorktree{}).ReadArtifact(context.Background(), workspace, ".ai/testing/policy/policy-runner.cjs", 32<<20)
+	require.ErrorIs(t, err, domain.ErrForbidden)
+}

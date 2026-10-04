@@ -106,7 +106,7 @@ func (g BundleTestingPolicyGate) VerifyTask(
 	if err != nil {
 		return TestingPolicyOutcome{}, fmt.Errorf("Testing Policy lock is unavailable: %w", domain.ErrValidation)
 	}
-	bundleBytes, err := g.Worktrees.ReadArtifact(ctx, workspace, ".ai/testing/policy/policy-runner.cjs", 10<<20)
+	bundleBytes, err := g.Worktrees.ReadArtifact(ctx, workspace, ".ai/testing/policy/policy-runner.cjs", 32<<20)
 	if err != nil {
 		return TestingPolicyOutcome{}, fmt.Errorf("Testing Policy bundle is unavailable: %w", domain.ErrValidation)
 	}

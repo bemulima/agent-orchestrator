@@ -204,7 +204,11 @@ func (w TaskWorktree) ReadArtifact(
 	if err != nil {
 		return nil, err
 	}
-	if maxBytes < 1 || maxBytes > 10<<20 {
+	maxAllowedBytes := int64(10 << 20)
+	if relative == filepath.Join(".ai", "testing", "policy", "policy-runner.cjs") {
+		maxAllowedBytes = 32 << 20
+	}
+	if maxBytes < 1 || maxBytes > maxAllowedBytes {
 		return nil, fmt.Errorf("invalid artifact size limit: %w", domain.ErrValidation)
 	}
 	target := filepath.Join(workspace.Path, relative)

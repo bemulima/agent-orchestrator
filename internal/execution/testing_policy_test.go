@@ -317,3 +317,36 @@ func TestValidateTestingPolicyDodReportInvalidAcceptanceStaysPendingWithoutWeake
 		}
 	}
 }
+
+func TestBundleTestingPolicyGateReadsReviewedBundleAboveGenericArtifactLimit(t *testing.T) {
+	bundle := make([]byte, (10<<20)+1)
+	digest := sha256.Sum256(bundle)
+	bundleSHA := hex.EncodeToString(digest[:])
+	sourceSHA, semanticsSHA := strings.Repeat("a", 40), strings.Repeat("b", 64)
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	lock, err := json.Marshal(testingPolicyLock{LockSchemaVersion: "testing-policy-bundle.v2", PolicyVersion: "testing-policy.v1", MatrixSchema: "required-test-matrix.v1", SourceRepository: "bemulima/learning-platform-verification", SourceCommit: sourceSHA, SemanticsSHA: semanticsSHA, BundleSHA256: bundleSHA})
+	require.NoError(t, err)
+	report := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[]}`, baseSHA, headSHA))
+	worktrees := &boundedPolicyBundleFixture{testingPolicyWorktreeFixture: testingPolicyWorktreeFixture{bundle: bundle, lock: lock, report: report}}
+	gate := BundleTestingPolicyGate{Worktrees: worktrees, ExpectedSourceCommit: sourceSHA, ExpectedSemanticsSHA: semanticsSHA, ExpectedBundleSHA256: bundleSHA}
+	outcome, err := gate.VerifyTask(context.Background(), domain.TaskWorkspace{}, "run-1", baseSHA, headSHA)
+	require.NoError(t, err)
+	require.Equal(t, int64(32<<20), worktrees.bundleLimit)
+	require.Equal(t, "DONE", outcome.LifecycleState)
+	require.Len(t, worktrees.commands, 3)
+}
+
+type boundedPolicyBundleFixture struct {
+	testingPolicyWorktreeFixture
+	bundleLimit int64
+}
+
+func (f *boundedPolicyBundleFixture) ReadArtifact(ctx context.Context, workspace domain.TaskWorkspace, path string, limit int64) ([]byte, error) {
+	if path == ".ai/testing/policy/policy-runner.cjs" {
+		f.bundleLimit = limit
+		if int64(len(f.bundle)) > limit {
+			return nil, fmt.Errorf("reviewed policy bundle exceeds requested bound: %w", domain.ErrValidation)
+		}
+	}
+	return f.testingPolicyWorktreeFixture.ReadArtifact(ctx, workspace, path, limit)
+}
