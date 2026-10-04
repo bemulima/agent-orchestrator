@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -69,7 +71,7 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 		},
 		{
 			name:                 "mapped required capability with valid immutable evidence can complete",
-			changedFile:          "internal/business/dod_fixture.go",
+			changedFile:          "internal/domain/course_outline.go",
 			businessEvidenceMode: "valid",
 			wantMatrixBA:         "REQUIRED",
 			wantResolution:       "MAPPED",
@@ -80,7 +82,7 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 		},
 		{
 			name:           "mapped required capability without evidence remains pending",
-			changedFile:    "internal/business/dod_fixture.go",
+			changedFile:    "internal/domain/course_outline.go",
 			wantMatrixBA:   "REQUIRED",
 			wantResolution: "MAPPED",
 			wantDodBA:      "PENDING",
@@ -90,7 +92,7 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 		},
 		{
 			name:                 "mapped required capability with invalid evidence remains pending",
-			changedFile:          "internal/business/dod_fixture.go",
+			changedFile:          "internal/domain/course_outline.go",
 			businessEvidenceMode: "invalid",
 			wantMatrixBA:         "REQUIRED",
 			wantResolution:       "MAPPED",
@@ -217,14 +219,17 @@ type testingPolicyE2EFixture struct {
 func prepareTestingPolicyFixture(t *testing.T, changedFile, businessEvidenceMode, node20 string) testingPolicyE2EFixture {
 	t.Helper()
 	root := t.TempDir()
-	repositoryRoot := filepath.Join(root, "course-dev-orchestrator")
+	repositoryName := "course-dev-orchestrator"
+	if changedFile == "internal/domain/course_outline.go" {
+		repositoryName = "ms-go-course"
+	}
+	repositoryRoot := filepath.Join(root, repositoryName)
 	require.NoError(t, os.MkdirAll(repositoryRoot, 0o750))
-	copyCommittedTestingPolicyFixture(t, repositoryRoot)
+	copyCommittedTestingPolicyFixture(t, repositoryRoot, repositoryName)
 
 	const taskID = "e2e-task-1"
 	const projectName = "policy-e2e"
 	rewriteTestingPolicyFixtureManifest(t, repositoryRoot)
-	writeTestingPolicyFixtureBusinessCapabilityMap(t, repositoryRoot)
 
 	binPath := filepath.Join(root, "node20-bin")
 	require.NoError(t, os.MkdirAll(binPath, 0o750))
@@ -261,7 +266,7 @@ func prepareTestingPolicyFixture(t *testing.T, changedFile, businessEvidenceMode
 		Models: map[string]string{"standard": "fixture-model"}, Reasoning: map[string]string{"standard": "medium"},
 		ReviewModel: "fixture-review", ReviewReasoning: "high", MaxTaskAttempts: 3, MaxReviewAttempts: 2,
 	}
-	workspacePath := filepath.Join(worktreeStore, projectName+"-task-e2etask1", "course-dev-orchestrator")
+	workspacePath := filepath.Join(worktreeStore, projectName+"-task-e2etask1", repositoryName)
 	require.Equal(t, filepath.Base(repositoryRoot), filepath.Base(workspacePath))
 
 	return testingPolicyE2EFixture{
@@ -269,35 +274,63 @@ func prepareTestingPolicyFixture(t *testing.T, changedFile, businessEvidenceMode
 	}
 }
 
-func writeTestingPolicyFixtureBusinessCapabilityMap(t *testing.T, repositoryRoot string) {
+// The mapped cases exercise an orchestrated GO_SERVICE target, using immutable
+// metadata from the published Course repository. These are protocol fixtures;
+// their pass commands and hosted evidence identifiers are synthetic.
+//
+//go:embed testdata/course-target-context.tar.gz
+var testingPolicyCourseContextArchive []byte
+
+//go:embed testdata/course-target-context.source.json
+var testingPolicyCourseContextSource []byte
+
+func copyTestingPolicyCourseContext(t *testing.T, destination string) {
 	t.Helper()
-	mapPath := filepath.Join(repositoryRoot, ".ai", "testing", "business-capability-map.v1.json")
-	require.NoError(t, os.MkdirAll(filepath.Dir(mapPath), 0o750))
-	capabilityMap := map[string]any{
-		"schema_version": "business-capability-map.v1",
-		"repository_id":  "course-dev-orchestrator",
-		"mappings": []any{map[string]any{
-			"mapping_id":     "dod-fixture-business",
-			"match":          "PREFIX",
-			"path":           "internal/business",
-			"capability_ids": []string{"learning_content_discovery"},
-		}},
+	var source struct {
+		Repository    string `json:"repository"`
+		SourceSHA     string `json:"source_sha"`
+		ArchiveSHA256 string `json:"archive_sha256"`
+		Files         []struct {
+			Path    string `json:"path"`
+			SHA256  string `json:"sha256"`
+			BlobSHA string `json:"blob_sha"`
+		} `json:"files"`
 	}
-	bytes, err := json.Marshal(capabilityMap)
+	require.NoError(t, json.Unmarshal(testingPolicyCourseContextSource, &source))
+	require.Equal(t, "bemulima/ms-go-course", source.Repository)
+	require.Equal(t, "1b740849e42f7b3f1616b715f252665a1ebaab19", source.SourceSHA)
+	archiveHash := sha256.Sum256(testingPolicyCourseContextArchive)
+	require.Equal(t, source.ArchiveSHA256, hex.EncodeToString(archiveHash[:]))
+	reader, err := gzip.NewReader(bytes.NewReader(testingPolicyCourseContextArchive))
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(mapPath, bytes, 0o640))
+	contents, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.NoError(t, extractTestingPolicyArchive(destination, contents))
+	require.NotEmpty(t, source.Files)
+	for _, file := range source.Files {
+		require.True(t, testingPolicyE2EFullGitSHA(file.BlobSHA), "immutable source blob for %s", file.Path)
+		content, err := os.ReadFile(filepath.Join(destination, filepath.FromSlash(file.Path)))
+		require.NoError(t, err)
+		digest := sha256.Sum256(content)
+		require.Equal(t, file.SHA256, hex.EncodeToString(digest[:]), "published target bytes for %s", file.Path)
+	}
 }
 
-func copyCommittedTestingPolicyFixture(t *testing.T, destination string) {
+func copyCommittedTestingPolicyFixture(t *testing.T, destination, repositoryName string) {
 	t.Helper()
 	_, sourceFile, _, ok := runtime.Caller(0)
 	require.True(t, ok)
 	cdoRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
-	archiveCommand := exec.Command("git", "archive", "--format=tar", "HEAD")
-	archiveCommand.Dir = cdoRoot
-	archiveBytes, err := archiveCommand.Output()
-	require.NoError(t, err)
-	require.NoError(t, extractTestingPolicyArchive(destination, archiveBytes))
+	if repositoryName == "ms-go-course" {
+		copyTestingPolicyCourseContext(t, destination)
+	} else {
+		archiveCommand := exec.Command("git", "archive", "--format=tar", "HEAD")
+		archiveCommand.Dir = cdoRoot
+		archiveBytes, err := archiveCommand.Output()
+		require.NoError(t, err)
+		require.NoError(t, extractTestingPolicyArchive(destination, archiveBytes))
+	}
 
 	for _, relative := range []string{".ai/testing/policy/policy-lock.json", ".ai/testing/policy/policy-runner.cjs"} {
 		content, readErr := os.ReadFile(filepath.Join(cdoRoot, filepath.FromSlash(relative)))
