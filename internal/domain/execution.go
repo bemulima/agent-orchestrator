@@ -162,6 +162,7 @@ type PlannedTask struct {
 	RequiresMigration    bool      `json:"requires_migration"`
 	ChangesContracts     bool      `json:"changes_contracts"`
 	VerificationCommands []string  `json:"verification_commands"`
+	ArchitecturalRoutes  []string  `json:"architectural_routes,omitempty"`
 	Depth                int       `json:"depth"`
 }
 
@@ -172,11 +173,14 @@ type PlannedDependency struct {
 }
 
 type PlannerOutput struct {
-	Summary      string              `json:"summary"`
-	RiskLevel    RiskLevel           `json:"risk_level"`
-	Risks        []string            `json:"risks"`
-	Tasks        []PlannedTask       `json:"tasks"`
-	Dependencies []PlannedDependency `json:"dependencies"`
+	PlanningMetadataVersion int                 `json:"planning_metadata_version,omitempty"`
+	Summary                 string              `json:"summary"`
+	RiskLevel               RiskLevel           `json:"risk_level"`
+	Risks                   []string            `json:"risks"`
+	Tasks                   []PlannedTask       `json:"tasks"`
+	Dependencies            []PlannedDependency `json:"dependencies"`
+	Routing                 *RoutingResult      `json:"routing,omitempty"`
+	ContractPlan            *ContractPlan       `json:"contract_plan,omitempty"`
 }
 
 type PlanBundle struct {

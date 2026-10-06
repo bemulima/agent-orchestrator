@@ -34,6 +34,8 @@ import (
 	temporaladapter "github.com/bemulima/agent-orchestrator/internal/adapters/temporal"
 	workitemadapter "github.com/bemulima/agent-orchestrator/internal/adapters/workitem"
 	"github.com/bemulima/agent-orchestrator/internal/agent"
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol/localrepo"
 	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	architectureprojection "github.com/bemulima/agent-orchestrator/internal/architecture"
 	architecturecatalog "github.com/bemulima/agent-orchestrator/internal/architecturecatalog"
@@ -644,6 +646,10 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 	if err != nil {
 		return planningOperations{}, err
 	}
+	controlPlane, err := loadAgentControlCatalog(".")
+	if err != nil {
+		return planningOperations{}, err
+	}
 	plans := pgadapter.PlanningRepoPG{Pool: pool}
 	taskExecutions := pgadapter.TaskExecutionRepoPG{Pool: pool}
 	catalog := pgadapter.TopologyRepoPG{Pool: pool}
@@ -652,10 +658,11 @@ func newPlanningOperations(cfg config.Config, pool *pgxpool.Pool, runner reposit
 		Planner: planningengine.AgentPlanner{
 			Base:   planningengine.Planner{MaxParallelTasks: cfg.MaxParallelTasks},
 			Runner: agentRunner, Model: cfg.CodexModelDeep, Reasoning: cfg.CodexReasoningDeep,
-			Router: agentpolicy.FromConfig(cfg),
+			Router: agentpolicy.FromConfig(cfg), ControlPlane: controlPlane,
 		},
 		Validator: planningengine.Validator{
 			MaxParallelTasks: cfg.MaxParallelTasks, MaxRequiredTaskDepth: cfg.MaxRequiredTaskDepth,
+			ControlPlane: controlPlane,
 		},
 	}
 	return planningOperations{
@@ -1692,4 +1699,12 @@ Commands:
   gitlab-links    Show persisted GitLab links for a plan
   version         Print build version
   help            Show this help`)
+}
+
+func loadAgentControlCatalog(root string) (agentcontrol.Catalog, error) {
+	catalog, err := localrepo.LoadCatalogFromDirectory(root)
+	if err != nil {
+		return agentcontrol.Catalog{}, fmt.Errorf("load canonical Agent Control Plane catalog: %w", err)
+	}
+	return catalog, nil
 }

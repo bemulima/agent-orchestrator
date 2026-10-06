@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
 	"github.com/bemulima/agent-orchestrator/internal/config"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -35,6 +37,7 @@ func TestAgentPlannerBuildsRussianScopedDependencyDAG(t *testing.T) {
 	planner := AgentPlanner{
 		Base: Planner{MaxParallelTasks: 3}, Runner: runner,
 		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
 	}
 	_, output, err := planner.Build(context.Background(), domain.Command{
 		ID: "command", Text: "Сначала определить правило, затем параллельно исправить три валидатора.",
@@ -44,6 +47,12 @@ func TestAgentPlannerBuildsRussianScopedDependencyDAG(t *testing.T) {
 	}
 	if runner.request.Role != domain.AgentRunPlanner || runner.request.Model != config.DefaultCodexModelDeep {
 		t.Fatalf("planner request = %#v", runner.request)
+	}
+	if !strings.Contains(runner.request.Prompt, "# Shared agent policy") ||
+		!strings.Contains(runner.request.Prompt, "# Task route") ||
+		!strings.Contains(runner.request.Prompt, "# Contract plan") ||
+		!strings.Contains(runner.request.Prompt, "CONTEXT.canonical_assets") {
+		t.Fatal("planner prompt did not consume the canonical route and contract-plan skills")
 	}
 	if len(output.Tasks) != 4 || len(output.Dependencies) != 3 || output.RiskLevel != domain.RiskLevelHigh {
 		t.Fatalf("output = %#v", output)
@@ -62,7 +71,7 @@ func TestAgentPlannerBuildsRussianScopedDependencyDAG(t *testing.T) {
 			t.Fatalf("browser write scope = %#v", task.WriteScope)
 		}
 	}
-	if err := (Validator{MaxParallelTasks: 3, MaxRequiredTaskDepth: 3}).Validate(context.Background(), output); err != nil {
+	if err := (Validator{MaxParallelTasks: 3, MaxRequiredTaskDepth: 3, ControlPlane: planner.ControlPlane}).Validate(context.Background(), output); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
 }
@@ -93,6 +102,7 @@ func TestAgentPlannerOwnerPrerequisiteOverridesReverseRuntimeTopology(t *testing
 	planner := AgentPlanner{
 		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
 		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
 	}
 
 	_, output, err := planner.Build(context.Background(), domain.Command{
@@ -110,8 +120,62 @@ func TestAgentPlannerOwnerPrerequisiteOverridesReverseRuntimeTopology(t *testing
 			t.Fatalf("dependency = %#v", dependency)
 		}
 	}
-	if err := (Validator{MaxParallelTasks: 3, MaxRequiredTaskDepth: 3}).Validate(context.Background(), output); err != nil {
+	if err := (Validator{MaxParallelTasks: 3, MaxRequiredTaskDepth: 3, ControlPlane: planner.ControlPlane}).Validate(context.Background(), output); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestAgentPlannerIncludesCanonicalProfileAndBoundedRepositoryFacts(t *testing.T) {
+	topology, request := plannerAgentFixture(t)
+	var gitRoot string
+	for index := range request.AvailableProjects {
+		if request.AvailableProjects[index].ID == "git" {
+			gitRoot = *request.AvailableProjects[index].LocalPath
+		}
+	}
+	writeFixtureFiles(t, gitRoot, canonicalGoFixtureFiles(map[string]string{
+		"go.mod":                       "module example.test/git-validator\n\ngo 1.24\n",
+		"AGENTS.md":                    "local-routing-fact: backend.usecase owns request validation",
+		".ai/service.yaml":             "name: validator\nowner_route: backend.usecase\n",
+		"internal/usecase/checkout.go": "package usecase\n\ntype Checkout struct{}\n",
+	}))
+	result := plannerAgentResult{
+		Summary:   "План сохраняет отдельные репозитории и существующий порядок работ.",
+		RiskLevel: domain.RiskLevelHigh,
+		Risks:     []string{"Изменение должно сохранить границы каждого репозитория."},
+		Tasks: []plannerAgentTask{
+			plannerAgentTaskFixture("policy", "Зафиксировать правило проверки", domain.RiskLevelMedium),
+			plannerAgentTaskFixture("git", "Исправить сценарий валидации", domain.RiskLevelHigh),
+			plannerAgentTaskFixture("http", "Сохранить поведение HTTP runtime", domain.RiskLevelHigh),
+			plannerAgentTaskFixture("browser", "Сохранить поведение браузерного runtime", domain.RiskLevelHigh),
+		},
+		Dependencies: []domain.PlannedDependency{},
+	}
+	planner := AgentPlanner{
+		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
+		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
+	}
+	_, output, err := planner.Build(context.Background(), domain.Command{
+		ID: "command", Text: "Добавить бизнес-процесс проверки запроса.",
+	}, topology, request)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	runner := planner.Runner.(*plannerRunnerFake)
+	if !strings.Contains(runner.request.Prompt, "profile/go.canonical") ||
+		!strings.Contains(runner.request.Prompt, "local-routing-fact: backend.usecase owns request validation") ||
+		!strings.Contains(runner.request.Prompt, "local-routing-fact") {
+		t.Fatal("planner prompt omitted canonical profile or bounded local repository facts")
+	}
+	resolved := false
+	for _, profile := range output.Routing.Profiles {
+		if profile.ProjectID == "git" && profile.ProfileID == "go.canonical" && profile.Status == domain.ProfileResolutionResolved {
+			resolved = true
+		}
+	}
+	if !resolved {
+		t.Fatalf("output did not persist resolved Go profile: %#v", output.Routing.Profiles)
 	}
 }
 
@@ -126,6 +190,7 @@ func TestAgentPlannerRejectsMissingOrForeignTasks(t *testing.T) {
 	_, _, err := (AgentPlanner{
 		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
 		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
 	}).Build(context.Background(), domain.Command{
 		ID: "command", Text: "Исправить выбранные валидаторы после определения общего правила.",
 	}, catalog, request)
@@ -151,11 +216,38 @@ func TestAgentPlannerRejectsUnverifiedScopeExpansion(t *testing.T) {
 	_, _, err := (AgentPlanner{
 		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
 		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
 	}).Build(context.Background(), domain.Command{
 		ID: "command", Text: "Исправить обработку путей рабочего пространства.",
 	}, catalog, request)
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("Build() error = %v, want validation", err)
+	}
+}
+
+func TestAgentPlannerRejectsDuplicateArchitecturalRoutes(t *testing.T) {
+	catalog, request := plannerAgentFixture(t)
+	result := plannerAgentResult{
+		Summary: "План сохраняет ограниченный состав задач.", RiskLevel: domain.RiskLevelMedium,
+		Risks: []string{"Повтор маршрута не должен расширять или искажать границы ответственности."},
+		Tasks: []plannerAgentTask{
+			plannerAgentTaskFixture("policy", "Зафиксировать общее правило проверки", domain.RiskLevelMedium),
+			plannerAgentTaskFixture("git", "Обновить выбранную проверку пути", domain.RiskLevelMedium),
+			plannerAgentTaskFixture("http", "Сохранить проверку HTTP-границы", domain.RiskLevelMedium),
+			plannerAgentTaskFixture("browser", "Сохранить проверку runtime-границы", domain.RiskLevelMedium),
+		},
+		Dependencies: []domain.PlannedDependency{},
+	}
+	result.Tasks[1].ArchitecturalRoutes = []string{"backend.usecase", "backend.usecase"}
+	_, _, err := (AgentPlanner{
+		Base: Planner{MaxParallelTasks: 3}, Runner: &plannerRunnerFake{result: result},
+		Model: config.DefaultCodexModelDeep, Reasoning: config.DefaultCodexReasoningDeep,
+		ControlPlane: plannerControlPlane(t),
+	}).Build(context.Background(), domain.Command{
+		ID: "command", Text: "Исправить сценарий проверки бизнес-процесса в выбранных репозиториях.",
+	}, catalog, request)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Build() error = %v, want validation for duplicate architectural routes", err)
 	}
 }
 
@@ -186,6 +278,15 @@ func plannerAgentFixture(t *testing.T) (domain.TopologyCatalog, domain.PlanReque
 	return domain.TopologyCatalog{
 		Revision: domain.TopologyRevision{ID: "revision"}, Services: services,
 	}, domain.PlanRequest{RequestedProjectIDs: requested, AvailableProjects: projects}
+}
+
+func plannerControlPlane(t *testing.T) agentcontrol.Catalog {
+	t.Helper()
+	catalog, err := agentcontrol.LoadCatalog(os.DirFS(filepath.Join("..", "..")))
+	if err != nil {
+		t.Fatalf("load canonical planner catalog: %v", err)
+	}
+	return catalog
 }
 
 func plannerAgentTaskFixture(key, title string, risk domain.RiskLevel) plannerAgentTask {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
 	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -17,11 +18,12 @@ import (
 var plannerResultSchemaJSON []byte
 
 type AgentPlanner struct {
-	Base      Planner
-	Runner    repository.AgentRunner
-	Model     string
-	Reasoning string
-	Router    agentpolicy.Router
+	Base         Planner
+	Runner       repository.AgentRunner
+	Model        string
+	Reasoning    string
+	Router       agentpolicy.Router
+	ControlPlane agentcontrol.Catalog
 }
 
 type plannerAgentResult struct {
@@ -33,33 +35,39 @@ type plannerAgentResult struct {
 }
 
 type plannerAgentTask struct {
-	Key                string           `json:"key"`
-	Title              string           `json:"title"`
-	Description        string           `json:"description"`
-	AcceptanceCriteria []string         `json:"acceptance_criteria"`
-	RiskLevel          domain.RiskLevel `json:"risk_level"`
-	ChangesContracts   bool             `json:"changes_contracts"`
-	RequiresMigration  bool             `json:"requires_migration"`
+	Key                 string           `json:"key"`
+	Title               string           `json:"title"`
+	Description         string           `json:"description"`
+	AcceptanceCriteria  []string         `json:"acceptance_criteria"`
+	RiskLevel           domain.RiskLevel `json:"risk_level"`
+	ChangesContracts    bool             `json:"changes_contracts"`
+	RequiresMigration   bool             `json:"requires_migration"`
+	ArchitecturalRoutes []string         `json:"architectural_routes,omitempty"`
 }
 
 type plannerAgentContext struct {
-	Request   string                       `json:"request"`
-	Baseline  domain.PlannerOutput         `json:"baseline"`
-	Projects  []plannerAgentProjectContext `json:"projects"`
-	Relations []domain.ServiceRelation     `json:"relations"`
+	Request         string                             `json:"request"`
+	Baseline        domain.PlannerOutput               `json:"baseline"`
+	Projects        []plannerAgentProjectContext       `json:"projects"`
+	Relations       []domain.ServiceRelation           `json:"relations"`
+	Routing         domain.RoutingResult               `json:"routing"`
+	ContractPlan    domain.ContractPlan                `json:"contract_plan"`
+	CanonicalAssets []canonicalPromptAsset             `json:"canonical_assets"`
+	RepositoryFacts map[string][]plannerRepositoryFact `json:"repository_facts"`
 }
 
 type plannerAgentProjectContext struct {
-	ProjectID      string                     `json:"project_id"`
-	Name           string                     `json:"name"`
-	RepositoryRole domain.RepositoryRole      `json:"repository_role"`
-	LocalPath      string                     `json:"local_path"`
-	ServiceKind    domain.ServiceKind         `json:"service_kind"`
-	Purpose        string                     `json:"purpose"`
-	Stack          []domain.Evidence          `json:"stack"`
-	Capabilities   []domain.ServiceCapability `json:"capabilities"`
-	Ownership      []domain.ServiceOwnership  `json:"ownership"`
-	Contracts      []plannerContractContext   `json:"contracts"`
+	ProjectID       string                     `json:"project_id"`
+	Name            string                     `json:"name"`
+	RepositoryRole  domain.RepositoryRole      `json:"repository_role"`
+	LocalPath       string                     `json:"local_path"`
+	ServiceKind     domain.ServiceKind         `json:"service_kind"`
+	Purpose         string                     `json:"purpose"`
+	Stack           []domain.Evidence          `json:"stack"`
+	Capabilities    []domain.ServiceCapability `json:"capabilities"`
+	Ownership       []domain.ServiceOwnership  `json:"ownership"`
+	Contracts       []plannerContractContext   `json:"contracts"`
+	RoutingEvidence []domain.RoutingEvidence   `json:"routing_evidence"`
 }
 
 type plannerContractContext struct {
@@ -83,7 +91,23 @@ func (p AgentPlanner) Build(
 		return domain.PlannerInput{}, domain.PlannerOutput{}, fmt.Errorf("planner-agent is not configured: %w", domain.ErrInvalidStatus)
 	}
 
-	agentContext, workingDirectory, err := buildPlannerAgentContext(input.CommandText, baseline, catalog, request.AvailableProjects)
+	routing, contractPlan, inventories, err := buildRoutingMetadata(input.CommandText, baseline, request.AvailableProjects, p.ControlPlane)
+	if err != nil {
+		return domain.PlannerInput{}, domain.PlannerOutput{}, err
+	}
+	profileIDs := make([]string, 0, len(routing.Profiles))
+	for _, profile := range routing.Profiles {
+		if profile.Status == domain.ProfileResolutionResolved {
+			profileIDs = append(profileIDs, profile.ProfileID)
+		}
+	}
+	canonicalAssets, err := canonicalPromptAssets(p.ControlPlane, profileIDs)
+	if err != nil {
+		return domain.PlannerInput{}, domain.PlannerOutput{}, err
+	}
+	agentContext, workingDirectory, err := buildPlannerAgentContext(
+		input.CommandText, baseline, catalog, request.AvailableProjects, routing, contractPlan, canonicalAssets, inventories,
+	)
 	if err != nil {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}
@@ -99,6 +123,17 @@ func (p AgentPlanner) Build(
 только перечисленные baseline-задачи, topology relations и read-only checkout каждого проекта.
 Ты не изменяешь файлы, не создаёшь issues или PR и не выполняешь внешние записи.
 
+	Каноническая shared policy, процедуры task-route и contract-plan, а также применимые
+	архитектурные профили включены в CONTEXT.canonical_assets из Agent Control Plane. Следуй им как единственному
+	источнику процедур. Детерминированный routing/evidence index уже ограничил доступные
+	профили, маршруты, пути и evidence; не расширяй их и не превращай маршруты в отдельные задачи.
+	Детерминированные route_candidates с отрицательной polarity являются обязательными
+	исключениями: не включай их route IDs в architectural_routes даже при наличии совпадающих слов.
+	Конфликтные и условные route_candidates требуют owner review и не становятся разрешёнными маршрутами.
+	Не открывай .env, credentials, private keys или другие secret-bearing files и не включай секреты в контекст.
+	CONTEXT.repository_facts содержит ограниченные локальные инструкции, контракты и manifests;
+	локальные ownership-указания имеют приоритет над эвристикой.
+
 Верни только JSON по схеме. Обязательные правила:
 - сохрани ровно по одной задаче на каждый baseline key; не добавляй и не удаляй проекты;
 - заголовок, описание, критерии приёмки, summary и риски пиши полностью на русском;
@@ -109,6 +144,15 @@ func (p AgentPlanner) Build(
 - явный prerequisite владельца имеет приоритет над направленной в обратную сторону runtime relation;
 - никогда не добавляй обе стороны одной зависимости и не создавай цикл;
 - независимые задачи не связывай искусственно;
+- Для каждой repository-level задачи укажи architectural_routes только для
+  тех responsibilities профиля, где действительно нужны изменения. Не включай
+  route только потому, что его evidence присутствует в routing. Используй только
+  route IDs, уже перечисленные для этого проекта в CONTEXT.routing. Пустой список
+  допустим для задач без source implementation; такие задачи останутся на owner review;
+- CONTEXT.contract_plan.contract_owner_routes задаёт ownership shared declarations,
+  а не implementation scope. Не добавляй contract-owner-only route в architectural_routes.
+  Application API и repository port разделены согласно boundary_ownership профиля;
+  usecase будет отображать application DTOs в domain repository types;
 - security-sensitive реализацию оценивай как high, обычную реализацию как medium,
   документационную или исследовательскую задачу без изменения runtime — как low/medium;
 - не ослабляй ограничения baseline и не выдумывай миграции или изменения контрактов;
@@ -148,6 +192,16 @@ func (p AgentPlanner) Build(
 	if err != nil {
 		return domain.PlannerInput{}, domain.PlannerOutput{}, err
 	}
+	if routing.OwnerReviewRequired {
+		refined.Risks = uniqueSorted(append(refined.Risks,
+			"Архитектурная маршрутизация требует отдельной проверки владельцем; подробности сохранены в routing."))
+	}
+	if err := validateArchitecturalRouteSelection(refined.Tasks, routing); err != nil {
+		return domain.PlannerInput{}, domain.PlannerOutput{}, err
+	}
+	refined.PlanningMetadataVersion = domain.PlannerMetadataVersionV1
+	refined.Routing = &routing
+	refined.ContractPlan = &contractPlan
 	return input, refined, nil
 }
 
@@ -156,6 +210,10 @@ func buildPlannerAgentContext(
 	baseline domain.PlannerOutput,
 	catalog domain.TopologyCatalog,
 	projects []domain.Project,
+	routing domain.RoutingResult,
+	contractPlan domain.ContractPlan,
+	canonicalAssets []canonicalPromptAsset,
+	inventories map[string]repositoryInventory,
 ) (plannerAgentContext, string, error) {
 	selected := make(map[string]struct{}, len(baseline.Tasks))
 	for _, task := range baseline.Tasks {
@@ -170,7 +228,14 @@ func buildPlannerAgentContext(
 		serviceByID[service.ProjectID] = service
 	}
 
-	result := plannerAgentContext{Request: requestText, Baseline: baseline}
+	result := plannerAgentContext{
+		Request: requestText, Baseline: baseline, Routing: routing,
+		ContractPlan: contractPlan, CanonicalAssets: canonicalAssets,
+		RepositoryFacts: make(map[string][]plannerRepositoryFact, len(inventories)),
+	}
+	for projectID, inventory := range inventories {
+		result.RepositoryFacts[projectID] = repositoryFacts(inventory)
+	}
 	workingDirectory := ""
 	for _, task := range baseline.Tasks {
 		project, ok := projectByID[task.ProjectID]
@@ -182,6 +247,11 @@ func buildPlannerAgentContext(
 			ProjectID: task.ProjectID, Name: project.Name, RepositoryRole: project.RepositoryRole,
 			LocalPath: strings.TrimSpace(*project.LocalPath), ServiceKind: service.ServiceKind,
 			Purpose: service.Purpose, Stack: append([]domain.Evidence(nil), service.Stack...),
+		}
+		for _, evidence := range routing.EvidenceIndex {
+			if evidence.ProjectID == task.ProjectID {
+				contextValue.RoutingEvidence = append(contextValue.RoutingEvidence, evidence)
+			}
 		}
 		if workingDirectory == "" {
 			workingDirectory = contextValue.LocalPath
@@ -213,6 +283,24 @@ func buildPlannerAgentContext(
 		}
 	}
 	return result, workingDirectory, nil
+}
+
+func validateArchitecturalRouteSelection(tasks []domain.PlannedTask, routing domain.RoutingResult) error {
+	available := map[string]map[string]struct{}{}
+	for _, route := range routing.Routes {
+		if available[route.ProjectID] == nil {
+			available[route.ProjectID] = map[string]struct{}{}
+		}
+		available[route.ProjectID][route.RouteID] = struct{}{}
+	}
+	for _, task := range tasks {
+		for _, routeID := range task.ArchitecturalRoutes {
+			if _, ok := available[task.ProjectID][routeID]; !ok {
+				return fmt.Errorf("task %q selected unrouted responsibility %q: %w", task.Key, routeID, domain.ErrValidation)
+			}
+		}
+	}
+	return nil
 }
 
 func plannerResultSchema() (map[string]any, error) {
@@ -264,9 +352,14 @@ func refinePlannerOutput(
 			len(candidate.AcceptanceCriteria) == 0 || !allContainCyrillic(candidate.AcceptanceCriteria) {
 			return domain.PlannerOutput{}, fmt.Errorf("planner-agent task %q is incomplete or not Russian: %w", candidate.Key, domain.ErrValidation)
 		}
+		routeIDs := trimmedValues(candidate.ArchitecturalRoutes)
+		if !allUniqueNonEmpty(routeIDs) {
+			return domain.PlannerOutput{}, fmt.Errorf("planner-agent task %q contains duplicate architectural routes: %w", candidate.Key, domain.ErrValidation)
+		}
 		base.Title = strings.TrimSpace(candidate.Title)
 		base.Description = strings.TrimSpace(candidate.Description)
 		base.AcceptanceCriteria = trimmedValues(candidate.AcceptanceCriteria)
+		base.ArchitecturalRoutes = uniqueSorted(routeIDs)
 		base.RiskLevel = maxRisk(base.RiskLevel, candidate.RiskLevel)
 		base.ModelProfile = modelProfile(base.RiskLevel)
 		if candidate.ChangesContracts && !base.ChangesContracts {

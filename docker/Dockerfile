@@ -36,6 +36,7 @@ RUN apk add --no-cache bubblewrap ca-certificates git openssh-client python3 \
     && chown -R orchestrator:orchestrator /data /projects
 WORKDIR /app
 COPY --from=builder /out/course-dev-orchestrator /app/course-dev-orchestrator
+COPY --from=builder /app/agent-system /app/agent-system
 COPY --from=runner-builder --chown=orchestrator:orchestrator /runner /app/runner
 USER orchestrator
 EXPOSE 8080

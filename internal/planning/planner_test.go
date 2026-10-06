@@ -324,3 +324,12 @@ func TestValidatorRejectsCyclesIncompleteTasksAndWideWaves(t *testing.T) {
 		})
 	}
 }
+
+func TestValidatorRejectsUnknownRoutingProfile(t *testing.T) {
+	catalog := plannerControlPlane(t)
+	output := validRoutedOutput(t, catalog)
+	output.Routing.Profiles[0].ProfileID = "unsupported.profile"
+	if err := (Validator{ControlPlane: catalog}).Validate(context.Background(), output); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Validate() error = %v, want unknown profile rejected", err)
+	}
+}

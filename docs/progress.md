@@ -1346,3 +1346,7 @@ deploy without their own subsequent explicit authorizations.
 - Focused exporter checks passed for deterministic output, immutable pin drift,
   missing roots, classification, duplicate identities and services, unchanged
   fleet counts, and retained explicit unknown dependencies.
+
+## Routing and contract publication prerequisites — 2026-10-06
+
+Publication candidate includes canonical catalog/assets, routing and ContractPlan validation, original planner serialization/fingerprint APIs, and required baseline model declarations. Shard/fanout/sandbox/lifecycle runtime changes remain outside scope. Verification results are recorded by the publication audit before commit.
