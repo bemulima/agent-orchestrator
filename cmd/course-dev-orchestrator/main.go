@@ -105,6 +105,15 @@ func run(args []string) error {
 		fmt.Printf("course-dev-orchestrator %s (%s)\n", version, commit)
 		return nil
 	}
+	if command == "context-prepare" {
+		return runContextPrepare(args[1:], os.Stdout)
+	}
+	if command == "context-expand" {
+		return runContextExpand(args[1:], os.Stdout)
+	}
+	if command == "context-evaluate" {
+		return runContextEvaluate(args[1:], os.Stdout)
+	}
 	if command == "agent-template-check" {
 		if err := agenttemplates.Validate(); err != nil {
 			return fmt.Errorf("validate agent template bundle: %w", err)
@@ -1646,6 +1655,9 @@ func printUsage() {
 	fmt.Println(`Usage: course-dev-orchestrator <command>
 
 Commands:
+  context-prepare Build a deterministic offline evidence pack from explicit admitted sources
+  context-expand  Expand a pack within its verified snapshot, read scope and cumulative budget
+  context-evaluate Evaluate versioned local retrieval gold fixtures without a model or network
   serve           Start the internal HTTP API (default)
   worker          Start the Temporal worker
   workflow-probe  Run a Temporal workflow/activity smoke test

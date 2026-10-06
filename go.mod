@@ -17,6 +17,7 @@ require (
 	go.temporal.io/sdk v1.35.0
 	go.uber.org/zap v1.26.0
 	gopkg.in/yaml.v3 v3.0.1
+	golang.org/x/sys v0.32.0
 )
 
 require (
@@ -40,7 +41,6 @@ require (
 	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/net v0.39.0 // indirect
 	golang.org/x/sync v0.13.0 // indirect
-	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240827150818-7e3bb234dfed // indirect

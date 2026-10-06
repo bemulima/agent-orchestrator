@@ -16,3 +16,6 @@ Repository code, migrations, tests, configuration, and the documents below are t
 Machine-readable mirrors for agent use live under `.ai/contracts`. The canonical shared policy distributed to other repositories lives in `internal/onboarding/templates/v1`; the root `.ai/rules/common.md` must remain byte-identical to that embedded common-rules file.
 
 - [Routing and contract control prerequisites](agent-control-plane.md): canonical catalog, routing metadata and contract verification APIs used by context retrieval.
+
+- [Context retrieval audit and design](agent-context-retrieval-audit.md): existing retrieval foundations, evidence and security gaps, reusable architecture, Student pilot, and staged rollout.
+- [Local context retrieval](agent-context-retrieval.md): implemented read-only core, coverage, trust and freshness, canonical pack, offline Prepare/Expand CLI and deterministic Gold evaluation.

@@ -1350,3 +1350,35 @@ deploy without their own subsequent explicit authorizations.
 ## Routing and contract publication prerequisites — 2026-10-06
 
 Publication candidate includes canonical catalog/assets, routing and ContractPlan validation, original planner serialization/fingerprint APIs, and required baseline model declarations. Shard/fanout/sandbox/lifecycle runtime changes remain outside scope. Verification results are recorded by the publication audit before commit.
+
+The Context retrieval entries below are historical dirty-tree implementation checks; exact publication verification follows them.
+
+## Context retrieval R1 — 2026-10-06
+
+Implemented companion `RoutingCoverageReport` without adding fields to approval-bound `RoutingResult` or `ContractPlan`. Inventory, acquisition, target/symbol projection and repository-facts limits have explicit ledgers; incomplete searches preserve NOT_VERIFIED/OMITTED rather than claiming absence. Route/config/source identities are bound to diagnostics. Focused `planner-route-test` passed offline using a temporary Makefile that omits only the `.env` include. Pre-change serialized PlannerOutput and approval fingerprint golden regression passed. R2–R4 and Gold remain in progress.
+
+## Context retrieval R2 — 2026-10-06
+
+Implemented versioned generic models and BuildPlan in `internal/contextretrieval`, independent of platform entities/DB/Temporal/model APIs. Explicit admitted identity/root/read paths and optional route identity mapping retain original routing; all sources remain forbidden for writes. Read-only adapters reuse discovery inventory via nil-default hooks, existing HTTP/NATS AST extraction, strict manifests, portable graph identities/pins, contractref and test files. Exact/docs, Go definitions/declarations/imports, metadata, captured graph, contract and test queries have explicit coverage; semantic callers/references/implementation/error_mapping/schema/history remain UNSUPPORTED. Focused discovery/adapters tests, legacy default-scanner checksum regression and final `context-test` passed offline.
+
+## Context retrieval R3 — 2026-10-06
+
+Implemented scoped hash-registered policy, inert source data, claim-specific authority, freshness, conflict preservation, deterministic ranking/overlap-safe dedup, whole-unit source/context/per-facet/per-source budgets and canonical JSON/Markdown ContextPack v1. Generated inputs are validated against already admitted snapshot documents; captured Git labels remain explicit unknowns. Semantic digest excludes operational IDs/host roots/time, and derived accounting is independently verified. Security regressions prove zero opens of named secret/token/key files and stores (including original/canonical root aliases), reject symlink descendants/hardlinks/nonregular files and withhold credential-like JSON content. Core quality/pack tests and final `context-test` passed.
+
+## Context retrieval R4 — 2026-10-06
+
+Implemented offline `context-prepare`, `context-expand`, `context-evaluate` before config loading. Prepare revalidates snapshot after resolving; Expand requires fresh caller scope/policy/route, live snapshot and deterministic trusted replay of initial Prepare/history. Recomputed malicious cache digests cannot promote provenance/reset budget/depth, including early blocked-return paths. Cumulative bounds retain prior evidence, and JSON/Markdown both expose blocked delta diagnostics. CLI inputs use bounded strict JSON and safe descriptor reads. Final focused tests/build and real binary smoke with empty environment passed: repeated Prepare JSON/digest identical; Expand round-trip count=1. Historical smoke fixture intentionally returns PARTIAL/ROUTING_COVERAGE_UNKNOWN; fresh bound R1 companion COMPLETE is tested with the real collector.
+
+## Context retrieval Gold / integration — 2026-10-06
+
+71 retrieval-gold/v1 fixtures cover 71 scenarios, including 12 adversarial cases. Actual offline CLI run: mandatory recall 34/34, overall recall 34/34, precision 36/36, conflicts 4/4; forbidden scope, silent missing required contract, stale runtime leaks, silent conflict suppression, false COMPLETE and duplicate ratio all zero. Raw missing contract 1/4 = .25 is the intentional negative case with explicit diagnostic. Token estimates sum 62185 across cases; one measured suite latency 155.274 ms is operational, not a performance guarantee. Case outcomes: COMPLETE 21, PARTIAL 37, BLOCKED 10, INVALID 2, STALE 1. Evaluator fault tests prove gate failures rather than labelling all results relevant. All R1 cap modes assert actual counters, including acquired mandatory evidence omitted at global 500.
+
+Independent review found and verified fixes for seven P1 boundaries: token filenames, missing R1 coverage wiring, blocked Markdown outcome, generated graph inputs, policy scope, early-return forged/stale base and secret-store root aliases. Final reviewer reports no remaining P0/P1. Full secret-free `make verify` equivalent passed with repo caches/GOPROXY=off and Compose --env-file /dev/null: policy/control-plane checks, gofmt/diff checks, Go vet/all unit/workflow tests, 40 Python runner tests, runner build, 17 UI tests/build and Compose validation. Dedicated DB/MVP/real-model/OCI certification gates were not invoked because retrieval does not integrate production execution.
+
+All program writes remain inside CDO (plus disposable temporary verification output). HEAD remains 82edd84cd63e1d40ded335463e59da22de01651b; no commit/push/branch/worktree lifecycle action. Original unrelated work was not reverted. Nine unrelated lifecycle/runner files changed concurrently since the pre-program hash baseline; these are preserved and not attributed to retrieval. No other repository, Student pilot, distribution, production gate or business WorkPackage was modified by this program. Next: separately approved read-only service pilot, not executed here. Implementation/CLI/schema/limitations are documented in [local context retrieval](agent-context-retrieval.md).
+
+
+
+## Context retrieval exact publication verification — 2026-10-06
+
+The standalone routing/catalog/contracts prerequisite layer and the complete R1–R4+Gold candidate both passed full secret-free verification on current origin/main. Original planner JSON/approval fingerprint compatibility, routing polarity and contract ownership passed. Final offline CLI/Prepare/Expand/determinism and Gold 71/71 passed; recall/precision 1.00 and all critical counters zero. Independent prerequisite/final reviews found P0=0 and P1=0. Original dirty source remains preserved; concurrent release documentation appends are retained and excluded from publication. Verification records and final Git publication proof are under ignored .cache/agent-context/publication-v2.

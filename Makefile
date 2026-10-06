@@ -328,3 +328,16 @@ architecture-export-test: ## Verify portable graph, owner inventory, immutable p
 
 architecture-export-format: ## Format only the portable architecture graph exporter files
 	gofmt -w internal/domain/architecture_fleet_inputs.go internal/architecturecatalog/fleet_external.go internal/architecturecatalog/fleet_external_test.go internal/architecturecatalog/builder.go internal/domain/architecture_catalog.go internal/architecturecatalog/fleet_inputs.go internal/architecturecatalog/fleet_inputs_test.go internal/usecase/architecturecatalog/fleet_export.go internal/usecase/architecturecatalog/fleet_export_test.go internal/domain/architecture_graph.go internal/architecturecatalog/export.go internal/architecturecatalog/export_test.go internal/usecase/architecturecatalog/current.go internal/usecase/architecturecatalog/export.go internal/usecase/architecturecatalog/export_test.go internal/adapters/git/architecture_blob.go internal/adapters/git/architecture_blob_test.go cmd/architecture-export/main.go cmd/architecture-export/main_test.go
+
+.PHONY: context-test context-format context-build context-gold
+context-test: ## Verify offline retrieval core, adapters, discovery reuse, routing and CLI
+	$(GO_ENV) go test ./internal/contextretrieval/... ./internal/adapters/contextretrieval/... ./internal/discovery ./internal/planning ./cmd/course-dev-orchestrator
+
+context-format: ## Format only context retrieval program files
+	gofmt -w $$(find internal/contextretrieval internal/adapters/contextretrieval -name '*.go') internal/discovery/scanner.go internal/discovery/retrieval.go internal/planning/routing.go internal/planning/routing_coverage.go internal/planning/routing_coverage_test.go cmd/course-dev-orchestrator/context_retrieval.go cmd/course-dev-orchestrator/context_retrieval_test.go cmd/course-dev-orchestrator/main.go
+
+context-build: ## Build the offline context command executable
+	$(GO_ENV) go build -o .cache/bin/course-dev-orchestrator-context ./cmd/course-dev-orchestrator
+
+context-gold: context-build ## Evaluate committed offline gold fixtures
+	.cache/bin/course-dev-orchestrator-context context-evaluate --fixtures-dir test/fixtures/context-retrieval/gold

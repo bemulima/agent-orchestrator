@@ -48,6 +48,10 @@ type Config struct {
 	MaxTotalBytes int64
 	MaxDepth      int
 	Now           func() time.Time
+	// Optional retrieval hooks preserve legacy discovery behavior when nil.
+	AdmitPath        func(relative string, directory bool) error
+	ReadFile         func(context.Context, string, string, int64) ([]byte, bool, error)
+	ObserveInventory func(InventoryEvent)
 }
 
 // Scanner performs bounded, read-only filesystem discovery.
@@ -149,6 +153,7 @@ func (s Scanner) inventory(ctx context.Context, root string) ([]analyzedFile, do
 	summary := domain.InventorySummary{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			s.observe("unreadable", relativePath(root, path), 0)
 			summary.Warnings = append(summary.Warnings, "unreadable path: "+relativePath(root, path))
 			return nil
 		}
@@ -159,8 +164,19 @@ func (s Scanner) inventory(ctx context.Context, root string) ([]analyzedFile, do
 		if relative == "." {
 			return nil
 		}
+		if s.config.AdmitPath != nil {
+			if err := s.config.AdmitPath(relative, entry.IsDir()); err != nil {
+				s.observe("skipped_by_policy", relative, 0)
+				summary.ExcludedPaths++
+				if entry.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+		}
 		depth := strings.Count(relative, "/") + 1
 		if depth > s.config.MaxDepth {
+			s.observe("depth_limit", relative, 0)
 			summary.Truncated = true
 			summary.ExcludedPaths++
 			if entry.IsDir() {
@@ -170,41 +186,58 @@ func (s Scanner) inventory(ctx context.Context, root string) ([]analyzedFile, do
 		}
 		if entry.IsDir() {
 			if _, excluded := excludedDirectories[entry.Name()]; excluded {
+				s.observe("skipped_by_policy", relative, 0)
 				summary.ExcludedPaths++
 				return fs.SkipDir
 			}
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			s.observe("nonregular", relative, 0)
 			summary.ExcludedPaths++
 			return nil
 		}
 		if summary.FilesVisited >= s.config.MaxFiles {
+			s.observe("file_limit", relative, 0)
 			summary.Truncated = true
 			return fs.SkipAll
 		}
 		summary.FilesVisited++
+		s.observe("visited", relative, 0)
 		if !shouldAnalyze(relative) {
+			s.observe("skipped_by_policy", relative, 0)
 			return nil
 		}
-		content, tooLarge, err := readBounded(path, s.config.MaxFileBytes)
+		var content []byte
+		var tooLarge bool
+		var err error
+		if s.config.ReadFile != nil {
+			content, tooLarge, err = s.config.ReadFile(ctx, root, relative, s.config.MaxFileBytes)
+		} else {
+			content, tooLarge, err = readBounded(path, s.config.MaxFileBytes)
+		}
 		if err != nil {
+			s.observe("unreadable", relative, 0)
 			summary.Warnings = append(summary.Warnings, "cannot read: "+relative)
 			return nil
 		}
 		if tooLarge {
+			s.observe("skipped_large", relative, 0)
 			summary.SkippedLarge++
 			return nil
 		}
 		if summary.BytesAnalyzed+int64(len(content)) > s.config.MaxTotalBytes {
+			s.observe("byte_limit", relative, int64(len(content)))
 			summary.Truncated = true
 			return fs.SkipAll
 		}
 		if isBinary(content) {
+			s.observe("skipped_by_policy", relative, 0)
 			summary.ExcludedPaths++
 			return nil
 		}
 		summary.FilesAnalyzed++
+		s.observe("indexed", relative, int64(len(content)))
 		summary.BytesAnalyzed += int64(len(content))
 		files = append(files, analyzedFile{path: relative, content: content})
 		return nil

@@ -43,6 +43,7 @@ type repositoryInventory struct {
 	root     string
 	evidence []indexedEvidence
 	byPath   map[string]indexedEvidence
+	coverage *RoutingRepositoryCoverage
 }
 
 type canonicalPromptAsset struct {
@@ -177,6 +178,7 @@ func buildRoutingMetadata(requestText string, baseline domain.PlannerOutput, pro
 	if err != nil {
 		return domain.RoutingResult{}, domain.ContractPlan{}, nil, err
 	}
+	recordRoutingRequirements(result, contractPlan, inventories)
 	result.EvidenceIndex = buildBoundedEvidenceIndex(allEvidence, result, contractPlan)
 	available := make(map[string]struct{}, len(result.EvidenceIndex))
 	for _, evidence := range result.EvidenceIndex {
@@ -330,7 +332,7 @@ func selectEvidenceBackedRoutes(
 		if len(candidate.files) > 0 {
 			candidate.localScore = localRouteScore(route, inventory)
 		}
-		candidate.diagnostic = analyzeRouteCandidate(route.ID, requestText, projectID, architectureEvidence, candidate.files)
+		candidate.diagnostic = analyzeRouteCandidateWithCoverage(route.ID, requestText, projectID, architectureEvidence, candidate.files, inventory.coverage)
 		candidates = append(candidates, candidate)
 	}
 	var selected []evidenceBackedRouteCandidate
@@ -397,6 +399,7 @@ func selectEvidenceBackedRoutes(
 			}
 			return files[i].value.Path < files[j].value.Path
 		})
+		recordRoutingTargetCoverage(inventory.coverage, candidate.route.ID, files)
 		if len(files) > maxRouteTargets {
 			files = files[:maxRouteTargets]
 		}
@@ -435,52 +438,93 @@ func indexRepository(root, projectID string) (repositoryInventory, error) {
 	if !rootInfo.IsDir() {
 		return repositoryInventory{}, fmt.Errorf("planner evidence root for project %q is not a directory: %w", projectID, domain.ErrInvalidStatus)
 	}
-	inventory := repositoryInventory{root: canonical, byPath: map[string]indexedEvidence{}}
+	inventory := repositoryInventory{root: canonical, byPath: map[string]indexedEvidence{}, coverage: newRoutingRepositoryCoverage(projectID)}
 	visited, totalBytes := 0, 0
 	err = filepath.WalkDir(canonical, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			inventory.coverage.ReadErrors++
+			inventory.coverage.UnscannedRemainder = true
+			inventory.coverage.RemainderCountKnown = false
+			relative, _ := filepath.Rel(canonical, current)
+			inventory.coverage.omit("inventory", filepath.ToSlash(relative), "walk_error", 1)
 			return nil
 		}
 		relative, relErr := filepath.Rel(canonical, current)
 		if relErr != nil {
+			inventory.coverage.ReadErrors++
+			inventory.coverage.omit("inventory", "", "relative_path_error", 1)
 			return nil
 		}
 		relative = filepath.ToSlash(relative)
 		if entry.IsDir() {
 			if relative != "." && excludedEvidenceDirectory(entry.Name()) {
+				inventory.coverage.ExcludedDirectories++
+				inventory.coverage.omit("inventory", relative, "excluded_by_policy_directory", 1)
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if entry.Type()&fs.ModeSymlink != 0 {
+			inventory.coverage.ExcludedSymlinks++
+			inventory.coverage.omit("inventory", relative, "excluded_symlink", 1)
 			return nil
 		}
 		if !entry.Type().IsRegular() {
+			inventory.coverage.ExcludedNonRegular++
+			inventory.coverage.omit("inventory", relative, "excluded_nonregular", 1)
 			return nil
 		}
 		if excludedEvidenceFile(relative) {
+			inventory.coverage.ExcludedFiles++
+			inventory.coverage.omit("inventory", relative, "excluded_by_policy_file", 1)
 			return nil
 		}
 		visited++
+		inventory.coverage.VisitedFiles = visited
 		if visited > maxRoutingFilesVisited || len(inventory.evidence) >= maxRoutingEvidence || totalBytes >= maxRoutingInventoryBytes {
+			reason := "inventory_bytes_limit"
+			if visited > maxRoutingFilesVisited {
+				reason = "visited_files_limit"
+			} else if len(inventory.evidence) >= maxRoutingEvidence {
+				reason = "inventory_evidence_limit"
+			}
+			inventory.coverage.TerminationReason = reason
+			inventory.coverage.UnscannedRemainder = true
+			inventory.coverage.omit("inventory", relative, reason, 1)
 			return filepath.SkipAll
 		}
 		kind := evidenceKind(relative)
 		if kind == "" {
+			inventory.coverage.UnsupportedFiles++
 			return nil
 		}
 		info, statErr := entry.Info()
 		if statErr != nil {
+			inventory.coverage.ReadErrors++
+			inventory.coverage.omit("inventory", relative, "stat_error", 1)
 			return nil
 		}
 		if info.Size() < 0 || info.Size() > maxRoutingFileBytes || totalBytes+int(info.Size()) > maxRoutingInventoryBytes {
+			reason := "inventory_bytes_omission"
+			if info.Size() < 0 {
+				reason = "invalid_file_size"
+			} else if info.Size() > maxRoutingFileBytes {
+				reason = "file_bytes_limit"
+				inventory.coverage.SkippedLargeFiles++
+			}
+			inventory.coverage.omit("inventory", relative, reason, 1)
 			return nil
 		}
 		content, readErr := os.ReadFile(current)
 		if readErr != nil {
+			inventory.coverage.ReadErrors++
+			inventory.coverage.omit("inventory", relative, "read_error", 1)
 			return nil
 		}
 		totalBytes += len(content)
+		inventory.coverage.IndexedFiles++
+		inventory.coverage.IndexedBytes = totalBytes
+		recordRoutingExtractionCoverage(inventory.coverage, relative, content)
 		evidence := makeEvidence(projectID, relative, kind, content)
 		indexed := indexedEvidence{value: evidence, content: content}
 		inventory.evidence = append(inventory.evidence, indexed)
@@ -669,6 +713,10 @@ var routeSignalKeywords = map[string][]string{
 }
 
 func analyzeRouteCandidate(routeID, requestText, projectID string, architectureEvidence []string, files []indexedEvidence) domain.RoutingCandidateEvidence {
+	return analyzeRouteCandidateWithCoverage(routeID, requestText, projectID, architectureEvidence, files, nil)
+}
+
+func analyzeRouteCandidateWithCoverage(routeID, requestText, projectID string, architectureEvidence []string, files []indexedEvidence, coverage *RoutingRepositoryCoverage) domain.RoutingCandidateEvidence {
 	result := domain.RoutingCandidateEvidence{
 		RouteReference: domain.RouteReference{ProjectID: projectID, RouteID: routeID},
 		Polarity:       domain.RoutePolarityNeutral, Decision: domain.RouteDecisionNotSelected,
@@ -679,6 +727,10 @@ func analyzeRouteCandidate(routeID, requestText, projectID string, architectureE
 	}
 	result.SourceEvidence = uniqueSorted(result.SourceEvidence)
 	if len(result.SourceEvidence) > maxRouteTargets {
+		if coverage != nil {
+			coverage.omit("candidate_evidence", "", "candidate_evidence_limit", len(result.SourceEvidence)-maxRouteTargets)
+			coverage.Omissions[len(coverage.Omissions)-1].RouteID = routeID
+		}
 		result.SourceEvidence = result.SourceEvidence[:maxRouteTargets]
 	}
 
@@ -693,6 +745,10 @@ func analyzeRouteCandidate(routeID, requestText, projectID string, architectureE
 		matches := routePhraseMatches(routeID, clause.text)
 		if len(matches) == 0 {
 			continue
+		}
+		if coverage != nil && len([]rune(strings.Join(strings.Fields(clause.text), " "))) > 180 {
+			coverage.omit("task_span", "", "task_clause_display_limit", 1)
+			coverage.Omissions[len(coverage.Omissions)-1].RouteID = routeID
 		}
 		lower := strings.ToLower(clause.text)
 		conditional := routingConditionalPattern.MatchString(lower)
@@ -771,6 +827,10 @@ func analyzeRouteCandidate(routeID, requestText, projectID string, architectureE
 	result.MatchedPhrase = strings.Join(uniqueInOrder(phrases), "; ")
 	result.TaskSpan = strings.Join(uniqueInOrder(spans), " | ")
 	if len(result.TaskSpan) > 360 {
+		if coverage != nil {
+			coverage.omit("task_span", "", "task_span_display_limit", len(result.TaskSpan)-360)
+			coverage.Omissions[len(coverage.Omissions)-1].RouteID = routeID
+		}
 		result.TaskSpan = result.TaskSpan[:360]
 	}
 	if result.CandidateSignal == "" {
@@ -1361,6 +1421,7 @@ func repositoryFacts(inventory repositoryInventory) []plannerRepositoryFact {
 		})
 		total += len(evidence.content)
 	}
+	recordRepositoryFactsCoverage(inventory.coverage, inventory.evidence, facts, total)
 	return facts
 }
 
