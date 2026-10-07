@@ -53,6 +53,44 @@ func TestFleetInputsStrictNormalizedLock(t *testing.T) {
 	}
 }
 
+func TestActiveFleetRetirementScope(t *testing.T) {
+	active := normalizedTestFleet()
+	active.Repositories = active.Repositories[:40]
+	raw, _ := json.Marshal(active)
+	if _, _, err := ParseFleetInputs(raw); err != nil {
+		t.Fatalf("active40 owner lock rejected: %v", err)
+	}
+	for _, retired := range []string{"bemulima/ms-infra-messaging", "bemulima/ms-go-tarantool"} {
+		t.Run(retired, func(t *testing.T) {
+			fleet := active
+			owner := classifiedTestExternalOwner()
+			owner.RepositoryID = retired
+			owner.SourceIdentity = "git:github.com/" + retired
+			owner.RemoteURL = "https://github.com/" + retired + ".git"
+			fleet.ExternalOwners = []domain.ArchitectureFleetExternalOwner{owner}
+			bytes, _ := json.Marshal(fleet)
+			if _, _, err := ParseFleetInputs(bytes); err == nil {
+				t.Fatal("retired identity accepted as external owner in active40")
+			}
+			fleet.ExternalOwners = nil
+			fleet.Repositories = append([]domain.ArchitectureFleetRepository{}, active.Repositories...)
+			fleet.Repositories[0].ServiceID = strings.TrimPrefix(retired, "bemulima/")
+			bytes, _ = json.Marshal(fleet)
+			if _, _, err := ParseFleetInputs(bytes); err == nil {
+				t.Fatal("retired service alias accepted in active40")
+			}
+		})
+	}
+	for _, count := range []int{39, 41} {
+		fleet := normalizedTestFleet()
+		fleet.Repositories = fleet.Repositories[:count]
+		bytes, _ := json.Marshal(fleet)
+		if _, _, err := ParseFleetInputs(bytes); err == nil {
+			t.Fatal("partial fleet accepted")
+		}
+	}
+}
+
 func classifiedTestExternalOwner() domain.ArchitectureFleetExternalOwner {
 	repo := normalizedTestFleet().Repositories[0]
 	repo.RepositoryID = "example/external-owner"

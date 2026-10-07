@@ -12,7 +12,8 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 )
 
-// ParseFleetInputs accepts a normalized full-fleet owner lock. Local object-store
+// ParseFleetInputs accepts the historical 42-owner lock or the active 40-owner
+// lock after retiring Messaging and the identity HTTP service. Local object-store
 // paths are deliberately excluded from the portable semantic digest.
 func ParseFleetInputs(raw []byte) (domain.ArchitectureFleetInputs, string, error) {
 	var result domain.ArchitectureFleetInputs
@@ -24,12 +25,16 @@ func ParseFleetInputs(raw []byte) (domain.ArchitectureFleetInputs, string, error
 	if err := decoder.Decode(&result); err != nil {
 		return result, "", err
 	}
-	if result.SchemaVersion != domain.ArchitectureFleetInputsSchemaV1 || len(result.Repositories) != 42 {
-		return result, "", fmt.Errorf("versioned exact 42 repository fleet required: %w", domain.ErrValidation)
+	active := len(result.Repositories) == 40
+	if result.SchemaVersion != domain.ArchitectureFleetInputsSchemaV1 || (!active && len(result.Repositories) != 42) {
+		return result, "", fmt.Errorf("versioned exact 40 active or 42 historical repository fleet required: %w", domain.ErrValidation)
 	}
 	services := map[string]bool{}
 	identities := map[string]bool{}
 	validate := func(repo domain.ArchitectureFleetRepository, previous string, requireProfile bool) error {
+		if active && (repo.RepositoryID == "bemulima/ms-infra-messaging" || repo.RepositoryID == "bemulima/ms-go-tarantool" || repo.ServiceID == "messaging" || repo.ServiceID == "ms-infra-messaging" || repo.ServiceID == "ms-go-tarantool") {
+			return fmt.Errorf("retired repository cannot be an active fleet or external owner: %w", domain.ErrValidation)
+		}
 		if !graphRepositoryID.MatchString(repo.RepositoryID) || repo.SourceIdentity != "git:github.com/"+repo.RepositoryID || repo.RemoteURL != "https://github.com/"+repo.RepositoryID+".git" || !graphGitSHA.MatchString(repo.CommitSHA) || (requireProfile && strings.TrimSpace(repo.Profile) == "") || strings.TrimSpace(repo.ServiceID) == "" || services[repo.ServiceID] || identities[repo.SourceIdentity] || (repo.RepositoryRole != domain.RepositoryRoleService && repo.RepositoryRole != domain.RepositoryRoleFrontend && repo.RepositoryRole != domain.RepositoryRoleInfrastructure && repo.RepositoryRole != domain.RepositoryRolePolicy && repo.RepositoryRole != domain.RepositoryRoleContent && repo.RepositoryRole != domain.RepositoryRoleDocumentation && repo.RepositoryRole != domain.RepositoryRoleArchive) || len(repo.Declarations) == 0 || (previous != "" && previous >= repo.SourceIdentity) {
 			return fmt.Errorf("invalid normalized fleet owner: %w", domain.ErrValidation)
 		}
