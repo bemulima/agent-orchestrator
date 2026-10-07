@@ -26,9 +26,9 @@ func TestDefaultTestingPolicyPinMatchesBundledArtifact(t *testing.T) {
 	require.NoError(t, err)
 	digest := sha256.Sum256(bundle)
 
-	require.Equal(t, "65a8b8af26a76034ded6836313c5d007df1a5364", TestingPolicySourceCommit)
+	require.Equal(t, "51c441d95aea289f8050f85b35f1171f04e7ceb0", TestingPolicySourceCommit)
 	require.Equal(t, "3a374a116118d07311dab69513fdb271b82ec7a91e07d966c3515a80ff408241", TestingPolicySemanticsSHA)
-	require.Equal(t, "90357c4a1484565649b2446c4e1f1f2e617004c6cce964772c4dfb80c8c6e235", TestingPolicyBundleSHA256)
+	require.Equal(t, "c172e13e9640f69b3a44aaf2912f993ca1b5aba5407067e187c125c423c7d0d9", TestingPolicyBundleSHA256)
 	require.Equal(t, lock.SourceCommit, TestingPolicySourceCommit)
 	require.Equal(t, lock.SemanticsSHA, TestingPolicySemanticsSHA)
 	require.Equal(t, lock.BundleSHA256, TestingPolicyBundleSHA256)
