@@ -29,7 +29,7 @@ override PATH := $(COMMAND_PATH)
 endif
 CONNECT_PATH := $(or $(PROJECT_PATH),$(PROJECT_PATH_FROM_PATH))
 
-.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check backup backup-status restore-check agent-policy agent-template-check codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-archive project-restore project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-retry-run run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
+.PHONY: help bootstrap up down restart ps logs migrate migrate-down migrate-status temporal-ui ui ui-test ui-build ui-e2e serve worker workflow-probe telegram config-check backup backup-status restore-check agent-policy agent-template-check agent-control-check agent-control-test agent-shard-test worker-test planner-route-test codex-auth-sync codex-auth-status project-connect project-list project-show project-scan project-report project-archive project-restore project-onboard project-enrich project-diff project-approve project-reject project-apply topology contracts contract-drift dependencies consumers plan plan-show plan-comment plan-issues plan-submit plan-approve plan-reject plan-publish-issues plan-run plan-shard-run plan-retry-run plan-shards run-status run-pause run-resume run-cancel task-show task-log task-retry task-cancel task-pr-prepare task-pr-publish gitlab-sync gitlab-links fmt fmt-check diff-check lint test test-unit test-integration mvp-rehearsal runner-test verify compose-check
 
 help: ## Show available targets
 	@echo "Available targets:"
@@ -118,6 +118,35 @@ agent-policy: ## Validate repository-local agent architecture and canonical bund
 agent-template-check: ## Validate and checksum the canonical shared agent policy bundle
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator agent-template-check
 
+agent-control-check: ## Validate canonical Agent Control Plane assets and profiles
+	$(GO_ENV) go run ./cmd/course-dev-orchestrator agent-control-check --root .
+
+agent-control-test: ## Run focused Agent Control Plane tests
+	$(GO_ENV) go test ./internal/agentcontrol/...
+	$(GO_ENV) go test ./cmd/course-dev-orchestrator -run '^TestAgent(Assets|Policy)'
+
+planner-route-test: ## Run focused planner routing and contract validation tests
+	$(GO_ENV) go test ./internal/planning
+
+.PHONY: context-test context-format context-build context-gold
+context-test: ## Verify offline retrieval core, adapters, discovery reuse, routing and CLI
+	$(GO_ENV) go test ./internal/contextretrieval/... ./internal/adapters/contextretrieval/... ./internal/discovery ./internal/planning ./cmd/course-dev-orchestrator
+
+context-format: ## Format only context retrieval program files
+	gofmt -w $$(find internal/contextretrieval internal/adapters/contextretrieval -name '*.go') internal/discovery/scanner.go internal/discovery/retrieval.go internal/planning/routing.go internal/planning/routing_coverage.go internal/planning/routing_coverage_test.go cmd/course-dev-orchestrator/context_retrieval.go cmd/course-dev-orchestrator/context_retrieval_test.go cmd/course-dev-orchestrator/main.go
+
+context-build: ## Build the offline context command executable
+	$(GO_ENV) go build -o .cache/bin/course-dev-orchestrator-context ./cmd/course-dev-orchestrator
+
+context-gold: context-build ## Evaluate committed offline gold fixtures
+	.cache/bin/course-dev-orchestrator-context context-evaluate --fixtures-dir test/fixtures/context-retrieval/gold
+
+agent-shard-test: ## Run focused shard, work-package, contract freeze, baseline, and readiness tests
+	$(GO_ENV) go test ./internal/planning ./internal/contractbaseline ./internal/usecase/contractfreeze ./internal/usecase/shardplanning ./internal/usecase/shardexecution ./internal/adapters/git ./internal/adapters/postgres
+
+worker-test: ## Run focused shard worker lifecycle, Temporal fan-out, barrier, and integration checks
+	$(GO_ENV) go test ./internal/usecase/shardexecution ./internal/activities ./internal/workflow ./internal/adapters/temporal ./internal/adapters/git
+
 codex-auth-sync: ## Copy the existing local codex-cli ChatGPT login into the worker volume
 	COMPOSE_COMMAND="$(COMPOSE)" ./scripts/sync-codex-auth.sh "$(CODEX_HOST_AUTH_FILE)"
 
@@ -193,9 +222,9 @@ consumers: ## Show direct and transitive consumers for SERVICE=id-or-name
 	@test -n "$(SERVICE)" || (echo "Set SERVICE=id-or-name"; exit 2)
 	$(GO_ENV) go run ./cmd/course-dev-orchestrator consumers --service "$(SERVICE)"
 
-plan: ## Create discussion plan from FILE (optional PROJECT_IDS and SOURCE_ISSUES=github:id:number)
+plan: ## Create discussion plan from FILE (optional PROJECT_IDS, SOURCE_ISSUES, IDEMPOTENCY_KEY, SUPERSEDES_PLAN_ID)
 	@test -n "$(FILE)" || (echo "Set FILE=path-to-command.md"; exit 2)
-	$(ORCHESTRATOR_CLI) plan --file - $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",) $(if $(SOURCE_ISSUES),--source-issues "$(SOURCE_ISSUES)",) < "$(FILE)"
+	$(ORCHESTRATOR_CLI) plan --file - $(if $(PROJECT_IDS),--project-ids "$(PROJECT_IDS)",) $(if $(SOURCE_ISSUES),--source-issues "$(SOURCE_ISSUES)",) $(if $(IDEMPOTENCY_KEY),--idempotency-key "$(IDEMPOTENCY_KEY)",) $(if $(SUPERSEDES_PLAN_ID),--supersedes-plan-id "$(SUPERSEDES_PLAN_ID)",) < "$(FILE)"
 
 plan-show: ## Show PLAN_ID=uuid with tasks and dependencies
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
@@ -218,6 +247,18 @@ plan-approve: ## Approve exact PLAN_ID=uuid FINGERPRINT=sha256:... (optional ACT
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
 	@test -n "$(FINGERPRINT)" || (echo "Set FINGERPRINT=sha256:..."; exit 2)
 	$(ORCHESTRATOR_CLI) plan-approve --plan-id "$(PLAN_ID)" --fingerprint "$(FINGERPRINT)" --actor "$(or $(ACTOR),owner)" $(if $(COMMENT),--comment "$(COMMENT)",)
+
+plan-shards: ## Materialize the approved Plan's internal shards and contract baseline for PLAN_ID=uuid (does not launch workers)
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(ORCHESTRATOR_CLI) plan-shards --plan-id "$(PLAN_ID)"
+
+plan-shard-run: ## Start approved architectural shard workers on Temporal for PLAN_ID=uuid
+	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
+	$(ORCHESTRATOR_CLI) plan-shard-run --plan-id "$(PLAN_ID)"
+
+plan-shard-remediate: ## Run owner-approved review remediation for PLAN_ID and REMEDIATION_REQUEST JSON
+	@test -n "$(PLAN_ID)" -a -n "$(REMEDIATION_REQUEST)" || (echo "Set PLAN_ID and REMEDIATION_REQUEST"; exit 2)
+	$(ORCHESTRATOR_CLI) plan-shard-remediate --plan-id "$(PLAN_ID)" --request-json "$(REMEDIATION_REQUEST)"
 
 plan-reject: ## Reject PLAN_ID=uuid (optional ACTOR=... COMMENT=...)
 	@test -n "$(PLAN_ID)" || (echo "Set PLAN_ID=uuid"; exit 2)
@@ -289,6 +330,9 @@ fmt: ## Format Go source files
 fmt-check: ## Check Go formatting without changing files
 	@files=$$(gofmt -l $(GO_FILES)); if [ -n "$$files" ]; then echo "Unformatted files:"; echo "$$files"; exit 1; fi
 
+diff-check: ## Check the working diff for whitespace errors
+	git diff --check
+
 lint: ## Run Go static analysis
 	$(GO_ENV) go vet ./...
 
@@ -308,13 +352,16 @@ mvp-rehearsal: ## Run the disposable full-lifecycle MVP rehearsal (requires an e
 	MVP_COMPOSE_FILE="$(abspath docker-compose.yml)" \
 	$(GO_ENV) go test -count=1 -timeout=7m -tags=mvp ./test/mvp/...
 
-runner-test: ## Build and test the pinned Codex SDK runner
+sandbox-test: ## Test trusted sandbox scopes, OCI candidate flags and narrow proc fallback
+	python3 -m unittest discover -s runner/bin -p 'test_*.py'
+
+runner-test: sandbox-test ## Build and test the pinned Codex SDK runner
 	cd runner && npm test
 
 compose-check: ## Validate Docker Compose configuration
 	$(COMPOSE) config --quiet
 
-verify: agent-policy fmt-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks
+verify: agent-policy agent-control-check fmt-check diff-check lint test-unit runner-test ui-test ui-build compose-check ## Run all non-destructive checks
 
 .PHONY: architecture-export architecture-export-build architecture-export-test architecture-export-format
 architecture-export: architecture-export-build ## Export persisted CURRENT graph using a clean, committed producer binary
@@ -327,17 +374,9 @@ architecture-export-test: ## Verify portable graph, owner inventory, immutable p
 	$(GO_ENV) go test ./internal/architecturecatalog ./internal/usecase/architecturecatalog ./internal/adapters/git ./cmd/architecture-export
 
 architecture-export-format: ## Format only the portable architecture graph exporter files
-	gofmt -w internal/domain/architecture_fleet_inputs.go internal/architecturecatalog/fleet_external.go internal/architecturecatalog/fleet_external_test.go internal/architecturecatalog/builder.go internal/domain/architecture_catalog.go internal/architecturecatalog/fleet_inputs.go internal/architecturecatalog/fleet_inputs_test.go internal/usecase/architecturecatalog/fleet_export.go internal/usecase/architecturecatalog/fleet_export_test.go internal/domain/architecture_graph.go internal/architecturecatalog/export.go internal/architecturecatalog/export_test.go internal/usecase/architecturecatalog/current.go internal/usecase/architecturecatalog/export.go internal/usecase/architecturecatalog/export_test.go internal/adapters/git/architecture_blob.go internal/adapters/git/architecture_blob_test.go cmd/architecture-export/main.go cmd/architecture-export/main_test.go
+	gofmt -w internal/domain/architecture_graph.go internal/architecturecatalog/export.go internal/architecturecatalog/export_test.go internal/usecase/architecturecatalog/current.go internal/usecase/architecturecatalog/export.go internal/usecase/architecturecatalog/export_test.go internal/adapters/git/architecture_blob.go internal/adapters/git/architecture_blob_test.go cmd/architecture-export/main.go cmd/architecture-export/main_test.go
 
-.PHONY: context-test context-format context-build context-gold
-context-test: ## Verify offline retrieval core, adapters, discovery reuse, routing and CLI
-	$(GO_ENV) go test ./internal/contextretrieval/... ./internal/adapters/contextretrieval/... ./internal/discovery ./internal/planning ./cmd/course-dev-orchestrator
-
-context-format: ## Format only context retrieval program files
-	gofmt -w $$(find internal/contextretrieval internal/adapters/contextretrieval -name '*.go') internal/discovery/scanner.go internal/discovery/retrieval.go internal/planning/routing.go internal/planning/routing_coverage.go internal/planning/routing_coverage_test.go cmd/course-dev-orchestrator/context_retrieval.go cmd/course-dev-orchestrator/context_retrieval_test.go cmd/course-dev-orchestrator/main.go
-
-context-build: ## Build the offline context command executable
-	$(GO_ENV) go build -o .cache/bin/course-dev-orchestrator-context ./cmd/course-dev-orchestrator
-
-context-gold: context-build ## Evaluate committed offline gold fixtures
-	.cache/bin/course-dev-orchestrator-context context-evaluate --fixtures-dir test/fixtures/context-retrieval/gold
+.PHONY: sandbox-certification-build
+sandbox-certification-build: ## Build the disposable certification candidate executable
+	mkdir -p .cache/certification-build-tmp
+	TMPDIR=$(CURDIR)/.cache/certification-build-tmp $(GO_ENV) go build -o .cache/bin/course-dev-orchestrator-sandbox-candidate ./cmd/course-dev-orchestrator

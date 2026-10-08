@@ -1,6 +1,17 @@
 # Implementation progress
 
 Last updated: 2026-09-24
+Last updated: 2026-09-30
+
+The Agent Control Plane foundation is implemented locally. The canonical
+`agent-system/` catalog defines managed global policy, skills, and architecture
+profiles; `internal/agentcontrol` validates checksums and profiles, builds
+read-only drift proposals, and applies repository assets only with the exact
+approved fingerprint. Local skills and `.ai` project knowledge remain owned by
+their repositories. Global policy inspection is explicit and read-only, and
+global installation remains unavailable. Focused tests, canonical policy
+checks, and full `make verify` pass for this stage, including Go, runner, UI,
+Compose, formatting, and whitespace validation.
 
 ## Current status
 
@@ -1181,6 +1192,130 @@ disposable PostgreSQL rows; no real Telegram bot, user, or chat was contacted.
   `make plan` passed; `make config` remains blocked by the unrelated missing
   `/Volumes/ZX10/Developments/nextjs/.env.example` contract.
 
+## D5 — planner route and contract-plan integration
+
+- Integrated evidence-backed route metadata and adaptive contract planning into
+  the existing deterministic-baseline plus `AgentPlanner` refinement flow.
+  Canonical shared policy, `task-route`, `contract-plan`, and applicable
+  architecture profile bytes come from the loaded Agent Control Plane catalog;
+  Go code contains only the compact prompt wrapper.
+- Added a bounded, read-only repository evidence index for local instructions,
+  service/architecture metadata, contracts, commands, test manifests, stack
+  manifests, and source/test paths, symbols, imports, and checksums. The walker
+  skips symlinks, `.env*`, build/cache/vendor directories, and the legacy
+  `.ai/agents`, common-rules, and workflow inputs.
+- Added verified `go.canonical` and `nextjs.common` profile resolution,
+  including student/admin variants. Unsupported repositories remain unresolved
+  and require owner review; no route is selected without concrete compatible
+  repository evidence.
+- Added typed route targets, primary route, contract inspections, verification
+  boundary, shared-boundary candidates, and contract-plan states. A shared
+  boundary across multiple routes yields `FREEZE_REQUIRED`; incomplete
+  routing defers the contract decision as `PLANNED`; an isolated route or
+  multiple routes without a shared candidate yields `NOT_REQUIRED`.
+- `freeze_required` is only a future owner-reviewed planning constraint.
+  There is no source-level contract baseline or frozen-contract claim, no
+  contract-pack materialization, no route-level task rows, and no Temporal
+  shard/freeze changes. Existing task rows and executable write scopes remain
+  intact under `scope_mode: analysis_only`.
+- Stored the typed metadata in `PlannerOutput`, which already persists as
+  JSONB and is exposed by the existing plan API. The existing input/output
+  SHA-256 fingerprint now uses a shared domain helper and binds routes,
+  evidence, contract boundaries, and freeze requirements to owner approval.
+  Old planner outputs with metadata version zero continue to decode.
+- Added semantic RED evidence: the focused validator test compiled and failed
+  because an unsupported architecture profile was accepted. The focused
+  planner target now passes profile, routing, contract-plan, validation,
+  persistence/fingerprint, and compatibility cases. Full `make verify`
+  passed, including Go vet/tests, agent-policy/control checks, runner tests,
+  UI type/tests/build, and Compose validation.
+
+## D6 — architectural shards, contract baselines, and fan-out readiness
+
+- Strengthened architecture profile resolution with required repository shape
+  evidence. `go.canonical` requires a Go module plus domain, usecase, transport,
+  and infrastructure paths; Go language/source evidence alone is insufficient.
+  `course-dev-orchestrator` and `ms-go-task-source` shaped fixtures remain
+  unresolved. `nextjs.common` retains shared structure for student/admin variants.
+- Added an approved planner-selected `architectural_routes` field. Shard
+  planning creates only those internal responsibilities; it preserves exactly
+  one project/repository-level Plan Task and creates no shard issues/PRs.
+- Added deterministic repository-scoped shard records with stable IDs, concise
+  local intent, bounded targets, explicit consumes/implements references,
+  narrow path ownership, test paths, risk, verification, and dependencies.
+  Composition routes are `COMPOSITION_REQUIRED`, serial, and deferred to an
+  after-workers phase.
+- Added profile-defined Go and TypeScript contract locations. The materializer
+  writes idempotent behavior-free skeletons, checks containment, module/package
+  and symbol validity, imports, syntax, symlinks, and protected-file collisions.
+- Added a separate execution baseline lifecycle
+  `NOT_REQUIRED/PENDING/MATERIALIZING/FROZEN/INVALIDATED/BLOCKED`, distinct from
+  planning `NOT_REQUIRED/PLANNED/FREEZE_REQUIRED`. Persisted baselines include
+  task/plan/repository identity, profile and contract fingerprints, Git base
+  revision, generated file hashes, contract references, validation, and
+  timestamps. Revision, profile, plan, or source-hash drift invalidates a
+  frozen baseline.
+- The current materializer writes deterministic behavior-free skeletons, but
+  the Contract Agent, contract-only Git commit, and independent reviewer are
+  not wired. Freeze-required baselines are therefore recorded as `BLOCKED`,
+  with aggregate hashes and missing-evidence reasons; readiness refuses them.
+  The persisted approved Plan fingerprint and future execution-base reference
+  prevent accidentally treating the original source revision as a frozen
+  contract baseline.
+- Added an informational `READY_FOR_FANOUT` gate that requires an approved
+  plan, verified contract baselines, valid dependencies, non-conflicting
+  parallel scopes, current profile fingerprints, and resolved routing. Its
+  persisted parallelism scope is limited to shards within one repository.
+  Gate reasons and evidence are persisted and audited.
+- Added migration `018_agent_shard_execution`, the approved-only
+  `plan-shards --plan-id` application entrypoint, and focused commands/tests.
+  No worker fan-out is wired or started.
+- `make agent-shard-test` passes, including profile semantics, deterministic
+  materialization, traversal and collision rejection, invalidation on profile/
+  revision/hash drift, incomplete-contract and scope-conflict gates, stable
+  shard identity, unsupported-profile owner review, and readiness prerequisites.
+  `make planner-route-test`, `make agent-control-test`, and full `make verify`
+  pass, including `go vet`, all Go tests, runner tests, UI typecheck/tests/build,
+  and Compose configuration validation. Migration `018` is defined but has not
+  been applied. Finish the Contract Agent/commit/reviewer path before worker
+  fan-out can safely consume `READY_FOR_FANOUT` evidence.
+
+## D6.1 — Contract Freeze execution and verification — 2026-10-01
+
+- Wired the Contract Agent into approved shard preparation using the existing
+  `AgentRunner`, structured-result validator, model router, and managed
+  `TaskWorktree`. Its prompt contains only the approved Plan and ContractPlan
+  fingerprints, scoped routing, same-repository shard plans, profile, selected
+  evidence/contracts, contract-plan skill, contract write scope, and fixed
+  verification capability. Prompt size and evidence content are bounded.
+- Added a full changed-path verifier. It rejects paths outside the profile-owned
+  contract directory, secret-like content, unexpected/implementation files,
+  unapproved declarations, and Go implementation/value changes. It parses Go
+  declarations with `go/parser`, applies a narrow TypeScript declaration check,
+  and binds the diff digest to each changed file's content hash.
+- Added a distinct read-only reviewer execution with strict `PASS`, `REJECT`,
+  and `REPLAN_REQUIRED` results. The exact verified paths are committed locally
+  only after the Contract Agent, mechanical checks, fixed contract verification,
+  and independent reviewer all pass.
+- `FROZEN` evidence now includes the agent thread/result hash, mechanical diff
+  hash, fixed contract-check result, independent reviewer identity/result hash,
+  commit SHA, committed file hashes, and aggregate digest. Verification requires
+  the commit to be a single-parent child of the approved source revision and
+  checks every persisted contract reference against committed content. Plan,
+  contract/profile, revision, commit, or content drift invalidates the baseline.
+- Readiness rejects missing or malformed evidence, missing independent review,
+  aggregate/hash drift, and contract-dependent sibling shards that do not use
+  the same repository baseline commit. No worker or Temporal fan-out was started.
+- The migration 018 integration suite passed on a fresh loopback-only
+  PostgreSQL 16 container with a tmpfs data directory. It applied migrations
+  001–018, round-tripped baseline evidence, exercised status/JSON constraints,
+  rolled migration 018 down and up, and confirmed existing project/plan/task
+  rows remained intact.
+- `make agent-control-test`, `make planner-route-test`, `make agent-shard-test`,
+  and `make verify` passed. The migration integration suite passed separately.
+  The successful `FROZEN` transition is proven by an end-to-end managed-worktree
+  fixture; no live approved Plan was supplied or executed.
+
 ## Remaining work
 
 - Do not approve or run legacy plan
@@ -1222,6 +1357,12 @@ the three pre-migration replacement records or publish the remaining three fake
 issues for plan `0436da42-b1cf-45de-a538-95f546f4ba9a` unless the owner names
 that exact action. Do not publish real issues/PR, start a plan, push, merge, or
 deploy without their own subsequent explicit authorizations.
+Resolve the failed source-inspection preflight, re-freeze the approved canary
+contracts through the existing Contract Freeze workflow, and re-establish
+`READY_FOR_FANOUT`. Then start a new canary-only Temporal fan-out and prove
+actual overlap before any assembly or integration verification. Do not reuse
+the invalidated baseline, promote the sandbox, or run against product
+repositories.
 
 ## Testing Policy task completion gate — 2026-09-30
 
@@ -1240,6 +1381,168 @@ deploy without their own subsequent explicit authorizations.
   signal; the worker currently supplies `not-required`. In-scope business
   acceptance therefore remains an integration gap, and this slice does not
   establish the full program completion criterion.
+- The task model does not provide a Business Acceptance scope signal. The
+  worker must therefore consume the disposition from the checksum-bound
+  Required Test Matrix rather than make that decision itself.
+
+## D6.2 — Contract profile repair and live freeze canary — 2026-10-02
+
+- Go contract import policy now distinguishes standard-library, same-module,
+  third-party, cross-layer, and external-service imports. The canonical Go
+  profile permits standard-library imports and only profile/project-evidenced
+  dependencies; route dependency direction still rejects usecase-to-Postgres.
+- Go contracts are materialized on the owning route surface. The availability
+  application/result and repository-port boundaries are owned by
+  `backend.usecase` and live under `internal/usecase/`; no universal
+  `internal/contracts` layer is defined or required.
+- Contract freeze snapshots source, materializer, and pre-agent state. It keeps
+  `MaterializerChanges`, `AgentChanges`, and full-source-to-final
+  `BaselineChanges` separate, validates agent claims against the agent delta,
+  and uses the full baseline diff for mechanical review, independent review,
+  commit scope, and persisted hashes.
+- Plan v4 remains historical blocked evidence. Plan v5 was created from the
+  unchanged `/availability` request, superseded v4, received the issue proposal,
+  and was approved through the exact fingerprint
+  `74f78e1b157d4cd2dd15b12bf6565284f6e6566218be1cd1524e7f9d9f031990`.
+- On clean source `a469c8941cbf172f071f116cd4c1e8477ab79736`, the real Contract
+  Agent completed in managed isolation. Independent review passed. Contract
+  commit `2430b73ec4eb1c9defb91a8462dae943f883e5cc` is its direct child and
+  changes only `internal/usecase/application_command_result.go` and
+  `internal/usecase/repository_port.go`. The persisted baseline is FROZEN with
+  matching file hashes, aggregate digest, agent result, mechanical verifier,
+  contract verification, and reviewer evidence.
+- All three persisted sibling shards use that exact contract commit and
+  baseline ID as `CONTRACT_BASELINE` execution base. The original database
+  records `READY_FOR_FANOUT`; no layer workers or Temporal Plan run were
+  started.
+- Drift verification used a separate repository clone and database. A direct
+  child commit changed `AvailabilityRequest.ResourceID` from `string` to
+  `[]byte`; verification persisted `INVALIDATED` after the committed file hash
+  no longer matched the frozen evidence, and the cloned readiness became
+  BLOCKED. The original FROZEN/READY rows remain unchanged.
+- `make agent-control-test`, `make planner-route-test`, `make agent-shard-test`,
+  `make runner-test`, `go vet ./...`, `go test ./...`, `git diff --check`, and
+  `make verify` passed. The full Go suite required loopback listener permission
+  for existing `httptest` packages. Sandbox classification remains CANARY_ONLY;
+  `PRODUCTION_SANDBOX_READY` remains NO.
+
+## D6.3 — Temporal architectural worker fan-out — 2026-10-02
+
+- Added a typed, deterministic `WorkPackage` containing one shard's local
+  intent, frozen contracts, target symbols/paths, write and read-only scopes,
+  verification boundary, semantic invariants, and allowed blockers. It excludes
+  the original broad business prompt.
+- Added explicit `ShardAttempt` and fan-out persistence in migration 020,
+  including the exact package/base, worker thread, model/effort, RED/GREEN,
+  verification, changed paths, orchestrator commit, status, and start/finish
+  timestamps.
+- Added Temporal workflow/activity coordination. The workflow schedules all
+  independent worker activities before awaiting results, uses the existing
+  global activity limit (3 in this canary), and keeps Git/model/database work
+  in activities. Mechanical RED validation, path-scope and frozen-contract
+  checks, GREEN reruns, orchestrator-created commits, the persisted barrier,
+  deterministic serialized assembly, integration checks, and read-only review
+  are implemented. Composition-required plans stop at the serial composition
+  boundary; this canary declares composition not required.
+- Focused worker/workpackage, Temporal overlap, barrier, assembly-order,
+  reviewer-verdict, scope, and managed-commit tests pass. `make worker-test`,
+  `make agent-control-test`, `make planner-route-test`, `make agent-shard-test`,
+  `make runner-test`, `go vet ./...`, and `git diff --check` passed before the
+  live attempt. `make verify` passed once before the final preflight-diagnostic
+  change and before an unrelated architecture-catalog edit appeared in the
+  shared working tree.
+- Applied only migration 020 to disposable database `cdo_live_freeze`, rebuilt
+  the disposable CDO image, and started its existing Temporal worker service.
+  The sandbox remains `CANARY_ONLY`: the worker has `seccomp=unconfined`, drops
+  all Linux capabilities, and has a writable container root filesystem.
+- Temporal workflow `shard-fanout-2cbc8350-fad7-4921-a490-72dbe7dc4b54`
+  started with parallelism limit 3. Its preparation activity rejected the
+  source checkout as drifted before WorkPackages or worker workspaces were
+  created. The activity's first failure invalidated ContractBaseline
+  `cbc8f078-ec85-5b4e-9686-250920ead847` and changed readiness to `BLOCKED`;
+  subsequent Temporal retries correctly refused the now-blocked readiness.
+  The workflow completed `BARRIER_BLOCKED` with no attempts. No layer worker,
+  commit, assembly, integration verification, or reviewer ran.
+- A read-only check after the failure found the canary source clean at
+  `a469c8941cbf172f071f116cd4c1e8477ab79736`, matching the persisted project
+  revision. The first activity did not persist the underlying source-inspection
+  error, so the cause cannot be safely distinguished from a transient or real
+  inspection failure. Added diagnostic reason preservation and tests for clean,
+  dirty, mismatched-HEAD, and inspection-error cases. The invalidated baseline
+  was not retried or restored.
+- A later `make verify` rerun stopped at `fmt-check` because the shared working
+  tree gained an unrelated unformatted edit in
+  `internal/domain/architecture_catalog.go`. The subsequent `go test ./...`
+  run failed in `internal/usecase/architecturecatalog` on that separate
+  architecture-catalog change; `go vet ./...` passed. Those files were left
+  untouched.
+
+### Safe next action
+
+Diagnose the original connected-source inspection error, then re-establish a
+current frozen baseline and `READY_FOR_FANOUT` evidence through the approved
+Contract Freeze path. Start a new Temporal run only after that preflight passes.
+Do not reuse the invalidated baseline or treat this attempt as parallel-worker
+proof. Production rollout remains prohibited.
+
+## D6.3 continuation — source-preflight semantics and PostgreSQL canary fixture — 2026-10-02
+
+- Added typed, persisted `SourcePreflightEvidence` to fan-out execution payloads:
+  project/repository path, expected and observed revision, expected-clean and
+  observed status, expected/observed repository identity, contract-baseline
+  commit, outcome, reason code, bounded error, and timestamp. Repeated
+  inspection attempts remain in the history when a later preparation succeeds.
+- Confirmed checkout drift (dirty tree, changed HEAD, repository identity or
+  project revision mismatch) and contract-hash mismatch invalidate the baseline
+  and readiness. Git/repository/contract-verifier inspection failures persist a
+  `BARRIER_BLOCKED` attempt while retaining `FROZEN` and `READY_FOR_FANOUT` so a
+  later inspection can retry. The contract verifier now marks Git command/read
+  errors separately from an observed hash mismatch.
+- Added service semantics tests for dirty/HEAD/identity drift, hash drift,
+  repository inspection failure, contract-verifier I/O failure, retry after a
+  successful inspection, and preservation of prior preflight history.
+- Prepared a separate canary clone at
+  `/Volumes/ZX10/Developments/.cdo-live-freeze-canary-20261001-a74e/projects/availability-service-postgres`.
+  Infrastructure-only commit `713849e5d9df0f11c0d09d447df5f0241cad8d40`
+  adds pgx, an existing availability schema migration, a scoped disposable
+  schema harness, seeded-row integration coverage, and a Docker/native
+  PostgreSQL test runner. It does not implement the Availability feature. The
+  runner passed against PostgreSQL 16.15 and cleaned up its temporary database.
+- CDO's safe verification environment now passes only the explicit
+  `TEST_DATABASE_URL` alongside its existing allowlist; the canary test fixture
+  rejects non-local hosts or database names without `test`. The planned
+  compose-only canary database uses a trust-authenticated internal network,
+  no published port, and no persistent volume.
+- `make agent-shard-test`, `make planner-route-test`, `make agent-control-test`,
+  `make worker-test`, `make runner-test`, `go vet ./...`, `go test ./...`, and
+  the complete `make verify` passed. `git diff --check` passed. Unrelated
+  architecture-catalog files were not edited by this continuation.
+- No new Plan, approval, ContractBaseline, readiness, WorkPackage, or worker
+  run was created. Docker Desktop reports `Docker Desktop is unable to start`,
+  and the canary API health request timed out. The previous failed Plan,
+  invalidated baseline, blocked readiness, and `BARRIER_BLOCKED` workflow remain
+  historical evidence; they were not reset or reused. The full new live canary
+  lifecycle is therefore still incomplete, and the sandbox remains
+  `CANARY_ONLY`.
+
+### Current safe next action
+
+Restore the existing disposable Docker Desktop canary runtime, confirm the
+orchestrator API and Temporal worker are healthy, then connect this committed
+canary source and follow the normal Command → Plan → issue-proposal → owner
+approval lifecycle. Keep the historical failed Plan and baseline unchanged.
+Do not start a worker run until the new source and contract baseline are
+persisted and readiness is `READY_FOR_FANOUT`.
+
+## Testing Policy business acceptance handoff — 2026-10-01
+
+- Removed CDO's hardcoded `--business-acceptance not-required` override. The
+  owner matrix is the sole source of business acceptance scope; CDO validates
+  the DoD report's resulting disposition and its lifecycle consistency.
+- The exact-argv allowlist accepts the new matrix-derived command and an
+  optional evidence argument, while rejecting the removed decision override.
+- Focused `go test ./internal/execution ./internal/adapters/git` and
+  `git diff --check` pass.
 
 ## Testing Policy final wave — CDO provisioner and graph identity — 2026-10-02
 
@@ -1315,6 +1618,7 @@ deploy without their own subsequent explicit authorizations.
   full-fleet artifact was produced.
 
 ## Exact pinned owner fleet producer — 2026-10-03
+## Agent Control Plane approved availability canary — 2026-10-03
 
 - Added architecture-fleet-inputs.v1 with exactly 42 sorted canonical Git owners,
   full source commits, declaration blob/digest locks, profiles and service IDs.
@@ -1335,9 +1639,435 @@ deploy without their own subsequent explicit authorizations.
   descriptor separation. These temporary
   reports are UNPUBLISHED working declaration diagnostics, not immutable fleet
   graph evidence. No authoritative graph, commit or publication was performed.
+- Owner explicitly approved existing Plan `809c8538-70fd-4233-8af0-a60f5cc8be11`,
+  fingerprint `78c991e4a685c96749f3673d493b78c7412fdeb7f8c7e9703af32f72564eb775`.
+  Live routes match HTTP/usecase/persistence, composition excluded,
+  `FREEZE_REQUIRED`; the approved Plan and issue scope were not changed.
+- Docker socket denial was the execution tool sandbox. Authorized Docker
+  access works without Desktop reset, storage or permission changes. The
+  canary bind mount additionally exhibited UID 100/0 fluctuation during Git
+  inspection; a runtime-only Git wrapper trusts exactly the disposable source
+  `/projects/availability-service-postgres`, without wildcard trust.
+- The live Contract Agent result failed the existing strict delta-claim gate.
+  A regression exposed that freeze retries reused the dirty rejected isolation.
+  Freeze now asks the approved isolation adapter for a fresh attempt workspace,
+  retaining the baseline identity and prior workspace; the prompt explicitly
+  requires edited materializer paths in both reported change sets. The retry
+  regression failed before the fix and the contractfreeze suite passes after it.
+- This continuation has not yet reached a frozen baseline or fan-out. It remains
+  CANARY_ONLY; no production readiness, push, merge, PR or product repository run.
+  Unrelated architecture-export formatting/schema blockers remain untouched.
+
+- Final live freeze attempt used Contract Agent thread
+  `01a1000b-1619-77b3-b528-2a27ead93e64` and distinct read-only reviewer
+  `01a1000b-f99d-7b01-b823-b1e63df861cb`. Agent provenance, complete diff,
+  syntax/profile checks and real-PostgreSQL `go test ./...` passed after using
+  a private runtime TMPDIR under canary `/data` (the standard `/tmp` is noexec).
+- Reviewer returned `REPLAN_REQUIRED / ARCHITECTURE_CONFLICT`: the planned
+  usecase-owned repository port exposes usecase-owned named request/result
+  types, but the approved profile permits persistence imports only from domain.
+  That dependency conflict was confirmed against the canonical profile. Baseline
+  `6ea0368c-d65b-51c8-a281-bf12fcf6fae6` remains BLOCKED with no contract commit;
+  workers, barrier and assembly were not started. No profile, approved Plan,
+  route or contract scope was altered to override review. A separate owner
+  decision is required before changing that approved architecture.
+- All five focused suites, vet, unit tests and full make verify passed after
+  the recovery fix. Earlier unrelated architecture-export blockers ceased
+  reproducing without edits from this workstream. The target
+  INTEGRATION_VERIFIED has not been achieved.
+
+## Contract ownership replan — 2026-10-03
+
+- Owner rejected persistence-to-usecase dependencies and selected separate
+  application/usecase and repository/domain shared boundaries. Canonical Go
+  dependency permissions remain unchanged. The profile now declares explicit
+  ordered boundary ownership and implementer routes; compatible existing port
+  paths are resolved from repository evidence, including domain repository,
+  domain ports and internal port variants. No universal contracts layer exists.
+- ContractPlan records contract_owner_routes independently of implementation
+  routes and boundary implementers independently of consumers. Non-selected
+  owners require explicit profile permission and source evidence. Validation
+  enforces inward consumer dependencies and rejects arbitrary owners or missing
+  evidence. Contract reference projections retain the implementer role without
+  creating a Domain worker. No application/domain mapping behavior was added.
+- The semantic regression failed before the fix (repository owner was usecase).
+  Focused planner/profile/import/baseline/shard/worker suites, runner tests,
+  vet, unit tests, full make verify and diff-check passed after the fix. Tests
+  prove three implementation shards with a Domain contract owner, rejected
+  persistence-to-usecase and transport-to-persistence imports, compatible path
+  variants, and changed fingerprints on ownership changes.
+- Created new Plan `fa9fc944-de2b-42b1-a16d-7ace265949e8` through normal Command,
+  planner, issue proposal and submit from the unchanged business request and
+  clean source commit `713849e5d9df0f11c0d09d447df5f0241cad8d40`.
+  Submitted fingerprint:
+  `0d309871a74643bc14d44a428ca242b2a31451e1e43e26b349cdc87b193fcae0`.
+  Approval `bb3dae27-b9d1-4163-8f86-9b96f0aba85c` is pending. Live implementation
+  routes are HTTP/usecase/persistence; composition excluded; FREEZE_REQUIRED.
+  Application target is internal/usecase/application_command_result.go;
+  repository target is internal/domain/repository_port.go. These paths derive
+  from profile/evidence and the existing deterministic filename convention.
+- The previous Plan and BLOCKED baseline payload were compared against their
+  retained snapshots and are exactly unchanged. The new Plan has zero execution
+  shards, zero baseline records and zero fan-out records: no freeze or workers
+  started. Disposable API/idle worker were updated to the matching Green planner
+  and catalog; CANARY_ONLY and production readiness NO remain. No product repos,
+  push, merge, PR, legacy .ai assets or Mermaid changes in this slice.
+
+### Approved ownership canary: freeze and WorkPackage directory deny fix
+
+- Owner approved Plan fa9fc944-de2b-42b1-a16d-7ace265949e8 with unchanged
+  fingerprint 0d309871a74643bc14d44a428ca242b2a31451e1e43e26b349cdc87b193fcae0.
+  First Contract Agent naming error was rejected by full diff verification.
+  A fresh managed retry passed independent Contract Reviewer and froze baseline
+  4116d9ba-1d41-5131-8342-cced1dd87c4f at
+  fca96936d5d6442558e54cba0e810621ff409a59; readiness READY_FOR_FANOUT.
+- Normal Temporal preparation exposed a concrete compatibility defect: persisted
+  canonical deny paths such as cmd/ were rejected by WorkPackage validation.
+  Added a regression test (RED before fix) and allowed safe directory deny
+  prefixes without rewriting persisted scope. Descendant matching now preserves
+  the directory restriction; unsafe/traversal paths remain rejected. All requested
+  focused suites, runner tests, lint, unit tests and make verify passed.
+- Plan routing, ContractPlan and frozen contracts remain unchanged. No workers
+  started in the rejected preparation. Retry uses the same approved canary only.
+
+- Live fan-out initially failed before a thread was created because worker
+  auth.json was an empty underlying fixture. API already had a valid secret
+  mount. Added the same existing secret mount to the private canary worker
+  overlay; no credential content was printed/copied. Read-only startup probe PASS.
+- Recovery then exposed hardcoded attempt_number=1 conflicting with preserved
+  failed attempts. Executor now allocates the next number from immutable history
+  only for finished FAILED attempts with identical WorkPackage and baseline;
+  active, verified, replan and contract-change attempts remain blocked. Regression
+  coverage and all focused/lint/unit/runner/full verify checks passed. Historical
+  attempts and Temporal histories remain available. No frozen/Plan scope changes.
+
+- Actual worker startup exposed strict RED response schema rejection: declared
+  pre_implementation_sha was absent from required. Regression test RED before
+  the one-field correction, GREEN after. Orchestrator remains authoritative for
+  pre-implementation SHA. All requested focused/vet/unit/runner/full verify
+  checks passed. API schema failure attempts are preserved, never counted as RED.
+
+- RED worker claims invented worker_thread=/root because thread IDs are assigned
+  by the runner after the request starts. Agent schemas no longer request this
+  identity. Orchestrator binds it only after matching runner callback, response
+  and requested resume thread; shard and baseline claims still checked. Tests
+  reject missing/mismatched runner identity. Schema regression RED before, GREEN
+  after; focused/lint/unit/runner/full verify PASS.
+- Fan-out Prepare now asks the approved isolation adapter for a fresh workspace
+  task identity each preparation. Previously edited failed workspaces are retained
+  for evidence; no direct reset/worktree commands by agents or workers. Approved
+  WorkPackages, scopes, routes and frozen baseline remain unchanged.
+
+- Latest canary reached budget guardrail at CODEX_SOL_MAX_RUNS_5H=20, enforce
+  mode. HTTP RED admission denied; usecase and persistence semantic RED were
+  independently rerun, but implementation admission denied. No verified shard
+  commits, barrier ready, assembly or integration review. Requested a bounded
+  owner decision for temporary canary-only limit 40, restore 20 after stopping.
+  No budget change or further runner execution without that decision.
+- Inspection of Persistence RED showed interface-only coverage alongside the
+  existing real fixture. Tightened generic RED prompt to require observable
+  behavior assertions, real PostgreSQL fixture+seed before semantic assertion,
+  and future repository query assertions; HTTP fake application and usecase fake
+  repository cases required. Prompt regression RED before correction and all
+  requested focused/lint/unit/runner/full verify checks GREEN afterward.
+
+### Owner-approved temporary budget canary resume
+
+- Owner explicitly approved 20 -> 40 only for Plan fa9fc944-de2b-42b1-a16d-7ace265949e8,
+  fingerprint and frozen baseline unchanged. Applied private canary overlay only;
+  enforce mode retained. Actual resume consumed 5 tracked runs (3 RED phases and
+  2 implementations); tracked five-hour totals 21 -> 26 non-denied, 3 denied
+  unchanged. No increase above 40 or default/production configuration changes.
+- Three real gpt-5.6-sol/low workers started from fca96936d5d6442558e54cba0e810621ff409a59.
+  HTTP and usecase received orchestrator-verified semantic RED. Persistence
+  correctly stopped before implementation: baseline AvailabilityStore has no
+  callable FindAvailable method, so strict real PostgreSQL behavior RED is
+  impossible without production scaffolding before RED. Interface-only failure
+  was not accepted. Preserved structured TEST_BOUNDARY_MISSING evidence.
+- HTTP/usecase implementations were rejected before GREEN because implementation
+  phase claims omit preserved RED test files, while verifier compared against the
+  full baseline diff. Added regression RED then corrected comparison to include
+  preserved RED files, retaining full writable-scope, frozen hash, max-file and
+  byte-for-byte RED test checks. Focused/lint/unit/runner/full verify GREEN.
+  Actual failed workspaces contain only assigned production and test paths.
+- Terminal workflow BARRIER_BLOCKED: zero verified commits; no assembly,
+  composition resolution or integration review. Original budget 20 was restored
+  in both API and worker with enforce mode, verified from effective runtime env.
+  Both frozen contract hashes match in all three latest assigned workspaces.
+  Stop pending owner decision about callable persistence test seam versus
+  strict no-production-scaffolding-before-RED constraint. No new Plan/freeze,
+  product repos, push, merge, PR, composition canary or production hardening.
+
+### Callable repository contract validation and owner retirement
+
+- Approval-impact inspection: existing Plan already approves domain-owned lookup
+  operation, usecase consumer and persistence implementer. Existing frozen port
+  already declares FindAvailable(context.Context, AvailabilityRange)
+  ([]AvailabilityInterval, error). CASE_A_REUSE_PLAN applies to the interface
+  signature; no routing, ownership, scope or fingerprint mutation is needed.
+  The missing callable execution is on AvailabilityStore, not RepositoryPort.
+- Added deterministic Go repository-port completeness validation: empty
+  interfaces, marker structs and interfaces without exported callable operations
+  are rejected. Local embedded interfaces/aliases resolve through the same file.
+  Contract Agent/Reviewer prompts require callable owner-owned signatures and
+  forbid executable adapter structs, SQL or method bodies in contract-only diff.
+  Regression RED before fix (empty interface and marker accepted); positive
+  domain-owned callable port and committed validation GREEN afterward. All
+  requested focused/lint/unit/runner/full verify checks and diff-check PASS.
+- Owner explicitly retired baseline 4116d9ba-1d41-5131-8342-cced1dd87c4f for execution.
+  Guarded canary-only transaction changed state to INVALIDATED and readiness
+  to BLOCKED; original payload retained in audit history and local evidence.
+  Commit fca96936d5d6442558e54cba0e810621ff409a59 was not edited.
+- No new freeze/Plan/model runs/workers: used gpt-5.6-sol runs=25 in five-hour
+  window versus limit20. Owner budget gate requires a new explicit decision.
+  Minimum remaining pipeline: 9 calls (2 freeze + 6 workers + 1 integration
+  reviewer); proposed cap40 with reserve, enforce retained, restoration20.
+- Separate unresolved condition: pure Go interface signatures cannot provide
+  executable adapter calls when AvailabilityStore has no method. No production
+  scaffold/body was added before RED. Requested owner clarification on permissible
+  callable fixture/RED boundary; a changed fixture source would require new Plan
+  approval. Previous claim-comparison repair remains in source and regression
+  tested. CANARY_ONLY, budget20/enforce, no push/merge/PR/product repositories.
+
+## Owner-approved canary RED_SETUP and replacement baseline — 2026-10-03
+
+- Added immutable historical baseline versions and migration021. Retired identities
+  cannot revive; successor freezes receive new identities. Fanout projections
+  select latest current-baseline attempts; full history remains auditable. Terminal
+  fanout replacement requires retired prior baseline, frozen compatible successor,
+  and no unfinished workers; exact previous payload is retained in audit.
+- Added optional persistence RED_SETUP with strict AST validation: pool dependency,
+  constructor, exact frozen port methods and explicit ErrNotImplemented only.
+  Persisted phase history, setup sources/hashes and mechanical PASS precede RED.
+  Test-only RED uses snapshot delta and preserves setup source bytes. Actual
+  implementation remains gated on orchestrator-verified semantic RED.
+- Existing implementation claim comparison fix remains intact. Focused shard/worker
+  tests, full make verify and disposable PostgreSQL integration tests PASS; the
+  migration rollback test now follows021/020/018 dependency order. Runtime changes
+  are confined to the approved disposable canary, temporary40/enforce with required
+  restoration20 after terminal outcome. No model support change or product work.
+
+- Live replacement preflight exposed initial-ID-only freeze validation and a
+  shard rematerialization DELETE CASCADE. Added predecessor-bound validation and
+  in-place shard updates with historical deletion refusal. Both regressions
+  reproduced before correction; focused and disposable database checks PASS.
+  Restored15 old failed attempts exactly from preserved fanout payload; SQL proof
+  confirms every payload matches. No historical failure was promoted to success.
+- Independent source review found worker HEAD continuation could conceal commits.
+  Workers now must retain frozen HEAD before orchestrator commit, and contract
+  hashes are read in the actual workspace, including after test-only RED edits.
+  Focused shard and worker checks PASS. Plan/fingerprint/ContractPlan unchanged.
+
+- Source-preflight successor guards now retain historical projections and use fresh
+  successor evidence. Regression, focused and full make verify checks PASS.
+- New baseline7c941e62-21f9-5380-8e7c-fa02835e79e2 frozen at
+  733832989572db82d20a725b236f21f146dd4f77 with independent Contract Reviewer PASS,
+  READY_FOR_FANOUT and unchanged Plan/ContractPlan fingerprints.
+- Three actual agents overlapped on the new baseline. HTTP and Usecase produced
+  fresh RED, independent orchestrator GREEN and verified local commits. Persistence
+  setup passed AST validation but its agent-local PostgreSQL prerequisite failure
+  did not count as RED and prevented implementation. Candidate RED now delegates
+  actual verification to the healthy orchestrator fixture; no agent environment
+  widening. Verified sibling reuse requires current approval, immutable commit,
+  frozen hashes, clean workspace and GREEN reruns. Full make verify PASS.
+
+## Disposable parallel canary terminal handoff — 2026-10-03
+
+- All3 current-baseline shards locally VERIFIED with semantic RED and orchestrator
+  GREEN; Persistence real PostgreSQL RED reached ErrNotImplemented after fixture
+  migration/seed and production RepositoryPort call. Original failed fixture
+  attempt was not counted as semantic RED and performed no implementation.
+- BARRIER_READY, deterministic Persistence→HTTP→Usecase assembly and independent
+  mechanical integration checks (diff-check, full Go suite with real PostgreSQL,
+  vet, unchanged frozen hashes) PASS. Composition SKIPPED_NOT_REQUIRED.
+- Independent integration review REJECT: public constructors absent (tests use
+  reflect/unsafe); HTTP non-UTC-offset validation missing; PostgreSQL left-boundary
+  test coverage missing. FINAL_CANARY_STATE INTEGRATION_REJECTED, not the target.
+  No frozen contracts, Plan, fingerprint, routes or scope changed.
+- Review activity heartbeat timeout also caused a duplicate reviewer. Added20s
+  heartbeat in source; focused/full make verify PASS. This correction was not
+  deployed or used to rerun the terminal canary. Temporal output remains mechanical
+  verification plus heartbeat timeout; persisted independent verdict is REJECT.
+- Temporary budget40 restored20/enforce in BOTH live API and worker; defaults
+  remain20/enforce. This continuation admitted13 runs; five-hour counter38 for
+  gpt-5.6-sol, plus1 earlier unsupported gpt-6.1-sol (39 total,3 historical denials
+  excluded). Remaining Sol capacity2 cannot accommodate fresh3-shard remediation
+  and independent review. Further runs require owner budget/scope decision.
+- Actual layer concurrency peak3 over current-baseline attempts; final verified
+  subset barrier metric2 because successful Persistence retry ran later. Evidence
+  distinguishes these measurements. CANARY_ONLY, production readinessNO, real
+  repository pilotNO. No push/merge/PR/product work or new canary started.
+
+### 2026-10-03 — Owner-approved selective canary review remediation
+
+Implemented explicit `plan-shard-remediate` execution metadata and a separate
+Temporal identity after independent integration REJECT. The approved Plan,
+ContractPlan, frozen baseline and canonical WorkPackages remain unchanged.
+Affected shards receive fresh managed isolation from the same frozen commit;
+completed VERIFIED attempts remain immutable history, with explicit remediation
+supersession and effective latest-attempt barrier evaluation. Integration uses a
+fresh managed workspace and the existing stable route order.
+
+For the HTTP offset regression, the orchestrator reproduces only exact previous
+VERIFIED production bytes, retaining frozen HEAD/base and persisting source/hash
+provenance. Constructor RED_SETUP may add only trivial public allocation; AST
+delta verification preserves every reproduced behavior node. HTTP tests then
+exercise the actual rejected offset behavior. Usecase constructor setup and real
+PostgreSQL callable stub setup do not add business/query behavior. Candidate
+finding regressions remain test-only until orchestrator semantic RED is persisted.
+Mechanical integration checks additionally validate assembled frozen bytes,
+canonical dependency directions and absence of reflect/unsafe construction.
+Periodic independent-review heartbeats remain enabled.
+
+Source verification PASS: `make agent-shard-test worker-test`, `make verify`, and
+`make test-integration POSTGRES_PORT=55474` with disposable PostgreSQL cleanup.
+Live remediation evidence is pending; no terminal canary result is claimed here.
+
+Live selective remediation terminal result: INTEGRATION_REJECTED. Three fresh
+same-baseline attempts became VERIFIED (HTTP ea880b9d64f835e3f4536d0834942b3d1c8c366f,
+Usecase bdff7af25161a9046919d98f7f7e86d2db9ef84a, Persistence
+caf1639612fa311ecaf60e803d552d0d8a215b88); barrier ready, stable fresh assembly
+c9e4bc01e94b0cfc0cdb7005f2a8c41e3f228669, composition SKIPPED_NOT_REQUIRED.
+Mechanical dependency verification initially rejected the approved test-only
+PostgreSQL fixture; a focused regression fixed that false positive while retaining
+production dependency restrictions. `make verify` passed again. Only the
+integration verification checkpoint was resumed; no workers/freeze/assembly were
+rerun. Mechanical checks and independent uncached real-PostgreSQL suite passed.
+
+New independent reviewer 01a1018f-a0fc-7ac2-b71e-b7e86c7a995d rejected the real
+HTTP/usecase +00:00 path: HTTP accepts offset zero, while the new usecase compares
+Location identity with time.UTC and rejects UTC-equivalent Local/fixed-zero times.
+No remediation continued after REJECT. Constructors/no reflect-unsafe, nonzero
+HTTP rejection and PostgreSQL left-boundary coverage were confirmed. Ten new
+runtime agent calls, actual three-layer call overlap; one review call/activity,
+attempt1 with live periodic heartbeats beyond its60-second lease and no duplicate.
+API and worker budget restored50→20 with enforce retained. Plan/baseline/readiness,
+all old19 attempt payloads, WorkPackages and frozen hashes remained unchanged.
+CANARY_ONLY; PRODUCTION_SANDBOX_READY=NO; real repository pilot=NO.
+Evidence: `.cdo-live-freeze-canary-20261001-a74e/evidence/20261003-review-remediation`
+in the workspace root. Further remediation awaits a new owner decision.
+
+### 2026-10-03 — Owner-approved UTC-equivalence selective remediation
+
+Owner decision7023e7c8 accepts independent REJECT and authorizes only Usecase
+UTC-equivalence remediation on the unchanged Plan and frozen73383298 baseline.
+Exact prior VERIFIED Usecase production bytes are reproduced on fresh frozen
+HEAD for a genuine Location-identity regression; existing public constructor
+needs no RED_SETUP. HTTP ea880b9d and Persistence caf16396 remain reusable verified
+commits, with no new worker model calls/workspaces for those unaffected shards.
+
+Added an explicitly requested verifier-owned ephemeral Go overlay regression:
+real HTTP handler → real Usecase → fake RepositoryPort. It forces a distinct
+zero-offset Local location, tests Z/+00:00 success, positive/negative offset
+rejection and equal/reversed-range rejection. No persistent canary file, shard,
+contract or composition is added. The managed verifier records source/hash,
+uncached output and unchanged assembled workspace; independent reviewer receives
+that mechanical evidence. Full-suite integration also runs uncached PostgreSQL.
+The same overlay reproduced the prior rejected tree's actual +00:00 HTTP400 and
+zero repository calls, while all remaining cases passed. This characterization
+is behavioral RED, not a compiler/fixture/environment failure.
+
+Source verification PASS: make agent-shard-test worker-test and make verify.
+Current tracked five-hour count is0; live API/worker remain20/enforce, so the
+owner's conditional temporary60 authorization is not used. Live selective UTC
+remediation is pending; no INTEGRATION_VERIFIED result claimed yet.
+
+Live UTC remediation completed: INTEGRATION_VERIFIED. Exactly one new Usecase
+attempt (8) used the unchanged frozen73383298 baseline; old22 attempts remained
+immutable. Genuine persisted RED rejected RFC3339+00:00 and FixedZone(0) under
+the exact previous Location-identity implementation. Only the Usecase UTC
+validation changed to Zone-offset checks, retaining start<end and other behavior.
+Independent orchestrator GREEN/scope/frozen verification produced commit
+629faadbb9c0ff7c70dfdc8f61d7ce0f1fdb1843, sole parent73383298. HTTP ea880b9d and
+Persistence caf16396 were reused with no new model calls/workspaces.
+
+Effective barrier ready; fresh stable Persistence→HTTP→Usecase assembly
+8e2b983443e00942d9a877cd2c9cc7fc7c16a72d. Composition SKIPPED_NOT_REQUIRED.
+All mechanical checks passed, including uncached real PostgreSQL and the
+verifier-owned real HTTP/real Usecase/fake RepositoryPort overlay. Z/+00:00
+succeeded; nonzero offsets and invalid ranges failed with zero repository calls.
+No persistent verifier file or scope expansion; source/hash and unchanged-tree
+proof persisted. Both frozen contract hashes match every effective commit/tree.
+
+New read-only reviewer01a102db-d1c6-78c3-8ce2-93a4169ce3d8 PASS, one model call
+and activity attempt1 with updated live heartbeat, no timeout or duplicate. Three
+new runtime calls total (gpt-5.6-sol low worker phases, high reviewer), tracked
+five-hour count0→3. Budget20/enforce remained sufficient throughout; conditional
+60 authorization was unused. Final live API/worker both20/enforce. No Plan,
+ContractPlan, Freeze, routing, contract, composition or product rollout change.
+CANARY_ONLY; PRODUCTION_SANDBOX_READY=NO; real repository pilot=NO. Stopped after
+INTEGRATION_VERIFIED. Evidence in workspace-root
+`.cdo-live-freeze-canary-20261001-a74e/evidence/20261003-utc-remediation`.
+
+## 2026-10-04 — Composition canary planning boundary
+
+Runtime HTTP route registration and message consumer registration remain
+composition routing evidence, but are excluded from source-interface freeze
+candidates. This prevents the planner from inventing a reverse transport to
+composition dependency. Application/repository ownership and dependency checks
+are unchanged. Focused planner regressions reproduce the former architecture
+conflict and now pass. Live composition execution remains gated by a new
+owner-approved Plan; the serialized execution phase is not yet implemented.
+
+## 2026-10-04 — Serialized composition implementation
+
+Typed composition package and attempt, post-barrier worker assembly, isolated
+RED/setup/implementation phases, wiring-only scope checks, orchestrator commit,
+fresh deterministic final assembly and composition-aware integration review
+are implemented locally. Live proof is pending under the submitted approved
+Plan; do not infer production readiness from these source changes.
+
+The first live worker assembly exposed missing PostgreSQL constraint values
+for serialized composition. Migration 022 adds only orchestration states;
+a real PostgreSQL isolated fixture verifies round-trip and down/up behavior,
+including rejection of downgrade while composition states exist. Assembly
+input workspaces are now freshly allocated by the isolation subsystem per
+attempt, preserving earlier failed assembly artifacts and verified workers.
+
+Live composition preserved its attempt/thread/package after an empty model
+timestamp caused strict decoding to fail before RED. Recovery verifies the
+exact unwired scaffold and archives the failure; no setup model rerun or
+worker rewrite. Real PostgreSQL-backed HTTP404 semantic RED then passed after
+constructor/route wiring, with an orchestrator verified composition commit.
+Final mechanical verification identified an overly broad reflection-import
+check on ordinary unit-test DeepEqual assertions; integration success remains
+pending correction and a fresh independent reviewer.
+
+Final composition canary stopped at INTEGRATION_REJECTED on 2026-10-04.
+Plan 9d0d2f78-f65d-4cd3-8f24-068b44e98f4e retained approved submitted
+fingerprint 784c39692cb3e2324a741bc1bc5be71846b6fd44eec70586d73fc62351a7f1bf.
+Three layer workers and composition are VERIFIED; BARRIER_READY preceded
+composition, deterministic final assembly and uncached real PostgreSQL-backed
+HTTP integration passed. Frozen contract hashes are identical. Mechanical
+verification passed after distinguishing test-only direct DeepEqual assertions
+from prohibited reflective construction. Fresh read-only reviewer
+01a10582-5db2-7f00-afdd-3bd624e386c8 REJECT: nonzero UTC offset rejection
+happens in Usecase after HTTP delegation, and no separate verifier-owned
+HTTP/usecase regression exists. No upstream repair performed inside composition;
+owner remediation decision required. Sixteen tracked canary agent runs completed,
+API and worker remain20/enforce. CANARY_ONLY, PRODUCTION_SANDBOX_READY=NO,
+safe to begin hardening/pilot=NO; no push/merge/PR or production execution.
+
+## 2026-10-04 — Owner-approved composition HTTP remediation
+
+Owner authorized selective HTTP offset/delegation remediation under the same
+approved Plan, ContractPlan and frozen baseline. Prior verified HTTP sources
+are reproduced only to demonstrate fresh actual delegation RED before fixes.
+An orchestrator gate requires the exact delegation failure marker; malformed
+and positive/negative offsets on both endpoints must reject before application
+calls. Independent ephemeral verifier adds HTTP/spy delegation cases alongside
+real HTTP/real Usecase/domain-port compatibility. On the untouched rejected
+assembly, delegation probe failed semantically and compatibility passed;
+ephemeral files were removed and Git workspace remained clean.
 
 
 ### Pinned external architecture owners
+Owner-approved selective remediation reached INTEGRATION_VERIFIED on 2026-10-04.
+Plan/fingerprint, ContractPlan and frozen baseline f4a809842678c4bad2605c0852d9fd12a3ced98d
+remain unchanged. Fresh HTTP attempt proved actual nonzero-offset delegation RED
+before implementation; independent GREEN and scope verification produced
+fc53781173125a45eb59431a19a73e880a32e9ba. Persistence/Usecase verified commits
+were reused unchanged; old HTTP audit remains preserved.
 
 - Added classified `external_owners` to the fleet lock and `external_owner`
   graph references with exact Git declaration pins and exact service ID matching.
@@ -1346,16 +2076,150 @@ deploy without their own subsequent explicit authorizations.
 - Focused exporter checks passed for deterministic output, immutable pin drift,
   missing roots, classification, duplicate identities and services, unchanged
   fleet counts, and retained explicit unknown dependencies.
+Changed effective inputs required a new CompositionWorkPackage and serialized
+attempt after BARRIER_READY. Managed replay copied only the prior regression
+and recorded empty-mux scaffold, followed by fresh real PostgreSQL-backed HTTP404
+RED. Wiring passed independent uncached GREEN; verified composition commit
+ac8ee255ccc52732e7818e5eb27ab0933883b43e changes only the two approved cmd paths.
+A narrow startup AST false positive was archived and resumed verification on
+the same completed attempt with zero additional model calls.
 
 ## Routing and contract publication prerequisites — 2026-10-06
+Fresh deterministic Persistence -> HTTP -> Usecase -> Composition assembly
+a61d04223b6885be0cf5769d1b42fff9fddb4c4a passed full real PostgreSQL application
+verification, dependency checks, frozen hashes and two verifier-owned ephemeral
+HTTP delegation/real Usecase regression levels. New independent read-only
+reviewer 01a105b1-f932-7420-8005-ad5c387a0ca7 returned PASS. Temporal proves one
+logical review, activity attempt1, advancing heartbeat and no duplicate reviewer.
+Twenty tracked canary runs completed (four remediation calls); API/worker budget
+remains20/enforce. make verify passed. Terminal pipeline stopped; CANARY_ONLY,
+PRODUCTION_SANDBOX_READY=NO, no product execution/hardening/pilot/push/merge/PR.
+Full result and hash manifest: .cdo-live-freeze-canary-20261001-a74e/evidence/
+20261004-composition-required/http-remediation-final (workspace root).
 
 Publication candidate includes canonical catalog/assets, routing and ContractPlan validation, original planner serialization/fingerprint APIs, and required baseline model declarations. Shard/fanout/sandbox/lifecycle runtime changes remain outside scope. Verification results are recorded by the publication audit before commit.
 
 The Context retrieval entries below are historical dirty-tree implementation checks; exact publication verification follows them.
+## 2026-10-04 — Production sandbox hardening candidate
+
+Audited actual canary runtime and managed command mounts/namespaces/environment
+without reading credentials. Trusted container seccomp remains unconfined and
+shared temporary paths remain a gap; current functional canary was not restarted.
+Scoped trusted requests now distinguish Contract/Layer/Composition/Reviewer and
+RED/implementation capabilities. Production admission refuses uncertified launch.
+Runner limits fail explicitly, cancel the Unix process group and bound pipe wait.
+Fallback now additionally requires network isolation; focused tests passed.
+
+A separate credential-free OCI command candidate enforces builtin seccomp,
+cap_dropALL, no-new-privileges, private PID/network namespaces, readonly mounts,
+exact writable files and resource limits. Actual image probes passed allowed
+source writes/Go tests and prohibited operation checks. Atomic replacement is
+blocked by exact file mounts; SDK-to-OCI attachment/new-file publication remain
+unimplemented. Default Docker seccomp prevents existing bwrap bootstrap.
+This is PARTIAL hardening, not production certification: PRODUCTION_SANDBOX_READY
+remainsNO, no model production canary or real repository pilot. See
+docs/production-sandbox.md for the machine profile and full blocker list.
+
+Final candidate probes passed42 checks after replacing an incorrect loopback-only name assumption with namespace-local flags/routes: LinuxKit dormant tunnel devices were down. Earlier failed probes are preserved. Four runtime role probes and make verify passed. No SDK/model canary was run; production admission remains fail-closed. Full evidence is in workspace .cdo-sandbox-hardening-20261004/evidence.
+
+
+## 2026-10-05 — SDK broker and bounded publication certification
+
+Attached the pinned SDK to a single HTTP MCP broker with local environment
+removed; actual native shell/patch/image tools absent. Stdio/no-environment and
+MCP approval/name mistakes were preserved as failing evidence, not counted as
+successful publication. Actual SDK role profiles, atomic/new-file publication,
+bounded proposals, readonly source view and isolated OCI scratch passed.
+Two metered gpt-5.6-sol/low runs proved RED/proposal/GREEN/publication, independent
+OCI GREEN and orchestrator-only bare verified commit objects; no branches or
+worktrees. Budget20/enforce unchanged, tracked rolling window2. Cleanup/resource
+probes passed for normal/failure/setsid, timeout/output/count/size breaches,
+context cancellation and runner-group SIGKILL.
+
+Production certification still PARTIAL:300 sequential child starts bypassed
+cumulative accounting (one counted command); kernel fork/clone instrumentation,
+SDK metadata/session quotas, bounded resume checkpoints, readonly dependencies
+and remaining Temporal/daemon failure certification are missing. Production
+admission fails closed; CANARY_ONLY/PRODUCTION_SANDBOX_READY=NO. No product
+execution, pilot, rollout, push, merge or PR. See production-sandbox.md and the
+certification evidence report. Full make verify result is recorded in evidence.
+
+
+## Final sandbox certification continuation: BLOCKED on actual SDK storage
+
+Owner revised resource policy: exact sequential fork/clone counting is optional; concurrent PID exhaustion must remain blocked. No privileged instrumentation added. Production remains denied.
+
+Optional SDK goals, orchestrator skills and user-input tools are disabled in trusted configuration. The actual SDK catalog now contains only cdo tools, MCP discovery/read-resource and unconditional update_plan. Hardened resume returns HARDENED_RESUME_NOT_SUPPORTED; lack of resume support itself is not a readiness blocker.
+
+A deterministic actual SDK probe made20 update_plan calls with controlled600KB explanations. It successfully persisted16911936 bytes/67 private files outside broker limits. No model API was called. The handler emits a session event before the TypeScript caller receives it. The pinned SDK exposes no pre-dispatch tool-registration allowlist hook; the current host private SDK state has no hard filesystem quota. This is a concrete mandatory storage/filesystem-closure blocker. It is not a source path escape. Production cannot be authorized by existing scoped broker/OCI evidence.
+
+Python cleanup now distinguishes a definitely absent container from Docker daemon errors (typed DOCKER_CONTAINER_STATE_UNKNOWN). Publication writes a durable journal outside ephemeral control state; PENDING/FAILED attempts cannot be republished, including after private state removal. A two-file failure after the first replacement is tested: partial disposable content remains, attempt is invalid, no successful runner result or trusted commit may follow. Trusted resource evidence now includes before/after cpu.stat/cpu.max/memory/pids and scratch bytes/files.
+
+Explicit hardened mode is recognized and denied by admission; it cannot fall through to legacy. Admission terminology is ADMISSION_GATE_IMPLEMENTATION=PASS (negative gate tests), PRODUCTION_ADMISSION_DECISION=DENIED. No final production-routed real model call occurs while mandatory closure is failed. External dependency provisioning, full Temporal cleanup, complete adversarial suite and authorizing release artifact are not certified in this blocked continuation. No product repository/pilot, worktree lifecycle, source commit, push/merge/PR or rollout.
+
+
+Final continuation checks: make verify PASS (24 TypeScript/22 Python tests, Go vet/test, diff check); all four actual SDK role probes PASS;19 OCI lifecycle/resource assertions PASS; actual SDK cancellation/runner-crash cleanup PASS. Candidate executable built with trusted build TMPDIR under repository cache. Final Docker budget query stalled and was terminated; subsequent bounded Docker-version/container-list reads timed out. Current runtime/cleanup/budget refresh is UNKNOWN, not PASS. Last verified budget20/enforce count2; this continuation made0 real-model calls and changed no budget settings. No authorizing release artifact or final production-routed model canary exists.
+
+## SDK private-state containment continuation
+
+Docker desktop-linux29.8.1 and both previous OCI image hashes were retained.
+No reset, prune or volume deletion was performed in this slice. SDK private
+regular-file state now uses a per-execution OCI tmpfs with hard8MiB/256-inode
+limits; HOME/CODEX_HOME/TMP/XDG roots are fixed inside it. No source/sibling/
+host-home/socket mount is present. Unknown writable storage mounts fail closed.
+Actual pinned SDK deterministic probes cover all four normal roles, update_plan
+byte overflow, inode overflow, SDK failure and cancellation/process-group crash.
+Separate storage counters and durable FAILED publication invalidation preserve
+source publication safety. Production remains DENIED/NO. Zero real model calls;
+20/enforce unchanged. Full evidence and final test status live in
+`.cache/sandbox-certification/SDK_PRIVATE_STATE_CONTAINMENT_RESULT.md`.
+
+## 2026-10-06 trusted canonical Go dependency provisioning
+
+Trusted preparer now binds approved go.mod/go.sum hashes, downloads external
+modules outside model OCI using fixed official proxy/checksum services, runs
+native checksum verification and emits a pinned immutable manifest/cache.
+Canonical hardened workers require that bundle and retain network=none; module
+inputs are readonly, build/test caches remain per-execution bounded tmpfs.
+Declaration changes require new trusted preparation. Integrity mismatch records
+FAILED and rejects execution; no verification bypass was introduced.
+
+Disposable UUID external-module fixtures passed all four OCI role profiles and
+actual SDK Layer/Contract/Composition/Reviewer tests. Actual SDK tamper admission
+was denied before model transport; build cache and SDK cleanup passed cancellation.
+SDK containment implementation was preserved. Production remains DENIED/NO,
+20/enforce unchanged, zero real model calls. Final checks and handoff are recorded
+in .cache/sandbox-certification/TRUSTED_GO_DEPENDENCY_PROVISIONING_RESULT.md.
+
 
 ## Context retrieval R1 — 2026-10-06
 
 Implemented companion `RoutingCoverageReport` without adding fields to approval-bound `RoutingResult` or `ContractPlan`. Inventory, acquisition, target/symbol projection and repository-facts limits have explicit ledgers; incomplete searches preserve NOT_VERIFIED/OMITTED rather than claiming absence. Route/config/source identities are bound to diagnostics. Focused `planner-route-test` passed offline using a temporary Makefile that omits only the `.env` include. Pre-change serialized PlannerOutput and approval fingerprint golden regression passed. R2–R4 and Gold remain in progress.
+
+## 2026-10-06 hardened execution lifecycle / actual Temporal
+
+Resumed the approved lifecycle slice after Docker desktop-linux29.8.1 recovery;
+retained command/SDK image pins and isolated Temporal dev server. No model API
+calls, worktrees, branches, source commits, push/merge/PR, product execution,
+Docker reset/prune or volume deletion. Budget20/enforce preserved.
+
+Production PlanWorkflow/PlanActivities/ProcessRunner now join cancellation
+teardown, reject stale execution/attempt envelopes and external obsolete GREEN,
+persist failures through bounded detached contexts, and guard verified commits.
+Hardened runner tracks typed durable lifecycle, asynchronously cancels publication,
+handles parent/pipe loss, and retains UNKNOWN for label-bound trusted reconciliation.
+Actual Temporal matrix and additional inner timeout/partial publisher crash/worker
+loss/known descendants passed20 cases. All four hardened roles, actual SDK quota
+failure with no retry, real histories, known outside PID isolation and one targeted
+SDK/external Go dependency regression passed. Prior failed evidence is retained.
+
+Full make verify passed earlier. A later final run found concurrent new untracked
+contextretrieval gold failures outside this slice; those sources/fixtures were
+not edited. Latest overall gate status and handoff are recorded in
+.cache/sandbox-certification/LIFECYCLE_TEMPORAL_CERTIFICATION_RESULT.md.
+Production admission remainsDENIED, readinessNO and real repository pilotNO.
+No release-bound certification or final model canary was started.
+
 
 ## Context retrieval R2 — 2026-10-06
 
@@ -1378,8 +2242,49 @@ Independent review found and verified fixes for seven P1 boundaries: token filen
 All program writes remain inside CDO (plus disposable temporary verification output). HEAD remains 82edd84cd63e1d40ded335463e59da22de01651b; no commit/push/branch/worktree lifecycle action. Original unrelated work was not reverted. Nine unrelated lifecycle/runner files changed concurrently since the pre-program hash baseline; these are preserved and not attributed to retrieval. No other repository, Student pilot, distribution, production gate or business WorkPackage was modified by this program. Next: separately approved read-only service pilot, not executed here. Implementation/CLI/schema/limitations are documented in [local context retrieval](agent-context-retrieval.md).
 
 
+### Lifecycle / Temporal certification terminal verification — 2026-10-06
 
 ## Context retrieval exact publication verification — 2026-10-06
+LIFECYCLE_TEMPORAL_CERTIFICATION = COMPLETE. Final repository `make verify`
+passed, including Go vet/all tests, 40 Python tests, 27 runner tests, 17 UI
+tests/build and Compose config. Earlier concurrent contextretrieval verification
+failures are retained as diagnostic evidence; no retrieval code was edited by
+this slice. Final durable newest-attempt guards passed focused tests.
+20 actual Temporal cases plus known outside PID isolation and targeted SDK/Go
+regressions passed. Histories and source hashes are retained in the lifecycle
+certification manifest. Disposable Temporal/runtime execution resources are gone.
+Budget remains20/enforce; real model calls0. Production admissionDENIED,
+production readinessNO, pilotNO. Work stops here; release-bound certification
+and final hardened model canary require the separate next task.
+
+
+## Release-bound certification — implementation checkpoint, 2026-10-06
+
+Exact dirty-source snapshot builder and installed runtime inventory implemented.
+Strict release authorizer compares 18 runtime identities, evidence pins and literal
+positive conditions; 29 runner tests and full make verify passed. Actual initial
+production backend/runner image built from its immutable captured source and
+trusted OCI observer returned positive runtime identity. New source additions
+require another captured candidate; old evidence is not automatically rebound.
+Tracked usage read from the existing orchestrator DB:0 runs/5h; DB restored to its
+previous stopped state. Budget20/enforce, real model calls0. General production
+admission DENIED and readinessNO. First-canary qualification ordering question
+is pending owner decision; no grant, fabricated positive evidence or model launch.
+Full SDK/Go/lifecycle suites are not repeated or reclassified by this checkpoint.
+
+
+## Release qualification resumed — 2026-10-08
+
+Owner's one-use qualification approval recorded for the existing pinned candidate;
+no release image rebuilt and historical BLOCKED artifact SHA preserved.
+Separate trusted grant validator/atomic consumption module and12 focused tests
+passed, including16-way consumption race with one winner, replay/expiry, all
+identity changes, fixed fixture/WorkPackage, scope, controller pin and strict
+missing/UNKNOWN prerequisite rejection. Real grant remains unconsumed.
+Socket-free exact-image inventory proved59 installed files, source identity,
+seccomp2, zero effective/bounding caps and no-new-privileges1. Disposable Go
+fixture readonly precheck proved an actual expected42 semantic failure with
+external UUID module and unchanged source; it is not final worker RED.
 
 The standalone routing/catalog/contracts prerequisite layer and the complete R1–R4+Gold candidate both passed full secret-free verification on current origin/main. Original planner JSON/approval fingerprint compatibility, routing polarity and contract ownership passed. Final offline CLI/Prepare/Expand/determinism and Gold 71/71 passed; recall/precision 1.00 and all critical counters zero. Independent prerequisite/final reviews found P0=0 and P1=0. Original dirty source remains preserved; concurrent release documentation appends are retained and excluded from publication. Verification records and final Git publication proof are under ignored .cache/agent-context/publication-v2.
 
@@ -1494,3 +2399,64 @@ pre-read admission, path race and inventory-bound gaps; runtime admission remain
 DENIED pending exact certification. These workstreams must not be inferred from
 this isolated constraint repair. Published Wave 1 retrieval, Course fixtures,
 CI evidence paths and historical owner evidence remain intact.
+SDK startup probe was not executed: automatic approval review rejected the host
+Docker socket mount in trusted backend due broad daemon authority and owner
+socket prohibition. No indirect workaround; owner transport decision pending.
+No final model/Temporal/positive four-role/adversarial route evidence fabricated.
+Qualification admissionDENIED, general productionDENIED, readinessNO, pilotNO;
+model calls0 and budget20/enforce unchanged. Final test/log/report evidence under
+.cache/sandbox-certification/release-qualification-20261008.
+
+## Safe runtime transport — finite staging checkpoint, 2026-10-08
+
+Implemented an authenticated host-only lifecycle controller with fixed
+credential-free command/SDK recipes, durable replay protection, exact ownership
+and OCI policy verification, bounded diagnostics and lifetime watchdog. Backend
+requests cannot select Docker flags, mounts, commands, networks or unrelated
+containers. Source review findings (slow request DoS, protected-source reads,
+cross-controller cleanup authority) fixed with regression checks. Actual Docker
+absence and stderr formats were characterized without weakening UNKNOWN behavior.
+
+Final `make verify` PASS:104 Python tests,33 runner tests,17 UI tests, Go/vet,
+policy, build and Compose checks. Final finite OCI probe PASS:8 executions across
+four role bindings and two recipes,128 rejected requests before Docker access,
+actual readonly Go expected42 failure and SDK CLI0.144.6; all owned cleanup
+confirmed, source/sibling/contracts and unrelated container inventory unchanged.
+These are finite transport probes, not normal model-role or final-worker evidence.
+
+New immutable staging source manifest:
+03de00c4dbd3d6634d76035f9cac8cc5618aafba27f9273c8f70cdc8bb8c7403.
+Runner image:
+sha256:d240e1b9a86ec6516f96b3bf8df456bc8956ce61fba04a5862879bdfdfe95260.
+659 captured source files match current source;65 installed files match inventory.
+New controller/protocol/transport identities are mandatory; Docker CLI removed.
+Installed production/hardened entry returns RUNTIME_TRANSPORT_NOT_CERTIFIED before
+state/subprocess/model work, and the normal authorizer returns DENIED.
+
+Owner's material release-identity gate requires a fresh exact decision before
+qualification. Full coordinator routing, active host/runtime/daemon attestation,
+lease/Temporal/crash cleanup and qualified model execution remain unproven.
+Automatic review accepted bounded probe/build/inventory commands; no explicit
+transport-design PASS artifact was returned, so that gate is not claimed PASS.
+Independent finite source review PASS is a separate, narrower verdict.
+Expired old grant unconsumed; replacement grant0; immutable old BLOCKED certificate
+unchanged. No model calls, Git operations, product execution, Docker reset/prune,
+volume deletion or unrelated service restart. Budget20/enforce verified in stopped
+worker metadata. General admissionDENIED; readinessNO; pilotNO. Stop here.
+
+## CDO cleanup feature source preservation checkpoint — 2026-10-08
+
+Main migration019 is independently verified and published at `8e7eeb5`.
+The separate feature candidate preserves accumulated shard/composition, execution,
+agent distribution, sandbox/release and finite safe transport source with paired
+contracts/tests/docs. All initial 188 paths and five newly owned transport source
+paths have explicit dispositions in `cleanup-source-preservation-checkpoint.json`.
+The candidate passed complete source verification (104 Python, 33 runner, 17 UI
+tests plus Go/policy/build/Compose) and disposable PostgreSQL integration.
+These checks do not certify production execution. The feature status is
+PARTIAL/BLOCKED; production admission DENIED, readiness NO, pilot NO.
+The original checkout remains an active owner workspace and is preserved.
+Historical progress entries are retained as dated evidence; this checkpoint
+does not renew their source/image/runtime identity or qualification grants.
+Wave1 retrieval READY, all 39 capability results and the 108 Gold regressions
+remain separate from these incomplete execution workstreams.

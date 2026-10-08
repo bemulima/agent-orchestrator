@@ -6,6 +6,8 @@
   `docs/README.md` before selecting project-specific documentation.
 - Read `docs/architecture-conventions.md`, `docs/implementation-plan.md`, and
   `docs/progress.md`.
+- Read `docs/agent-control-plane.md` and `agent-system/manifest.yaml` before
+  changing centrally managed agent assets or their distribution behavior.
 - Update `docs/progress.md` after each completed implementation stage.
 - Do not claim a stage is complete unless its relevant checks pass.
 

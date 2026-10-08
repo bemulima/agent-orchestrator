@@ -295,6 +295,7 @@ func TestValidateTestingPolicyDodReportInvalidAcceptanceStaysPendingWithoutWeake
 		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "", "", "PENDING", false},
 		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "BLOCKING", "", "", "PENDING", true},
 		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "", "", "EVIDENCE_PRESENT", true},
+		{"UNREVIEWED_ACCEPTANCE_CODE", "PENDING", "", "", "PENDING", true},
 		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "DOD_COMMAND_RESULT_MISSING", "PENDING", "PENDING", true},
 		{"DOD_BUSINESS_ACCEPTANCE_INVALID", "PENDING", "DOD_IDENTITY_MISMATCH", "BLOCKING", "PENDING", true},
 	} {
@@ -342,6 +343,39 @@ type boundedPolicyBundleFixture struct {
 }
 
 func (f *boundedPolicyBundleFixture) ReadArtifact(ctx context.Context, workspace domain.TaskWorkspace, path string, limit int64) ([]byte, error) {
+	if path == ".ai/testing/policy/policy-runner.cjs" {
+		f.bundleLimit = limit
+		if int64(len(f.bundle)) > limit {
+			return nil, fmt.Errorf("reviewed policy bundle exceeds requested bound: %w", domain.ErrValidation)
+		}
+	}
+	return f.testingPolicyWorktreeFixture.ReadArtifact(ctx, workspace, path, limit)
+}
+
+// The active 40-owner authority bundle is larger than the generic artifact bound.
+// Keep the reviewed bundle identity checks while permitting its exact bytes.
+func TestInfraConsolidationReviewedBundleBound(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("..", "..", ".ai", "testing", "policy", "policy-runner.cjs"))
+	require.NoError(t, err)
+	require.Greater(t, len(bundle), 10<<20)
+	require.LessOrEqual(t, len(bundle), 32<<20)
+	lock, err := os.ReadFile(filepath.Join("..", "..", ".ai", "testing", "policy", "policy-lock.json"))
+	require.NoError(t, err)
+	baseSHA, headSHA := strings.Repeat("d", 40), strings.Repeat("e", 40)
+	report := []byte(fmt.Sprintf(`{"schema_version":"agent-dod.v1","lifecycle_state":"DONE","identity":{"base_sha":%q,"head_sha":%q},"dispositions":{"business_acceptance":"NOT_REQUIRED"},"blockers":[]}`, baseSHA, headSHA))
+	worktrees := &infraConsolidationBoundedPolicyFixture{testingPolicyWorktreeFixture: testingPolicyWorktreeFixture{bundle: bundle, lock: lock, report: report}}
+	outcome, err := (BundleTestingPolicyGate{Worktrees: worktrees}).VerifyTask(context.Background(), domain.TaskWorkspace{}, "run-1", baseSHA, headSHA)
+	require.NoError(t, err)
+	require.Equal(t, int64(32<<20), worktrees.bundleLimit)
+	require.Equal(t, "DONE", outcome.LifecycleState)
+}
+
+type infraConsolidationBoundedPolicyFixture struct {
+	testingPolicyWorktreeFixture
+	bundleLimit int64
+}
+
+func (f *infraConsolidationBoundedPolicyFixture) ReadArtifact(ctx context.Context, workspace domain.TaskWorkspace, path string, limit int64) ([]byte, error) {
 	if path == ".ai/testing/policy/policy-runner.cjs" {
 		f.bundleLimit = limit
 		if int64(len(f.bundle)) > limit {

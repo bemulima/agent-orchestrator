@@ -175,6 +175,10 @@ func TestBundleTestingPolicyDoDControlsTaskCompletionWithRealArtifacts(t *testin
 				require.Empty(t, dod.Blockers)
 			}
 
+			if test.wantDodBA == "EVIDENCE_PRESENT" {
+				assertTestingPolicyE2EValidatedBusinessEvidence(t, fixture.workspace, matrixDescriptor.Checksum, matrix)
+			}
+
 			if matrix.BusinessAcceptanceRequired == "UNKNOWN" {
 				scopeBlocker := testingPolicyE2EBlockerByCode(t, dod.Blockers, "DOD_BUSINESS_SCOPE_UNKNOWN")
 				require.Equal(t, "PENDING", scopeBlocker.Severity)
@@ -850,4 +854,142 @@ func testingPolicyE2EBlockerByCode(t *testing.T, blockers []testingPolicyE2EBloc
 	}
 	t.Fatalf("missing DoD blocker %s", code)
 	return testingPolicyE2EBlocker{}
+}
+
+const (
+	testingPolicyE2EVerificationRepository  = "bemulima/learning-platform-verification"
+	testingPolicyE2EVerificationRunID       = 1
+	testingPolicyE2EVerificationRunAttempt  = 1
+	testingPolicyE2EVerificationRunProvider = "github-actions"
+	testingPolicyE2EResultRepositoryID      = "learning-platform-verification"
+)
+
+func assertTestingPolicyE2EValidatedBusinessEvidence(t *testing.T, repositoryRoot, matrixChecksum string, matrix testingPolicyE2EMatrix) {
+	t.Helper()
+
+	evidencePath := filepath.Join(repositoryRoot, filepath.FromSlash(businessAcceptanceEvidencePath))
+	evidenceBytes, err := os.ReadFile(evidencePath)
+	require.NoError(t, err)
+	var evidence struct {
+		Subject struct {
+			RepositoryID          string   `json:"repository_id"`
+			BaseSHA               string   `json:"base_sha"`
+			HeadSHA               string   `json:"head_sha"`
+			MatrixSHA256          string   `json:"matrix_sha256"`
+			RequiredCapabilityIDs []string `json:"required_capability_ids"`
+		} `json:"subject"`
+		Policy struct {
+			SourceRepository string `json:"source_repository"`
+			SourceCommitSHA  string `json:"source_commit_sha"`
+			SemanticsSHA256  string `json:"semantics_sha256"`
+			BundleSHA256     string `json:"bundle_sha256"`
+		} `json:"policy"`
+		Verification struct {
+			RepositoryID string `json:"repository_id"`
+			CommitSHA    string `json:"commit_sha"`
+		} `json:"verification"`
+		Run struct {
+			Provider   string `json:"provider"`
+			Repository string `json:"repository"`
+			RunID      int    `json:"run_id"`
+			RunAttempt int    `json:"run_attempt"`
+			RunURL     string `json:"run_url"`
+		} `json:"run"`
+		Artifact struct {
+			Name        string `json:"name"`
+			ArtifactID  int    `json:"artifact_id"`
+			ArchiveSHA  string `json:"archive_sha256"`
+			ArchivePath string `json:"archive_path"`
+		} `json:"artifact"`
+		Results []struct {
+			CapabilityID string `json:"capability_id"`
+			FeatureID    string `json:"feature_id"`
+			ScenarioID   string `json:"scenario_id"`
+			EvidenceType string `json:"evidence_type"`
+			Status       string `json:"status"`
+			ResultPath   string `json:"result_path"`
+			ResultSHA256 string `json:"result_sha256"`
+		} `json:"results"`
+		Status string `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(evidenceBytes, &evidence))
+	require.Equal(t, "PASS", evidence.Status)
+	require.Equal(t, matrix.Repository.ID, evidence.Subject.RepositoryID)
+	require.Equal(t, matrix.BaseSHA, evidence.Subject.BaseSHA)
+	require.Equal(t, matrix.HeadSHA, evidence.Subject.HeadSHA)
+	require.Equal(t, strings.TrimPrefix(matrixChecksum, "sha256:"), evidence.Subject.MatrixSHA256)
+	require.Equal(t, matrix.BusinessAcceptanceResolution.RequiredCapabilityIDs, evidence.Subject.RequiredCapabilityIDs)
+	require.Equal(t, matrix.Policy.Identity.SourceRepository, evidence.Policy.SourceRepository)
+	require.Equal(t, matrix.Policy.Identity.SourceCommit, evidence.Policy.SourceCommitSHA)
+	require.Equal(t, matrix.Policy.Identity.SemanticsSHA, evidence.Policy.SemanticsSHA256)
+	require.Equal(t, matrix.Policy.Identity.BundleSHA256, evidence.Policy.BundleSHA256)
+	require.True(t, fullSHA(matrix.Policy.Identity.SourceCommit))
+	require.Equal(t, testingPolicyE2EVerificationRepository, evidence.Verification.RepositoryID)
+	require.Equal(t, matrix.Policy.Identity.SourceCommit, evidence.Verification.CommitSHA)
+	require.Equal(t, testingPolicyE2EVerificationRunProvider, evidence.Run.Provider)
+	require.Equal(t, testingPolicyE2EVerificationRepository, evidence.Run.Repository)
+	require.Equal(t, testingPolicyE2EVerificationRunID, evidence.Run.RunID)
+	require.Equal(t, testingPolicyE2EVerificationRunAttempt, evidence.Run.RunAttempt)
+	expectedRunURL := fmt.Sprintf("https://github.com/%s/actions/runs/%d", testingPolicyE2EVerificationRepository, testingPolicyE2EVerificationRunID)
+	require.Equal(t, expectedRunURL, evidence.Run.RunURL)
+	require.Equal(t, "business-acceptance-e2e-fixture", evidence.Artifact.Name)
+	require.Equal(t, 1, evidence.Artifact.ArtifactID)
+	require.Equal(t, "test-results/business-acceptance/acceptance-results.zip", evidence.Artifact.ArchivePath)
+	require.Len(t, evidence.Results, 1)
+	require.Equal(t, []string{"learning_content_discovery"}, []string{evidence.Results[0].CapabilityID})
+	require.Equal(t, "course_public_outline", evidence.Results[0].FeatureID)
+	require.Equal(t, "course_outline_visible", evidence.Results[0].ScenarioID)
+	require.Equal(t, "test-result.v1", evidence.Results[0].EvidenceType)
+	require.Equal(t, "PASS", evidence.Results[0].Status)
+
+	archivePath := filepath.Join(repositoryRoot, filepath.FromSlash(evidence.Artifact.ArchivePath))
+	archiveBytes, err := os.ReadFile(archivePath)
+	require.NoError(t, err)
+	archiveHash := sha256.Sum256(archiveBytes)
+	require.Equal(t, hex.EncodeToString(archiveHash[:]), evidence.Artifact.ArchiveSHA)
+
+	result := evidence.Results[0]
+	require.True(t, strings.HasPrefix(result.ResultPath, "test-results/"))
+	resultPath := filepath.Join(repositoryRoot, filepath.FromSlash(result.ResultPath))
+	resultBytes, err := os.ReadFile(resultPath)
+	require.NoError(t, err)
+	resultHash := sha256.Sum256(resultBytes)
+	require.Equal(t, hex.EncodeToString(resultHash[:]), result.ResultSHA256)
+
+	archive, err := zip.OpenReader(archivePath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, archive.Close()) })
+	require.Len(t, archive.File, 1)
+	var resultEntries []*zip.File
+	for _, entry := range archive.File {
+		if entry.Name == result.ResultPath {
+			resultEntries = append(resultEntries, entry)
+		}
+	}
+	require.Len(t, resultEntries, 1)
+	entryReader, err := resultEntries[0].Open()
+	require.NoError(t, err)
+	archivedResult, err := io.ReadAll(entryReader)
+	require.NoError(t, err)
+	require.NoError(t, entryReader.Close())
+	require.Equal(t, resultBytes, archivedResult)
+	var archivedResultIdentity struct {
+		Repository struct {
+			ID        string `json:"id"`
+			CommitSHA string `json:"commit_sha"`
+		} `json:"repository"`
+		CI struct {
+			Provider   string `json:"provider"`
+			RunID      string `json:"run_id"`
+			RunAttempt int    `json:"run_attempt"`
+			RunURL     string `json:"run_url"`
+		} `json:"ci"`
+	}
+	require.NoError(t, json.Unmarshal(archivedResult, &archivedResultIdentity))
+	require.Equal(t, testingPolicyE2EResultRepositoryID, archivedResultIdentity.Repository.ID)
+	require.Equal(t, matrix.Policy.Identity.SourceCommit, archivedResultIdentity.Repository.CommitSHA)
+	require.Equal(t, evidence.Run.Provider, archivedResultIdentity.CI.Provider)
+	require.Equal(t, fmt.Sprint(evidence.Run.RunID), archivedResultIdentity.CI.RunID)
+	require.Equal(t, evidence.Run.RunAttempt, archivedResultIdentity.CI.RunAttempt)
+	require.Equal(t, evidence.Run.RunURL, archivedResultIdentity.CI.RunURL)
 }

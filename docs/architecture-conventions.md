@@ -89,6 +89,32 @@ owned by this repository.
   architecture, commands, and contracts remain repository-specific evidence
   in `.ai/service.yaml`, `.ai/architecture.yaml`, `.ai/contracts/**`, and the
   owning repository's linked documentation.
+- The new Agent Control Plane canonical source is `agent-system/`; it owns the
+  global policy template, shared skills, and architecture profiles. This is a
+  separate compatibility surface from the embedded v1 bundle that still
+  generates the legacy `.ai/rules/common.md` copy. Migration between them is
+  not implicit.
+- Architecture profiles resolve from required repository structure and
+  evidence, not language alone. Next.js role variants share the same
+  structural profile. An approved planner-selected route list determines
+  internal architectural shards; a shard never becomes a top-level Plan Task,
+  issue, or pull request.
+- Planning contract state and execution contract baseline state are separate.
+  `FREEZE_REQUIRED` describes approved intent; `FROZEN` requires a contract-only
+  baseline commit, validation, a Contract Agent result, and independent review.
+  The Contract Agent and separate read-only reviewer run through the managed
+  isolation subsystem; the full changed-path verifier and post-commit checks
+  bind the persisted hashes to a single-parent contract-only commit. Contract
+  baseline and `READY_FOR_FANOUT` evidence are durable PostgreSQL records.
+  Readiness itself does not start workers; the explicit `plan-shard-run`
+  command starts a deterministic Temporal workflow, which schedules all
+  independent shard activities before awaiting results and relies on the
+  existing global activity limit. Fan-out is currently validated only in the
+  disposable `CANARY_ONLY` environment. Contract-dependent shards must share
+  the same verified baseline commit. Structured source-preflight evidence
+  distinguishes confirmed checkout or contract drift, which invalidates the
+  baseline and readiness, from inspection failure, which blocks only the
+  current fan-out attempt and preserves a retryable `FROZEN` baseline.
 - Agent onboarding is limited to code/content/infrastructure targets.
   Repositories classified as policy, documentation, or archive are knowledge
   sources and do not receive `AGENTS.md`/`.ai` architecture from the

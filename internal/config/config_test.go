@@ -151,7 +151,7 @@ func TestLoadUsesChatGPTCodexModelDefaults(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.CodexModelFast != "gpt-5.6-luna" || cfg.CodexModelStandard != "gpt-5.6-terra" ||
-		cfg.CodexModelDeep != "gpt-5.6-sol" || cfg.CodexModelCoder != "gpt-5.3-codex-spark" ||
+		cfg.CodexModelDeep != "gpt-5.6-sol" || cfg.CodexModelCoder != "gpt-5.6-sol" ||
 		cfg.CodexModelReview != "gpt-5.6-terra" || cfg.CodexReasoningReview != "medium" ||
 		cfg.CodexReasoningFast != "low" || cfg.CodexReasoningDeep != "high" {
 		t.Fatalf("unexpected Codex defaults: %#v", cfg.SafeSummary())

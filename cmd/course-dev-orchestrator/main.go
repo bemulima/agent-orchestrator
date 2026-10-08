@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,6 +43,7 @@ import (
 	architecturemanifest "github.com/bemulima/agent-orchestrator/internal/architecturemanifest"
 	"github.com/bemulima/agent-orchestrator/internal/architecturepresentation"
 	"github.com/bemulima/agent-orchestrator/internal/config"
+	"github.com/bemulima/agent-orchestrator/internal/contractbaseline"
 	currentverification "github.com/bemulima/agent-orchestrator/internal/currentverification"
 	"github.com/bemulima/agent-orchestrator/internal/discovery"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -55,6 +57,7 @@ import (
 	architectureuc "github.com/bemulima/agent-orchestrator/internal/usecase/architecture"
 	architecturecataloguc "github.com/bemulima/agent-orchestrator/internal/usecase/architecturecatalog"
 	architecturetargetuc "github.com/bemulima/agent-orchestrator/internal/usecase/architecturetarget"
+	contractfreezeuc "github.com/bemulima/agent-orchestrator/internal/usecase/contractfreeze"
 	conversationuc "github.com/bemulima/agent-orchestrator/internal/usecase/conversation"
 	executionuc "github.com/bemulima/agent-orchestrator/internal/usecase/execution"
 	gitlabuc "github.com/bemulima/agent-orchestrator/internal/usecase/gitlab"
@@ -62,6 +65,8 @@ import (
 	onboardinguc "github.com/bemulima/agent-orchestrator/internal/usecase/onboarding"
 	planninguc "github.com/bemulima/agent-orchestrator/internal/usecase/planning"
 	projectuc "github.com/bemulima/agent-orchestrator/internal/usecase/project"
+	shardexecutionuc "github.com/bemulima/agent-orchestrator/internal/usecase/shardexecution"
+	shardplanninguc "github.com/bemulima/agent-orchestrator/internal/usecase/shardplanning"
 	telegramuc "github.com/bemulima/agent-orchestrator/internal/usecase/telegram"
 	topologyuc "github.com/bemulima/agent-orchestrator/internal/usecase/topology"
 	uiuc "github.com/bemulima/agent-orchestrator/internal/usecase/ui"
@@ -122,6 +127,18 @@ func run(args []string) error {
 			"status": "ok", "version": agenttemplates.Version, "checksum": agenttemplates.Checksum(),
 		})
 	}
+	if command == "agent-control-check" {
+		return runAgentControlCheck(args[1:], os.Stdout)
+	}
+	if command == "agent-assets-plan" {
+		return runAgentAssetsPlan(args[1:], os.Stdout)
+	}
+	if command == "agent-assets-apply" {
+		return runAgentAssetsApply(args[1:], os.Stdout)
+	}
+	if command == "agent-policy-plan" {
+		return runAgentPolicyPlan(args[1:], os.Stdout)
+	}
 	if command == "architecture-render" {
 		return runArchitectureRender(args[1:], os.Stdout)
 	}
@@ -153,6 +170,8 @@ func run(args []string) error {
 	defer func() { _ = logger.Sync() }()
 
 	switch command {
+	case "sandbox-certification-model":
+		return runSandboxCertification(cfg, args[1:], os.Stdout)
 	case "serve":
 		return runServer(cfg, logger)
 	case "worker":
@@ -166,7 +185,7 @@ func run(args []string) error {
 		return runProjectCommand(cfg, command, args[1:], os.Stdout)
 	case "topology", "contracts", "contract-drift", "dependencies", "consumers":
 		return runTopologyCommand(cfg, command, args[1:], os.Stdout)
-	case "plan", "plan-show", "plan-comment", "plan-issues", "plan-submit", "plan-approve", "plan-reject",
+	case "plan", "plan-show", "plan-comment", "plan-issues", "plan-submit", "plan-approve", "plan-reject", "plan-shards", "plan-shard-run", "plan-shard-remediate",
 		"plan-publish-issues", "plan-run", "plan-retry-run", "task-pr-prepare", "task-pr-publish",
 		"run-status", "run-pause", "run-resume", "run-cancel", "task-show", "task-log", "task-retry", "task-cancel":
 		return runPlanningCommand(cfg, command, args[1:], os.Stdin, os.Stdout)
@@ -176,6 +195,131 @@ func run(args []string) error {
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func runAgentControlCheck(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("agent-control-check", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	root := flags.String("root", ".", "repository root containing agent-system/manifest.yaml")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse agent-control-check arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*root) == "" {
+		return fmt.Errorf("usage: course-dev-orchestrator agent-control-check --root <repository-root>")
+	}
+	catalog, err := loadAgentControlCatalog(*root)
+	if err != nil {
+		return err
+	}
+	return writeJSON(output, map[string]any{
+		"status": "ok", "schema_version": catalog.Manifest.SchemaVersion,
+		"catalog_digest": catalog.Digest, "assets": len(catalog.Assets), "profiles": sortedAgentProfiles(catalog),
+	})
+}
+
+func runAgentAssetsPlan(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("agent-assets-plan", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	targetRoot := flags.String("root", "", "target Git repository root")
+	catalogRoot := flags.String("catalog-root", ".", "repository root containing canonical agent-system assets")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse agent-assets-plan arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*targetRoot) == "" {
+		return fmt.Errorf("usage: course-dev-orchestrator agent-assets-plan --root <target-repository> [--catalog-root <orchestrator-repository>]")
+	}
+	catalog, err := loadAgentControlCatalog(*catalogRoot)
+	if err != nil {
+		return err
+	}
+	service := agentcontrol.DistributionService{Repository: localrepo.LocalRepository{Root: *targetRoot}}
+	proposal, err := service.Plan(context.Background(), catalog)
+	if err != nil {
+		return fmt.Errorf("plan managed-asset distribution: %w", err)
+	}
+	return writeJSON(output, proposal)
+}
+
+func runAgentAssetsApply(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("agent-assets-apply", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	targetRoot := flags.String("root", "", "target Git repository root")
+	catalogRoot := flags.String("catalog-root", ".", "repository root containing canonical agent-system assets")
+	fingerprint := flags.String("approve-fingerprint", "", "exact proposal fingerprint reviewed and approved by the owner")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse agent-assets-apply arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*targetRoot) == "" || strings.TrimSpace(*fingerprint) == "" {
+		return fmt.Errorf("usage: course-dev-orchestrator agent-assets-apply --root <target-repository> --approve-fingerprint <sha256:...> [--catalog-root <orchestrator-repository>]")
+	}
+	catalog, err := loadAgentControlCatalog(*catalogRoot)
+	if err != nil {
+		return err
+	}
+	service := agentcontrol.DistributionService{Repository: localrepo.LocalRepository{Root: *targetRoot}}
+	result, err := service.Apply(context.Background(), catalog, *fingerprint)
+	if err != nil {
+		return fmt.Errorf("apply approved managed assets: %w", err)
+	}
+	return writeJSON(output, result)
+}
+
+func runAgentPolicyPlan(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("agent-policy-plan", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	target := flags.String("target", "", "explicit global policy target, for example ~/.codex/AGENTS.md")
+	catalogRoot := flags.String("catalog-root", ".", "repository root containing canonical agent-system assets")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse agent-policy-plan arguments: %w", err)
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*target) == "" {
+		return fmt.Errorf("usage: course-dev-orchestrator agent-policy-plan --target <explicit-path> [--catalog-root <orchestrator-repository>]")
+	}
+	targetPath := *target
+	if strings.HasPrefix(targetPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("resolve user home: %w", err)
+		}
+		targetPath = filepath.Join(home, targetPath[2:])
+	}
+	targetPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		return fmt.Errorf("resolve policy target: %w", err)
+	}
+	if filepath.Base(targetPath) != "AGENTS.md" || filepath.Base(filepath.Dir(targetPath)) != ".codex" {
+		return fmt.Errorf("global policy planning is limited to an explicit .codex/AGENTS.md target")
+	}
+	targetPath, current, exists, err := localrepo.ReadGlobalPolicyTarget(targetPath)
+	if err != nil {
+		return fmt.Errorf("inspect explicit global policy target: %w", err)
+	}
+	catalog, err := loadAgentControlCatalog(*catalogRoot)
+	if err != nil {
+		return err
+	}
+	proposal, err := agentcontrol.BuildGlobalPolicyProposal(catalog, targetPath, current, exists)
+	if err != nil {
+		return fmt.Errorf("build read-only global policy proposal: %w", err)
+	}
+	return writeJSON(output, proposal)
+}
+
+func loadAgentControlCatalog(root string) (agentcontrol.Catalog, error) {
+	catalog, err := localrepo.LoadCatalogFromDirectory(root)
+	if err != nil {
+		return agentcontrol.Catalog{}, fmt.Errorf("load canonical Agent Control Plane catalog: %w", err)
+	}
+	return catalog, nil
+}
+
+func sortedAgentProfiles(catalog agentcontrol.Catalog) []string {
+	profiles := make([]string, 0, len(catalog.Profiles))
+	for id := range catalog.Profiles {
+		profiles = append(profiles, id)
+	}
+	sort.Strings(profiles)
+	return profiles
 }
 
 func runArchitectureRender(args []string, output io.Writer) error {
@@ -1138,12 +1282,112 @@ func runPlanningCommand(cfg config.Config, command string, args []string, input 
 	}
 
 	switch command {
+	case "plan-shard-remediate":
+		flags := flag.NewFlagSet(command, flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		planID := flags.String("plan-id", "", "approved plan ID")
+		requestPath := flags.String("request-json", "", "owner remediation decision JSON")
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if *planID == "" || *requestPath == "" || flags.NArg() != 0 {
+			return fmt.Errorf("plan-id and request-json required: %w", domain.ErrValidation)
+		}
+		file, err := os.Open(*requestPath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		var request shardexecutionuc.RemediationRequest
+		decoder := json.NewDecoder(file)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			return err
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			return fmt.Errorf("remediation request requires exactly one JSON object: %w", domain.ErrValidation)
+		}
+		starter, ok := runner.(interface {
+			StartShardRemediation(context.Context, string, int, shardexecutionuc.RemediationRequest) (string, string, error)
+		})
+		if !ok {
+			return fmt.Errorf("Temporal remediation runner unavailable: %w", domain.ErrInvalidStatus)
+		}
+		workflowID, runID, err := starter.StartShardRemediation(ctx, *planID, cfg.MaxGlobalAgentRuns, request)
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, map[string]any{"plan_id": *planID, "workflow_id": workflowID, "run_id": runID, "remediation_request": request})
+	case "plan-shard-run":
+		planID, err := requiredIDFlag(command, args, "plan-id")
+		if err != nil {
+			return err
+		}
+		starter, ok := runner.(interface {
+			StartShardFanout(context.Context, string, int) (string, string, error)
+		})
+		if !ok {
+			return fmt.Errorf("Temporal shard fan-out runner is unavailable: %w", domain.ErrInvalidStatus)
+		}
+		workflowID, runID, err := starter.StartShardFanout(ctx, planID, cfg.MaxGlobalAgentRuns)
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, map[string]any{
+			"plan_id": planID, "workflow_id": workflowID, "run_id": runID,
+			"parallelism_limit": cfg.MaxGlobalAgentRuns,
+		})
+	case "plan-shards":
+		planID, err := requiredIDFlag(command, args, "plan-id")
+		if err != nil {
+			return err
+		}
+		controlPlane, err := loadAgentControlCatalog(".")
+		if err != nil {
+			return err
+		}
+		projectSource := gitadapter.ProjectSource{
+			AllowedRoots: cfg.RepositoryAllowedRoots, StoragePath: cfg.RepositoryStoragePath,
+		}
+		runner, err := newAgentRunner(cfg, pool)
+		if err != nil {
+			return err
+		}
+		validator, err := agent.NewValidator()
+		if err != nil {
+			return fmt.Errorf("create Contract Agent result validator: %w", err)
+		}
+		contractSkill, err := os.ReadFile(filepath.Join("agent-system", "skills", "contract-plan", "SKILL.md"))
+		if err != nil {
+			return fmt.Errorf("read canonical contract-plan skill: %w", err)
+		}
+		worktrees := gitadapter.TaskWorktree{
+			StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
+		}
+		freezer := contractfreezeuc.Service{
+			Worktrees: worktrees, Runner: runner, Validator: validator,
+			Materializer: contractbaseline.FileMaterializer{}, Router: agentpolicy.FromConfig(cfg),
+			ContractSkill: string(contractSkill),
+		}
+		service := shardplanninguc.Service{
+			Plans: pgadapter.PlanningRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+			Execution: pgadapter.AgentExecutionPlanRepoPG{Pool: pool}, Repositories: projectSource,
+			Catalog: controlPlane, Materializer: contractbaseline.FileMaterializer{}, Freezer: freezer,
+		}
+		readiness, err := service.Prepare(ctx, planID)
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, readiness)
 	case "plan":
 		flags := flag.NewFlagSet(command, flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
 		file := flags.String("file", "", "natural-language command file")
 		projectIDs := flags.String("project-ids", "", "optional comma-separated project IDs")
 		sourceIssues := flags.String("source-issues", "", "optional provider:project-id:number list")
+		idempotencyKey := flags.String("idempotency-key", "", "optional explicit command idempotency key for a fresh planning request")
+		supersedesPlanID := flags.String("supersedes-plan-id", "", "optional existing Plan ID to invalidate while creating a replacement")
 		if err := flags.Parse(args); err != nil {
 			return fmt.Errorf("parse plan flags: %w", err)
 		}
@@ -1155,7 +1399,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, input 
 			return err
 		}
 		created, err := operations.CreateCommand.Handle(ctx, planninguc.CreateCommandInput{
-			Source: domain.CommandSourceCLI, Text: text,
+			Source: domain.CommandSourceCLI, Text: text, IdempotencyKey: *idempotencyKey,
 		})
 		if err != nil {
 			return err
@@ -1166,6 +1410,7 @@ func runPlanningCommand(cfg config.Config, command string, args []string, input 
 		}
 		bundle, err := operations.CreatePlan.Handle(ctx, created.ID, domain.PlanRequest{
 			RequestedProjectIDs: commaSeparated(*projectIDs), SourceIssues: issueReferences,
+			SupersedesPlanID: strings.TrimSpace(*supersedesPlanID),
 		})
 		if err != nil {
 			return err
@@ -1363,7 +1608,7 @@ func runGitLabCommand(cfg config.Config, command string, args []string, output i
 
 func planningCommandNeedsTemporal(command string) bool {
 	switch command {
-	case "plan-run", "plan-retry-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
+	case "plan-run", "plan-shard-run", "plan-shard-remediate", "plan-retry-run", "run-pause", "run-resume", "run-cancel", "task-retry", "task-cancel":
 		return true
 	default:
 		return false
@@ -1575,6 +1820,16 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 	worktrees := gitadapter.TaskWorktree{
 		StoragePath: cfg.WorktreeStoragePath, AuthorName: cfg.OnboardingAuthorName, AuthorEmail: cfg.OnboardingAuthorEmail,
 	}
+	catalog, err := loadAgentControlCatalog(".")
+	if err != nil {
+		return fmt.Errorf("load Agent Control Plane catalog for shard workers: %w", err)
+	}
+	projectSource := gitadapter.ProjectSource{AllowedRoots: cfg.RepositoryAllowedRoots, StoragePath: cfg.RepositoryStoragePath}
+	shardExecution := shardexecutionuc.Service{
+		Plans: pgadapter.PlanningRepoPG{Pool: pool}, Projects: pgadapter.ProjectRepoPG{Pool: pool},
+		Execution: pgadapter.AgentExecutionPlanRepoPG{Pool: pool}, Repositories: projectSource,
+		Worktrees: worktrees, Runner: runner, Router: agentpolicy.FromConfig(cfg), Catalog: catalog,
+	}
 	executor := &executionengine.Service{
 		Repository: taskExecutions, Worktrees: worktrees, Runner: runner, Validator: resultValidator,
 		Verifier: executionengine.Verifier{Worktrees: worktrees},
@@ -1599,10 +1854,12 @@ func runWorker(cfg config.Config, logger *zap.Logger) error {
 	})
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.SystemProbeWorkflow)
 	temporalWorker.RegisterWorkflow(orchestratorworkflow.PlanWorkflow)
+	temporalWorker.RegisterWorkflow(orchestratorworkflow.ShardFanoutWorkflow)
 	temporalWorker.RegisterActivity(&activities.SystemActivities{})
 	temporalWorker.RegisterActivity(&activities.PlanActivities{
 		Plans: pgadapter.PlanningRepoPG{Pool: pool}, TaskExecutions: taskExecutions, Executor: executor,
 	})
+	temporalWorker.RegisterActivity(&activities.ShardFanoutActivities{Execution: shardExecution})
 	logger.Info("starting temporal worker",
 		zap.String("namespace", cfg.TemporalNamespace),
 		zap.String("task_queue", cfg.TemporalTaskQueue),
@@ -1676,6 +1933,10 @@ Commands:
   project-archive Archive a project without deleting history or snapshots
   project-restore Restore a project to its pre-archive status
   agent-template-check Validate the canonical shared agent template bundle
+  agent-control-check Validate canonical agent-system assets, manifest, skills, and profiles
+  agent-assets-plan  Inspect a repository and print a deterministic managed-skill proposal
+  agent-assets-apply Apply a proposal only when its exact fingerprint is explicitly approved
+  agent-policy-plan  Compare the global policy with an explicitly named target (read-only)
   project-onboard Prepare an evidence-backed onboarding proposal
   project-enrich  Prepare a Codex semantic onboarding proposal with quoted evidence
   project-diff    Print an onboarding proposal diff
@@ -1689,6 +1950,9 @@ Commands:
   consumers       Show direct and transitive consumers for a service
   plan            Create a discussion-stage DAG from a command file or source issue
   plan-show       Show a persisted plan, discussion, work items, approval, and run
+  plan-shards     Prepare architectural shards, freeze source contracts, and record fan-out readiness
+  plan-shard-remediate  Correct selected shards from a rejected independent review
+  plan-shard-run  Start the approved Plan's Temporal architectural worker fan-out
   plan-comment    Add an owner comment while discussing a plan
   plan-issues     Ask issue-manage-agent for complete Russian issue proposals
   plan-submit     Freeze the issue-backed plan version for owner approval
@@ -1711,12 +1975,4 @@ Commands:
   gitlab-links    Show persisted GitLab links for a plan
   version         Print build version
   help            Show this help`)
-}
-
-func loadAgentControlCatalog(root string) (agentcontrol.Catalog, error) {
-	catalog, err := localrepo.LoadCatalogFromDirectory(root)
-	if err != nil {
-		return agentcontrol.Catalog{}, fmt.Errorf("load canonical Agent Control Plane catalog: %w", err)
-	}
-	return catalog, nil
 }

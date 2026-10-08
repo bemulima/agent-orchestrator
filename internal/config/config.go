@@ -20,7 +20,7 @@ const (
 	DefaultCodexModelFast         = "gpt-5.6-luna"
 	DefaultCodexModelStandard     = "gpt-5.6-terra"
 	DefaultCodexModelDeep         = "gpt-5.6-sol"
-	DefaultCodexModelCoder        = "gpt-5.3-codex-spark"
+	DefaultCodexModelCoder        = "gpt-5.6-sol"
 	DefaultCodexModelReview       = "gpt-5.6-terra"
 	DefaultCodexReasoningFast     = "low"
 	DefaultCodexReasoningStandard = "medium"
@@ -79,7 +79,7 @@ type Config struct {
 	CodexModelFast         string `envconfig:"CODEX_MODEL_FAST" default:"gpt-5.6-luna" validate:"required"`
 	CodexModelStandard     string `envconfig:"CODEX_MODEL_STANDARD" default:"gpt-5.6-terra" validate:"required"`
 	CodexModelDeep         string `envconfig:"CODEX_MODEL_DEEP" default:"gpt-5.6-sol" validate:"required"`
-	CodexModelCoder        string `envconfig:"CODEX_MODEL_CODER" default:"gpt-5.3-codex-spark" validate:"required"`
+	CodexModelCoder        string `envconfig:"CODEX_MODEL_CODER" default:"gpt-5.6-sol" validate:"required"`
 	CodexModelReview       string `envconfig:"CODEX_MODEL_REVIEW" default:"gpt-5.6-terra" validate:"required"`
 	CodexReasoningFast     string `envconfig:"CODEX_REASONING_FAST" default:"low" validate:"oneof=minimal low medium high xhigh"`
 	CodexReasoningStandard string `envconfig:"CODEX_REASONING_STANDARD" default:"medium" validate:"oneof=minimal low medium high xhigh"`
