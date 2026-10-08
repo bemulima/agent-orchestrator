@@ -1,0 +1,83 @@
+package v1
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	"github.com/example/ms-student-service/internal/usecase/hybridapplication"
+	"github.com/go-chi/chi/v5"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+type intentRouteCapture struct {
+	creates, gets   int
+	actor, path, id string
+}
+
+func (c *intentRouteCapture) CreateIntent(_ context.Context, actor, path string, input hybridapplication.CreateIntentInput) (domain.HybridLearningIntentReceipt, error) {
+	c.creates++
+	c.actor = actor
+	c.path = path
+	c.id = input.IntentID
+	return domain.HybridLearningIntentReceipt{}, nil
+}
+func (c *intentRouteCapture) GetIntent(_ context.Context, actor, path, id string) (domain.HybridLearningIntentReceipt, error) {
+	c.gets++
+	c.actor = actor
+	c.path = path
+	c.id = id
+	return domain.HybridLearningIntentReceipt{}, nil
+}
+func TestHybridIntentRegisteredLearnerActorAndStrictBody(t *testing.T) {
+	actor, path, id := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"
+	input := hybridapplication.CreateIntentInput{IntentID: id, ExpectedPathRevision: 3, Kind: "CHANGE_GOAL", RequestedChange: domain.HybridRequestedChange{Scope: domain.HybridScopeIdentity{GoalCode: "go.advanced", DirectionCode: "backend", DesiredStacks: []string{"go"}}, Mutations: []domain.HybridFutureMutation{}}}
+	raw, _ := json.Marshal(input)
+	request := func(body, role, method, url string, capture *intentRouteCapture) (int, string) {
+		r := chi.NewRouter()
+		r.Use((middleware.AuthMiddleware{}).Middleware)
+		RegisterHybridIntentRoutes(r, &handlers.StudentHybridIntentHandler{Intents: capture})
+		req := httptest.NewRequest(method, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-User-ID", actor)
+		req.Header.Set("X-User-Role", role)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+	url := "/student/learning-paths/" + path + "/learning-intents"
+	for _, role := range []string{"STUDENT", "STUDENT_PRO", "TEACHER", "ADMIN"} {
+		capture := &intentRouteCapture{}
+		status, _ := request(string(raw), role, "POST", url, capture)
+		if role == "STUDENT" || role == "STUDENT_PRO" {
+			if status != 200 || capture.creates != 1 || capture.actor != actor || capture.path != path || capture.id != id {
+				t.Fatal("learner actor not bound")
+			}
+		} else if status != 403 || capture.creates != 0 {
+			t.Fatal("Teacher/admin fabricated learner intent")
+		}
+	}
+	capture := &intentRouteCapture{}
+	status, _ := request("", "STUDENT", "GET", url+"/"+id, capture)
+	if status != 200 || capture.gets != 1 || capture.actor != actor || capture.path != path || capture.id != id {
+		t.Fatal("receipt read not actor/path bound")
+	}
+	cases := map[string]string{"duplicate": `{"kind":"CHANGE_GOAL",` + string(raw[1:]), "case": strings.Replace(string(raw), `"kind":`, `"Kind":`, 1), "trailing": string(raw) + ` {}`, "actor injection": `{"student_id":"PRIVATE_CANARY",` + string(raw[1:]), "timestamp injection": `{"created_at":"2026-10-05T00:00:00Z",` + string(raw[1:]), "null": strings.Replace(string(raw), `"mutations":[]`, `"mutations":null`, 1), "private nested": strings.Replace(string(raw), `"scope":{`, `"scope":{"solution":"PRIVATE_CANARY",`, 1), "oversized": strings.Repeat(" ", domain.MaximumPlanningSnapshotRequestBytes+1)}
+	var body map[string]any
+	json.Unmarshal(raw, &body)
+	delete(body, "expected_path_revision")
+	missing, _ := json.Marshal(body)
+	cases["missing"] = string(missing)
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			capture := &intentRouteCapture{}
+			status, response := request(body, "STUDENT", "POST", url, capture)
+			if status != 400 || capture.creates != 0 || strings.Contains(response, "PRIVATE_CANARY") {
+				t.Fatalf("malformed admitted%d calls%d %s", status, capture.creates, response)
+			}
+		})
+	}
+}

@@ -1,0 +1,104 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"testing/fstest"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type freshMigrationRow struct {
+	tables int
+	err    error
+}
+
+func (row freshMigrationRow) Scan(dest ...any) error {
+	if row.err != nil {
+		return row.err
+	}
+	if len(dest) != 1 {
+		return errors.New("unexpected scan destination")
+	}
+	value, ok := dest[0].(*int)
+	if !ok {
+		return errors.New("unexpected scan type")
+	}
+	*value = row.tables
+	return nil
+}
+
+var _ pgx.Row = freshMigrationRow{}
+
+type freshMigrationRunnerFake struct {
+	tables   int
+	query    error
+	failAt   string
+	executed []string
+}
+
+func (runner *freshMigrationRunnerFake) QueryRow(context.Context, string, ...any) pgx.Row {
+	return freshMigrationRow{tables: runner.tables, err: runner.query}
+}
+
+func (runner *freshMigrationRunnerFake) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	runner.executed = append(runner.executed, sql)
+	if sql == runner.failAt {
+		return pgconn.CommandTag{}, errors.New("sql failure")
+	}
+	return pgconn.CommandTag{}, nil
+}
+
+var _ freshMigrationRunner = (*freshMigrationRunnerFake)(nil)
+
+func TestRunFreshMigrationsUsesOnlyForwardFilesInLexicalOrder(t *testing.T) {
+	runner := &freshMigrationRunnerFake{}
+	migrations := fstest.MapFS{
+		"010_second.up.sql":   &fstest.MapFile{Data: []byte("second")},
+		"001_first.sql":       &fstest.MapFile{Data: []byte("first")},
+		"010_second.down.sql": &fstest.MapFile{Data: []byte("rollback")},
+		"notes.txt":           &fstest.MapFile{Data: []byte("ignore")},
+	}
+	result, err := RunFreshMigrations(context.Background(), runner, migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Schema != FreshMigrationResultSchema || result.Status != "applied" || result.MigrationCount != 2 || result.Reason != "" || result.FailedMigration != "" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(runner.executed) != 2 || runner.executed[0] != "first" || runner.executed[1] != "second" {
+		t.Fatalf("execution order = %#v", runner.executed)
+	}
+}
+
+func TestRunFreshMigrationsRejectsNonEmptyTargetBeforeAnySQL(t *testing.T) {
+	runner := &freshMigrationRunnerFake{tables: 1}
+	result, err := RunFreshMigrations(context.Background(), runner, fstest.MapFS{"001_init.sql": &fstest.MapFile{Data: []byte("first")}})
+	if !errors.Is(err, ErrMigrationTargetNotEmpty) || result.Status != "failed" || result.Reason != "target_not_empty" || len(runner.executed) != 0 {
+		t.Fatalf("result=%#v err=%v executed=%#v", result, err, runner.executed)
+	}
+}
+
+func TestRunFreshMigrationsStopsAtFirstFailedFile(t *testing.T) {
+	runner := &freshMigrationRunnerFake{failAt: "second"}
+	result, err := RunFreshMigrations(context.Background(), runner, fstest.MapFS{
+		"001_first.sql":  &fstest.MapFile{Data: []byte("first")},
+		"002_second.sql": &fstest.MapFile{Data: []byte("second")},
+		"003_third.sql":  &fstest.MapFile{Data: []byte("third")},
+	})
+	if !errors.Is(err, ErrMigrationFailed) || result.Status != "failed" || result.Reason != "migration_failed" || result.FailedMigration != "002_second.sql" || result.MigrationCount != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(runner.executed) != 2 || runner.executed[1] != "second" {
+		t.Fatalf("execution did not stop at failed file: %#v", runner.executed)
+	}
+}
+
+func TestOrderedForwardMigrationsRejectsEmptyDirectory(t *testing.T) {
+	_, err := orderedForwardMigrations(fstest.MapFS{"001_init.down.sql": &fstest.MapFile{Data: []byte("rollback")}})
+	if err == nil || err.Error() != "no forward migrations found" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

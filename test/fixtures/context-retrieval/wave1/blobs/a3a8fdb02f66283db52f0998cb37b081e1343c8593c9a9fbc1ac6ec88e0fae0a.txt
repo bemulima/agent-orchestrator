@@ -1,0 +1,273 @@
+package domain
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/google/uuid"
+)
+
+const StudentPlanningReadinessSnapshotSchema = "student-planning-readiness-snapshot.v1"
+
+type StudentPlanningReadinessStateRef struct {
+	Kind    string `json:"kind"`
+	Version int64  `json:"version"`
+}
+
+type StudentPlanningReadinessStackValues struct {
+	State  string    `json:"state"`
+	Values *[]string `json:"values,omitempty"`
+}
+
+type StudentPlanningReadinessLanguage struct {
+	Code       string `json:"code,omitempty"`
+	Provenance string `json:"provenance"`
+	Source     string `json:"source,omitempty"`
+}
+
+type StudentPlanningReadinessProfile struct {
+	DirectionCode          *string                             `json:"direction_code,omitempty"`
+	SelfAssessedExperience *string                             `json:"self_assessed_experience,omitempty"`
+	KnownStacks            StudentPlanningReadinessStackValues `json:"known_stacks"`
+	DesiredStacks          StudentPlanningReadinessStackValues `json:"desired_stacks"`
+	PreferredLanguage      *StudentPlanningReadinessLanguage   `json:"preferred_language,omitempty"`
+	ContentLanguage        *StudentPlanningReadinessLanguage   `json:"content_language,omitempty"`
+	WeeklyMinutes          *int                                `json:"weekly_minutes,omitempty"`
+	PreferredPace          *string                             `json:"preferred_pace,omitempty"`
+}
+
+type StudentPlanningReadinessLearningIntent struct {
+	Code       string `json:"code"`
+	Source     string `json:"source"`
+	Provenance string `json:"provenance"`
+}
+
+// StudentPlanningReadinessActivePath is observational only: it is emitted
+// only for the exact selected path that is currently ACTIVE.
+type StudentPlanningReadinessActivePath struct {
+	LearningPathID string `json:"learning_path_id"`
+	Version        int64  `json:"version"`
+	CourseID       string `json:"course_id"`
+	GoalCode       string `json:"goal_code"`
+	Status         string `json:"status"`
+}
+
+// StudentPlanningReadinessSnapshot is the intentionally small Planner input.
+// It is not an onboarding write model and contains no raw model output.
+type StudentPlanningReadinessSnapshot struct {
+	Schema         string                                  `json:"schema"`
+	StudentID      string                                  `json:"student_id"`
+	StateRef       StudentPlanningReadinessStateRef        `json:"state_ref"`
+	LearningIntent *StudentPlanningReadinessLearningIntent `json:"learning_intent,omitempty"`
+	Profile        StudentPlanningReadinessProfile         `json:"profile"`
+	ActivePath     *StudentPlanningReadinessActivePath     `json:"active_path,omitempty"`
+}
+
+// StudentPlanningReadinessProvenance is the narrow accepted-slot evidence
+// needed to determine whether a language was explicitly accepted.
+type StudentPlanningReadinessProvenance struct {
+	SlotCode               string
+	CodeValue              *string
+	StacksValue            *[]string
+	AcceptedDraftVersion   int64
+	AcceptedProfileVersion *int64
+	Origin                 StudentOnboardingTurnOrigin
+}
+
+// StudentPlanningReadinessSource is read by the adapter in one consistent
+// snapshot. An active draft wins deterministically over a finalized profile.
+type StudentPlanningReadinessSource struct {
+	StudentID  string
+	Draft      *StudentOnboardingDraft
+	Profile    *StudentOnboarding
+	Provenance []StudentPlanningReadinessProvenance
+	ActivePath *StudentPlanningReadinessActivePath
+}
+
+func BuildStudentPlanningReadinessSnapshot(input StudentPlanningReadinessSource) (StudentPlanningReadinessSnapshot, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	if _, err := uuid.Parse(input.StudentID); err != nil {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness student")
+	}
+	var finalizedDraftVersion int64
+	if input.Draft != nil {
+		draft, err := NormalizeStudentOnboardingDraft(*input.Draft)
+		if err != nil || draft.StudentID != input.StudentID {
+			return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness draft")
+		}
+		if draft.Status == StudentOnboardingDraftStatusDraft && draft.Version > 0 {
+			return buildPlanningReadinessFromDraft(input.StudentID, draft, input.Provenance, input.ActivePath)
+		}
+		if draft.Status == StudentOnboardingDraftStatusCompleted && draft.CompletedProfileVersion != nil &&
+			input.Profile != nil && *draft.CompletedProfileVersion == input.Profile.Version {
+			finalizedDraftVersion = draft.Version
+		}
+	}
+	if input.Profile != nil {
+		profile, err := NormalizeStudentOnboarding(*input.Profile)
+		if err != nil || profile.StudentID != input.StudentID {
+			return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness profile")
+		}
+		return buildPlanningReadinessFromProfile(input.StudentID, profile, input.Provenance, finalizedDraftVersion, input.ActivePath)
+	}
+	return normalizeStudentPlanningReadiness(StudentPlanningReadinessSnapshot{
+		Schema: StudentPlanningReadinessSnapshotSchema, StudentID: input.StudentID,
+		StateRef: StudentPlanningReadinessStateRef{Kind: "none", Version: 0},
+		Profile: StudentPlanningReadinessProfile{
+			KnownStacks: unansweredPlanningReadinessStacks(), DesiredStacks: unansweredPlanningReadinessStacks(),
+		}, ActivePath: input.ActivePath,
+	})
+}
+
+func buildPlanningReadinessFromDraft(studentID string, draft StudentOnboardingDraft, provenance []StudentPlanningReadinessProvenance, activePath *StudentPlanningReadinessActivePath) (StudentPlanningReadinessSnapshot, error) {
+	profile := StudentPlanningReadinessProfile{
+		DirectionCode: draft.DirectionCode, SelfAssessedExperience: draft.SelfAssessedExperience,
+		KnownStacks: planningReadinessDraftStacks(draft.KnownStacks), DesiredStacks: planningReadinessDraftStacks(draft.DesiredStacks),
+		WeeklyMinutes: draft.WeeklyMinutes, PreferredPace: draft.PreferredPace,
+	}
+	if draft.PreferredLanguage != nil {
+		profile.PreferredLanguage = planningReadinessLanguage(*draft.PreferredLanguage, provenance, draft.Version, nil, 0)
+		if planningReadinessLanguageTrusted(profile.PreferredLanguage) {
+			profile.ContentLanguage = &StudentPlanningReadinessLanguage{Code: profile.PreferredLanguage.Code, Provenance: profile.PreferredLanguage.Provenance, Source: "preferred_language"}
+		}
+	}
+	result := StudentPlanningReadinessSnapshot{
+		Schema: StudentPlanningReadinessSnapshotSchema, StudentID: studentID,
+		StateRef: StudentPlanningReadinessStateRef{Kind: "accepted_draft", Version: draft.Version},
+		Profile:  profile, ActivePath: activePath,
+	}
+	if draft.GoalCode != nil && *draft.GoalCode == "learn_programming" {
+		result.LearningIntent = &StudentPlanningReadinessLearningIntent{
+			Code: "learn_programming", Source: "onboarding_goal_code.v1", Provenance: "accepted_student_draft",
+		}
+	}
+	return normalizeStudentPlanningReadiness(result)
+}
+
+func buildPlanningReadinessFromProfile(studentID string, profile StudentOnboarding, provenance []StudentPlanningReadinessProvenance, finalizedDraftVersion int64, activePath *StudentPlanningReadinessActivePath) (StudentPlanningReadinessSnapshot, error) {
+	known := unresolvedPlanningReadinessStacks()
+	if len(profile.KnownStacks) > 0 {
+		known = answeredPlanningReadinessStacks(profile.KnownStacks)
+	} else if planningReadinessHasMatchingStacks(provenance, StudentOnboardingSlotKnownStacks, profile.KnownStacks, 0, &profile.Version, finalizedDraftVersion) {
+		known = answeredPlanningReadinessStacks(profile.KnownStacks)
+	}
+	desired := answeredPlanningReadinessStacks(profile.DesiredStacks)
+	result := StudentPlanningReadinessSnapshot{
+		Schema: StudentPlanningReadinessSnapshotSchema, StudentID: studentID,
+		StateRef: StudentPlanningReadinessStateRef{Kind: "finalized_profile", Version: profile.Version},
+		Profile: StudentPlanningReadinessProfile{
+			DirectionCode: &profile.DirectionCode, SelfAssessedExperience: &profile.SelfAssessedExperience,
+			KnownStacks: known, DesiredStacks: desired, WeeklyMinutes: &profile.WeeklyMinutes, PreferredPace: &profile.PreferredPace,
+			PreferredLanguage: planningReadinessLanguage(profile.PreferredLanguage, provenance, 0, &profile.Version, finalizedDraftVersion),
+		}, ActivePath: activePath,
+	}
+	if planningReadinessLanguageTrusted(result.Profile.PreferredLanguage) {
+		result.Profile.ContentLanguage = &StudentPlanningReadinessLanguage{Code: result.Profile.PreferredLanguage.Code, Provenance: result.Profile.PreferredLanguage.Provenance, Source: "preferred_language"}
+	}
+	if profile.GoalCode == "learn_programming" {
+		result.LearningIntent = &StudentPlanningReadinessLearningIntent{
+			Code: "learn_programming", Source: "onboarding_goal_code.v1", Provenance: "finalized_profile",
+		}
+	}
+	return normalizeStudentPlanningReadiness(result)
+}
+
+func planningReadinessDraftStacks(values *[]string) StudentPlanningReadinessStackValues {
+	if values == nil {
+		return unansweredPlanningReadinessStacks()
+	}
+	return answeredPlanningReadinessStacks(*values)
+}
+func unansweredPlanningReadinessStacks() StudentPlanningReadinessStackValues {
+	return StudentPlanningReadinessStackValues{State: "unanswered"}
+}
+func unresolvedPlanningReadinessStacks() StudentPlanningReadinessStackValues {
+	return StudentPlanningReadinessStackValues{State: "unresolved"}
+}
+func answeredPlanningReadinessStacks(values []string) StudentPlanningReadinessStackValues {
+	copied := append([]string{}, values...)
+	return StudentPlanningReadinessStackValues{State: "answered", Values: &copied}
+}
+
+func planningReadinessLanguage(code string, values []StudentPlanningReadinessProvenance, draftVersion int64, profileVersion *int64, finalizedDraftVersion int64) *StudentPlanningReadinessLanguage {
+	for _, value := range values {
+		if value.SlotCode != StudentOnboardingSlotPreferredLanguage || value.CodeValue == nil || *value.CodeValue != code || value.Origin != StudentOnboardingTurnOriginExplicitUI && value.Origin != StudentOnboardingTurnOriginExplicitText {
+			continue
+		}
+		// The draft row has one terminal, monotonically increasing lineage. A
+		// later accepted turn carries untouched slots forward without inserting
+		// duplicate provenance, so the latest exact slot evidence remains valid.
+		if draftVersion > 0 && value.AcceptedProfileVersion == nil &&
+			value.AcceptedDraftVersion > 0 && value.AcceptedDraftVersion <= draftVersion {
+			return &StudentPlanningReadinessLanguage{Code: code, Provenance: string(value.Origin)}
+		}
+		if profileVersion != nil && value.AcceptedProfileVersion != nil && *value.AcceptedProfileVersion == *profileVersion {
+			return &StudentPlanningReadinessLanguage{Code: code, Provenance: string(value.Origin)}
+		}
+		if profileVersion != nil && finalizedDraftVersion > 0 && value.AcceptedProfileVersion == nil &&
+			value.AcceptedDraftVersion > 0 && value.AcceptedDraftVersion <= finalizedDraftVersion {
+			return &StudentPlanningReadinessLanguage{Code: code, Provenance: string(value.Origin)}
+		}
+	}
+	return &StudentPlanningReadinessLanguage{Code: code, Provenance: "untrusted_persisted"}
+}
+
+func planningReadinessLanguageTrusted(value *StudentPlanningReadinessLanguage) bool {
+	return value != nil && (value.Provenance == string(StudentOnboardingTurnOriginExplicitUI) || value.Provenance == string(StudentOnboardingTurnOriginExplicitText))
+}
+
+func planningReadinessHasMatchingStacks(values []StudentPlanningReadinessProvenance, slot string, stacks []string, draftVersion int64, profileVersion *int64, finalizedDraftVersion int64) bool {
+	for _, value := range values {
+		if value.SlotCode != slot || value.StacksValue == nil || len(*value.StacksValue) != len(stacks) {
+			continue
+		}
+		matches := true
+		for index := range stacks {
+			if (*value.StacksValue)[index] != stacks[index] {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		if draftVersion > 0 && value.AcceptedProfileVersion == nil &&
+			value.AcceptedDraftVersion > 0 && value.AcceptedDraftVersion <= draftVersion {
+			return true
+		}
+		if profileVersion != nil && value.AcceptedProfileVersion != nil && *value.AcceptedProfileVersion == *profileVersion {
+			return true
+		}
+		if profileVersion != nil && finalizedDraftVersion > 0 && value.AcceptedProfileVersion == nil &&
+			value.AcceptedDraftVersion > 0 && value.AcceptedDraftVersion <= finalizedDraftVersion {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeStudentPlanningReadiness(input StudentPlanningReadinessSnapshot) (StudentPlanningReadinessSnapshot, error) {
+	if input.Schema != StudentPlanningReadinessSnapshotSchema || input.StudentID == "" ||
+		(input.StateRef.Kind != "none" && input.StateRef.Kind != "accepted_draft" && input.StateRef.Kind != "finalized_profile") || input.StateRef.Version < 0 ||
+		(input.StateRef.Kind == "none" && input.StateRef.Version != 0) || (input.StateRef.Kind != "none" && input.StateRef.Version < 1) {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness snapshot")
+	}
+	for _, stacks := range []StudentPlanningReadinessStackValues{input.Profile.KnownStacks, input.Profile.DesiredStacks} {
+		if (stacks.State != "answered" && stacks.State != "unanswered" && stacks.State != "unresolved") || (stacks.Values != nil && len(*stacks.Values) > 20) || (stacks.State == "answered" && stacks.Values == nil) || (stacks.State != "answered" && stacks.Values != nil) {
+			return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness stacks")
+		}
+	}
+	if input.LearningIntent != nil && (input.LearningIntent.Code != "learn_programming" || input.LearningIntent.Source != "onboarding_goal_code.v1" || (input.LearningIntent.Provenance != "accepted_student_draft" && input.LearningIntent.Provenance != "finalized_profile")) {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness intent")
+	}
+	if input.Profile.PreferredLanguage != nil && (input.Profile.PreferredLanguage.Provenance != "explicit_ui" && input.Profile.PreferredLanguage.Provenance != "explicit_text" && input.Profile.PreferredLanguage.Provenance != "untrusted_persisted") {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness language")
+	}
+	if input.Profile.ContentLanguage != nil && (!planningReadinessLanguageTrusted(input.Profile.ContentLanguage) || input.Profile.ContentLanguage.Source != "preferred_language" || input.Profile.PreferredLanguage == nil || input.Profile.ContentLanguage.Code != input.Profile.PreferredLanguage.Code || input.Profile.ContentLanguage.Provenance != input.Profile.PreferredLanguage.Provenance) {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness content language")
+	}
+	if input.ActivePath != nil && (input.ActivePath.LearningPathID == "" || input.ActivePath.Version < 1 || input.ActivePath.CourseID == "" || input.ActivePath.GoalCode == "" || input.ActivePath.Status != "ACTIVE") {
+		return StudentPlanningReadinessSnapshot{}, errors.New("invalid planning readiness path")
+	}
+	return input, nil
+}

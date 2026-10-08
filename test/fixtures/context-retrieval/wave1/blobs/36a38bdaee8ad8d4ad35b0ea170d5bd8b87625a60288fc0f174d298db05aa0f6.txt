@@ -1,0 +1,314 @@
+package courseclient
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+func TestGetTaskPreservesTrustedStructuredAssessmentKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/internal/task/get-internal-task/task-id" {
+			http.NotFound(responseWriter, request)
+			return
+		}
+		if request.Header.Get("X-Internal-Token") != "trusted-token" {
+			http.Error(responseWriter, "forbidden", http.StatusForbidden)
+			return
+		}
+		responseWriter.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(responseWriter).Encode(map[string]any{
+			"id":        "task-id",
+			"lesson_id": "lesson-id",
+			"course_id": "course-id",
+			"status":    1,
+			"type":      13,
+			"task_kind": "classification",
+			"learning_targets": []any{
+				map[string]any{"type": "capability", "key": "learning.semantic-sequence", "version": "v1"},
+				map[string]any{"type": "concept", "key": "program.instructions.sequence"},
+			},
+			"tests": []any{
+				map[string]any{
+					"id": "question-id", "kind": "classification", "title": "Classify", "order": 1,
+					"groups": []any{
+						map[string]any{"id": "group-id", "title": "Group", "order": 1},
+					},
+					"variants": []any{
+						map[string]any{
+							"id": "variant-id", "text": "Item", "order": 1,
+							"is_correct": true, "correct_order": 2,
+							"group_id": "group-id", "group_source_key": "group-key",
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	task, err := (Client{
+		BaseURL:       server.URL,
+		InternalToken: "trusted-token",
+		HTTPClient:    server.Client(),
+	}).GetTask(context.Background(), "task-id")
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if len(task.Tests) != 1 || task.Tests[0].Kind != "classification" || len(task.Tests[0].Groups) != 1 {
+		t.Fatalf("structured assessment metadata missing: %+v", task.Tests)
+	}
+	if len(task.LearningTargets) != 2 {
+		t.Fatalf("learning target metadata missing: %+v", task.LearningTargets)
+	}
+	if task.LearningTargets[0].Type != domain.LearningTargetCapability || task.LearningTargets[0].Key != "learning.semantic-sequence" || task.LearningTargets[0].Version != "v1" {
+		t.Fatalf("unexpected first learning target: %+v", task.LearningTargets[0])
+	}
+	variant := task.Tests[0].Variants[0]
+	if !variant.IsCorrect || variant.CorrectOrder == nil || *variant.CorrectOrder != 2 {
+		t.Fatalf("trusted correctness metadata missing: %+v", variant)
+	}
+	if variant.GroupID != "group-id" || variant.GroupSourceKey != "group-key" {
+		t.Fatalf("trusted classification assignment missing: %+v", variant)
+	}
+}
+
+func TestGetTaskRejectsInvalidLearningTargets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
+		responseWriter.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(responseWriter).Encode(map[string]any{
+			"id": "task-id",
+			"learning_targets": []any{
+				map[string]any{"type": "mastery", "key": "learning.semantic-sequence"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	if _, err := (Client{BaseURL: server.URL, HTTPClient: server.Client()}).GetTask(context.Background(), "task-id"); err == nil {
+		t.Fatal("expected invalid learning target error")
+	}
+}
+
+func TestGetTaskChecksAndCachesPublicRelationAccess(t *testing.T) {
+	const relationID = "7f8b2498-4666-4ff2-8527-b5991199ca22"
+	publicCalls := 0
+	internalCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/task/get/task-id":
+			publicCalls++
+			if request.URL.Query().Get("fields") != "id" || request.URL.Query().Get("via_relation_id") != relationID {
+				t.Fatalf("unexpected public access query: %s", request.URL.RawQuery)
+			}
+			if request.Header.Get("X-Internal-Token") != "" {
+				t.Fatal("public access check must not use the internal token")
+			}
+			if request.Header.Get("X-User-ID") != "student-id" || request.Header.Get("X-User-Role") != "STUDENT_PRO" {
+				t.Fatalf("public access check is missing audience headers: %v", request.Header)
+			}
+			responseWriter.Header().Set("Content-Type", "application/json")
+			_, _ = responseWriter.Write([]byte(`{"id":"task-id"}`))
+		case "/internal/task/get-internal-task/task-id":
+			internalCalls++
+			if request.Header.Get("X-Internal-Token") != "trusted-token" {
+				t.Fatal("trusted metadata request is missing its internal token")
+			}
+			responseWriter.Header().Set("Content-Type", "application/json")
+			_, _ = responseWriter.Write([]byte(`{"id":"task-id","lesson_id":"lesson-id","course_id":"course-id","status":1}`))
+		default:
+			http.NotFound(responseWriter, request)
+		}
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, InternalToken: "trusted-token", HTTPClient: server.Client()}
+	ctx := answer.WithPublicContentAccessAudience(context.Background(), relationID, "student-id", "student_pro")
+	for range 2 {
+		if _, err := client.GetTask(ctx, "task-id"); err != nil {
+			t.Fatalf("get task: %v", err)
+		}
+	}
+	if publicCalls != 1 {
+		t.Fatalf("expected one cached public preflight, got %d", publicCalls)
+	}
+	if internalCalls != 2 {
+		t.Fatalf("expected two trusted metadata reads, got %d", internalCalls)
+	}
+}
+
+func TestGetTaskRejectsHiddenDirectAccessBeforeTrustedMetadataRead(t *testing.T) {
+	internalCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/v1/task/get/task-id" {
+			if request.URL.Query().Get("via_relation_id") != "" {
+				t.Fatal("direct access unexpectedly included a relation")
+			}
+			http.NotFound(responseWriter, request)
+			return
+		}
+		internalCalls++
+		http.Error(responseWriter, "unexpected trusted read", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := (Client{BaseURL: server.URL, InternalToken: "trusted-token", HTTPClient: server.Client()}).GetTask(
+		answer.WithPublicContentAccess(context.Background(), ""),
+		"task-id",
+	)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected not found, got %v", err)
+	}
+	if internalCalls != 0 {
+		t.Fatalf("hidden task reached trusted metadata endpoint %d times", internalCalls)
+	}
+}
+
+func TestGetTaskAllowsHiddenCourseWhenStudentHasAssignment(t *testing.T) {
+	internalCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/task/get/task-id":
+			http.NotFound(responseWriter, request)
+		case "/internal/task/get-internal-task/task-id":
+			internalCalls++
+			_ = json.NewEncoder(responseWriter).Encode(map[string]any{
+				"id": "task-id", "lesson_id": "lesson-id", "course_id": "private-course-id", "status": 1,
+			})
+		default:
+			http.NotFound(responseWriter, request)
+		}
+	}))
+	defer server.Close()
+
+	access := &assignedCourseAccessStub{allowed: true}
+	client := Client{
+		BaseURL: server.URL, InternalToken: "trusted-token", HTTPClient: server.Client(), AssignmentAccess: access,
+	}
+	ctx := answer.WithPublicContentAccessAudience(context.Background(), "", "student-id", "STUDENT")
+	task, err := client.GetTask(ctx, "task-id")
+	if err != nil {
+		t.Fatalf("get assigned private task: %v", err)
+	}
+	if task.CourseID != "private-course-id" || internalCalls != 1 || access.studentID != "student-id" ||
+		access.courseID != "private-course-id" {
+		t.Fatalf("unexpected assigned access: task=%+v calls=%d access=%+v", task, internalCalls, access)
+	}
+}
+
+func TestGetCourseStructureAllowsHiddenCourseWhenStudentHasAssignment(t *testing.T) {
+	internalCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/course/get/private-course-id":
+			http.NotFound(responseWriter, request)
+		case "/internal/course/get-internal-course-structure/private-course-id":
+			internalCalls++
+			_ = json.NewEncoder(responseWriter).Encode(map[string]any{
+				"course_id": "private-course-id",
+				"lessons":   []map[string]any{{"id": "lesson-id", "course_id": "private-course-id", "status": 1}},
+			})
+		default:
+			http.NotFound(responseWriter, request)
+		}
+	}))
+	defer server.Close()
+
+	access := &assignedCourseAccessStub{allowed: true}
+	client := Client{
+		BaseURL: server.URL, InternalToken: "trusted-token", HTTPClient: server.Client(), AssignmentAccess: access,
+	}
+	ctx := answer.WithPublicContentAccessAudience(context.Background(), "", "student-id", "STUDENT")
+	structure, err := client.GetCourseStructure(ctx, "private-course-id")
+	if err != nil {
+		t.Fatalf("get assigned private course: %v", err)
+	}
+	if structure.CourseID != "private-course-id" || len(structure.Lessons) != 1 || internalCalls != 1 ||
+		access.studentID != "student-id" || access.courseID != "private-course-id" {
+		t.Fatalf("unexpected assigned access: structure=%+v calls=%d access=%+v", structure, internalCalls, access)
+	}
+}
+
+func TestGetTaskRejectsHiddenCourseWhenStudentHasNoAssignment(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/task/get/task-id":
+			http.NotFound(responseWriter, request)
+		case "/internal/task/get-internal-task/task-id":
+			_ = json.NewEncoder(responseWriter).Encode(map[string]any{
+				"id": "task-id", "lesson_id": "lesson-id", "course_id": "private-course-id", "status": 1,
+			})
+		default:
+			http.NotFound(responseWriter, request)
+		}
+	}))
+	defer server.Close()
+
+	access := &assignedCourseAccessStub{allowed: false}
+	client := Client{
+		BaseURL: server.URL, InternalToken: "trusted-token", HTTPClient: server.Client(), AssignmentAccess: access,
+	}
+	ctx := answer.WithPublicContentAccessAudience(context.Background(), "", "student-id", "STUDENT")
+	if _, err := client.GetTask(ctx, "task-id"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("unassigned hidden task: %v", err)
+	}
+}
+
+func TestPublicAccessPreflightUsesResourceSpecificRoutes(t *testing.T) {
+	paths := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		paths = append(paths, request.URL.Path)
+		responseWriter.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, HTTPClient: server.Client()}
+	for _, item := range []struct {
+		kind string
+		id   string
+	}{
+		{kind: "course", id: "course-id"},
+		{kind: "lesson", id: "lesson-id"},
+		{kind: "task", id: "task-id"},
+	} {
+		ctx := answer.WithPublicContentAccess(context.Background(), "")
+		if err := client.requirePublicAccess(ctx, item.kind, item.id); err != nil {
+			t.Fatalf("preflight %s: %v", item.kind, err)
+		}
+	}
+
+	want := []string{
+		"/api/v1/course/get/course-id",
+		"/api/v1/lesson/get/lesson-id",
+		"/api/v1/task/get/task-id",
+	}
+	if len(paths) != len(want) {
+		t.Fatalf("unexpected preflight paths: %v", paths)
+	}
+	for index := range want {
+		if paths[index] != want[index] {
+			t.Fatalf("preflight path %d: got %q want %q", index, paths[index], want[index])
+		}
+	}
+}
+
+type assignedCourseAccessStub struct {
+	allowed             bool
+	studentID, courseID string
+	err                 error
+}
+
+func (stub *assignedCourseAccessStub) CanAccessCourse(
+	_ context.Context,
+	studentID string,
+	courseID string,
+) (bool, error) {
+	stub.studentID, stub.courseID = studentID, courseID
+	return stub.allowed, stub.err
+}

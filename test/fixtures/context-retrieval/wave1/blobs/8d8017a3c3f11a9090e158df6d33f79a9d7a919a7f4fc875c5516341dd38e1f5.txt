@@ -1,0 +1,184 @@
+package teacherdialog_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+)
+
+type mutationSummaryState struct {
+	scope       domain.TeacherContextScope
+	from        int64
+	through     int64
+	invalidated bool
+}
+
+type contextMutationStore struct {
+	receipts  map[string]domain.DialogTeacherContextMutation
+	fences    map[string]domain.DialogTeacherContextMutation
+	summaries []*mutationSummaryState
+	err       error
+}
+
+func (store *contextMutationStore) ApplyMutation(_ context.Context, raw domain.DialogTeacherContextMutation, _ time.Time) (repository.TeacherContextMutationApplyResult, error) {
+	if store.err != nil {
+		return repository.TeacherContextMutationApplyResult{}, store.err
+	}
+	mutation, err := domain.NewDialogTeacherContextMutation(raw)
+	if err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	if existing, found := store.receipts[mutation.EventID]; found {
+		if existing != mutation {
+			return repository.TeacherContextMutationApplyResult{}, domain.ErrDialogTeacherContextMutationConflict
+		}
+		return repository.TeacherContextMutationApplyResult{}, nil
+	}
+	store.receipts[mutation.EventID] = mutation
+	key := mutation.StudentID + mutation.PersonalTeacherID + mutation.DialogID + string(mutation.ContextType) + mutation.ContextID + mutation.MessageID
+	if existing, found := store.fences[key]; found {
+		if existing.MessageSequence != mutation.MessageSequence ||
+			(existing.MessageVersion == mutation.MessageVersion && (existing.LastEventSequence != mutation.LastEventSequence || existing.Mutation != mutation.Mutation)) ||
+			(existing.MessageVersion < mutation.MessageVersion && existing.LastEventSequence >= mutation.LastEventSequence) {
+			return repository.TeacherContextMutationApplyResult{}, domain.ErrDialogTeacherContextMutationConflict
+		}
+		if existing.MessageVersion >= mutation.MessageVersion {
+			return repository.TeacherContextMutationApplyResult{Processed: true}, nil
+		}
+	}
+	store.fences[key] = mutation
+	invalidated := false
+	for _, summary := range store.summaries {
+		if summary.scope == mutation.Scope() && !summary.invalidated && summary.from <= mutation.MessageSequence && summary.through >= mutation.MessageSequence {
+			summary.invalidated = true
+			invalidated = true
+		}
+	}
+	return repository.TeacherContextMutationApplyResult{Processed: true, Advanced: true, Invalidated: invalidated}, nil
+}
+
+func mutationFixture(eventID string, version int, eventSequence int64) domain.DialogTeacherContextMutation {
+	return domain.DialogTeacherContextMutation{
+		SchemaVersion: domain.DialogTeacherContextMutatedSchemaVersion,
+		EventID:       eventID, EventType: domain.SubjectDialogTeacherContextMutated,
+		OccurredAt: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC),
+		DialogID:   "22222222-2222-4222-8222-222222222222", EventSequence: eventSequence,
+		StudentID:         "33333333-3333-4333-8333-333333333333",
+		PersonalTeacherID: "44444444-4444-4444-8444-444444444444",
+		ContextType:       domain.LearningContextLesson, ContextID: "55555555-5555-4555-8555-555555555555",
+		MessageID: "66666666-6666-4666-8666-666666666666", MessageSequence: 7,
+		MessageVersion: version, LastEventSequence: eventSequence, Mutation: domain.DialogTeacherContextMutationUpdated,
+	}
+}
+
+func TestContextMutationHandlerInvalidatesCompactedRangeWithoutHistory(t *testing.T) {
+	mutation := mutationFixture("11111111-1111-4111-8111-111111111111", 2, 61)
+	summary := &mutationSummaryState{scope: mutation.Scope(), from: 1, through: 20}
+	store := &contextMutationStore{receipts: map[string]domain.DialogTeacherContextMutation{}, fences: map[string]domain.DialogTeacherContextMutation{}, summaries: []*mutationSummaryState{summary}}
+	handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Date(2026, 9, 4, 12, 1, 0, 0, time.UTC)}}
+
+	processed, err := handler.Handle(context.Background(), mutation)
+	require.NoError(t, err)
+	require.True(t, processed)
+	require.True(t, summary.invalidated)
+
+	processed, err = handler.Handle(context.Background(), mutation)
+	require.NoError(t, err)
+	require.False(t, processed)
+}
+
+func TestContextMutationHandlerInvalidatesCompactedRangeAfterDelete(t *testing.T) {
+	mutation := mutationFixture("11111111-1111-4111-8111-111111111111", 2, 61)
+	mutation.Mutation = domain.DialogTeacherContextMutationDeleted
+	summary := &mutationSummaryState{scope: mutation.Scope(), from: 1, through: 20}
+	store := &contextMutationStore{receipts: map[string]domain.DialogTeacherContextMutation{}, fences: map[string]domain.DialogTeacherContextMutation{}, summaries: []*mutationSummaryState{summary}}
+	handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Date(2026, 9, 4, 12, 1, 0, 0, time.UTC)}}
+
+	processed, err := handler.Handle(context.Background(), mutation)
+	require.NoError(t, err)
+	require.True(t, processed)
+	require.True(t, summary.invalidated)
+}
+
+func TestContextMutationHandlerIgnoresReorderedOlderVersionAfterRebuild(t *testing.T) {
+	newer := mutationFixture("11111111-1111-4111-8111-111111111111", 3, 62)
+	summary := &mutationSummaryState{scope: newer.Scope(), from: 1, through: 20}
+	store := &contextMutationStore{receipts: map[string]domain.DialogTeacherContextMutation{}, fences: map[string]domain.DialogTeacherContextMutation{}, summaries: []*mutationSummaryState{summary}}
+	handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Now().UTC()}}
+
+	processed, err := handler.Handle(context.Background(), newer)
+	require.NoError(t, err)
+	require.True(t, processed)
+	require.True(t, summary.invalidated)
+
+	// Simulate a safe rebuild from the current Dialog state. A reordered older
+	// event is durably receipted but cannot advance the fence or invalidate it.
+	summary.invalidated = false
+	older := mutationFixture("77777777-7777-4777-8777-777777777777", 2, 61)
+	processed, err = handler.Handle(context.Background(), older)
+	require.NoError(t, err)
+	require.True(t, processed)
+	require.False(t, summary.invalidated)
+}
+
+func TestContextMutationHandlerLeavesOutsideRangeAndCrossBindingSummariesIntact(t *testing.T) {
+	base := mutationFixture("11111111-1111-4111-8111-111111111111", 2, 61)
+	tests := map[string]func(*domain.DialogTeacherContextMutation){
+		"outside range": func(value *domain.DialogTeacherContextMutation) {
+			value.MessageID = "77777777-7777-4777-8777-777777777777"
+			value.MessageSequence = 21
+		},
+		"student binding": func(value *domain.DialogTeacherContextMutation) {
+			value.StudentID = "88888888-8888-4888-8888-888888888888"
+		},
+		"dialog binding": func(value *domain.DialogTeacherContextMutation) {
+			value.DialogID = "88888888-8888-4888-8888-888888888888"
+		},
+		"teacher binding": func(value *domain.DialogTeacherContextMutation) {
+			value.PersonalTeacherID = "99999999-9999-4999-8999-999999999999"
+		},
+		"context binding": func(value *domain.DialogTeacherContextMutation) {
+			value.ContextID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		},
+		"context type binding": func(value *domain.DialogTeacherContextMutation) {
+			value.ContextType = domain.LearningContextPracticeTask
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			summary := &mutationSummaryState{scope: base.Scope(), from: 1, through: 20}
+			store := &contextMutationStore{receipts: map[string]domain.DialogTeacherContextMutation{}, fences: map[string]domain.DialogTeacherContextMutation{}, summaries: []*mutationSummaryState{summary}}
+			handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Now().UTC()}}
+			mutation := base
+			mutate(&mutation)
+			processed, err := handler.Handle(context.Background(), mutation)
+			require.NoError(t, err)
+			require.True(t, processed)
+			require.False(t, summary.invalidated)
+		})
+	}
+}
+
+func TestContextMutationHandlerPropagatesTransactionalFailure(t *testing.T) {
+	store := &contextMutationStore{err: errors.New("transaction failed")}
+	handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Now().UTC()}}
+	processed, err := handler.Handle(context.Background(), mutationFixture("11111111-1111-4111-8111-111111111111", 2, 61))
+	require.ErrorContains(t, err, "transaction failed")
+	require.False(t, processed)
+}
+
+func TestContextMutationHandlerRejectsConflictingEventReplay(t *testing.T) {
+	mutation := mutationFixture("11111111-1111-4111-8111-111111111111", 2, 61)
+	store := &contextMutationStore{receipts: map[string]domain.DialogTeacherContextMutation{mutation.EventID: mutation}, fences: map[string]domain.DialogTeacherContextMutation{}}
+	handler := teacherdialog.ContextMutationHandler{Mutations: store, Clock: dialogClock{value: time.Now().UTC()}}
+	mutation.MessageVersion = 3
+	_, err := handler.Handle(context.Background(), mutation)
+	require.ErrorIs(t, err, domain.ErrDialogTeacherContextMutationConflict)
+}

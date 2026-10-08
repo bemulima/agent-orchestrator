@@ -1,0 +1,277 @@
+package answer
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+// StartTaskAnswerInput carries details for starting attempt.
+type StartTaskAnswerInput struct {
+	StudentID          string
+	TaskID             string
+	LearningPathItemID string
+	RequirementID      string
+}
+
+type StartTaskAnswerOutput struct {
+	AnswerID               string
+	LearningActionID       string
+	SandboxID              string
+	Status                 string
+	PreviewURL             string
+	Type                   int16
+	TaskKind               string
+	ExecutionMode          string
+	EvaluationMode         string
+	UIMode                 string
+	SubmissionMode         string
+	RequiresSandbox        bool
+	ExposesPreview         bool
+	ExposesTerminal        bool
+	SupportsLiveValidation bool
+	TerminalWSURL          string
+}
+
+// StartTaskAnswer starts attempt ensuring limits and task availability.
+type StartTaskAnswer struct {
+	TaskProvider        TaskProvider
+	LessonAssignments   LessonAssessmentTaskResolver
+	Answers             repository.StudentTaskAnswerRepository
+	LearningActions     repository.LearningActionLifecycleRepository
+	Publisher           domain.EventPublisher
+	SandboxCreator      domain.SandboxCreator
+	Progression         *ProgressionService
+	PracticeTaskRuntime PracticeTaskRuntimeBridge
+}
+
+var defaultComposeConfig = json.RawMessage(`{
+  "version": "3.9",
+  "services": {
+    "app": {
+      "image": "node:20-alpine",
+      "working_dir": "/workspace",
+      "command": [
+        "sh",
+        "-c",
+        "while true; do sleep 3600; done"
+      ]
+    }
+  }
+}`)
+
+// Handle creates a new attempt if allowed.
+func (uc StartTaskAnswer) Handle(ctx context.Context, in StartTaskAnswerInput) (StartTaskAnswerOutput, error) {
+	if (in.LearningPathItemID == "") != (in.RequirementID == "") {
+		return StartTaskAnswerOutput{}, domain.ErrValidation
+	}
+	var task *TaskMetadata
+	var err error
+	if in.LearningPathItemID != "" {
+		if _, err := uuid.Parse(in.LearningPathItemID); err != nil {
+			return StartTaskAnswerOutput{}, domain.ErrValidation
+		}
+		if _, err := uuid.Parse(in.RequirementID); err != nil {
+			return StartTaskAnswerOutput{}, domain.ErrValidation
+		}
+		if uc.LessonAssignments == nil || uc.LearningActions == nil {
+			return StartTaskAnswerOutput{}, domain.ErrValidation
+		}
+		task, err = uc.LessonAssignments.ResolveAssessmentTask(ctx, in.StudentID, in.LearningPathItemID, in.RequirementID, in.TaskID)
+	} else {
+		task, err = uc.TaskProvider.GetTask(WithTaskLookupContext(ctx, in.StudentID, ""), in.TaskID)
+	}
+	if err != nil {
+		return StartTaskAnswerOutput{}, err
+	}
+	if task == nil {
+		return StartTaskAnswerOutput{}, domain.ErrValidation
+	}
+	task = NormalizeTaskMetadata(task)
+	if task.Status != domain.TaskStatusActive {
+		return StartTaskAnswerOutput{}, domain.ErrInvalidStatus
+	}
+	if isPracticeTaskRuntimeTask(task) {
+		if task.Locked {
+			return StartTaskAnswerOutput{}, &TaskLockedError{
+				TaskID:           in.TaskID,
+				RedirectLessonID: task.RedirectLessonID,
+				RedirectTaskID:   task.RedirectTaskID,
+			}
+		}
+	} else if in.LearningPathItemID == "" && uc.Progression != nil {
+		access, err := uc.Progression.ResolveTaskAccess(ctx, in.StudentID, in.TaskID)
+		if err != nil {
+			return StartTaskAnswerOutput{}, err
+		}
+		if access.Locked {
+			return StartTaskAnswerOutput{}, &TaskLockedError{
+				TaskID:           in.TaskID,
+				RedirectLessonID: access.RedirectLessonID,
+				RedirectTaskID:   access.RedirectTaskID,
+			}
+		}
+	}
+	now := time.Now().UTC()
+	var created domain.StudentTaskAnswer
+	var learningAction domain.StudentLearningAction
+	if isPracticeTaskRuntimeTask(task) {
+		// Reopen/resume stays on the same active answer while the milestone is in progress.
+		// A new answer is created only after the previous one has already been finalized.
+		if active, activeErr := uc.Answers.GetActiveForTaskAndStudent(ctx, in.TaskID, in.StudentID); activeErr == nil && active != nil {
+			created = *active
+			if uc.LearningActions != nil {
+				candidate, actionErr := newLearningAction(created, task, now)
+				if actionErr != nil {
+					return StartTaskAnswerOutput{}, actionErr
+				}
+				learningAction, actionErr = uc.LearningActions.EnsureActive(ctx, candidate)
+				if actionErr != nil {
+					return StartTaskAnswerOutput{}, actionErr
+				}
+			}
+		}
+	}
+	if created.ID == "" {
+		answer := domain.StudentTaskAnswer{
+			ID:        uuid.NewString(),
+			StudentID: in.StudentID,
+			TaskID:    in.TaskID,
+			StartedAt: now,
+			Status:    domain.StudentTaskAnswerStatusInProgress,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if in.LearningPathItemID != "" {
+			answer.LearningPathItemID = in.LearningPathItemID
+			answer.RequirementID = in.RequirementID
+			answer.FrozenTaskJSON, err = json.Marshal(task)
+			if err != nil {
+				return StartTaskAnswerOutput{}, err
+			}
+		}
+		if uc.LearningActions != nil {
+			candidate, actionErr := newLearningAction(answer, task, now)
+			if actionErr != nil {
+				return StartTaskAnswerOutput{}, actionErr
+			}
+			created, learningAction, err = uc.LearningActions.CreateAnswer(ctx, answer, task.MaxAttempts, candidate)
+		} else {
+			created, err = uc.Answers.Create(ctx, answer, task.MaxAttempts)
+		}
+		if err != nil {
+			return StartTaskAnswerOutput{}, err
+		}
+		if uc.Publisher != nil {
+			_ = uc.Publisher.Publish(domain.SubjectTaskAnswerStarted, map[string]any{
+				"task_id":                in.TaskID,
+				"user_id":                in.StudentID,
+				"student_task_answer_id": created.ID,
+				"learning_action_id":     learningAction.ID,
+				"course_id":              task.CourseID,
+				"attempt":                created.Attempt,
+				"started_at":             now,
+			})
+		}
+	}
+
+	out := StartTaskAnswerOutput{
+		AnswerID:               created.ID,
+		LearningActionID:       learningAction.ID,
+		Status:                 "IN_PROCESS",
+		Type:                   task.Type,
+		TaskKind:               task.TaskKind,
+		ExecutionMode:          task.ExecutionMode,
+		EvaluationMode:         task.EvaluationMode,
+		UIMode:                 task.UIMode,
+		SubmissionMode:         task.SubmissionMode,
+		RequiresSandbox:        task.RequiresSandbox,
+		ExposesPreview:         task.ExposesPreview,
+		ExposesTerminal:        task.ExposesTerminal,
+		SupportsLiveValidation: task.SupportsLiveValidation,
+	}
+	if !task.RequiresSandbox {
+		return out, nil
+	}
+	if uc.SandboxCreator == nil {
+		return StartTaskAnswerOutput{}, domain.ErrValidation
+	}
+
+	composeConfig := resolveComposeConfig(task.ComposeConfig)
+	sandboxID, previewURL, err := uc.SandboxCreator.CreateSandbox(
+		ctx,
+		in.StudentID,
+		in.TaskID,
+		created.ID,
+		composeConfig,
+		task.CodeStructureType,
+		task.CodeStructure,
+		pickStarterArchiveID(task.StarterFiles),
+	)
+	if err != nil {
+		return StartTaskAnswerOutput{}, fmt.Errorf("create sandbox: %w", err)
+	}
+	out.SandboxID = sandboxID
+	if task.ExposesPreview {
+		out.PreviewURL = previewURL
+	}
+	if uc.PracticeTaskRuntime != nil && isPracticeTaskRuntimeTask(task) {
+		preview := previewURL
+		if err := uc.PracticeTaskRuntime.BindAnswer(ctx, in.StudentID, in.TaskID, created.ID, sandboxID, &preview); err != nil {
+			return StartTaskAnswerOutput{}, err
+		}
+	}
+	return out, nil
+}
+
+func pickStarterArchiveID(items []TaskStarterFileMetadata) string {
+	for _, item := range items {
+		if item.Type == 1 && item.FileStorageID != "" {
+			return item.FileStorageID
+		}
+	}
+	return ""
+}
+
+func resolveComposeConfig(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return defaultComposeConfig
+	}
+
+	var payload any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return trimmed
+	}
+
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return trimmed
+	}
+
+	servicesRaw, ok := root["services"]
+	if !ok {
+		return defaultComposeConfig
+	}
+
+	switch services := servicesRaw.(type) {
+	case map[string]any:
+		if len(services) == 0 {
+			return defaultComposeConfig
+		}
+	case map[any]any:
+		if len(services) == 0 {
+			return defaultComposeConfig
+		}
+	default:
+		return defaultComposeConfig
+	}
+
+	return trimmed
+}

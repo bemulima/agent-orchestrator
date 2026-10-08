@@ -1,0 +1,155 @@
+# Product-aware onboarding (S7)
+
+> Historical compatibility note: S11 no longer admits a new standalone S7
+> session-v2 flow. Frozen v2 interactions still recover by their persisted
+> session version, independent of current flags; all new admission uses the
+> full canonical session-v3 chain described in the S8/S11 rollout runbook.
+
+S7 is an additive, default-dark Teacher policy. It asks Learning Planner whether
+the exact current Student onboarding state is sufficient to prepare a supported
+learning path, then deterministically chooses the next prompt or a terminal
+message. Teacher does not create a path, course, or lesson in this flow.
+
+## Rollout and replay
+
+Before S11, `TEACHER_PRODUCT_AWARE_ONBOARDING_ENABLED=false` selected the
+legacy session-v1 admission path. Migration 023 ends that split: the flag is
+now one member of the full S11 admission chain with dense ordering, canonical
+actions, unified coordination, and Planner handoff. If any member is off, a
+request without persisted evidence fails before the readiness call or any
+other downstream effect; a new request is never admitted as v1 or v2.
+
+Every frozen prompt identifies its immutable policy and session version.
+Existing `.v1` prompts continue through policy v1, and an already admitted v2
+turn completes as v2 after flags are disabled. Version-3 recovery likewise
+continues with handoff semantics. No prompt is reinterpreted from a live
+process flag.
+
+## Exact readiness read
+
+Teacher sends `POST /internal/students/{studentID}/learning-readiness` to
+Learning Planner with the dedicated Learning Planner `X-Internal-Token`. The
+strict request is bounded to 16 KiB:
+
+```json
+{
+  "schema": "learning-readiness-request.v1",
+  "expected_state_ref": {"kind": "accepted_draft", "version": 4}
+}
+```
+
+The request contains no Student profile, graph, mastery, or path projection.
+`expected_state_ref` is always present and comes from the exact authoritative
+Student state or accepted S3 receipt. A response is at most 64 KiB, has JSON
+content type, contains one strict JSON object with no unknown fields, and must
+match the expected state reference. Schema, resolver version, scope, result,
+one reason code, `executable=false`, `content_status=NOT_CREATED`, goal tuple,
+and optional active-path observation are closed and validated together.
+
+A `409`, mismatched reference, malformed response, other non-2xx status, or
+operational failure never becomes `no_effect`, never advances the dense cursor,
+and never falls back to a guessed product. After a `409` on an accepted turn,
+Teacher rereads the exact Student S3 receipt and authoritative state before one
+retry. Raw reason codes, graph identifiers, and path/course IDs are never shown.
+
+Readiness is called only from these boundaries:
+
+- on a new product-aware ensure after the authoritative Student state read;
+- after an accepted Student S3 effect and before staging the next response;
+- on recovery from `student_staged`, after proving the exact accepted receipt.
+
+It is not called before Student CAS, after `no_effect` or a tangent, or after a
+response is staged. The post-effect response and transition to
+`delivery_pending` commit in one existing S5 transaction.
+
+## Prompt policy v2
+
+`teacher-onboarding-prompt-policy.v2` is immutable and additive; v1 remains
+available for frozen-prompt replay. Its core fields are:
+
+- `goal_code=learn_programming`;
+- experience `beginner|basic|intermediate|advanced` (`new` is v1 only);
+- direction includes `undecided`; exact “Не знаю” meaning maps to it;
+- desired stack is asked only for `backend` and accepts exact `go`;
+- content language is explicitly asked when missing.
+
+Known stacks, interests, `weekly_minutes`, and pace are deferred. Multiple
+high-confidence, exact, low-risk facts from one semantic result may become one
+atomic Student S3 patch when provenance and missing-slot rules all pass.
+Direction and desired stack remain high-impact and use confirmation when
+needed. This adds no LLM invocation: attached free text still uses the one
+existing S4 semantic execution, while canonical actions and exact “Не знаю”
+remain deterministic. Teacher never calls Student `FinalizeCurrentV1` merely
+because Planner reports readiness.
+
+`READY` produces a no-action terminal message saying there is enough data to
+prepare `Основы программирования` or `Go backend`, while explicitly saying no
+path, course, or lessons were created. `ACTIVE_PATH_EXISTS` preserves the
+existing path with no card, action, or mutation. Clarification selects one
+actual missing core field from the Planner reason and authoritative Student
+state. Unsupported combinations receive an honest deterministic correction
+prompt; unavailable published graph or invalid output fails closed.
+
+## Durable prompt closure
+
+Migration `020_teacher_product_aware_onboarding_interaction_close` adds the
+honest immutable interaction state `closed`, exact reason
+`planning_ready|active_path_exists`, and `closed_at`. Active v1 is atomically
+superseded when an exact v2 successor prompt is admitted. Terminal ensure locks
+and closes the sole active prompt; it never steals a reserved or action-claimed
+prompt and instead reports that current prompt as collecting. Canonical receipt
+claim and terminal close share the same per-Dialog transaction fence, so exactly
+one wins. New stale clicks fail before Dialog materialization or Student CAS;
+an already materialized exact receipt remains replayable. Rollback requires a
+drain and fails closed while any terminal-close evidence or canonical
+`claimed|applied|materialized` prompt-effect receipt exists.
+
+For a coordinator terminal response, the durable accepted Student effect and
+empty staged UI identify `close_terminal` after a crash. A response-only tangent
+or `no_effect` instead identifies `preserve_prompt`. Delivery therefore closes
+the reserved prompt for `PLANNING_READY`/`ACTIVE_PATH_EXISTS`, but keeps a prompt
+active only for a genuine tangent/no-effect reply.
+
+## Browser session and action result
+
+While S7 is enabled, ensure returns `teacher-onboarding-session.v2`:
+
+```json
+{
+  "schema": "teacher-onboarding-session.v2",
+  "dialog_id": "00000000-0000-4000-8000-000000000000",
+  "status": "COLLECTING",
+  "phase": "DETERMINING_START",
+  "state_ref": {"kind": "accepted_draft", "version": 4},
+  "current_prompt": {"message_id": "00000000-0000-4000-8000-000000000001", "message_version": 1}
+}
+```
+
+Status is `COLLECTING|PLANNING_READY|ACTIVE_PATH_EXISTS`; phase is
+`GETTING_ACQUAINTED|DETERMINING_START|PREPARING_PATH|READY_TO_START`.
+`current_prompt` exists only for `COLLECTING`. Terminal sessions carry
+`terminal.kind`; `PLANNING_READY` also carries the safe `display_name`, while
+`ACTIVE_PATH_EXISTS` carries no path identity.
+
+The canonical endpoint keeps `assistant-ui-action-result.v2` unchanged:
+
+```json
+{
+  "schema": "assistant-ui-action-result.v2",
+  "mode": "canonical",
+  "materialized": true,
+  "replayed": false,
+  "canonical_student_message_id": "00000000-0000-4000-8000-000000000002"
+}
+```
+
+This means only that the canonical Student message is materialized and its v2
+turn is pending/completing through the dense coordinator. It does not claim
+Student onboarding or product planning completed. Correlation uses the request
+Dialog, frozen prompt message/version, idempotency key, and returned canonical
+Student message ID.
+
+S8 optionally replaces only the `PLANNING_READY` boundary with a durable,
+non-executable Planner admission. Its separate flag, ledger, recovery rules,
+and `teacher-onboarding-session.v3` projection are documented in
+[Durable onboarding Planner handoff S8](durable-onboarding-handoff.md).

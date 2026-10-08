@@ -1,0 +1,263 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type fixedOnboardingDraftClock struct {
+	now time.Time
+}
+
+func (clock fixedOnboardingDraftClock) Now() time.Time { return clock.now }
+
+func TestStudentOnboardingDraftResumeReplayFinalizeAndIsolation(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	var migrationPresent bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.student_onboarding_draft') IS NOT NULL`).Scan(&migrationPresent); err != nil {
+		t.Fatal(err)
+	}
+	if !migrationPresent {
+		t.Skip("migration 023_student_onboarding_draft.sql is not applied to the configured integration database")
+	}
+
+	studentIDs := []string{
+		"81000000-0000-4000-8000-000000000001",
+		"81000000-0000-4000-8000-000000000002",
+		"81000000-0000-4000-8000-000000000003",
+		"81000000-0000-4000-8000-000000000004",
+		"81000000-0000-4000-8000-000000000005",
+	}
+	defer cleanupOnboardingDraftStudents(t, pool, studentIDs)
+	cleanupOnboardingDraftStudents(t, pool, studentIDs)
+
+	repository := &postgres.StudentOnboardingRepoPG{Pool: pool}
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	getDraft := studentuc.GetStudentOnboardingDraft{Drafts: repository}
+	putDraft := studentuc.PutStudentOnboardingDraft{Drafts: repository, Clock: fixedOnboardingDraftClock{now: now}}
+	finalize := studentuc.FinalizeStudentOnboardingDraft{Drafts: repository, Clock: fixedOnboardingDraftClock{now: now.Add(time.Minute)}}
+
+	empty, err := getDraft.Handle(ctx, studentIDs[0])
+	if err != nil || empty.Version != 0 || empty.CreatedAt != nil {
+		t.Fatalf("stable empty draft: draft=%+v err=%v", empty, err)
+	}
+	direction := "backend"
+	firstInput := studentuc.PutStudentOnboardingDraftInput{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: studentIDs[0],
+		RequestID: "82000000-0000-4000-8000-000000000001", ExpectedVersion: 0,
+		StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{DirectionCode: &direction},
+	}
+	first, err := putDraft.Handle(ctx, firstInput)
+	if err != nil || first.Version != 1 || first.DirectionCode == nil {
+		t.Fatalf("first partial replace: draft=%+v err=%v", first, err)
+	}
+	replayed, err := putDraft.Handle(ctx, firstInput)
+	if err != nil || onboardingDraftJSON(t, replayed) != onboardingDraftJSON(t, first) {
+		t.Fatalf("lost-response replay changed result: replay=%+v err=%v", replayed, err)
+	}
+	differentDirection := "frontend"
+	firstInput.DirectionCode = &differentDirection
+	if _, err := putDraft.Handle(ctx, firstInput); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("same request id accepted different payload: %v", err)
+	}
+	resumed, err := getDraft.Handle(ctx, studentIDs[0])
+	if err != nil || onboardingDraftJSON(t, resumed) != onboardingDraftJSON(t, first) {
+		t.Fatalf("refresh did not resume stored draft: draft=%+v err=%v", resumed, err)
+	}
+
+	completeInput := completeOnboardingDraftInput(studentIDs[0], "82000000-0000-4000-8000-000000000002", 1)
+	complete, err := putDraft.Handle(ctx, completeInput)
+	if err != nil || complete.Version != 2 {
+		t.Fatalf("complete draft replacement: draft=%+v err=%v", complete, err)
+	}
+	finalizeInput := studentuc.FinalizeStudentOnboardingDraftInput{
+		Schema: domain.StudentOnboardingFinalizeCommandSchema, StudentID: studentIDs[0],
+		RequestID:            "82000000-0000-4000-8000-000000000003",
+		ExpectedDraftVersion: 2, ExpectedProfileVersion: 0,
+	}
+	finalized, err := finalize.Handle(ctx, finalizeInput)
+	if err != nil || finalized.Draft.Status != domain.StudentOnboardingDraftStatusCompleted ||
+		finalized.Draft.DirectionCode != nil || finalized.Profile.Version != 1 {
+		t.Fatalf("atomic finalize: result=%+v err=%v", finalized, err)
+	}
+	var redactedReplaceReceipt []byte
+	var redactedEnvelope map[string]bool
+	queryErr := pool.QueryRow(ctx, `SELECT response_json FROM student_onboarding_draft_command WHERE request_id=$1`,
+		firstInput.RequestID).Scan(&redactedReplaceReceipt)
+	decodeErr := json.Unmarshal(redactedReplaceReceipt, &redactedEnvelope)
+	if queryErr != nil || decodeErr != nil || len(redactedEnvelope) != 1 || !redactedEnvelope["redacted"] {
+		t.Fatalf("completed finalize retained partial answers in PUT receipt: response=%s queryErr=%v decodeErr=%v",
+			redactedReplaceReceipt, queryErr, decodeErr)
+	}
+	finalize.Clock = fixedOnboardingDraftClock{now: now.Add(24 * time.Hour)}
+	finalizeReplay, err := finalize.Handle(ctx, finalizeInput)
+	if err != nil || onboardingDraftJSON(t, finalizeReplay) != onboardingDraftJSON(t, finalized) {
+		t.Fatalf("finalize replay did not return original snapshot: result=%+v err=%v", finalizeReplay, err)
+	}
+	finalizeInput.RequestID = "82000000-0000-4000-8000-000000000004"
+	if _, err := finalize.Handle(ctx, finalizeInput); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("completed draft accepted new finalize command: %v", err)
+	}
+	if _, err := putDraft.Handle(ctx, completeInput); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("completed draft replay exposed cleared PUT response: %v", err)
+	}
+	completeInput.RequestID = "82000000-0000-4000-8000-000000000005"
+	completeInput.ExpectedVersion = finalized.Draft.Version
+	if _, err := putDraft.Handle(ctx, completeInput); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("completed draft accepted new PUT: %v", err)
+	}
+	completedProjection, err := getDraft.Handle(ctx, studentIDs[0])
+	if err != nil || completedProjection.DirectionCode != nil || completedProjection.KnownStacks != nil ||
+		completedProjection.Status != domain.StudentOnboardingDraftStatusCompleted {
+		t.Fatalf("completed GET exposed cleared answers: draft=%+v err=%v", completedProjection, err)
+	}
+
+	crossStudent := completeOnboardingDraftInput(studentIDs[1], firstInput.RequestID, 0)
+	if _, err := putDraft.Handle(ctx, crossStudent); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("request id replay crossed student boundary: %v", err)
+	}
+	otherEmpty, err := getDraft.Handle(ctx, studentIDs[1])
+	if err != nil || otherEmpty.Version != 0 {
+		t.Fatalf("cross-student conflict mutated other learner: draft=%+v err=%v", otherEmpty, err)
+	}
+
+	t.Run("existing profile version is updated once", func(t *testing.T) {
+		createdAt := now.Add(-time.Hour)
+		legacyProfile, normalizeErr := domain.NormalizeStudentOnboarding(domain.StudentOnboarding{
+			StudentID: studentIDs[2], DirectionCode: "frontend", SelfAssessedExperience: "basic",
+			KnownStacks: []string{"javascript"}, DesiredStacks: []string{"typescript"}, GoalCode: "first-job",
+			PreferredLanguage: "ru", WeeklyMinutes: 240, PreferredPace: "balanced",
+			Version: 1, CreatedAt: createdAt, UpdatedAt: createdAt,
+		})
+		if normalizeErr != nil {
+			t.Fatal(normalizeErr)
+		}
+		if _, saveErr := repository.Save(ctx, legacyProfile, 0); saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		draft, putErr := putDraft.Handle(ctx, completeOnboardingDraftInput(studentIDs[2], "83000000-0000-4000-8000-000000000001", 0))
+		if putErr != nil {
+			t.Fatal(putErr)
+		}
+		input := studentuc.FinalizeStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingFinalizeCommandSchema, StudentID: studentIDs[2],
+			RequestID:            "83000000-0000-4000-8000-000000000002",
+			ExpectedDraftVersion: draft.Version, ExpectedProfileVersion: 1,
+		}
+		result, finalizeErr := finalize.Handle(ctx, input)
+		if finalizeErr != nil || result.Profile.Version != 2 || !result.Profile.CreatedAt.Equal(createdAt) {
+			t.Fatalf("existing profile update: result=%+v err=%v", result, finalizeErr)
+		}
+		replayedResult, replayErr := finalize.Handle(ctx, input)
+		storedProfile, getErr := repository.Get(ctx, studentIDs[2])
+		if replayErr != nil || getErr != nil || replayedResult.Profile.Version != 2 || storedProfile.Version != 2 {
+			t.Fatalf("finalize replay updated profile twice: replay=%+v stored=%+v replayErr=%v getErr=%v", replayedResult, storedProfile, replayErr, getErr)
+		}
+	})
+
+	t.Run("incomplete finalize leaves profile and draft unchanged", func(t *testing.T) {
+		partial := "backend"
+		draft, putErr := putDraft.Handle(ctx, studentuc.PutStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingDraftSchema, StudentID: studentIDs[4],
+			RequestID: "85000000-0000-4000-8000-000000000001", ExpectedVersion: 0,
+			StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{DirectionCode: &partial},
+		})
+		if putErr != nil {
+			t.Fatal(putErr)
+		}
+		_, finalizeErr := finalize.Handle(ctx, studentuc.FinalizeStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingFinalizeCommandSchema, StudentID: studentIDs[4],
+			RequestID:            "85000000-0000-4000-8000-000000000002",
+			ExpectedDraftVersion: draft.Version, ExpectedProfileVersion: 0,
+		})
+		storedDraft, getErr := getDraft.Handle(ctx, studentIDs[4])
+		_, profileErr := repository.Get(ctx, studentIDs[4])
+		if !errors.Is(finalizeErr, domain.ErrValidation) || getErr != nil || storedDraft.Version != draft.Version ||
+			storedDraft.Status != domain.StudentOnboardingDraftStatusDraft || !errors.Is(profileErr, domain.ErrNotFound) {
+			t.Fatalf("failed finalize was not atomic: finalizeErr=%v draft=%+v getErr=%v profileErr=%v", finalizeErr, storedDraft, getErr, profileErr)
+		}
+	})
+
+	t.Run("concurrent put and finalize have one winner", func(t *testing.T) {
+		draft, putErr := putDraft.Handle(ctx, completeOnboardingDraftInput(studentIDs[3], "84000000-0000-4000-8000-000000000001", 0))
+		if putErr != nil {
+			t.Fatal(putErr)
+		}
+		putInput := completeOnboardingDraftInput(studentIDs[3], "84000000-0000-4000-8000-000000000002", draft.Version)
+		finalizeInput := studentuc.FinalizeStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingFinalizeCommandSchema, StudentID: studentIDs[3],
+			RequestID:            "84000000-0000-4000-8000-000000000003",
+			ExpectedDraftVersion: draft.Version, ExpectedProfileVersion: 0,
+		}
+		var putErrConcurrent, finalizeErrConcurrent error
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			_, putErrConcurrent = putDraft.Handle(ctx, putInput)
+		}()
+		go func() {
+			defer wait.Done()
+			_, finalizeErrConcurrent = finalize.Handle(ctx, finalizeInput)
+		}()
+		wait.Wait()
+		putWon := putErrConcurrent == nil && errors.Is(finalizeErrConcurrent, domain.ErrConflict)
+		finalizeWon := finalizeErrConcurrent == nil && errors.Is(putErrConcurrent, domain.ErrConflict)
+		if !putWon && !finalizeWon {
+			t.Fatalf("expected exactly one winner: put=%v finalize=%v", putErrConcurrent, finalizeErrConcurrent)
+		}
+	})
+}
+
+func completeOnboardingDraftInput(studentID, requestID string, expectedVersion int64) studentuc.PutStudentOnboardingDraftInput {
+	direction, experience := "backend", "basic"
+	known, desired := []string{}, []string{"go"}
+	goal, goalText, language := "first-job", "", "ru"
+	weeklyMinutes, pace := 300, "balanced"
+	return studentuc.PutStudentOnboardingDraftInput{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: studentID,
+		RequestID: requestID, ExpectedVersion: expectedVersion,
+		StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{
+			DirectionCode: &direction, SelfAssessedExperience: &experience,
+			KnownStacks: &known, DesiredStacks: &desired, GoalCode: &goal, GoalText: &goalText,
+			PreferredLanguage: &language, WeeklyMinutes: &weeklyMinutes, PreferredPace: &pace,
+		},
+	}
+}
+
+func onboardingDraftJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func cleanupOnboardingDraftStudents(t *testing.T, pool *pgxpool.Pool, studentIDs []string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, statement := range []string{
+		`DELETE FROM student_onboarding_draft_command WHERE student_id = ANY($1::uuid[])`,
+		`DELETE FROM student_onboarding_draft WHERE student_id = ANY($1::uuid[])`,
+		`DELETE FROM student_onboarding WHERE student_id = ANY($1::uuid[])`,
+	} {
+		if _, err := pool.Exec(ctx, statement, studentIDs); err != nil {
+			t.Fatalf("clean onboarding draft integration rows: %v", err)
+		}
+	}
+}

@@ -1,0 +1,185 @@
+package examplerelation
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+var (
+	relationSlugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	supportedRelations  = map[string]struct{}{
+		domain.LessonRelationImplementation: {},
+		domain.LessonRelationPractice:       {},
+		domain.LessonRelationComparison:     {},
+		domain.LessonRelationReference:      {},
+		domain.LessonRelationPrerequisite:   {},
+		domain.LessonRelationContinuation:   {},
+		domain.LessonRelationSeeAlso:        {},
+	}
+)
+
+// ReplaceExampleRelations reconciles all outgoing semantic links for one example.
+type ReplaceExampleRelations struct {
+	Examples  repository.LessonExampleRepository
+	Relations repository.LessonExampleRelationRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc ReplaceExampleRelations) Handle(ctx context.Context, sourceExampleID string, relations []domain.LessonExampleRelation) error {
+	sourceExampleID, err := normalizeID(sourceExampleID)
+	if err != nil || uc.Examples == nil || uc.Relations == nil {
+		return domain.ErrValidation
+	}
+	normalized, err := normalizeRelations(sourceExampleID, relations)
+	if err != nil {
+		return err
+	}
+	run := func(fn func(context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	return run(func(ctx context.Context) error {
+		if _, err := uc.Examples.Get(ctx, sourceExampleID); err != nil {
+			return err
+		}
+		for _, relation := range normalized {
+			if _, err := uc.Examples.Get(ctx, relation.TargetExampleID); err != nil {
+				return err
+			}
+		}
+		return uc.Relations.ReplaceBySourceExample(ctx, sourceExampleID, normalized)
+	})
+}
+
+// ListExampleRelations returns outgoing example relations.
+type ListExampleRelations struct {
+	Examples  repository.LessonExampleRepository
+	Relations repository.LessonExampleRelationRepository
+}
+
+func (uc ListExampleRelations) Handle(ctx context.Context, sourceExampleID string, activeOnly bool) ([]domain.LessonExampleRelation, error) {
+	sourceExampleID, err := normalizeID(sourceExampleID)
+	if err != nil || uc.Examples == nil || uc.Relations == nil {
+		return nil, domain.ErrValidation
+	}
+	example, err := uc.Examples.Get(ctx, sourceExampleID)
+	if err != nil {
+		return nil, err
+	}
+	if activeOnly && example.Status != domain.LessonExampleStatusActive {
+		return nil, domain.ErrNotFound
+	}
+	return uc.Relations.ListBySourceExample(ctx, sourceExampleID, activeOnly)
+}
+
+// DeleteExampleRelation removes one semantic example relation.
+type DeleteExampleRelation struct {
+	Relations repository.LessonExampleRelationRepository
+}
+
+func (uc DeleteExampleRelation) Handle(ctx context.Context, relationID string) error {
+	relationID, err := normalizeID(relationID)
+	if err != nil || uc.Relations == nil {
+		return domain.ErrValidation
+	}
+	return uc.Relations.Delete(ctx, relationID)
+}
+
+func normalizeRelations(sourceExampleID string, relations []domain.LessonExampleRelation) ([]domain.LessonExampleRelation, error) {
+	result := make([]domain.LessonExampleRelation, 0, len(relations))
+	sourceKeys := make(map[string]struct{}, len(relations))
+	identities := make(map[string]struct{}, len(relations))
+	for _, relation := range relations {
+		if relation.ID == "" {
+			relation.ID = uuid.NewString()
+		} else {
+			var err error
+			relation.ID, err = normalizeID(relation.ID)
+			if err != nil {
+				return nil, domain.ErrValidation
+			}
+		}
+		var err error
+		relation.SourceKey, err = domain.NormalizeContentSourceKey(relation.SourceKey)
+		if err != nil || relation.SourceKey == "" {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := sourceKeys[relation.SourceKey]; exists {
+			return nil, fmt.Errorf("%w: duplicate example relation source_key", domain.ErrConflict)
+		}
+		sourceKeys[relation.SourceKey] = struct{}{}
+		relation.SourceExampleID = sourceExampleID
+		relation.TargetExampleID, err = normalizeID(relation.TargetExampleID)
+		if err != nil || relation.TargetExampleID == sourceExampleID {
+			return nil, domain.ErrValidation
+		}
+		relation.Relation = strings.TrimSpace(relation.Relation)
+		if _, ok := supportedRelations[relation.Relation]; !ok {
+			return nil, domain.ErrValidation
+		}
+		identity := relation.TargetExampleID + "\x00" + relation.Relation
+		if _, exists := identities[identity]; exists {
+			return nil, fmt.Errorf("%w: duplicate semantic example relation", domain.ErrConflict)
+		}
+		identities[identity] = struct{}{}
+		relation.Stacks, err = normalizeSlugs(relation.Stacks)
+		if err != nil {
+			return nil, err
+		}
+		relation.Concepts, err = normalizeSlugs(relation.Concepts)
+		if err != nil {
+			return nil, err
+		}
+		relation.PrimaryStack = strings.TrimSpace(relation.PrimaryStack)
+		if !relationSlugPattern.MatchString(relation.PrimaryStack) || !contains(relation.Stacks, relation.PrimaryStack) {
+			return nil, domain.ErrValidation
+		}
+		result = append(result, relation)
+	}
+	return result, nil
+}
+
+func normalizeSlugs(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, domain.ErrValidation
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if len(value) > 128 || !relationSlugPattern.MatchString(value) {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := seen[value]; exists {
+			return nil, domain.ErrValidation
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func normalizeID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if _, err := uuid.Parse(value); err != nil {
+		return "", domain.ErrValidation
+	}
+	return value, nil
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

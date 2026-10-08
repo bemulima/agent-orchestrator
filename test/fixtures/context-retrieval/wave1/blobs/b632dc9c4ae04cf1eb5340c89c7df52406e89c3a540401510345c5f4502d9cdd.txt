@@ -1,0 +1,176 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const t18DiagnosticSubject = "student.diagnostic-result.committed.v1"
+
+func t18DiagnosticPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("STUDENT_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("requires explicitly owned T18 Student PostgreSQL proof database")
+	}
+	u, err := url.Parse(dsn)
+	owned := os.Getenv("T18_OWNED_STUDENT_DATABASE_NAME")
+	if err != nil || owned == "" || !strings.HasSuffix(owned, "_integration_proof") || u.Path != "/"+owned || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1") {
+		t.Fatal("refusing database without exact owned loopback proof identity")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return pool
+}
+
+func t18DiagnosticFixture(t *testing.T, pool *pgxpool.Pool) (*DiagnosticAssessmentRepoPG, repository.DiagnosticAssessmentCompleteCommand) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 4, 0, 0, 0, 123456000, time.UTC)
+	plan := domain.DiagnosticAssessmentPlan{
+		Schema: domain.DiagnosticAssessmentPlanSchema, ID: uuid.NewString(), StudentID: uuid.NewString(), CourseID: uuid.NewString(),
+		PlanRevision: 1, PolicyVersion: domain.DiagnosticAssessmentPolicy, OnboardingVersion: 1,
+		BootstrapPolicyVersion: domain.DiagnosticBootstrapPolicy, BootstrapContextDigest: "sha256:" + strings.Repeat("b", 64),
+		CourseContentRevision: "sha256:" + strings.Repeat("c", 64), CreatedAt: now,
+	}
+	for i := 0; i < 3; i++ {
+		plan.Assessments = append(plan.Assessments, domain.DiagnosticAssessmentPlanItem{
+			LessonID: uuid.NewString(), TaskID: uuid.NewString(), TaskVersion: 1, UpdatedAt: now, LessonOrder: i, TaskOrder: i,
+			LearningTargets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.syntax", Version: "v1"}},
+		})
+	}
+	var err error
+	plan.PlanDigest, err = domain.DiagnosticAssessmentPlanDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO student_onboarding(student_id,direction_code,self_assessed_experience,desired_stacks,goal_code,preferred_language,weekly_minutes,preferred_pace,profile_version,version,created_at,updated_at) VALUES($1,'backend','beginner',ARRAY['go'],'job','en',60,'steady','student-onboarding.v1',1,$2,$2)`, plan.StudentID, now); err != nil {
+		t.Fatalf("seed owned onboarding: %v", err)
+	}
+	repo := &DiagnosticAssessmentRepoPG{Pool: pool}
+	hash := "sha256:" + strings.Repeat("d", 64)
+	attempt, replay, err := repo.ReserveDiagnosticAssessment(ctx, repository.DiagnosticAssessmentReserveCommand{Plan: plan, RequestID: plan.ID, RequestHash: hash, OccurredAt: now})
+	if err != nil || replay || attempt.ID != plan.ID {
+		t.Fatalf("real reservation: replay=%t err=%v", replay, err)
+	}
+	for i, item := range plan.Assessments {
+		_, replay, err = repo.SubmitDiagnosticAssessment(ctx, repository.DiagnosticAssessmentSubmitCommand{StudentID: plan.StudentID, AttemptID: plan.ID, TaskID: item.TaskID, RequestID: uuid.NewString(), RequestHash: hash, Response: json.RawMessage(`{"selected_options":["option-a"]}`), Correct: i < 2, OccurredAt: now.Add(time.Duration(i+1) * time.Second)})
+		if err != nil || replay {
+			t.Fatalf("real submit %d: replay=%t err=%v", i, replay, err)
+		}
+	}
+	return repo, repository.DiagnosticAssessmentCompleteCommand{StudentID: plan.StudentID, AttemptID: plan.ID, RequestID: uuid.NewString(), RequestHash: hash, OccurredAt: now.Add(4*time.Second + 789*time.Nanosecond)}
+}
+
+func TestT18DiagnosticCompletionDurableOutbox(t *testing.T) {
+	pool := t18DiagnosticPool(t)
+	repo, command := t18DiagnosticFixture(t, pool)
+	ctx := context.Background()
+	result, replay, err := repo.CompleteDiagnosticAssessment(ctx, command)
+	if err != nil || replay {
+		t.Fatalf("real completion: replay=%t err=%v", replay, err)
+	}
+	stored, err := repo.GetDiagnosticAssessment(ctx, command.StudentID, command.AttemptID)
+	if err != nil || stored.Result == nil || stored.Result.ResultDigest != result.ResultDigest {
+		t.Fatalf("completion must first prove real durable result: err=%v", err)
+	}
+	var receipts, events int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_diagnostic_assessment_receipt WHERE request_id=$1 AND command_kind='COMPLETE'`, command.RequestID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_outbox WHERE subject=$1 AND correlation_id=$2`, t18DiagnosticSubject, command.AttemptID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("real PostgreSQL completion: durable_result=true completion_receipts=%d diagnostic_outbox=%d", receipts, events)
+	if receipts != 1 || events != 1 {
+		t.Fatalf("completion requires one atomic durable trigger: result committed, receipts=%d outbox=%d", receipts, events)
+	}
+	var unrelated int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM student_target_mastery WHERE student_id=$1)+(SELECT count(*) FROM student_learning_evidence WHERE student_id=$1)+(SELECT count(*) FROM student_learning_path WHERE student_id=$1)+(SELECT count(*) FROM student_task_answer WHERE student_id=$1)+(SELECT count(*) FROM student_learning_action WHERE student_id=$1)`, command.StudentID).Scan(&unrelated); err != nil || unrelated != 0 {
+		t.Fatalf("diagnostic completion wrote unrelated learning state: rows=%d err=%v", unrelated, err)
+	}
+	var payload []byte
+	var occurred time.Time
+	var eventID, causation string
+	if err := pool.QueryRow(ctx, `SELECT event_id::text,causation_id,occurred_at,payload FROM student_outbox WHERE subject=$1 AND correlation_id=$2`, t18DiagnosticSubject, command.AttemptID).Scan(&eventID, &causation, &occurred, &payload); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.IntegrationEvent{EventID: eventID, Subject: t18DiagnosticSubject, CorrelationID: command.AttemptID, CausationID: causation, StudentID: command.StudentID, OccurredAt: occurred, SchemaVersion: 1, Payload: payload}
+	if err := domain.ValidateDiagnosticResultCommittedEvent(event); err != nil || causation != command.RequestID || !occurred.Equal(result.CompletedAt) {
+		t.Fatalf("stored trigger binding: %v", err)
+	}
+	var envelope domain.EventEnvelope
+	var data domain.DiagnosticResultCommittedData
+	if json.Unmarshal(payload, &envelope) != nil || json.Unmarshal(envelope.Data, &data) != nil || data.PlanDigest != result.PlanDigest || data.ResultDigest != result.ResultDigest || data.PlanRevision != result.PlanRevision {
+		t.Fatal("stored references differ from authoritative result")
+	}
+	command.OccurredAt = command.OccurredAt.Add(time.Hour)
+	duplicate, replay, err := repo.CompleteDiagnosticAssessment(ctx, command)
+	if err != nil || !replay || duplicate.ResultDigest != result.ResultDigest || !duplicate.CompletedAt.Equal(result.CompletedAt) {
+		t.Fatalf("exact receipt replay: replay=%t err=%v", replay, err)
+	}
+	var after []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM student_outbox WHERE event_id=$1`, eventID).Scan(&after); err != nil || string(after) != string(payload) {
+		t.Fatal("replay changed durable trigger")
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_outbox WHERE subject=$1 AND correlation_id=$2`, t18DiagnosticSubject, command.AttemptID).Scan(&events); err != nil || events != 1 {
+		t.Fatal("replay duplicated durable trigger")
+	}
+	t.Log("exact completion replay preserved one result, one receipt and one identical trigger")
+}
+
+func TestT18DiagnosticOutboxInsertFailureRollsBackCompletion(t *testing.T) {
+	pool := t18DiagnosticPool(t)
+	repo, command := t18DiagnosticFixture(t, pool)
+	ctx := context.Background()
+	// A scoped failure injector in the owned proof database rejects only this
+	// fixture. NOT VALID avoids scanning existing rows; no schema migration or
+	// existing diagnostic result is rewritten or deleted.
+	constraint := "t18_outbox_failure_" + strings.ReplaceAll(command.AttemptID, "-", "")
+	statement := fmt.Sprintf(`ALTER TABLE student_outbox ADD CONSTRAINT %s CHECK (subject <> '%s' OR correlation_id <> '%s') NOT VALID`, constraint, t18DiagnosticSubject, command.AttemptID)
+	if _, err := pool.Exec(ctx, statement); err != nil {
+		t.Fatal(err)
+	}
+	drop := "ALTER TABLE student_outbox DROP CONSTRAINT " + constraint
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, "ALTER TABLE student_outbox DROP CONSTRAINT IF EXISTS "+constraint); err != nil {
+			t.Errorf("remove scoped failure injector: %v", err)
+		}
+	})
+	if _, _, err := repo.CompleteDiagnosticAssessment(ctx, command); err == nil {
+		t.Fatal("outbox insertion failure must fail completion")
+	}
+	var results, receipts, events int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM student_diagnostic_assessment_result WHERE attempt_id=$1),(SELECT count(*) FROM student_diagnostic_assessment_receipt WHERE request_id=$2),(SELECT count(*) FROM student_outbox WHERE subject=$3 AND correlation_id=$4)`, command.AttemptID, command.RequestID, t18DiagnosticSubject, command.AttemptID).Scan(&results, &receipts, &events); err != nil {
+		t.Fatal(err)
+	}
+	if results != 0 || receipts != 0 || events != 0 {
+		t.Fatalf("failed insertion leaked state: results=%d receipts=%d events=%d", results, receipts, events)
+	}
+	t.Log("actual outbox insert failure rolled back result and completion receipt")
+	if _, err := pool.Exec(ctx, drop); err != nil {
+		t.Fatal(err)
+	}
+	if _, replay, err := repo.CompleteDiagnosticAssessment(ctx, command); err != nil || replay {
+		t.Fatalf("retry after rollback: replay=%t err=%v", replay, err)
+	}
+}

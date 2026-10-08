@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -757,5 +758,55 @@ func TestMessageRegistrationIsWiringNotFrozenSourceContract(t *testing.T) {
 	}, map[string]agentcontrol.Profile{"project": catalog.Profiles["go.canonical"]})
 	if len(candidates) != 0 {
 		t.Fatalf("consumer registration became a source contract: %#v", candidates)
+	}
+}
+
+func TestWave1GoldFairScan(t *testing.T) {
+	files := canonicalGoFixtureFiles(map[string]string{"go.mod": "module fixture\n", "internal/usecase/change.go": "package usecase\nfunc Change(){}\n"})
+	for i := 0; i < maxRoutingEvidence; i++ {
+		files[fmt.Sprintf(".ai/contracts/f%04d.yaml", i)] = "contract: fixture\n"
+	}
+	root := t.TempDir()
+	writeFixtureFiles(t, root, files)
+	inventory, err := indexRepository(root, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution, _, err := resolveArchitectureProfile("change business process", "fixture", inventory, plannerControlPlane(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Status != domain.ProfileResolutionResolved {
+		t.Fatalf("existing required layers hidden by metadata: %s", resolution.Reason)
+	}
+	if inventory.coverage.IndexedFiles > maxRoutingEvidence || !inventory.coverage.UnscannedRemainder || inventory.coverage.RemainderCountKnown {
+		t.Fatal("bounded acquisition uncertainty lost")
+	}
+}
+func TestWave1GoldOutboundHTTPRoot(t *testing.T) {
+	root := t.TempDir()
+	files := canonicalGoFixtureFiles(map[string]string{"go.mod": "module fixture\n", "internal/usecase/change.go": "package usecase\nfunc Change(){}\n", ".ai/architecture.yaml": "outbound_client: internal/infrastructure/http/remote\n", "internal/infrastructure/http/remote/client.go": "package remote\nimport \"net/http\"\nfunc Call(){http.Get(\"https://remote.example.test\")}\n"})
+	writeFixtureFiles(t, root, files)
+	route, _ := coverageBuild(t, root, "Change external client timeout")
+	found := false
+	for _, r := range route.Routes {
+		found = found || r.RouteID == "backend.infrastructure.client"
+	}
+	if !found {
+		t.Fatalf("owner-declared outbound root unresolved: %+v", route.RouteCandidates)
+	}
+}
+
+func TestWave1GoldOutboundRejectsInboundAndComments(t *testing.T) {
+	for _, declaration := range []string{"inbound_http: internal/infrastructure/http/server\n", "outbound_client: internal/infrastructure/http/server\n"} {
+		root := t.TempDir()
+		files := canonicalGoFixtureFiles(map[string]string{"go.mod": "module fixture\n", "internal/usecase/change.go": "package usecase\nfunc Change(){}\n", ".ai/architecture.yaml": declaration, "internal/infrastructure/http/server/handler.go": "package server\nimport \"net/http\"\n// client.Do( is prohibited here\nfunc Serve(){http.HandleFunc(\"/\",func(http.ResponseWriter,*http.Request){})}\n"})
+		writeFixtureFiles(t, root, files)
+		route, _ := coverageBuild(t, root, "Change external client timeout")
+		for _, r := range route.Routes {
+			if r.RouteID == "backend.infrastructure.client" {
+				t.Fatal("inbound/comment became outbound implementation")
+			}
+		}
 	}
 }

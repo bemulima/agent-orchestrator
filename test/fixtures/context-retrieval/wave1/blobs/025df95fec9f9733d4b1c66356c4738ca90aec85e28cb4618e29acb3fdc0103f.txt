@@ -1,0 +1,110 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+type LessonRevisionProvider interface {
+	ResolveLessonRevision(context.Context, string, string) (domain.LessonRevision, error)
+}
+type LessonCompletionRepository interface {
+	GetLessonItem(context.Context, string, string) (domain.LearningPathItem, error)
+	ApplyLessonFact(context.Context, domain.LessonActivityFact) (domain.LearningPathItem, bool, error)
+}
+type LessonCompletion struct {
+	Repository LessonCompletionRepository
+	Clock      LearningJourneyClock
+}
+
+func (s LessonCompletion) Content(ctx context.Context, studentID, itemID string) (json.RawMessage, error) {
+	if s.Repository == nil || !validStudentUUID(studentID) || !validStudentUUID(itemID) {
+		return nil, domain.ErrValidation
+	}
+	item, err := s.Repository.GetLessonItem(ctx, studentID, itemID)
+	if err != nil {
+		return nil, err
+	}
+	if item.LessonRevisionID == "" {
+		return nil, domain.ErrConflict
+	}
+	return domain.PublicLessonContent(item.LessonContent)
+}
+func (s LessonCompletion) AcknowledgeTheory(ctx context.Context, studentID, itemID, requirementID, key string) (domain.LearningPathItem, error) {
+	if s.Repository == nil || s.Clock == nil || !validStudentUUID(key) || !validStudentUUID(studentID) || !validStudentUUID(itemID) || !validStudentUUID(requirementID) {
+		return domain.LearningPathItem{}, domain.ErrValidation
+	}
+	item, err := s.Repository.GetLessonItem(ctx, studentID, itemID)
+	if err != nil {
+		return item, err
+	}
+	for _, r := range item.FrozenRequirements {
+		if r.ID == requirementID {
+			if r.Type != "theory_acknowledged" {
+				return item, domain.ErrConflict
+			}
+			updated, _, err := s.Repository.ApplyLessonFact(ctx, domain.LessonActivityFact{StudentID: studentID, ItemID: itemID, RequirementID: requirementID, Type: r.Type, SourceID: r.SourceReference.ID, SourceRevisionID: r.SourceReference.RevisionID, FactID: key, OccurredAt: s.Clock.Now().UTC()})
+			return updated, err
+		}
+	}
+	return item, domain.ErrNotFound
+}
+
+// freezeLessonItems is called only for new assignments. Legacy persisted items
+// are carried through with their nullable revision and existing semantics.
+func freezeLessonItems(ctx context.Context, provider LessonRevisionProvider, items []domain.LearningPathItem, seed string, current []domain.LearningPathItem) ([]domain.LearningPathItem, error) {
+	out := append([]domain.LearningPathItem(nil), items...)
+	existing := map[string]domain.LearningPathItem{}
+	legacy := map[string]domain.LearningPathItem{}
+	for _, i := range current {
+		if i.ID != "" {
+			existing[i.ID] = i
+		}
+		if i.LessonRevisionID == "" {
+			legacy[i.ReferenceType+":"+i.ReferenceID] = i
+		}
+	}
+	for n := range out {
+		i := &out[n]
+		if i.ID != "" {
+			old, ok := existing[i.ID]
+			if !ok {
+				return nil, domain.ErrConflict
+			}
+			if i.ReferenceID != old.ReferenceID || i.ReferenceType != old.ReferenceType || i.LessonRevisionID != old.LessonRevisionID {
+				return nil, domain.ErrConflict
+			}
+			i.FrozenRequirements = append([]domain.LessonRequirement(nil), old.FrozenRequirements...)
+			i.LessonContent = append([]byte(nil), old.LessonContent...)
+			continue
+		}
+		if old, ok := legacy[i.ReferenceType+":"+i.ReferenceID]; ok && i.LessonRevisionID == "" {
+			i.ID = old.ID
+			continue
+		}
+		if i.ReferenceType != "lesson" {
+			continue
+		}
+		if provider == nil {
+			return nil, domain.ErrValidation
+		}
+		revision, err := provider.ResolveLessonRevision(ctx, i.ReferenceID, i.LessonRevisionID)
+		if err != nil {
+			return nil, err
+		}
+		i.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s:%d:%s", seed, n, i.ReferenceID))).String()
+		i.LessonRevisionID = revision.ID
+		i.LessonContent = append([]byte(nil), revision.Content...)
+		i.FrozenRequirements = nil
+		for _, a := range revision.Activities {
+			i.FrozenRequirements = append(i.FrozenRequirements, domain.LessonRequirement{ID: uuid.NewSHA1(uuid.MustParse(i.ID), []byte(a.ID)).String(), ActivityID: a.ID, Type: a.Type, Required: a.Required, SourceReference: a.SourceReference})
+		}
+		if err = domain.ValidateLessonAssignment(*i); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}

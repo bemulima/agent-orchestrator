@@ -1,0 +1,498 @@
+//go:build integration
+
+package postgres_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root alone runs this migrated PostgreSQL owner proof. Initial profile/path
+// and frozen upstream material are named metadata fixtures created through
+// owner repositories. Consequences are named Planner wire contract fixtures;
+// this test proves Student application, not Planner policy qualification.
+// The separate composed actual gate delivers the real Planner consequence.
+func TestT204HybridApplicationPostgres(t *testing.T) {
+	dsn := os.Getenv("STUDENT_T204_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("root-owned T20.4 PostgreSQL gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_student_integration_proof" {
+		t.Fatal("SETUP: exact isolated T20 database required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	t.Run("intent and future permutation atomic replay", func(t *testing.T) {
+		path := t204InitialOwnerPath(t, ctx, pool, false)
+		snapshot := t204Snapshot(t, ctx, repo, path)
+		one, two := 1, 2
+		ops := []domain.HybridFutureMutation{{Kind: "REORDER_PENDING_ITEMS", ItemID: path.Items[1].ID, TargetPosition: &two}, {Kind: "REORDER_PENDING_ITEMS", ItemID: path.Items[2].ID, TargetPosition: &one}}
+		intent := t204Intent(snapshot, "SUBSTANTIAL_SCOPE_CHANGE", ops)
+		before := t204Counts(t, ctx, pool, path)
+		constraint := "t204_intent_failure_" + strings.ReplaceAll(intent.IntentID, "-", "")
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE student_outbox ADD CONSTRAINT %s CHECK(causation_id<>'%s') NOT VALID`, constraint, intent.IntentID)); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_, _ = pool.Exec(context.Background(), "ALTER TABLE student_outbox DROP CONSTRAINT IF EXISTS "+constraint)
+		}()
+		if _, err := repo.CreateHybridLearningIntent(ctx, path.StudentID, intent); err == nil {
+			t.Fatal("intent outbox failure did not abort")
+		}
+		if got := t204Counts(t, ctx, pool, path); got != before {
+			t.Fatalf("failed intent partially committed before=%v after=%v", before, got)
+		}
+		if _, err := pool.Exec(ctx, "ALTER TABLE student_outbox DROP CONSTRAINT "+constraint); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := repo.CreateHybridLearningIntent(ctx, path.StudentID, intent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent.CreatedAt = intent.CreatedAt.Add(time.Hour)
+		replay, err := repo.CreateHybridLearningIntent(ctx, path.StudentID, intent)
+		if err != nil || !reflect.DeepEqual(stored, replay) {
+			t.Fatalf("server time altered exact intent replay %v", err)
+		}
+		changed := intent
+		changed.Kind = "CHANGE_GOAL"
+		changed.RequestedChange.Scope.GoalCode = "go.changed"
+		if _, err = repo.CreateHybridLearningIntent(ctx, path.StudentID, changed); !errors.Is(err, domain.ErrHybridConflict) {
+			t.Fatalf("changed same intentID accepted %v", err)
+		}
+		competing := intent
+		competing.IntentID = uuid.NewString()
+		if _, err = repo.CreateHybridLearningIntent(ctx, path.StudentID, competing); !errors.Is(err, domain.ErrHybridConflict) {
+			t.Fatalf("competing exactrevision intent accepted %v", err)
+		}
+		if _, err = repo.GetHybridLearningIntent(ctx, uuid.NewString(), path.ID, intent.IntentID); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("foreign intent disclosed %v", err)
+		}
+		withIntent := t204Snapshot(t, ctx, repo, path)
+		if withIntent.PendingIntent == nil || withIntent.PendingIntent.IntentID != intent.IntentID || withIntent.References.SnapshotRef == snapshot.References.SnapshotRef {
+			t.Fatal("durable intent missing from coherent owner identity")
+		}
+		c := t204Consequence(withIntent, ops)
+		c.ApplicationMode = domain.HybridApplicationRequiresIntent
+		c.IntentID = intent.IntentID
+		c.RequiredIntentKind = intent.Kind
+		c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+		before = t204Counts(t, ctx, pool, path)
+		failed := "t204_receipt_failure_" + strings.ReplaceAll(c.ConsequenceID, "-", "")
+		if _, err = pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE student_hybrid_application_receipt ADD CONSTRAINT %s CHECK(consequence_id<>'%s') NOT VALID`, failed, c.ConsequenceID)); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_, _ = pool.Exec(context.Background(), "ALTER TABLE student_hybrid_application_receipt DROP CONSTRAINT IF EXISTS "+failed)
+		}()
+		if _, err = repo.ApplyHybridConsequence(ctx, c); err == nil {
+			t.Fatal("receipt failure did not abort future application")
+		}
+		if got := t204Counts(t, ctx, pool, path); got != before {
+			t.Fatalf("application partial transaction before=%v after=%v", before, got)
+		}
+		if failedSnapshot := t204Snapshot(t, ctx, repo, path); failedSnapshot.References != withIntent.References {
+			t.Fatal("rollback rewrote path, material, intent or context")
+		}
+		if _, err = pool.Exec(ctx, "ALTER TABLE student_hybrid_application_receipt DROP CONSTRAINT "+failed); err != nil {
+			t.Fatal(err)
+		}
+		type applicationAttempt struct {
+			receipt domain.HybridApplicationReceipt
+			err     error
+		}
+		attempts := make(chan applicationAttempt, 2)
+		for n := 0; n < 2; n++ {
+			go func() { r, e := repo.ApplyHybridConsequence(ctx, c); attempts <- applicationAttempt{r, e} }()
+		}
+		first, second := <-attempts, <-attempts
+		result, err := first.receipt, first.err
+		if err != nil || second.err != nil || !reflect.DeepEqual(result, second.receipt) || result.Status != domain.HybridApplicationApplied || result.ResultingRevision != path.Version+1 {
+			t.Fatalf("concurrent exact matching intent application %#v %v / %#v %v", result, err, second.receipt, second.err)
+		}
+		updated, err := repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(updated.Items[0], path.Items[0]) || updated.Items[1].ID != path.Items[2].ID || updated.Items[2].ID != path.Items[1].ID {
+			t.Fatal("future permutation touched current private assignment or failed exact slots")
+		}
+		consumed, err := repo.GetHybridLearningIntent(ctx, path.StudentID, path.ID, intent.IntentID)
+		if err != nil || consumed.ConsumedAt == nil || consumed.ConsumedByConsequenceID != c.ConsequenceID {
+			t.Fatal("successful intent was not consumed once atomically")
+		}
+		after := t204Counts(t, ctx, pool, path)
+		if after[0] != before[0]+1 || after[1] != before[1]+1 || after[3] != before[3]+1 || after[4] != before[4]+1 || after[6] != before[6]+1 || after[7] != before[7]+1 {
+			t.Fatalf("one application revision/context/receipt/consumption expected before=%v after=%v", before, after)
+		}
+		for n := 0; n < 3; n++ {
+			exact, err := repo.ApplyHybridConsequence(ctx, c)
+			if err != nil || !reflect.DeepEqual(exact, result) {
+				t.Fatalf("lost ACK replay %v", err)
+			}
+		}
+		if got := t204Counts(t, ctx, pool, path); got != after {
+			t.Fatal("replay mutated owner counters")
+		}
+		for _, query := range []string{`UPDATE student_learning_intent SET kind=kind WHERE intent_id=$1`, `DELETE FROM student_learning_intent WHERE intent_id=$1`} {
+			if _, err = pool.Exec(ctx, query, intent.IntentID); err == nil {
+				t.Fatal("consumed intent provenance mutated")
+			}
+		}
+		for _, query := range []string{`UPDATE student_hybrid_application SET payload_hash=payload_hash WHERE consequence_id=$1`, `DELETE FROM student_hybrid_application WHERE consequence_id=$1`, `UPDATE student_hybrid_application_receipt SET receipt_json=receipt_json WHERE consequence_id=$1`, `DELETE FROM student_hybrid_application_receipt WHERE consequence_id=$1`} {
+			if _, err = pool.Exec(ctx, query, c.ConsequenceID); err == nil {
+				t.Fatal("immutable application/receipt mutated")
+			}
+		}
+		c.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+		if _, err = repo.ApplyHybridConsequence(ctx, c); !errors.Is(err, domain.ErrHybridConflict) {
+			t.Fatalf("same consequenceID changedpayload accepted %v", err)
+		}
+		t.Log("actual intent+outbox and future permutation+revision+journey+receipt+consumption commit atomically; rollback/replay preserve protected private row")
+	})
+	t.Run("no change and coherent stale fence", func(t *testing.T) {
+		path := t204InitialOwnerPath(t, ctx, pool, false)
+		s := t204Snapshot(t, ctx, repo, path)
+		c := t204Consequence(s, []domain.HybridFutureMutation{})
+		c.Outcome = domain.HybridOutcomeNoChange
+		c.ApplicationMode = ""
+		c.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+		before := t204Counts(t, ctx, pool, path)
+		receipt, err := repo.ApplyHybridConsequence(ctx, c)
+		if err != nil || receipt.Status != domain.HybridApplicationNoChange || receipt.ResultingRevision != path.Version {
+			t.Fatalf("nochange %#v %v", receipt, err)
+		}
+		after := t204Counts(t, ctx, pool, path)
+		if after[0] != before[0] || after[1] != before[1] || after[6] != before[6] || after[4] != before[4]+1 {
+			t.Fatal("nochange created path revision or failed receipt")
+		}
+		stalePath := t204InitialOwnerPath(t, ctx, pool, false)
+		old := t204Snapshot(t, ctx, repo, stalePath)
+		stale := t204Consequence(old, []domain.HybridFutureMutation{})
+		stale.Outcome = domain.HybridOutcomeNoChange
+		stale.ApplicationMode = ""
+		stale.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+		t204OfficialEvidence(t, ctx, pool, stalePath, 1)
+		before = t204Counts(t, ctx, pool, stalePath)
+		if _, err = repo.ApplyHybridConsequence(ctx, stale); !errors.Is(err, domain.ErrHybridStale) {
+			t.Fatalf("fresh mastery with samepathversion did not invalidate consequence %v", err)
+		}
+		if after = t204Counts(t, ctx, pool, stalePath); after != before {
+			t.Fatal("stale consequence mutated owner state")
+		}
+	})
+	t.Run("exact intent unstarted READY replacement", func(t *testing.T) {
+		path := t204InitialOwnerPath(t, ctx, pool, false)
+		s := t204Snapshot(t, ctx, repo, path)
+		op := domain.HybridFutureMutation{Kind: "REPLACE_ACTIVE_ACTIVITY", ItemID: path.Items[0].ID, TemplateItemID: path.Items[1].ID}
+		intent := t204Intent(s, "REPLACE_ACTIVE_ACTIVITY", []domain.HybridFutureMutation{op})
+		if _, err := repo.CreateHybridLearningIntent(ctx, path.StudentID, intent); err != nil {
+			t.Fatal(err)
+		}
+		s = t204Snapshot(t, ctx, repo, path)
+		c := t204Consequence(s, []domain.HybridFutureMutation{op})
+		c.ApplicationMode = domain.HybridApplicationRequiresIntent
+		c.IntentID = intent.IntentID
+		c.RequiredIntentKind = intent.Kind
+		c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+		receipt, err := repo.ApplyHybridConsequence(ctx, c)
+		if err != nil || receipt.Status != domain.HybridApplicationApplied {
+			t.Fatalf("safe READY replacement %#v %v", receipt, err)
+		}
+		updated, err := repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.Items[0].ID != path.Items[0].ID || updated.Items[0].Position != path.Items[0].Position || updated.Items[0].Status != domain.LearningPathItemReady || string(updated.Items[0].LessonContent) != string(path.Items[1].LessonContent) || !reflect.DeepEqual(updated.Items[1:], path.Items[1:]) {
+			t.Fatal("READY replacement changed execution identity or future source")
+		}
+		t.Log("actual exact learner intent replaces only unstarted READY material, preserving occurrence identity/position/status")
+	})
+	t.Run("unselected application preserves independent selected and paused paths", func(t *testing.T) {
+		selected := t204InitialOwnerPath(t, ctx, pool, false)
+		cloneInitial := func() domain.StudentLearningPath {
+			p := selected
+			p.ID = uuid.NewString()
+			p.CourseID = uuid.NewString()
+			p.IsPrimary = false
+			p.IsSelected = false
+			p.Version = 1
+			p.Items = append([]domain.LearningPathItem{}, selected.Items...)
+			for n := range p.Items {
+				p.Items[n].ID = uuid.NewString()
+			}
+			created, replay, err := repo.CreateLearningPathIdempotently(ctx, p, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("b", 64)})
+			if err != nil || replay {
+				t.Fatalf("named second initial owner path %v", err)
+			}
+			return created
+		}
+		unselected := cloneInitial()
+		paused := cloneInitial()
+		journey, err := repo.GetLearningContext(ctx, paused.StudentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Ordinary path lifecycle commands bind the aggregate journey version,
+		// which includes both additional path admissions, not path revision 1.
+		if _, err := repo.PauseLearningPath(ctx, paused.StudentID, paused.ID, journey.Version, time.Now().UTC().Truncate(time.Microsecond)); err != nil {
+			t.Fatal(err)
+		}
+		selectedBefore, err := repo.GetLearningPathByID(ctx, selected.StudentID, selected.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pausedBefore, err := repo.GetLearningPathByID(ctx, paused.StudentID, paused.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selectedID, status string
+		var version int64
+		if err := pool.QueryRow(ctx, `SELECT selected_learning_path_id::text,selected_path_status,version FROM student_learning_context WHERE student_id=$1`, selected.StudentID).Scan(&selectedID, &status, &version); err != nil {
+			t.Fatal(err)
+		}
+		s := t204Snapshot(t, ctx, repo, unselected)
+		one, two := 1, 2
+		c := t204Consequence(s, []domain.HybridFutureMutation{{Kind: "REORDER_PENDING_ITEMS", ItemID: unselected.Items[1].ID, TargetPosition: &two}, {Kind: "REORDER_PENDING_ITEMS", ItemID: unselected.Items[2].ID, TargetPosition: &one}})
+		c.ReasonCodes = []string{"EXISTING_PREREQUISITE_GAP"}
+		if _, err := repo.ApplyHybridConsequence(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		var afterID, afterStatus string
+		var afterVersion int64
+		if err := pool.QueryRow(ctx, `SELECT selected_learning_path_id::text,selected_path_status,version FROM student_learning_context WHERE student_id=$1`, selected.StudentID).Scan(&afterID, &afterStatus, &afterVersion); err != nil {
+			t.Fatal(err)
+		}
+		if afterID != selectedID || afterStatus != status || afterVersion != version+1 {
+			t.Fatal("unselected application changed independent selected context")
+		}
+		selectedAfter, err := repo.GetLearningPathByID(ctx, selected.StudentID, selected.ID)
+		if err != nil || !reflect.DeepEqual(selectedBefore, selectedAfter) {
+			t.Fatal("unselected application changed selected owner path")
+		}
+		pausedAfter, err := repo.GetLearningPathByID(ctx, paused.StudentID, paused.ID)
+		if err != nil || !reflect.DeepEqual(pausedBefore, pausedAfter) {
+			t.Fatal("unselected application changed paused owner path")
+		}
+	})
+	t.Run("frozen equivalent replacement and accepted gap contract insertion", func(t *testing.T) {
+		for _, kind := range []string{"REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM", "INSERT_FUTURE_REMEDIATION"} {
+			t.Run(kind, func(t *testing.T) {
+				path := t204InitialOwnerPath(t, ctx, pool, false)
+				s := t204Snapshot(t, ctx, repo, path)
+				op := domain.HybridFutureMutation{Kind: kind, ItemID: path.Items[1].ID, TemplateItemID: path.Items[0].ID}
+				if kind == "INSERT_FUTURE_REMEDIATION" {
+					position := 1
+					op.TargetPosition = &position
+					op.NewItemID = uuid.NewString()
+				}
+				intent := t204Intent(s, "SUBSTANTIAL_SCOPE_CHANGE", []domain.HybridFutureMutation{op})
+				if _, err := repo.CreateHybridLearningIntent(ctx, path.StudentID, intent); err != nil {
+					t.Fatal(err)
+				}
+				s = t204Snapshot(t, ctx, repo, path)
+				c := t204Consequence(s, []domain.HybridFutureMutation{op})
+				c.ApplicationMode = domain.HybridApplicationRequiresIntent
+				c.IntentID = intent.IntentID
+				c.RequiredIntentKind = intent.Kind
+				c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+				if kind == "INSERT_FUTURE_REMEDIATION" {
+					c.ReasonCodes = append(c.ReasonCodes, "EXISTING_PREREQUISITE_GAP")
+					sort.Strings(c.ReasonCodes)
+				}
+				receipt, err := repo.ApplyHybridConsequence(ctx, c)
+				if err != nil || receipt.Status != domain.HybridApplicationApplied {
+					t.Fatalf("frozen material %s %#v %v", kind, receipt, err)
+				}
+				updated, err := repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(updated.Items[0], path.Items[0]) || string(updated.Items[1].LessonContent) != string(path.Items[0].LessonContent) || updated.Items[1].LessonRevisionID != path.Items[0].LessonRevisionID {
+					t.Fatal("frozen template not reused exactly or protected source mutated")
+				}
+				if kind == "INSERT_FUTURE_REMEDIATION" {
+					if len(updated.Items) != len(path.Items)+1 || updated.Items[1].ID != op.NewItemID || updated.Items[2].ID != path.Items[1].ID {
+						t.Fatal("insertion lost existing occurrence")
+					}
+				} else if updated.Items[1].ID != path.Items[1].ID || updated.Items[1].Position != path.Items[1].Position {
+					t.Fatal("equivalent replacement changed occurrence identity")
+				}
+			})
+		}
+	})
+	t.Run("open Practice remains active and major intent waits", func(t *testing.T) {
+		path := t204InitialOwnerPath(t, ctx, pool, true)
+		actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+		practiceOwner := studentuc.PracticeLearningActions{Actions: actions, Clock: t204OwnerInputs{}, IDs: t204OwnerInputs{}}
+		instance := uuid.NewString()
+		digest := "sha256:" + strings.Repeat("c", 64)
+		binding, err := practiceOwner.Reserve(ctx, domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: path.StudentID, TaskInstanceID: instance, IdempotencyKey: instance, TaskRevisionID: path.Items[0].ReferenceID, TaskRevisionDigest: digest, SurfaceClassification: "project", LearningTargets: path.Items[0].Targets, LearningPathID: path.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err = practiceOwner.Open(ctx, path.StudentID, instance, binding.LearningActionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path, err = repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t204OfficialEvidence(t, ctx, pool, path, 8)
+		s := t204Snapshot(t, ctx, repo, path)
+		c := t204Consequence(s, []domain.HybridFutureMutation{{Kind: "SKIP_REDUNDANT_PENDING_ITEM", ItemID: path.Items[1].ID}})
+		receipt, err := repo.ApplyHybridConsequence(ctx, c)
+		if err != nil || receipt.Status != domain.HybridApplicationApplied {
+			t.Fatalf("safe future while currentOPEN %#v %v", receipt, err)
+		}
+		afterBinding, err := actions.GetPracticeLearningAction(ctx, path.StudentID, instance)
+		if err != nil || !reflect.DeepEqual(binding, afterBinding) {
+			t.Fatal("safe future changed active Practice binding")
+		}
+		updated, err := repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+		if err != nil || !reflect.DeepEqual(updated.Items[0], path.Items[0]) {
+			t.Fatal("future application changed current execution")
+		}
+		path = updated
+		s = t204Snapshot(t, ctx, repo, path)
+		intent := t204Intent(s, "REMOVE_ACTIVE_PROJECT", []domain.HybridFutureMutation{{Kind: "REMOVE_ACTIVE_PROJECT", ItemID: path.Items[0].ID}})
+		if _, err = repo.CreateHybridLearningIntent(ctx, path.StudentID, intent); err != nil {
+			t.Fatal(err)
+		}
+		s = t204Snapshot(t, ctx, repo, path)
+		c = t204Consequence(s, intent.RequestedChange.Mutations)
+		c.ApplicationMode = domain.HybridApplicationRequiresIntent
+		c.IntentID = intent.IntentID
+		c.RequiredIntentKind = intent.Kind
+		c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+		before := t204Counts(t, ctx, pool, path)
+		for n := 0; n < 2; n++ {
+			receipt, err = repo.ApplyHybridConsequence(ctx, c)
+			if err != nil || receipt.Status != domain.HybridApplicationWaitingSafeBoundary || receipt.ResultingRevision != path.Version {
+				t.Fatalf("active major proposal %#v %v", receipt, err)
+			}
+		}
+		after := t204Counts(t, ctx, pool, path)
+		if after[0] != before[0] || after[1] != before[1] || after[3] != before[3]+1 || after[4] != before[4] || after[7] != before[7] {
+			t.Fatalf("WAITING created terminal receipt/revision/consumption before=%v after=%v", before, after)
+		}
+		storedIntent, err := repo.GetHybridLearningIntent(ctx, path.StudentID, path.ID, intent.IntentID)
+		if err != nil || storedIntent.ConsumedAt != nil {
+			t.Fatal("waiting consumed intent")
+		}
+		currentBinding, err := actions.GetPracticeLearningAction(ctx, path.StudentID, instance)
+		if err != nil || !reflect.DeepEqual(currentBinding, binding) {
+			t.Fatal("waiting changed Practice-owned execution")
+		}
+	})
+	t.Log("PASS actual Student owner intent/application PostgreSQL boundary; named Planner consequence fixtures, no Planner evaluator policy claim")
+}
+
+type t204OwnerInputs struct{}
+
+func (t204OwnerInputs) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+func (t204OwnerInputs) NewID() string  { return uuid.NewString() }
+
+func t204InitialOwnerPath(t *testing.T, ctx context.Context, pool *pgxpool.Pool, practice bool) domain.StudentLearningPath {
+	t.Helper()
+	sid := uuid.NewString()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	profile := domain.StudentOnboarding{StudentID: sid, DirectionCode: "backend", SelfAssessedExperience: "basic", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "en", WeeklyMinutes: 60, PreferredPace: "standard", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if _, err := (&postgres.StudentOnboardingRepoPG{Pool: pool}).Save(ctx, profile, 0); err != nil {
+		t.Fatal(err)
+	}
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "t204.exact-owner-boundary", Version: "v1"}
+	path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: sid, CourseID: uuid.NewString(), GoalCode: "go.backend", CourseFingerprint: "named-t204-upstream-frozen-course-v1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Named initial owner path and frozen metadata; no evidence/finalstate injected", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}
+	for n := 0; n < 4; n++ {
+		item := domain.LearningPathItem{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), LessonRevisionID: uuid.NewString(), Position: n, Status: domain.LearningPathItemPlanned, ReasonCode: "current_gap", Targets: []domain.LearningTargetRef{target}, LessonContent: json.RawMessage(fmt.Sprintf(`{"title":"Named frozen lesson %d","private_marker":"retained-material-%d"}`, n, n)), FrozenRequirements: []domain.LessonRequirement{{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "theory_acknowledged", Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString()}}}}
+		if n == 0 {
+			item.Status = domain.LearningPathItemReady
+			if practice {
+				item.ReferenceType = "practice"
+				item.LessonRevisionID = ""
+				item.FrozenRequirements = nil
+				item.LessonContent = nil
+			}
+		}
+		path.Items = append(path.Items, item)
+	}
+	path, replay, err := (&postgres.LearningJourneyRepoPG{Pool: pool}).CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if err != nil || replay {
+		t.Fatalf("initial owner fixture %v", err)
+	}
+	stored, err := (&postgres.LearningJourneyRepoPG{Pool: pool}).GetLearningPathByID(ctx, path.StudentID, path.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stored
+}
+func t204Snapshot(t *testing.T, ctx context.Context, repo *postgres.LearningJourneyRepoPG, path domain.StudentLearningPath) domain.StudentPlanningSnapshot {
+	t.Helper()
+	targets := path.Items[0].Targets
+	source, err := repo.ReadPlanningSnapshot(ctx, path.StudentID, path.ID, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := domain.BuildStudentPlanningSnapshot(source, domain.PlanningSnapshotRequest{Targets: targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "synthetic_received_Planner_contract_fixture", Reason: "actual Student owner application proof"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+func t204Consequence(s domain.StudentPlanningSnapshot, ops []domain.HybridFutureMutation) domain.HybridConsequence {
+	ops = append([]domain.HybridFutureMutation{}, ops...)
+	sort.Slice(ops, func(i, j int) bool { return ops[i].ItemID < ops[j].ItemID })
+	scope := domain.HybridScopeIdentity{GoalCode: s.Path.GoalCode, DirectionCode: s.Profile.DirectionCode, DesiredStacks: append([]string{}, s.Profile.DesiredStacks...)}
+	c := domain.HybridConsequence{Schema: domain.HybridConsequenceSchema, StudentID: s.StudentID, LearningPathID: s.LearningPathID, ExpectedPathRevision: s.Path.Version, SnapshotRef: s.References.SnapshotRef, SnapshotTargets: s.RequestedTargets, PolicyVersion: domain.HybridReplanPolicyVersion, PolicyInputHash: "sha256:" + strings.Repeat("a", 64), Outcome: domain.HybridOutcomeReplanNeeded, ApplicationMode: domain.HybridApplicationAuto, ReasonCodes: []string{"TARGET_MASTERED_STABLE"}, BaselineScope: scope, DesiredScope: scope, Mutations: ops}
+	c.ConsequenceID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("planner-hybrid-consequence.v1\x00"+c.StudentID+"\x00"+c.LearningPathID+"\x00"+c.SnapshotRef+"\x00"+c.PolicyVersion)).String()
+	return c
+}
+func t204Intent(s domain.StudentPlanningSnapshot, kind string, ops []domain.HybridFutureMutation) domain.HybridLearningIntentProjection {
+	return domain.HybridLearningIntentProjection{IntentID: uuid.NewString(), StudentID: s.StudentID, LearningPathID: s.LearningPathID, ExpectedPathRevision: s.Path.Version, Kind: kind, CreatedAt: time.Now().UTC().Truncate(time.Microsecond), RequestedChange: domain.HybridRequestedChange{Scope: domain.HybridScopeIdentity{GoalCode: s.Path.GoalCode, DirectionCode: s.Profile.DirectionCode, DesiredStacks: append([]string{}, s.Profile.DesiredStacks...)}, Mutations: ops}}
+}
+func t204OfficialEvidence(t *testing.T, ctx context.Context, pool *pgxpool.Pool, path domain.StudentLearningPath, count int) {
+	t.Helper()
+	apply := studentuc.ApplyPracticeEvidence{Evidence: &postgres.LearningEvidenceRepoPG{Pool: pool}}
+	for n := 0; n < count; n++ {
+		id := uuid.NewString()
+		bundle := domain.PracticeCompetencyEvidenceBundle{Schema: domain.PracticeCompetencyEvidenceSchemaV1, PolicyVersion: domain.PracticeCompetencyEvidencePolicyV1, EvidenceID: id, SubmissionID: id, StudentID: path.StudentID, TaskInstanceID: uuid.NewString(), TaskRevisionID: uuid.NewString(), Outcome: "passed", AssistancePolicyVersion: "teacher-assistance-v1", Evidence: []domain.PracticeCompetencyEvidence{{Target: path.Items[0].Targets[0], Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{"named-upstream-runtime-proof-step"}}}, OccurredAt: time.Now().UTC().Truncate(time.Microsecond)}
+		if _, err := apply.Handle(ctx, path.StudentID, id, bundle); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// pathversion, revisions, intents, application admissions, terminal receipts,
+// intent-trigger outbox, journeyversion, consumed intents.
+func t204Counts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, path domain.StudentLearningPath) [8]int64 {
+	t.Helper()
+	var c [8]int64
+	err := pool.QueryRow(ctx, `SELECT p.version,(SELECT count(*) FROM student_learning_path_revision WHERE student_learning_path_id=p.id),(SELECT count(*) FROM student_learning_intent WHERE learning_path_id=p.id),(SELECT count(*) FROM student_hybrid_application WHERE learning_path_id=p.id),(SELECT count(*) FROM student_hybrid_application_receipt r JOIN student_hybrid_application a USING(consequence_id) WHERE a.learning_path_id=p.id),(SELECT count(*) FROM student_outbox WHERE student_id=p.student_id AND subject='student.planning-state.changed.v1' AND payload->'data'->>'trigger_kind'='LEARNING_INTENT'),(SELECT version FROM student_learning_context WHERE student_id=p.student_id),(SELECT count(*) FROM student_learning_intent WHERE learning_path_id=p.id AND consumed_at IS NOT NULL) FROM student_learning_path p WHERE p.id=$1`, path.ID).Scan(&c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}

@@ -1,0 +1,717 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+type PracticeTaskAIReviewRequest struct {
+	ProviderCode       string
+	TemplateCode       string
+	LanguageCode       string
+	ResponseSchemaCode string
+	Variables          map[string]any
+}
+
+type PracticeTaskAIReviewClient interface {
+	Execute(ctx context.Context, request PracticeTaskAIReviewRequest) (json.RawMessage, error)
+}
+
+type PracticeTaskMentorDecision struct {
+	Passed   bool
+	Score    *float64
+	Feedback *string
+}
+
+type practiceTaskFinalValidationResult struct {
+	PracticeTaskRuntimeMilestoneID string                     `json:"practice_task_runtime_milestone_id"`
+	Result                         domain.ValidationRunResult `json:"result"`
+}
+
+func (useCase StudentUseCase) SubmitPracticeTaskFinalReview(ctx context.Context, studentID, studentPracticeTaskID string) (*domain.StudentPracticeTaskFinalReview, error) {
+	project, err := useCase.GetStudentPracticeTask(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if project.Status != domain.StudentPracticeTaskStatusReadyForReview {
+		return nil, domain.ErrInvalidStatus
+	}
+	runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	variant, err := selectedRuntimeVariant(runtimeContext, project.PracticeTaskSolutionVariantID)
+	if err != nil {
+		return nil, err
+	}
+	policy, configured, err := parsePracticeTaskReviewPolicy(variant.ReviewPolicyJSON)
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
+		return nil, fmt.Errorf("%w: practice task revision has no final review policy", domain.ErrValidation)
+	}
+
+	milestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !allMilestonesCompleted(milestones) {
+		return nil, fmt.Errorf("%w: all milestones must pass before final review", domain.ErrValidation)
+	}
+	lastMilestone, err := lastSubmittedMilestone(runtimeContext.PracticeTaskMilestones, milestones)
+	if err != nil {
+		return nil, err
+	}
+	lastAnswerID := derefString(lastMilestone.TaskAnswerID)
+	if lastAnswerID == "" {
+		return nil, fmt.Errorf("%w: final milestone answer is required", domain.ErrValidation)
+	}
+	artifacts, err := useCase.Students.ListArtifacts(ctx, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	artifact, err := practiceTaskArtifactForAnswer(artifacts, lastAnswerID)
+	if err != nil {
+		return nil, err
+	}
+	artifactID := artifact.ID
+	finalValidationResults, integrationBundlePresent, err := useCase.runPracticeTaskFinalDeterministicValidation(ctx, project, runtimeContext, variant)
+	if err != nil {
+		return nil, err
+	}
+	deterministicReportJSON, err := marshalDeterministicReviewReport(milestones, finalValidationResults, integrationBundlePresent)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	review := domain.StudentPracticeTaskFinalReview{
+		ID:                             uuid.NewString(),
+		StudentPracticeTaskID:          project.ID,
+		StudentPracticeTaskMilestoneID: lastMilestone.ID,
+		TaskAnswerID:                   lastAnswerID,
+		ArtifactID:                     &artifactID,
+		Status:                         domain.PracticeTaskFinalReviewStatusPendingMentor,
+		AIStatus:                       domain.PracticeTaskAIReviewStatusSkipped,
+		AIResultJSON:                   json.RawMessage(`{}`),
+		MentorStatus:                   domain.PracticeTaskMentorReviewStatusPending,
+		DeterministicReportJSON:        deterministicReportJSON,
+		SubmittedAt:                    now,
+		CreatedAt:                      now,
+		UpdatedAt:                      now,
+	}
+	if policy.AIReview.Mode != domain.PracticeTaskAIReviewModeDisabled {
+		review.Status = domain.PracticeTaskFinalReviewStatusPendingAI
+		review.AIStatus = domain.PracticeTaskAIReviewStatusPending
+	}
+	saved, err := useCase.Students.CreateFinalReview(ctx, review)
+	if err != nil {
+		return nil, err
+	}
+	project.Status = domain.StudentPracticeTaskStatusInReview
+	project.UpdatedAt = now
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, *project); err != nil {
+		return nil, err
+	}
+	if policy.AIReview.Mode == domain.PracticeTaskAIReviewModeDisabled {
+		return saved, nil
+	}
+	return useCase.executePracticeTaskAIReview(ctx, project, runtimeContext, variant, policy, saved)
+}
+
+func practiceTaskArtifactForAnswer(artifacts []domain.StudentPracticeTaskArtifact, answerID string) (*domain.StudentPracticeTaskArtifact, error) {
+	for index := range artifacts {
+		var metadata struct {
+			TaskAnswerID string `json:"task_answer_id"`
+		}
+		if err := json.Unmarshal(artifacts[index].MetaJSON, &metadata); err != nil {
+			continue
+		}
+		if metadata.TaskAnswerID == answerID && strings.TrimSpace(artifacts[index].StorageFileID) != "" {
+			return &artifacts[index], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: immutable submission artifact for final milestone answer is required", domain.ErrValidation)
+}
+
+func (useCase StudentUseCase) runPracticeTaskFinalDeterministicValidation(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+	runtimeContext *domain.PracticeTaskRuntimeContext,
+	variant domain.PracticeTaskRuntimeVariant,
+) ([]practiceTaskFinalValidationResult, bool, error) {
+	if project == nil || runtimeContext == nil || useCase.Validation == nil || useCase.Sandbox == nil || project.ActiveSandboxID == nil || strings.TrimSpace(*project.ActiveSandboxID) == "" {
+		return nil, false, fmt.Errorf("%w: final deterministic validation infrastructure is unavailable", domain.ErrValidation)
+	}
+	evaluation, err := useCase.Catalog.GetRevisionEvaluationContext(ctx, project.PracticeTaskRevisionID)
+	if err != nil {
+		return nil, false, err
+	}
+	integrationBundlePresent, err := validateVariantIntegrationEvaluationBundle(evaluation, variant.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	files, err := useCase.Sandbox.GetSnapshot(ctx, *project.ActiveSandboxID)
+	if err != nil {
+		return nil, false, err
+	}
+	selectedMilestones, err := milestonesForSolutionVariant(runtimeContext.PracticeTaskMilestones, variant)
+	if err != nil {
+		return nil, false, err
+	}
+	results := make([]practiceTaskFinalValidationResult, 0, len(selectedMilestones))
+	for _, milestone := range selectedMilestones {
+		if !milestone.IsActive {
+			continue
+		}
+		contract, err := parseStoredValidationContract(milestone.ValidationContractJSON)
+		if err != nil {
+			return nil, false, err
+		}
+		contractJSON, err := json.Marshal(contract)
+		if err != nil {
+			return nil, false, err
+		}
+		codeStructureTypeCode, _, err := milestoneRuntimeProfile(milestone)
+		if err != nil {
+			return nil, false, err
+		}
+		result, err := useCase.Validation.Validate(ctx, domain.ValidationRunRequest{
+			TaskID:                fmt.Sprintf("practice-task-final:%s:%s", project.ID, milestone.ID),
+			CodeStructureTypeCode: codeStructureTypeCode,
+			Mode:                  "final",
+			CodeStructure:         contractJSON,
+			WorkspaceFiles:        append([]domain.WorkspaceFile(nil), files...),
+			TaskMetadata: domain.ValidationTaskMetadata{
+				TaskKind:       "practice_task_final_integration",
+				ExecutionMode:  taskExecutionModeBrowserPreview,
+				EvaluationMode: taskEvaluationModeAuto,
+				SubmissionMode: taskSubmissionModeSnapshot,
+			},
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		if result == nil || !result.Passed {
+			return nil, false, fmt.Errorf("%w: final deterministic validation failed for milestone %s", domain.ErrValidation, milestone.ID)
+		}
+		results = append(results, practiceTaskFinalValidationResult{
+			PracticeTaskRuntimeMilestoneID: milestone.ID,
+			Result:                         *result,
+		})
+	}
+	if len(results) == 0 {
+		return nil, false, fmt.Errorf("%w: final deterministic validation has no active milestones", domain.ErrValidation)
+	}
+	return results, integrationBundlePresent, nil
+}
+
+func validateVariantIntegrationEvaluationBundle(evaluation *domain.PracticeTaskEvaluationContext, variantID string) (bool, error) {
+	if evaluation == nil {
+		return false, domain.ErrNotFound
+	}
+	for _, item := range evaluation.Variants {
+		if item.PracticeTaskSolutionVariantID != variantID {
+			continue
+		}
+		hasAny := item.IntegrationTestSuiteRef != nil || item.IntegrationReferenceSolutionRef != nil || len(item.IntegrationNegativeFixtureRefs) > 0 || item.VerificationRunnerRef != nil
+		if !hasAny {
+			return false, nil
+		}
+		if item.IntegrationTestSuiteRef == nil || item.IntegrationReferenceSolutionRef == nil || len(item.IntegrationNegativeFixtureRefs) == 0 || item.VerificationRunnerRef == nil {
+			return false, fmt.Errorf("%w: incomplete private integration evaluation bundle", domain.ErrValidation)
+		}
+		return true, nil
+	}
+	return false, domain.ErrNotFound
+}
+
+func (useCase StudentUseCase) ListPracticeTaskFinalReviews(ctx context.Context, studentID, studentPracticeTaskID string) ([]domain.StudentPracticeTaskFinalReview, error) {
+	if _, err := useCase.GetStudentPracticeTask(ctx, studentID, studentPracticeTaskID); err != nil {
+		return nil, err
+	}
+	return useCase.Students.ListFinalReviews(ctx, studentPracticeTaskID)
+}
+
+func (useCase StudentUseCase) ListPendingPracticeTaskFinalReviews(ctx context.Context, limit, offset int) ([]domain.PracticeTaskFinalReviewQueueItem, error) {
+	reviews, err := useCase.Students.ListPendingFinalReviews(ctx, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.PracticeTaskFinalReviewQueueItem, 0, len(reviews))
+	for _, review := range reviews {
+		project, err := useCase.Students.GetStudentPracticeTask(ctx, review.StudentPracticeTaskID)
+		if err != nil {
+			return nil, err
+		}
+		task, err := useCase.buildPublicationTaskSnapshot(ctx, project)
+		if err != nil {
+			return nil, err
+		}
+		evaluation, err := useCase.Catalog.GetRevisionEvaluationContext(ctx, project.PracticeTaskRevisionID)
+		if err != nil {
+			return nil, err
+		}
+		rubric, err := mentorRubricForVariant(evaluation, project.PracticeTaskSolutionVariantID)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, domain.PracticeTaskFinalReviewQueueItem{
+			Review:           review,
+			Project:          *project,
+			Task:             task,
+			MentorRubricJSON: rubric,
+		})
+	}
+	return items, nil
+}
+
+func (useCase StudentUseCase) GetPracticeTaskFinalReviewForReviewer(ctx context.Context, studentPracticeTaskID, reviewID string) (*domain.PracticeTaskFinalReviewDetail, error) {
+	if useCase.PublicationFiles == nil {
+		return nil, fmt.Errorf("%w: review artifact storage is unavailable", domain.ErrValidation)
+	}
+	review, err := useCase.Students.GetFinalReview(ctx, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	if review.StudentPracticeTaskID != studentPracticeTaskID {
+		return nil, domain.ErrNotFound
+	}
+	project, err := useCase.Students.GetStudentPracticeTask(ctx, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	task, err := useCase.buildPublicationTaskSnapshot(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	evaluation, err := useCase.Catalog.GetRevisionEvaluationContext(ctx, project.PracticeTaskRevisionID)
+	if err != nil {
+		return nil, err
+	}
+	rubric, err := mentorRubricForVariant(evaluation, project.PracticeTaskSolutionVariantID)
+	if err != nil {
+		return nil, err
+	}
+	if review.ArtifactID == nil || strings.TrimSpace(*review.ArtifactID) == "" {
+		return nil, fmt.Errorf("%w: immutable review artifact is required", domain.ErrValidation)
+	}
+	artifacts, err := useCase.Students.ListArtifacts(ctx, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	var storageFileID string
+	for _, artifact := range artifacts {
+		if artifact.ID == *review.ArtifactID {
+			storageFileID = strings.TrimSpace(artifact.StorageFileID)
+			break
+		}
+	}
+	if storageFileID == "" {
+		return nil, fmt.Errorf("%w: immutable review artifact was not found", domain.ErrValidation)
+	}
+	archive, err := useCase.PublicationFiles.DownloadSourceArchive(ctx, storageFileID)
+	if err != nil {
+		return nil, fmt.Errorf("download review artifact: %w", err)
+	}
+	prepared, err := preparePublicationSnapshot(archive)
+	if err != nil {
+		return nil, err
+	}
+	return &domain.PracticeTaskFinalReviewDetail{
+		Review:           *review,
+		Project:          *project,
+		Task:             task,
+		MentorRubricJSON: rubric,
+		Files:            prepared.Files,
+		ExcludedPaths:    prepared.SecurityReport.ExcludedPaths,
+	}, nil
+}
+
+func (useCase StudentUseCase) ReviewPracticeTaskFinalSubmission(ctx context.Context, reviewerID, studentPracticeTaskID, reviewID string, decision PracticeTaskMentorDecision) (*domain.StudentPracticeTaskFinalReview, error) {
+	if strings.TrimSpace(reviewerID) == "" {
+		return nil, domain.ErrForbidden
+	}
+	if decision.Score != nil && (*decision.Score < 0 || *decision.Score > 100) {
+		return nil, fmt.Errorf("%w: mentor score must be between 0 and 100", domain.ErrValidation)
+	}
+	review, err := useCase.Students.GetFinalReview(ctx, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	if review.StudentPracticeTaskID != studentPracticeTaskID {
+		return nil, domain.ErrNotFound
+	}
+	if review.Status != domain.PracticeTaskFinalReviewStatusPendingMentor && review.Status != domain.PracticeTaskFinalReviewStatusBlockedAI {
+		return nil, domain.ErrInvalidStatus
+	}
+	if !decision.Passed && (decision.Feedback == nil || strings.TrimSpace(*decision.Feedback) == "") {
+		return nil, fmt.Errorf("%w: mentor feedback is required for changes", domain.ErrValidation)
+	}
+	project, err := useCase.Students.GetStudentPracticeTask(ctx, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	review.MentorID = stringPointer(strings.TrimSpace(reviewerID))
+	review.MentorFeedback = trimStringPointer(decision.Feedback)
+	review.MentorScore = decision.Score
+	review.ReviewedAt = &now
+	review.UpdatedAt = now
+	if decision.Passed {
+		review.Status = domain.PracticeTaskFinalReviewStatusPassed
+		review.MentorStatus = domain.PracticeTaskMentorReviewStatusPassed
+		project.Status = domain.StudentPracticeTaskStatusCompleted
+		project.CompletedAt = &now
+	} else {
+		review.Status = domain.PracticeTaskFinalReviewStatusChangesRequested
+		review.MentorStatus = domain.PracticeTaskMentorReviewStatusChangesRequested
+		project.Status = domain.StudentPracticeTaskStatusChangesRequested
+		project.CompletedAt = nil
+		if err := useCase.reopenReviewedMilestone(ctx, review, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := useCase.Students.UpdateFinalReview(ctx, *review); err != nil {
+		return nil, err
+	}
+	project.UpdatedAt = now
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, *project); err != nil {
+		return nil, err
+	}
+	return review, nil
+}
+
+func (useCase StudentUseCase) RetryPracticeTaskAIReview(ctx context.Context, studentPracticeTaskID, reviewID string) (*domain.StudentPracticeTaskFinalReview, error) {
+	review, err := useCase.Students.GetFinalReview(ctx, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	if review.StudentPracticeTaskID != studentPracticeTaskID {
+		return nil, domain.ErrNotFound
+	}
+	retryableMentorFallback := review.Status == domain.PracticeTaskFinalReviewStatusPendingMentor &&
+		review.AIStatus == domain.PracticeTaskAIReviewStatusUnavailable &&
+		review.MentorStatus == domain.PracticeTaskMentorReviewStatusPending
+	if review.Status != domain.PracticeTaskFinalReviewStatusPendingAI &&
+		review.Status != domain.PracticeTaskFinalReviewStatusBlockedAI &&
+		!retryableMentorFallback {
+		return nil, domain.ErrInvalidStatus
+	}
+	project, err := useCase.Students.GetStudentPracticeTask(ctx, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	variant, err := selectedRuntimeVariant(runtimeContext, project.PracticeTaskSolutionVariantID)
+	if err != nil {
+		return nil, err
+	}
+	policy, configured, err := parsePracticeTaskReviewPolicy(variant.ReviewPolicyJSON)
+	if err != nil {
+		return nil, err
+	}
+	if !configured || policy.AIReview.Mode == domain.PracticeTaskAIReviewModeDisabled {
+		return nil, domain.ErrInvalidStatus
+	}
+	now := time.Now().UTC()
+	review.Status = domain.PracticeTaskFinalReviewStatusPendingAI
+	review.AIStatus = domain.PracticeTaskAIReviewStatusPending
+	review.AIError = nil
+	review.UpdatedAt = now
+	if err := useCase.Students.UpdateFinalReview(ctx, *review); err != nil {
+		return nil, err
+	}
+	return useCase.executePracticeTaskAIReview(ctx, project, runtimeContext, variant, policy, review)
+}
+
+func (useCase StudentUseCase) executePracticeTaskAIReview(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+	runtimeContext *domain.PracticeTaskRuntimeContext,
+	variant domain.PracticeTaskRuntimeVariant,
+	policy domain.PracticeTaskReviewPolicy,
+	review *domain.StudentPracticeTaskFinalReview,
+) (*domain.StudentPracticeTaskFinalReview, error) {
+	contract, contractErr := useCase.loadAIReviewContract(ctx, project.PracticeTaskRevisionID, variant.ID)
+	var resultJSON json.RawMessage
+	var executionErr error
+	if contractErr != nil {
+		executionErr = contractErr
+	} else if useCase.AIReview == nil {
+		executionErr = fmt.Errorf("AI review service is unavailable")
+	} else if project.ActiveSandboxID == nil || strings.TrimSpace(*project.ActiveSandboxID) == "" || useCase.Sandbox == nil {
+		executionErr = fmt.Errorf("practice task sandbox is unavailable")
+	} else {
+		files, err := useCase.Sandbox.GetSnapshot(ctx, *project.ActiveSandboxID)
+		if err != nil {
+			executionErr = err
+		} else {
+			files = sanitizeWorkspaceFilesForAI(files)
+			variables := map[string]any{
+				"practice_task":        runtimeContext.PracticeTask,
+				"solution_variant":     variant,
+				"milestones":           runtimeContext.PracticeTaskMilestones,
+				"deterministic_report": json.RawMessage(review.DeterministicReportJSON),
+				"workspace_files":      files,
+				"review_contract":      contract,
+			}
+			encoded, _ := json.Marshal(variables)
+			if len(encoded) > policy.AIReview.MaxInputBytes {
+				executionErr = fmt.Errorf("AI review input exceeds configured byte budget")
+			} else {
+				resultJSON, executionErr = useCase.AIReview.Execute(ctx, PracticeTaskAIReviewRequest{
+					ProviderCode:       contract.ProviderCode,
+					TemplateCode:       contract.TemplateCode,
+					LanguageCode:       contract.LanguageCode,
+					ResponseSchemaCode: contract.ResponseSchemaCode,
+					Variables:          variables,
+				})
+				if executionErr == nil {
+					executionErr = validateAIReviewResult(resultJSON)
+				}
+			}
+		}
+	}
+
+	now := time.Now().UTC()
+	review.UpdatedAt = now
+	if executionErr != nil {
+		review.AIStatus = domain.PracticeTaskAIReviewStatusUnavailable
+		errorText := truncateReviewError(executionErr.Error())
+		review.AIError = &errorText
+		review.AIResultJSON = json.RawMessage(`{}`)
+		if policy.AIReview.OnUnavailable == domain.PracticeTaskAIUnavailableMentorOnly {
+			review.Status = domain.PracticeTaskFinalReviewStatusPendingMentor
+		} else {
+			review.Status = domain.PracticeTaskFinalReviewStatusBlockedAI
+		}
+	} else {
+		review.AIStatus = domain.PracticeTaskAIReviewStatusCompleted
+		review.AIResultJSON = resultJSON
+		review.AIError = nil
+		review.Status = domain.PracticeTaskFinalReviewStatusPendingMentor
+	}
+	if err := useCase.Students.UpdateFinalReview(ctx, *review); err != nil {
+		return nil, err
+	}
+	project.UpdatedAt = now
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, *project); err != nil {
+		return nil, err
+	}
+	return review, nil
+}
+
+func (useCase StudentUseCase) loadAIReviewContract(ctx context.Context, revisionID, variantID string) (domain.PracticeTaskAIReviewContract, error) {
+	evaluation, err := useCase.Catalog.GetRevisionEvaluationContext(ctx, revisionID)
+	if err != nil {
+		return domain.PracticeTaskAIReviewContract{}, err
+	}
+	for _, item := range evaluation.Variants {
+		if item.PracticeTaskSolutionVariantID != variantID {
+			continue
+		}
+		var contract domain.PracticeTaskAIReviewContract
+		if err := json.Unmarshal(item.AIReviewContractJSON, &contract); err != nil {
+			return domain.PracticeTaskAIReviewContract{}, fmt.Errorf("%w: invalid AI review contract", domain.ErrValidation)
+		}
+		if contract.Version != 1 || strings.TrimSpace(contract.TemplateCode) == "" || strings.TrimSpace(contract.ResponseSchemaCode) == "" {
+			return domain.PracticeTaskAIReviewContract{}, fmt.Errorf("%w: incomplete AI review contract", domain.ErrValidation)
+		}
+		return contract, nil
+	}
+	return domain.PracticeTaskAIReviewContract{}, domain.ErrNotFound
+}
+
+func (useCase StudentUseCase) reopenReviewedMilestone(ctx context.Context, review *domain.StudentPracticeTaskFinalReview, now time.Time) error {
+	milestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, review.StudentPracticeTaskID)
+	if err != nil {
+		return err
+	}
+	for _, item := range milestones {
+		if item.ID != review.StudentPracticeTaskMilestoneID {
+			continue
+		}
+		item.Status = domain.StudentMilestoneStatusFailed
+		item.PassedAt = nil
+		item.UpdatedAt = now
+		if err := useCase.Students.UpdateStudentPracticeTaskMilestone(ctx, item); err != nil {
+			return err
+		}
+		break
+	}
+	if useCase.Answers != nil {
+		answer, err := useCase.Answers.GetByID(ctx, review.TaskAnswerID)
+		if err == nil && answer != nil {
+			answer.Status = domain.StudentTaskAnswerStatusRejected
+			answer.UpdatedAt = now
+			if err := useCase.Answers.Update(ctx, *answer); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func parsePracticeTaskReviewPolicy(raw json.RawMessage) (domain.PracticeTaskReviewPolicy, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return domain.PracticeTaskReviewPolicy{}, false, nil
+	}
+	var policy domain.PracticeTaskReviewPolicy
+	if err := json.Unmarshal(trimmed, &policy); err != nil {
+		return domain.PracticeTaskReviewPolicy{}, false, fmt.Errorf("%w: invalid review policy", domain.ErrValidation)
+	}
+	policy.AIReview.Mode = strings.ToLower(strings.TrimSpace(policy.AIReview.Mode))
+	policy.AIReview.OnUnavailable = strings.ToLower(strings.TrimSpace(policy.AIReview.OnUnavailable))
+	policy.MentorReview.Mode = strings.ToLower(strings.TrimSpace(policy.MentorReview.Mode))
+	if policy.Version != 1 {
+		return domain.PracticeTaskReviewPolicy{}, false, fmt.Errorf("%w: unsupported review policy", domain.ErrValidation)
+	}
+	switch policy.AIReview.Mode {
+	case domain.PracticeTaskAIReviewModeDisabled:
+	case domain.PracticeTaskAIReviewModeOptional, domain.PracticeTaskAIReviewModeRequired:
+		if policy.AIReview.MaxInputBytes <= 0 || (policy.AIReview.OnUnavailable != domain.PracticeTaskAIUnavailableMentorOnly && policy.AIReview.OnUnavailable != domain.PracticeTaskAIUnavailableBlock) {
+			return domain.PracticeTaskReviewPolicy{}, false, fmt.Errorf("%w: invalid AI review policy", domain.ErrValidation)
+		}
+	default:
+		return domain.PracticeTaskReviewPolicy{}, false, fmt.Errorf("%w: unsupported AI review mode", domain.ErrValidation)
+	}
+	if policy.MentorReview.Mode != domain.PracticeTaskMentorReviewModeRequired {
+		return domain.PracticeTaskReviewPolicy{}, false, fmt.Errorf("%w: review policy version 1 requires mentor review", domain.ErrValidation)
+	}
+	return policy, true, nil
+}
+
+func selectedRuntimeVariant(runtimeContext *domain.PracticeTaskRuntimeContext, variantID string) (domain.PracticeTaskRuntimeVariant, error) {
+	for _, variant := range runtimeContext.SolutionVariants {
+		if variant.ID == variantID || (variantID == "" && len(runtimeContext.SolutionVariants) == 1) {
+			return variant, nil
+		}
+	}
+	return domain.PracticeTaskRuntimeVariant{}, domain.ErrNotFound
+}
+
+func mentorRubricForVariant(evaluation *domain.PracticeTaskEvaluationContext, variantID string) (json.RawMessage, error) {
+	if evaluation == nil {
+		return nil, domain.ErrNotFound
+	}
+	for _, item := range evaluation.Variants {
+		if item.PracticeTaskSolutionVariantID == variantID {
+			return append(json.RawMessage(nil), item.MentorRubricJSON...), nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func lastSubmittedMilestone(runtimeMilestones []domain.PracticeTaskRuntimeMilestone, studentMilestones []domain.StudentPracticeTaskMilestone) (*domain.StudentPracticeTaskMilestone, error) {
+	byRuntimeID := make(map[string]domain.StudentPracticeTaskMilestone, len(studentMilestones))
+	for _, item := range studentMilestones {
+		byRuntimeID[item.PracticeTaskPartMilestoneID] = item
+	}
+	sorted := domainSortRuntimeMilestones(runtimeMilestones)
+	for index := len(sorted) - 1; index >= 0; index-- {
+		if item, ok := byRuntimeID[sorted[index].ID]; ok && item.TaskAnswerID != nil {
+			copy := item
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func domainSortRuntimeMilestones(items []domain.PracticeTaskRuntimeMilestone) []domain.PracticeTaskRuntimeMilestone {
+	result := append([]domain.PracticeTaskRuntimeMilestone(nil), items...)
+	for left := 0; left < len(result); left++ {
+		for right := left + 1; right < len(result); right++ {
+			if result[right].PartSortOrder < result[left].PartSortOrder || (result[right].PartSortOrder == result[left].PartSortOrder && result[right].SortOrder < result[left].SortOrder) {
+				result[left], result[right] = result[right], result[left]
+			}
+		}
+	}
+	return result
+}
+
+func marshalDeterministicReviewReport(items []domain.StudentPracticeTaskMilestone, finalValidation []practiceTaskFinalValidationResult, integrationBundlePresent bool) (json.RawMessage, error) {
+	reports := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		reports = append(reports, map[string]any{
+			"student_milestone_id": item.ID,
+			"part_milestone_id":    item.PracticeTaskPartMilestoneID,
+			"status":               item.Status,
+			"attempts_count":       item.AttemptsCount,
+			"result":               json.RawMessage(item.BestResultJSON),
+		})
+	}
+	return json.Marshal(map[string]any{
+		"milestones": reports,
+		"final_validation": map[string]any{
+			"passed":                     true,
+			"integration_bundle_present": integrationBundlePresent,
+			"milestones":                 finalValidation,
+		},
+	})
+}
+
+func validateAIReviewResult(raw json.RawMessage) error {
+	var result domain.PracticeTaskAIReviewResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("%w: invalid AI review result", domain.ErrValidation)
+	}
+	result.Decision = strings.ToLower(strings.TrimSpace(result.Decision))
+	if result.Decision != "pass" && result.Decision != "changes_requested" && result.Decision != "uncertain" {
+		return fmt.Errorf("%w: unsupported AI review decision", domain.ErrValidation)
+	}
+	if strings.TrimSpace(result.Summary) == "" {
+		return fmt.Errorf("%w: AI review summary is required", domain.ErrValidation)
+	}
+	if result.Findings == nil || result.Evidence == nil {
+		return fmt.Errorf("%w: AI review findings and evidence are required", domain.ErrValidation)
+	}
+	for _, finding := range result.Findings {
+		if strings.TrimSpace(finding.Category) == "" || strings.TrimSpace(finding.Message) == "" {
+			return fmt.Errorf("%w: AI review finding is incomplete", domain.ErrValidation)
+		}
+		if finding.Severity != "advisory" && finding.Severity != "warning" && finding.Severity != "blocking" {
+			return fmt.Errorf("%w: AI review finding severity is unsupported", domain.ErrValidation)
+		}
+	}
+	for _, evidence := range result.Evidence {
+		if strings.TrimSpace(evidence.Requirement) == "" || strings.TrimSpace(evidence.Observation) == "" || evidence.Files == nil {
+			return fmt.Errorf("%w: AI review evidence is incomplete", domain.ErrValidation)
+		}
+	}
+	return nil
+}
+
+func stringPointer(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func trimStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	return stringPointer(strings.TrimSpace(*value))
+}
+
+func truncateReviewError(value string) string {
+	const maxLength = 1000
+	if len(value) <= maxLength {
+		return value
+	}
+	return value[:maxLength]
+}

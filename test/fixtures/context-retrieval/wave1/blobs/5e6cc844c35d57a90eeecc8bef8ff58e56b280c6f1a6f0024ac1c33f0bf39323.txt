@@ -1,0 +1,185 @@
+package postgres
+
+import (
+	"context"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// CourseOutlineRepoPG loads a lightweight public course hierarchy without
+// lesson bodies, task payloads, or per-node queries.
+type CourseOutlineRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseOutlineRepoPG) GetPublic(ctx context.Context, courseID string, lang string) (*domain.CourseOutline, error) {
+	runner := getRunner(ctx, r.Pool)
+
+	var outline domain.CourseOutline
+	err := runner.QueryRow(ctx, `
+WITH requested_i18n AS (
+    SELECT id FROM i18n WHERE language = $1
+)
+SELECT
+    c.id,
+    c.slug,
+    COALESCE(ci.title, ci_fallback.title, c.slug)
+FROM course c
+LEFT JOIN requested_i18n ri ON TRUE
+LEFT JOIN course_i18n ci ON ci.course_id = c.id AND ci.i18n_id = ri.id
+LEFT JOIN LATERAL (
+    SELECT title
+    FROM course_i18n
+    WHERE course_id = c.id
+    ORDER BY i18n_id
+    LIMIT 1
+) ci_fallback ON TRUE
+WHERE c.id = $2
+  AND c.status = $3
+  AND c.catalog_visible = TRUE`, lang, courseID, domain.CourseStatusActive).Scan(
+		&outline.CourseID,
+		&outline.Slug,
+		&outline.Title,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+
+	rows, err := runner.Query(ctx, `
+WITH requested_i18n AS (
+    SELECT id FROM i18n WHERE language = $1
+)
+SELECT
+    m.id,
+    COALESCE(mi.title, mi_fallback.title, ''),
+    cm."order",
+    s.id,
+    COALESCE(si.title, si_fallback.title, ''),
+    ms."order",
+    l.id,
+    COALESCE(li.title, li_fallback.title, l.title),
+    sl."order",
+    COALESCE(task_counts.tasks_count, 0)
+FROM course c
+JOIN course_module cm ON cm.course_id = c.id AND cm.status = $3
+JOIN module m ON m.id = cm.module_id AND m.status = $3
+JOIN module_section ms ON ms.module_id = m.id AND ms.status = $3
+JOIN section s ON s.id = ms.section_id AND s.status = $3
+JOIN section_lesson sl ON sl.section_id = s.id AND sl.status = $3
+JOIN lesson l ON l.id = sl.lesson_id AND l.status = $3
+LEFT JOIN requested_i18n ri ON TRUE
+LEFT JOIN module_i18n mi ON mi.module_id = m.id AND mi.i18n_id = ri.id
+LEFT JOIN section_i18n si ON si.section_id = s.id AND si.i18n_id = ri.id
+LEFT JOIN lesson_i18n li ON li.lesson_id = l.id AND li.i18n_id = ri.id
+LEFT JOIN LATERAL (
+    SELECT title
+    FROM module_i18n
+    WHERE module_id = m.id
+    ORDER BY i18n_id
+    LIMIT 1
+) mi_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT title
+    FROM section_i18n
+    WHERE section_id = s.id
+    ORDER BY i18n_id
+    LIMIT 1
+) si_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT title
+    FROM lesson_i18n
+    WHERE lesson_id = l.id
+    ORDER BY i18n_id
+    LIMIT 1
+) li_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)::int AS tasks_count
+    FROM task t
+    WHERE t.lesson_id = l.id AND t.status = $3
+) task_counts ON TRUE
+WHERE c.id = $2
+  AND c.status = $4
+  AND c.catalog_visible = TRUE
+ORDER BY
+    cm."order" ASC,
+    m.id ASC,
+    ms."order" ASC,
+    s.id ASC,
+    sl."order" ASC,
+    l.id ASC`, lang, courseID, domain.ModuleStatusActive, domain.CourseStatusActive)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	outline.Modules = make([]domain.CourseOutlineModule, 0)
+	moduleIndexes := make(map[string]int)
+	sectionIndexes := make(map[string]map[string]int)
+
+	for rows.Next() {
+		var moduleID, moduleTitle string
+		var moduleOrder int
+		var sectionID, sectionTitle string
+		var sectionOrder int
+		var lesson domain.CourseOutlineLesson
+		if err := rows.Scan(
+			&moduleID,
+			&moduleTitle,
+			&moduleOrder,
+			&sectionID,
+			&sectionTitle,
+			&sectionOrder,
+			&lesson.ID,
+			&lesson.Title,
+			&lesson.Order,
+			&lesson.TasksCount,
+		); err != nil {
+			return nil, err
+		}
+
+		moduleIndex, ok := moduleIndexes[moduleID]
+		if !ok {
+			moduleIndex = len(outline.Modules)
+			moduleIndexes[moduleID] = moduleIndex
+			sectionIndexes[moduleID] = make(map[string]int)
+			outline.Modules = append(outline.Modules, domain.CourseOutlineModule{
+				ID:       moduleID,
+				Title:    moduleTitle,
+				Order:    moduleOrder,
+				Sections: make([]domain.CourseOutlineSection, 0),
+			})
+		}
+
+		sectionIndex, ok := sectionIndexes[moduleID][sectionID]
+		if !ok {
+			sectionIndex = len(outline.Modules[moduleIndex].Sections)
+			sectionIndexes[moduleID][sectionID] = sectionIndex
+			outline.Modules[moduleIndex].Sections = append(
+				outline.Modules[moduleIndex].Sections,
+				domain.CourseOutlineSection{
+					ID:      sectionID,
+					Title:   sectionTitle,
+					Order:   sectionOrder,
+					Lessons: make([]domain.CourseOutlineLesson, 0),
+				},
+			)
+		}
+
+		outline.Modules[moduleIndex].Sections[sectionIndex].Lessons = append(
+			outline.Modules[moduleIndex].Sections[sectionIndex].Lessons,
+			lesson,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return &outline, nil
+}
+
+var _ repository.CourseOutlineRepository = (*CourseOutlineRepoPG)(nil)

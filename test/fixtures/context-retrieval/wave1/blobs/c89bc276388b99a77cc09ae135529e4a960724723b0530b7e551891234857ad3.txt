@@ -1,0 +1,136 @@
+package student
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+type onboardingDraftRepositoryStub struct {
+	draft           domain.StudentOnboardingDraft
+	finalized       domain.StudentOnboardingFinalizeResult
+	err             error
+	replaceCommand  repository.StudentOnboardingDraftReplaceCommand
+	finalizeCommand repository.StudentOnboardingDraftFinalizeCommand
+}
+
+func (stub *onboardingDraftRepositoryStub) GetDraft(context.Context, string) (domain.StudentOnboardingDraft, error) {
+	return stub.draft, stub.err
+}
+
+func (stub *onboardingDraftRepositoryStub) ReplaceDraft(
+	_ context.Context,
+	command repository.StudentOnboardingDraftReplaceCommand,
+) (domain.StudentOnboardingDraft, bool, error) {
+	stub.replaceCommand = command
+	return stub.draft, false, stub.err
+}
+
+func (stub *onboardingDraftRepositoryStub) FinalizeDraft(
+	_ context.Context,
+	command repository.StudentOnboardingDraftFinalizeCommand,
+) (domain.StudentOnboardingFinalizeResult, bool, error) {
+	stub.finalizeCommand = command
+	return stub.finalized, false, stub.err
+}
+
+func TestGetStudentOnboardingDraftReturnsStableEmptyProjection(t *testing.T) {
+	studentID := "11111111-1111-4111-8111-111111111111"
+	empty, err := domain.EmptyStudentOnboardingDraft(studentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (GetStudentOnboardingDraft{Drafts: &onboardingDraftRepositoryStub{draft: empty}}).Handle(
+		context.Background(), studentID,
+	)
+	if err != nil || result.Version != 0 || result.StudentID != studentID {
+		t.Fatalf("empty draft result=%+v err=%v", result, err)
+	}
+}
+
+func TestPutStudentOnboardingDraftNormalizesAndHashesStudentOwnedReplacement(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	studentID, requestID := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	stored := activeOnboardingDraft(t, studentID, 1, now)
+	repositoryStub := &onboardingDraftRepositoryStub{draft: stored}
+	direction, known, goalText := " Backend ", []string{}, ""
+	_, err := (PutStudentOnboardingDraft{Drafts: repositoryStub, Clock: onboardingClockStub{now: now}}).Handle(
+		context.Background(), PutStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingDraftSchema, StudentID: studentID, RequestID: requestID, ExpectedVersion: 0,
+			StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{
+				DirectionCode: &direction, KnownStacks: &known, GoalText: &goalText,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := repositoryStub.replaceCommand
+	if command.StudentID != studentID || command.RequestID != requestID || command.RequestHash == "" ||
+		command.Answers.DirectionCode == nil || *command.Answers.DirectionCode != "backend" ||
+		command.Answers.KnownStacks == nil || len(*command.Answers.KnownStacks) != 0 || command.Answers.GoalText == nil {
+		t.Fatalf("replacement command mismatch: %+v", command)
+	}
+
+	other := &onboardingDraftRepositoryStub{draft: activeOnboardingDraft(t, "33333333-3333-4333-8333-333333333333", 1, now)}
+	_, err = (PutStudentOnboardingDraft{Drafts: other, Clock: onboardingClockStub{now: now}}).Handle(
+		context.Background(), PutStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingDraftSchema, StudentID: "33333333-3333-4333-8333-333333333333",
+			RequestID: requestID, ExpectedVersion: 0,
+			StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{DirectionCode: &direction, KnownStacks: &known, GoalText: &goalText},
+		},
+	)
+	if err != nil || other.replaceCommand.RequestHash == command.RequestHash {
+		t.Fatalf("request hash was not student-bound: other=%+v err=%v", other.replaceCommand, err)
+	}
+}
+
+func TestPutStudentOnboardingDraftRejectsInvalidPartialAnswer(t *testing.T) {
+	invalid := "not valid"
+	_, err := (PutStudentOnboardingDraft{
+		Drafts: &onboardingDraftRepositoryStub{}, Clock: onboardingClockStub{now: time.Now()},
+	}).Handle(context.Background(), PutStudentOnboardingDraftInput{
+		Schema:    domain.StudentOnboardingDraftSchema,
+		StudentID: "11111111-1111-4111-8111-111111111111", RequestID: "22222222-2222-4222-8222-222222222222",
+		StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{PreferredPace: &invalid},
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("invalid partial answer error=%v", err)
+	}
+}
+
+func TestFinalizeStudentOnboardingDraftBuildsVersionBoundCommand(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	studentID, requestID := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	repositoryStub := &onboardingDraftRepositoryStub{}
+	_, err := (FinalizeStudentOnboardingDraft{Drafts: repositoryStub, Clock: onboardingClockStub{now: now}}).Handle(
+		context.Background(), FinalizeStudentOnboardingDraftInput{
+			Schema: domain.StudentOnboardingFinalizeCommandSchema, StudentID: studentID, RequestID: requestID,
+			ExpectedDraftVersion: 3, ExpectedProfileVersion: 2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := repositoryStub.finalizeCommand
+	if command.StudentID != studentID || command.RequestID != requestID || command.ExpectedDraftVersion != 3 ||
+		command.ExpectedProfileVersion != 2 || command.RequestHash == "" || !command.OccurredAt.Equal(now) {
+		t.Fatalf("finalize command mismatch: %+v", command)
+	}
+}
+
+func activeOnboardingDraft(t *testing.T, studentID string, version int64, now time.Time) domain.StudentOnboardingDraft {
+	t.Helper()
+	draft, err := domain.NormalizeStudentOnboardingDraft(domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: studentID,
+		Status: domain.StudentOnboardingDraftStatusDraft, Version: version, CreatedAt: &now, UpdatedAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return draft
+}

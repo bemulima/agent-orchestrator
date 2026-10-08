@@ -1,0 +1,171 @@
+package student
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+type LearningPathReplanInput struct {
+	Schema               string
+	StudentID            string
+	LearningPathID       string
+	PlanningRequestID    string
+	IdempotencyKey       string
+	CourseID             string
+	GoalCode             string
+	CourseFingerprint    string
+	PlannerPolicyVersion string
+	ReasonCode           string
+	ReasonSummary        string
+	ExpectedPathVersion  int64
+	DesiredItems         []domain.LearningPathItem
+}
+
+type LearningPathNoGapInput struct {
+	Schema               string
+	StudentID            string
+	LearningPathID       string
+	PlanningRequestID    string
+	IdempotencyKey       string
+	CourseID             string
+	GoalCode             string
+	CourseFingerprint    string
+	PlannerPolicyVersion string
+	ReasonCode           string
+	ReasonSummary        string
+	ExpectedPathVersion  int64
+}
+
+type LearningPathPlanning struct {
+	Revisions LessonRevisionProvider
+	Paths     repository.LearningPathPlanningRepository
+	Clock     LearningJourneyClock
+}
+
+func (useCase LearningPathPlanning) Get(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+) (domain.LearningPathPlanningState, error) {
+	studentID = strings.TrimSpace(studentID)
+	pathID = strings.TrimSpace(pathID)
+	if useCase.Paths == nil || !validStudentUUID(studentID) || !validStudentUUID(pathID) {
+		return domain.LearningPathPlanningState{}, domain.ErrValidation
+	}
+	return useCase.Paths.GetLearningPathPlanningState(ctx, studentID, pathID)
+}
+
+func (useCase LearningPathPlanning) Replan(
+	ctx context.Context,
+	input LearningPathReplanInput,
+) (domain.LearningPathPlanningCommandResult, error) {
+	command := domain.LearningPathPlanningCommand{
+		Schema: input.Schema, Kind: domain.LearningPathPlanningCommandReplan,
+		StudentID: input.StudentID, LearningPathID: input.LearningPathID,
+		PlanningRequestID: input.PlanningRequestID, IdempotencyKey: input.IdempotencyKey,
+		CourseID: input.CourseID, GoalCode: input.GoalCode, CourseFingerprint: input.CourseFingerprint,
+		PlannerPolicyVersion: input.PlannerPolicyVersion, ReasonCode: input.ReasonCode,
+		ReasonSummary: input.ReasonSummary, ExpectedPathVersion: input.ExpectedPathVersion,
+		DesiredItems: input.DesiredItems,
+	}
+	if useCase.Revisions != nil {
+		command.OccurredAt = useCase.Clock.Now().UTC()
+		command.RequestHash = strings.Repeat("0", 64)
+		command.RequestHash = learningPathPlanningCommandHash(command)
+		if reader, ok := useCase.Paths.(interface {
+			ReplayLearningPathCommand(context.Context, domain.LearningPathPlanningCommand) (domain.LearningPathPlanningCommandResult, bool, error)
+		}); ok {
+			stored, replayed, err := reader.ReplayLearningPathCommand(ctx, command)
+			if err != nil {
+				return stored, err
+			}
+			if replayed {
+				return stored, nil
+			}
+		}
+
+		current, err := useCase.Paths.GetLearningPathPlanningState(ctx, input.StudentID, input.LearningPathID)
+		if err != nil {
+			return domain.LearningPathPlanningCommandResult{}, err
+		}
+		input.DesiredItems, err = freezeLessonItems(ctx, useCase.Revisions, input.DesiredItems, input.PlanningRequestID, current.Items)
+		if err != nil {
+			return domain.LearningPathPlanningCommandResult{}, err
+		}
+		command.DesiredItems = input.DesiredItems
+	}
+	return useCase.apply(ctx, command)
+}
+
+func (useCase LearningPathPlanning) CompleteNoGap(
+	ctx context.Context,
+	input LearningPathNoGapInput,
+) (domain.LearningPathPlanningCommandResult, error) {
+	command := domain.LearningPathPlanningCommand{
+		Schema: input.Schema, Kind: domain.LearningPathPlanningCommandNoGap,
+		StudentID: input.StudentID, LearningPathID: input.LearningPathID,
+		PlanningRequestID: input.PlanningRequestID, IdempotencyKey: input.IdempotencyKey,
+		CourseID: input.CourseID, GoalCode: input.GoalCode, CourseFingerprint: input.CourseFingerprint,
+		PlannerPolicyVersion: input.PlannerPolicyVersion, ReasonCode: input.ReasonCode,
+		ReasonSummary: input.ReasonSummary, ExpectedPathVersion: input.ExpectedPathVersion,
+	}
+	return useCase.apply(ctx, command)
+}
+
+func (useCase LearningPathPlanning) apply(
+	ctx context.Context,
+	command domain.LearningPathPlanningCommand,
+) (domain.LearningPathPlanningCommandResult, error) {
+	if useCase.Paths == nil || useCase.Clock == nil {
+		return domain.LearningPathPlanningCommandResult{}, domain.ErrValidation
+	}
+	originalHash := command.RequestHash
+	command.RequestHash = strings.Repeat("0", 64)
+	command.OccurredAt = useCase.Clock.Now().UTC()
+	normalized, err := domain.NormalizeLearningPathPlanningCommand(command)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, domain.ErrValidation
+	}
+	normalized.RequestHash = learningPathPlanningCommandHash(normalized)
+	if originalHash != "" {
+		normalized.RequestHash = originalHash
+	}
+	normalized, err = domain.NormalizeLearningPathPlanningCommand(normalized)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, domain.ErrValidation
+	}
+	result, _, err := useCase.Paths.ApplyLearningPathPlanningCommand(ctx, normalized)
+	return result, err
+}
+
+func learningPathPlanningCommandHash(command domain.LearningPathPlanningCommand) string {
+	payload := struct {
+		Schema               string                                 `json:"schema"`
+		Kind                 domain.LearningPathPlanningCommandKind `json:"kind"`
+		StudentID            string                                 `json:"student_id"`
+		LearningPathID       string                                 `json:"learning_path_id"`
+		CourseID             string                                 `json:"course_id"`
+		GoalCode             string                                 `json:"goal_code"`
+		CourseFingerprint    string                                 `json:"course_fingerprint"`
+		PlannerPolicyVersion string                                 `json:"planner_policy_version"`
+		ReasonCode           string                                 `json:"reason_code"`
+		ReasonSummary        string                                 `json:"reason_summary"`
+		ExpectedPathVersion  int64                                  `json:"expected_path_version"`
+		DesiredItems         []domain.LearningPathItem              `json:"desired_items,omitempty"`
+	}{
+		Schema: command.Schema, Kind: command.Kind, StudentID: command.StudentID,
+		LearningPathID: command.LearningPathID, CourseID: command.CourseID, GoalCode: command.GoalCode,
+		CourseFingerprint: command.CourseFingerprint, PlannerPolicyVersion: command.PlannerPolicyVersion,
+		ReasonCode: command.ReasonCode, ReasonSummary: command.ReasonSummary,
+		ExpectedPathVersion: command.ExpectedPathVersion, DesiredItems: command.DesiredItems,
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}

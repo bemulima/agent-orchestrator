@@ -1,0 +1,123 @@
+package filestorage
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestPublicationArchiveLifecycle(t *testing.T) {
+	const fileID = "00000000-0000-0000-0000-000000000123"
+	const sourceFileID = "00000000-0000-0000-0000-000000000124"
+	archive := []byte("publication-zip")
+	sourceArchive := []byte("approved-source-zip")
+	var stored []byte
+	activated := false
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/internal/v1/files/upload":
+			reader, err := request.MultipartReader()
+			if err != nil {
+				t.Fatalf("multipart reader: %v", err)
+			}
+			fields := map[string]string{}
+			for {
+				part, err := reader.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("read multipart: %v", err)
+				}
+				content, _ := io.ReadAll(part)
+				if part.FormName() == "file" {
+					if bytes.Equal(content, archive) || !bytes.HasPrefix(content, publicationCipherHeader) || part.FileName() != "snapshot.snapshot" {
+						t.Fatalf("unexpected archive upload: filename=%s content=%q", part.FileName(), content)
+					}
+					stored = append([]byte(nil), content...)
+				} else {
+					fields[part.FormName()] = string(content)
+				}
+			}
+			for key, expected := range map[string]string{
+				"file_kind": "STUDENT_SUBMISSION", "owner_id": "00000000-0000-0000-0000-000000000001",
+				"is_archive": "false", "archive_format": "", "is_temp": "true", "ttl_minutes": "60",
+			} {
+				if fields[key] != expected {
+					t.Fatalf("unexpected %s: %q", key, fields[key])
+				}
+			}
+			responseWriter.WriteHeader(http.StatusCreated)
+			_, _ = responseWriter.Write([]byte(`{"ID":"` + fileID + `"}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/internal/v1/files/"+fileID+"/activate":
+			activated = true
+			responseWriter.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodGet && request.URL.Path == "/internal/v1/files/"+fileID+"/download":
+			responseWriter.WriteHeader(http.StatusOK)
+			_, _ = responseWriter.Write(stored)
+		case request.Method == http.MethodGet && request.URL.Path == "/internal/v1/files/"+sourceFileID+"/download":
+			responseWriter.WriteHeader(http.StatusOK)
+			_, _ = responseWriter.Write(sourceArchive)
+		default:
+			http.NotFound(responseWriter, request)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "test-token", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	if err != nil {
+		t.Fatalf("create encrypted client: %v", err)
+	}
+	client.HTTPClient = server.Client()
+	uploadedID, err := client.UploadTemporaryArchive(
+		context.Background(), "00000000-0000-0000-0000-000000000001", "snapshot.snapshot", archive,
+	)
+	if err != nil || uploadedID != fileID {
+		t.Fatalf("upload publication archive: id=%s err=%v", uploadedID, err)
+	}
+	if err := client.Activate(context.Background(), uploadedID); err != nil || !activated {
+		t.Fatalf("activate publication archive: activated=%v err=%v", activated, err)
+	}
+	downloaded, err := client.DownloadPublicationSnapshot(context.Background(), uploadedID)
+	if err != nil || string(downloaded) != string(archive) {
+		t.Fatalf("download publication archive: content=%q err=%v", downloaded, err)
+	}
+	downloadedSource, err := client.DownloadSourceArchive(context.Background(), sourceFileID)
+	if err != nil || string(downloadedSource) != string(sourceArchive) {
+		t.Fatalf("download source archive without publication decryption: content=%q err=%v", downloadedSource, err)
+	}
+}
+
+func TestPublicationDownloadLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
+		responseWriter.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(responseWriter, strings.NewReader(strings.Repeat("x", maxPublicationArchiveBytes+1)))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "test-token", base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32)))
+	if err != nil {
+		t.Fatalf("create encrypted client: %v", err)
+	}
+	client.HTTPClient = server.Client()
+	if _, err := client.DownloadPublicationSnapshot(context.Background(), "file"); err == nil {
+		t.Fatal("oversized download must fail")
+	}
+}
+
+func TestPublicationEncryptionConfigurationFailsClosed(t *testing.T) {
+	client, err := NewClient("http://filestorage", "test-token", "")
+	if err != nil {
+		t.Fatalf("empty key keeps service startup compatible: %v", err)
+	}
+	if _, err := client.encryptPublicationSnapshot([]byte("code")); err == nil {
+		t.Fatal("publication must stay disabled when its encryption key is absent")
+	}
+	if _, err := NewClient("http://filestorage", "test-token", "not-a-32-byte-base64-key"); err == nil {
+		t.Fatal("invalid configured publication key must fail startup")
+	}
+}

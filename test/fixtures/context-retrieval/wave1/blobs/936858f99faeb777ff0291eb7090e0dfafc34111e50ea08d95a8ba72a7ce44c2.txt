@@ -1,0 +1,294 @@
+package domain
+
+import (
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestReconcilePlannerLearningPathItemsPreservesMonotonicProgress(t *testing.T) {
+	current := planningTestPath([]LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: "11111111-1111-4111-8111-111111111111", Position: 0, Status: LearningPathItemReady, ReasonCode: "already_ready"},
+		{ReferenceType: "lesson", ReferenceID: "22222222-2222-4222-8222-222222222222", Position: 1, Status: LearningPathItemInProgress, ReasonCode: "student_started", Targets: []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.old", Version: "v1"}}},
+		{ReferenceType: "lesson", ReferenceID: "33333333-3333-4333-8333-333333333333", Position: 2, Status: LearningPathItemCompleted, ReasonCode: "course_completed"},
+		{ReferenceType: "lesson", ReferenceID: "44444444-4444-4444-8444-444444444444", Position: 3, Status: LearningPathItemSkippedMastered, ReasonCode: "mastery_no_gap"},
+	})
+	desired := []LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: "11111111-1111-4111-8111-111111111111", Position: 0, Status: LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+		{ReferenceType: "lesson", ReferenceID: "22222222-2222-4222-8222-222222222222", Position: 1, Status: LearningPathItemPlanned, ReasonCode: "planner_refresh", Targets: []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.new", Version: "v2"}}},
+		{ReferenceType: "lesson", ReferenceID: "33333333-3333-4333-8333-333333333333", Position: 2, Status: LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+		{ReferenceType: "lesson", ReferenceID: "44444444-4444-4444-8444-444444444444", Position: 3, Status: LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+	}
+	items, changed, err := ReconcilePlannerLearningPathItems(current, desired)
+	if err != nil {
+		t.Fatalf("reconcile items: %v", err)
+	}
+	want := []LearningPathItemStatus{
+		LearningPathItemReady, LearningPathItemInProgress, LearningPathItemCompleted, LearningPathItemSkippedMastered,
+	}
+	for index := range want {
+		if items[index].Status != want[index] || items[index].ReasonCode != current.Items[index].ReasonCode {
+			t.Fatalf("item %d regressed: got=%+v want_status=%s", index, items[index], want[index])
+		}
+	}
+	if changed {
+		t.Fatal("planner-only status regressions should reconcile to a no-op")
+	}
+	if len(items[1].Targets) != 1 || items[1].Targets[0].Key != "go.old" || items[1].Targets[0].Version != "v1" {
+		t.Fatalf("progressed item target drifted: %+v", items[1].Targets)
+	}
+}
+
+func TestReconcilePlannerLearningPathItemsDoesNotCreateSecondReadyItem(t *testing.T) {
+	current := planningTestPath([]LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: "11111111-1111-4111-8111-111111111111", Position: 0, Status: LearningPathItemReady, ReasonCode: "already_ready"},
+		{ReferenceType: "lesson", ReferenceID: "22222222-2222-4222-8222-222222222222", Position: 1, Status: LearningPathItemPlanned, ReasonCode: "later"},
+	})
+	items, _, err := ReconcilePlannerLearningPathItems(current, []LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: "11111111-1111-4111-8111-111111111111", Position: 0, Status: LearningPathItemPlanned, ReasonCode: "refresh"},
+		{ReferenceType: "lesson", ReferenceID: "22222222-2222-4222-8222-222222222222", Position: 1, Status: LearningPathItemReady, ReasonCode: "new_ready"},
+	})
+	if err != nil || items[0].Status != LearningPathItemReady || items[1].Status != LearningPathItemPlanned {
+		t.Fatalf("unexpected READY reconciliation: items=%+v err=%v", items, err)
+	}
+}
+
+func TestNormalizeLearningPathPlanningCommandRejectsPlannerProgressMutation(t *testing.T) {
+	command := planningTestCommand()
+	command.DesiredItems[0].Status = LearningPathItemCompleted
+	if _, err := NormalizeLearningPathPlanningCommand(command); err == nil {
+		t.Fatal("expected Planner COMPLETED status to be rejected")
+	}
+}
+
+func TestApplyPlannerLearningPathReplanReplacesDesiredCourseIdentity(t *testing.T) {
+	current := planningTestPath(planningTestCommand().DesiredItems)
+	command := planningTestCommand()
+	command.CourseID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+	command.CourseFingerprint = "fingerprint-v2"
+	command.DesiredItems = []LearningPathItem{{
+		ReferenceType: "lesson", ReferenceID: "99999999-9999-4999-8999-999999999999",
+		Position: 0, Status: LearningPathItemReady, ReasonCode: "first_current_gap",
+		Targets: []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.syntax", Version: "v1"}},
+	}}
+	updated, changed, err := ApplyPlannerLearningPathReplan(current, command)
+	if err != nil || !changed || updated.ID != current.ID || updated.CourseID != command.CourseID ||
+		updated.CourseFingerprint != command.CourseFingerprint || updated.CurriculumRevision != command.CourseFingerprint ||
+		updated.Version != current.Version+1 || updated.Items[0].ReferenceID == current.Items[0].ReferenceID {
+		t.Fatalf("replace desired Course identity: updated=%+v changed=%v err=%v", updated, changed, err)
+	}
+}
+
+func TestApplyPlannerLearningPathReplanRejectsStalePathVersion(t *testing.T) {
+	current := planningTestPath(planningTestCommand().DesiredItems)
+	command := planningTestCommand()
+	command.ExpectedPathVersion = current.Version + 1
+	if _, _, err := ApplyPlannerLearningPathReplan(current, command); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale replan error=%v, want conflict", err)
+	}
+}
+
+func TestApplyPlannerLearningPathReplanKeepsSameCourseNoOpStable(t *testing.T) {
+	command := planningTestCommand()
+	current := planningTestPath(command.DesiredItems)
+	current.PlannerPolicyVersion = command.PlannerPolicyVersion
+	current.ReasonCode = command.ReasonCode
+	current.ReasonSummary = command.ReasonSummary
+	current, err := NormalizeStudentLearningPath(current)
+	if err != nil {
+		t.Fatalf("normalize current: %v", err)
+	}
+	updated, changed, err := ApplyPlannerLearningPathReplan(current, command)
+	if err != nil || changed || !reflect.DeepEqual(updated, current) {
+		t.Fatalf("same-Course no-op: updated=%+v changed=%v err=%v", updated, changed, err)
+	}
+}
+
+func planningTestPath(items []LearningPathItem) StudentLearningPath {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	return StudentLearningPath{
+		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", StudentID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		CourseID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", GoalCode: "go.backend",
+		CurriculumRevision: "fingerprint-v1", PolicyVersion: LearningPathPolicyVersion,
+		PlannerPolicyVersion: "planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Initial route",
+		Status: LearningPathStatusActive, Version: 1, Items: items, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func planningTestCommand() LearningPathPlanningCommand {
+	return LearningPathPlanningCommand{
+		Schema: LearningPathReplanRequestSchema, Kind: LearningPathPlanningCommandReplan,
+		StudentID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", LearningPathID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		PlanningRequestID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", IdempotencyKey: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+		CourseID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", GoalCode: "go.backend", CourseFingerprint: "fingerprint-v1",
+		PlannerPolicyVersion: "planner-v2", ReasonCode: "replan", ReasonSummary: "Refresh route", ExpectedPathVersion: 1,
+		DesiredItems: []LearningPathItem{{
+			ReferenceType: "lesson", ReferenceID: "11111111-1111-4111-8111-111111111111",
+			Position: 0, Status: LearningPathItemPlanned, ReasonCode: "refresh",
+		}},
+		RequestHash: strings.Repeat("1", 64), OccurredAt: time.Date(2026, 9, 4, 11, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestApplyPlannerLearningPathReplanKeepsPersistedLegacyNoOpStable(t *testing.T) {
+	for _, explicitID := range []bool{false, true} {
+		name := "omitted_desired_id"
+		if explicitID {
+			name = "explicit_desired_id"
+		}
+		t.Run(name, func(t *testing.T) {
+			command := planningTestCommand()
+			current := planningTestPath(append([]LearningPathItem(nil), command.DesiredItems...))
+			current.PlannerPolicyVersion = command.PlannerPolicyVersion
+			current.ReasonCode = command.ReasonCode
+			current.ReasonSummary = command.ReasonSummary
+			// Stored legacy items have stable Student IDs and JSON [] requirements.
+			current.Items[0].ID = "77777777-7777-4777-8777-777777777777"
+			current.Items[0].FrozenRequirements = []LessonRequirement{}
+			if explicitID {
+				command.DesiredItems[0].ID = current.Items[0].ID
+			}
+			current, err := NormalizeStudentLearningPath(current)
+			if err != nil {
+				t.Fatalf("normalize current: %v", err)
+			}
+			updated, changed, err := ApplyPlannerLearningPathReplan(current, command)
+			if err != nil || changed || !reflect.DeepEqual(updated, current) {
+				t.Fatalf("persisted same-Course no-op: updated=%+v changed=%v err=%v", updated, changed, err)
+			}
+		})
+	}
+}
+
+func TestReconcilePlannerLearningPathItemsPreservesSuppliedAndFrozenIdentity(t *testing.T) {
+	t.Run("explicit_legacy_id_is_not_overwritten", func(t *testing.T) {
+		command := planningTestCommand()
+		current := planningTestPath(append([]LearningPathItem(nil), command.DesiredItems...))
+		current.Items[0].ID = "77777777-7777-4777-8777-777777777777"
+		command.DesiredItems[0].ID = "88888888-8888-4888-8888-888888888888"
+		items, changed, err := ReconcilePlannerLearningPathItems(current, command.DesiredItems)
+		if err != nil || !changed || items[0].ID != command.DesiredItems[0].ID {
+			t.Fatalf("explicit desired identity was overwritten: items=%+v changed=%v err=%v", items, changed, err)
+		}
+	})
+	t.Run("bound_assignment_keeps_frozen_requirements_and_content", func(t *testing.T) {
+		item := completionItem("theory_acknowledged")
+		item.LessonContent = []byte(`{"title":"frozen"}`)
+		current, err := NormalizeStudentLearningPath(planningTestPath([]LearningPathItem{item}))
+		if err != nil {
+			t.Fatalf("normalize bound current: %v", err)
+		}
+		desired := item
+		desired.FrozenRequirements = append([]LessonRequirement(nil), item.FrozenRequirements...)
+		desired.FrozenRequirements[0].Satisfied = true
+		desired.LessonContent = []byte(`{"title":"changed"}`)
+		items, changed, err := ReconcilePlannerLearningPathItems(current, []LearningPathItem{desired})
+		if err != nil || changed || !reflect.DeepEqual(items[0], current.Items[0]) {
+			t.Fatalf("bound assignment drifted: items=%+v changed=%v err=%v", items, changed, err)
+		}
+	})
+	t.Run("bound_revision_drift_is_rejected", func(t *testing.T) {
+		item := completionItem("theory_acknowledged")
+		current := planningTestPath([]LearningPathItem{item})
+		desired := item
+		desired.LessonRevisionID = "99999999-9999-4999-8999-999999999999"
+		if _, _, err := ReconcilePlannerLearningPathItems(current, []LearningPathItem{desired}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("bound revision drift error=%v, want conflict", err)
+		}
+	})
+}
+
+func TestReplanRejectsCompletedHistoryStructuralChanges(t *testing.T) {
+	for _, change := range []string{"omit", "move", "identity", "reference", "revision"} {
+		t.Run(change, func(t *testing.T) {
+			completed := completionItem("theory_acknowledged")
+			completed.Status = LearningPathItemCompleted
+			completed.FrozenRequirements[0].Satisfied = true
+			later := planningTestCommand().DesiredItems[0]
+			later.Position = 1
+			current := planningTestPath([]LearningPathItem{completed, later})
+			desired := []LearningPathItem{completed, later}
+			desired[0].Status = LearningPathItemPlanned
+			switch change {
+			case "omit":
+				desired = desired[1:]
+				desired[0].Position = 0
+			case "move":
+				desired[0], desired[1] = desired[1], desired[0]
+				desired[0].Position = 0
+				desired[1].Position = 1
+			case "identity":
+				desired[0].ID = "99999999-9999-4999-8999-999999999999"
+			case "reference":
+				desired[0].ReferenceID = "99999999-9999-4999-8999-999999999999"
+			case "revision":
+				desired[0].LessonRevisionID = "99999999-9999-4999-8999-999999999999"
+			}
+			command := planningTestCommand()
+			command.DesiredItems = desired
+			if _, _, err := ApplyPlannerLearningPathReplan(current, command); !errors.Is(err, ErrConflict) {
+				t.Fatalf("%s accepted: %v", change, err)
+			}
+		})
+	}
+}
+
+func TestReplanPreservesCompletedHistoryAgainstSameRankDesiredDrift(t *testing.T) {
+	item := completionItem("theory_acknowledged")
+	item.Status = LearningPathItemCompleted
+	item.FrozenRequirements[0].Satisfied = true
+	item.Targets = []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.old", Version: "v1"}}
+	current, err := NormalizeStudentLearningPath(planningTestPath([]LearningPathItem{item}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := item
+	desired.Status = LearningPathItemReady
+	desired.ReasonCode = "changed"
+	desired.Targets = []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.new", Version: "v2"}}
+	desired.FrozenRequirements = nil
+	desired.LessonContent = []byte(`{"title":"changed"}`)
+	items, changed, err := ReconcilePlannerLearningPathItems(current, []LearningPathItem{desired})
+	if err != nil || changed || !reflect.DeepEqual(items[0], current.Items[0]) {
+		t.Fatalf("history drift: %+v changed=%v err=%v", items, changed, err)
+	}
+}
+
+func TestReplanWaitsForActiveBoundaryButAllowsExactNoOp(t *testing.T) {
+	command := planningTestCommand()
+	current := planningTestPath(append([]LearningPathItem(nil), command.DesiredItems...))
+	current.Items[0].Status = LearningPathItemInProgress
+	current.PlannerPolicyVersion = command.PlannerPolicyVersion
+	current.ReasonCode = command.ReasonCode
+	current.ReasonSummary = command.ReasonSummary
+	current, err := NormalizeStudentLearningPath(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated, changed, err := ApplyPlannerLearningPathReplan(current, command); err != nil || changed || !reflect.DeepEqual(updated, current) {
+		t.Fatalf("exact active no-op rejected: changed=%v err=%v", changed, err)
+	}
+	for _, change := range []string{"omit_active", "future_insert", "course", "fingerprint"} {
+		t.Run(change, func(t *testing.T) {
+			c := planningTestCommand()
+			switch change {
+			case "omit_active":
+				c.DesiredItems[0].ReferenceID = "99999999-9999-4999-8999-999999999999"
+			case "future_insert":
+				next := c.DesiredItems[0]
+				next.ReferenceID = "99999999-9999-4999-8999-999999999999"
+				next.Position = 1
+				c.DesiredItems = append(c.DesiredItems, next)
+			case "course":
+				c.CourseID = "99999999-9999-4999-8999-999999999999"
+			case "fingerprint":
+				c.CourseFingerprint = "changed"
+			}
+			if _, _, err := ApplyPlannerLearningPathReplan(current, c); !errors.Is(err, ErrConflict) {
+				t.Fatalf("%s accepted: %v", change, err)
+			}
+		})
+	}
+}

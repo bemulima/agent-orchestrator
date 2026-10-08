@@ -1,0 +1,607 @@
+package validators
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	answeruc "github.com/example/ms-student-service/internal/usecase/answer"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// WorkspaceFile represents a file in workspace.
+type WorkspaceFile = answeruc.WorkspaceFile
+
+type ValidationResult = answeruc.ValidationResult
+
+type ValidationError = answeruc.ValidationError
+
+type ValidatorClient = answeruc.ValidatorClient
+
+// Factory creates validator clients.
+type Factory struct {
+	natsConn          *natsgo.Conn
+	htmlValidatorURL  string
+	htmlSubject       string
+	cssSubject        string
+	phpValidatorURL   string
+	nodeValidatorURL  string
+	reactValidatorURL string
+}
+
+// NewFactory creates a new validator factory.
+func NewFactory(natsConn *natsgo.Conn, htmlValidatorURL, htmlSubject, cssSubject, phpValidatorURL, nodeValidatorURL, reactValidatorURL string) *Factory {
+	return &Factory{
+		natsConn:          natsConn,
+		htmlValidatorURL:  htmlValidatorURL,
+		htmlSubject:       htmlSubject,
+		cssSubject:        cssSubject,
+		phpValidatorURL:   phpValidatorURL,
+		nodeValidatorURL:  nodeValidatorURL,
+		reactValidatorURL: reactValidatorURL,
+	}
+}
+
+// GetValidator returns validator for code structure type.
+func (f *Factory) GetValidator(codeStructureTypeCode string) ValidatorClient {
+	switch normalizeCodeStructureTypeCode(codeStructureTypeCode) {
+	case "html":
+		return &HTMLValidator{
+			conn:    f.natsConn,
+			subject: f.htmlSubject,
+			baseURL: f.htmlValidatorURL,
+		}
+	case "css", "scss", "acss", "sass":
+		return &CSSValidator{conn: f.natsConn, subject: f.cssSubject}
+	case "php":
+		return NewPHPValidator(f.phpValidatorURL)
+	case "node", "nodejs", "javascript", "typescript":
+		return &NodeValidator{baseURL: f.nodeValidatorURL}
+	case "react", "reactjs":
+		return &ReactValidator{baseURL: f.reactValidatorURL}
+	default:
+		return nil
+	}
+}
+
+func normalizeCodeStructureTypeCode(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	upper := strings.ToUpper(trimmed)
+	switch upper {
+	case "HTML_BASIC_DOCUMENT":
+		return "html"
+	case "CSS_BASIC_STYLESHEET":
+		return "css"
+	case "PHP_BASIC_SCRIPT":
+		return "php"
+	case "REACT_COMPONENT_BASIC":
+		return "react"
+	case "NEXTJS_BASIC":
+		return "react"
+	case "EXPRESSJS_BASIC":
+		return "nodejs"
+	case "JAVASCRIPT_BASIC":
+		return "javascript"
+	case "JAVASCRIPT_BASIC_SCRIPT":
+		return "javascript"
+	case "TYPESCRIPT_BASIC":
+		return "typescript"
+	case "TYPESCRIPT_BASIC_SCRIPT":
+		return "typescript"
+	case "NODEJS_BASIC_SCRIPT":
+		return "nodejs"
+	}
+
+	lower := strings.ToLower(trimmed)
+	switch lower {
+	case "task-html":
+		return "html"
+	case "task-react":
+		return "react"
+	default:
+		return lower
+	}
+}
+
+// HTMLValidator validates HTML.
+type HTMLValidator struct {
+	conn    *natsgo.Conn
+	subject string
+	baseURL string
+}
+
+func (v *HTMLValidator) ValidateAll(ctx context.Context, taskID string, files []WorkspaceFile) (*ValidationResult, error) {
+	var htmlPath string
+	var htmlContent string
+	for _, file := range files {
+		if isHTMLFilePath(file.Path) {
+			htmlPath = file.Path
+			htmlContent = file.Content
+			break
+		}
+	}
+	if htmlContent == "" {
+		return &ValidationResult{Valid: false, Errors: []ValidationError{
+			{Code: "NO_HTML_FILE", Message: "No HTML file found"},
+		}}, nil
+	}
+
+	if strings.TrimSpace(v.baseURL) != "" {
+		return v.validateOverHTTP(ctx, taskID, htmlPath, htmlContent)
+	}
+	if v.conn == nil {
+		return nil, fmt.Errorf("html validator unavailable: nats connection is nil")
+	}
+	if strings.TrimSpace(v.subject) == "" {
+		return nil, fmt.Errorf("html validator unavailable: subject is empty")
+	}
+
+	req := map[string]interface{}{
+		"taskId": taskID,
+		"code":   htmlContent,
+	}
+	data, _ := json.Marshal(req)
+
+	msg, err := v.conn.RequestWithContext(ctx, v.subject, data)
+	if err != nil {
+		return nil, fmt.Errorf("html validator request unavailable")
+	}
+	return decodeHTMLValidationResponse(msg.Data, "")
+}
+
+func (v *HTMLValidator) validateOverHTTP(ctx context.Context, taskID, htmlPath, htmlContent string) (*ValidationResult, error) {
+	reqPayload := map[string]any{
+		"taskId": taskID,
+		"code":   htmlContent,
+	}
+	data, err := json.Marshal(reqPayload)
+	if err != nil {
+		return nil, fmt.Errorf("html validator request encoding failed")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(v.baseURL, "/")+"/validate", bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("html validator request unavailable")
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("html validator request unavailable")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("html validator response unavailable")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("html validator returned a technical error")
+	}
+	return decodeHTMLValidationResponse(body, htmlPath)
+}
+
+func decodeHTMLValidationResponse(data []byte, fallbackPath string) (*ValidationResult, error) {
+	var response struct {
+		IsValid *bool           `json:"isValid"`
+		Errors  json.RawMessage `json:"errors"`
+		Error   json.RawMessage `json:"error"`
+	}
+	protocolError := func() (*ValidationResult, error) {
+		return nil, fmt.Errorf("html validator returned an invalid response")
+	}
+	if json.Unmarshal(data, &response) != nil || response.IsValid == nil || len(response.Error) != 0 ||
+		len(response.Errors) == 0 || bytes.Equal(bytes.TrimSpace(response.Errors), []byte("null")) {
+		return protocolError()
+	}
+	var issues []struct {
+		Code    string  `json:"code"`
+		Message *string `json:"message"`
+		Path    string  `json:"path"`
+	}
+	if json.Unmarshal(response.Errors, &issues) != nil || (*response.IsValid && len(issues) != 0) {
+		return protocolError()
+	}
+	result := &ValidationResult{Valid: *response.IsValid, Errors: []ValidationError{}}
+	for _, item := range issues {
+		if strings.TrimSpace(item.Code) == "" || item.Message == nil {
+			return protocolError()
+		}
+		file := item.Path
+		if fallbackPath != "" {
+			file = strings.TrimSpace(file)
+			if file == "" {
+				file = fallbackPath
+			}
+		}
+		result.Errors = append(result.Errors, ValidationError{
+			Code:    item.Code,
+			Message: *item.Message,
+			File:    file,
+		})
+	}
+	return result, nil
+}
+
+// CSSValidator validates CSS.
+type CSSValidator struct {
+	conn    *natsgo.Conn
+	subject string
+}
+
+func (v *CSSValidator) ValidateAll(ctx context.Context, taskID string, files []WorkspaceFile) (*ValidationResult, error) {
+	if v.conn == nil {
+		return nil, fmt.Errorf("css validator unavailable: nats connection is nil")
+	}
+	if strings.TrimSpace(v.subject) == "" {
+		return nil, fmt.Errorf("css validator unavailable: subject is empty")
+	}
+	var stylesheets []WorkspaceFile
+	for _, file := range files {
+		path := strings.ToLower(strings.TrimSpace(file.Path))
+		if strings.HasSuffix(path, ".sass") {
+			return nil, fmt.Errorf("css validator does not support indented Sass")
+		}
+		if cssFileLanguage(path) != "" {
+			stylesheets = append(stylesheets, file)
+		}
+	}
+	if len(stylesheets) == 0 {
+		return &ValidationResult{Valid: false, Errors: []ValidationError{{Code: "NO_CSS_FILE", Message: "No CSS file found"}}}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	result := &ValidationResult{Valid: true, Errors: []ValidationError{}}
+	for _, file := range stylesheets {
+		request := map[string]any{
+			"language": cssFileLanguage(strings.ToLower(strings.TrimSpace(file.Path))),
+			"code":     file.Content,
+			"rules":    map[string]any{"rules": []any{}},
+			"locale":   "en",
+			"meta":     map[string]string{"taskId": taskID, "path": file.Path},
+		}
+		data, err := json.Marshal(request)
+		if err != nil {
+			return nil, fmt.Errorf("css validator request encoding failed")
+		}
+		message, err := v.conn.RequestWithContext(ctx, v.subject, data)
+		if err != nil {
+			return nil, fmt.Errorf("css validator request unavailable")
+		}
+		fileResult, err := decodeCSSValidationResponse(message.Data, file.Path)
+		if err != nil {
+			return nil, err
+		}
+		result.Valid = result.Valid && fileResult.Valid
+		result.Errors = append(result.Errors, fileResult.Errors...)
+	}
+	return result, nil
+}
+
+func cssFileLanguage(path string) string {
+	for _, language := range []string{"css", "scss", "acss"} {
+		if strings.HasSuffix(path, "."+language) {
+			return language
+		}
+	}
+	return ""
+}
+
+func decodeCSSValidationResponse(data []byte, filePath string) (*ValidationResult, error) {
+	var response struct {
+		IsValid *bool           `json:"isValid"`
+		Errors  json.RawMessage `json:"errors"`
+	}
+	protocolError := func() (*ValidationResult, error) {
+		return nil, fmt.Errorf("css validator returned an invalid response")
+	}
+	if json.Unmarshal(data, &response) != nil || response.IsValid == nil ||
+		len(response.Errors) == 0 || bytes.Equal(bytes.TrimSpace(response.Errors), []byte("null")) {
+		return protocolError()
+	}
+	var errors []struct {
+		Code     string `json:"code"`
+		Message  string `json:"message"`
+		Position *struct {
+			Line   *int `json:"line"`
+			Column *int `json:"column"`
+		} `json:"position"`
+	}
+	if json.Unmarshal(response.Errors, &errors) != nil || (*response.IsValid && len(errors) != 0) || (!*response.IsValid && len(errors) == 0) {
+		return protocolError()
+	}
+	result := &ValidationResult{Valid: *response.IsValid, Errors: []ValidationError{}}
+	for _, item := range errors {
+		if strings.TrimSpace(item.Code) == "" || strings.TrimSpace(item.Message) == "" {
+			return protocolError()
+		}
+		// The provider conflates source syntax and internal failures under this
+		// code. Preserve that uncertainty instead of recording a learner failure.
+		if item.Code == "internal.compiler_error" {
+			return nil, fmt.Errorf("css validator compilation unavailable")
+		}
+		// Only the provider-owned I18nMessageKey semantic codes may cross this
+		// boundary. Arbitrary codes and localized/provider-authored text can
+		// contain source or private diagnostic details.
+		switch item.Code {
+		case "selector.not_found", "selector.not_found_in_media", "declaration.not_found",
+			"declaration.value_mismatch", "declaration.not_allowed_value", "occurrence.min",
+			"occurrence.max", "media.not_found":
+		default:
+			return protocolError()
+		}
+		mapped := ValidationError{Code: item.Code, Message: "Stylesheet validation failed", File: filePath}
+		if item.Position != nil {
+			if item.Position.Line != nil {
+				mapped.Line = *item.Position.Line
+			}
+			if item.Position.Column != nil {
+				mapped.Column = *item.Position.Column
+			}
+		}
+		result.Errors = append(result.Errors, mapped)
+	}
+	return result, nil
+}
+
+func isHTMLFilePath(path string) bool {
+	lower := strings.ToLower(strings.TrimSpace(path))
+	return strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".htm")
+}
+
+// NodeValidator validates Node.js.
+type NodeValidator struct {
+	baseURL string
+}
+
+func (v *NodeValidator) ValidateAll(ctx context.Context, taskID string, files []WorkspaceFile) (*ValidationResult, error) {
+	if v.baseURL == "" {
+		return nil, fmt.Errorf("node validator url is empty")
+	}
+	if len(files) == 0 {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "NO_SOURCE_FILES", Message: "No source files found"},
+			},
+		}, nil
+	}
+	language := "ts"
+	entrypoint, sourceContent := pickPrimarySource(files)
+	if entrypoint == "" {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "NO_SOURCE_FILE", Message: "No JavaScript or TypeScript source file found"},
+			},
+		}, nil
+	}
+	if strings.TrimSpace(sourceContent) == "" {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "EMPTY_SOURCE_FILE", Message: fmt.Sprintf("Source file is empty: %s", entrypoint), File: entrypoint},
+			},
+		}, nil
+	}
+	if strings.HasSuffix(entrypoint, ".js") || strings.HasSuffix(entrypoint, ".jsx") {
+		language = "js"
+	}
+
+	reqPayload := map[string]any{
+		"language":  language,
+		"framework": "none",
+		"mode": map[string]bool{
+			"static":    true,
+			"structure": false,
+			"runtime":   false,
+		},
+		"taskMeta": map[string]string{
+			"taskId": taskID,
+		},
+		"code": map[string]any{
+			"files":      files,
+			"entrypoint": entrypoint,
+		},
+		"rules": map[string]any{},
+	}
+	data, err := json.Marshal(reqPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+"/api/v1/validate-node", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("node validator error: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var decoded struct {
+		OK     bool  `json:"ok"`
+		Valid  *bool `json:"valid,omitempty"`
+		Errors []struct {
+			Code     string `json:"code"`
+			Message  string `json:"message"`
+			Location struct {
+				File   string `json:"file"`
+				Line   int    `json:"line"`
+				Column int    `json:"column"`
+			} `json:"location"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, err
+	}
+
+	isValid := decoded.OK
+	if decoded.Valid != nil {
+		isValid = *decoded.Valid
+	}
+
+	errors := make([]ValidationError, 0, len(decoded.Errors))
+	for _, item := range decoded.Errors {
+		errors = append(errors, ValidationError{
+			Code:    item.Code,
+			Message: item.Message,
+			File:    item.Location.File,
+			Line:    item.Location.Line,
+			Column:  item.Location.Column,
+		})
+	}
+
+	return &ValidationResult{Valid: isValid, Errors: errors}, nil
+}
+
+// ReactValidator validates React.
+type ReactValidator struct {
+	baseURL string
+}
+
+func (v *ReactValidator) ValidateAll(ctx context.Context, taskID string, files []WorkspaceFile) (*ValidationResult, error) {
+	if v.baseURL == "" {
+		return nil, fmt.Errorf("react validator url is empty")
+	}
+
+	reactPath, reactCode, reactLang := pickReactSource(files)
+	if reactPath == "" {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "NO_REACT_FILE", Message: "No React source file found"},
+			},
+		}, nil
+	}
+
+	reqPayload := map[string]any{
+		"language":  reactLang,
+		"framework": "react",
+		"taskId":    taskID,
+		"code":      reactCode,
+		"rules":     []any{},
+	}
+	data, err := json.Marshal(reqPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+"/validate", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("react validator error: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var decoded struct {
+		Success bool `json:"success"`
+		Errors  []struct {
+			Code       string `json:"code"`
+			MessageKey string `json:"messageKey"`
+			Message    string `json:"message"`
+			Location   struct {
+				File   string `json:"file"`
+				Line   int    `json:"line"`
+				Column int    `json:"column"`
+			} `json:"location"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, err
+	}
+
+	errors := make([]ValidationError, 0, len(decoded.Errors))
+	for _, item := range decoded.Errors {
+		message := strings.TrimSpace(item.Message)
+		if message == "" {
+			message = strings.TrimSpace(item.MessageKey)
+		}
+		if message == "" {
+			message = "React validation error"
+		}
+		code := strings.TrimSpace(item.Code)
+		if code == "" {
+			code = "REACT_VALIDATION_ERROR"
+		}
+		errors = append(errors, ValidationError{
+			Code:    code,
+			Message: message,
+			File:    item.Location.File,
+			Line:    item.Location.Line,
+			Column:  item.Location.Column,
+		})
+	}
+
+	return &ValidationResult{Valid: decoded.Success, Errors: errors}, nil
+}
+
+func pickPrimarySource(files []WorkspaceFile) (string, string) {
+	extensions := []string{".ts", ".tsx", ".js", ".jsx"}
+	for _, ext := range extensions {
+		for _, file := range files {
+			if strings.HasSuffix(strings.ToLower(file.Path), ext) {
+				return file.Path, file.Content
+			}
+		}
+	}
+	return "", ""
+}
+
+func pickReactSource(files []WorkspaceFile) (path string, content string, language string) {
+	type candidate struct {
+		ext  string
+		lang string
+	}
+	ordered := []candidate{
+		{ext: ".tsx", lang: "tsx"},
+		{ext: ".jsx", lang: "jsx"},
+		{ext: ".ts", lang: "ts"},
+		{ext: ".js", lang: "js"},
+	}
+	for _, wanted := range ordered {
+		for _, file := range files {
+			if strings.HasSuffix(strings.ToLower(file.Path), wanted.ext) {
+				return file.Path, file.Content, wanted.lang
+			}
+		}
+	}
+	return "", "", ""
+}

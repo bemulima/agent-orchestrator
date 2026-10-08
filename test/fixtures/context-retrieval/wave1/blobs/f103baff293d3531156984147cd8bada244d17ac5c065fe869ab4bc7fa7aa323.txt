@@ -1,0 +1,1119 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+// AnswerHandler handles student and reviewer endpoints.
+type AnswerHandler struct {
+	Validator   *validator.Validate
+	Start       answer.StartTaskAnswer
+	Progress    *answer.ProgressionService
+	Submit      answer.SubmitTaskAnswer
+	SubmitById  answer.FinalValidation
+	List        answer.ListStudentAnswers
+	Get         answer.GetStudentAnswer
+	ListResults answer.ListStudentResults
+	GetResult   answer.GetStudentResult
+	Manual      answer.ApplyManualReview
+}
+
+// SubmitRequest body.
+type SubmitRequest struct {
+	StudentTaskAnswerID string `json:"student_task_answer_id" validate:"required,uuid4"`
+	FilestorageID       string `json:"filestorage_id" validate:"required,uuid4"`
+}
+
+// ManualReviewRequest body.
+type ManualReviewRequest struct {
+	Status     int      `json:"status" validate:"required,oneof=3 5"`
+	FinalScore *float64 `json:"final_score" validate:"omitempty"`
+	Feedback   *string  `json:"feedback" validate:"omitempty"`
+}
+
+type startTaskResponse struct {
+	AnswerID               string `json:"answer_id"`
+	LearningActionID       string `json:"learning_action_id"`
+	SandboxID              string `json:"sandbox_id"`
+	Status                 string `json:"status"`
+	PreviewURL             string `json:"preview_url"`
+	Type                   int16  `json:"type"`
+	TaskKind               string `json:"task_kind"`
+	ExecutionMode          string `json:"execution_mode"`
+	EvaluationMode         string `json:"evaluation_mode"`
+	UIMode                 string `json:"ui_mode"`
+	SubmissionMode         string `json:"submission_mode"`
+	RequiresSandbox        bool   `json:"requires_sandbox"`
+	ExposesPreview         bool   `json:"exposes_preview"`
+	ExposesTerminal        bool   `json:"exposes_terminal"`
+	SupportsLiveValidation bool   `json:"supports_live_validation"`
+	TerminalWSURL          string `json:"terminal_ws_url,omitempty"`
+}
+
+type taskLockedResponse struct {
+	Code             string `json:"code"`
+	Message          string `json:"message"`
+	RedirectLessonID string `json:"redirect_lesson_id,omitempty"`
+	RedirectTaskID   string `json:"redirect_task_id,omitempty"`
+}
+
+type submitByIDRequest struct {
+	AnswerPayload json.RawMessage `json:"answer_payload"`
+}
+
+type wikiReviewResponse struct {
+	Passed  bool  `json:"passed"`
+	Errors  []any `json:"errors"`
+	Score   int   `json:"score"`
+	Details any   `json:"details,omitempty"`
+}
+
+type wikiSubmitResponse struct {
+	AnswerID string             `json:"answer_id"`
+	Status   string             `json:"status"`
+	Review   wikiReviewResponse `json:"review"`
+}
+
+type wikiGetAnswerResponse struct {
+	AnswerID    string             `json:"answer_id"`
+	Status      string             `json:"status"`
+	StartedAt   time.Time          `json:"started_at"`
+	SubmittedAt *time.Time         `json:"submitted_at,omitempty"`
+	Review      wikiReviewResponse `json:"review"`
+}
+
+// StartTask starts new attempt.
+func (h AnswerHandler) StartTask(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	taskID := chi.URLParam(r, "taskID")
+	var input struct {
+		LearningPathItemID string `json:"learning_path_item_id"`
+		RequirementID      string `json:"requirement_id"`
+	}
+	if r.Body != nil {
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 4097))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil && err != io.EOF {
+			writeDomainError(w, domain.ErrValidation)
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeDomainError(w, domain.ErrValidation)
+			return
+		}
+	}
+	out, err := h.Start.Handle(requestContext, answer.StartTaskAnswerInput{StudentID: userID, TaskID: taskID, LearningPathItemID: input.LearningPathItemID, RequirementID: input.RequirementID})
+	if err != nil {
+		var lockedErr *answer.TaskLockedError
+		if errors.As(err, &lockedErr) {
+			writeJSON(w, http.StatusConflict, taskLockedResponse{
+				Code:             "TASK_LOCKED",
+				Message:          lockedErr.Error(),
+				RedirectLessonID: lockedErr.RedirectLessonID,
+				RedirectTaskID:   lockedErr.RedirectTaskID,
+			})
+			return
+		}
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, startTaskResponse{
+		AnswerID:               out.AnswerID,
+		LearningActionID:       out.LearningActionID,
+		SandboxID:              out.SandboxID,
+		Status:                 out.Status,
+		PreviewURL:             out.PreviewURL,
+		Type:                   out.Type,
+		TaskKind:               out.TaskKind,
+		ExecutionMode:          out.ExecutionMode,
+		EvaluationMode:         out.EvaluationMode,
+		UIMode:                 out.UIMode,
+		SubmissionMode:         out.SubmissionMode,
+		RequiresSandbox:        out.RequiresSandbox,
+		ExposesPreview:         out.ExposesPreview,
+		ExposesTerminal:        out.ExposesTerminal,
+		SupportsLiveValidation: out.SupportsLiveValidation,
+		TerminalWSURL:          out.TerminalWSURL,
+	})
+}
+
+// GetCourseProgression returns ordered lessons/tasks with lock state for current user.
+func (h AnswerHandler) GetCourseProgression(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.Progress == nil {
+		http.Error(w, "progression is not configured", http.StatusInternalServerError)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	courseID := chi.URLParam(r, "courseID")
+	result, err := h.Progress.ResolveCourse(requestContext, userID, courseID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetTaskAccess returns access state for one task for current user.
+func (h AnswerHandler) GetTaskAccess(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.Progress == nil {
+		http.Error(w, "progression is not configured", http.StatusInternalServerError)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	taskID := chi.URLParam(r, "taskID")
+	result, err := h.Progress.ResolveTaskAccess(requestContext, userID, taskID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetLessonAccess returns access state for one lesson for current user.
+func (h AnswerHandler) GetLessonAccess(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.Progress == nil {
+		http.Error(w, "progression is not configured", http.StatusInternalServerError)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	lessonID := chi.URLParam(r, "lessonID")
+	result, err := h.Progress.ResolveLessonAccess(requestContext, userID, lessonID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetLesson returns lesson details only when lesson access is allowed.
+func (h AnswerHandler) GetLesson(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.Progress == nil || h.Progress.Lessons == nil {
+		http.Error(w, "lesson provider is not configured", http.StatusInternalServerError)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	lessonID := chi.URLParam(r, "lessonID")
+	access, err := h.Progress.ResolveLessonAccess(requestContext, userID, lessonID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if access.Locked {
+		writeLessonLocked(w, access)
+		return
+	}
+	item, err := h.Progress.Lessons.GetLesson(requestContext, lessonID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildStudentLessonResponse(item))
+}
+
+// GetTask returns task details only when task access is allowed.
+func (h AnswerHandler) GetTask(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.Progress == nil || h.Progress.TaskProvider == nil {
+		http.Error(w, "task provider is not configured", http.StatusInternalServerError)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	taskID := chi.URLParam(r, "taskID")
+	access, err := h.Progress.ResolveTaskAccess(requestContext, userID, taskID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if access.Locked {
+		writeTaskLocked(w, access)
+		return
+	}
+	item, err := h.Progress.TaskProvider.GetTask(answer.WithTaskLookupContext(requestContext, userID, ""), taskID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildStudentTaskResponse(answer.NormalizeTaskMetadata(item)))
+}
+
+// GetAnswerById returns answer details for task (wiki-compatible).
+func (h AnswerHandler) GetAnswerById(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	answerID := chi.URLParam(r, "answerID")
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	details, err := h.Get.Handle(r.Context(), answerID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if details.Answer.StudentID != userID || details.Answer.TaskID != taskID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, wikiGetAnswerResponse{
+		AnswerID:    details.Answer.ID,
+		Status:      statusToWiki(details.Answer.Status),
+		StartedAt:   details.Answer.StartedAt,
+		SubmittedAt: details.Answer.EndedAt,
+		Review:      buildWikiReview(details.Answer.Status, details.AutoReview, requestLocale(r)),
+	})
+}
+
+// SubmitTask submits attempt for review.
+func (h AnswerHandler) SubmitTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	var req SubmitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	ans, err := h.Submit.Handle(requestContext, answer.SubmitTaskAnswerInput{
+		StudentID:           userID,
+		TaskID:              taskID,
+		StudentTaskAnswerID: req.StudentTaskAnswerID,
+		FilestorageID:       req.FilestorageID,
+	})
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildStudentAnswerResponse(*ans, nil, nil))
+}
+
+// SubmitAnswerById submits answer by ID for final validation.
+func (h AnswerHandler) SubmitAnswerById(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	answerID := chi.URLParam(r, "answerID")
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	requestContext, err := publicContentContext(r)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	// Verify ownership
+	details, err := h.Get.Handle(requestContext, answerID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if details.Answer.StudentID != userID || details.Answer.TaskID != taskID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var req submitByIDRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	// Execute final validation
+	err = h.SubmitById.Handle(requestContext, answerID, req.AnswerPayload)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	// Return updated answer
+	updated, err := h.Get.Handle(requestContext, answerID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wikiSubmitResponse{
+		AnswerID: updated.Answer.ID,
+		Status:   statusToWiki(updated.Answer.Status),
+		Review:   buildWikiReview(updated.Answer.Status, updated.AutoReview, requestLocale(r)),
+	})
+}
+
+// ListMyAnswers returns attempts for current user and task.
+func (h AnswerHandler) ListMyAnswers(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	taskID := chi.URLParam(r, "taskID")
+	answers, err := h.List.Handle(r.Context(), taskID, userID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	resp := make([]answerResponse, 0, len(answers))
+	for _, a := range answers {
+		resp = append(resp, buildStudentAnswerResponse(a, nil, nil))
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// GetMyAnswer returns attempt details.
+func (h AnswerHandler) GetMyAnswer(w http.ResponseWriter, r *http.Request) {
+	answerID := chi.URLParam(r, "answerID")
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	details, err := h.Get.Handle(r.Context(), answerID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if details.Answer.StudentID != userID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildStudentAnswerResponse(details.Answer, details.AutoReview, details.ManualReview))
+}
+
+// ListMyResults returns attempts across all tasks for current user.
+func (h AnswerHandler) ListMyResults(w http.ResponseWriter, r *http.Request) {
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.ListResults.Answers == nil {
+		http.Error(w, "results are not configured", http.StatusInternalServerError)
+		return
+	}
+
+	limit := 20
+	offset := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			offset = parsed
+		}
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	resultPage, err := h.ListResults.Handle(r.Context(), userID, answer.ListStudentResultsInput{
+		TaskID: strings.TrimSpace(r.URL.Query().Get("task_id")),
+		Limit:  limit,
+		Offset: offset,
+	})
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	items := make([]map[string]any, 0, len(resultPage.Items))
+	for _, item := range resultPage.Items {
+		payload := map[string]any{
+			"id":             item.Answer.ID,
+			"task_id":        item.Answer.TaskID,
+			"status":         item.Answer.Status,
+			"attempt":        item.Answer.Attempt,
+			"started_at":     item.Answer.StartedAt,
+			"ended_at":       item.Answer.EndedAt,
+			"filestorage_id": item.Answer.FilestorageID,
+			"created_at":     item.Answer.CreatedAt,
+		}
+		if item.SandboxID != "" {
+			payload["sandbox_id"] = item.SandboxID
+		}
+		if item.Task != nil {
+			payload["task"] = map[string]any{
+				"id":          item.Task.ID,
+				"lesson_id":   item.Task.LessonID,
+				"course_id":   item.Task.CourseID,
+				"title":       item.Task.Title,
+				"description": item.Task.Description,
+			}
+		}
+		items = append(items, payload)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":  items,
+		"limit":  resultPage.Limit,
+		"offset": resultPage.Offset,
+		"total":  resultPage.Total,
+	})
+}
+
+// GetMyResult returns detailed result payload for one answer.
+func (h AnswerHandler) GetMyResult(w http.ResponseWriter, r *http.Request) {
+	answerID := chi.URLParam(r, "answerID")
+	userID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if h.GetResult.GetAnswer.Answers == nil {
+		http.Error(w, "result details are not configured", http.StatusInternalServerError)
+		return
+	}
+
+	result, err := h.GetResult.Handle(r.Context(), userID, answerID)
+	if err != nil {
+		if err == domain.ErrForbidden {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		writeDomainError(w, err)
+		return
+	}
+
+	var taskPayload any
+	if result.Task != nil {
+		taskPayload = map[string]any{
+			"id":           result.Task.ID,
+			"lesson_id":    result.Task.LessonID,
+			"course_id":    result.Task.CourseID,
+			"title":        result.Task.Title,
+			"description":  result.Task.Description,
+			"max_attempts": result.Task.MaxAttempts,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"answer":            buildStudentAnswerResponse(result.Details.Answer, result.Details.AutoReview, result.Details.ManualReview),
+		"task":              taskPayload,
+		"attempts_for_task": result.AttemptsForTask,
+		"sandbox_id":        result.SandboxID,
+	})
+}
+
+// ManualReview handles reviewer decision.
+func (h AnswerHandler) ManualReview(w http.ResponseWriter, r *http.Request) {
+	answerID := chi.URLParam(r, "answerID")
+	var req ManualReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	reviewerID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	_, err := h.Manual.Handle(r.Context(), answer.ApplyManualReviewInput{
+		StudentTaskAnswerID: answerID,
+		ReviewerID:          reviewerID,
+		Status:              req.Status,
+		FinalScore:          req.FinalScore,
+		Feedback:            req.Feedback,
+	})
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	details, err := h.Get.Handle(r.Context(), answerID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildAnswerResponse(details.Answer, details.AutoReview, details.ManualReview))
+}
+
+func buildAnswerResponse(ans domain.StudentTaskAnswer, auto *domain.StudentTaskAnswerAutoReview, manual *domain.StudentTaskAnswerReview) answerResponse {
+	resp := answerResponse{
+		ID:            ans.ID,
+		StudentID:     ans.StudentID,
+		TaskID:        ans.TaskID,
+		FilestorageID: ans.FilestorageID,
+		AnswerPayload: ans.AnswerPayload,
+		StartedAt:     ans.StartedAt,
+		EndedAt:       ans.EndedAt,
+		Status:        ans.Status,
+		Attempt:       ans.Attempt,
+		CreatedAt:     ans.CreatedAt,
+		UpdatedAt:     ans.UpdatedAt,
+	}
+	if auto != nil {
+		resp.AutoReview = &autoReviewResponse{
+			ValidatorName: auto.ValidatorName,
+			AutoScore:     auto.AutoScore,
+			Passed:        auto.Passed,
+			Feedback:      auto.Feedback,
+			CheckedAt:     auto.CheckedAt,
+			RawResult:     auto.RawResult,
+		}
+	}
+	if manual != nil {
+		resp.ManualReview = &manualReviewResponse{
+			ReviewerID: manual.ReviewerID,
+			CheckedAt:  manual.CheckedAt,
+			FinalScore: manual.FinalScore,
+			Status:     manual.Status,
+			Feedback:   manual.Feedback,
+		}
+	}
+	return resp
+}
+
+func buildStudentAnswerResponse(ans domain.StudentTaskAnswer, auto *domain.StudentTaskAnswerAutoReview, manual *domain.StudentTaskAnswerReview) answerResponse {
+	resp := buildAnswerResponse(ans, auto, manual)
+	if resp.AutoReview != nil && auto != nil {
+		resp.AutoReview.RawResult = safeStudentReviewRawResult(auto.RawResult, auto.Passed)
+		if isTaskTestRawResult(auto.RawResult) {
+			resp.AutoReview.Feedback = nil
+		}
+	}
+	return resp
+}
+
+func statusToWiki(status int) string {
+	switch status {
+	case domain.StudentTaskAnswerStatusInProgress:
+		return "IN_PROCESS"
+	case domain.StudentTaskAnswerStatusUnderReview:
+		return "UNDER_REVIEW"
+	case domain.StudentTaskAnswerStatusFailed:
+		return "FAILED"
+	case domain.StudentTaskAnswerStatusRejected:
+		return "REJECTED"
+	case domain.StudentTaskAnswerStatusPassed:
+		return "PASSED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func buildWikiReview(status int, auto *domain.StudentTaskAnswerAutoReview, locale string) wikiReviewResponse {
+	passed := status == domain.StudentTaskAnswerStatusPassed
+	if auto != nil && status != domain.StudentTaskAnswerStatusUnderReview {
+		passed = auto.Passed
+	}
+	score := 0
+	if passed {
+		score = 100
+	}
+	errors := []any{}
+	var safeRawResult map[string]any
+	if auto != nil {
+		safeRawResult = safeStudentReviewRawResult(auto.RawResult, passed)
+	}
+	if !passed && safeRawResult != nil {
+		if rawErrors, ok := safeRawResult["errors"]; ok {
+			if arr, ok := rawErrors.([]any); ok {
+				errors = localizeValidationErrors(arr, locale)
+			}
+		}
+	}
+	var details any
+	if safeRawResult != nil {
+		details = localizeReviewDetails(safeRawResult, locale)
+	}
+	return wikiReviewResponse{Passed: passed, Errors: errors, Score: score, Details: details}
+}
+
+func requestLocale(r *http.Request) string {
+	if r == nil {
+		return "en"
+	}
+
+	locale := strings.TrimSpace(r.Header.Get("X-Locale"))
+	if locale == "" {
+		locale = strings.TrimSpace(r.Header.Get("Accept-Language"))
+	}
+	if locale == "" {
+		return "en"
+	}
+
+	primary := strings.Split(locale, ",")[0]
+	primary = strings.Split(primary, ";")[0]
+	primary = strings.ToLower(strings.TrimSpace(primary))
+	if strings.HasPrefix(primary, "ru") {
+		return "ru"
+	}
+	return "en"
+}
+
+func localizeValidationErrors(errors []any, locale string) []any {
+	if len(errors) == 0 || locale != "ru" {
+		return errors
+	}
+
+	localized := make([]any, 0, len(errors))
+	for _, item := range errors {
+		record, ok := item.(map[string]any)
+		if !ok {
+			localized = append(localized, item)
+			continue
+		}
+
+		code := extractStringField(record, "Code", "code")
+		message := extractStringField(record, "Message", "message")
+		translated := translateValidationMessage(locale, code, message)
+		if translated == "" || translated == message {
+			localized = append(localized, item)
+			continue
+		}
+
+		clone := make(map[string]any, len(record))
+		for key, value := range record {
+			clone[key] = value
+		}
+		if _, exists := clone["Message"]; exists {
+			clone["Message"] = translated
+		} else if _, exists := clone["message"]; exists {
+			clone["message"] = translated
+		} else {
+			clone["Message"] = translated
+		}
+		localized = append(localized, clone)
+	}
+
+	return localized
+}
+
+func localizeReviewDetails(raw map[string]any, locale string) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(raw))
+	for key, value := range raw {
+		clone[key] = value
+	}
+	if locale != "ru" {
+		return clone
+	}
+
+	items, ok := clone["items"].([]any)
+	if !ok {
+		return clone
+	}
+	localizedItems := make([]any, 0, len(items))
+	for _, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok {
+			localizedItems = append(localizedItems, item)
+			continue
+		}
+		copied := make(map[string]any, len(record))
+		for key, value := range record {
+			copied[key] = value
+		}
+		if value, exists := copied["correct"]; exists {
+			if isCorrect, ok := value.(bool); ok {
+				if isCorrect {
+					copied["result_label"] = "Верно"
+				} else {
+					copied["result_label"] = "Неверно"
+				}
+			}
+		}
+		localizedItems = append(localizedItems, copied)
+	}
+	clone["items"] = localizedItems
+	return clone
+}
+
+func extractStringField(record map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := record[key]
+		if !ok {
+			continue
+		}
+		asString, ok := value.(string)
+		if !ok {
+			continue
+		}
+		trimmed := strings.TrimSpace(asString)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func translateValidationMessage(locale, code, message string) string {
+	if locale != "ru" {
+		return message
+	}
+
+	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
+	if strings.HasPrefix(normalizedMessage, "required string is missing:") {
+		details := strings.TrimSpace(message[len("Required string is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найдено обязательное содержимое: %s", details)
+		}
+		return "Не найдено обязательное содержимое"
+	}
+	if strings.HasPrefix(normalizedMessage, "required variable is missing:") {
+		details := strings.TrimSpace(message[len("Required variable is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найдена обязательная переменная: %s", details)
+		}
+		return "Не найдена обязательная переменная"
+	}
+	if strings.HasPrefix(normalizedMessage, "required interface is missing or incomplete:") {
+		details := strings.TrimSpace(message[len("Required interface is missing or incomplete:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найден или некорректен обязательный интерфейс: %s", details)
+		}
+		return "Не найден или некорректен обязательный интерфейс"
+	}
+	if strings.HasPrefix(normalizedMessage, "required function is missing:") {
+		details := strings.TrimSpace(message[len("Required function is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найдена обязательная функция: %s", details)
+		}
+		return "Не найдена обязательная функция"
+	}
+	if strings.HasPrefix(normalizedMessage, "required method usage is missing:") {
+		details := strings.TrimSpace(message[len("Required method usage is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найдено обязательное использование метода: %s", details)
+		}
+		return "Не найдено обязательное использование метода"
+	}
+	if strings.HasPrefix(normalizedMessage, "required route is missing:") {
+		details := strings.TrimSpace(message[len("Required route is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найден обязательный маршрут: %s", details)
+		}
+		return "Не найден обязательный маршрут"
+	}
+	if strings.HasPrefix(normalizedMessage, "source file is empty:") {
+		details := strings.TrimSpace(message[len("Source file is empty:"):])
+		if details != "" {
+			return fmt.Sprintf("Исходный файл пуст: %s", details)
+		}
+		return "Исходный файл пуст"
+	}
+	if strings.HasPrefix(normalizedMessage, "answer is missing for question:") {
+		details := strings.TrimSpace(message[len("Answer is missing for question:"):])
+		if details != "" {
+			return fmt.Sprintf("Нет ответа на вопрос: %s", details)
+		}
+		return "Нет ответа на вопрос"
+	}
+	if strings.HasPrefix(normalizedMessage, "selected answer does not belong to question:") {
+		details := strings.TrimSpace(message[len("Selected answer does not belong to question:"):])
+		if details != "" {
+			return fmt.Sprintf("Выбранный вариант не относится к вопросу: %s", details)
+		}
+		return "Выбранный вариант не относится к вопросу"
+	}
+	if strings.HasPrefix(normalizedMessage, "incorrect answer for question:") {
+		details := strings.TrimSpace(message[len("Incorrect answer for question:"):])
+		if details != "" {
+			return fmt.Sprintf("Неверный ответ на вопрос: %s", details)
+		}
+		return "Неверный ответ на вопрос"
+	}
+	if strings.HasPrefix(normalizedMessage, "incorrect order for question:") {
+		details := strings.TrimSpace(message[len("Incorrect order for question:"):])
+		if details != "" {
+			return fmt.Sprintf("Указан неверный порядок элементов: %s", details)
+		}
+		return "Указан неверный порядок элементов"
+	}
+	if strings.HasPrefix(normalizedMessage, "incorrect classification for question:") {
+		details := strings.TrimSpace(message[len("Incorrect classification for question:"):])
+		if details != "" {
+			return fmt.Sprintf("Элементы распределены по неверным группам: %s", details)
+		}
+		return "Элементы распределены по неверным группам"
+	}
+	if strings.HasPrefix(normalizedMessage, "too many incorrect answers:") {
+		details := strings.TrimSpace(message[len("Too many incorrect answers:"):])
+		if details != "" {
+			return fmt.Sprintf("Слишком много неверных ответов: %s", details)
+		}
+		return "Слишком много неверных ответов"
+	}
+	if strings.HasPrefix(normalizedMessage, "required tag is missing:") {
+		details := strings.TrimSpace(message[len("Required tag is missing:"):])
+		if details != "" {
+			return fmt.Sprintf("Не найден обязательный тег: %s", details)
+		}
+		return "Не найден обязательный тег"
+	}
+	if strings.HasPrefix(normalizedMessage, "required attribute is missing on <") {
+		return strings.Replace(message, "Required attribute is missing on <", "Не найден обязательный атрибут у <", 1)
+	}
+	if strings.HasPrefix(normalizedMessage, "required attribute has invalid value on <") {
+		return strings.Replace(message, "Required attribute has invalid value on <", "Некорректное значение обязательного атрибута у <", 1)
+	}
+	if strings.HasPrefix(normalizedMessage, "required child tag is missing inside <") {
+		return strings.Replace(message, "Required child tag is missing inside <", "Не найден обязательный дочерний тег внутри <", 1)
+	}
+	if strings.HasPrefix(normalizedMessage, "required text is missing inside <") {
+		return strings.Replace(message, "Required text is missing inside <", "Не найден обязательный текст внутри <", 1)
+	}
+	if strings.HasPrefix(normalizedMessage, "tag <") && strings.Contains(normalizedMessage, "must contain at least") {
+		remainder := strings.TrimSpace(message[strings.Index(normalizedMessage, "must contain at least")+len("must contain at least"):])
+		return fmt.Sprintf("%s должен содержать как минимум %s", strings.TrimSpace(message[:strings.Index(message, "must contain at least")]), strings.TrimSpace(strings.TrimSuffix(remainder, "matching child elements")))
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "REQUIRED_FILE_MISSING":
+		return "Не найден обязательный файл"
+	case "REQUIRED_STRING_MISSING":
+		return "Не найдено обязательное содержимое"
+	case "REQUIRED_VARIABLE_MISSING":
+		return "Не найдена обязательная переменная"
+	case "REQUIRED_INTERFACE_MISSING":
+		return "Не найден или некорректен обязательный интерфейс"
+	case "REQUIRED_FUNCTION_MISSING":
+		return "Не найдена обязательная функция"
+	case "REQUIRED_METHOD_MISSING":
+		return "Не найдено обязательное использование метода"
+	case "REQUIRED_ROUTE_MISSING":
+		return "Не найден обязательный маршрут"
+	case "REQUIRED_DOCTYPE_MISSING":
+		return "Не найден обязательный doctype"
+	case "REQUIRED_TAG_MISSING":
+		return "Не найден обязательный тег"
+	case "REQUIRED_ATTRIBUTE_MISSING":
+		return "Не найден обязательный атрибут"
+	case "REQUIRED_ATTRIBUTE_VALUE_INVALID":
+		return "У обязательного атрибута некорректное значение"
+	case "REQUIRED_CHILD_MISSING":
+		return "Не найден обязательный дочерний тег"
+	case "REQUIRED_TEXT_MISSING":
+		return "Не найден обязательный текст"
+	case "REQUIRED_MIN_CHILDREN":
+		return "Недостаточно дочерних элементов"
+	case "HTML_DOCUMENT_MISSING":
+		return "HTML документ не найден"
+	case "INVALID_CODE_STRUCTURE":
+		return "Некорректная структура code_structure"
+	case "VALIDATOR_UNAVAILABLE":
+		return "Валидатор недоступен"
+	case "NO_WORKSPACE_FILES":
+		return "Рабочая область пуста"
+	case "NO_SOURCE_FILES":
+		return "Исходные файлы не найдены"
+	case "NO_SOURCE_FILE":
+		return "Файл JavaScript или TypeScript не найден"
+	case "EMPTY_SOURCE_FILE":
+		return "Исходный файл пуст"
+	case "NO_HTML_FILE":
+		return "HTML файл не найден"
+	case "NO_CSS_FILE":
+		return "CSS файл не найден"
+	case "NO_PHP_FILE":
+		return "PHP файл не найден"
+	case "NO_REACT_FILE":
+		return "Файл React не найден"
+	case "REACT_VALIDATION_ERROR":
+		return "Ошибка валидации React"
+	case "TEST_DEFINITION_MISSING":
+		return "Тестовые вопросы не настроены"
+	case "TEST_ANSWERS_INCOMPLETE":
+		return "Нужно ответить на все вопросы теста"
+	case "TEST_DUPLICATE_ANSWER":
+		return "Для одного вопроса можно выбрать только один вариант"
+	case "TEST_ANSWER_MISSING":
+		return "Нужно ответить на вопрос теста"
+	case "TEST_VARIANT_INVALID":
+		return "Выбранный вариант ответа некорректен"
+	case "TEST_VARIANT_INCORRECT":
+		return "Выбран неверный вариант ответа"
+	case "TEST_ORDER_INCORRECT":
+		return "Указан неверный порядок элементов"
+	case "TEST_CLASSIFICATION_INCORRECT":
+		return "Элементы распределены по неверным группам"
+	case "ASSESSMENT_INCORRECT":
+		return "Ответ на задание неверен"
+	case "TEST_ALLOWED_ERRORS_EXCEEDED":
+		return "Количество ошибок превышает допустимый порог"
+	}
+
+	switch normalizedMessage {
+	case "required file is missing":
+		return "Не найден обязательный файл"
+	case "required string is missing":
+		return "Не найдено обязательное содержимое"
+	case "invalid code_structure json":
+		return "Некорректная структура code_structure"
+	case "workspace is empty":
+		return "Рабочая область пуста"
+	case "no source files found":
+		return "Исходные файлы не найдены"
+	case "no javascript or typescript source file found":
+		return "Файл JavaScript или TypeScript не найден"
+	case "react validation error":
+		return "Ошибка валидации React"
+	case "no html file found":
+		return "HTML файл не найден"
+	case "no react source file found":
+		return "Файл React не найден"
+	case "test questions are not configured":
+		return "Тестовые вопросы не настроены"
+	case "answers for all test questions are required":
+		return "Нужно ответить на все вопросы теста"
+	case "only one answer per test question is allowed":
+		return "Для одного вопроса можно выбрать только один вариант"
+	}
+
+	return message
+}
+
+type answerResponse struct {
+	ID            string                `json:"id"`
+	StudentID     string                `json:"student_id"`
+	TaskID        string                `json:"task_id"`
+	FilestorageID *string               `json:"filestorage_id,omitempty"`
+	AnswerPayload json.RawMessage       `json:"answer_payload,omitempty"`
+	StartedAt     time.Time             `json:"started_at"`
+	EndedAt       *time.Time            `json:"ended_at,omitempty"`
+	Status        int                   `json:"status"`
+	Attempt       int                   `json:"attempt"`
+	CreatedAt     time.Time             `json:"created_at"`
+	UpdatedAt     time.Time             `json:"updated_at"`
+	AutoReview    *autoReviewResponse   `json:"auto_review,omitempty"`
+	ManualReview  *manualReviewResponse `json:"manual_review,omitempty"`
+}
+
+type autoReviewResponse struct {
+	ValidatorName string         `json:"validator_name"`
+	AutoScore     *float64       `json:"auto_score,omitempty"`
+	Passed        bool           `json:"passed"`
+	Feedback      *string        `json:"feedback,omitempty"`
+	RawResult     map[string]any `json:"raw_result,omitempty"`
+	CheckedAt     time.Time      `json:"checked_at"`
+}
+
+type manualReviewResponse struct {
+	ReviewerID string    `json:"reviewer_id"`
+	CheckedAt  time.Time `json:"checked_at"`
+	FinalScore *float64  `json:"final_score,omitempty"`
+	Status     int       `json:"status"`
+	Feedback   *string   `json:"feedback,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeDomainError(w http.ResponseWriter, err error) {
+	var lockedErr *answer.TaskLockedError
+	if errors.As(err, &lockedErr) {
+		writeJSON(w, http.StatusConflict, taskLockedResponse{
+			Code:             "TASK_LOCKED",
+			Message:          lockedErr.Error(),
+			RedirectLessonID: lockedErr.RedirectLessonID,
+			RedirectTaskID:   lockedErr.RedirectTaskID,
+		})
+		return
+	}
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, domain.ErrForbidden):
+		http.Error(w, err.Error(), http.StatusForbidden)
+	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrSandboxNotFound):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, domain.ErrInvalidStatus), errors.Is(err, domain.ErrMaxAttempts), errors.Is(err, domain.ErrAnswerNotInProgress), errors.Is(err, domain.ErrAlreadyReviewed), errors.Is(err, domain.ErrValidation):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}

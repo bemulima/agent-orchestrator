@@ -1,0 +1,257 @@
+package domain
+
+import (
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	// SubjectLearningActionClosed is the student-owned action finalization trigger.
+	SubjectLearningActionClosed = "learning_action.closed"
+	// LearningActionClosedSchemaVersion is the current closure payload schema.
+	LearningActionClosedSchemaVersion = 1
+	// LearningActionCodeContextPolicyVersion identifies the bounded, secret-safe
+	// workspace projection exposed to teacher orchestration.
+	LearningActionCodeContextPolicyVersion = "student-learning-action-code-context-v1"
+	SandboxValidationObservationVersion    = "sandbox-validation-observation-v1"
+)
+
+// StudentLearningAction is one immutable work cycle. One answer may own
+// multiple cycles when FAILED or REJECTED activity reopens the answer.
+type StudentLearningAction struct {
+	ID                   string
+	StudentTaskAnswerID  string
+	StudentID            string
+	TaskID               string
+	Cycle                int
+	ContextType          LearningContextType
+	ContextID            string
+	LearningTargets      []LearningTargetRef
+	EvidenceClass        LearningEvidenceClass
+	Outcome              LearningActionOutcome
+	OutcomePolicyVersion string
+	OpenedAt             time.Time
+	ClosedAt             *time.Time
+}
+
+// LearningActionStatus exposes lifecycle only. Objective outcome remains
+// private to the student-owned evidence reducer.
+type LearningActionStatus string
+
+const (
+	LearningActionStatusOpen   LearningActionStatus = "OPEN"
+	LearningActionStatusClosed LearningActionStatus = "CLOSED"
+)
+
+// LearningActionContext is the bounded, safe read projection used by teacher
+// orchestration. It deliberately excludes answer identity and objective result.
+type LearningActionContext struct {
+	LearningActionID string               `json:"learning_action_id"`
+	StudentID        string               `json:"student_id"`
+	TaskID           string               `json:"task_id"`
+	ContextType      LearningContextType  `json:"context_type"`
+	ContextID        string               `json:"context_id"`
+	LearningTargets  []LearningTargetRef  `json:"learning_targets"`
+	Status           LearningActionStatus `json:"status"`
+	OpenedAt         time.Time            `json:"opened_at"`
+}
+
+// LearningActionCodeFile is a bounded text-only workspace file. Sandbox and
+// answer identities, binary content, dependencies, build artifacts, and known
+// secret files are deliberately absent.
+type LearningActionCodeFile struct {
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated"`
+}
+
+type LearningActionValidationObservation struct {
+	Available     bool       `json:"available"`
+	Kind          string     `json:"kind"`
+	Passed        bool       `json:"passed"`
+	IssueCount    int        `json:"issue_count"`
+	CheckedAt     *time.Time `json:"checked_at,omitempty"`
+	PolicyVersion string     `json:"policy_version"`
+}
+
+// LearningActionCodeContext is an ownership-scoped transient Sandbox
+// projection for one open learning action. It contains no validator result.
+type LearningActionCodeContext struct {
+	LearningActionID string                              `json:"learning_action_id"`
+	StudentID        string                              `json:"student_id"`
+	TaskID           string                              `json:"task_id"`
+	Available        bool                                `json:"available"`
+	Files            []LearningActionCodeFile            `json:"files"`
+	OmittedFileCount int                                 `json:"omitted_file_count"`
+	Truncated        bool                                `json:"truncated"`
+	PolicyVersion    string                              `json:"policy_version"`
+	Validation       LearningActionValidationObservation `json:"validation"`
+}
+
+// NewLearningActionCodeContext validates the public size and identity
+// boundary independently from the Sandbox implementation.
+func NewLearningActionCodeContext(input LearningActionCodeContext) (LearningActionCodeContext, error) {
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.Validation.Kind = strings.ToLower(strings.TrimSpace(input.Validation.Kind))
+	input.Validation.PolicyVersion = strings.TrimSpace(input.Validation.PolicyVersion)
+	if input.Validation.CheckedAt != nil {
+		checkedAt := input.Validation.CheckedAt.UTC()
+		input.Validation.CheckedAt = &checkedAt
+	}
+	if !validLearningUUID(input.LearningActionID) || !validLearningUUID(input.StudentID) || !validLearningUUID(input.TaskID) ||
+		input.PolicyVersion != LearningActionCodeContextPolicyVersion || len(input.Files) > 12 ||
+		input.Validation.PolicyVersion != SandboxValidationObservationVersion || !validLearningActionValidation(input.Validation) ||
+		input.OmittedFileCount < 0 || input.OmittedFileCount > 100_000 || (!input.Available && (len(input.Files) != 0 || input.OmittedFileCount != 0 || input.Truncated || input.Validation.Available)) {
+		return LearningActionCodeContext{}, errors.New("invalid learning action code context")
+	}
+	files := make([]LearningActionCodeFile, len(input.Files))
+	seen, totalBytes, hasTruncatedFile := make(map[string]struct{}, len(input.Files)), 0, false
+	for index, file := range input.Files {
+		file.Path = strings.TrimSpace(strings.ReplaceAll(file.Path, "\\", "/"))
+		if file.Path == "" || len(file.Path) > 300 || strings.HasPrefix(file.Path, "/") ||
+			strings.Contains("/"+file.Path+"/", "/../") || strings.ContainsRune(file.Path, '\x00') ||
+			!utf8.ValidString(file.Path) || !utf8.ValidString(file.Content) || strings.ContainsRune(file.Content, '\x00') || len(file.Content) > 16<<10 {
+			return LearningActionCodeContext{}, errors.New("invalid learning action code file")
+		}
+		if _, exists := seen[file.Path]; exists {
+			return LearningActionCodeContext{}, errors.New("duplicate learning action code file")
+		}
+		seen[file.Path] = struct{}{}
+		totalBytes += len(file.Content)
+		hasTruncatedFile = hasTruncatedFile || file.Truncated
+		files[index] = file
+	}
+	if totalBytes > 64<<10 || input.Truncated != (input.OmittedFileCount > 0 || hasTruncatedFile) {
+		return LearningActionCodeContext{}, errors.New("invalid learning action code bounds")
+	}
+	input.Files = files
+	return input, nil
+}
+
+func validLearningActionValidation(input LearningActionValidationObservation) bool {
+	if input.IssueCount < 0 || input.IssueCount > 10_000 {
+		return false
+	}
+	if !input.Available {
+		return input.Kind == "" && !input.Passed && input.IssueCount == 0 && input.CheckedAt == nil
+	}
+	if (input.Kind != "validation" && input.Kind != "tests") || input.CheckedAt == nil {
+		return false
+	}
+	if input.CheckedAt.IsZero() {
+		return false
+	}
+	return true
+}
+
+// NewLearningActionContext projects only trusted action identity, frozen
+// targets, and lifecycle state from the student-owned record.
+func NewLearningActionContext(action StudentLearningAction) (LearningActionContext, error) {
+	action.ID = strings.TrimSpace(action.ID)
+	action.StudentID = strings.TrimSpace(action.StudentID)
+	action.TaskID = strings.TrimSpace(action.TaskID)
+	action.ContextID = strings.TrimSpace(action.ContextID)
+	action.OpenedAt = action.OpenedAt.UTC()
+	if !validLearningUUID(action.ID) || !validLearningUUID(action.StudentID) || !validLearningUUID(action.TaskID) ||
+		!validLearningActionContextType(action.ContextType) || !validLearningValue(action.ContextID, 255) || action.OpenedAt.IsZero() {
+		return LearningActionContext{}, errors.New("invalid learning action context")
+	}
+	if action.ClosedAt != nil {
+		closedAt := action.ClosedAt.UTC()
+		if closedAt.IsZero() || closedAt.Before(action.OpenedAt) {
+			return LearningActionContext{}, errors.New("invalid learning action lifecycle")
+		}
+	}
+	targets, err := NormalizeLearningTargetRefs(action.LearningTargets)
+	if err != nil {
+		return LearningActionContext{}, err
+	}
+	status := LearningActionStatusOpen
+	if action.ClosedAt != nil {
+		status = LearningActionStatusClosed
+	}
+	return LearningActionContext{
+		LearningActionID: action.ID,
+		StudentID:        action.StudentID,
+		TaskID:           action.TaskID,
+		ContextType:      action.ContextType,
+		ContextID:        action.ContextID,
+		LearningTargets:  targets,
+		Status:           status,
+		OpenedAt:         action.OpenedAt,
+	}, nil
+}
+
+// LearningActionClosedEventData intentionally excludes objective outcome,
+// score, confidence, and mastery. Student keeps those facts locally.
+type LearningActionClosedEventData struct {
+	LearningActionID string              `json:"learning_action_id"`
+	ContextType      LearningContextType `json:"context_type"`
+	ContextID        string              `json:"context_id"`
+	LearningTargets  []LearningTargetRef `json:"learning_targets"`
+}
+
+// NewStudentLearningAction validates one open cycle and freezes target order.
+func NewStudentLearningAction(input StudentLearningAction) (StudentLearningAction, error) {
+	return normalizeStudentLearningAction(input, true)
+}
+
+func normalizeStudentLearningAction(input StudentLearningAction, requireEvidenceClass bool) (StudentLearningAction, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	input.StudentTaskAnswerID = strings.TrimSpace(input.StudentTaskAnswerID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	input.OpenedAt = input.OpenedAt.UTC()
+	if !validLearningUUID(input.ID) || !validLearningUUID(input.StudentTaskAnswerID) ||
+		input.ID == input.StudentTaskAnswerID || !validLearningUUID(input.StudentID) ||
+		!validLearningUUID(input.TaskID) || !validLearningContextType(input.ContextType) ||
+		!validLearningValue(input.ContextID, 255) || input.OpenedAt.IsZero() || input.ClosedAt != nil || input.Cycle < 0 ||
+		input.Outcome != "" || strings.TrimSpace(input.OutcomePolicyVersion) != "" {
+		return StudentLearningAction{}, errors.New("invalid student learning action")
+	}
+	targets, err := NormalizeLearningTargetRefs(input.LearningTargets)
+	if err != nil {
+		return StudentLearningAction{}, err
+	}
+	if requireEvidenceClass && !IsLearningEvidenceClass(input.EvidenceClass) {
+		return StudentLearningAction{}, errors.New("learning action evidence class is required")
+	}
+	if input.EvidenceClass != "" && !IsLearningEvidenceClass(input.EvidenceClass) {
+		return StudentLearningAction{}, errors.New("invalid learning action evidence class")
+	}
+	input.LearningTargets = targets
+	return input, nil
+}
+
+// NewLearningActionClosedEvent creates the trigger consumed by teacher-agent.
+func NewLearningActionClosedEvent(eventID string, action StudentLearningAction, closedAt time.Time) (IntegrationEvent, error) {
+	normalized, err := normalizeStudentLearningAction(action, false)
+	if err != nil {
+		return IntegrationEvent{}, err
+	}
+	closedAt = closedAt.UTC()
+	if closedAt.IsZero() || closedAt.Before(normalized.OpenedAt) {
+		return IntegrationEvent{}, errors.New("invalid learning action closure time")
+	}
+	return NewIntegrationEvent(
+		eventID,
+		SubjectLearningActionClosed,
+		normalized.ID,
+		normalized.StudentTaskAnswerID,
+		normalized.StudentID,
+		closedAt,
+		LearningActionClosedSchemaVersion,
+		LearningActionClosedEventData{
+			LearningActionID: normalized.ID,
+			ContextType:      normalized.ContextType,
+			ContextID:        normalized.ContextID,
+			LearningTargets:  normalized.LearningTargets,
+		},
+	)
+}

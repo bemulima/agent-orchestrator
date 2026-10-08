@@ -1,0 +1,187 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/jackc/pgx/v5"
+)
+
+type nextActionRow struct {
+	values []any
+	err    error
+}
+
+func (r nextActionRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) != len(r.values) {
+		return fmt.Errorf("scan count %d, want %d", len(dest), len(r.values))
+	}
+	for i, v := range r.values {
+		reflect.ValueOf(dest[i]).Elem().Set(reflect.ValueOf(v))
+	}
+	return nil
+}
+
+type nextActionRows struct {
+	pgx.Rows
+	values [][]any
+	index  int
+}
+
+func (r *nextActionRows) Next() bool { r.index++; return r.index <= len(r.values) }
+func (r *nextActionRows) Scan(dest ...any) error {
+	return (nextActionRow{values: r.values[r.index-1]}).Scan(dest...)
+}
+func (r *nextActionRows) Close()     {}
+func (r *nextActionRows) Err() error { return nil }
+
+type nextActionSnapshotFixture struct {
+	student, path   string
+	status          domain.LearningPathStatus
+	facts           []any
+	instances       []string
+	missingSelected bool
+	answers         [][]any
+	correlated      bool
+	t               *testing.T
+}
+
+func (f nextActionSnapshotFixture) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	f.t.Helper()
+	if len(args) == 0 || args[0] != f.student {
+		f.t.Fatalf("snapshot query is not owner scoped: %s %v", sql, args)
+	}
+	now := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+	switch {
+	case strings.Contains(sql, "FROM student_learning_context"):
+		if f.path == "" {
+			return nextActionRow{err: pgx.ErrNoRows}
+		}
+		return nextActionRow{values: []any{f.student, f.path, int64(7), now}}
+	case strings.Contains(sql, "FROM student_learning_path WHERE") && len(args) == 2:
+		if f.missingSelected {
+			return nextActionRow{err: pgx.ErrNoRows}
+		}
+		if len(args) != 2 || args[1] != f.path {
+			f.t.Fatalf("wrong selected path: %v", args)
+		}
+		return nextActionRow{values: []any{f.path, f.student, "33333333-3333-4333-8333-333333333333", "go.backend", "r10", domain.LearningPathPolicyVersion, "planner-v1", "planned", "Learn Go", f.status, false, int64(9), now, now}}
+	case strings.Contains(sql, "FROM student_learning_action"):
+		instance := args[1].(string)
+		var opened *time.Time
+		lifecycle := domain.PracticeLearningActionReserved
+		if instance == f.instances[0] {
+			opened = &now
+			lifecycle = domain.PracticeLearningActionOpen
+		}
+		path, item, requirement, version := "", "", "", int64(0)
+		if f.correlated {
+			path = "11111111-1111-4111-8111-111111111111"
+			item = "99999999-9999-4999-8999-999999999999"
+			requirement = "66666666-6666-4666-8666-666666666666"
+			version = 9
+		}
+		return nextActionRow{values: []any{"44444444-4444-4444-8444-444444444444", f.student, instance, "55555555-5555-4555-8555-555555555555", "sha256:" + strings.Repeat("a", 64), "practice", []byte(`[{"type":"concept","key":"go.test","version":"v1"}]`), lifecycle, path, version, 0, opened, (*time.Time)(nil), "", "hash", item, requirement}}
+	case strings.Contains(sql, "SELECT i.frozen_requirements"):
+		return nextActionRow{values: []any{[]byte(`[{"requirement_id":"66666666-6666-4666-8666-666666666666","activity_id":"77777777-7777-4777-8777-777777777777","type":"practice_completed","required":false,"source_reference":{"id":"55555555-5555-4555-8555-555555555555","revision_id":"55555555-5555-4555-8555-555555555555"},"satisfied":false}]`)}}
+	default:
+		return nextActionRow{values: f.facts}
+	}
+}
+
+func TestNextActionSnapshotRetainsOptionalBindingRequirementWithoutSelectedPath(t *testing.T) {
+	f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", facts: []any{true, false, false, false, true, false}, instances: []string{"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}, correlated: true}
+	s, err := readNextActionSnapshot(context.Background(), f, f.student)
+	if err != nil || len(s.Bindings) != 1 || len(s.BindingRequirements) != 1 || domain.RequiredNextActionBinding(s, s.Bindings[0]) {
+		t.Fatalf("lost authoritative optional binding facts: %+v err=%v", s, err)
+	}
+}
+func (f nextActionSnapshotFixture) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	switch {
+	case strings.Contains(sql, "FROM student_task_answer"):
+		if len(args) != 2 || args[0] != f.student || args[1] != f.path {
+			f.t.Fatalf("wrong answer ownership: %v", args)
+		}
+		return &nextActionRows{values: f.answers}, nil
+	case strings.Contains(sql, "FROM student_learning_path_item"):
+		if len(args) != 1 || args[0] != f.path {
+			f.t.Fatalf("wrong item path: %v", args)
+		}
+		requirements := []byte(`[{"requirement_id":"66666666-6666-4666-8666-666666666666","activity_id":"77777777-7777-4777-8777-777777777777","type":"theory_acknowledged","required":true,"source_reference":{"id":"88888888-8888-4888-8888-888888888888"},"satisfied":true}]`)
+		return &nextActionRows{values: [][]any{{"lesson", "88888888-8888-4888-8888-888888888888", 0, domain.LearningPathItemCompleted, []byte(`[]`), "lesson_requirements_satisfied", "99999999-9999-4999-8999-999999999999", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requirements, []byte(`{"title":"frozen"}`)}}}, nil
+	case strings.Contains(sql, "FROM student_learning_action"):
+		if len(args) != 1 || args[0] != f.student {
+			f.t.Fatalf("wrong binding owner: %v", args)
+		}
+		rows := &nextActionRows{}
+		for _, id := range f.instances {
+			rows.values = append(rows.values, []any{id})
+		}
+		return rows, nil
+	default:
+		return nil, fmt.Errorf("unexpected query: %s", sql)
+	}
+}
+
+func TestNextActionSnapshotCarriesOnlyExactCorrelatedOfficialAttempts(t *testing.T) {
+	f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", path: "11111111-1111-4111-8111-111111111111", status: domain.LearningPathStatusActive,
+		answers: [][]any{{"99999999-9999-4999-8999-999999999999", "66666666-6666-4666-8666-666666666666", "dddddddd-dddd-4ddd-8ddd-dddddddddddd", domain.StudentTaskAnswerStatusUnderReview}}}
+	s, err := readNextActionSnapshot(context.Background(), f, f.student)
+	if err != nil || len(s.Answers) != 1 || s.Answers[0].Status != domain.StudentTaskAnswerStatusUnderReview || s.Answers[0].RequirementID != "66666666-6666-4666-8666-666666666666" {
+		t.Fatalf("lost official correlated attempt: %+v err=%v", s, err)
+	}
+}
+func TestNextActionSnapshotReadsCompletedSelectedPathAndFrozenFacts(t *testing.T) {
+	f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", path: "11111111-1111-4111-8111-111111111111", status: domain.LearningPathStatusCompleted}
+	s, err := readNextActionSnapshot(context.Background(), f, f.student)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Context.Version != 7 || s.SelectedPath == nil || s.SelectedPath.Version != 9 || s.SelectedPath.Status != domain.LearningPathStatusCompleted || !s.SelectedPath.Items[0].FrozenRequirements[0].Satisfied {
+		t.Fatalf("snapshot lost authoritative facts: %+v", s)
+	}
+}
+func TestNextActionSnapshotRejectsMissingSelectedOwnerPath(t *testing.T) {
+	f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", path: "11111111-1111-4111-8111-111111111111", missingSelected: true}
+	if _, err := readNextActionSnapshot(context.Background(), f, f.student); !errors.Is(err, domain.ErrStateChanged) {
+		t.Fatalf("missing selected path accepted: %v", err)
+	}
+}
+func TestNextActionSnapshotNoSelectionLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		facts []any
+		want  string
+	}{
+		{"onboarding", []any{false, false, false, false, false, false}, "onboarding_required"},
+		{"planning", []any{true, false, true, false, false, false}, "planning_in_progress"},
+		{"diagnostic", []any{true, false, false, true, false, false}, "diagnostic_required"},
+		{"selection", []any{true, false, false, false, true, true}, "path_selection_required"},
+		{"completed", []any{true, false, false, false, false, true}, "path_completed"},
+		{"needs_plan", []any{true, false, false, false, false, false}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", facts: tc.facts}
+			s, err := readNextActionSnapshot(context.Background(), f, f.student)
+			if err != nil || s.LifecycleReason != tc.want || s.SelectedPath != nil {
+				t.Fatalf("lifecycle=%+v err=%v", s, err)
+			}
+		})
+	}
+}
+func TestNextActionSnapshotRetainsAllOwnedActiveBindings(t *testing.T) {
+	f := nextActionSnapshotFixture{t: t, student: "22222222-2222-4222-8222-222222222222", facts: []any{true, false, false, false, false, false}, instances: []string{"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}}
+	s, err := readNextActionSnapshot(context.Background(), f, f.student)
+	if err != nil || len(s.Bindings) != 2 || s.Bindings[0].LifecycleStatus != domain.PracticeLearningActionOpen || s.Bindings[1].LifecycleStatus != domain.PracticeLearningActionReserved {
+		t.Fatalf("lost active binding: %+v err=%v", s, err)
+	}
+}

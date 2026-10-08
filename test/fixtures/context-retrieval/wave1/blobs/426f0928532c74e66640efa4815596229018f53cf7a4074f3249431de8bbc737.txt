@@ -1,0 +1,261 @@
+package courseclient
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+type deniedDiagnosticAssignment struct{}
+
+func (deniedDiagnosticAssignment) CanAccessCourse(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+const catalogCourseID = "11111111-1111-4111-8111-111111111111"
+
+func diagnosticCatalogPayload() map[string]any {
+	p := map[string]any{"schema": "course-diagnostic-assessment-catalog.v1", "course_id": catalogCourseID, "curriculum_revision": "sha256:" + strings.Repeat("a", 64)}
+	lessons := make([]any, 0, 3)
+	for i := 0; i < 3; i++ {
+		lessonID := "22222222-2222-4222-8222-22222222222" + string(rune('0'+i))
+		lessons = append(lessons, map[string]any{"id": lessonID, "course_id": catalogCourseID, "status": 1, "order": i, "tasks": []any{map[string]any{"id": "33333333-3333-4333-8333-33333333333" + string(rune('0'+i)), "lesson_id": lessonID, "type": 11, "assessment_purpose": "diagnostic", "evaluation_mode": "AUTO", "version": 1, "status": 1, "updated_at": "2026-01-02T00:00:00Z", "order": i, "learning_targets": []any{map[string]any{"type": "concept", "key": "go.syntax", "version": "v1"}}}}})
+	}
+	p["lessons"] = lessons
+	return p
+}
+
+func TestDiagnosticCatalogValidExactNestedCourseProjection(t *testing.T) {
+	payload := diagnosticCatalogPayload()
+	body, _ := json.Marshal(payload)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != "catalog-token" {
+			t.Errorf("token missing")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	got, err := (DiagnosticCatalogClient{BaseURL: server.URL, InternalToken: "catalog-token", HTTPClient: server.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+	if err != nil || got.Schema != "course-diagnostic-assessment-catalog.v1" || got.CourseID != catalogCourseID || len(got.Items) != 3 || got.Items[0].AssessmentPurpose != "diagnostic" || got.Items[0].Type != 11 {
+		t.Fatalf("catalog=%+v err=%v", got, err)
+	}
+}
+
+func TestDiagnosticCatalogRejectsMalformedNestedSchemaAndBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"schema", func(p map[string]any) { p["schema"] = "other" }}, {"course", func(p map[string]any) { p["course_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }}, {"revision", func(p map[string]any) { p["curriculum_revision"] = "sha256:ABC" }},
+		{"empty", func(p map[string]any) { p["lessons"] = []any{} }}, {"negative order", func(p map[string]any) { p["lessons"].([]any)[0].(map[string]any)["order"] = -1 }}, {"wrong status", func(p map[string]any) { p["lessons"].([]any)[0].(map[string]any)["status"] = 0 }},
+		{"wrong purpose", func(p map[string]any) {
+			p["lessons"].([]any)[0].(map[string]any)["tasks"].([]any)[0].(map[string]any)["assessment_purpose"] = "practice"
+		}}, {"wrong type", func(p map[string]any) {
+			p["lessons"].([]any)[0].(map[string]any)["tasks"].([]any)[0].(map[string]any)["type"] = 1
+		}},
+		{"wrong evaluation mode", func(p map[string]any) {
+			p["lessons"].([]any)[0].(map[string]any)["tasks"].([]any)[0].(map[string]any)["evaluation_mode"] = "MANUAL"
+		}}, {"wrong evaluation mode type", func(p map[string]any) {
+			p["lessons"].([]any)[0].(map[string]any)["tasks"].([]any)[0].(map[string]any)["evaluation_mode"] = 1
+		}},
+		{"unknown", func(p map[string]any) { p["private_answer_key"] = "secret" }},
+	}
+	for _, tc := range tests {
+		p := diagnosticCatalogPayload()
+		tc.mutate(p)
+		body, _ := json.Marshal(p)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		}))
+		_, err := (DiagnosticCatalogClient{BaseURL: server.URL, InternalToken: "x", HTTPClient: server.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+		server.Close()
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Errorf("%s err=%v", tc.name, err)
+		}
+	}
+	duplicate := diagnosticCatalogPayload()
+	duplicate["lessons"].([]any)[1].(map[string]any)["tasks"].([]any)[0].(map[string]any)["id"] = duplicate["lessons"].([]any)[0].(map[string]any)["tasks"].([]any)[0].(map[string]any)["id"]
+	body, _ := json.Marshal(duplicate)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	_, err := (DiagnosticCatalogClient{BaseURL: server.URL, InternalToken: "x", HTTPClient: server.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+	server.Close()
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("duplicate err=%v", err)
+	}
+	tooMany := diagnosticCatalogPayload()
+	items := tooMany["lessons"].([]any)
+	for i := 0; i < 501; i++ {
+		items = append(items, items[0])
+	}
+	tooMany["lessons"] = items
+	body, _ = json.Marshal(tooMany)
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	_, err = (DiagnosticCatalogClient{BaseURL: server.URL, InternalToken: "x", HTTPClient: server.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+	server.Close()
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("too many err=%v", err)
+	}
+}
+
+func TestDiagnosticCatalogRejectsMediaTrailingAndOversize(t *testing.T) {
+	for _, tc := range []struct{ name, media, body string }{{"media", "text/plain", `{}`}, {"trailing", "application/json", string(mustJSON(diagnosticCatalogPayload())) + " {}"}, {"oversize", "application/json", strings.Repeat("x", (1<<20)+1)}} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", tc.media)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		_, err := (DiagnosticCatalogClient{BaseURL: server.URL, InternalToken: "x", HTTPClient: server.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+		server.Close()
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Errorf("%s err=%v", tc.name, err)
+		}
+	}
+}
+func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+func TestGetTaskRedirectNeverContactsTargetOrForwardsInternalToken(t *testing.T) {
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		if r.Header.Get("X-Internal-Token") != "" {
+			t.Errorf("token forwarded")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/internal/task/get-internal-task/"+r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:], http.StatusFound)
+	}))
+	defer source.Close()
+	_, err := (Client{BaseURL: source.URL, InternalToken: "secret", HTTPClient: source.Client()}).GetTask(context.Background(), "task-id")
+	if err == nil || targetCalls.Load() != 0 {
+		t.Fatalf("redirect err=%v target_calls=%d", err, targetCalls.Load())
+	}
+}
+
+func TestDiagnosticCatalogRedirectNeverContactsTargetOrForwardsToken(t *testing.T) {
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		if r.Header.Get("X-Internal-Token") != "" {
+			t.Errorf("catalog token forwarded to redirect target")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/catalog", http.StatusFound)
+	}))
+	defer source.Close()
+	_, err := (DiagnosticCatalogClient{BaseURL: source.URL, InternalToken: "catalog-secret", HTTPClient: source.Client()}).GetDiagnosticAssessmentCatalog(context.Background(), catalogCourseID)
+	if err == nil || targetCalls.Load() != 0 {
+		t.Fatalf("catalog redirect err=%v target_calls=%d", err, targetCalls.Load())
+	}
+}
+
+func TestDiagnosticCatalogRejectsNonCanonicalRequestedCourseID(t *testing.T) {
+	if _, err := (DiagnosticCatalogClient{BaseURL: "http://127.0.0.1", InternalToken: "x"}).GetDiagnosticAssessmentCatalog(context.Background(), " "+catalogCourseID); err == nil {
+		t.Fatal("whitespace course ID accepted")
+	}
+}
+
+func TestDiagnosticTaskBypassesOnlyPublicAssignmentGate(t *testing.T) {
+	taskID := "33333333-3333-4333-8333-333333333333"
+	lessonID := "22222222-2222-4222-8222-222222222222"
+	var publicCalls, internalCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/task/get/") {
+			publicCalls.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/internal/task/get-internal-task/") {
+			internalCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"` + taskID + `","lesson_id":"` + lessonID + `","course_id":"` + catalogCourseID + `","status":1,"type":11,"evaluation_mode":"AUTO","assessment_purpose":"diagnostic","version":1,"updated_at":"2026-01-02T00:00:00Z","learning_targets":[{"type":"concept","key":"go.syntax","version":"v1"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "ordinary", HTTPClient: server.Client(), AssignmentAccess: deniedDiagnosticAssignment{}}
+	ctx := answer.WithPublicContentAccessAudience(context.Background(), "", "11111111-1111-4111-8111-111111111111", "STUDENT")
+	if _, err := client.GetTask(ctx, taskID); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("ordinary err=%v internal=%d", err, internalCalls.Load())
+	}
+	if _, err := client.GetDiagnosticTask(ctx, taskID); err != nil || publicCalls.Load() != 1 || internalCalls.Load() != 2 {
+		t.Fatalf("diagnostic err=%v public=%d internal=%d", err, publicCalls.Load(), internalCalls.Load())
+	}
+}
+
+func TestDiagnosticTaskAcceptsKnownCoursePrivateProjectionAndResolvesCourseFromLesson(t *testing.T) {
+	taskID := "33333333-3333-4333-8333-333333333333"
+	lessonID := "22222222-2222-4222-8222-222222222222"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/internal/task/get-internal-task/" + taskID:
+			_, _ = w.Write([]byte(`{"id":"` + taskID + `","lesson_id":"` + lessonID + `","title":"Diagnostic","description":"","translations":[],"learning_targets":[{"type":"concept","key":"go.syntax","version":"v1"}],"code_structure_type_id":"00000000-0000-0000-0000-00000000f900","code_structure_type_code":"TEST_SINGLE_CHOICE_BASIC","code_structure":{"test":{"mode":"single_choice"}},"compose_config":null,"type":11,"assessment_purpose":"diagnostic","task_kind":"test","execution_mode":"NO_RUN","evaluation_mode":"AUTO","ui_mode":"QUIZ","submission_mode":"ANSWER_PAYLOAD","requires_sandbox":false,"exposes_preview":false,"exposes_terminal":false,"supports_live_validation":false,"allowed_errors_count":0,"order":0,"status":1,"version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","tests":[{"id":"44444444-4444-4444-8444-444444444444","source_key":"diagnostic.question","task_id":"` + taskID + `","kind":"single_choice","title":"Question","description":"","translations":[],"order":1,"variants":[{"id":"55555555-5555-4555-8555-555555555555","source_key":"diagnostic.answer","task_test_id":"44444444-4444-4444-8444-444444444444","text":"Answer","is_correct":true,"translations":[],"order":1},{"id":"66666666-6666-4666-8666-666666666666","source_key":"diagnostic.wrong","task_test_id":"44444444-4444-4444-8444-444444444444","text":"Wrong","is_correct":false,"translations":[],"order":2}]}]}`))
+		case "/internal/lesson/get-internal-lesson/" + lessonID:
+			_, _ = w.Write([]byte(`{"id":"` + lessonID + `","course_id":"` + catalogCourseID + `","title":"Lesson","excerpt":"","description":"","order":0,"status":1}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	task, err := (Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}).GetDiagnosticTask(context.Background(), taskID)
+	if err != nil || task == nil || task.CourseID != catalogCourseID || len(task.Tests) != 1 || len(task.Tests[0].Variants) != 2 {
+		t.Fatalf("diagnostic task = %#v, err=%v", task, err)
+	}
+}
+
+func TestDiagnosticTaskFailsClosedOnUnsafeWire(t *testing.T) {
+	taskID := "33333333-3333-4333-8333-333333333333"
+	lessonID := "22222222-2222-4222-8222-222222222222"
+	valid := `{"id":"` + taskID + `","lesson_id":"` + lessonID + `","course_id":"` + catalogCourseID + `","status":1,"type":11,"evaluation_mode":"AUTO","assessment_purpose":"diagnostic","version":1,"updated_at":"2026-01-02T00:00:00Z","learning_targets":[{"type":"concept","key":"go.syntax","version":"v1"}]}`
+	for _, tc := range []struct {
+		name, media, body string
+		status            int
+	}{
+		{"media", "text/plain", valid, http.StatusOK}, {"unknown", "application/json", valid[:len(valid)-1] + `,"private":"x"}`, http.StatusOK},
+		{"trailing", "application/json", valid + ` {}`, http.StatusOK}, {"manual", "application/json", strings.Replace(valid, `"AUTO"`, `"MANUAL"`, 1), http.StatusOK}, {"created", "application/json", valid, http.StatusCreated}, {"no content", "application/json", valid, http.StatusNoContent}, {"redirect", "application/json", "", http.StatusFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.media)
+				if tc.status == http.StatusFound {
+					w.Header().Set("Location", "http://example.invalid")
+					w.WriteHeader(tc.status)
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			if _, err := (Client{BaseURL: server.URL, InternalToken: "x", HTTPClient: server.Client()}).GetDiagnosticTask(context.Background(), taskID); err == nil {
+				t.Fatal("unsafe diagnostic task accepted")
+			}
+		})
+	}
+	if _, err := (Client{BaseURL: "http://127.0.0.1", InternalToken: "x"}).GetDiagnosticTask(context.Background(), " "+taskID); err == nil {
+		t.Fatal("noncanonical task ID accepted")
+	}
+	if _, err := (Client{BaseURL: "http://127.0.0.1"}).GetDiagnosticTask(context.Background(), taskID); err == nil {
+		t.Fatal("empty diagnostic token accepted")
+	}
+}

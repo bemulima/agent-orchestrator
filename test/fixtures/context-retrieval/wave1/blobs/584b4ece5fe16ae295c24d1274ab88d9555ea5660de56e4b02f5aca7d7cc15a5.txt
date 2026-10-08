@@ -1,0 +1,93 @@
+package internalapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"github.com/example/ms-student-service/internal/domain"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+type hybridApplicationCapture struct {
+	calls int
+	err   error
+}
+
+func (c *hybridApplicationCapture) Apply(_ context.Context, _ string, _ string, p domain.HybridConsequence) (domain.HybridApplicationReceipt, error) {
+	c.calls++
+	return domain.HybridApplicationReceipt{ConsequenceID: p.ConsequenceID, LearningPathID: p.LearningPathID, Status: domain.HybridApplicationNoChange}, c.err
+}
+func hybridHTTPConsequence() domain.HybridConsequence {
+	sid, pid := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	ref := "sha256:" + strings.Repeat("a", 64)
+	scope := domain.HybridScopeIdentity{GoalCode: "go.backend", DirectionCode: "backend", DesiredStacks: []string{"go"}}
+	return domain.HybridConsequence{Schema: domain.HybridConsequenceSchema, ConsequenceID: domain.HybridConsequenceID(sid, pid, ref, domain.HybridReplanPolicyVersion), StudentID: sid, LearningPathID: pid, ExpectedPathRevision: 3, SnapshotRef: ref, SnapshotTargets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.values", Version: "1"}}, PolicyVersion: domain.HybridReplanPolicyVersion, PolicyInputHash: "sha256:" + strings.Repeat("b", 64), Outcome: domain.HybridOutcomeNoChange, ReasonCodes: []string{"NO_SIGNIFICANT_CHANGE"}, BaselineScope: scope, DesiredScope: scope, Mutations: []domain.HybridFutureMutation{}}
+}
+func TestHybridApplicationPlannerOnlyAndStrictMalformedPrivacy(t *testing.T) {
+	c := hybridHTTPConsequence()
+	raw, _ := json.Marshal(c)
+	url := "/v1/students/" + c.StudentID + "/learning-paths/" + c.LearningPathID + "/hybrid-consequences"
+	for _, token := range []string{"planner", "general", "teacher", ""} {
+		t.Run(token, func(t *testing.T) {
+			capture := &hybridApplicationCapture{}
+			router := NewRouter(&Handler{HybridApplication: capture}, "general", "planner", "teacher")
+			req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(string(raw)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Internal-Token", token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if token == "planner" {
+				if w.Code != 200 || capture.calls != 1 {
+					t.Fatalf("plannerstatus%d", w.Code)
+				}
+			} else if w.Code != http.StatusForbidden || capture.calls != 0 {
+				t.Fatalf("wrong token admitted status%d calls%d", w.Code, capture.calls)
+			}
+		})
+	}
+	var fields map[string]any
+	json.Unmarshal(raw, &fields)
+	cases := map[string]string{"duplicate": `{"schema":"x",` + string(raw[1:]), "case": strings.Replace(string(raw), `"schema":`, `"Schema":`, 1), "trailing": string(raw) + ` {}`, "private": strings.Replace(string(raw), `"schema":`, `"raw_evidence":"PRIVATE_CANARY","schema":`, 1), "null": strings.Replace(string(raw), `"mutations":[]`, `"mutations":null`, 1), "nested duplicate": strings.Replace(string(raw), `"goal_code":"go.backend"`, `"goal_code":"go.backend","goal_code":"go.backend"`, 1), "oversized": strings.Repeat(" ", domain.MaximumPlanningSnapshotRequestBytes+1)}
+	delete(fields, "expected_path_revision")
+	missing, _ := json.Marshal(fields)
+	cases["missing"] = string(missing)
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			capture := &hybridApplicationCapture{}
+			router := NewRouter(&Handler{HybridApplication: capture}, "general", "planner", "teacher")
+			req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Internal-Token", "planner")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != 400 || capture.calls != 0 || strings.Contains(w.Body.String(), "PRIVATE_CANARY") {
+				t.Fatalf("malformed admitted status%d calls%d body%s", w.Code, capture.calls, w.Body.String())
+			}
+		})
+	}
+}
+func TestHybridApplicationTypedConflictCodes(t *testing.T) {
+	c := hybridHTTPConsequence()
+	raw, _ := json.Marshal(c)
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{{domain.ErrHybridStale, 409, "HYBRID_STALE"}, {domain.ErrHybridIntentRequired, 409, "HYBRID_INTENT_REQUIRED"}, {domain.ErrHybridUnsafe, 409, "HYBRID_UNSAFE"}, {domain.ErrHybridConflict, 409, "HYBRID_CONFLICT"}, {domain.ErrHybridUnsupported, 422, "HYBRID_UNSUPPORTED"}, {errors.New("PRIVATE_DATABASE_CANARY"), 500, "HYBRID_UNAVAILABLE"}} {
+		t.Run(tc.code, func(t *testing.T) {
+			capture := &hybridApplicationCapture{err: tc.err}
+			router := NewRouter(&Handler{HybridApplication: capture}, "general", "planner")
+			req := httptest.NewRequest("POST", "/v1/students/"+c.StudentID+"/learning-paths/"+c.LearningPathID+"/hybrid-consequences", strings.NewReader(string(raw)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Internal-Token", "planner")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.status || !strings.Contains(w.Body.String(), tc.code) || strings.Contains(w.Body.String(), "PRIVATE_DATABASE_CANARY") {
+				t.Fatalf("typederr status%d body%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}

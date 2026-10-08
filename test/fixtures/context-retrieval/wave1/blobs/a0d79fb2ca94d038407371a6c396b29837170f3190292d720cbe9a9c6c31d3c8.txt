@@ -1,0 +1,195 @@
+package task
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+)
+
+// InternalCourseStructureResponse returns ordered lessons/tasks for one course.
+type InternalCourseStructureResponse struct {
+	CourseID           string                          `json:"course_id"`
+	CurriculumRevision string                          `json:"curriculum_revision"`
+	Lessons            []InternalCourseStructureLesson `json:"lessons"`
+}
+
+const DiagnosticAssessmentCatalogSchema = "course-diagnostic-assessment-catalog.v1"
+
+type InternalDiagnosticAssessmentCatalogResponse struct {
+	Schema             string                          `json:"schema"`
+	CourseID           string                          `json:"course_id"`
+	CurriculumRevision string                          `json:"curriculum_revision"`
+	Lessons            []InternalCourseStructureLesson `json:"lessons"`
+}
+
+// InternalCourseStructureLesson represents one lesson in internal structure payload.
+type InternalCourseStructureLesson struct {
+	ID          string                        `json:"id"`
+	CourseID    string                        `json:"course_id"`
+	SectionID   string                        `json:"section_id"`
+	Title       string                        `json:"title"`
+	Description string                        `json:"description"`
+	Order       int                           `json:"order"`
+	Status      int                           `json:"status"`
+	UpdatedAt   string                        `json:"updated_at"`
+	Tasks       []InternalCourseStructureTask `json:"tasks"`
+}
+
+// InternalCourseStructureTask represents one task in internal structure payload.
+type InternalCourseStructureTask struct {
+	ID                string                          `json:"id"`
+	LessonID          string                          `json:"lesson_id"`
+	Title             string                          `json:"title"`
+	Description       string                          `json:"description"`
+	Type              int16                           `json:"type"`
+	AssessmentPurpose string                          `json:"assessment_purpose"`
+	EvaluationMode    string                          `json:"evaluation_mode"`
+	Order             int                             `json:"order"`
+	Status            int                             `json:"status"`
+	LearningTargets   []InternalCourseStructureTarget `json:"learning_targets"`
+	UpdatedAt         string                          `json:"updated_at"`
+	Version           int                             `json:"version"`
+}
+
+type InternalCourseStructureTarget struct {
+	Type    string `json:"type"`
+	Key     string `json:"key"`
+	Version string `json:"version,omitempty"`
+}
+
+// GetInternalCourseStructure loads lessons/tasks for one course.
+type GetInternalCourseStructure struct {
+	Lessons interface {
+		ListByCourse(ctx context.Context, courseID string) ([]domain.Lesson, error)
+	}
+	Tasks lessonTaskLister
+}
+
+// Handle returns course structure for internal consumers.
+func (uc GetInternalCourseStructure) Handle(ctx context.Context, courseID string) (*InternalCourseStructureResponse, error) {
+	courseID = strings.TrimSpace(courseID)
+	if courseID == "" || uc.Lessons == nil || uc.Tasks == nil {
+		return nil, domain.ErrValidation
+	}
+	lessons, err := uc.Lessons.ListByCourse(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
+
+	// ListByCourse is authoritative for course/module/section/lesson order.
+	// Lesson.Order is scoped to its section; globally sorting it here would
+	// move later sections' first lessons ahead of earlier sections.
+	response := &InternalCourseStructureResponse{
+		CourseID: courseID,
+		Lessons:  make([]InternalCourseStructureLesson, 0, len(lessons)),
+	}
+
+	for _, lesson := range lessons {
+		tasks, err := uc.Tasks.ListByLesson(ctx, lesson.ID)
+		if err != nil {
+			return nil, err
+		}
+		sort.SliceStable(tasks, func(left, right int) bool {
+			if tasks[left].Order == tasks[right].Order {
+				return tasks[left].ID < tasks[right].ID
+			}
+			return tasks[left].Order < tasks[right].Order
+		})
+
+		lessonItem := InternalCourseStructureLesson{
+			ID:          lesson.ID,
+			CourseID:    courseID,
+			SectionID:   lesson.SectionID,
+			Title:       lesson.Title,
+			Description: lesson.Description,
+			Order:       lesson.Order,
+			Status:      lesson.Status,
+			UpdatedAt:   lesson.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			Tasks:       make([]InternalCourseStructureTask, 0, len(tasks)),
+		}
+
+		for _, taskItem := range tasks {
+			targets := make([]InternalCourseStructureTarget, 0, len(taskItem.LearningTargets))
+			for _, target := range taskItem.LearningTargets {
+				targets = append(targets, InternalCourseStructureTarget{Type: string(target.Type), Key: target.Key, Version: target.Version})
+			}
+			lessonItem.Tasks = append(lessonItem.Tasks, InternalCourseStructureTask{
+				ID:                taskItem.ID,
+				LessonID:          taskItem.LessonID,
+				Title:             taskItem.Title,
+				Description:       taskItem.Description,
+				Type:              taskItem.Type,
+				AssessmentPurpose: domain.AssessmentPurposeValue(taskItem.AssessmentPurpose),
+				EvaluationMode:    domain.TaskEvaluationModeName(taskItem.EvaluationMode),
+				Order:             taskItem.Order,
+				Status:            taskItem.Status,
+				LearningTargets:   targets,
+				UpdatedAt:         taskItem.UpdatedAt.UTC().Format(time.RFC3339Nano),
+				Version:           taskItem.Version,
+			})
+		}
+
+		response.Lessons = append(response.Lessons, lessonItem)
+	}
+	revisionPayload, err := json.Marshal(response.Lessons)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(revisionPayload)
+	response.CurriculumRevision = "sha256:" + hex.EncodeToString(digest[:])
+
+	return response, nil
+}
+
+// DiagnosticOnly returns a bounded, answer-key-free diagnostic assessment catalog.
+func (response *InternalCourseStructureResponse) DiagnosticOnly() (*InternalDiagnosticAssessmentCatalogResponse, error) {
+	if response == nil {
+		return nil, domain.ErrValidation
+	}
+	filtered := &InternalDiagnosticAssessmentCatalogResponse{Schema: DiagnosticAssessmentCatalogSchema, CourseID: response.CourseID, Lessons: make([]InternalCourseStructureLesson, 0)}
+	total := 0
+	for _, lesson := range response.Lessons {
+		items := make([]InternalCourseStructureTask, 0)
+		for _, item := range lesson.Tasks {
+			purpose, purposeErr := domain.NormalizeAssessmentPurpose(item.AssessmentPurpose)
+			if purposeErr != nil {
+				return nil, purposeErr
+			}
+			if purpose != domain.AssessmentPurposeDiagnostic {
+				continue
+			}
+			if !domain.IsAssessmentTaskType(item.Type) {
+				return nil, domain.ErrValidation
+			}
+			if !domain.IsOfficialAutoScoredDiagnostic(item.Type, item.EvaluationMode) {
+				return nil, domain.ErrValidation
+			}
+			if item.Status != domain.TaskStatusActive || lesson.Status != domain.LessonStatusActive {
+				continue
+			}
+			items = append(items, item)
+			total++
+		}
+		if len(items) == 0 {
+			continue
+		}
+		if total > 100 {
+			return nil, domain.ErrValidation
+		}
+		lesson.Tasks = items
+		filtered.Lessons = append(filtered.Lessons, lesson)
+	}
+	payload, err := json.Marshal(filtered.Lessons)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(payload)
+	filtered.CurriculumRevision = "sha256:" + hex.EncodeToString(digest[:])
+	return filtered, nil
+}

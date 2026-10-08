@@ -1,0 +1,65 @@
+package postgres
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMigration020DownFailsClosedWithPromptEffectEvidence(t *testing.T) {
+	pool := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	conn, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+
+	schema := "teacher_s7_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err = conn.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE") })
+	_, err = conn.Exec(ctx, "SET search_path TO "+quotedSchema)
+	require.NoError(t, err)
+
+	root := migration019RepositoryRoot(t)
+	upPaths, err := migration019UpPaths(root)
+	require.NoError(t, err)
+	for _, path := range upPaths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := conn.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+
+	now := time.Date(2026, 9, 11, 9, 0, 0, 0, time.UTC)
+	teacherID, studentID := uuid.NewString(), uuid.NewString()
+	_, err = conn.Exec(ctx, `
+INSERT INTO personal_teacher (
+ id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,created_at,updated_at
+) VALUES ($1,$2,'default','ru','supportive','progressive','progressive','balanced',$3,$3)
+`, teacherID, studentID, now)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, `
+INSERT INTO teacher_onboarding_action_receipt (
+ idempotency_key,request_hash,student_id,personal_teacher_id,dialog_id,source_message_id,source_message_version,
+ block_id,action_id,step_id,status,claim_token,locked_until,student_command_id,dialog_message_command_id,
+ execution_mode,canonical_message_command_id,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,1,'onboarding.direction.d0.v2','direction.undecided','direction','claimed',$7,$8,$9,$10,'canonical',$11,$12,$12)
+`, uuid.NewString(), strings.Repeat("a", 64), studentID, teacherID, uuid.NewString(), uuid.NewString(), uuid.NewString(), now.Add(time.Minute), uuid.NewString(), uuid.NewString(), uuid.NewString(), now)
+	require.NoError(t, err)
+
+	down, err := os.ReadFile(filepath.Join(root, "db", "migrations", "020_teacher_product_aware_onboarding_interaction_close.down.sql"))
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, string(down))
+	require.ErrorContains(t, err, "terminal-close or prompt-effect fence evidence exists")
+	var indexStillPresent bool
+	require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass('uq_teacher_onboarding_canonical_prompt_effect') IS NOT NULL`).Scan(&indexStillPresent))
+	require.True(t, indexStillPresent, "fail-closed rollback leaves the prompt-effect fence installed")
+}

@@ -1,0 +1,196 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+)
+
+func TestExactPathPlanningPreservesProgressAndOtherSelectedPath(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_context WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path_request WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path WHERE student_id=$1`, studentID)
+	})
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	now := time.Now().UTC()
+
+	first := integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), now)
+	first.Items = []domain.LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemCompleted, ReasonCode: "course_completed", Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.old", Version: "v1"}}},
+		{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 1, Status: domain.LearningPathItemCompleted, ReasonCode: "course_completed"},
+		{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 2, Status: domain.LearningPathItemPlanned, ReasonCode: "later"},
+	}
+	first, _, err := repo.CreateLearningPathIdempotently(ctx, first, repository.LearningPathCreationRequest{
+		IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("1", 64),
+	})
+	if err != nil {
+		t.Fatalf("create first path: %v", err)
+	}
+	if _, err := repo.GetLearningPathPlanningState(ctx, uuid.NewString(), first.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("foreign planning-state read error=%v, want not found", err)
+	}
+	second, _, err := repo.CreateLearningPathIdempotently(ctx,
+		integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), now.Add(time.Second)),
+		repository.LearningPathCreationRequest{
+			IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("2", 64),
+		})
+	if err != nil {
+		t.Fatalf("create second path: %v", err)
+	}
+	if _, err := repo.ActivateLearningPath(ctx, studentID, second.ID, 2, false, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("select second path: %v", err)
+	}
+	secondBefore, err := repo.GetLearningPathByID(ctx, studentID, second.ID)
+	if err != nil {
+		t.Fatalf("read second path: %v", err)
+	}
+
+	sameCourseDesired := []domain.LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: first.Items[0].ReferenceID, Position: 0, Status: domain.LearningPathItemPlanned, ReasonCode: "planner_refresh", Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.new", Version: "v2"}}},
+		{ReferenceType: "lesson", ReferenceID: first.Items[1].ReferenceID, Position: 1, Status: domain.LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+		{ReferenceType: "lesson", ReferenceID: first.Items[2].ReferenceID, Position: 2, Status: domain.LearningPathItemReady, ReasonCode: "next_gap"},
+	}
+	sameCourseReplan := integrationPlanningCommand(
+		first, domain.LearningPathPlanningCommandReplan, 1, sameCourseDesired, now.Add(3*time.Second), "a",
+	)
+	sameCourseResult, replayed, err := repo.ApplyLearningPathPlanningCommand(ctx, sameCourseReplan)
+	if err != nil || replayed || !sameCourseResult.Changed || sameCourseResult.State.PathVersion != 2 ||
+		sameCourseResult.State.JourneyVersion != 4 || sameCourseResult.State.IsSelected {
+		t.Fatalf("replan exact unselected path: result=%+v replayed=%v err=%v", sameCourseResult, replayed, err)
+	}
+	if sameCourseResult.State.Items[0].Status != domain.LearningPathItemCompleted ||
+		sameCourseResult.State.Items[1].Status != domain.LearningPathItemCompleted ||
+		sameCourseResult.State.Items[2].Status != domain.LearningPathItemReady {
+		t.Fatalf("progress regressed during replan: %+v", sameCourseResult.State.Items)
+	}
+	if len(sameCourseResult.State.Items[0].Targets) != 1 || sameCourseResult.State.Items[0].Targets[0].Key != "go.old" {
+		t.Fatalf("progressed item target drifted: %+v", sameCourseResult.State.Items[0])
+	}
+	secondAfter, _ := repo.GetLearningPathByID(ctx, studentID, second.ID)
+	if !reflect.DeepEqual(secondBefore, secondAfter) {
+		t.Fatalf("replan mutated selected second path: before=%+v after=%+v", secondBefore, secondAfter)
+	}
+
+	newCourseID := uuid.NewString()
+	newFingerprint := "fingerprint-v2"
+	// Accepted Hybrid ADR preserves completed history and only adapts future
+	// work at the ordinary boundary. Active-work rejection has a dedicated proof.
+	newCourseDesired := []domain.LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: first.Items[0].ReferenceID, Position: 0, Status: domain.LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+		{ReferenceType: "lesson", ReferenceID: first.Items[1].ReferenceID, Position: 1, Status: domain.LearningPathItemPlanned, ReasonCode: "planner_refresh"},
+		{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 2, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap"},
+	}
+	newCourseReplan := integrationPlanningCommand(
+		first, domain.LearningPathPlanningCommandReplan, 2, newCourseDesired, now.Add(4*time.Second), "b",
+	)
+	newCourseReplan.CourseID = newCourseID
+	newCourseReplan.CourseFingerprint = newFingerprint
+	newCourseResult, replayed, err := repo.ApplyLearningPathPlanningCommand(ctx, newCourseReplan)
+	if err != nil || replayed || !newCourseResult.Changed || newCourseResult.State.PathVersion != 3 ||
+		newCourseResult.State.JourneyVersion != 5 || newCourseResult.State.CourseID != newCourseID ||
+		newCourseResult.State.CourseFingerprint != newFingerprint {
+		t.Fatalf("replace exact path Course identity: result=%+v replayed=%v err=%v", newCourseResult, replayed, err)
+	}
+	if newCourseResult.State.Items[0].Status != domain.LearningPathItemCompleted ||
+		newCourseResult.State.Items[0].ReferenceID != first.Items[0].ReferenceID ||
+		newCourseResult.State.Items[2].Status != domain.LearningPathItemReady {
+		t.Fatalf("progress crossed a non-matching new-Course reference: %+v", newCourseResult.State.Items)
+	}
+	secondAfterNewCourse, _ := repo.GetLearningPathByID(ctx, studentID, second.ID)
+	if !reflect.DeepEqual(secondBefore, secondAfterNewCourse) {
+		t.Fatalf("new-Course replan mutated selected second path: before=%+v after=%+v", secondBefore, secondAfterNewCourse)
+	}
+
+	current := first
+	current.CourseID = newCourseID
+	current.CurriculumRevision = newFingerprint
+	current.CourseFingerprint = newFingerprint
+	noOp := integrationPlanningCommand(
+		current, domain.LearningPathPlanningCommandReplan, 3, newCourseDesired, now.Add(5*time.Second), "c",
+	)
+	noOp.PlannerPolicyVersion = newCourseReplan.PlannerPolicyVersion
+	noOp.ReasonCode = newCourseReplan.ReasonCode
+	noOp.ReasonSummary = newCourseReplan.ReasonSummary
+	noOpResult, _, err := repo.ApplyLearningPathPlanningCommand(ctx, noOp)
+	if err != nil || noOpResult.Changed || noOpResult.State.PathVersion != 3 || noOpResult.State.JourneyVersion != 5 {
+		t.Fatalf("no-op replan changed versions: %+v err=%v", noOpResult, err)
+	}
+
+	stale := integrationPlanningCommand(
+		current, domain.LearningPathPlanningCommandReplan, 2, newCourseDesired, now.Add(6*time.Second), "d",
+	)
+	if _, _, err := repo.ApplyLearningPathPlanningCommand(ctx, stale); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("stale exact-path version error=%v, want conflict", err)
+	}
+
+	noGap := integrationPlanningCommand(current, domain.LearningPathPlanningCommandNoGap, 3, nil, now.Add(7*time.Second), "e")
+	noGap.Schema = domain.LearningPathNoGapRequestSchema
+	noGap.ReasonCode = "mastery_no_gap"
+	noGap.ReasonSummary = "All targets already mastered"
+	completed, replayed, err := repo.ApplyLearningPathPlanningCommand(ctx, noGap)
+	if err != nil || replayed || !completed.Changed || completed.State.Status != domain.LearningPathStatusCompleted ||
+		completed.State.PathVersion != 4 || completed.State.JourneyVersion != 6 {
+		t.Fatalf("complete exact path: result=%+v replayed=%v err=%v", completed, replayed, err)
+	}
+	for _, item := range completed.State.Items {
+		if item.Status != domain.LearningPathItemCompleted && item.Status != domain.LearningPathItemSkippedMastered {
+			t.Fatalf("NO_GAP left nonterminal item: %+v", item)
+		}
+	}
+	contextValue, _ := repo.GetLearningContext(ctx, studentID)
+	if contextValue.SelectedLearningPathID != second.ID || contextValue.Version != 6 {
+		t.Fatalf("NO_GAP changed the other selected path: %+v", contextValue)
+	}
+	secondAfterCompletion, _ := repo.GetLearningPathByID(ctx, studentID, second.ID)
+	if !reflect.DeepEqual(secondBefore, secondAfterCompletion) {
+		t.Fatalf("NO_GAP mutated another path: before=%+v after=%+v", secondBefore, secondAfterCompletion)
+	}
+	noGap.OccurredAt = now.Add(8 * time.Second)
+	completionReplay, replayed, err := repo.ApplyLearningPathPlanningCommand(ctx, noGap)
+	if err != nil || !replayed || !reflect.DeepEqual(completionReplay, completed) {
+		t.Fatalf("NO_GAP replay was not exact: result=%+v replayed=%v err=%v", completionReplay, replayed, err)
+	}
+	newCourseReplan.OccurredAt = now.Add(9 * time.Second)
+	replanReplay, replayed, err := repo.ApplyLearningPathPlanningCommand(ctx, newCourseReplan)
+	if err != nil || !replayed || !reflect.DeepEqual(replanReplay, newCourseResult) {
+		t.Fatalf("new-Course replan replay did not return original response: result=%+v replayed=%v err=%v", replanReplay, replayed, err)
+	}
+	contextValue, _ = repo.GetLearningContext(ctx, studentID)
+	if contextValue.Version != 6 {
+		t.Fatalf("old replan replay changed current journey version: %+v", contextValue)
+	}
+}
+
+func integrationPlanningCommand(
+	path domain.StudentLearningPath,
+	kind domain.LearningPathPlanningCommandKind,
+	expectedVersion int64,
+	desired []domain.LearningPathItem,
+	now time.Time,
+	hashDigit string,
+) domain.LearningPathPlanningCommand {
+	return domain.LearningPathPlanningCommand{
+		Schema: domain.LearningPathReplanRequestSchema, Kind: kind, StudentID: path.StudentID,
+		LearningPathID: path.ID, PlanningRequestID: uuid.NewString(), IdempotencyKey: uuid.NewString(),
+		CourseID: path.CourseID, GoalCode: path.GoalCode, CourseFingerprint: path.CourseFingerprint,
+		PlannerPolicyVersion: "planner-v2", ReasonCode: "replan", ReasonSummary: "Refresh route",
+		ExpectedPathVersion: expectedVersion, DesiredItems: desired,
+		RequestHash: strings.Repeat(hashDigit, 64), OccurredAt: now,
+	}
+}

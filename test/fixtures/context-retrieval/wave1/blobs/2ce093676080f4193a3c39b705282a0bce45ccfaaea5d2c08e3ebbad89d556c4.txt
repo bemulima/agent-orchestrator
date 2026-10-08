@@ -1,0 +1,111 @@
+package curriculum
+
+import (
+	"context"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+type DiagnosticGateway interface {
+	EnsureDiagnosticPlacement(context.Context, string, string) (domain.DiagnosticPlacementSummary, error)
+	GetDiagnosticPlanningState(context.Context, string, string) (domain.DiagnosticPlanningState, error)
+}
+
+// Diagnostic orchestrates owner projections; completion never submits planning.
+type Diagnostic struct {
+	Gateway  DiagnosticGateway
+	Overview repository.StudentLearnerOverviewReader
+	Plans    LearningPlanner
+}
+
+func (d Diagnostic) Complete(ctx context.Context, studentID, planID string) (domain.TeacherDiagnosticPlacementState, error) {
+	return d.state(ctx, studentID, planID, false)
+}
+
+func (d Diagnostic) Plan(ctx context.Context, studentID, planID string) (domain.TeacherDiagnosticPlacementState, error) {
+	return d.state(ctx, studentID, planID, true)
+}
+
+func (d Diagnostic) state(ctx context.Context, studentID, planID string, submit bool) (domain.TeacherDiagnosticPlacementState, error) {
+	result := domain.TeacherDiagnosticPlacementState{Schema: "teacher-diagnostic-placement-state.v1", PlanID: planID}
+	student, studentErr := uuid.Parse(studentID)
+	plan, planErr := uuid.Parse(planID)
+	if studentErr != nil || planErr != nil || student.String() != studentID || plan.String() != planID {
+		return result, domain.ErrInvalidCurriculum
+	}
+	if d.Gateway == nil || d.Overview == nil || (submit && d.Plans == nil) {
+		return result, domain.ErrCurriculumUnavailable
+	}
+	placement, err := d.Gateway.EnsureDiagnosticPlacement(ctx, studentID, planID)
+	if err != nil {
+		return result, err
+	}
+	result.Placement = placement
+	state, err := d.Gateway.GetDiagnosticPlanningState(ctx, studentID, planID)
+	if err != nil {
+		return result, err
+	}
+	result.GoalCode = state.GoalCode
+	// Existing accepted jobs are historical facts; profile changes cannot rewrite them.
+	if state.Request != nil && (!submit || state.Request.Status != "FAILED" || state.Request.FailureCode != "ATTEMPTS_EXHAUSTED") {
+		return d.project(ctx, studentID, result, state.Request)
+	}
+	overview, err := d.Overview.GetLearnerOverview(ctx, studentID)
+	if err != nil {
+		return result, domain.ErrCurriculumUnavailable
+	}
+	if overview.StudentID != studentID || overview.Onboarding == nil {
+		return result, domain.ErrCurriculumUnavailable
+	}
+	profile := overview.Onboarding
+	if profile.GoalCode != state.GoalCode || profile.Version != state.OnboardingVersion || profile.DirectionCode != state.DirectionCode {
+		result.Status, result.FailureCode = "DIAGNOSTIC_CONTEXT_STALE", "DIAGNOSTIC_CONTEXT_STALE"
+		return result, nil
+	}
+	result.Status = "READY_FOR_PLANNING"
+	if !submit {
+		return result, nil
+	}
+	_, err = d.Plans.CreateCoursePlan(ctx, PlanInput{StudentID: studentID, IdempotencyKey: planID, DiagnosticPlanID: planID,
+		GoalCode: state.GoalCode, DesiredOutcome: "Build my initial learning path after diagnostic", Reason: PlanReasonInitial})
+	if err != nil {
+		return result, err
+	}
+	state, err = d.Gateway.GetDiagnosticPlanningState(ctx, studentID, planID)
+	if err != nil || state.Request == nil {
+		return result, domain.ErrCurriculumUnavailable
+	}
+	return d.project(ctx, studentID, result, state.Request)
+}
+
+func (d Diagnostic) project(ctx context.Context, studentID string, result domain.TeacherDiagnosticPlacementState, request *domain.DiagnosticPlanningRequest) (domain.TeacherDiagnosticPlacementState, error) {
+	result.PlannerRequestID = request.RequestID
+	switch request.Status {
+	case "REQUESTED", "PLANNING":
+		result.Status = "PLANNING_PENDING"
+	case "FAILED":
+		result.PlanningRetryable = request.FailureCode == "ATTEMPTS_EXHAUSTED"
+		result.Status, result.FailureCode = "PLANNING_FAILED", request.FailureCode
+		if request.FailureCode == "DIAGNOSTIC_PLAN_INVALID" {
+			result.Status = "DIAGNOSTIC_CONTEXT_STALE"
+		}
+	case "COMPLETED":
+		if request.LearningPathID == "" {
+			if request.ResultCode != "NO_GAP" {
+				return result, domain.ErrCurriculumUnavailable
+			}
+			result.Status = "NO_GAP"
+		} else {
+			overview, err := d.Overview.GetLearnerOverview(ctx, studentID)
+			if err != nil || overview.StudentID != studentID || overview.LearningPath == nil || overview.LearningPath.StudentID != studentID || overview.LearningPath.ID != request.LearningPathID || overview.LearningPath.Status != "ACTIVE" {
+				return result, domain.ErrCurriculumUnavailable
+			}
+			result.Status, result.LearningPathID = "LEARNING_PATH_ACTIVE", request.LearningPathID
+		}
+	default:
+		return result, domain.ErrCurriculumUnavailable
+	}
+	return result, nil
+}

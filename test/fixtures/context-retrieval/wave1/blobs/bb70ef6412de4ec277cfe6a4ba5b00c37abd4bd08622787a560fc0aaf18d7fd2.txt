@@ -1,0 +1,822 @@
+# Knowledge task manifest
+
+> Deprecated compatibility contract. It documents an offline migration tool
+> for already deployed Course data. Practice v2 authoring/runtime and lazy
+> prerequisite generation do not call Knowledge Tree or consume this
+> manifest/bundle. Delete the tooling after all legacy source-key-owned content
+> is re-authored or archived and production readback has no active references.
+
+`knowledge-task-manifest.v1` is the deployable representation of tasks and
+assessment questions authored in Knowledge Tree. It is intentionally separate
+from lesson Markdown: lesson text remains source material, while this manifest
+contains only data that must be created, executed, or automatically checked by
+the course platform.
+
+Use the importer in offline dry-run mode while authoring:
+
+```sh
+python3 scripts/import_knowledge_task_manifest.py path/to/manifest.json
+```
+
+Before deployment, validate all references against the target administrative
+API. This mode performs only GET requests and does not mutate platform data:
+
+```sh
+MS_COURSE_BASE_URL=http://localhost:8083 \
+python3 scripts/import_knowledge_task_manifest.py --check-references path/to/manifest.json
+```
+
+For sandbox content, also compare every selected task stage with the engine IDs
+actually registered by the target validation orchestrator:
+
+```sh
+MS_COURSE_BASE_URL=http://localhost:8083 \
+MS_VALIDATION_ORCHESTRATOR_URL=http://localhost:8080 \
+python3 scripts/import_knowledge_task_manifest.py \
+  --check-references \
+  --check-sandbox-engines \
+  path/to/manifest.json
+```
+
+`--check-sandbox-engines` calls only `GET /api/v1/engines` and runs before the
+first platform write. It checks the exact manifests remaining after any scoped
+selector, reports each missing engine with the affected task source keys, and
+does not add fields to `knowledge-task-manifest.v1`. The same flag can be used
+with `--apply`; a missing or unreachable orchestrator then stops deployment
+before `ms-go-course` is mutated.
+
+Deploy only a manifest that passes the deployment-aware check:
+
+```sh
+MS_COURSE_BASE_URL=http://localhost:8083 \
+python3 scripts/import_knowledge_task_manifest.py --apply path/to/manifest.json
+```
+
+### Practice-task learning bundles
+
+This section describes the retired pre-v2 bridge and must not be used for new
+practice tasks. In the current flow, Practice asks Learning Planner to ensure a
+frozen material reference and Learning Planner calls Course's idempotent
+`POST /internal/generated-courses`; Course persists an ordinary one-Lesson
+hierarchy under `practice-material-fingerprint-v1`.
+
+Previously, Knowledge Tree exported that Lesson through
+`knowledge-task-manifest.v1` and additionally created a checksum-sealed
+`knowledge-practice-task-learning-import-bundle.v1` that records the exact
+Lesson scopes approved with the practice task. The bundle is transport
+evidence, not a second Course schema.
+
+Validate a bundle offline first:
+
+```sh
+python3 scripts/import_knowledge_learning_bundle.py path/to/bundle.json
+```
+
+Then run the read-only deployment checks:
+
+```sh
+MS_COURSE_BASE_URL=http://localhost:8083 \
+python3 scripts/import_knowledge_learning_bundle.py \
+  --check-references \
+  path/to/bundle.json
+```
+
+`--apply` is a separate, explicitly authorized operation. The importer verifies
+every manifest SHA-256 before reading content, rejects duplicate or missing
+Lesson IDs, preflights every scope before its first write, and applies each
+Lesson with `ownership=append`. The selected Lesson, Tasks, assessments and
+examples are upserted idempotently. Ancestor Course/Module/Section objects and
+relation targets are ensure-only; undeclared sibling Lessons and Tasks are not
+removed. A scoped learning-bundle import never publishes the parent Course.
+
+Each bundle entry already binds one approved `capability_key` to one selected
+Lesson. During a legacy import, Course projects that capability as an opaque
+`learning_target` onto every Task in the selected Lesson and verifies the
+post-commit readback. Explicit task-level concept targets
+may coexist with the projected Lesson capability. A normal manifest update that
+omits `learning_targets` preserves previously stored targets; an explicit empty
+array clears them.
+
+One Lesson scope is a database transaction and is verified immediately after
+commit. A bundle containing several Lessons is intentionally resumable rather
+than pretending to be one cross-Lesson transaction: if a later scope fails,
+earlier verified scopes remain committed and a repeat addresses the same stable
+source keys.
+
+Deploy a complete set of courses with cross-course relations in one batch:
+
+```sh
+MS_COURSE_BASE_URL=http://localhost:8083 \
+python3 scripts/import_knowledge_task_manifest.py --apply \
+  path/to/course-a.manifest.json \
+  path/to/course-b.manifest.json \
+  path/to/course-c.manifest.json
+```
+
+When multiple paths are supplied, the importer validates the complete set and
+all platform references before its first write. It then prepares two phases:
+
+1. upsert catalogs, courses, modules, sections, lessons, tasks, examples, and
+   their ownership/order links;
+2. replace semantic lesson/example relations, then publish the courses.
+
+The prepared database writes are sent once to
+`POST /knowledge-import/batch`. The endpoint runs only an allowlisted subset of
+the existing admin create/update routes, hierarchy replacement routes, and task
+deletion, and executes every operation inside one outer PostgreSQL transaction.
+The first failed operation rolls the complete database batch back; course/task
+lifecycle events are released only after the commit succeeds. This is a
+transport-level transaction boundary and does not add fields or a second schema
+to `knowledge-task-manifest.v1`.
+
+Declared `starter_files` are queued by the importer while it prepares the
+database batch and uploaded only after that batch commits. A database rollback
+therefore never uploads files. Each uploaded archive remains temporary with a
+finite TTL until its task binding transaction commits. Course then activates
+the archive through the idempotent FileStorage lifecycle endpoint. If activation
+fails, Course restores the previous binding and the new temporary file remains
+eligible for cleanup; repeating the import is safe.
+
+Every lesson or example targeted by a semantic relation must be declared in
+one of the supplied manifests. This strict closure makes deployment independent
+of file order and prevents a partially written batch caused by a missing
+cross-course target. The server accepts at most 10,000 write operations and a
+64 MiB batch request. Run the same command without `--apply` for a side-effect
+free batch plan, or use `--check-references` to include read-only platform
+reference validation.
+
+Shared Track, Level, and Course Group entities may occur in multiple manifests
+only when their definitions are identical. Conflicting global Track orders,
+contradictory catalog parents, sibling order collisions, duplicate owned
+`source_key` values, and duplicate course slugs are rejected before deployment.
+
+## Optional lesson reading access
+
+Track, Level, Course Group, Course, Module, Section, and Lesson objects may
+declare `lesson_read_access` as `guest`, `student`, `student_pro`, `disabled`,
+or `null`. This is an optional extension of the existing
+`knowledge-task-manifest.v1`; no second manifest version is introduced.
+
+Importer update semantics are presence-aware:
+
+- an omitted field preserves the existing platform override;
+- explicit `null` clears the override and restores hierarchy inheritance;
+- an explicit value replaces the override on that exact node.
+
+The setting controls reading the Lesson body only. It does not change catalog
+visibility, progression locks, task/test access, or sandbox authorization.
+When no active hierarchy node declares a value, the effective fallback is
+`student`.
+
+## Scoped import selectors
+
+The importer applies every supplied manifest by default. A mutually exclusive
+CLI selector can narrow one run without adding fields to
+`knowledge-task-manifest.v1`:
+
+```sh
+python3 scripts/import_knowledge_task_manifest.py --track foundation manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --course foundation.beginner.programming-basics manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --module foundation.beginner.programming-basics.program manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --section foundation.beginner.programming-basics.program.instructions manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --lesson foundation.beginner.programming-basics.program.instructions.sequence manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --example foundation.beginner.programming-basics.program.instructions.sequence.neutral-example manifests/*.json
+python3 scripts/import_knowledge_task_manifest.py --task foundation.beginner.programming-basics.program.instructions.sequence.choice manifests/*.json
+```
+
+`--session` is an alias for `--section`. `--all` is the explicit spelling of
+the default full-import behavior. Selectors match exact, case-sensitive
+`source_key` values; they never guess from titles, paths, or localized text.
+
+Ownership is a CLI-only runtime choice and is not stored in the manifest:
+
+- `--ownership auto` is the default: `full` without a selector and `partial`
+  with a selector;
+- `full` atomically replaces catalog relations aggregated across the supplied
+  batch, replaces Module/Section/Lesson placements under every declared owned
+  parent, and removes undeclared tasks from declared lessons;
+- `partial` performs the same reconciliation only below the selected owned
+  entity; ancestor and dependency paths remain add/ensure-only;
+- `append` keeps the previous upsert/add-only hierarchy behavior and never
+  removes undeclared tasks or placements.
+
+`full` does not delete a Track, Level, Course Group, or Course root that is not
+represented by the supplied batch. Replaced module/section/lesson placements
+are detached from the owned parent; the importer does not physically delete a
+detached reusable entity. Task deletion is limited to lessons owned by the run
+and participates in the same PostgreSQL batch transaction as all other writes.
+
+Before the first write, the importer builds an in-memory scope plan from the
+supplied manifests. The selected entity and its descendants are owned by the
+run. Its Track/Level/Course Group/Course/Module/Section/Lesson parent path and
+semantic lesson/example relation targets are included as dependencies. Supply
+the complete deployment batch when a selected node has a cross-course target;
+the importer rejects an incomplete closure instead of consulting mutable
+platform state to guess the missing authoring definition.
+
+Existing ancestors and relation targets are only ensured and are not updated.
+Missing dependencies may be created from the manifest. A child-scoped run does
+not publish its parent Course. Lesson relations and example relations are
+reconciled only for selected source entities. A single-example update reads the
+existing lesson examples during preflight and merges the selected example into
+that complete set, preserving undeclared siblings; an order collision fails
+before any write. A selected Lesson or broader scope continues to own the
+complete example and outgoing-relation sets for its selected lessons.
+
+Offline dry-run labels selected entities as `upsert` and parent/dependency
+shells as `ensure`. `--check-references` validates only the resulting scope and
+performs the same read-only example merge preflight. Use
+`--ownership append` when an intentionally incomplete manifest set must not
+remove any existing hierarchy placement or task.
+
+Every successful CLI `--apply` performs post-commit readback through the
+existing administrative GET/list endpoints. For owned parents it requires an
+exact child set and order; for ancestor/dependency shells it requires the
+selected children as an ordered subset and allows unrelated siblings. It also
+checks task membership and numeric order, first-class examples, lesson
+relations, and example relations. Success ends with `Verified post-apply
+readback (... checks).`
+
+Readback is a verification step, not a reverse exporter. It does not reconstruct
+a manifest and never modifies Knowledge Tree. If it finds drift, the command
+returns exit code 2 with a bounded mismatch report stating that the atomic
+database apply already committed, so operators can inspect the deployed state
+before deciding whether to retry.
+
+The repository integration target exercises the full reference-seed contract
+against a running development service:
+
+```sh
+MODE=dev make test-knowledge-task-manifest-integration
+```
+
+It loads `db/seeds/reference/reference_create.sql`, performs a deployment-aware
+dry-run, applies the bundled technology-specific, Java/Kotlin runtime,
+Java/Kotlin quiz, and neutral examples, verifies the automatic readback, stale
+task deletion, repeated apply, and forced transaction rollback, and then
+verifies the dry-run again. The same isolated scenario runs in
+`.github/workflows/knowledge-import.yml` for pull requests and `main`.
+
+## Technology-neutral courses
+
+Technology-neutral content uses the same mandatory technology contract as any
+other course. The bundled reference seeds provide the exact values
+`tech.label = neutral`, `tech_version.version = 1`, and `tag.slug = neutral`.
+A neutral manifest therefore declares `main_tech_label: "neutral"`, assigns the
+same label to its module and section, and uses
+`tech_version: {"label": "neutral", "version": "1"}`. Existing course rows do
+not need a migration or backfill because the model remains non-null and the new
+reference records are seeded idempotently.
+
+Neutral courses participate in the regular course, module, section, and tag
+filters. They can contain non-sandbox `test`, `ordering`, `classification`, and
+`quiz_theory` tasks with
+`submission_mode: "ANSWER_PAYLOAD"`; those tasks do not declare a runtime
+profile. A course may still override a section with a concrete technology when
+the lesson genuinely depends on it. Sandbox tasks remain technology-specific
+and must declare a compatible runtime profile rather than inheriting a neutral
+runtime implicitly.
+
+See [the neutral example manifest](../db/manifests/knowledge-task-manifest.neutral.example.json).
+
+## Java/Kotlin coding and quiz courses
+
+The reference seed exposes exact `java` and `kotlin` technology labels,
+technology version `1`, and matching tag slugs. Both languages may use
+fixed-choice assessments with the existing platform contract:
+
+- `task_kind: "test"`;
+- `code_structure_type_code: "TEST_SINGLE_CHOICE_BASIC"`;
+- `execution_mode: "NO_RUN"`;
+- `submission_mode: "ANSWER_PAYLOAD"`;
+- `requires_sandbox: false`.
+
+Such assessment lessons do not declare `runtime_profile`, starter files, or
+Compose config. Coding lessons use the explicit `JAVA_BASIC_SCRIPT` or
+`KOTLIN_BASIC_SCRIPT` contracts described below; a generic language technology
+reference alone is not proof that an arbitrary sandbox shape is supported.
+
+See the [Java quiz](../db/manifests/knowledge-task-manifest.java-quiz.example.json),
+[Kotlin quiz](../db/manifests/knowledge-task-manifest.kotlin-quiz.example.json),
+[Java runtime](../db/manifests/knowledge-task-manifest.java-runtime.example.json),
+[Kotlin runtime](../db/manifests/knowledge-task-manifest.kotlin-runtime.example.json),
+[JavaScript browser](../db/manifests/knowledge-task-manifest.browser-javascript.example.json),
+and [TypeScript browser](../db/manifests/knowledge-task-manifest.browser-typescript.example.json)
+manifests.
+
+## Identity and repeated delivery
+
+Every course, module, section, lesson, task, question, and answer variant has
+a globally unique, lowercase `source_key`. The importer derives a UUID v5 from
+that key. Therefore unchanged content receives the same platform ID on every
+run and is updated rather than duplicated. A course with the same `slug` but a
+different ID is considered unmanaged content and stops deployment safely.
+
+`source_key` is immutable after creation. Renaming it creates a different
+learning object; move or edit the existing object instead when continuity of
+student progress is required.
+
+Downstream services that need runtime UUIDs must use the internal
+`POST /internal/course/resolve-lesson-bindings` contract with exact course and
+lesson source keys. The resolver proves the lesson placement and reports
+unresolved pairs; it is the source of truth instead of a consumer-generated
+UUID algorithm.
+
+## Translations and additional locales
+
+The existing `translations` object is shared by catalog entities, courses,
+modules, sections, lessons, examples, tasks, assessment questions, groups, and
+variants. RU and EN remain required for compatibility with legacy fallback
+fields. Any number of additional locale keys may be included without changing
+the `knowledge-task-manifest.v1` schema version.
+
+Offline validation checks every localized value's existing shape. Deployment-aware
+validation additionally requires every locale key to match a language returned
+by the target service's `GET /i18n/list` endpoint. Matching is exact and
+case-sensitive. A missing locale stops `--check-references` and `--apply` before
+the first write, with all affected manifest paths in the error report.
+
+## Semantic lesson relations
+
+The optional root `lesson_relations` array publishes directed semantic edges
+between lessons. Supported relation kinds are `implementation`, `practice`,
+`comparison`, `reference`, `prerequisite`, `continuation`, and `see_also`:
+
+```json
+{
+  "lesson_relations": [
+    {
+      "source_key": "lesson-relation.d802ceb8246cba5fc5acb3ec9f90388e",
+      "source_lesson_key": "foundation.beginner.programming-basics.sequence",
+      "target_lesson_key": "foundation.beginner.programming-basics.loop",
+      "relation": "implementation",
+      "primary_stack": "neutral",
+      "stacks": ["neutral"],
+      "concepts": ["sequence", "repetition"]
+    }
+  ]
+}
+```
+
+The relation `source_key` is stable identity derived from source lesson,
+target lesson, and relation kind. Reimporting the same key updates only its
+stack/concept metadata without creating another row; changing an identity
+component requires the corresponding new key and stale-edge reconciliation.
+The source lesson must be declared by the current manifest; the target may be in
+the same manifest or may already exist in the service. Apply fails before any
+relation write if a target lesson is missing. Self-links, duplicate
+`source + target + relation` identities, unsupported kinds, duplicate metadata
+values, and a `primary_stack` absent from `stacks` are rejected.
+
+Presence of `lesson_relations` declares ownership of the complete outgoing
+relation set for every lesson in that manifest. Apply atomically upserts the
+declared rows and removes stale rows for each source lesson; an explicit empty
+array therefore clears all managed outgoing relations. Omitting the root field
+leaves existing relations unchanged for backward compatibility. Deleting
+either endpoint lesson deletes the relation through foreign-key cascade, so a
+dangling relation cannot remain.
+
+Administrative clients reconcile with
+`PUT /lesson-relations/replace/{sourceLessonID}`, read with
+`GET /lesson-relations/list/{sourceLessonID}`, and may remove one row with
+`DELETE /lesson-relations/delete/{relationID}`. Student clients use
+`GET /api/v1/lesson-relations/list/{sourceLessonID}`. Read responses include
+both UUIDs and stable lesson source keys.
+
+## First-class lesson examples
+
+The optional root `examples` array publishes examples as independent learning
+artifacts rather than embedding their text into a lesson description:
+
+```json
+{
+  "examples": [
+    {
+      "source_key": "foundation.beginner.programming-basics.sequence.neutral-example",
+      "lesson_source_key": "foundation.beginner.programming-basics.sequence",
+      "order": 1,
+      "status": 1,
+      "mode": "concept-snippet",
+      "stacks": ["neutral"],
+      "target_concepts": ["sequence"],
+      "translations": {
+        "ru": { "title": "Порядок", "description": "Markdown example body" },
+        "en": { "title": "Order", "description": "Markdown example body" }
+      }
+    }
+  ]
+}
+```
+
+Every example has stable identity, a unique 1-based order inside its lesson,
+active/inactive status, a kebab-case presentation mode, non-empty stack and
+concept metadata, and required RU/EN title plus Markdown description. Additional
+translation keys are allowed when the same language exists in the target
+service's `GET /i18n/list` response. A
+`primary_stack`, when present, must also occur in `stacks`. `neutral` examples
+and language-specific examples use the same model; no runtime or task is
+created merely because an example contains source code.
+
+Presence of `examples` owns the complete example set for every lesson declared
+by the manifest. Apply atomically updates rows and translations by
+`source_key`, supports order changes, and deletes stale examples. Omitting the
+field preserves existing rows; an explicit empty array clears them. A stable
+key cannot move to another lesson. Deleting a lesson deletes its examples.
+Student readback includes only active examples from an active lesson, while
+administrative readback includes inactive drafts.
+
+`example_relations` defines a separate directed graph between examples. It
+uses the same seven relation kinds as lesson relations and requires
+`primary_stack`, non-empty `stacks`, and non-empty `concepts`. The source
+example must be declared in the current manifest; the target may already exist
+in the service. The field owns the complete outgoing relation set for each
+declared example, so repeated imports update metadata without duplicate rows
+and remove stale edges. Self-links, duplicate identities, missing targets, and
+stack mismatches fail closed. Deleting either example cascades to its relation.
+
+Administrative APIs are:
+
+- `PUT /lesson-examples/replace/{lessonID}` and `GET /lesson-examples/list/{lessonID}`;
+- `DELETE /lesson-examples/delete/{exampleID}`;
+- `PUT /example-relations/replace/{sourceExampleID}` and `GET /example-relations/list/{sourceExampleID}`;
+- `DELETE /example-relations/delete/{relationID}`.
+
+Student clients use `GET /api/v1/lesson-examples/list/{lessonID}` and
+`GET /api/v1/example-relations/list/{sourceExampleID}`. Responses retain UUID,
+stable source-key identity, order, stack/concept metadata, and both localized
+texts.
+
+## Aggregated student lesson materials
+
+Student clients can load the material graph for a Lesson in one request:
+
+```http
+GET /api/v1/lesson-materials/get/{lessonID}
+GET /api/v1/lesson-materials/get/{lessonID}?stack=go
+```
+
+The response is a read model built from the existing entities and relation
+tables; it does not add fields to `knowledge-task-manifest.v1` and does not
+create another authoring contract. It contains:
+
+- the current Lesson, its active `examples`, and its active `tasks` with nested
+  assessment questions;
+- `related_lessons`, where every authored Lesson relation is paired with the
+  active target Lesson and that target's active Examples, Tasks, and tests;
+- `related_examples`, where every authored Example relation is paired with the
+  complete active target Example.
+
+Without `stack`, every authored outgoing relation is returned. With an exact
+lowercase stack slug, Lesson and Example relations are filtered by their
+existing `primary_stack` / `stacks` metadata, and Examples inside related
+Lessons are filtered to that stack. The current Lesson's own materials remain
+visible as the reading context. Inactive Lessons, Examples, and Tasks are never
+included. Test questions and answer variants are returned through the same
+student-safe mapper as `GET /api/v1/task/get/{taskID}`, so correct-answer,
+ordering, and classification keys are not exposed.
+
+## Sandbox runtime profiles
+
+Sandbox execution is fail-closed. A task with `requires_sandbox: true` must
+resolve a named runtime profile declared in the manifest root. Profiles are
+stable authoring identifiers; each one contains the exact Compose config and
+the technologies and code-structure contracts it supports:
+
+```json
+{
+  "runtime_profiles": {
+    "node-20": {
+      "tech_labels": ["javascript"],
+      "code_structure_type_codes": ["JAVASCRIPT_BASIC_SCRIPT"],
+      "compose_config": {
+        "version": "3.9",
+        "services": {
+          "app": {
+            "image": "node:20-alpine",
+            "working_dir": "/app",
+            "volumes": [".:/app"],
+            "command": ["sh", "-c", "while true; do sleep 3600; done"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Every profile requires a non-empty `services.app.image`. Profile names are
+lowercase stable keys. `tech_labels` is mandatory;
+`code_structure_type_codes` is optional, but when present it is an allowlist.
+Technology labels, versions, tag slugs, and code-structure type codes are
+compared exactly and case-sensitively with the target deployment. Values are
+not trimmed, case-folded, or otherwise normalized. For example, the bundled
+reference seeds use `javascript` and version `1`; `JavaScript` or `ES2022` are
+different references and are rejected. The same exact comparison is used for
+runtime profiles and section/task declarations, so a Go task cannot
+accidentally receive the Node runtime.
+
+Assign a default at lesson level and override it only where a task genuinely
+needs a different environment. The abbreviated example assumes both referenced
+profiles are declared in the root `runtime_profiles` object:
+
+```json
+{
+  "source_key": "knowledge-tree.javascript.output",
+  "runtime_profile": "node-20",
+  "tasks": [
+    {
+      "source_key": "knowledge-tree.javascript.output.implement",
+      "requires_sandbox": true
+    },
+    {
+      "source_key": "knowledge-tree.javascript.output.legacy-node",
+      "requires_sandbox": true,
+      "runtime_profile": "node-18"
+    }
+  ]
+}
+```
+
+Resolution is always `task runtime_profile -> lesson runtime_profile`. A
+task-level profile is rejected for a non-sandbox task because the platform
+would not execute it. Non-sandbox tests may coexist in a lesson that supplies a
+runtime for its coding tasks.
+
+During apply, the importer sends the resolved lesson/task Compose configs
+through the existing lesson and task APIs. Compose configs are reused by JSON
+value, so repeated imports do not create duplicate config rows. When an update
+removes a task-level profile, the importer sends `compose_config: null`; the
+backend clears the task override and returns to the lesson fallback.
+
+Removing a lesson-level profile is also explicit. The importer first persists
+all task overrides, then sends `compose_config: null` for the lesson. Omitting
+`compose_config` from a direct lesson update preserves the current runtime.
+The backend rejects task creation, task updates, and lesson runtime clears that
+would leave a sandbox task without either a task or lesson config. Referenced
+Compose config rows cannot be deleted until those bindings are removed.
+
+Reference Node, TypeScript, Java, Go, Python, and PHP profiles used by contract tests live in
+[`test/fixtures/knowledge-runtime-profiles.json`](../test/fixtures/knowledge-runtime-profiles.json).
+
+### TypeScript live-static and final-runtime tasks
+
+Beginner TypeScript implementation tasks that require behavioral validation use the exact combination shown in
+[`knowledge-task-manifest.typescript-runtime.example.json`](../db/manifests/knowledge-task-manifest.typescript-runtime.example.json):
+
+- `code_structure_type_code: "TYPESCRIPT_BASIC_SCRIPT"`;
+- runtime profile `node-24-typescript` with the digest-pinned Node 24.2 image;
+- a `ts.ast` stage in `both` mode for inexpensive live feedback;
+- a `ts.runtime` stage in `final` mode with `depends_on` pointing to `ts.ast`;
+- a relative `.ts`, `.mts`, or `.cts` entrypoint present in both `targets.files` and `starter_files`;
+- constrained `checks.kind: "cli"` with optional `args` and `timeoutMs`, expected `exitCode`, and at least one stdout or stderr assertion.
+
+The manifest importer rejects an authored shell `command`, path traversal, declaration-file entrypoints, runtime stages outside final mode, missing static dependencies, and exit-code-only checks. The supported task capabilities are `cli_programming`, `TERMINAL_RUN`, `AUTO`, `TERMINAL`, `SNAPSHOT`, sandbox and terminal enabled, preview disabled, and live validation enabled through the static stage.
+
+The Compose profile is the interactive student sandbox. It lets the student run `node --experimental-transform-types main.ts` without downloading a compiler or dependencies. Authoritative validation is separate: live requests reach `ts.ast`, while Submit reaches `ts.ast` followed by `ts.runtime` through `ms-go-validation-orchestrator`. The runtime supports dependency-free `.ts`, `.mts`, and `.cts` files under Node's native type transformation. TSX, package installation, path aliases, and TypeScript features that require compiler code generation are outside this profile.
+
+### Browser input and form tasks
+
+Beginner JavaScript and TypeScript UI implementation tasks use the exact contracts in
+[`knowledge-task-manifest.browser-javascript.example.json`](../db/manifests/knowledge-task-manifest.browser-javascript.example.json)
+and
+[`knowledge-task-manifest.browser-typescript.example.json`](../db/manifests/knowledge-task-manifest.browser-typescript.example.json).
+The four canonical seed variants—JavaScript/TypeScript × input/form—live in
+[`engine-browser-runtime-fixtures.json`](../db/seeds/test/sources/engine-browser-runtime-fixtures.json).
+
+The supported shape is deliberately narrow:
+
+- `frontend_preview`, `BROWSER_PREVIEW`, `AUTO`, `PREVIEW`, and `SNAPSHOT`;
+- sandbox and preview enabled, terminal hidden, live validation enabled;
+- `HTML_BASIC_DOCUMENT` with exactly `index.html` plus `app.js` or `app.ts`;
+- `html.dom` and exactly one `js.ast` or `ts.ast` stage in `both` mode;
+- one `browser.runtime` stage in `final` mode depending on both static stages;
+- TypeScript uses only the fixed `checks.build` mapping `app.ts -> app.js`;
+- input checks use `fill`/`input`/`type`, exact input values, and visible text assertions;
+- form checks use `submit`, an ordered pending-to-result text sequence, and an
+  absolute HTTP(S) mock with exactly one deterministic response per expected request.
+
+The JavaScript preview profile serves the workspace with nginx. The TypeScript
+profile adds the digest-pinned Node 24.2 builder already used by the TypeScript
+runtime contract; it watches `app.ts` and generates `app.js` without package
+installation. This build is for interactive preview only. Submit sends the
+student `app.ts` to the browser validator, which compiles it independently
+before executing the final browser checks.
+
+`browser.runtime` never runs in live mode and never marks the task passed while
+the student is editing. Static stages return live diagnostics; only Submit can
+produce the authoritative result. External browser traffic is blocked, response
+fixtures are deterministic, unsupported actions and invented check fields are
+rejected, and task authors cannot provide shell commands or a student-owned
+generated `app.js` for the TypeScript contract.
+
+### Java live-compile and final-runtime tasks
+
+Beginner Java implementation tasks use the exact combination shown in
+[`knowledge-task-manifest.java-runtime.example.json`](../db/manifests/knowledge-task-manifest.java-runtime.example.json):
+
+- `code_structure_type_code: "JAVA_BASIC_SCRIPT"`;
+- runtime profile `java-21` with the digest-pinned Eclipse Temurin Java 21 image;
+- exactly one dependency-free `Main.java` starter and workspace file;
+- a `java.compile` stage in `both` mode with the exact `Main.java` target and empty `rules`;
+- a `java.runtime` stage in `final` mode that depends only on `java.compile`;
+- constrained CLI checks with optional arguments and timeout, expected exit code, and at least one stdout or stderr assertion.
+
+The importer rejects packages, multi-file task shapes, alternate entrypoints,
+non-empty rules, authored commands, validation links, runtime stages in live
+mode, missing compile dependencies, and exit-code-only checks. Live validation
+returns structured `javac` diagnostics without completing the task. Submit compiles again, runs
+the fixed `java Main` path, and produces the authoritative result. Dependencies,
+custom classpaths, compiler plugins, package installation, and authored shell
+commands are outside this Beginner profile.
+
+### Kotlin live-compile and final-runtime tasks
+
+Beginner Kotlin implementation tasks use the exact combination shown in
+[`knowledge-task-manifest.kotlin-runtime.example.json`](../db/manifests/knowledge-task-manifest.kotlin-runtime.example.json):
+
+- `code_structure_type_code: "KOTLIN_BASIC_SCRIPT"`;
+- runtime profile `kotlin-2.3-jdk21` with the digest-pinned official Gradle 9.6.1 JDK 21 image containing Kotlin 2.3.21;
+- exactly one dependency-free `Main.kt` starter and workspace file;
+- a `kotlin.compile` stage in `both` mode with the exact `Main.kt` target and empty `rules`;
+- a `kotlin.runtime` stage in `final` mode that depends only on `kotlin.compile`;
+- constrained CLI checks with optional arguments and timeout, expected exit code, and at least one stdout or stderr assertion.
+
+The importer rejects packages, multi-file task shapes, alternate entrypoints,
+non-empty rules, authored commands, validation links, runtime stages in live
+mode, missing compile dependencies, and exit-code-only checks. Live validation
+returns structured Kotlin compiler diagnostics without completing the task.
+Submit compiles again, runs the fixed `MainKt` path, and produces the
+authoritative result. The interactive sandbox exposes `kotlin-run`, which
+compiles and runs the current `Main.kt` without downloads. Gradle projects,
+external dependencies, compiler plugins, custom classpaths, and authored shell
+commands are outside this Beginner profile.
+
+### PHP live-static tasks
+
+Beginner PHP sandbox tasks may advertise live validation when their
+`ValidationContractV1` contains a `php.core` stage in `live` or `both` mode.
+The engine performs syntax, token, and structural checks without executing
+student code, so it can return structured editor feedback safely. Use
+`PHP_BASIC_SCRIPT`, a PHP-compatible runtime profile such as the reference
+`php-8.2` profile, and target the exact `.php` starter file.
+
+Output, HTTP, or other behavioral execution remains a final-only concern and
+belongs in a separate runtime stage. A common task shape is `php.core` in
+`live` or `both` mode followed by a runtime stage in `final` mode. The importer
+rejects `supports_live_validation: true` when every `php.core` stage is
+final-only, even if another stage in the same composite can run live. Existing
+legacy PHP payloads retain their legacy validation path.
+
+Every stage dependency must be available in every request mode in which the
+dependent stage runs. In particular, a final runtime stage cannot depend on a
+live-only static stage; use `both` for the prerequisite so Submit can plan and
+execute the complete dependency chain.
+
+## Catalog hierarchy
+
+The optional `catalog` block preserves the course path above `Course`:
+
+```text
+Track -> Level -> Course Group -> Course
+```
+
+Existing v1 manifests without `catalog` remain valid. Knowledge Tree exporters
+should include the block whenever they deploy a course so the importer can
+create or update the three catalog entities and their ordered relations:
+
+```json
+{
+  "catalog": {
+    "track_order": 8,
+    "track": {
+      "source_key": "knowledge-tree.programming-languages",
+      "slug": "programming-languages",
+      "status": 1,
+      "translations": {
+        "ru": { "title": "Языки программирования", "description": "..." },
+        "en": { "title": "Programming languages", "description": "..." }
+      }
+    },
+    "level": {
+      "source_key": "knowledge-tree.programming-languages.beginner",
+      "slug": "beginner",
+      "status": 1,
+      "order": 1,
+      "translations": {
+        "ru": { "title": "Beginner", "description": "..." },
+        "en": { "title": "Beginner", "description": "..." }
+      }
+    },
+    "course_group": {
+      "source_key": "knowledge-tree.programming-languages.beginner.language-cores",
+      "slug": "language-cores",
+      "status": 1,
+      "order": 1,
+      "translations": {
+        "ru": { "title": "Основы языков", "description": "..." },
+        "en": { "title": "Language cores", "description": "..." }
+      }
+    },
+    "course_order": 1
+  }
+}
+```
+
+`track_order` is the global top-level Track position. `level.order`,
+`course_group.order`, and `course_order` are the child orders in their
+respective parent relations. `track_order` is optional only for backward
+compatibility with older v1 manifests; current exporters should always emit it.
+Catalog entities are shared between
+per-course manifests. The importer therefore upserts only the declared path; it
+does not bulk-replace a parent's other children. A relation-order collision
+below Track stops the deployment instead of deleting or silently reordering
+content owned by another manifest. Because Track rows are delivered by separate
+course manifests, the producer must reject contradictory `track_order` values
+for the same source key and duplicate global positions across its deployment
+set before apply.
+
+Level slugs are scoped to their parent Track. For example,
+`foundation.beginner` and `programming-languages.beginner` are distinct Levels
+with stable source keys and UUIDs even though both use the slug `beginner`.
+Within one Track, linking two different Levels with the same slug is rejected.
+The importer performs its unmanaged-slug collision check with the Track filter,
+and the database enforces the same invariant when links or Level slugs change.
+
+All three catalog entities require stable `source_key` values and RU/EN
+translations. Additional translation keys are allowed when the language exists
+in the target service's `GET /i18n/list` response. This deliberately makes an
+exporter report missing Course Group localization instead of generating a lossy
+label from a slug.
+
+Tracks created outside the deployment contract may have a null global order.
+Track lists place imported ordered rows first and use stable source key, creation
+time, and UUID tie-breakers, so administrative and public reads remain
+deterministic while legacy rows sort last.
+
+## Task mapping
+
+| Knowledge Tree activity | Manifest task kind |
+| --- | --- |
+| `concept-check`, `scenario-check`, `code-output` with fixed options | `test` |
+| Put items into a canonical sequence | `ordering` |
+| Assign items to localized groups | `classification` |
+| Code implementation | `cli_programming` |
+| Fixing an existing program | `debug_fix` |
+| Inline lesson example | No task unless it must be run or assessed |
+
+`task_kind: "test"` is a single-choice assessment. It must contain 1 or more
+questions, every question must have 2–5 variants and exactly one correct
+variant. It is not a code acceptance test suite. Program acceptance checks
+belong in a coding task's `code_structure` contract.
+
+`task_kind: "ordering"` stores every item as a variant. Its authored `order`
+controls the initial display order and `correct_order` stores the unique,
+contiguous 1-based answer position. Each question declares `kind: "ordering"`
+and uses `code_structure_type_code: "TEST_ORDERING_BASIC"`.
+
+`task_kind: "classification"` stores 2–20 localized `groups` and assigns every
+variant with `group_source_key`. Every group must receive at least one item.
+Each question declares `kind: "classification"` and uses
+`code_structure_type_code: "TEST_CLASSIFICATION_BASIC"`.
+
+All assessment questions, groups, and variants require globally unique
+`source_key` values. The importer derives their UUIDs from those keys, so a
+second delivery updates the same rows. The public task endpoint returns item
+text and classification group labels but omits `is_correct`, `correct_order`,
+`group_id`, and `group_source_key`. Admin and internal task reads return those
+answer fields for downstream evaluation. Rendering and evaluating the answer
+payload remain the responsibility of `ms-go-student`; this service preserves
+the first-class contract without converting it to single choice.
+See the [structured assessment contract](structured-assessment-contract.md)
+for trusted/public response boundaries and downstream identity rules.
+
+## Required task fields
+
+All tasks explicitly set execution, evaluation, UI, submission, and sandbox
+capabilities. For `test`, `ordering`, and `classification`, they must be:
+
+```json
+{
+  "execution_mode": "NO_RUN",
+  "evaluation_mode": "AUTO",
+  "ui_mode": "QUIZ",
+  "submission_mode": "ANSWER_PAYLOAD",
+  "requires_sandbox": false,
+  "exposes_preview": false,
+  "exposes_terminal": false,
+  "supports_live_validation": false
+}
+```
+
+Coding tasks require a real `code_structure` validation contract. A contract
+that only lists starter files is rejected by `ms-go-course`; starter code must
+also fail the acceptance rules before a student changes it.
+
+Sandbox coding tasks additionally require a compatible runtime profile as
+described above. There is no implicit default Node environment.
+
+`starter_files` accepts text `content` or binary `content_base64`. When present,
+the importer packages the files and uploads the archive after the task is
+created or updated.
+
+See [the technology-specific example manifest](../db/manifests/knowledge-task-manifest.example.json).

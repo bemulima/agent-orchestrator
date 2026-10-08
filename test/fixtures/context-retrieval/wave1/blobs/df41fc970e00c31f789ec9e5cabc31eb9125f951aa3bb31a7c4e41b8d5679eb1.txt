@@ -1,0 +1,707 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	dialogclient "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	teacherhttp "github.com/bemulima/ms-go-teacher-agent/internal/transport/http"
+	adminhandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/admin/v1/handlers"
+	apihandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/private/handlers"
+	dialogevents "github.com/bemulima/ms-go-teacher-agent/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+)
+
+// This finite composed proof requires ROOT's fresh, migrated Teacher and Dialog
+// databases and dedicated JetStream. It never starts providers or migrates DBs.
+// Runtime reconstruction is in-process; generator/soul/overview are named safe
+// fixtures. No real LLM, JWT, browser, or OS-process-restart claim is made.
+func TestT15DenseActualNATSDialogChain(t *testing.T) {
+	if os.Getenv("T15_COMPOSED") != "true" {
+		t.Skip("T15_COMPOSED=true requires ROOT-owned disposable PG/Dialog/NATS")
+	}
+	for _, key := range []string{"TEACHER_TEST_DATABASE_URL", "NATS_URL", "T15_DIALOG_READY_FILE", "T15_DIALOG_TOKEN", "T15_CHAIN_RESULT_FILE"} {
+		if strings.TrimSpace(os.Getenv(key)) == "" {
+			t.Fatalf("SETUP: required configuration missing: %s", key)
+		}
+	}
+	t15RequireLoopback(t, os.Getenv("NATS_URL"), "nats")
+	var ready struct {
+		ControlURL string `json:"control_url"`
+	}
+	t14ChainRead(t, os.Getenv("T15_DIALOG_READY_FILE"), &ready)
+	t15RequireLoopback(t, ready.ControlURL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	pool := teacherDecisionIntegrationPool(t)
+	var existing int
+	if pool.QueryRow(ctx, `SELECT count(*) FROM teacher_dialog_job`).Scan(&existing) != nil || existing != 0 {
+		t.Fatal("SETUP: composed harness requires empty ROOT-owned Teacher job database")
+	}
+	h := &t15Chain{t: t, ctx: ctx, pool: pool, control: ready.ControlURL, token: os.Getenv("T15_DIALOG_TOKEN"), http: &http.Client{Timeout: 4 * time.Second}}
+	ledger := &t15IntakeLedger{calls: map[string]int{}, accepted: map[string]int{}, duplicates: map[string]int{}, failOnce: true, postCommitNAK: make(chan struct{}, 1)}
+	var conn *nats.Conn
+	connect := func() {
+		t.Helper()
+		var err error
+		conn, err = nats.Connect(os.Getenv("NATS_URL"), nats.Timeout(4*time.Second), nats.NoReconnect())
+		if err != nil {
+			t.Fatal("SETUP: dedicated JetStream connection unavailable")
+		}
+		intake := teacherdialog.Intake{Jobs: TeacherDialogJobRepository{Pool: pool}, Clock: t14ChainClock{}}
+		subscriber := dialogevents.DialogTeacherRequestedSubscriber{Conn: conn, AckWait: time.Second, RetryDelay: 750 * time.Millisecond,
+			Handler: func(c context.Context, request domain.DialogTeacherRequest) (bool, error) {
+				ledger.mu.Lock()
+				ledger.calls[request.EventID]++
+				if ledger.failOnce {
+					ledger.failOnce = false
+					ledger.transientFailures++
+					ledger.mu.Unlock()
+					return false, errors.New("t15_named_intake_before_accept_transient")
+				}
+				ledger.mu.Unlock()
+				accepted, err := intake.Handle(c, request)
+				if err == nil {
+					ledger.mu.Lock()
+					if accepted {
+						ledger.accepted[request.EventID]++
+					} else {
+						ledger.duplicates[request.EventID]++
+					}
+					if accepted && request.SourceMessageID == ledger.postCommitSource {
+						ledger.postCommitSource = ""
+						ledger.postCommitFailures++
+						ledger.postCommitNAK <- struct{}{}
+						ledger.mu.Unlock()
+						return false, errors.New("t15_named_intake_after_accept_transient")
+					}
+					ledger.mu.Unlock()
+				}
+				return accepted, err
+			}}
+		if subscriber.Subscribe(ctx) != nil {
+			t.Fatal("SETUP: production NATS subscriber registration failed")
+		}
+	}
+	connect()
+	t.Cleanup(func() { conn.Close() })
+	ack := func(request domain.DialogTeacherRequest) {
+		t.Helper()
+		t15Await(t, ctx, "durable intake and actual JetStream ACK", func() bool {
+			ledger.mu.Lock()
+			accepted := ledger.accepted[request.EventID] == 1
+			ledger.mu.Unlock()
+			js, e := conn.JetStream()
+			if e != nil {
+				return false
+			}
+			info, e := js.ConsumerInfo(dialogevents.DialogEventsStream, dialogevents.DialogRequestConsumerDurable)
+			return e == nil && accepted && info.NumAckPending == 0 && info.NumPending == 0
+		})
+		var count int
+		if pool.QueryRow(ctx, `SELECT count(*) FROM teacher_dialog_job WHERE event_id=$1`, request.EventID).Scan(&count) != nil || count != 1 {
+			t.Fatal("durable intake does not contain exactly one actual source job")
+		}
+	}
+	generator := &t15BoundedGeneratorFixture{calls: map[string]int{}, successes: map[string]int{}, failOnce: map[string]bool{}, poison: map[string]bool{}}
+	allRequests := []domain.DialogTeacherRequest{}
+	// Two separate actual V1 producers exercise both consumer configurations.
+	matrix := []map[string]any{}
+	for _, consumerDense := range []bool{false, true} {
+		lane := h.lane(false)
+		source := h.source(lane)
+		if !consumerDense {
+			ledger.mu.Lock()
+			ledger.postCommitSource = source
+			ledger.mu.Unlock()
+		}
+		r := h.publish(lane, source, 0)
+		if !consumerDense {
+			select {
+			case <-ledger.postCommitNAK:
+			case <-time.After(12 * time.Second):
+				t.Fatal("bounded post-PG-commit NAK stage timed out")
+			}
+			// Barrier waits for the production callback to finish its actual
+			// NakWithDelay; Flush then confirms the protocol write reached NATS.
+			callbackFinished := make(chan struct{})
+			if conn.Barrier(func() { close(callbackFinished) }) != nil {
+				t.Fatal("production subscriber callback barrier unavailable")
+			}
+			select {
+			case <-callbackFinished:
+			case <-time.After(4 * time.Second):
+				t.Fatal("bounded production NAK callback barrier timed out")
+			}
+			if conn.FlushTimeout(4*time.Second) != nil {
+				t.Fatal("actual production NAK protocol flush failed")
+			}
+			conn.Close()
+			connect() // same durable; actual pending redelivery verifies PG duplicate
+		}
+		allRequests = append(allRequests, r)
+		ack(r)
+		h.process(lane, consumerDense, generator, true)
+		h.delivered(lane, r, generator, 1)
+		matrix = append(matrix, map[string]any{"producer_dense": false, "consumer_dense": consumerDense, "source_schema": r.SchemaVersion, "delivered": true})
+	}
+	ledger.mu.Lock()
+	faults := ledger.transientFailures
+	ledger.mu.Unlock()
+	if faults != 1 {
+		t.Fatal("named pre-accept intake transient did not run exactly once")
+	}
+	// V2 acceptance is independent of the consumer flag; readiness diagnoses
+	// the durable backlog through the actual protected root HealthHandler.
+	offLane := h.lane(true)
+	offRequest := h.publish(offLane, h.source(offLane), 1)
+	allRequests = append(allRequests, offRequest)
+	ack(offRequest)
+	h.process(offLane, false, generator, false)
+	offRepo := TeacherDialogJobRepository{Pool: pool, DenseOrderingEnabled: false}
+	cause := offRepo.CheckDenseOrderingReadiness(ctx)
+	if cause == nil || cause.Error() != "dense_teacher_ordering_disabled_with_pending_v2" {
+		t.Fatal("flag-off V2 backlog lacks bounded readiness cause")
+	}
+	health := httptest.NewServer(teacherhttp.NewRouter(teacherhttp.RouterDependencies{APIPersonalTeacher: &apihandlers.PersonalTeacherHandler{}, APITeacherDialog: &apihandlers.TeacherDialogHandler{}, AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{}, PrivateHealth: &privatehandlers.HealthHandler{Ready: func(c context.Context) error {
+		if e := pool.Ping(c); e != nil {
+			return e
+		}
+		return offRepo.CheckDenseOrderingReadiness(c)
+	}, ReadinessFailureCode: func(err error) string {
+		if errors.Is(err, ErrDenseTeacherOrderingDisabledWithPendingV2) {
+			return "dense_teacher_ordering_disabled_with_pending_v2"
+		}
+		return ""
+	}}, InternalToken: h.token}))
+	t.Cleanup(health.Close)
+	var readiness struct {
+		Status string `json:"status"`
+		Code   string `json:"error_code"`
+	}
+	h.call(http.MethodGet, health.URL+"/internal/readyz", nil, h.token, nil, 503, &readiness)
+	if readiness.Status != "not ready" || readiness.Code != cause.Error() {
+		t.Fatal("protected readiness did not expose only the bounded known failure code")
+	}
+	h.call(http.MethodGet, health.URL+"/internal/readyz", nil, "", nil, 403, nil)
+	h.call(http.MethodGet, health.URL+"/internal/readyz", nil, "t15-wrong-token", nil, 403, nil)
+	h.process(offLane, true, generator, true)
+	h.delivered(offLane, offRequest, generator, 1)
+	h.call(http.MethodGet, health.URL+"/internal/readyz", nil, h.token, nil, 200, nil)
+	matrix = append(matrix, map[string]any{"producer_dense": true, "consumer_dense": false, "source_schema": offRequest.SchemaVersion, "durably_accepted": true, "not_claimed": true, "protected_readiness": 503, "cause": cause.Error(), "enabled_reconstruction_drained": true})
+	// Reverse actual outbox publication, not fabricated requests: turn 2 must
+	// exist durably but cannot be claimed while turn 1 has not arrived.
+	dense := h.lane(true)
+	firstSource, secondSource := h.source(dense), h.source(dense)
+	second := h.publish(dense, secondSource, 2)
+	allRequests = append(allRequests, second)
+	ack(second)
+	h.process(dense, true, generator, false)
+	h.cursor(dense, 1)
+	first := h.publish(dense, firstSource, 1)
+	allRequests = append(allRequests, first)
+	ack(first)
+	jobs := TeacherDialogJobRepository{Pool: pool, DenseOrderingEnabled: true}
+	now := time.Now().UTC()
+	leased, claimed, e := jobs.Claim(ctx, repository.TeacherDialogClaim{ClaimToken: uuid.NewString(), WorkerID: "t15-expiring-lease", Now: now, LockedUntil: now.Add(150 * time.Millisecond)})
+	if e != nil || !claimed || leased.Request.EventID != first.EventID {
+		t.Fatal("lease fixture did not claim actual dense turn 1")
+	}
+	h.process(dense, true, generator, false)
+	h.cursor(dense, 1)
+	t15Await(t, ctx, "actual claim lease expiry", func() bool {
+		var expired bool
+		return pool.QueryRow(ctx, `SELECT locked_until<=now() FROM teacher_dialog_job WHERE event_id=$1`, first.EventID).Scan(&expired) == nil && expired
+	})
+	generator.failOnce[first.EventID] = true
+	h.processFailure(dense, generator, "generation outage retry")
+	h.cursor(dense, 1)
+	if !errors.Is(jobs.RenewLease(ctx, first.EventID, leased.ClaimToken, time.Now().UTC(), time.Now().UTC().Add(time.Minute)), domain.ErrTeacherDialogLeaseLost) {
+		t.Fatal("expired/replaced claim token retained lease authority")
+	}
+	h.due(first)
+	h.call(http.MethodPost, h.control+"/__t15/append-cut", map[string]bool{"enabled": true}, h.token, nil, 200, nil)
+	h.processFailure(dense, generator, "committed append response cut")
+	h.cursor(dense, 1)
+	cut := h.inspect(dense)
+	if cut.AssistantCount != 1 || cut.AppendCutCount != 1 || len(cut.Replies) != 1 || cut.Replies[0].Key != first.EventID || cut.Replies[0].SHA256 != t14Hash(t15FixtureReply) {
+		t.Fatal("append response cut lacks one actual committed exact reply")
+	}
+	var pendingBody string
+	var pendingStatus, decisionBefore string
+	if pool.QueryRow(ctx, `SELECT status,response_body,decision_id::text FROM teacher_dialog_job WHERE event_id=$1`, first.EventID).Scan(&pendingStatus, &pendingBody, &decisionBefore) != nil || pendingStatus != "delivery_pending" || pendingBody != t15FixtureReply || decisionBefore == "" {
+		t.Fatal("append ambiguity did not preserve exact pending response and decision")
+	}
+	h.due(first)
+	h.process(dense, true, generator, true)
+	h.delivered(dense, first, generator, 1)
+	var decisionAfter string
+	if pool.QueryRow(ctx, `SELECT decision_id::text FROM teacher_dialog_job WHERE event_id=$1`, first.EventID).Scan(&decisionAfter) != nil || decisionAfter != decisionBefore || generator.calls[first.EventID] != 2 {
+		t.Fatal("exact cached delivery retry replaced its decision or regenerated after append ambiguity")
+	}
+	h.cursor(dense, 2)
+	h.process(dense, true, generator, true)
+	h.delivered(dense, second, generator, 1)
+	h.cursor(dense, 3)
+	ordered := h.inspect(dense)
+	if len(ordered.Replies) != 2 || ordered.Replies[0].Key != first.EventID || ordered.Replies[1].Key != second.EventID || ordered.Replies[0].ID != cut.Replies[0].ID {
+		t.Fatal("dense order or committed append identity changed during recovery")
+	}
+	matrix = append(matrix, map[string]any{"producer_dense": true, "consumer_dense": true, "source_schema": first.SchemaVersion, "arrival": []int{2, 1}, "reply_order": []int{1, 2}})
+	// Replay actual PG outbox through actual Dispatcher. Its first real publish
+	// commits to JetStream before a named lost-ACK fixture returns failure.
+	beforeReplay := h.snapshot(dense)
+	jsDense, err := conn.JetStream()
+	if err != nil {
+		t.Fatal("actual dense source replay ledger unavailable")
+	}
+	denseLastBefore, err := jsDense.GetLastMsg(dialogevents.DialogEventsStream, domain.SubjectDialogTeacherRequested)
+	if err != nil {
+		t.Fatal("actual dense source replay event absent")
+	}
+	if !reflect.DeepEqual(first, h.publish(dense, firstSource, 1)) || !reflect.DeepEqual(second, h.publish(dense, secondSource, 2)) {
+		t.Fatal("replayed actual PG outbox source envelope changed")
+	}
+	denseLastAfter, err := jsDense.GetLastMsg(dialogevents.DialogEventsStream, domain.SubjectDialogTeacherRequested)
+	if err != nil || denseLastAfter.Sequence != denseLastBefore.Sequence || !reflect.DeepEqual(beforeReplay, h.snapshot(dense)) {
+		t.Fatal("actual JetStream duplicate dense source replay changed stream or durable Teacher facts")
+	}
+	dispatchLane := h.lane(true)
+	dispatchSource := h.source(dispatchLane)
+	var dispatch struct {
+		Failed  int    `json:"failed"`
+		Lost    int    `json:"lost_publish_reply_count"`
+		EventID string `json:"lost_event_id"`
+	}
+	h.call(http.MethodPost, h.control+"/__t15/dispatch", map[string]bool{"lose_publish_reply_once": true}, h.token, nil, 200, &dispatch)
+	if dispatch.Failed != 1 || dispatch.Lost != 1 || dispatch.EventID == "" {
+		t.Fatal("actual Dispatcher lost publish acknowledgement fixture did not retain pending source")
+	}
+	retained := false
+	for _, row := range h.inspect(dispatchLane).Outbox {
+		if row.ID == dispatch.EventID && !row.Published && row.Attempts == 1 {
+			retained = true
+		}
+	}
+	if !retained {
+		t.Fatal("actual ambiguous Dispatcher publish did not retain exact PG source pending")
+	}
+	jsBeforeRetry, err := conn.JetStream()
+	if err != nil {
+		t.Fatal("actual JetStream replay ledger unavailable")
+	}
+	lastBeforeRetry, err := jsBeforeRetry.GetLastMsg(dialogevents.DialogEventsStream, domain.SubjectDialogTeacherRequested)
+	if err != nil {
+		t.Fatal("actual JetStream published teacher source absent")
+	}
+	t15Await(t, ctx, "actual Dispatcher scheduled replay", func() bool {
+		h.call(http.MethodPost, h.control+"/__t15/dispatch", map[string]bool{"lose_publish_reply_once": false}, h.token, nil, 200, nil)
+		for _, l := range h.lanes {
+			for _, row := range h.inspect(l).Outbox {
+				if !row.Published {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	ack(first)
+	ack(second)
+	if !reflect.DeepEqual(beforeReplay, h.snapshot(dense)) {
+		t.Fatal("Dispatcher duplicate replay changed Teacher terminal facts")
+	}
+	lastAfterRetry, e := jsBeforeRetry.GetLastMsg(dialogevents.DialogEventsStream, domain.SubjectDialogTeacherRequested)
+	if e != nil || lastAfterRetry.Sequence != lastBeforeRetry.Sequence {
+		t.Fatal("actual JetStream Msg-ID retry did not deduplicate stored teacher event")
+	}
+	dispatchRequest := h.publish(dispatchLane, dispatchSource, 1)
+	if dispatchRequest.EventID != dispatch.EventID {
+		t.Fatal("actual Dispatcher ambiguous event differs from stored source identity")
+	}
+	allRequests = append(allRequests, dispatchRequest)
+	ack(dispatchRequest)
+	h.process(dispatchLane, true, generator, true)
+	h.delivered(dispatchLane, dispatchRequest, generator, 1)
+	h.cursor(dispatchLane, 2)
+	h.process(dense, true, generator, false)
+	if !reflect.DeepEqual(beforeReplay, h.snapshot(dense)) || !reflect.DeepEqual(ordered.Replies, h.inspect(dense).Replies) {
+		t.Fatal("runtime reconstruction/replay changed cursor, outcomes, decisions or exact replies")
+	}
+	ledger.mu.Lock()
+	postCommitFailures := ledger.postCommitFailures
+	restartDuplicates := ledger.duplicates[allRequests[0].EventID]
+	ledger.mu.Unlock()
+	if postCommitFailures != 1 || restartDuplicates < 1 {
+		t.Fatal("preserved-durable subscriber reconstruction did not verify actual PG duplicate")
+	}
+	// A permanent named generation poison blocks only its own dense dialog.
+	// No timeout/no-effect proof is invented and no operator mutation is made.
+	poisonLane := h.lane(true)
+	p1 := h.publish(poisonLane, h.source(poisonLane), 1)
+	ack(p1)
+	p2 := h.publish(poisonLane, h.source(poisonLane), 2)
+	ack(p2)
+	allRequests = append(allRequests, p1, p2)
+	generator.poison[p1.EventID] = true
+	h.processFailure(poisonLane, generator, "permanent generation poison")
+	h.cursor(poisonLane, 1)
+	h.process(poisonLane, true, generator, false)
+	var poisonStatus string
+	if pool.QueryRow(ctx, `SELECT status FROM teacher_dialog_job WHERE event_id=$1`, p1.EventID).Scan(&poisonStatus) != nil || poisonStatus != "blocked" || h.inspect(poisonLane).AssistantCount != 0 || generator.calls[p2.EventID] != 0 {
+		t.Fatal("poison turn was skipped or produced downstream reply")
+	}
+	independent := h.lane(true)
+	i1 := h.publish(independent, h.source(independent), 1)
+	allRequests = append(allRequests, i1)
+	ack(i1)
+	h.process(independent, true, generator, true)
+	h.delivered(independent, i1, generator, 1)
+	h.cursor(independent, 2)
+	h.cursor(poisonLane, 1)
+	// Negative authentication uses real registered Dialog reader/append routes.
+	badClient := dialogclient.Client{BaseURL: dense.URL, InternalToken: "t15-wrong-token", HTTPClient: h.http}
+	if _, e := badClient.GetTeacherRequestContext(ctx, first, 0); e == nil {
+		t.Fatal("actual Dialog request context accepted wrong private token")
+	}
+	if _, e := badClient.AppendTeacherResponse(ctx, first, first.EventID, t15FixtureReply); e == nil {
+		t.Fatal("actual Dialog append accepted wrong private token")
+	}
+	if !reflect.DeepEqual(ordered.Replies, h.inspect(dense).Replies) {
+		t.Fatal("wrong-token negative changed actual Dialog replies")
+	}
+	safeSources := []map[string]any{}
+	ledger.mu.Lock()
+	for _, r := range allRequests {
+		if ledger.accepted[r.EventID] != 1 {
+			ledger.mu.Unlock()
+			t.Fatal("actual source accepted more or less than once")
+		}
+		safeSources = append(safeSources, map[string]any{"event_id": r.EventID, "source_message_id": r.SourceMessageID, "dialog_id": r.DialogID, "schema": r.SchemaVersion, "teacher_turn_sequence": r.TeacherTurnSequence, "intake_calls": ledger.calls[r.EventID], "accepted": ledger.accepted[r.EventID], "verified_duplicates": ledger.duplicates[r.EventID], "generator_calls": generator.calls[r.EventID], "generation_successes": generator.successes[r.EventID]})
+	}
+	ledger.mu.Unlock()
+	t14ChainWrite(t, os.Getenv("T15_CHAIN_RESULT_FILE"), map[string]any{"classification": "actual Dialog registered HTTP/PG transactional outbox/Dispatcher/JetStream; production Teacher subscriber/decoder/intake/PG claims/Worker/production Dialog reader-appender; named bounded generation/default soul/empty overview fixtures", "matrix": matrix, "source_facts": safeSources, "pre_accept_transient_NAK_then_ACK": faults, "actual_ack_ledger_drained": true, "lease_expiry_and_stale_token_fenced": true, "generation_outage_cursor_unchanged": true, "append_commit_response_cut_exact_retry": true, "append_cut_count": cut.AppendCutCount, "reply_body_sha256": t14Hash(t15FixtureReply), "dense_terminal_snapshot": beforeReplay, "dense_both_source_replays_jetstream_deduplicated": true, "dispatcher_lost_publish_reply_count": dispatch.Lost, "dispatcher_replay_terminal_facts_unchanged": true, "reconstructed_subscriber_same_durable_actual_pending_redelivery": true, "post_commit_NAK_failures": postCommitFailures, "restart_verified_duplicates": restartDuplicates, "jetstream_teacher_last_sequence_before_after_retry": lastBeforeRetry.Sequence, "dispatcher_lost_event_id": dispatch.EventID, "poison_cursor": 1, "poison_second_generation_calls": generator.calls[p2.EventID], "independent_dialog_delivered": true, "poison_recovery_policy": "BLOCKED_ARCHITECTURE: no authorized operator skip/no-effect proof for unknown poison; demonstrated blocked cursor and independent progress", "wrong_auth_rejected": true, "limitations": []string{"no full E2E", "no JWT/browser", "no real LLM", "in-process reconstruction only; no OS restart"}})
+}
+
+type t15Lane struct {
+	URL       string `json:"url"`
+	StudentID string `json:"student_id"`
+	TeacherID string `json:"personal_teacher_id"`
+	DialogID  string `json:"dialog_id"`
+	SpaceID   string `json:"space_id"`
+}
+type t15Inspection struct {
+	AssistantCount int `json:"assistant_count"`
+	AppendCutCount int `json:"append_cut_count"`
+	Replies        []struct {
+		ID     string `json:"id"`
+		Key    string `json:"key"`
+		SHA256 string `json:"sha256"`
+	} `json:"replies"`
+	Outbox []struct {
+		ID        string `json:"id"`
+		Published bool   `json:"published"`
+		Attempts  int    `json:"attempts"`
+	} `json:"outbox"`
+}
+type t15Chain struct {
+	t              *testing.T
+	ctx            context.Context
+	pool           *pgxpool.Pool
+	control, token string
+	http           *http.Client
+	lanes          []t15Lane
+}
+
+func (h *t15Chain) call(method, endpoint string, body any, token string, headers map[string]string, status int, out any) {
+	h.t.Helper()
+	var encoded []byte
+	var e error
+	if body != nil {
+		encoded, e = json.Marshal(body)
+	}
+	if e != nil {
+		h.t.Fatal("control request encoding failed")
+	}
+	req, e := http.NewRequestWithContext(h.ctx, method, endpoint, bytes.NewReader(encoded))
+	if e != nil {
+		h.t.Fatal("control request construction failed")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Token", token)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, e := h.http.Do(req)
+	if e != nil {
+		h.t.Fatal("actual HTTP stage unavailable")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != status {
+		h.t.Fatalf("actual HTTP status assertion: method=%s wanted=%d got=%d", method, status, resp.StatusCode)
+	}
+	if out != nil && json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out) != nil {
+		h.t.Fatal("bounded HTTP metadata decoding failed")
+	}
+}
+
+func (h *t15Chain) lane(dense bool) t15Lane {
+	h.t.Helper()
+	var l t15Lane
+	h.call(http.MethodPost, h.control+"/__t15/lanes", map[string]bool{"dense": dense}, h.token, nil, 200, &l)
+	t15RequireLoopback(h.t, l.URL, "http")
+	for _, id := range []string{l.StudentID, l.TeacherID, l.DialogID, l.SpaceID} {
+		if _, e := uuid.Parse(id); e != nil {
+			h.t.Fatal("lane metadata lacks exact UUID identities")
+		}
+	}
+	now := time.Now().UTC()
+	_, e := h.pool.Exec(h.ctx, `INSERT INTO personal_teacher(id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,version,created_at,updated_at) VALUES($1,$2,'t15-fixture','ru','adaptive','adaptive','progressive','balanced',1,$3,$3)`, l.TeacherID, l.StudentID, now)
+	if e != nil {
+		h.t.Fatal("SETUP: owned synthetic Teacher identity persistence failed")
+	}
+	h.lanes = append(h.lanes, l)
+	h.t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Exact owned identities only. Null cyclic terminal references before
+		// deleting this lane's outcome/proof/job rows; never broad shared cleanup.
+		for _, query := range []string{
+			`UPDATE teacher_dialog_job SET status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,response_body=NULL,delivered_message_id=NULL,teacher_response_message_id=NULL,delivered_at=NULL,terminal_outcome=NULL,reconciliation_state=NULL,no_effect_proof_id=NULL,recoverable_outcome_id=NULL,error_code='t15_owned_cleanup' WHERE personal_teacher_id=$1`,
+			`DELETE FROM teacher_dialog_turn_outcome WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`,
+			`DELETE FROM teacher_dialog_turn_proof WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`,
+			`DELETE FROM teacher_dialog_turn_cursor WHERE dialog_id IN (SELECT dialog_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`,
+			`DELETE FROM teacher_dialog_job WHERE personal_teacher_id=$1`,
+			`DELETE FROM teacher_outbox WHERE student_id IN (SELECT student_id FROM personal_teacher WHERE id=$1)`,
+			`DELETE FROM teacher_decision WHERE personal_teacher_id=$1`,
+			`DELETE FROM personal_teacher WHERE id=$1`,
+		} {
+			if _, e := h.pool.Exec(c, query, l.TeacherID); e != nil {
+				h.t.Error("owned Teacher fixture cleanup failed")
+			}
+		}
+	})
+	return l
+}
+
+func (h *t15Chain) source(l t15Lane) string {
+	h.t.Helper()
+	var result struct {
+		ID string `json:"id"`
+	}
+	h.call(http.MethodPost, l.URL+"/api/v1/message/create", map[string]string{"dialog_id": l.DialogID, "body": "Please explain the boundary condition before changing it.", "idempotency_key": uuid.NewString()}, "", map[string]string{"X-User-ID": l.StudentID, "X-User-Role": "STUDENT"}, 201, &result)
+	if _, e := uuid.Parse(result.ID); e != nil {
+		h.t.Fatal("actual Dialog source creation lacks stored message ID")
+	}
+	return result.ID
+}
+
+func (h *t15Chain) publish(l t15Lane, sourceID string, sequence int) domain.DialogTeacherRequest {
+	h.t.Helper()
+	input := map[string]any{"dialog_id": l.DialogID}
+	if sequence > 0 {
+		input["teacher_turn_sequence"] = sequence
+	} else {
+		input["source_message_id"] = sourceID
+	}
+	var result struct {
+		EventID string          `json:"event_id"`
+		Payload json.RawMessage `json:"event_payload"`
+	}
+	h.call(http.MethodPost, h.control+"/__t15/publish", input, h.token, nil, 200, &result)
+	r, e := dialogevents.DecodeDialogTeacherRequested(result.Payload)
+	if e != nil || r.EventID != result.EventID || r.DialogID != l.DialogID || r.StudentID != l.StudentID || r.PersonalTeacherID != l.TeacherID || r.SourceMessageID != sourceID || r.TeacherTurnSequence != int64(sequence) || (sequence == 0 && r.SchemaVersion != 1) || (sequence > 0 && r.SchemaVersion != 2) {
+		h.t.Fatal("actual stored source envelope identities/schema differ")
+	}
+	return r
+}
+
+func (h *t15Chain) worker(l t15Lane, dense bool, g *t15BoundedGeneratorFixture) teacherdialog.Worker {
+	h.t.Helper()
+	soul, e := domain.NewTeacherSoul(l.TeacherID, l.StudentID, domain.DefaultTeacherSoulSettings(), time.Now().UTC())
+	if e != nil {
+		h.t.Fatal("declared default soul fixture invalid")
+	}
+	pedagogy, e := teacherdialog.NewPedagogyRegistry(domain.DefaultPedagogyMethodCode, teacherdialog.ProgressiveHintMethod{})
+	if e != nil {
+		h.t.Fatal("production pedagogy registry unavailable")
+	}
+	dc := dialogclient.Client{BaseURL: l.URL, InternalToken: h.token, HTTPClient: h.http}
+	return teacherdialog.Worker{Jobs: TeacherDialogJobRepository{Pool: h.pool, DenseOrderingEnabled: dense}, Teachers: t14PGTeacherReader{Repo: PersonalTeacherRepository{Pool: h.pool}}, Souls: t14DefaultSoulFixture{Soul: soul}, StudentContext: t14EmptyLearnerOverviewFixture{}, PromptContext: teacherdialog.ContextBuilder{}, DialogReader: dc, DialogAppender: dc, Decisions: TeacherDecisionRepository{Pool: h.pool}, Pedagogy: pedagogy, Generator: g, IDs: t13IDs{}, Clock: t14ChainClock{}, WorkerID: "t15-" + uuid.NewString(), LeaseTTL: 30 * time.Second, LeaseRenewInterval: 5 * time.Second, MaxAttempts: 5, RetryBaseDelay: 100 * time.Millisecond, RetryMaxDelay: 100 * time.Millisecond}
+}
+
+func (h *t15Chain) process(l t15Lane, dense bool, g *t15BoundedGeneratorFixture, wantClaim bool) {
+	h.t.Helper()
+	w := h.worker(l, dense, g)
+	claimed, e := w.ProcessNext(h.ctx)
+	if e != nil || claimed != wantClaim {
+		h.t.Fatalf("actual Worker claim stage wanted=%t got=%t error_present=%t", wantClaim, claimed, e != nil)
+	}
+}
+
+func (h *t15Chain) processFailure(l t15Lane, g *t15BoundedGeneratorFixture, stage string) {
+	h.t.Helper()
+	w := h.worker(l, true, g)
+	claimed, e := w.ProcessNext(h.ctx)
+	if !claimed || e == nil {
+		h.t.Fatalf("named failure stage=%s claimed=%t error_present=%t", stage, claimed, e != nil)
+	}
+}
+
+func (h *t15Chain) due(r domain.DialogTeacherRequest) {
+	h.t.Helper()
+	t15Await(h.t, h.ctx, "actual persisted retry due", func() bool {
+		var due bool
+		return h.pool.QueryRow(h.ctx, `SELECT next_attempt_at<=now() FROM teacher_dialog_job WHERE event_id=$1`, r.EventID).Scan(&due) == nil && due
+	})
+}
+
+func (h *t15Chain) cursor(l t15Lane, want int64) {
+	h.t.Helper()
+	c, e := (TeacherDialogJobRepository{Pool: h.pool}).GetCursor(h.ctx, l.DialogID)
+	if e != nil || c.NextTeacherTurnSequence != want {
+		h.t.Fatalf("actual cursor stage wanted=%d got=%d read_ok=%t", want, c.NextTeacherTurnSequence, e == nil)
+	}
+}
+
+func (h *t15Chain) inspect(l t15Lane) t15Inspection {
+	h.t.Helper()
+	var result t15Inspection
+	h.call(http.MethodGet, h.control+"/__t15/inspect?dialog_id="+url.QueryEscape(l.DialogID), nil, h.token, nil, 200, &result)
+	return result
+}
+
+func (h *t15Chain) delivered(l t15Lane, r domain.DialogTeacherRequest, g *t15BoundedGeneratorFixture, successes int) {
+	h.t.Helper()
+	var status, replyID, decisionID string
+	var cleared bool
+	var outcomes, decisions int
+	e := h.pool.QueryRow(h.ctx, `SELECT status,coalesce(delivered_message_id::text,''),coalesce(decision_id::text,''),response_body IS NULL,(SELECT count(*) FROM teacher_dialog_turn_outcome WHERE source_event_id=$1::uuid),(SELECT count(*) FROM teacher_decision WHERE causation_id=$1::text) FROM teacher_dialog_job WHERE event_id=$1::uuid`, r.EventID).Scan(&status, &replyID, &decisionID, &cleared, &outcomes, &decisions)
+	wantOutcomes := 0
+	if r.SchemaVersion == 2 {
+		wantOutcomes = 1
+	}
+	if e != nil || status != "delivered" || replyID == "" || decisionID == "" || !cleared || outcomes != wantOutcomes || decisions != 1 || g.successes[r.EventID] != successes {
+		h.t.Fatalf("actual delivered readback status=%s read_ok=%t response_cleared=%t outcomes=%d decisions=%d generation_successes=%d", status, e == nil, cleared, outcomes, decisions, g.successes[r.EventID])
+	}
+	matches := 0
+	for _, reply := range h.inspect(l).Replies {
+		if reply.ID == replyID && reply.Key == r.EventID && reply.SHA256 == t14Hash(t15FixtureReply) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		h.t.Fatal("actual Dialog lacks exactly one exact accepted reply")
+	}
+}
+
+// snapshot contains only bounded durable identities/counters, never bodies.
+func (h *t15Chain) snapshot(l t15Lane) map[string]any {
+	h.t.Helper()
+	var next, revision int64
+	var cursorEvent, cursorReply string
+	if h.pool.QueryRow(h.ctx, `SELECT next_teacher_turn_sequence,revision,last_source_event_id::text,last_teacher_response_message_id::text FROM teacher_dialog_turn_cursor WHERE dialog_id=$1`, l.DialogID).Scan(&next, &revision, &cursorEvent, &cursorReply) != nil {
+		h.t.Fatal("safe actual cursor snapshot read failed")
+	}
+	rows, e := h.pool.Query(h.ctx, `SELECT event_id::text,teacher_job_id::text,status,decision_id::text,delivered_message_id::text,terminal_outcome,response_body IS NULL,(SELECT count(*) FROM teacher_dialog_turn_outcome o WHERE o.source_event_id=j.event_id) FROM teacher_dialog_job j WHERE dialog_id=$1 ORDER BY teacher_turn_sequence`, l.DialogID)
+	if e != nil {
+		h.t.Fatal("safe actual terminal snapshot query failed")
+	}
+	defer rows.Close()
+	facts := []map[string]any{}
+	for rows.Next() {
+		var event, job, status, decision, reply, outcome string
+		var cleared bool
+		var outcomes int
+		if rows.Scan(&event, &job, &status, &decision, &reply, &outcome, &cleared, &outcomes) != nil {
+			h.t.Fatal("safe actual terminal snapshot decoding failed")
+		}
+		facts = append(facts, map[string]any{"event_id": event, "teacher_job_id": job, "status": status, "decision_id": decision, "reply_id": reply, "terminal_outcome": outcome, "response_cleared": cleared, "outcome_count": outcomes})
+	}
+	if rows.Err() != nil {
+		h.t.Fatal("safe actual terminal snapshot iteration failed")
+	}
+	return map[string]any{"next": next, "revision": revision, "last_event_id": cursorEvent, "last_reply_id": cursorReply, "jobs": facts}
+}
+
+type t15IntakeLedger struct {
+	mu                          sync.Mutex
+	calls, accepted, duplicates map[string]int
+	failOnce                    bool
+	transientFailures           int
+	postCommitSource            string
+	postCommitFailures          int
+	postCommitNAK               chan struct{}
+}
+
+const t15FixtureReply = "Inspect the boundary condition before changing the implementation."
+
+type t15BoundedGeneratorFixture struct {
+	calls, successes map[string]int
+	failOnce, poison map[string]bool
+}
+
+func (g *t15BoundedGeneratorFixture) Generate(_ context.Context, r domain.TeacherGenerationRequest) (domain.TeacherGeneratedResponse, error) {
+	g.calls[r.IdempotencyKey]++
+	if g.poison[r.IdempotencyKey] {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	if g.failOnce[r.IdempotencyKey] {
+		delete(g.failOnce, r.IdempotencyKey)
+		return domain.TeacherGeneratedResponse{}, domain.ErrTeacherGenerationUnavailable
+	}
+	g.successes[r.IdempotencyKey]++
+	now := time.Now().UTC()
+	return domain.TeacherGeneratedResponse{ExecutionID: uuid.NewString(), IdempotencyKey: r.IdempotencyKey, TemplateCode: domain.TeacherResponseTemplateCode, TemplateVersion: 1, ProviderCode: "t15-named-bounded-generator", ProviderModel: "synthetic", LanguageCode: r.LanguageCode, ResponseSchemaCode: domain.TeacherResponseSchemaCode, Body: t15FixtureReply, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, nil
+}
+
+func (g *t15BoundedGeneratorFixture) Replay(context.Context, string) (domain.TeacherGeneratedResponse, error) {
+	return domain.TeacherGeneratedResponse{}, errors.New("unexpected t15 generator fixture replay")
+}
+
+func t15Await(t *testing.T, ctx context.Context, stage string, predicate func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(12 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if predicate() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("bounded stage cancelled: %s", stage)
+		case <-deadline.C:
+			t.Fatalf("bounded stage timed out: %s", stage)
+		case <-ticker.C:
+		}
+	}
+}
+
+func t15RequireLoopback(t *testing.T, endpoint, scheme string) {
+	t.Helper()
+	u, e := url.Parse(endpoint)
+	if e != nil || u.Scheme != scheme || u.Port() == "" || u.User != nil || (u.Hostname() != "localhost" && !net.ParseIP(u.Hostname()).IsLoopback()) {
+		t.Fatal("SETUP: dedicated provider endpoint must use credential-free loopback URL")
+	}
+}

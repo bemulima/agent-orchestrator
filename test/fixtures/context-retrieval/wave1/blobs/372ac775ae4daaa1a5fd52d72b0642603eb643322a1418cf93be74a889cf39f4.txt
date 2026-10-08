@@ -1,0 +1,138 @@
+package postgres
+
+import (
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type onboardingDraftRowStub struct {
+	values []any
+}
+
+func (stub onboardingDraftRowStub) Scan(destinations ...any) error {
+	if len(destinations) != len(stub.values) {
+		return &onboardingDraftScanCountError{got: len(destinations), want: len(stub.values)}
+	}
+	for index, destination := range destinations {
+		target := reflect.ValueOf(destination)
+		if stub.values[index] == nil {
+			target.Elem().SetZero()
+			continue
+		}
+		target.Elem().Set(reflect.ValueOf(stub.values[index]))
+	}
+	return nil
+}
+
+type onboardingDraftScanCountError struct {
+	got  int
+	want int
+}
+
+func (err *onboardingDraftScanCountError) Error() string {
+	return "unexpected onboarding draft scan destination count"
+}
+
+func TestScanStudentOnboardingDraftPreservesAnsweredEmptyAndCompletedRedaction(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	emptyText := ""
+	emptyStacks := []string{}
+	active, err := scanStudentOnboardingDraft(onboardingDraftRowStub{values: []any{
+		"11111111-1111-4111-8111-111111111111", domain.StudentOnboardingDraftSchema,
+		domain.StudentOnboardingDraftStatusDraft, nil, nil, &emptyStacks, nil, nil, &emptyText,
+		nil, nil, nil, int64(1), nil, &now, &now, nil,
+	}})
+	if err != nil || active.KnownStacks == nil || len(*active.KnownStacks) != 0 ||
+		active.GoalText == nil || *active.GoalText != "" || active.DirectionCode != nil {
+		t.Fatalf("active draft scan lost answered/unanswered state: draft=%+v err=%v", active, err)
+	}
+
+	profileVersion := int64(2)
+	completed, err := scanStudentOnboardingDraft(onboardingDraftRowStub{values: []any{
+		"11111111-1111-4111-8111-111111111111", domain.StudentOnboardingDraftSchema,
+		domain.StudentOnboardingDraftStatusCompleted, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, int64(3), &profileVersion, &now, &now, &now,
+	}})
+	if err != nil || completed.Status != domain.StudentOnboardingDraftStatusCompleted ||
+		completed.DirectionCode != nil || completed.KnownStacks != nil || completed.CompletedProfileVersion == nil {
+		t.Fatalf("completed draft was not a redacted tombstone: draft=%+v err=%v", completed, err)
+	}
+}
+
+func TestOnboardingDraftValuesPreserveAnsweredEmptyArrayForPGX(t *testing.T) {
+	var empty []string
+	values := onboardingDraftValues(domain.StudentOnboardingDraft{
+		StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{KnownStacks: &empty},
+	})
+	known, ok := values[5].([]string)
+	if !ok || known == nil || len(known) != 0 {
+		t.Fatalf("known_stacks value=%#v, want concrete non-nil empty slice", values[5])
+	}
+	if values[6] != nil {
+		t.Fatalf("unanswered desired_stacks value=%#v, want nil", values[6])
+	}
+}
+
+func TestOnboardingDraftRepositoryKeepsCommandsAtomicAndReceiptsRequestMinimal(t *testing.T) {
+	repositorySource, err := os.ReadFile("student_onboarding_draft_repo_pg.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(repositorySource)
+	for _, required := range []string{
+		"defer func() { _ = tx.Rollback(ctx) }()",
+		"lockOnboardingDraftCommand(ctx, tx, command.RequestID, command.StudentID)",
+		"saveStudentOnboardingInTransaction(",
+		"status='COMPLETED', direction_code=NULL",
+		"SET response_json='{\"redacted\":true}'::jsonb",
+		"WHERE student_id=$1 AND command_kind='REPLACE'",
+		"insertOnboardingDraftReceipt(ctx, tx",
+		"tx.Commit(ctx)",
+		"if current.Status == domain.StudentOnboardingDraftStatusCompleted",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("onboarding draft transaction is missing %q", required)
+		}
+	}
+	finalizeStart := strings.Index(source, "func (repo *StudentOnboardingRepoPG) FinalizeDraft")
+	if finalizeStart < 0 {
+		t.Fatal("FinalizeDraft not found")
+	}
+	finalizeSource := source[finalizeStart:]
+	if receiptAt, stateAt := strings.Index(finalizeSource, "getOnboardingDraftReceipt"), strings.Index(finalizeSource, "getStudentOnboardingDraft"); receiptAt < 0 || stateAt < 0 || receiptAt > stateAt {
+		t.Fatal("finalize must replay a durable receipt before inspecting terminal draft state")
+	}
+
+	migrationSource, err := os.ReadFile("../../../../db/migrations/023_student_onboarding_draft.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration := string(migrationSource)
+	commandStart := strings.Index(migration, "CREATE TABLE IF NOT EXISTS student_onboarding_draft_command")
+	if commandStart < 0 || strings.Index(migration, "CREATE TABLE IF NOT EXISTS student_onboarding_draft") > commandStart {
+		t.Fatal("migration must create the draft before its receipt foreign key")
+	}
+	commandTable := migration[commandStart:]
+	for _, forbidden := range []string{
+		"direction_code", "self_assessed_experience", "known_stacks", "desired_stacks",
+		"goal_code", "goal_text", "preferred_language", "weekly_minutes", "preferred_pace",
+		"request_payload", "answers_json",
+	} {
+		if strings.Contains(commandTable, forbidden) {
+			t.Fatalf("durable command receipt stores unnecessary raw request field %q", forbidden)
+		}
+	}
+	for _, required := range []string{"request_hash CHAR(64)", "result_draft_version", "result_profile_version", "response_json JSONB"} {
+		if !strings.Contains(commandTable, required) {
+			t.Fatalf("durable command receipt is missing replay metadata %q", required)
+		}
+	}
+	if strings.Contains(strings.ToUpper(migration), "DROP TABLE") {
+		t.Fatal("forward migration contains a destructive down operation")
+	}
+}

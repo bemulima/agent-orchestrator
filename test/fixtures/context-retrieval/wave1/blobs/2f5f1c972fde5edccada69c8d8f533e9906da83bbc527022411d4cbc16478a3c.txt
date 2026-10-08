@@ -1,0 +1,415 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"path"
+	"strings"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type AIPromptClient interface {
+	Execute(ctx context.Context, request AIPromptExecuteRequest) (json.RawMessage, error)
+}
+
+type AIPromptExecuteRequest struct {
+	ProviderCode       string         `json:"provider_code"`
+	TemplateCode       string         `json:"template_code"`
+	LanguageCode       string         `json:"language_code"`
+	ResponseSchemaCode string         `json:"response_schema_code"`
+	Variables          map[string]any `json:"variables"`
+}
+
+type MilestoneBuildPreview struct {
+	Milestone domain.PracticeTaskRuntimeMilestone `json:"milestone"`
+	Starter   domain.StarterBuildResult           `json:"starter"`
+	Contract  domain.ValidationContract           `json:"contract"`
+}
+
+type PartBuildPreview struct {
+	Part       domain.PracticeTaskPart   `json:"part"`
+	Milestones []MilestoneBuildPreview   `json:"milestones"`
+	Starter    domain.StarterBuildResult `json:"starter"`
+	Contract   domain.ValidationContract `json:"contract"`
+}
+
+type BuildUseCase struct {
+	Builders  domain.BuilderRegistry
+	AIPrompts AIPromptClient
+}
+
+func (useCase BuildUseCase) BuildMilestonePreview(ctx context.Context, project domain.PracticeTask, milestone domain.PracticeTaskRuntimeMilestone, part *domain.PracticeTaskPart) (*MilestoneBuildPreview, error) {
+	starter, authored, err := parseStoredStarterWorkspace(milestone.StarterWorkspaceJSON)
+	if err != nil {
+		return nil, err
+	}
+	if !authored {
+		partTypeCode := ""
+		if part != nil {
+			partTypeCode = part.PartTypeCode
+		}
+		if useCase.Builders == nil {
+			return nil, domain.ErrValidation
+		}
+		starterBuilder, ok := useCase.Builders.GetStarter(milestone.MilestoneKindCode)
+		if !ok {
+			return nil, domain.ErrValidation
+		}
+		starter, err = starterBuilder.BuildStarter(ctx, domain.StarterBuildInput{
+			MilestoneKind:     milestone.MilestoneKindCode,
+			StackCode:         milestone.StackCode,
+			PartTypeCode:      partTypeCode,
+			LanguageCode:      project.LanguageCode,
+			PracticeTaskTheme: project.Theme,
+			ConfigJSON:        milestone.ConfigJSON,
+			Difficulty:        "normal",
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	contract, err := parseStoredValidationContract(milestone.ValidationContractJSON)
+	if err != nil {
+		return nil, err
+	}
+	return &MilestoneBuildPreview{
+		Milestone: milestone,
+		Starter:   starter,
+		Contract:  contract,
+	}, nil
+}
+
+func parseStoredStarterWorkspace(raw json.RawMessage) (domain.StarterBuildResult, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return domain.StarterBuildResult{}, false, nil
+	}
+	var starter domain.StarterBuildResult
+	if err := json.Unmarshal(trimmed, &starter); err != nil {
+		return domain.StarterBuildResult{}, false, fmt.Errorf("%w: invalid stored starter workspace: %v", domain.ErrValidation, err)
+	}
+	if len(starter.Files) == 0 || len(starter.Entrypoints) == 0 {
+		return domain.StarterBuildResult{}, false, fmt.Errorf("%w: stored starter requires files and entrypoints", domain.ErrValidation)
+	}
+	files := make(map[string]struct{}, len(starter.Files))
+	for _, file := range starter.Files {
+		if !safeStarterPath(file.Path) {
+			return domain.StarterBuildResult{}, false, fmt.Errorf("%w: unsafe stored starter path %q", domain.ErrValidation, file.Path)
+		}
+		if _, duplicate := files[file.Path]; duplicate {
+			return domain.StarterBuildResult{}, false, fmt.Errorf("%w: duplicate stored starter path %q", domain.ErrValidation, file.Path)
+		}
+		files[file.Path] = struct{}{}
+	}
+	for _, item := range append(append(append([]string{}, starter.ReadOnlyFiles...), starter.EditableFiles...), starter.Entrypoints...) {
+		if _, ok := files[item]; !ok || !safeStarterPath(item) {
+			return domain.StarterBuildResult{}, false, fmt.Errorf("%w: stored starter references unknown path %q", domain.ErrValidation, item)
+		}
+	}
+	return starter, true, nil
+}
+
+func safeStarterPath(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00') &&
+		!strings.Contains(value, "\\") && !strings.HasPrefix(value, "/") &&
+		path.Clean(value) == value && value != "." && !strings.HasPrefix(value, "../")
+}
+
+func parseStoredValidationContract(raw json.RawMessage) (domain.ValidationContract, error) {
+	var contract domain.ValidationContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		return domain.ValidationContract{}, fmt.Errorf("%w: invalid milestone validation contract: %v", domain.ErrValidation, err)
+	}
+	if contract.Version <= 0 || strings.TrimSpace(contract.Kind) == "" || len(contract.Stages) == 0 {
+		return domain.ValidationContract{}, fmt.Errorf("%w: milestone validation contract requires version, kind, and stages", domain.ErrValidation)
+	}
+	return contract, nil
+}
+
+func (useCase BuildUseCase) BuildPracticeTaskMilestones(ctx context.Context, project domain.PracticeTask, parts []domain.PracticeTaskPart, milestones []domain.PracticeTaskRuntimeMilestone) ([]MilestoneBuildPreview, error) {
+	partsByID := make(map[string]domain.PracticeTaskPart, len(parts))
+	for _, part := range parts {
+		partsByID[part.ID] = part
+	}
+	result := make([]MilestoneBuildPreview, 0, len(milestones))
+	for _, milestone := range milestones {
+		var part *domain.PracticeTaskPart
+		if value, ok := partsByID[milestone.PracticeTaskPartID]; ok {
+			part = &value
+		}
+		item, err := useCase.BuildMilestonePreview(ctx, project, milestone, part)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *item)
+	}
+	return result, nil
+}
+
+func (useCase BuildUseCase) BuildPartPreview(ctx context.Context, project domain.PracticeTask, part domain.PracticeTaskPart, milestones []domain.PracticeTaskRuntimeMilestone) (*PartBuildPreview, error) {
+	previews := make([]MilestoneBuildPreview, 0, len(milestones))
+	for _, milestone := range milestones {
+		preview, err := useCase.BuildMilestonePreview(ctx, project, milestone, &part)
+		if err != nil {
+			return nil, err
+		}
+		previews = append(previews, *preview)
+	}
+	return &PartBuildPreview{
+		Part:       part,
+		Milestones: previews,
+		Starter:    aggregatePartStarter(previews),
+		Contract:   aggregatePartContract(part, previews),
+	}, nil
+}
+
+func (useCase BuildUseCase) GenerateBlueprint(ctx context.Context, request AIPromptExecuteRequest) (json.RawMessage, error) {
+	if useCase.AIPrompts == nil {
+		return nil, domain.ErrValidation
+	}
+	return useCase.AIPrompts.Execute(ctx, request)
+}
+
+func aggregatePartStarter(previews []MilestoneBuildPreview) domain.StarterBuildResult {
+	result := domain.StarterBuildResult{
+		Files:         []domain.WorkspaceFile{},
+		ReadOnlyFiles: []string{},
+		EditableFiles: []string{},
+		Entrypoints:   []string{},
+		PreviewConfig: map[string]any{},
+		Meta:          map[string]any{},
+	}
+	if len(previews) == 0 {
+		return result
+	}
+
+	fileIndexByPath := map[string]int{}
+	readOnlySet := map[string]struct{}{}
+	editableSet := map[string]struct{}{}
+	entrypointSet := map[string]struct{}{}
+
+	for _, preview := range previews {
+		for _, file := range preview.Starter.Files {
+			if _, ok := fileIndexByPath[file.Path]; ok {
+				continue
+			}
+			fileIndexByPath[file.Path] = len(result.Files)
+			result.Files = append(result.Files, file)
+		}
+		for _, path := range preview.Starter.ReadOnlyFiles {
+			if _, ok := readOnlySet[path]; ok {
+				continue
+			}
+			readOnlySet[path] = struct{}{}
+			result.ReadOnlyFiles = append(result.ReadOnlyFiles, path)
+		}
+		for _, path := range preview.Starter.EditableFiles {
+			if _, ok := editableSet[path]; ok {
+				continue
+			}
+			editableSet[path] = struct{}{}
+			result.EditableFiles = append(result.EditableFiles, path)
+		}
+		for _, entrypoint := range preview.Starter.Entrypoints {
+			if _, ok := entrypointSet[entrypoint]; ok {
+				continue
+			}
+			entrypointSet[entrypoint] = struct{}{}
+			result.Entrypoints = append(result.Entrypoints, entrypoint)
+		}
+		for key, value := range preview.Starter.PreviewConfig {
+			if _, exists := result.PreviewConfig[key]; exists {
+				continue
+			}
+			result.PreviewConfig[key] = value
+		}
+		for key, value := range preview.Starter.Meta {
+			if _, exists := result.Meta[key]; exists {
+				continue
+			}
+			result.Meta[key] = value
+		}
+	}
+	return result
+}
+
+func aggregatePartContract(part domain.PracticeTaskPart, previews []MilestoneBuildPreview) domain.ValidationContract {
+	if len(previews) == 0 {
+		return domain.ValidationContract{
+			Version:   1,
+			Kind:      "validation_contract_v1",
+			Stages:    []domain.ValidationStage{},
+			Links:     []domain.ValidationLink{},
+			Workspace: domain.ContractWorkspace{},
+		}
+	}
+
+	result := domain.ValidationContract{
+		Version:   previews[0].Contract.Version,
+		Kind:      previews[0].Contract.Kind,
+		Profile:   previews[0].Contract.Profile,
+		Profiles:  append([]string(nil), previews[0].Contract.Profiles...),
+		Stages:    []domain.ValidationStage{},
+		Links:     []domain.ValidationLink{},
+		Workspace: domain.ContractWorkspace{},
+	}
+	requiredFilesSet := map[string]struct{}{}
+	stageIDsByMilestone := map[string][]string{}
+	stageIDsByLocalID := map[string]map[string]string{}
+
+	for _, preview := range previews {
+		stageIDsByLocalID[preview.Milestone.ID] = map[string]string{}
+		for _, path := range preview.Contract.Workspace.RequiredFiles {
+			if _, ok := requiredFilesSet[path]; ok {
+				continue
+			}
+			requiredFilesSet[path] = struct{}{}
+			result.Workspace.RequiredFiles = append(result.Workspace.RequiredFiles, path)
+		}
+		for _, profile := range preview.Contract.Profiles {
+			if containsString(result.Profiles, profile) {
+				continue
+			}
+			result.Profiles = append(result.Profiles, profile)
+		}
+
+		for _, stage := range preview.Contract.Stages {
+			localStageID := strings.TrimSpace(stage.ID)
+			if localStageID == "" {
+				localStageID = fmt.Sprintf("stage_%d", len(stageIDsByMilestone[preview.Milestone.ID])+1)
+			}
+			prefixedID := prefixedPartStageID(preview.Milestone.ID, localStageID)
+			stageCopy := stage
+			stageCopy.ID = prefixedID
+			stageCopy.DependsOn = prefixDependencyIDs(preview.Milestone.ID, stage.DependsOn)
+			result.Stages = append(result.Stages, stageCopy)
+			stageIDsByMilestone[preview.Milestone.ID] = append(stageIDsByMilestone[preview.Milestone.ID], prefixedID)
+			stageIDsByLocalID[preview.Milestone.ID][localStageID] = prefixedID
+		}
+
+		for _, link := range preview.Contract.Links {
+			localLinkID := strings.TrimSpace(link.ID)
+			if localLinkID == "" {
+				localLinkID = fmt.Sprintf("link_%d", len(result.Links)+1)
+			}
+			linkCopy := link
+			linkCopy.ID = prefixedPartStageID(preview.Milestone.ID, localLinkID)
+			linkCopy.DependsOn = prefixDependencyIDs(preview.Milestone.ID, link.DependsOn)
+			result.Links = append(result.Links, linkCopy)
+		}
+	}
+
+	orderedMilestones := make([]domain.PracticeTaskRuntimeMilestone, 0, len(previews))
+	for _, preview := range previews {
+		orderedMilestones = append(orderedMilestones, preview.Milestone)
+	}
+	siblingGroups := groupPartMilestonesByParent(orderedMilestones)
+	strictDependencies := map[string][]string{}
+	if part.IsStrictOrder {
+		for _, group := range siblingGroups {
+			for index := 1; index < len(group); index++ {
+				prevID := group[index-1].ID
+				currentID := group[index].ID
+				strictDependencies[currentID] = append(strictDependencies[currentID], stageIDsByMilestone[prevID]...)
+			}
+		}
+	}
+
+	for stageIndex := range result.Stages {
+		milestoneID, _, ok := splitPrefixedPartStageID(result.Stages[stageIndex].ID)
+		if !ok {
+			continue
+		}
+		if parentID := findPartMilestoneParentID(orderedMilestones, milestoneID); parentID != "" {
+			result.Stages[stageIndex].DependsOn = append(result.Stages[stageIndex].DependsOn, stageIDsByMilestone[parentID]...)
+		}
+		if deps, ok := strictDependencies[milestoneID]; ok {
+			result.Stages[stageIndex].DependsOn = append(result.Stages[stageIndex].DependsOn, deps...)
+		}
+		result.Stages[stageIndex].DependsOn = uniqueNonEmptyStrings(result.Stages[stageIndex].DependsOn)
+	}
+
+	return result
+}
+
+func prefixedPartStageID(milestoneID, localID string) string {
+	return fmt.Sprintf("%s::%s", milestoneID, localID)
+}
+
+func prefixDependencyIDs(milestoneID string, values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if strings.Contains(trimmed, "::") {
+			result = append(result, trimmed)
+			continue
+		}
+		result = append(result, prefixedPartStageID(milestoneID, trimmed))
+	}
+	return result
+}
+
+func splitPrefixedPartStageID(value string) (string, string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(value), "::", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func groupPartMilestonesByParent(items []domain.PracticeTaskRuntimeMilestone) map[string][]domain.PracticeTaskRuntimeMilestone {
+	result := map[string][]domain.PracticeTaskRuntimeMilestone{}
+	for _, item := range items {
+		parentKey := ""
+		if item.ParentPartMilestoneID != nil {
+			parentKey = strings.TrimSpace(*item.ParentPartMilestoneID)
+		}
+		result[parentKey] = append(result[parentKey], item)
+	}
+	return result
+}
+
+func findPartMilestoneParentID(items []domain.PracticeTaskRuntimeMilestone, milestoneID string) string {
+	for _, item := range items {
+		if item.ID != milestoneID || item.ParentPartMilestoneID == nil {
+			continue
+		}
+		return strings.TrimSpace(*item.ParentPartMilestoneID)
+	}
+	return ""
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	set := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := set[trimmed]; ok {
+			continue
+		}
+		set[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}

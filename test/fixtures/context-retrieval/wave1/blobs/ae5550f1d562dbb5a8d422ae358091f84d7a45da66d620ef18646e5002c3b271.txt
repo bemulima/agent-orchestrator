@@ -1,0 +1,255 @@
+package sandboxclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+func (client Client) CreateOrResumeSandbox(ctx context.Context, request domain.SandboxProvisionRequest) (*domain.SandboxSession, error) {
+	if strings.TrimSpace(client.BaseURL) == "" {
+		return nil, fmt.Errorf("sandbox service url is empty")
+	}
+	body, err := json.Marshal(map[string]any{
+		"user_id":                  request.StudentID,
+		"task_id":                  request.TaskID,
+		"answer_id":                request.AnswerID,
+		"compose_config":           json.RawMessage(request.ComposeConfig),
+		"code_structure_type_code": request.CodeStructureTypeCode,
+		"code_structure":           json.RawMessage(request.CodeStructure),
+	})
+	if err != nil {
+		return nil, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(client.BaseURL, "/")+"/api/v1/sandboxes", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	client.setInternalAuthentication(httpRequest)
+
+	response, err := client.httpClient().Do(httpRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("sandbox create request failed: %s", response.Status)
+	}
+
+	var payload struct {
+		SandboxID       string `json:"sandboxId"`
+		PreviewURL      string `json:"previewUrl"`
+		SandboxIDSnake  string `json:"sandbox_id"`
+		PreviewURLSnake string `json:"preview_url"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	sandboxID := firstNonEmpty(payload.SandboxID, payload.SandboxIDSnake)
+	if sandboxID == "" {
+		return nil, fmt.Errorf("sandbox response missing sandbox id")
+	}
+	return &domain.SandboxSession{
+		SandboxID:  sandboxID,
+		PreviewURL: firstNonEmpty(payload.PreviewURL, payload.PreviewURLSnake),
+	}, nil
+}
+
+func (client Client) CreateFile(ctx context.Context, sandboxID, _ string, path, content string) error {
+	if strings.TrimSpace(client.BaseURL) == "" {
+		return fmt.Errorf("sandbox service url is empty")
+	}
+	body, err := json.Marshal(map[string]string{
+		"path":    path,
+		"content": content,
+	})
+	if err != nil {
+		return err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/api/v1/sandboxes/%s/files", strings.TrimRight(client.BaseURL, "/"), sandboxID), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	client.setInternalAuthentication(httpRequest)
+
+	response, err := client.httpClient().Do(httpRequest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("sandbox create file request failed: %s", response.Status)
+	}
+	return nil
+}
+
+func (client Client) GetSnapshot(ctx context.Context, sandboxID string) ([]domain.WorkspaceFile, error) {
+	if strings.TrimSpace(client.BaseURL) == "" {
+		return nil, fmt.Errorf("sandbox service url is empty")
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/internal/sandboxes/%s/snapshot", strings.TrimRight(client.BaseURL, "/"), sandboxID), nil)
+	if err != nil {
+		return nil, err
+	}
+	if client.InternalToken != "" {
+		httpRequest.Header.Set("X-Internal-Token", client.InternalToken)
+	}
+
+	response, err := client.httpClient().Do(httpRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, domain.ErrNotFound
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("sandbox snapshot request failed: %s", response.Status)
+	}
+
+	var payload struct {
+		Files []struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	files := make([]domain.WorkspaceFile, 0, len(payload.Files))
+	for _, file := range payload.Files {
+		files = append(files, domain.WorkspaceFile{
+			Path:    file.Path,
+			Content: file.Content,
+		})
+	}
+	return files, nil
+}
+
+func (client Client) GetValidationObservation(ctx context.Context, sandboxID string) (domain.LearningActionValidationObservation, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(sandboxID) == "" {
+		return domain.LearningActionValidationObservation{}, fmt.Errorf("sandbox validation observation configuration is invalid")
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/internal/sandboxes/%s/validation-observation", strings.TrimRight(client.BaseURL, "/"), url.PathEscape(sandboxID)), nil)
+	if err != nil {
+		return domain.LearningActionValidationObservation{}, err
+	}
+	if client.InternalToken != "" {
+		httpRequest.Header.Set("X-Internal-Token", client.InternalToken)
+	}
+	response, err := client.httpClient().Do(httpRequest)
+	if err != nil {
+		return domain.LearningActionValidationObservation{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return domain.LearningActionValidationObservation{}, domain.ErrNotFound
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		return domain.LearningActionValidationObservation{}, fmt.Errorf("sandbox validation observation request failed: %s", response.Status)
+	}
+	limited := &io.LimitedReader{R: response.Body, N: 64<<10 + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	var result domain.LearningActionValidationObservation
+	if err := decoder.Decode(&result); err != nil {
+		return domain.LearningActionValidationObservation{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || limited.N == 0 {
+		return domain.LearningActionValidationObservation{}, fmt.Errorf("invalid sandbox validation observation response")
+	}
+	return result, nil
+}
+
+func (client Client) FindSandbox(ctx context.Context, userID, taskID string) (*domain.SandboxSession, error) {
+	return client.findSandbox(ctx, userID, taskID, "")
+}
+
+// FindSandboxForAnswer resolves the exact Sandbox bound to the answer behind a
+// Student-owned learning action. The answer identity never leaves Student's
+// internal boundary.
+func (client Client) FindSandboxForAnswer(ctx context.Context, userID, taskID, answerID string) (*domain.SandboxSession, error) {
+	if strings.TrimSpace(answerID) == "" {
+		return nil, domain.ErrValidation
+	}
+	return client.findSandbox(ctx, userID, taskID, answerID)
+}
+
+func (client Client) findSandbox(ctx context.Context, userID, taskID, answerID string) (*domain.SandboxSession, error) {
+	if strings.TrimSpace(client.BaseURL) == "" {
+		return nil, fmt.Errorf("sandbox service url is empty")
+	}
+	values := url.Values{}
+	values.Set("user_id", userID)
+	values.Set("task_id", taskID)
+	if strings.TrimSpace(answerID) != "" {
+		values.Set("answer_id", answerID)
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(client.BaseURL, "/")+"/internal/sandboxes?"+values.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if client.InternalToken != "" {
+		httpRequest.Header.Set("X-Internal-Token", client.InternalToken)
+	}
+	response, err := client.httpClient().Do(httpRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, domain.ErrNotFound
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("sandbox find request failed: %s", response.Status)
+	}
+	var payload struct {
+		SandboxID string `json:"sandboxId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.SandboxID == "" {
+		return nil, domain.ErrNotFound
+	}
+	return &domain.SandboxSession{SandboxID: payload.SandboxID}, nil
+}
+
+func (client Client) httpClient() *http.Client {
+	if client.HTTPClient != nil {
+		return client.HTTPClient
+	}
+	return &http.Client{Timeout: 20 * time.Second}
+}
+
+func (client Client) setInternalAuthentication(request *http.Request) {
+	if token := strings.TrimSpace(client.InternalToken); token != "" {
+		request.Header.Set("X-Internal-Token", token)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

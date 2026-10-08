@@ -1,0 +1,243 @@
+package task
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+// CreateTaskInput holds fields for task creation.
+type CreateTaskInput struct {
+	ID                     string
+	SourceKey              string
+	LessonID               string
+	Title                  string
+	Description            string
+	Translations           []domain.TaskI18n
+	LearningTargets        []domain.TaskLearningTarget
+	CodeStructureTypeID    string
+	CodeStructure          []byte
+	ComposeConfig          []byte
+	Type                   *string
+	AssessmentPurpose      *string
+	ExecutionMode          *string
+	EvaluationMode         *string
+	UIMode                 *string
+	SubmissionMode         *string
+	RequiresSandbox        *bool
+	ExposesPreview         *bool
+	ExposesTerminal        *bool
+	SupportsLiveValidation *bool
+	AllowedErrorsCount     int
+	Order                  int
+	MaxAttempts            *int
+	Tests                  []domain.TaskTest
+	StarterFiles           []domain.TaskFileStorage
+}
+
+// CreateTask creates a new task.
+type CreateTask struct {
+	Tasks           repository.TaskRepository
+	Lessons         repository.LessonRepository
+	TaskI18n        repository.TaskI18nRepository
+	TaskTests       repository.TaskTestRepository
+	TaskFiles       repository.TaskFileStorageRepository
+	LearningTargets repository.TaskLearningTargetRepository
+	Publisher       domain.EventPublisher
+	StructureRes    repository.CodeStructureTypeRepository
+	ComposeConfigs  repository.ComposeConfigRepository
+	Tx              repository.TransactionManager
+}
+
+// Handle validates and creates task.
+func (uc CreateTask) Handle(ctx context.Context, in CreateTaskInput) (domain.Task, error) {
+	learningTargets, err := domain.NormalizeTaskLearningTargets(in.LearningTargets)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	requestedType, err := requestedTaskTypeCode(in.Type)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	purpose := domain.AssessmentPurposeKnowledgeCheck
+	if in.AssessmentPurpose != nil {
+		purpose, err = domain.NormalizeAssessmentPurpose(*in.AssessmentPurpose)
+		if err != nil {
+			return domain.Task{}, err
+		}
+	}
+	sourceKey, err := domain.NormalizeContentSourceKey(in.SourceKey)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	in.SourceKey = sourceKey
+	isAssessmentTask := domain.IsAssessmentTaskType(requestedType)
+	assessmentKind := domain.TaskAssessmentKind(requestedType)
+	if purpose == domain.AssessmentPurposeDiagnostic && !isAssessmentTask {
+		return domain.Task{}, domain.ErrValidation
+	}
+
+	var structureType *domain.CodeStructureType
+	if isAssessmentTask {
+		if err := normalizeTaskTestSourceKeys(in.Tests, assessmentKind); err != nil {
+			return domain.Task{}, err
+		}
+		if err := domain.ValidateTaskAssessments(in.Tests, in.AllowedErrorsCount, assessmentKind); err != nil {
+			return domain.Task{}, err
+		}
+		structureType, err = uc.StructureRes.GetByCode(ctx, domain.TaskAssessmentCodeStructureType(requestedType))
+		if err != nil {
+			return domain.Task{}, err
+		}
+		in.CodeStructureTypeID = structureType.ID
+		in.CodeStructure = domain.DefaultTaskAssessmentCodeStructure(assessmentKind)
+		in.ComposeConfig = nil
+	} else {
+		if strings.TrimSpace(in.CodeStructureTypeID) == "" || len(bytes.TrimSpace(in.CodeStructure)) == 0 {
+			return domain.Task{}, domain.ErrValidation
+		}
+		if len(in.Tests) > 0 {
+			return domain.Task{}, domain.ErrValidation
+		}
+		in.AllowedErrorsCount = 0
+		if err := domain.ValidateTaskContract(requestedType, in.CodeStructure); err != nil {
+			return domain.Task{}, err
+		}
+		structureType, err = uc.StructureRes.GetByID(ctx, in.CodeStructureTypeID)
+		if err != nil {
+			return domain.Task{}, err
+		}
+	}
+	var task domain.Task
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		taskID := strings.TrimSpace(in.ID)
+		if taskID == "" {
+			taskID = uuid.NewString()
+		} else if _, err := uuid.Parse(taskID); err != nil {
+			return domain.ErrValidation
+		}
+		translations := normalizeTranslations(in.Translations)
+		if len(translations) == 0 {
+			return domain.ErrValidation
+		}
+		title := translations[0].Title
+		description := translations[0].Description
+
+		var composeConfigID *string
+		in.ComposeConfig = domain.NormalizeComposeConfig(in.ComposeConfig)
+		if len(in.ComposeConfig) > 0 && uc.ComposeConfigs != nil {
+			existing, err := uc.ComposeConfigs.GetByConfig(ctx, in.ComposeConfig)
+			if err != nil && err != domain.ErrNotFound {
+				return err
+			}
+			if existing != nil {
+				composeConfigID = &existing.ID
+			} else {
+				title, description := domain.DeriveComposeConfigMeta(in.ComposeConfig)
+				config := domain.ComposeConfig{
+					ID:          uuid.NewString(),
+					Title:       &title,
+					Description: &description,
+					Config:      in.ComposeConfig,
+					CreatedAt:   time.Now().UTC(),
+				}
+				if err := uc.ComposeConfigs.Create(ctx, config); err != nil {
+					return err
+				}
+				composeConfigID = &config.ID
+			}
+		}
+		caps, err := domain.InferTaskCapabilities(structureType.Code, in.CodeStructure, domain.TaskCapabilityInput{
+			Type:                   in.Type,
+			ExecutionMode:          in.ExecutionMode,
+			EvaluationMode:         in.EvaluationMode,
+			UIMode:                 in.UIMode,
+			SubmissionMode:         in.SubmissionMode,
+			RequiresSandbox:        in.RequiresSandbox,
+			ExposesPreview:         in.ExposesPreview,
+			ExposesTerminal:        in.ExposesTerminal,
+			SupportsLiveValidation: in.SupportsLiveValidation,
+		})
+		if err != nil {
+			return err
+		}
+		if err := domain.ValidatePHPCoreLiveValidationCapability(in.CodeStructure, caps.SupportsLiveValidation); err != nil {
+			return err
+		}
+
+		task = domain.Task{
+			ID:                  taskID,
+			SourceKey:           in.SourceKey,
+			LessonID:            in.LessonID,
+			AssessmentPurpose:   purpose,
+			Title:               title,
+			Description:         description,
+			CodeStructureTypeID: in.CodeStructureTypeID,
+			CodeStructure:       in.CodeStructure,
+			ComposeConfigID:     composeConfigID,
+			ComposeConfig:       in.ComposeConfig,
+			Order:               in.Order,
+			Status:              domain.TaskStatusActive,
+			Version:             1,
+			CreatedAt:           time.Now().UTC(),
+			UpdatedAt:           time.Now().UTC(),
+			MaxAttempts:         in.MaxAttempts,
+			AllowedErrorsCount:  in.AllowedErrorsCount,
+		}
+		domain.ApplyTaskCapabilities(&task, caps)
+		if err := validateSandboxRuntime(ctx, uc.Lessons, &task); err != nil {
+			return err
+		}
+		if err := uc.Tasks.Create(ctx, task); err != nil {
+			return err
+		}
+		if uc.LearningTargets == nil && len(learningTargets) > 0 {
+			return domain.ErrValidation
+		}
+		if uc.LearningTargets != nil {
+			for index := range learningTargets {
+				learningTargets[index].TaskID = task.ID
+			}
+			if err := uc.LearningTargets.ReplaceForTask(ctx, task.ID, learningTargets); err != nil {
+				return err
+			}
+			task.LearningTargets = learningTargets
+		}
+
+		if uc.TaskI18n != nil {
+			for _, translation := range translations {
+				translation.TaskID = task.ID
+				if err := uc.TaskI18n.Upsert(ctx, translation); err != nil {
+					return err
+				}
+			}
+		}
+		if isAssessmentTask && uc.TaskTests != nil {
+			if err := uc.TaskTests.ReplaceForTask(ctx, task.ID, prepareTaskTests(task.ID, in.Tests)); err != nil {
+				return err
+			}
+		}
+		if uc.TaskFiles != nil {
+			starterFiles := normalizeTaskStarterFiles(task.ID, in.StarterFiles)
+			if err := uc.TaskFiles.ReplaceForTask(ctx, task.ID, starterFiles); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return domain.Task{}, err
+	}
+	_ = uc.Publisher.Publish(ctx, domain.SubjectTaskCreated, map[string]any{"task_id": task.ID, "lesson_id": task.LessonID})
+	return task, nil
+}

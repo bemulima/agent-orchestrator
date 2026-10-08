@@ -1,0 +1,140 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type CoursePlanNotificationRepository struct{ Pool *pgxpool.Pool }
+
+var _ repository.CoursePlanNotificationStore = CoursePlanNotificationRepository{}
+
+func (repository CoursePlanNotificationRepository) Accept(
+	ctx context.Context,
+	notification domain.CoursePlanNotification,
+) (domain.CoursePlanNotification, bool, error) {
+	normalized, err := domain.NormalizeCoursePlanNotification(notification)
+	if err != nil || normalized.Outcome.Source != domain.CoursePlanSourceTeacher || normalized.DeliveredAt != nil {
+		return domain.CoursePlanNotification{}, false, domain.ErrInvalidCoursePlanOutcome
+	}
+	// The current inbox schema predates Planner v2's optional path field. Do
+	// not silently discard it if a future caller bypasses the notification
+	// handler; a schema migration is required before durable path binding.
+	if normalized.Outcome.LearningPathID != "" {
+		return domain.CoursePlanNotification{}, false, domain.ErrInvalidCoursePlanOutcome
+	}
+	if repository.Pool == nil {
+		return domain.CoursePlanNotification{}, false, errors.New("course plan notification repository pool is required")
+	}
+	command, err := repository.Pool.Exec(ctx, `
+INSERT INTO teacher_course_plan_notification_inbox (
+    event_id,event_type,request_id,causation_id,student_id,personal_teacher_id,dialog_id,
+    source_message_id,teacher_decision_id,status,result_code,course_id,reused,failure_code,
+    source,reason,body,occurred_at,accepted_at
+) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,'')::uuid,NULLIF($8,'')::uuid,NULLIF($9,'')::uuid,$10,$11,
+          NULLIF($12,'')::uuid,$13,$14,$15,$16,$17,$18,$19)
+ON CONFLICT (event_id) DO NOTHING`,
+		normalized.Outcome.EventID, normalized.Outcome.EventType, normalized.Outcome.RequestID,
+		normalized.Outcome.CausationID, normalized.Outcome.StudentID, normalized.PersonalTeacherID,
+		normalized.Outcome.AuditRefs.DialogID, normalized.Outcome.AuditRefs.SourceMessageID,
+		normalized.Outcome.AuditRefs.TeacherDecisionID, normalized.Outcome.Status,
+		normalized.Outcome.ResultCode, normalized.Outcome.CourseID, normalized.Outcome.Reused,
+		normalized.Outcome.FailureCode, normalized.Outcome.Source, normalized.Outcome.Reason,
+		normalized.Body, normalized.Outcome.OccurredAt, normalized.AcceptedAt,
+	)
+	if err != nil {
+		return domain.CoursePlanNotification{}, false, err
+	}
+	stored, err := repository.get(ctx, normalized.Outcome.EventID)
+	if err != nil {
+		return domain.CoursePlanNotification{}, false, err
+	}
+	if !sameCoursePlanNotification(stored, normalized) {
+		return domain.CoursePlanNotification{}, false, errors.New("conflicting course plan outcome replay")
+	}
+	return stored, command.RowsAffected() == 1, nil
+}
+
+func (repository CoursePlanNotificationRepository) MarkDelivered(
+	ctx context.Context,
+	eventID string,
+	messageID string,
+	deliveredAt time.Time,
+) error {
+	if repository.Pool == nil {
+		return errors.New("course plan notification repository pool is required")
+	}
+	if _, err := uuid.Parse(eventID); err != nil {
+		return domain.ErrInvalidCoursePlanOutcome
+	}
+	if _, err := uuid.Parse(messageID); err != nil || deliveredAt.IsZero() {
+		return domain.ErrInvalidCoursePlanOutcome
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_course_plan_notification_inbox
+SET dialog_message_id=$2, delivered_at=$3
+WHERE event_id=$1 AND (delivered_at IS NULL OR dialog_message_id=$2)`, eventID, messageID, deliveredAt.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return errors.New("course plan notification delivery state conflict")
+	}
+	return nil
+}
+
+func (repository CoursePlanNotificationRepository) get(ctx context.Context, eventID string) (domain.CoursePlanNotification, error) {
+	if repository.Pool == nil {
+		return domain.CoursePlanNotification{}, errors.New("course plan notification repository pool is required")
+	}
+	return scanCoursePlanNotification(repository.Pool.QueryRow(ctx, `
+SELECT event_id::text,event_type,request_id::text,causation_id::text,student_id,
+       personal_teacher_id::text,COALESCE(dialog_id::text,''),COALESCE(source_message_id::text,''),
+       COALESCE(teacher_decision_id::text,''),status,result_code,COALESCE(course_id::text,''),
+       reused,failure_code,source,reason,body,occurred_at,accepted_at,
+       COALESCE(dialog_message_id::text,''),delivered_at
+FROM teacher_course_plan_notification_inbox WHERE event_id=$1`, eventID))
+}
+
+type coursePlanNotificationRow interface{ Scan(...any) error }
+
+func scanCoursePlanNotification(row coursePlanNotificationRow) (domain.CoursePlanNotification, error) {
+	var notification domain.CoursePlanNotification
+	var deliveredAt *time.Time
+	err := row.Scan(
+		&notification.Outcome.EventID, &notification.Outcome.EventType, &notification.Outcome.RequestID,
+		&notification.Outcome.CausationID, &notification.Outcome.StudentID, &notification.PersonalTeacherID,
+		&notification.Outcome.AuditRefs.DialogID, &notification.Outcome.AuditRefs.SourceMessageID,
+		&notification.Outcome.AuditRefs.TeacherDecisionID, &notification.Outcome.Status,
+		&notification.Outcome.ResultCode, &notification.Outcome.CourseID, &notification.Outcome.Reused,
+		&notification.Outcome.FailureCode, &notification.Outcome.Source, &notification.Outcome.Reason,
+		&notification.Body, &notification.Outcome.OccurredAt, &notification.AcceptedAt,
+		&notification.DialogMessageID, &deliveredAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.CoursePlanNotification{}, err
+	}
+	if err != nil {
+		return domain.CoursePlanNotification{}, err
+	}
+	notification.DeliveredAt = deliveredAt
+	return domain.NormalizeCoursePlanNotification(notification)
+}
+
+func sameCoursePlanNotification(left, right domain.CoursePlanNotification) bool {
+	return left.Outcome.EventID == right.Outcome.EventID && left.Outcome.EventType == right.Outcome.EventType &&
+		left.Outcome.RequestID == right.Outcome.RequestID && left.Outcome.CausationID == right.Outcome.CausationID &&
+		left.Outcome.StudentID == right.Outcome.StudentID && left.Outcome.Status == right.Outcome.Status &&
+		left.Outcome.ResultCode == right.Outcome.ResultCode && left.Outcome.CourseID == right.Outcome.CourseID &&
+		left.Outcome.Reused == right.Outcome.Reused && left.Outcome.FailureCode == right.Outcome.FailureCode &&
+		left.Outcome.Source == right.Outcome.Source && left.Outcome.Reason == right.Outcome.Reason &&
+		left.Outcome.AuditRefs == right.Outcome.AuditRefs && left.PersonalTeacherID == right.PersonalTeacherID &&
+		left.Outcome.OccurredAt.Equal(right.Outcome.OccurredAt)
+}

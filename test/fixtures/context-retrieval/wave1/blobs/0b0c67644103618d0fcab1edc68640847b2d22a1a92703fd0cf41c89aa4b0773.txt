@@ -1,0 +1,183 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+func TestProductAwareInteractionReplacementTerminalCloseAndActionRace(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	ctx := context.Background()
+	var migrationApplied bool
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+SELECT EXISTS (
+ SELECT 1 FROM information_schema.columns
+ WHERE table_schema=current_schema() AND table_name='teacher_onboarding_interaction' AND column_name='session_schema_version'
+)`).Scan(&migrationApplied))
+	if !migrationApplied {
+		t.Skip("migration 023 is not applied to TEACHER_TEST_DATABASE_URL")
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.pool.Exec(context.Background(), `DELETE FROM teacher_onboarding_action_receipt WHERE personal_teacher_id=$1`, fixture.teacherID)
+		_, _ = fixture.pool.Exec(context.Background(), `DELETE FROM teacher_onboarding_interaction WHERE personal_teacher_id=$1`, fixture.teacherID)
+	})
+
+	turns := TeacherOnboardingTurnRepository{Pool: fixture.pool}
+	receipts := OnboardingActionRepository{Pool: fixture.pool}
+	now := time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC)
+	dialogID := uuid.NewString()
+	v1 := productInteraction(fixture, dialogID, uuid.NewString(), uuid.NewString(), strings.Repeat("1", 64), 0, now)
+	stored, created, err := turns.EnsureActiveInteraction(ctx, v1)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, v1.ID, stored.ID)
+
+	v2 := productInteraction(fixture, dialogID, uuid.NewString(), uuid.NewString(), strings.Repeat("2", 64), 0, now.Add(time.Second))
+	stored, created, err = turns.EnsureActiveInteraction(ctx, v2)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, v2.ID, stored.ID)
+	require.Equal(t, 3, stored.SessionSchemaVersion)
+	var oldState string
+	var successor string
+	var supersededAt time.Time
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT state,superseded_by_interaction_id::text,updated_at FROM teacher_onboarding_interaction WHERE interaction_id=$1`, v1.ID).Scan(&oldState, &successor, &supersededAt))
+	require.Equal(t, "superseded", oldState)
+	require.Equal(t, v2.ID, successor)
+	require.Equal(t, v2.CreatedAt, supersededAt.UTC(), "replacement timestamp must use the new interaction timestamp, never the schema-version placeholder")
+
+	closed, found, err := turns.CloseActiveInteractionForTerminal(ctx, dialogID, fixture.teacherID, domain.TeacherOnboardingClosedPlanningReady, now.Add(2*time.Second))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingInteractionClosed, closed.State)
+	_, active, err := turns.GetActiveInteraction(ctx, dialogID, v2.PromptMessageID, fixture.teacherID)
+	require.NoError(t, err)
+	require.False(t, active)
+	closedRequest := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: dialogID, MessageID: v2.PromptMessageID,
+		MessageVersion: 1, BlockID: "onboarding.direction.d0.v2", ActionID: "direction.undecided", IdempotencyKey: uuid.NewString()}
+	closedReceipt, err := domain.NewOnboardingActionReceiptForMode(closedRequest, fixture.studentID, fixture.teacherID, uuid.NewString(), now.Add(2500*time.Millisecond), now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	_, _, err = receipts.Claim(ctx, closedReceipt)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingConflict, "closed terminal prompt cannot acquire a new receipt fence")
+
+	dualDialogID := uuid.NewString()
+	dualInteraction := productInteraction(fixture, dualDialogID, uuid.NewString(), uuid.NewString(), strings.Repeat("5", 64), 0, now.Add(3*time.Second))
+	_, _, err = turns.EnsureActiveInteraction(ctx, dualInteraction)
+	require.NoError(t, err)
+	actionIDs := []string{"direction.undecided", "direction.backend"}
+	dualReceipts := make([]domain.OnboardingActionReceipt, len(actionIDs))
+	for index, actionID := range actionIDs {
+		request := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: dualDialogID, MessageID: dualInteraction.PromptMessageID,
+			MessageVersion: 1, BlockID: "onboarding.direction.d0.v2", ActionID: actionID, IdempotencyKey: uuid.NewString()}
+		dualReceipts[index], err = domain.NewOnboardingActionReceiptForMode(request, fixture.studentID, fixture.teacherID, uuid.NewString(), now.Add(time.Duration(4+index)*time.Second), now.Add(2*time.Minute), domain.OnboardingActionExecutionCanonical)
+		require.NoError(t, err)
+	}
+	dualStart := make(chan struct{})
+	dualErrors := make([]error, len(dualReceipts))
+	var dualWait sync.WaitGroup
+	dualWait.Add(len(dualReceipts))
+	for index := range dualReceipts {
+		go func(index int) {
+			defer dualWait.Done()
+			<-dualStart
+			_, _, dualErrors[index] = receipts.Claim(ctx, dualReceipts[index])
+		}(index)
+	}
+	close(dualStart)
+	dualWait.Wait()
+	claimSuccesses, claimConflicts := 0, 0
+	for _, dualErr := range dualErrors {
+		if dualErr == nil {
+			claimSuccesses++
+		} else if errors.Is(dualErr, domain.ErrTeacherOnboardingConflict) || errors.Is(dualErr, domain.ErrTeacherOnboardingBusy) {
+			claimConflicts++
+		} else {
+			t.Fatalf("unexpected concurrent claim error: %v", dualErr)
+		}
+	}
+	require.Equal(t, 1, claimSuccesses)
+	require.Equal(t, 1, claimConflicts)
+	var effectCapable int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+SELECT count(*) FROM teacher_onboarding_action_receipt
+WHERE dialog_id=$1 AND source_message_id=$2 AND source_message_version=$3
+  AND execution_mode='canonical' AND status IN ('claimed','applied','materialized')
+`, dualDialogID, dualInteraction.PromptMessageID, dualInteraction.PromptMessageVersion).Scan(&effectCapable))
+	require.Equal(t, 1, effectCapable, "real PostgreSQL keeps one effect-capable receipt per prompt")
+
+	raceDialogID := uuid.NewString()
+	raceInteraction := productInteraction(fixture, raceDialogID, uuid.NewString(), uuid.NewString(), strings.Repeat("3", 64), 0, now.Add(3*time.Second))
+	_, _, err = turns.EnsureActiveInteraction(ctx, raceInteraction)
+	require.NoError(t, err)
+	request := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: raceDialogID, MessageID: raceInteraction.PromptMessageID,
+		MessageVersion: 1, BlockID: "onboarding.direction.d0.v2", ActionID: "direction.undecided", IdempotencyKey: uuid.NewString()}
+	receipt, err := domain.NewOnboardingActionReceiptForMode(request, fixture.studentID, fixture.teacherID, uuid.NewString(), now.Add(4*time.Second), now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(2)
+	var claimErr, closeErr error
+	var raceClosed domain.TeacherOnboardingInteraction
+	go func() {
+		defer wait.Done()
+		<-start
+		_, _, claimErr = receipts.Claim(ctx, receipt)
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		raceClosed, _, closeErr = turns.CloseActiveInteractionForTerminal(ctx, raceDialogID, fixture.teacherID, domain.TeacherOnboardingClosedActivePathExists, now.Add(5*time.Second))
+	}()
+	close(start)
+	wait.Wait()
+	require.NoError(t, closeErr)
+	claimWon := claimErr == nil
+	closeWon := raceClosed.State == domain.TeacherOnboardingInteractionClosed
+	require.NotEqual(t, claimWon, closeWon, "the advisory dialog fence permits exactly one terminal-close or action-claim winner")
+	if !claimWon {
+		require.ErrorIs(t, claimErr, domain.ErrTeacherOnboardingConflict)
+	}
+
+	pendingDialogID := uuid.NewString()
+	pendingInteraction := productInteraction(fixture, pendingDialogID, uuid.NewString(), uuid.NewString(), strings.Repeat("4", 64), 0, now.Add(6*time.Second))
+	_, _, err = turns.EnsureActiveInteraction(ctx, pendingInteraction)
+	require.NoError(t, err)
+	firstRequest := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: pendingDialogID, MessageID: pendingInteraction.PromptMessageID,
+		MessageVersion: 1, BlockID: "onboarding.direction.d0.v2", ActionID: "direction.undecided", IdempotencyKey: uuid.NewString()}
+	firstReceipt, err := domain.NewOnboardingActionReceiptForMode(firstRequest, fixture.studentID, fixture.teacherID, uuid.NewString(), now.Add(7*time.Second), now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	claimed, _, err := receipts.Claim(ctx, firstReceipt)
+	require.NoError(t, err)
+	_, err = receipts.CompleteCanonical(ctx, claimed.IdempotencyKey, claimed.ClaimToken, uuid.NewString(), now.Add(8*time.Second))
+	require.NoError(t, err)
+	secondRequest := firstRequest
+	secondRequest.IdempotencyKey = uuid.NewString()
+	secondRequest.ActionID = "direction.backend"
+	secondReceipt, err := domain.NewOnboardingActionReceiptForMode(secondRequest, fixture.studentID, fixture.teacherID, uuid.NewString(), now.Add(9*time.Second), now.Add(2*time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	_, _, err = receipts.Claim(ctx, secondReceipt)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingConflict, "materialized receipt keeps the prompt-level effect fence")
+	stillOpen, found, err := turns.CloseActiveInteractionForTerminal(ctx, pendingDialogID, fixture.teacherID, domain.TeacherOnboardingClosedPlanningReady, now.Add(10*time.Second))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingInteractionActive, stillOpen.State, "terminal ensure must not steal a materialized action awaiting its Dialog event")
+}
+
+func productInteraction(fixture *teacherDecisionIntegrationFixture, dialogID, interactionID, promptID, digest string, draftVersion int64, now time.Time) domain.TeacherOnboardingInteraction {
+	return domain.TeacherOnboardingInteraction{
+		ID: interactionID, DialogID: dialogID, StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID,
+		PromptMessageID: promptID, PromptMessageVersion: 1, PromptAssistantUIDigest: digest,
+		SlotCode: domain.TeacherOnboardingSlotDirection, ExpectedDraftVersion: draftVersion,
+		SessionSchemaVersion: 3, State: domain.TeacherOnboardingInteractionActive, CreatedAt: now, UpdatedAt: now,
+	}
+}

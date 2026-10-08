@@ -1,0 +1,840 @@
+package answer
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+// FinalValidation performs final validation and sets PASSED status.
+type FinalValidation struct {
+	Answers                repository.StudentTaskAnswerRepository
+	TaskTestAnswers        repository.TaskTestAnswerVariantRepository
+	TaskProvider           TaskProvider
+	Progression            *ProgressionService
+	SandboxClient          SandboxClient
+	ValidatorFactory       ValidatorFactory
+	ValidationOrchestrator ValidationOrchestratorClient
+	Publisher              domain.EventPublisher
+	CommandPublisher       domain.CommandPublisher
+	AutoReviews            repository.AutoReviewRepository
+	LearningActions        repository.LearningActionLifecycleRepository
+	PracticeTaskRuntime    PracticeTaskRuntimeBridge
+}
+
+// SandboxClient provides access to sandbox service.
+type SandboxClient interface {
+	GetSnapshot(ctx context.Context, sandboxID string) (WorkspaceSnapshot, error)
+	FindByUserAndTask(ctx context.Context, userID, taskID, answerID string) (string, error)
+	ArchiveAndUpload(ctx context.Context, sandboxID, answerID string) (string, error)
+}
+
+// WorkspaceFile represents a file in workspace.
+type WorkspaceFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type WorkspaceSnapshot struct {
+	Files    []WorkspaceFile `json:"files"`
+	RootPath string          `json:"root_path,omitempty"`
+}
+
+// ValidatorFactory creates validators.
+type ValidatorFactory interface {
+	GetValidator(codeStructureTypeCode string) ValidatorClient
+}
+
+// ValidatorClient validates code.
+type ValidatorClient interface {
+	ValidateAll(ctx context.Context, taskID string, files []WorkspaceFile) (*ValidationResult, error)
+}
+
+type ValidationOrchestratorClient interface {
+	Validate(ctx context.Context, request OrchestratorValidationRequest) (*OrchestratorValidationResult, error)
+}
+
+// ValidationResult represents validation result.
+type ValidationResult struct {
+	Valid  bool
+	Errors []ValidationError
+}
+
+// ValidationError represents a validation error.
+type ValidationError struct {
+	Code    string
+	Message string
+	File    string
+	Line    int
+	Column  int
+}
+
+type OrchestratorValidationRequest struct {
+	TaskID                string          `json:"task_id"`
+	CodeStructureTypeCode string          `json:"code_structure_type_code,omitempty"`
+	Mode                  string          `json:"mode"`
+	CodeStructure         json.RawMessage `json:"code_structure"`
+	Workspace             struct {
+		Files    []WorkspaceFile `json:"files"`
+		RootPath string          `json:"root_path,omitempty"`
+	} `json:"workspace"`
+	TaskMetadata struct {
+		TaskKind               string `json:"task_kind,omitempty"`
+		ExecutionMode          string `json:"execution_mode,omitempty"`
+		EvaluationMode         string `json:"evaluation_mode,omitempty"`
+		SubmissionMode         string `json:"submission_mode,omitempty"`
+		SupportsLiveValidation bool   `json:"supports_live_validation,omitempty"`
+	} `json:"task_metadata,omitempty"`
+}
+
+type OrchestratorValidationResult struct {
+	ContractKind    string                        `json:"contract_kind"`
+	ContractVersion int                           `json:"contract_version"`
+	Legacy          bool                          `json:"legacy"`
+	Passed          bool                          `json:"passed"`
+	Stages          []OrchestratorStageReport     `json:"stages"`
+	Links           []OrchestratorLinkReport      `json:"links,omitempty"`
+	Errors          []OrchestratorValidationError `json:"errors,omitempty"`
+}
+
+type OrchestratorStageReport struct {
+	StageID  string                        `json:"stage_id"`
+	Engine   string                        `json:"engine"`
+	Status   string                        `json:"status"`
+	Passed   bool                          `json:"passed"`
+	Optional bool                          `json:"optional"`
+	Errors   []OrchestratorValidationError `json:"errors,omitempty"`
+	Warnings []OrchestratorValidationError `json:"warnings,omitempty"`
+}
+
+type OrchestratorLinkReport struct {
+	LinkID   string                        `json:"link_id"`
+	Kind     string                        `json:"kind"`
+	Status   string                        `json:"status"`
+	Passed   bool                          `json:"passed"`
+	Optional bool                          `json:"optional"`
+	Errors   []OrchestratorValidationError `json:"errors,omitempty"`
+}
+
+type OrchestratorValidationError struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Severity string `json:"severity,omitempty"`
+	StageID  string `json:"stage_id,omitempty"`
+	Engine   string `json:"engine,omitempty"`
+	File     string `json:"file,omitempty"`
+	Selector string `json:"selector,omitempty"`
+	Route    string `json:"route,omitempty"`
+	Symbol   string `json:"symbol,omitempty"`
+	Property string `json:"property,omitempty"`
+	Hint     string `json:"hint,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Column   int    `json:"column,omitempty"`
+}
+
+// Handle performs final validation.
+func (uc FinalValidation) Handle(ctx context.Context, answerID string, answerPayload json.RawMessage) error {
+	// 1. Get answer
+	answer, err := uc.Answers.GetByID(ctx, answerID)
+	if err != nil {
+		return err
+	}
+
+	// 2. Get task
+	task, err := taskForAnswer(ctx, uc.TaskProvider, answer)
+	if err != nil {
+		return err
+	}
+	task = NormalizeTaskMetadata(task)
+	if task.Status != domain.TaskStatusActive {
+		return domain.ErrInvalidStatus
+	}
+	if err := requireAnswerTaskUnlocked(ctx, uc.Progression, answer); err != nil {
+		return err
+	}
+	evaluationMode := strings.ToUpper(strings.TrimSpace(task.EvaluationMode))
+	if evaluationMode == "" {
+		evaluationMode = taskEvaluationAuto
+	}
+	submissionMode := strings.ToUpper(strings.TrimSpace(task.SubmissionMode))
+	if submissionMode == "" {
+		submissionMode = taskSubmissionSnapshot
+	}
+
+	answer.AnswerPayload = normalizeAnswerPayload(answerPayload)
+	if submissionMode == taskSubmissionAnswerPayload && isStructuredAssessment(task) {
+		if _, err := decodeTaskTestAnswerPayload(task, answer.AnswerPayload); err != nil {
+			return err
+		}
+	}
+	if len(answer.AnswerPayload) > 0 {
+		answer.UpdatedAt = time.Now().UTC()
+		if err := uc.Answers.Update(ctx, *answer); err != nil {
+			return err
+		}
+	}
+
+	switch submissionMode {
+	case taskSubmissionAnswerPayload:
+		return uc.handleAnswerPayload(ctx, answer, task, evaluationMode)
+	default:
+		return uc.handleSnapshot(ctx, answer, task, evaluationMode)
+	}
+}
+
+func (uc FinalValidation) handleSnapshot(ctx context.Context, answer *domain.StudentTaskAnswer, task *TaskMetadata, evaluationMode string) error {
+	if uc.SandboxClient == nil {
+		return domain.ErrValidation
+	}
+	sandboxID, err := uc.SandboxClient.FindByUserAndTask(ctx, answer.StudentID, answer.TaskID, answer.ID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := uc.SandboxClient.GetSnapshot(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	files := snapshot.Files
+	if len(files) == 0 {
+		return uc.markFailed(ctx, answer, task, &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "NO_WORKSPACE_FILES", Message: "Workspace is empty"},
+			},
+		}, nil, &sandboxID)
+	}
+
+	if evaluationMode == taskEvaluationManual {
+		fileStorageID, err := uc.archiveSandbox(ctx, sandboxID, answer.ID)
+		if err != nil {
+			return err
+		}
+		answer.FilestorageID = &fileStorageID
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, false, nil, nil, &sandboxID)
+	}
+
+	if usesValidationContractV1(task.CodeStructure) {
+		if uc.ValidationOrchestrator == nil {
+			return domain.ErrValidation
+		}
+
+		result, rawResult, err := uc.validateWithOrchestrator(ctx, task, files, snapshot.RootPath)
+		if err != nil {
+			return err
+		}
+		if !result.Valid {
+			return uc.markFailed(ctx, answer, task, result, rawResult, &sandboxID)
+		}
+
+		fileStorageID, err := uc.archiveSandbox(ctx, sandboxID, answer.ID)
+		if err != nil {
+			return err
+		}
+		answer.FilestorageID = &fileStorageID
+
+		if evaluationMode == taskEvaluationHybrid {
+			return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, true, result, rawResult, &sandboxID)
+		}
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusPassed, true, result, rawResult, &sandboxID)
+	}
+
+	ruleResult, err := validateCodeStructureRules(task.CodeStructure, files)
+	if err != nil {
+		return err
+	}
+	if !ruleResult.Valid {
+		return uc.markFailed(ctx, answer, task, ruleResult, nil, &sandboxID)
+	}
+
+	validator := uc.ValidatorFactory.GetValidator(task.CodeStructureType)
+	if validator == nil {
+		return domain.ErrValidation
+	}
+	result, err := validator.ValidateAll(ctx, answer.TaskID, files)
+	if err != nil {
+		return err
+	}
+	if !result.Valid {
+		return uc.markFailed(ctx, answer, task, result, nil, &sandboxID)
+	}
+
+	fileStorageID, err := uc.archiveSandbox(ctx, sandboxID, answer.ID)
+	if err != nil {
+		return err
+	}
+	answer.FilestorageID = &fileStorageID
+
+	if evaluationMode == taskEvaluationHybrid {
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, true, result, nil, &sandboxID)
+	}
+	return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusPassed, true, result, nil, &sandboxID)
+}
+
+func (uc FinalValidation) validateWithOrchestrator(
+	ctx context.Context,
+	task *TaskMetadata,
+	files []WorkspaceFile,
+	rootPath string,
+) (*ValidationResult, map[string]any, error) {
+	request := OrchestratorValidationRequest{
+		TaskID:                task.ID,
+		CodeStructureTypeCode: task.CodeStructureType,
+		Mode:                  "final",
+		CodeStructure:         task.CodeStructure,
+	}
+	request.Workspace.Files = files
+	request.Workspace.RootPath = rootPath
+	request.TaskMetadata.TaskKind = task.TaskKind
+	request.TaskMetadata.ExecutionMode = task.ExecutionMode
+	request.TaskMetadata.EvaluationMode = task.EvaluationMode
+	request.TaskMetadata.SubmissionMode = task.SubmissionMode
+	request.TaskMetadata.SupportsLiveValidation = task.SupportsLiveValidation
+
+	report, err := uc.ValidationOrchestrator.Validate(ctx, request)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return mapOrchestratorValidationResult(report)
+}
+
+func (uc FinalValidation) markFailed(ctx context.Context, answer *domain.StudentTaskAnswer, task *TaskMetadata, result *ValidationResult, rawResult map[string]any, sandboxID *string) error {
+	now := time.Now().UTC()
+	answer.Status = domain.StudentTaskAnswerStatusFailed
+	answer.EndedAt = &now
+	answer.UpdatedAt = now
+
+	if uc.AutoReviews != nil {
+		review := domain.StudentTaskAnswerAutoReview{
+			ID:                  uuid.NewString(),
+			StudentTaskAnswerID: answer.ID,
+			CheckedAt:           now,
+			ValidatorName:       "ms-go-student",
+			AutoScore:           nil,
+			Passed:              false,
+			Feedback:            nil,
+			RawResult:           mergeAutoReviewRawResult(rawResult, result),
+		}
+		if err := uc.AutoReviews.Save(ctx, review); err != nil {
+			return err
+		}
+	}
+	if err := closeAnswerLearningAction(ctx, uc.LearningActions, uc.Answers, *answer, now); err != nil {
+		return err
+	}
+
+	_ = uc.publishAutoChecked(domain.SubjectTaskAnswerAutoChecked, map[string]any{
+		"student_task_answer_id": answer.ID,
+		"validator_name":         "ms-go-student",
+		"passed":                 false,
+	})
+	if uc.PracticeTaskRuntime != nil && isPracticeTaskRuntimeTask(task) {
+		if err := uc.PracticeTaskRuntime.FinalizeAnswer(ctx, answer.ID, false, mergeAutoReviewRawResult(rawResult, result), answer.FilestorageID, sandboxID, nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (uc FinalValidation) handleAnswerPayload(ctx context.Context, answer *domain.StudentTaskAnswer, task *TaskMetadata, evaluationMode string) error {
+	if len(bytes.TrimSpace(answer.AnswerPayload)) == 0 {
+		return domain.ErrValidation
+	}
+	if evaluationMode == taskEvaluationManual {
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, false, nil, nil, nil)
+	}
+	if isStructuredAssessment(task) {
+		return uc.handleTestAnswerPayload(ctx, answer, task, evaluationMode)
+	}
+
+	result, err := validateAnswerPayload(task.CodeStructure, answer.AnswerPayload)
+	if err != nil {
+		return err
+	}
+	if !result.Valid {
+		return uc.markFailed(ctx, answer, task, result, nil, nil)
+	}
+	if evaluationMode == taskEvaluationHybrid {
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, true, result, nil, nil)
+	}
+	return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusPassed, true, result, nil, nil)
+}
+
+func (uc FinalValidation) archiveSandbox(ctx context.Context, sandboxID, answerID string) (string, error) {
+	if uc.SandboxClient == nil {
+		return "", domain.ErrValidation
+	}
+	return uc.SandboxClient.ArchiveAndUpload(ctx, sandboxID, answerID)
+}
+
+func (uc FinalValidation) updateAnswerStatus(ctx context.Context, answer *domain.StudentTaskAnswer, task *TaskMetadata, status int, saveAutoReview bool, result *ValidationResult, rawResult map[string]any, sandboxID *string) error {
+	now := time.Now().UTC()
+	answer.Status = status
+	answer.EndedAt = &now
+	answer.UpdatedAt = now
+
+	if saveAutoReview && result != nil && uc.AutoReviews != nil {
+		review := domain.StudentTaskAnswerAutoReview{
+			ID:                  uuid.NewString(),
+			StudentTaskAnswerID: answer.ID,
+			CheckedAt:           now,
+			ValidatorName:       "ms-go-student",
+			Passed:              result.Valid,
+			RawResult:           mergeAutoReviewRawResult(rawResult, result),
+		}
+		if err := uc.AutoReviews.Save(ctx, review); err != nil {
+			return err
+		}
+	}
+	if status == domain.StudentTaskAnswerStatusPassed || status == domain.StudentTaskAnswerStatusFailed {
+		if err := closeAnswerLearningAction(ctx, uc.LearningActions, uc.Answers, *answer, now); err != nil {
+			return err
+		}
+	} else if err := uc.Answers.Update(ctx, *answer); err != nil {
+		return err
+	}
+
+	if saveAutoReview {
+		_ = uc.publishAutoChecked(domain.SubjectTaskAnswerAutoChecked, map[string]any{
+			"student_task_answer_id": answer.ID,
+			"validator_name":         "ms-go-student",
+			"passed":                 result != nil && result.Valid,
+		})
+	}
+	if uc.PracticeTaskRuntime != nil && isPracticeTaskRuntimeTask(task) {
+		if err := uc.PracticeTaskRuntime.FinalizeAnswer(ctx, answer.ID, status == domain.StudentTaskAnswerStatusPassed, mergeAutoReviewRawResult(rawResult, result), answer.FilestorageID, sandboxID, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (uc FinalValidation) handleTestAnswerPayload(ctx context.Context, answer *domain.StudentTaskAnswer, task *TaskMetadata, evaluationMode string) error {
+	result, rawResult, selectedVariants, err := validateTaskTestAnswerPayload(answer.ID, answer.TaskID, task, answer.AnswerPayload)
+	if err != nil {
+		return err
+	}
+	if uc.TaskTestAnswers != nil {
+		if err := uc.TaskTestAnswers.ReplaceForAnswer(ctx, answer.ID, selectedVariants); err != nil {
+			return err
+		}
+	}
+	if !result.Valid {
+		return uc.markFailed(ctx, answer, task, result, rawResult, nil)
+	}
+	if evaluationMode == taskEvaluationHybrid {
+		return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusUnderReview, true, result, rawResult, nil)
+	}
+	return uc.updateAnswerStatus(ctx, answer, task, domain.StudentTaskAnswerStatusPassed, true, result, rawResult, nil)
+}
+
+func (uc FinalValidation) publishAutoChecked(subject string, payload any) error {
+	if uc.CommandPublisher != nil {
+		return uc.CommandPublisher.Publish(subject, payload)
+	}
+	if uc.Publisher != nil {
+		return uc.Publisher.Publish(subject, payload)
+	}
+	return nil
+}
+
+func validateTaskTestAnswerPayload(answerID, taskID string, task *TaskMetadata, payload json.RawMessage) (*ValidationResult, map[string]any, []domain.TaskTestAnswerVariant, error) {
+	return evaluateStructuredAssessment(answerID, taskID, task, payload)
+}
+
+func mergeAutoReviewRawResult(rawResult map[string]any, result *ValidationResult) map[string]any {
+	if rawResult == nil {
+		rawResult = map[string]any{}
+	}
+	clone := make(map[string]any, len(rawResult)+2)
+	for key, value := range rawResult {
+		clone[key] = value
+	}
+	if _, exists := clone["source"]; !exists {
+		clone["source"] = "final_validation"
+	}
+	if result != nil {
+		clone["errors"] = result.Errors
+	}
+	return clone
+}
+
+func usesValidationContractV1(codeStructure json.RawMessage) bool {
+	if len(bytes.TrimSpace(codeStructure)) == 0 {
+		return false
+	}
+
+	var payload struct {
+		Version int             `json:"version"`
+		Kind    string          `json:"kind"`
+		Stages  json.RawMessage `json:"stages"`
+	}
+	if err := json.Unmarshal(codeStructure, &payload); err != nil {
+		return false
+	}
+
+	return payload.Version > 0 &&
+		strings.TrimSpace(payload.Kind) != "" &&
+		len(bytes.TrimSpace(payload.Stages)) > 0 &&
+		!bytes.Equal(bytes.TrimSpace(payload.Stages), []byte("null")) &&
+		!bytes.Equal(bytes.TrimSpace(payload.Stages), []byte("[]"))
+}
+
+func mapOrchestratorValidationResult(report *OrchestratorValidationResult) (*ValidationResult, map[string]any, error) {
+	if report == nil {
+		return nil, nil, fmt.Errorf("validation orchestrator returned empty result")
+	}
+
+	errors := make([]ValidationError, 0, len(report.Errors))
+	for _, item := range report.Errors {
+		errors = append(errors, ValidationError{
+			Code:    item.Code,
+			Message: composeOrchestratorErrorMessage(item),
+			File:    item.File,
+			Line:    item.Line,
+			Column:  item.Column,
+		})
+	}
+
+	if !report.Passed && len(errors) == 0 {
+		for _, stage := range report.Stages {
+			if stage.Passed {
+				continue
+			}
+			errors = append(errors, ValidationError{
+				Code:    "VALIDATION_STAGE_FAILED",
+				Message: fmt.Sprintf("Validation stage failed: %s", stage.StageID),
+			})
+		}
+		for _, link := range report.Links {
+			if link.Passed {
+				continue
+			}
+			errors = append(errors, ValidationError{
+				Code:    "VALIDATION_LINK_FAILED",
+				Message: fmt.Sprintf("Validation link failed: %s", link.LinkID),
+			})
+		}
+	}
+
+	rawResult := map[string]any{
+		"source":            "validation_orchestrator",
+		"contract_kind":     report.ContractKind,
+		"contract_version":  report.ContractVersion,
+		"passed":            report.Passed,
+		"legacy_contract":   report.Legacy,
+		"validation_report": report,
+	}
+
+	return &ValidationResult{
+		Valid:  report.Passed,
+		Errors: errors,
+	}, rawResult, nil
+}
+
+func composeOrchestratorErrorMessage(item OrchestratorValidationError) string {
+	parts := make([]string, 0, 4)
+	if item.StageID != "" {
+		parts = append(parts, "stage="+item.StageID)
+	}
+	if item.Engine != "" {
+		parts = append(parts, "engine="+item.Engine)
+	}
+	if item.Selector != "" {
+		parts = append(parts, "selector="+item.Selector)
+	}
+	if item.Route != "" {
+		parts = append(parts, "route="+item.Route)
+	}
+
+	prefix := strings.Join(parts, " ")
+	if prefix == "" {
+		return item.Message
+	}
+
+	return prefix + ": " + item.Message
+}
+
+func safeTaskVariantID(variant *TaskTestVariantMetadata) any {
+	if variant == nil {
+		return nil
+	}
+	return variant.ID
+}
+
+func safeTaskVariantText(variant *TaskTestVariantMetadata) any {
+	if variant == nil {
+		return nil
+	}
+	return variant.Text
+}
+
+func normalizeAnswerPayload(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return nil
+	}
+	return trimmed
+}
+
+func validateAnswerPayload(codeStructure json.RawMessage, payload json.RawMessage) (*ValidationResult, error) {
+	var quizConfig struct {
+		Quiz struct {
+			ExpectedAnswers []string `json:"expected_answers"`
+			IgnoreCase      bool     `json:"ignore_case"`
+			TrimSpace       bool     `json:"trim_space"`
+		} `json:"quiz"`
+	}
+	if err := json.Unmarshal(codeStructure, &quizConfig); err != nil {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "INVALID_CODE_STRUCTURE", Message: "Invalid code_structure JSON"},
+			},
+		}, nil
+	}
+
+	var answerBody struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(payload, &answerBody); err != nil {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "INVALID_ANSWER_PAYLOAD", Message: "Invalid answer payload"},
+			},
+		}, nil
+	}
+
+	actual := answerBody.Text
+	if quizConfig.Quiz.TrimSpace {
+		actual = strings.TrimSpace(actual)
+	}
+	if quizConfig.Quiz.IgnoreCase {
+		actual = strings.ToLower(actual)
+	}
+	for _, expected := range quizConfig.Quiz.ExpectedAnswers {
+		candidate := expected
+		if quizConfig.Quiz.TrimSpace {
+			candidate = strings.TrimSpace(candidate)
+		}
+		if quizConfig.Quiz.IgnoreCase {
+			candidate = strings.ToLower(candidate)
+		}
+		if candidate != "" && candidate == actual {
+			return &ValidationResult{Valid: true}, nil
+		}
+	}
+
+	return &ValidationResult{
+		Valid: false,
+		Errors: []ValidationError{
+			{Code: "QUIZ_ANSWER_INCORRECT", Message: "Submitted answer does not match expected answer"},
+		},
+	}, nil
+}
+
+func validateCodeStructureRules(codeStructure json.RawMessage, files []WorkspaceFile) (*ValidationResult, error) {
+	trimmed := bytes.TrimSpace(codeStructure)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return &ValidationResult{Valid: true, Errors: nil}, nil
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "INVALID_CODE_STRUCTURE", Message: "Invalid code_structure JSON"},
+			},
+		}, nil
+	}
+
+	rulesRaw, ok := payload["rules"]
+	rules := map[string]any{}
+	if ok {
+		typed, typedOK := rulesRaw.(map[string]any)
+		if typedOK {
+			rules = typed
+		}
+	}
+
+	requiredFiles := mergeUniqueStrings(
+		extractRequiredFiles(rules["required_files"]),
+		extractRequiredFiles(rules["required_pages"]),
+		extractRequiredFiles(rules["required_api_routes"]),
+	)
+	requiredStrings := collectRequiredNeedles(rules)
+	requiredVariables := extractRequiredVariables(rules["required_variables"])
+	requiredInterfaces := extractRequiredInterfaces(rules["required_interfaces"])
+	requiredFunctions := extractRequiredFunctions(rules["required_functions"])
+	requiredConstructs := extractRequiredConstructs(rules["required_constructs"])
+	requiredClasses := extractRequiredClasses(rules["required_classes"])
+	requiredMethods := extractRequiredMethods(rules["required_methods"])
+	requiredRoutes := extractRequiredRoutes(rules["required_routes"])
+	requiredReactComponents := extractRequiredReactComponents(payload)
+
+	fileContents := make(map[string]string, len(files))
+	for _, file := range files {
+		fileContents[normalizePath(file.Path)] = file.Content
+	}
+
+	htmlErrors, handledHTMLRules, err := validateHTMLDocumentRules(rules, requiredFiles, fileContents)
+	if err != nil {
+		return nil, err
+	}
+	if len(requiredFiles) == 0 &&
+		len(requiredStrings) == 0 &&
+		len(requiredVariables) == 0 &&
+		len(requiredInterfaces) == 0 &&
+		len(requiredFunctions) == 0 &&
+		len(requiredConstructs) == 0 &&
+		len(requiredClasses) == 0 &&
+		len(requiredMethods) == 0 &&
+		len(requiredRoutes) == 0 &&
+		len(requiredReactComponents) == 0 &&
+		!handledHTMLRules {
+		return &ValidationResult{Valid: true, Errors: nil}, nil
+	}
+
+	errors := make([]ValidationError, 0, len(htmlErrors))
+	errors = append(errors, htmlErrors...)
+	targetContents := make([]string, 0)
+	if len(requiredFiles) > 0 {
+		for _, path := range requiredFiles {
+			content, exists := fileContents[path]
+			if !exists {
+				errors = append(errors, ValidationError{
+					Code:    "REQUIRED_FILE_MISSING",
+					Message: "Required file is missing",
+					File:    path,
+				})
+				continue
+			}
+			targetContents = append(targetContents, content)
+		}
+	} else {
+		for _, content := range fileContents {
+			targetContents = append(targetContents, content)
+		}
+	}
+
+	for _, needle := range requiredStrings {
+		found := false
+		for _, content := range targetContents {
+			if strings.Contains(content, needle) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errors = append(errors, ValidationError{
+				Code:    "REQUIRED_STRING_MISSING",
+				Message: fmt.Sprintf("Required string is missing: %s", needle),
+				File:    strings.Join(requiredFiles, ","),
+			})
+		}
+	}
+
+	for _, variable := range requiredVariables {
+		if hasRequiredVariable(targetContents, variable) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_VARIABLE_MISSING",
+			Message: fmt.Sprintf("Required variable is missing: %s", variable.Name),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, iface := range requiredInterfaces {
+		if hasRequiredInterface(targetContents, iface) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_INTERFACE_MISSING",
+			Message: fmt.Sprintf("Required interface is missing or incomplete: %s", iface.Name),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, fn := range requiredFunctions {
+		if hasRequiredFunction(targetContents, fn) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_FUNCTION_MISSING",
+			Message: fmt.Sprintf("Required function is missing: %s", fn.Name),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, construct := range requiredConstructs {
+		if hasRequiredConstruct(targetContents, construct) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_CONSTRUCT_MISSING",
+			Message: fmt.Sprintf("Required construct is missing: %s", construct.Type),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, classReq := range requiredClasses {
+		if hasRequiredClass(targetContents, classReq) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_CLASS_MISSING",
+			Message: fmt.Sprintf("Required class is missing or incomplete: %s", classReq.Name),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, method := range requiredMethods {
+		if hasRequiredMethod(targetContents, method) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_METHOD_MISSING",
+			Message: fmt.Sprintf("Required method usage is missing: %s", method),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, route := range requiredRoutes {
+		if hasRequiredRoute(targetContents, route) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_ROUTE_MISSING",
+			Message: fmt.Sprintf("Required route is missing: %s %s", route.Method, route.Path),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	for _, component := range requiredReactComponents {
+		if hasRequiredReactComponent(targetContents, component) {
+			continue
+		}
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_COMPONENT_MISSING",
+			Message: fmt.Sprintf("Required React component is missing or incomplete: %s", component.Name),
+			File:    strings.Join(requiredFiles, ","),
+		})
+	}
+
+	if len(errors) > 0 {
+		return &ValidationResult{Valid: false, Errors: errors}, nil
+	}
+
+	return &ValidationResult{Valid: true, Errors: nil}, nil
+}

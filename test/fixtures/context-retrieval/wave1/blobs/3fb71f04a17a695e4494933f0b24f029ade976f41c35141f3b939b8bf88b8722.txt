@@ -1,0 +1,605 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherOnboardingHandoffRepository struct{ Pool *pgxpool.Pool }
+
+func (store TeacherOnboardingHandoffRepository) Enqueue(ctx context.Context, input repository.TeacherOnboardingHandoffEnqueue, now time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	intent, err := domain.NewTeacherOnboardingHandoffIntent(input.Intent)
+	coordinatorOrigin := strings.TrimSpace(input.EventID) != "" || strings.TrimSpace(input.ClaimToken) != ""
+	if store.Pool == nil || err != nil || now.IsZero() ||
+		(coordinatorOrigin && (!validUUIDString(input.EventID) || !validUUIDString(input.ClaimToken) || !validUUIDString(intent.SourceTeacherJobID) || !validUUIDString(intent.SourceInteractionID))) ||
+		(!coordinatorOrigin && (input.EventID != "" || input.ClaimToken != "" || intent.SourceTeacherJobID != "" || intent.SourceInteractionID != "")) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOnboardingDialog(ctx, tx, intent.DialogID); err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	var coordinatorMode string
+	if coordinatorOrigin {
+		var jobID, interactionID string
+		err = tx.QueryRow(ctx, `
+SELECT job.teacher_job_id::text,turn.interaction_id::text,turn.coordinator_mode
+FROM teacher_dialog_job AS job
+JOIN teacher_onboarding_turn AS turn ON turn.teacher_job_id=job.teacher_job_id
+WHERE job.event_id=$1 AND job.claim_token=$2 AND job.status='processing'
+  AND job.student_id=$3 AND job.personal_teacher_id=$4 AND job.dialog_id=$5
+  AND turn.stage='student_staged' AND turn.student_effect_state='accepted'
+FOR UPDATE OF job,turn
+`, input.EventID, input.ClaimToken, intent.StudentID, intent.PersonalTeacherID, intent.DialogID).Scan(&jobID, &interactionID, &coordinatorMode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherDialogLeaseLost
+		}
+		if err != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, err
+		}
+		if jobID != intent.SourceTeacherJobID || interactionID != intent.SourceInteractionID ||
+			(coordinatorMode != string(domain.TeacherOnboardingCoordinatorAction) && coordinatorMode != string(domain.TeacherOnboardingCoordinatorText)) {
+			return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingConflict
+		}
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_plan_handoff (
+ handoff_intent_id,student_id,personal_teacher_id,dialog_id,source_teacher_job_id,source_interaction_id,
+ command_id,command_teacher_job_id,request_hash,state_ref_kind,state_ref_version,
+ goal_code,goal_version,graph_version,locale,status,next_attempt_at,notification_command_id,created_at,updated_at
+) VALUES ($1,$2,$3,$4,NULLIF($5,'')::uuid,NULLIF($6,'')::uuid,$7,$8,$9,$10,$11,$12,$13,$14,$15,'queued',$16,$17,$18,$18)
+ON CONFLICT DO NOTHING
+`, intent.ID, intent.StudentID, intent.PersonalTeacherID, intent.DialogID, intent.SourceTeacherJobID, intent.SourceInteractionID,
+		intent.CommandID, intent.CommandTeacherJobID, intent.RequestHash, intent.StateRef.Kind, intent.StateRef.Version,
+		intent.Goal.Code, intent.Goal.Version, intent.Goal.GraphVersion, intent.Locale, intent.NextAttemptAt, intent.NotificationCommandID, intent.CreatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	created := command.RowsAffected() == 1
+	stored, err := scanTeacherOnboardingHandoff(tx.QueryRow(ctx, teacherOnboardingHandoffColumns+`
+WHERE student_id=$1 AND state_ref_kind=$2 AND state_ref_version=$3
+FOR UPDATE
+`, intent.StudentID, intent.StateRef.Kind, intent.StateRef.Version))
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	if !sameTeacherOnboardingHandoffIdentity(stored, intent) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHandoffConflict
+	}
+	if coordinatorOrigin {
+		closed, closeErr := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET
+ state='handoff_pending',closed_reason='planning_ready',closed_at=$3,updated_at=$3
+WHERE interaction_id=$1 AND reserved_teacher_job_id=$2 AND state='reserved'
+`, intent.SourceInteractionID, intent.SourceTeacherJobID, now.UTC())
+		if closeErr != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, closeErr
+		}
+		if closed.RowsAffected() != 1 {
+			return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		released, releaseErr := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET coordinator_mode=$3,status='queued',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+ error_code=NULL,next_attempt_at=$4,updated_at=$4
+WHERE event_id=$1 AND claim_token=$2 AND status='processing' AND response_body IS NULL AND decision_id IS NULL
+`, input.EventID, input.ClaimToken, coordinatorMode, now.UTC())
+		if releaseErr != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, releaseErr
+		}
+		if released.RowsAffected() != 1 {
+			return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherDialogLeaseLost
+		}
+	} else {
+		interaction, found, findErr := scanOptionalTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND personal_teacher_id=$2 AND state IN ('active','reserved')
+  AND (NULLIF($3,'')::uuid IS NULL OR interaction_id=NULLIF($3,'')::uuid)
+ORDER BY created_at DESC,interaction_id DESC LIMIT 1 FOR UPDATE
+`, intent.DialogID, intent.PersonalTeacherID, intent.SourceInteractionID))
+		if findErr != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, findErr
+		}
+		if found {
+			if intent.SourceInteractionID != "" && interaction.ID != intent.SourceInteractionID {
+				return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHandoffConflict
+			}
+			if interaction.State == domain.TeacherOnboardingInteractionReserved {
+				return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingBusy
+			}
+			var actionPending bool
+			if err := tx.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM teacher_onboarding_action_receipt
+ WHERE dialog_id=$1 AND personal_teacher_id=$2 AND source_message_id=$3 AND source_message_version=$4
+   AND status IN ('claimed','applied','materialized'))
+`, intent.DialogID, intent.PersonalTeacherID, interaction.PromptMessageID, interaction.PromptMessageVersion).Scan(&actionPending); err != nil {
+				return domain.TeacherOnboardingHandoffIntent{}, false, err
+			}
+			if actionPending {
+				return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingBusy
+			}
+			if _, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET state='closed',closed_reason='planning_ready',closed_at=$2,updated_at=$2
+WHERE interaction_id=$1 AND state='active'
+`, interaction.ID, now.UTC()); err != nil {
+				return domain.TeacherOnboardingHandoffIntent{}, false, err
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	return stored, created, nil
+}
+
+func (store TeacherOnboardingHandoffRepository) GetByStudentState(ctx context.Context, studentID string, stateRef domain.TeacherStudentReadinessStateRef, goal domain.TeacherLearningReadinessGoal) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, teacherOnboardingHandoffColumns+`
+WHERE student_id=$1 AND state_ref_kind=$2 AND state_ref_version=$3
+`, studentID, stateRef.Kind, stateRef.Version))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	if err == nil && intent.Goal != goal {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHandoffConflict
+	}
+	return intent, err == nil, err
+}
+
+func (store TeacherOnboardingHandoffRepository) FindOnlyRecoverableHandoffForStudent(ctx context.Context, studentID string) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	rows, err := store.Pool.Query(ctx, teacherOnboardingHandoffColumns+`
+WHERE handoff_intent_id IN (
+ SELECT handoff.handoff_intent_id
+ FROM teacher_onboarding_plan_handoff AS handoff
+ WHERE handoff.student_id=$1 AND handoff.status <> 'blocked' AND (
+   (handoff.source_teacher_job_id IS NULL AND handoff.source_interaction_id IS NULL)
+   OR EXISTS (
+     SELECT 1
+     FROM teacher_onboarding_interaction AS source_interaction
+     JOIN teacher_dialog_job AS source_job ON source_job.teacher_job_id=handoff.source_teacher_job_id
+     WHERE source_interaction.interaction_id=handoff.source_interaction_id
+       AND source_interaction.session_schema_version=3
+       AND source_interaction.state IN ('handoff_pending','completed')
+       AND source_job.teacher_job_id=source_interaction.reserved_teacher_job_id
+       AND source_job.coordinator_mode=source_interaction.reservation_mode
+       AND ((source_interaction.state='handoff_pending' AND source_job.status='queued')
+         OR (source_interaction.state='completed' AND source_job.status='delivered'))
+       AND source_interaction.student_id=handoff.student_id
+       AND source_interaction.personal_teacher_id=handoff.personal_teacher_id
+       AND source_interaction.dialog_id=handoff.dialog_id
+       AND source_job.student_id=handoff.student_id
+       AND source_job.personal_teacher_id=handoff.personal_teacher_id
+       AND source_job.dialog_id=handoff.dialog_id
+   )
+ )
+)
+ORDER BY handoff_intent_id LIMIT 2
+`, studentID)
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	defer rows.Close()
+	var intent domain.TeacherOnboardingHandoffIntent
+	count := 0
+	for rows.Next() {
+		intent, err = scanTeacherOnboardingHandoff(rows)
+		if err != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, err
+		}
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	if count > 1 {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if count == 0 {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	return intent, true, nil
+}
+
+func (store TeacherOnboardingHandoffRepository) GetBySourceSession(ctx context.Context, studentID, interactionID, teacherJobID string) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) || !validUUIDString(interactionID) || !validUUIDString(teacherJobID) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, teacherOnboardingHandoffColumns+`
+WHERE handoff_intent_id IN (
+ SELECT handoff.handoff_intent_id
+ FROM teacher_onboarding_plan_handoff AS handoff
+ JOIN teacher_onboarding_interaction AS source_interaction
+   ON source_interaction.interaction_id=handoff.source_interaction_id
+  AND source_interaction.session_schema_version=3
+  AND source_interaction.state IN ('handoff_pending','completed')
+ JOIN teacher_dialog_job AS source_job
+   ON source_job.teacher_job_id=handoff.source_teacher_job_id
+  AND source_job.teacher_job_id=source_interaction.reserved_teacher_job_id
+  AND source_job.coordinator_mode=source_interaction.reservation_mode
+ WHERE handoff.student_id=$1 AND handoff.source_interaction_id=$2 AND handoff.source_teacher_job_id=$3
+   AND handoff.status <> 'blocked'
+   AND ((source_interaction.state='handoff_pending' AND source_job.status='queued')
+     OR (source_interaction.state='completed' AND source_job.status='delivered'))
+   AND source_interaction.student_id=handoff.student_id
+   AND source_interaction.personal_teacher_id=handoff.personal_teacher_id
+   AND source_interaction.dialog_id=handoff.dialog_id
+   AND source_job.student_id=handoff.student_id
+   AND source_job.personal_teacher_id=handoff.personal_teacher_id
+   AND source_job.dialog_id=handoff.dialog_id
+)
+`, studentID, interactionID, teacherJobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	return intent, err == nil, err
+}
+
+func (store TeacherOnboardingHandoffRepository) HasHandoffHistory(ctx context.Context, studentID string) (bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return false, domain.ErrInvalidTeacherOnboarding
+	}
+	var found bool
+	err := store.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM teacher_onboarding_plan_handoff WHERE student_id=$1)`, studentID).Scan(&found)
+	return found, err
+}
+
+func (store TeacherOnboardingHandoffRepository) GetByPlannerHandoffID(ctx context.Context, plannerHandoffID string) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(plannerHandoffID) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, teacherOnboardingHandoffColumns+`
+WHERE planner_handoff_id=$1
+`, plannerHandoffID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	return intent, err == nil, err
+}
+
+func (store TeacherOnboardingHandoffRepository) ClaimDispatch(ctx context.Context, claimToken, workerID string, now, lockedUntil time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(claimToken) || !validHandoffWorkerID(workerID) || now.IsZero() || !lockedUntil.After(now) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, `
+WITH candidate AS (
+ SELECT handoff_intent_id FROM teacher_onboarding_plan_handoff
+ WHERE (status='queued' AND next_attempt_at <= $1) OR (status='dispatching' AND locked_until <= $1)
+ ORDER BY next_attempt_at,created_at,handoff_intent_id FOR UPDATE SKIP LOCKED LIMIT 1
+)
+UPDATE teacher_onboarding_plan_handoff AS handoff SET
+ status='dispatching',claim_token=$2,locked_by=$3,locked_until=$4,attempts=attempts+1,updated_at=$1
+FROM candidate WHERE handoff.handoff_intent_id=candidate.handoff_intent_id
+RETURNING `+teacherOnboardingHandoffReturningColumns, now.UTC(), claimToken, strings.TrimSpace(workerID), lockedUntil.UTC()))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	return intent, err == nil, err
+}
+
+func (store TeacherOnboardingHandoffRepository) RetryDispatch(ctx context.Context, intentID, claimToken, code string, retryAt, now time.Time) error {
+	if !retryAt.After(now) || !validHandoffErrorCode(code) {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	return store.finishClaim(ctx, intentID, claimToken, `
+UPDATE teacher_onboarding_plan_handoff SET status='queued',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+ next_attempt_at=$3,last_error_code=$4,updated_at=$5
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status='dispatching'
+`, retryAt.UTC(), code, now.UTC())
+}
+
+func (store TeacherOnboardingHandoffRepository) MarkAccepted(ctx context.Context, intentID, claimToken string, result domain.TeacherOnboardingPlanHandoff, now time.Time) error {
+	if store.Pool == nil || !validUUIDString(intentID) || !validUUIDString(claimToken) || now.IsZero() {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, teacherOnboardingHandoffColumns+` WHERE handoff_intent_id=$1`, intentID))
+	if err != nil {
+		return err
+	}
+	result, err = domain.NormalizeTeacherOnboardingPlanHandoff(result, intent)
+	if err != nil {
+		return err
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, result.ReadinessObservedAt)
+	if err != nil {
+		return domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	return store.finishClaim(ctx, intentID, claimToken, `
+UPDATE teacher_onboarding_plan_handoff SET status='accepted',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+ planner_handoff_id=$3,readiness_observed_at=$4,accepted_at=$5,last_error_code=NULL,next_attempt_at=$5,updated_at=$5
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status='dispatching'
+`, result.HandoffID, observedAt.UTC(), now.UTC())
+}
+
+func (store TeacherOnboardingHandoffRepository) ClaimNotification(ctx context.Context, claimToken, workerID string, now, lockedUntil time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.Pool == nil || !validUUIDString(claimToken) || !validHandoffWorkerID(workerID) || now.IsZero() || !lockedUntil.After(now) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	intent, err := scanTeacherOnboardingHandoff(store.Pool.QueryRow(ctx, `
+WITH candidate AS (
+ SELECT handoff_intent_id FROM teacher_onboarding_plan_handoff
+ WHERE ((status IN ('accepted','active_path') AND next_attempt_at <= $1) OR (status='message_pending' AND locked_until <= $1))
+ ORDER BY next_attempt_at,created_at,handoff_intent_id FOR UPDATE SKIP LOCKED LIMIT 1
+)
+UPDATE teacher_onboarding_plan_handoff AS handoff SET
+ status='message_pending',claim_token=$2,locked_by=$3,locked_until=$4,attempts=attempts+1,updated_at=$1
+FROM candidate WHERE handoff.handoff_intent_id=candidate.handoff_intent_id
+RETURNING `+teacherOnboardingHandoffReturningColumns, now.UTC(), claimToken, strings.TrimSpace(workerID), lockedUntil.UTC()))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, err
+	}
+	if intent.SourceTeacherJobID != "" {
+		job, jobErr := scanTeacherDialogJob(store.Pool.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+` FROM teacher_dialog_job AS job WHERE teacher_job_id=$1`, intent.SourceTeacherJobID))
+		if jobErr != nil {
+			return domain.TeacherOnboardingHandoffIntent{}, false, jobErr
+		}
+		request := job.Request
+		intent.SourceRequest = &request
+	}
+	return intent, true, nil
+}
+
+func (store TeacherOnboardingHandoffRepository) MarkActivePath(ctx context.Context, intentID, claimToken string, now time.Time) error {
+	return store.finishClaim(ctx, intentID, claimToken, `
+UPDATE teacher_onboarding_plan_handoff SET status='active_path',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+ last_error_code=NULL,next_attempt_at=$3,updated_at=$3
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status='dispatching'
+`, now.UTC())
+}
+
+func (store TeacherOnboardingHandoffRepository) RetryNotification(ctx context.Context, intentID, claimToken, code string, retryAt, now time.Time) error {
+	if !retryAt.After(now) || !validHandoffErrorCode(code) {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	return store.finishClaim(ctx, intentID, claimToken, `
+UPDATE teacher_onboarding_plan_handoff SET status=CASE WHEN planner_handoff_id IS NULL THEN 'active_path' ELSE 'accepted' END,
+ claim_token=NULL,locked_by=NULL,locked_until=NULL,next_attempt_at=$3,last_error_code=$4,updated_at=$5
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status='message_pending'
+`, retryAt.UTC(), code, now.UTC())
+}
+
+func (store TeacherOnboardingHandoffRepository) MarkDelivered(ctx context.Context, intentID, claimToken, messageID string, now time.Time) error {
+	if store.Pool == nil || !validUUIDString(intentID) || !validUUIDString(claimToken) || !validUUIDString(messageID) || now.IsZero() {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	intent, err := scanTeacherOnboardingHandoff(tx.QueryRow(ctx, teacherOnboardingHandoffColumns+` WHERE handoff_intent_id=$1 FOR UPDATE`, intentID))
+	if err != nil || intent.Status != domain.TeacherOnboardingHandoffMessagePending || intent.ClaimToken != claimToken {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingHandoffConflict
+	}
+	if intent.SourceTeacherJobID != "" {
+		job, jobErr := scanTeacherDialogJob(tx.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+` FROM teacher_dialog_job AS job WHERE teacher_job_id=$1 FOR UPDATE`, intent.SourceTeacherJobID))
+		if jobErr != nil || job.Status != domain.TeacherDialogJobQueued || job.ResponseBody != "" || job.DecisionID != "" || !job.Request.UsesDenseTeacherOrdering() {
+			if jobErr != nil {
+				return jobErr
+			}
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+		var turnInteractionID, studentCommandID string
+		if err := tx.QueryRow(ctx, `SELECT interaction_id::text,student_command_id::text FROM teacher_onboarding_turn
+WHERE teacher_job_id=$1 AND stage='student_staged' AND student_effect_state='accepted' FOR UPDATE`, job.TeacherJobID).Scan(&turnInteractionID, &studentCommandID); err != nil {
+			return err
+		}
+		var nextSequence, revision int64
+		if err := tx.QueryRow(ctx, `SELECT next_teacher_turn_sequence,revision FROM teacher_dialog_turn_cursor WHERE dialog_id=$1 FOR UPDATE`, job.Request.DialogID).Scan(&nextSequence, &revision); err != nil {
+			return err
+		}
+		if nextSequence != job.Request.TeacherTurnSequence {
+			return domain.ErrTeacherDialogCursorBlocked
+		}
+		command, updateErr := tx.Exec(ctx, `UPDATE teacher_dialog_turn_cursor SET
+ next_teacher_turn_sequence=next_teacher_turn_sequence+1,last_source_event_id=$2,last_teacher_job_id=$3,
+ last_terminal_outcome='delivered',last_teacher_response_message_id=$4,last_no_effect_proof_id=NULL,
+ last_recoverable_outcome_id=NULL,last_failure_code=NULL,revision=$5,updated_at=$6
+WHERE dialog_id=$1 AND next_teacher_turn_sequence=$7 AND revision=$8`, job.Request.DialogID, job.Request.EventID, job.TeacherJobID, messageID, revision+1, now.UTC(), nextSequence, revision)
+		if updateErr != nil || command.RowsAffected() != 1 {
+			if updateErr != nil {
+				return updateErr
+			}
+			return domain.ErrTeacherDialogCursorBlocked
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO teacher_dialog_turn_outcome (
+ recoverable_outcome_id,teacher_job_id,source_event_id,dialog_id,teacher_turn_sequence,turn_correlation_id,
+ outcome,student_command_id,teacher_response_message_id,no_effect_proof_id,failure_code,created_at
+) VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::uuid,'delivered',$7,$8,NULL,NULL,$9)
+ON CONFLICT (source_event_id) DO NOTHING`, uuid.NewString(), job.TeacherJobID, job.Request.EventID, job.Request.DialogID,
+			job.Request.TeacherTurnSequence, job.Request.CorrelationID, studentCommandID, messageID, now.UTC()); err != nil {
+			return err
+		}
+		if command, updateErr := tx.Exec(ctx, `UPDATE teacher_onboarding_interaction SET
+ state='completed',completed_at=$2,closed_reason=NULL,closed_at=NULL,updated_at=$2
+WHERE interaction_id=$1 AND state='handoff_pending'`, turnInteractionID, now.UTC()); updateErr != nil || command.RowsAffected() != 1 {
+			if updateErr != nil {
+				return updateErr
+			}
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+		if command, updateErr := tx.Exec(ctx, `UPDATE teacher_onboarding_turn SET stage='delivered',updated_at=$2
+WHERE teacher_job_id=$1 AND stage='student_staged' AND student_effect_state='accepted'`, job.TeacherJobID, now.UTC()); updateErr != nil || command.RowsAffected() != 1 {
+			if updateErr != nil {
+				return updateErr
+			}
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+		if command, updateErr := tx.Exec(ctx, `UPDATE teacher_dialog_job SET
+ status='delivered',delivered_message_id=$2,teacher_response_message_id=$2,terminal_outcome='delivered',
+ delivered_at=$3,error_code=NULL,updated_at=$3
+WHERE teacher_job_id=$1 AND status='queued' AND coordinator_mode IN ('onboarding_action','onboarding_text')`, job.TeacherJobID, messageID, now.UTC()); updateErr != nil || command.RowsAffected() != 1 {
+			if updateErr != nil {
+				return updateErr
+			}
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+	}
+	command, err := tx.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET
+ status='delivered',claim_token=NULL,locked_by=NULL,locked_until=NULL,notification_message_id=$3,
+ delivered_at=$4,last_error_code=NULL,updated_at=$4
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status='message_pending'`, intentID, claimToken, messageID, now.UTC())
+	if err != nil || command.RowsAffected() != 1 {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingHandoffConflict
+	}
+	return tx.Commit(ctx)
+}
+
+func (store TeacherOnboardingHandoffRepository) Block(ctx context.Context, intentID, claimToken, code string, now time.Time) error {
+	if store.Pool == nil || !validUUIDString(intentID) || !validUUIDString(claimToken) || !validHandoffErrorCode(code) || now.IsZero() {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var sourceJobID *string
+	command, err := tx.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET
+ status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,last_error_code=$3,updated_at=$4
+WHERE handoff_intent_id=$1 AND claim_token=$2 AND status IN ('dispatching','message_pending')`, intentID, claimToken, code, now.UTC())
+	if err != nil || command.RowsAffected() != 1 {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingHandoffConflict
+	}
+	if err := tx.QueryRow(ctx, `SELECT source_teacher_job_id::text FROM teacher_onboarding_plan_handoff WHERE handoff_intent_id=$1`, intentID).Scan(&sourceJobID); err != nil {
+		return err
+	}
+	if sourceJobID != nil {
+		var jobStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM teacher_dialog_job WHERE teacher_job_id=$1 FOR UPDATE`, *sourceJobID).Scan(&jobStatus); err != nil {
+			return err
+		}
+		if jobStatus != string(domain.TeacherDialogJobQueued) {
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+		turn, err := tx.Exec(ctx, `UPDATE teacher_onboarding_turn SET stage='blocked_unknown',student_effect_state='committed_unreconciled',updated_at=$2
+WHERE teacher_job_id=$1 AND stage='student_staged' AND student_effect_state='accepted'`, *sourceJobID, now.UTC())
+		if err != nil {
+			return err
+		}
+		if turn.RowsAffected() != 1 {
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+		job, err := tx.Exec(ctx, `UPDATE teacher_dialog_job SET status='blocked',error_code=$2,updated_at=$3
+WHERE teacher_job_id=$1 AND status='queued'`, *sourceJobID, code, now.UTC())
+		if err != nil {
+			return err
+		}
+		if job.RowsAffected() != 1 {
+			return domain.ErrTeacherOnboardingHandoffConflict
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (store TeacherOnboardingHandoffRepository) finishClaim(ctx context.Context, intentID, claimToken, query string, args ...any) error {
+	if store.Pool == nil || !validUUIDString(intentID) || !validUUIDString(claimToken) {
+		return domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	command, err := store.Pool.Exec(ctx, query, append([]any{intentID, claimToken}, args...)...)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherOnboardingHandoffConflict
+	}
+	return nil
+}
+
+const teacherOnboardingHandoffColumns = `SELECT
+handoff_intent_id::text,student_id::text,personal_teacher_id::text,dialog_id::text,
+source_teacher_job_id::text,source_interaction_id::text,command_id::text,command_teacher_job_id::text,request_hash,
+state_ref_kind,state_ref_version,goal_code,goal_version,graph_version,locale,status,claim_token::text,locked_by,locked_until,
+attempts,next_attempt_at,planner_handoff_id::text,notification_command_id::text,notification_message_id::text,last_error_code,
+created_at,updated_at,accepted_at,readiness_observed_at,delivered_at
+FROM teacher_onboarding_plan_handoff `
+
+const teacherOnboardingHandoffReturningColumns = `
+handoff.handoff_intent_id::text,handoff.student_id::text,handoff.personal_teacher_id::text,handoff.dialog_id::text,
+handoff.source_teacher_job_id::text,handoff.source_interaction_id::text,handoff.command_id::text,handoff.command_teacher_job_id::text,handoff.request_hash,
+handoff.state_ref_kind,handoff.state_ref_version,handoff.goal_code,handoff.goal_version,handoff.graph_version,handoff.locale,handoff.status,
+handoff.claim_token::text,handoff.locked_by,handoff.locked_until,handoff.attempts,handoff.next_attempt_at,handoff.planner_handoff_id::text,
+handoff.notification_command_id::text,handoff.notification_message_id::text,handoff.last_error_code,
+handoff.created_at,handoff.updated_at,handoff.accepted_at,handoff.readiness_observed_at,handoff.delivered_at`
+
+type onboardingHandoffRow interface{ Scan(...any) error }
+
+func scanTeacherOnboardingHandoff(row onboardingHandoffRow) (domain.TeacherOnboardingHandoffIntent, error) {
+	var intent domain.TeacherOnboardingHandoffIntent
+	var sourceJobID, sourceInteractionID, claimToken, lockedBy, plannerID, messageID, lastError *string
+	var lockedUntil, acceptedAt, readinessObservedAt, deliveredAt *time.Time
+	err := row.Scan(&intent.ID, &intent.StudentID, &intent.PersonalTeacherID, &intent.DialogID, &sourceJobID, &sourceInteractionID,
+		&intent.CommandID, &intent.CommandTeacherJobID, &intent.RequestHash, &intent.StateRef.Kind, &intent.StateRef.Version,
+		&intent.Goal.Code, &intent.Goal.Version, &intent.Goal.GraphVersion, &intent.Locale, &intent.Status, &claimToken, &lockedBy, &lockedUntil,
+		&intent.Attempts, &intent.NextAttemptAt, &plannerID, &intent.NotificationCommandID, &messageID, &lastError,
+		&intent.CreatedAt, &intent.UpdatedAt, &acceptedAt, &readinessObservedAt, &deliveredAt)
+	if err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, err
+	}
+	intent.SourceTeacherJobID = valueOrEmpty(sourceJobID)
+	intent.SourceInteractionID = valueOrEmpty(sourceInteractionID)
+	intent.ClaimToken = valueOrEmpty(claimToken)
+	intent.LockedBy = valueOrEmpty(lockedBy)
+	intent.LockedUntil = timeOrZero(lockedUntil)
+	intent.PlannerHandoffID = valueOrEmpty(plannerID)
+	intent.NotificationMessageID = valueOrEmpty(messageID)
+	intent.LastErrorCode = valueOrEmpty(lastError)
+	intent.AcceptedAt = timeOrZero(acceptedAt)
+	intent.ReadinessObservedAt = timeOrZero(readinessObservedAt)
+	intent.DeliveredAt = timeOrZero(deliveredAt)
+	return domain.NewTeacherOnboardingHandoffIntent(intent)
+}
+
+func scanOptionalTeacherOnboardingInteraction(row teacherOnboardingRow) (domain.TeacherOnboardingInteraction, bool, error) {
+	interaction, err := scanTeacherOnboardingInteraction(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	return interaction, err == nil, err
+}
+
+func sameTeacherOnboardingHandoffIdentity(left, right domain.TeacherOnboardingHandoffIntent) bool {
+	return left.ID == right.ID && left.StudentID == right.StudentID && left.PersonalTeacherID == right.PersonalTeacherID &&
+		left.DialogID == right.DialogID && left.SourceTeacherJobID == right.SourceTeacherJobID && left.SourceInteractionID == right.SourceInteractionID &&
+		left.CommandID == right.CommandID && left.CommandTeacherJobID == right.CommandTeacherJobID && left.RequestHash == right.RequestHash &&
+		left.StateRef == right.StateRef && left.Goal == right.Goal && left.Locale == right.Locale && left.NotificationCommandID == right.NotificationCommandID
+}
+
+func validHandoffWorkerID(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && len(value) <= 128
+}
+
+func validHandoffErrorCode(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && len(value) <= 64
+}
+
+var _ repository.TeacherOnboardingHandoffStore = TeacherOnboardingHandoffRepository{}

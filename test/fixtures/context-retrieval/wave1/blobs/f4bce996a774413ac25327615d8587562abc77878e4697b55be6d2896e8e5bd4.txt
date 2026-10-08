@@ -1,0 +1,161 @@
+//go:build integration
+
+package practice
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/google/uuid"
+)
+
+// TestT12RuntimeFeedback consumes the serialized driver's real PostgreSQL-backed
+// Runtime HTTP fixture. It neither supplies a provider nor calls a model.
+func TestT12RuntimeFeedback(t *testing.T) {
+	required := func(name string) string {
+		t.Helper()
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			t.Fatalf("%s is required for the opted-in actual Runtime proof", name)
+		}
+		return value
+	}
+	// Ordinary integration suites do not opt into this externally serialized proof.
+	if os.Getenv("T12_RUNTIME_READY_FILE") == "" {
+		t.Skip("T12 actual Runtime proof not selected")
+	}
+	baseURL := required("T12_RUNTIME_URL")
+	token := required("T12_TEACHER_TOKEN")
+	readyPath := required("T12_RUNTIME_READY_FILE")
+	resultPath := required("T12_TEACHER_RESULT_FILE")
+	expected := required("T12_EXPECT_OUTCOME")
+	if expected != "FAIL" && expected != "ERROR" && expected != "PASS" {
+		t.Fatal("T12_EXPECT_OUTCOME must be FAIL, ERROR, or PASS")
+	}
+	var ready struct {
+		URL                 string  `json:"url"`
+		StudentID           string  `json:"student_id"`
+		InstanceID          string  `json:"task_instance_id"`
+		RevisionID          string  `json:"task_revision_id"`
+		ActionID            string  `json:"learning_action_id"`
+		SubmissionID        string  `json:"submission_id"`
+		WorkspaceDigest     string  `json:"workspace_digest"`
+		Outcome             string  `json:"outcome"`
+		ErrorClassification *string `json:"error_classification"`
+	}
+	payload, err := os.ReadFile(readyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(payload, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.Outcome != expected || ready.URL != "" && strings.TrimRight(ready.URL, "/") != strings.TrimRight(baseURL, "/") {
+		t.Fatal("driver outcome or Runtime URL mismatch")
+	}
+	for _, value := range []string{ready.StudentID, ready.InstanceID, ready.RevisionID, ready.ActionID, ready.SubmissionID} {
+		if _, parseErr := uuid.Parse(value); parseErr != nil {
+			t.Fatal("driver identity must be a UUID")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := Client{BaseURL: baseURL, InternalToken: token}
+	practice, err := client.GetPracticeTaskContext(ctx, ready.StudentID, ready.InstanceID)
+	if err != nil {
+		t.Fatalf("actual Runtime teacher-context: %v", err)
+	}
+	if practice.TaskRevisionID != ready.RevisionID || practice.LearningActionID != ready.ActionID {
+		t.Fatal("actual base context identity differs from persisted fixture")
+	}
+	validation, err := client.GetPracticeTeacherValidationContext(ctx, practice, ready.ActionID)
+	if err != nil {
+		t.Fatalf("actual Runtime validation context: %v", err)
+	}
+	// This assertion must fail against the original always-unavailable Runtime.
+	if !validation.Available || validation.TeacherExplanation == nil || validation.Passed == nil {
+		t.Fatal("persisted official feedback must be available from actual Runtime")
+	}
+	if validation.SubmissionID == nil || *validation.SubmissionID != ready.SubmissionID || validation.WorkspaceDigest == nil || *validation.WorkspaceDigest != ready.WorkspaceDigest {
+		t.Fatal("official submission/workspace correlation mismatch")
+	}
+	if !practice.Validation.Available || practice.Validation.Passed != *validation.Passed {
+		t.Fatal("base and explanation persisted outcome mismatch")
+	}
+	issues := validation.TeacherExplanation.BlockingIssues
+	switch expected {
+	case "PASS":
+		if !*validation.Passed || len(issues) != 0 {
+			t.Fatal("PASS must have no blocking issues")
+		}
+	case "FAIL":
+		if *validation.Passed || len(issues) == 0 || ready.ErrorClassification != nil {
+			t.Fatal("FAIL requires semantic blocking issues without technical classification")
+		}
+		for _, issue := range issues {
+			if issue.StageID == "" || t12KnownTechnicalCode(issue.Code) {
+				t.Fatal("FAIL issue must identify a semantic required stage")
+			}
+		}
+	case "ERROR":
+		if *validation.Passed || ready.ErrorClassification == nil || !t12KnownTechnicalCode(*ready.ErrorClassification) || len(issues) != 1 {
+			t.Fatal("ERROR requires one known technical classification")
+		}
+		if issues[0].Code != *ready.ErrorClassification || issues[0].StageID != "" {
+			t.Fatal("ERROR must convey technical classification without pretending a semantic stage failure")
+		}
+	}
+	repeated, err := client.GetPracticeTeacherValidationContext(ctx, practice, ready.ActionID)
+	if err != nil || !reflect.DeepEqual(validation, repeated) {
+		t.Fatal("unchanged durable feedback and source_digest must remain stable across reads")
+	}
+	foreignStudent := uuid.NewString()
+	foreignPractice := practice
+	foreignPractice.StudentID = foreignStudent
+	if _, err = client.GetPracticeTaskContext(ctx, foreignStudent, ready.InstanceID); err == nil {
+		t.Fatal("foreign student base context was accepted")
+	}
+	if _, err = client.GetPracticeTeacherValidationContext(ctx, foreignPractice, ready.ActionID); err == nil {
+		t.Fatal("foreign student explanation was accepted")
+	}
+	if _, err = client.GetPracticeTeacherValidationContext(ctx, practice, uuid.NewString()); !errors.Is(err, domain.ErrInvalidStudentContext) {
+		t.Fatal("foreign action explanation must fail closed")
+	}
+	wrongToken := Client{BaseURL: baseURL, InternalToken: uuid.NewString()}
+	if _, err = wrongToken.GetPracticeTeacherValidationContext(ctx, practice, ready.ActionID); err == nil {
+		t.Fatal("foreign Teacher credential was accepted")
+	}
+	// The allowlisted decoded envelope contains no token, workspace files, or raw report.
+	proof := struct {
+		Schema                 string                                  `json:"schema"`
+		Outcome                string                                  `json:"outcome"`
+		Context                domain.PracticeTeacherValidationContext `json:"context"`
+		RepeatEqual            bool                                    `json:"repeat_equal"`
+		ForeignStudentRejected bool                                    `json:"foreign_student_rejected"`
+		ForeignActionRejected  bool                                    `json:"foreign_action_rejected"`
+		ForeignTokenRejected   bool                                    `json:"foreign_token_rejected"`
+	}{"t12-teacher-consumer-proof.v1", expected, validation, true, true, true, true}
+	payload, err = json.MarshalIndent(proof, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(resultPath, append(payload, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func t12KnownTechnicalCode(value string) bool {
+	switch value {
+	case "VALIDATOR_TIMEOUT", "VALIDATOR_UNAVAILABLE", "VALIDATOR_PROTOCOL", "STAGE_EXECUTION_ERROR", "SNAPSHOT_UNAVAILABLE", "SNAPSHOT_CORRUPT", "SNAPSHOT_DIGEST_MISMATCH", "UNSUPPORTED_CONFIGURATION", "AUTHORING_DEFECT":
+		return true
+	default:
+		return false
+	}
+}

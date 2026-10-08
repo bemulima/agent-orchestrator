@@ -1,0 +1,167 @@
+package task
+
+import (
+	"context"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+)
+
+type courseStructureLessonStub struct{ items []domain.Lesson }
+
+func (stub courseStructureLessonStub) ListByCourse(context.Context, string) ([]domain.Lesson, error) {
+	return append([]domain.Lesson(nil), stub.items...), nil
+}
+
+type courseStructureTaskStub struct{ items map[string][]domain.Task }
+
+func (stub courseStructureTaskStub) ListByLesson(_ context.Context, lessonID string) ([]domain.Task, error) {
+	return append([]domain.Task(nil), stub.items[lessonID]...), nil
+}
+
+func TestGetInternalCourseStructureReturnsStableCurriculumRevisionAndTargets(t *testing.T) {
+	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+	lessons := []domain.Lesson{
+		{ID: "lesson-1", SectionID: "section", Title: "First", Order: 1, Status: domain.LessonStatusActive, UpdatedAt: now},
+		{ID: "lesson-2", SectionID: "section", Title: "Second", Order: 2, Status: domain.LessonStatusActive, UpdatedAt: now},
+	}
+	tasks := map[string][]domain.Task{
+		"lesson-1": {{
+			ID: "task-1", LessonID: "lesson-1", Title: "Task", Order: 1,
+			Status: domain.TaskStatusActive, EvaluationMode: domain.TaskEvaluationModeAuto, UpdatedAt: now,
+			LearningTargets: []domain.TaskLearningTarget{{Type: domain.LearningTargetConcept, Key: "go.interfaces", Version: "v1"}},
+		}},
+	}
+	useCase := GetInternalCourseStructure{Lessons: courseStructureLessonStub{items: lessons}, Tasks: courseStructureTaskStub{items: tasks}}
+	first, err := useCase.Handle(context.Background(), "course-1")
+	if err != nil {
+		t.Fatalf("get internal course structure: %v", err)
+	}
+	second, err := useCase.Handle(context.Background(), "course-1")
+	if err != nil {
+		t.Fatalf("get internal course structure again: %v", err)
+	}
+	if !strings.HasPrefix(first.CurriculumRevision, "sha256:") || first.CurriculumRevision != second.CurriculumRevision {
+		t.Fatalf("curriculum revision is not stable: %q %q", first.CurriculumRevision, second.CurriculumRevision)
+	}
+	if first.Lessons[0].ID != "lesson-1" || len(first.Lessons[0].Tasks) != 1 || len(first.Lessons[0].Tasks[0].LearningTargets) != 1 {
+		t.Fatalf("ordered curriculum projection lost target metadata: %+v", first)
+	}
+	if first.Lessons[0].Tasks[0].LearningTargets[0].Key != "go.interfaces" || first.Lessons[0].UpdatedAt == "" {
+		t.Fatalf("unexpected curriculum projection: %+v", first.Lessons[0])
+	}
+}
+
+func TestGetInternalCourseStructurePreservesRepositoryHierarchyOrder(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	// Lesson.Order is local to a section. The repository already returns this
+	// list in course/module/section/lesson order; local zero orders must not be
+	// globally resorted by the internal projection.
+	lessons := []domain.Lesson{
+		{ID: "first-section-first", SectionID: "section-1", Order: 0, Status: domain.LessonStatusActive, UpdatedAt: now},
+		{ID: "first-section-second", SectionID: "section-1", Order: 1, Status: domain.LessonStatusActive, UpdatedAt: now},
+		{ID: "second-section-first", SectionID: "section-2", Order: 0, Status: domain.LessonStatusActive, UpdatedAt: now},
+	}
+	useCase := GetInternalCourseStructure{
+		Lessons: courseStructureLessonStub{items: lessons},
+		Tasks:   courseStructureTaskStub{items: map[string][]domain.Task{}},
+	}
+
+	result, err := useCase.Handle(context.Background(), "course-1")
+	if err != nil {
+		t.Fatalf("get internal course structure: %v", err)
+	}
+	got := []string{result.Lessons[0].ID, result.Lessons[1].ID, result.Lessons[2].ID}
+	want := []string{"first-section-first", "first-section-second", "second-section-first"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("lesson order = %v, want %v", got, want)
+	}
+}
+
+func TestGetInternalCourseStructureRejectsMissingDependencies(t *testing.T) {
+	if _, err := (GetInternalCourseStructure{}).Handle(context.Background(), "course-1"); err != domain.ErrValidation {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
+func TestDiagnosticOnlyFiltersAndRedactsByConstruction(t *testing.T) {
+	response := &InternalCourseStructureResponse{CourseID: "course-1", Lessons: []InternalCourseStructureLesson{{
+		ID: "lesson-1", Status: domain.LessonStatusActive, Tasks: []InternalCourseStructureTask{
+			{ID: "knowledge", Type: domain.TaskTypeTest, AssessmentPurpose: domain.AssessmentPurposeKnowledgeCheck},
+			{ID: "diagnostic", Type: domain.TaskTypeOrdering, Status: domain.TaskStatusActive, Version: 3, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO",
+				LearningTargets: []InternalCourseStructureTarget{{Type: "concept", Key: "go.types"}}},
+		},
+	}}}
+	filtered, err := response.DiagnosticOnly()
+	if err != nil || len(filtered.Lessons) != 1 || len(filtered.Lessons[0].Tasks) != 1 || filtered.Lessons[0].Tasks[0].ID != "diagnostic" {
+		t.Fatalf("unexpected diagnostic projection: %#v %v", filtered, err)
+	}
+	if filtered.Lessons[0].Tasks[0].AssessmentPurpose != domain.AssessmentPurposeDiagnostic || len(filtered.Lessons[0].Tasks[0].LearningTargets) != 1 {
+		t.Fatalf("diagnostic identity/targets were not preserved: %#v", filtered.Lessons[0].Tasks[0])
+	}
+	if filtered.Schema != DiagnosticAssessmentCatalogSchema || filtered.Lessons[0].Tasks[0].Version != 3 || filtered.CurriculumRevision == "" {
+		t.Fatalf("diagnostic catalog schema/version/revision missing: %#v", filtered)
+	}
+}
+
+func TestDiagnosticOnlyExcludesInactiveAndRejectsMalformed(t *testing.T) {
+	base := InternalCourseStructureResponse{CourseID: "course", Lessons: []InternalCourseStructureLesson{
+		{ID: "inactive-lesson", Status: domain.LessonStatusNoActive, Tasks: []InternalCourseStructureTask{{ID: "d1", Type: domain.TaskTypeTest, Status: domain.TaskStatusActive, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO"}}},
+		{ID: "active-lesson", Status: domain.LessonStatusActive, Tasks: []InternalCourseStructureTask{{ID: "inactive-task", Type: domain.TaskTypeTest, Status: domain.TaskStatusNoActive, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO"}, {ID: "bad", Type: domain.TaskTypeFrontendPreview, Status: domain.TaskStatusActive, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO"}}},
+	}}
+	if _, err := base.DiagnosticOnly(); err != domain.ErrValidation {
+		t.Fatalf("malformed diagnostic should fail closed: %v", err)
+	}
+	base.Lessons[1].Tasks = base.Lessons[1].Tasks[:1]
+	filtered, err := base.DiagnosticOnly()
+	if err != nil || len(filtered.Lessons) != 0 {
+		t.Fatalf("inactive diagnostic items should be excluded: %#v %v", filtered, err)
+	}
+}
+
+func TestDiagnosticOnlyBoundAndRevisionChangesWithTaskVersionAndTargets(t *testing.T) {
+	response := &InternalCourseStructureResponse{CourseID: "course", Lessons: []InternalCourseStructureLesson{{ID: "lesson", Status: domain.LessonStatusActive, Tasks: []InternalCourseStructureTask{{ID: "task", Type: domain.TaskTypeTest, Status: domain.TaskStatusActive, Version: 1, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO", LearningTargets: []InternalCourseStructureTarget{{Type: "concept", Key: "go.types"}}}}}}}
+	first, err := response.DiagnosticOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := response.DiagnosticOnly()
+	if err != nil || first.CurriculumRevision != repeat.CurriculumRevision {
+		t.Fatalf("same input must have deterministic revision: %q %q %v", first.CurriculumRevision, repeat.CurriculumRevision, err)
+	}
+	response.Lessons[0].Tasks[0].Version = 2
+	response.Lessons[0].Tasks[0].LearningTargets[0].Key = "go.interfaces"
+	second, err := response.DiagnosticOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CurriculumRevision == second.CurriculumRevision {
+		t.Fatal("revision did not change after version/target change")
+	}
+	response.Lessons[0].Tasks = make([]InternalCourseStructureTask, 101)
+	for i := range response.Lessons[0].Tasks {
+		response.Lessons[0].Tasks[i] = InternalCourseStructureTask{ID: "task", Type: domain.TaskTypeTest, Status: domain.TaskStatusActive, AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: "AUTO"}
+	}
+	if _, err := response.DiagnosticOnly(); err != domain.ErrValidation {
+		t.Fatalf("more than 100 diagnostic tasks should fail: %v", err)
+	}
+}
+
+func TestDiagnosticOnlyRejectsNonAutoEvaluationModes(t *testing.T) {
+	for _, evaluationMode := range []string{"MANUAL", "HYBRID", "INVALID"} {
+		t.Run(evaluationMode, func(t *testing.T) {
+			response := &InternalCourseStructureResponse{CourseID: "course", Lessons: []InternalCourseStructureLesson{{
+				ID: "lesson", Status: domain.LessonStatusActive, Tasks: []InternalCourseStructureTask{{
+					ID: "diagnostic", Type: domain.TaskTypeClassification, Status: domain.TaskStatusActive,
+					AssessmentPurpose: domain.AssessmentPurposeDiagnostic, EvaluationMode: evaluationMode,
+				}},
+			}}}
+			if _, err := response.DiagnosticOnly(); err != domain.ErrValidation {
+				t.Fatalf("evaluation mode %q should fail closed, got %v", evaluationMode, err)
+			}
+		})
+	}
+}

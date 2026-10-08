@@ -1,0 +1,246 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/google/uuid"
+)
+
+// Requires a disposable PostgreSQL database migrated through 024. The rows are
+// intentionally append-only, so this test never deletes them; the caller must
+// drop its whole disposable database after the test.
+func TestStudentOnboardingTurnAtomicReplayProofAndLegacyRace(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	var present bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.student_onboarding_turn_command') IS NOT NULL`).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Skip("migration 024_student_onboarding_turn.sql is not applied to the disposable database")
+	}
+
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	repo := &postgres.StudentOnboardingRepoPG{Pool: pool}
+	apply := studentuc.ApplyStudentOnboardingTurn{Turns: repo, Clock: fixedOnboardingDraftClock{now: now}, EffectsEnabled: true}
+	proof := studentuc.ProveStudentOnboardingTurnNoEffect{Turns: repo, Clock: fixedOnboardingDraftClock{now: now.Add(time.Minute)}}
+	getDraft := studentuc.GetStudentOnboardingDraft{Drafts: repo}
+
+	studentID := uuid.NewString()
+	first := integrationOnboardingTurn(studentID, 0, false)
+	accepted, err := apply.Handle(ctx, first)
+	if err != nil || accepted.StudentEffectState != domain.StudentOnboardingTurnEffectAccepted || accepted.ResultDraftVersion == nil || *accepted.ResultDraftVersion != 1 {
+		t.Fatalf("v0 accept: result=%+v err=%v", accepted, err)
+	}
+	replay, err := apply.Handle(ctx, first)
+	if err != nil || !replay.Replayed || replay.ResultDraftVersion == nil || *replay.ResultDraftVersion != 1 {
+		t.Fatalf("exact replay: result=%+v err=%v", replay, err)
+	}
+	if _, err := proof.Handle(ctx, domain.StudentOnboardingTurnNoEffectProof{Schema: domain.StudentOnboardingTurnNoEffectProofSchema, Command: first}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("accepted command must not become no_effect proof: err=%v", err)
+	}
+	disabledApply := studentuc.ApplyStudentOnboardingTurn{Turns: repo, Clock: fixedOnboardingDraftClock{now: now}, EffectsEnabled: false}
+	disabledReplay, err := disabledApply.Handle(ctx, first)
+	if err != nil || !disabledReplay.Replayed || disabledReplay.StudentEffectState != domain.StudentOnboardingTurnEffectAccepted {
+		t.Fatalf("feature-off exact replay: result=%+v err=%v", disabledReplay, err)
+	}
+	if _, err := disabledApply.Handle(ctx, integrationOnboardingTurn(studentID, 1, false)); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("feature-off new effect err=%v", err)
+	}
+	changedSameCommand := first
+	changedDirection := "frontend"
+	changedSameCommand.Slots[0].CodeValue = &changedDirection
+	if _, err := apply.Handle(ctx, changedSameCommand); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("same command id with different normalized payload err=%v", err)
+	}
+
+	// Every unique identity collision rolls back the candidate draft update.
+	for _, collision := range []struct {
+		name   string
+		mutate func(*domain.StudentOnboardingTurnCommand)
+	}{
+		{name: "canonical", mutate: func(command *domain.StudentOnboardingTurnCommand) {
+			command.CanonicalStudentMessageID = first.CanonicalStudentMessageID
+			command.DialogCausationID = command.CanonicalStudentMessageID
+			command.CorrelationID = command.CanonicalStudentMessageID
+		}},
+		{name: "source event", mutate: func(command *domain.StudentOnboardingTurnCommand) { command.SourceEventID = first.SourceEventID }},
+		{name: "teacher job", mutate: func(command *domain.StudentOnboardingTurnCommand) { command.TeacherJobID = first.TeacherJobID }},
+	} {
+		t.Run(collision.name, func(t *testing.T) {
+			candidate := integrationOnboardingTurn(studentID, 1, false)
+			collision.mutate(&candidate)
+			if _, applyErr := apply.Handle(ctx, candidate); !errors.Is(applyErr, domain.ErrConflict) {
+				t.Fatalf("collision err=%v", applyErr)
+			}
+			draft, getErr := getDraft.Handle(ctx, studentID)
+			if getErr != nil || draft.Version != 1 {
+				t.Fatalf("collision changed draft=%+v err=%v", draft, getErr)
+			}
+		})
+	}
+
+	// Force a late provenance insert failure in the disposable database. The
+	// draft update and command receipt must roll back with it.
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION test_s3_onboarding_provenance_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test provenance failure'; END; $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER trg_test_s3_onboarding_provenance_failure BEFORE INSERT ON student_onboarding_turn_provenance FOR EACH ROW EXECUTE FUNCTION test_s3_onboarding_provenance_failure()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS trg_test_s3_onboarding_provenance_failure ON student_onboarding_turn_provenance`)
+		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_s3_onboarding_provenance_failure()`)
+	})
+	if _, err := apply.Handle(ctx, integrationOnboardingTurn(studentID, 1, false)); err == nil {
+		t.Fatal("forced provenance failure was accepted")
+	}
+	afterProvenanceFailure, err := getDraft.Handle(ctx, studentID)
+	if err != nil || afterProvenanceFailure.Version != 1 {
+		t.Fatalf("provenance failure changed draft=%+v err=%v", afterProvenanceFailure, err)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER trg_test_s3_onboarding_provenance_failure ON student_onboarding_turn_provenance`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DROP FUNCTION test_s3_onboarding_provenance_failure()`); err != nil {
+		t.Fatal(err)
+	}
+
+	// A full-command proof obtains the same locks and creates an immutable
+	// no_effect fence; a delayed matching apply cannot mutate the draft.
+	fenced := integrationOnboardingTurn(studentID, 1, false)
+	noEffect, err := proof.Handle(ctx, domain.StudentOnboardingTurnNoEffectProof{Schema: domain.StudentOnboardingTurnNoEffectProofSchema, Command: fenced})
+	if err != nil || noEffect.StudentEffectState != domain.StudentOnboardingTurnEffectNoEffect || noEffect.NoEffectProofID == nil {
+		t.Fatalf("proof: result=%+v err=%v", noEffect, err)
+	}
+	delayed, err := apply.Handle(ctx, fenced)
+	if err != nil || !delayed.Replayed || delayed.StudentEffectState != domain.StudentOnboardingTurnEffectNoEffect {
+		t.Fatalf("proof did not fence delayed apply: result=%+v err=%v", delayed, err)
+	}
+
+	// Strict v1 finalization is deliberately untouched: an incomplete final
+	// candidate rolls back without creating a profile or advancing draft.
+	incomplete := integrationOnboardingTurn(studentID, 1, true)
+	if _, err := apply.Handle(ctx, incomplete); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("incomplete v1 finalization err=%v", err)
+	}
+	afterIncomplete, err := getDraft.Handle(ctx, studentID)
+	if err != nil || afterIncomplete.Version != 1 {
+		t.Fatalf("incomplete finalization mutated draft=%+v err=%v", afterIncomplete, err)
+	}
+
+	// The existing v1 replacement takes the exact same per-student advisory lock.
+	raceStudentID := uuid.NewString()
+	v2 := integrationOnboardingTurn(raceStudentID, 0, false)
+	v1Direction := "frontend"
+	v1 := studentuc.PutStudentOnboardingDraft{Drafts: repo, Clock: fixedOnboardingDraftClock{now: now}}
+	var v1Err, v2Err error
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		_, v1Err = v1.Handle(ctx, studentuc.PutStudentOnboardingDraftInput{Schema: domain.StudentOnboardingDraftSchema, StudentID: raceStudentID, RequestID: uuid.NewString(), ExpectedVersion: 0, StudentOnboardingDraftAnswers: domain.StudentOnboardingDraftAnswers{DirectionCode: &v1Direction}})
+	}()
+	go func() { defer wait.Done(); _, v2Err = apply.Handle(ctx, v2) }()
+	wait.Wait()
+	if !((v1Err == nil && errors.Is(v2Err, domain.ErrConflict)) || (v2Err == nil && errors.Is(v1Err, domain.ErrConflict))) {
+		t.Fatalf("v1/v2 race needs exactly one winner: v1=%v v2=%v", v1Err, v2Err)
+	}
+
+	s3RaceStudentID := uuid.NewString()
+	left, right := integrationOnboardingTurn(s3RaceStudentID, 0, false), integrationOnboardingTurn(s3RaceStudentID, 0, false)
+	var leftErr, rightErr error
+	var s3Wait sync.WaitGroup
+	s3Wait.Add(2)
+	go func() { defer s3Wait.Done(); _, leftErr = apply.Handle(ctx, left) }()
+	go func() { defer s3Wait.Done(); _, rightErr = apply.Handle(ctx, right) }()
+	s3Wait.Wait()
+	if !((leftErr == nil && errors.Is(rightErr, domain.ErrConflict)) || (rightErr == nil && errors.Is(leftErr, domain.ErrConflict))) {
+		t.Fatalf("S3/S3 CAS needs exactly one winner: left=%v right=%v", leftErr, rightErr)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE student_onboarding_turn_command SET request_hash=request_hash WHERE student_command_id=$1`, first.StudentCommandID); err == nil {
+		t.Fatal("accepted receipt must be immutable")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE student_onboarding_turn_provenance SET slot_code=slot_code WHERE student_command_id=$1`, first.StudentCommandID); err == nil {
+		t.Fatal("accepted provenance must be immutable")
+	}
+
+	t.Run("action receipt and S3/S3 apply-proof race", func(t *testing.T) {
+		actionStudentID := uuid.NewString()
+		action := integrationOnboardingActionTurn(actionStudentID, 0)
+		if _, actionErr := apply.Handle(ctx, action); actionErr != nil {
+			t.Fatal(actionErr)
+		}
+		actionCollision := integrationOnboardingActionTurn(actionStudentID, 1)
+		actionCollision.ActionReceiptID = action.ActionReceiptID
+		actionCollision.CorrelationID = *action.ActionReceiptID
+		if _, actionErr := apply.Handle(ctx, actionCollision); !errors.Is(actionErr, domain.ErrConflict) {
+			t.Fatalf("action receipt collision err=%v", actionErr)
+		}
+
+		raceCommand := integrationOnboardingTurn(uuid.NewString(), 0, false)
+		var applyResult, proofResult domain.StudentOnboardingTurnResult
+		var applyErr, proofErr error
+		var raceWait sync.WaitGroup
+		raceWait.Add(2)
+		go func() { defer raceWait.Done(); applyResult, applyErr = apply.Handle(ctx, raceCommand) }()
+		go func() {
+			defer raceWait.Done()
+			proofResult, proofErr = proof.Handle(ctx, domain.StudentOnboardingTurnNoEffectProof{Schema: domain.StudentOnboardingTurnNoEffectProofSchema, Command: raceCommand})
+		}()
+		raceWait.Wait()
+		proofWon := applyErr == nil && proofErr == nil &&
+			applyResult.StudentEffectState == domain.StudentOnboardingTurnEffectNoEffect &&
+			proofResult.StudentEffectState == domain.StudentOnboardingTurnEffectNoEffect
+		applyWon := applyErr == nil &&
+			applyResult.StudentEffectState == domain.StudentOnboardingTurnEffectAccepted &&
+			errors.Is(proofErr, domain.ErrConflict)
+		if !proofWon && !applyWon {
+			t.Fatalf("apply/proof race did not produce one terminal outcome: apply=%+v applyErr=%v proof=%+v proofErr=%v", applyResult, applyErr, proofResult, proofErr)
+		}
+	})
+}
+
+func integrationOnboardingTurn(studentID string, expectedDraftVersion int64, finalize bool) domain.StudentOnboardingTurnCommand {
+	confidence := 5000
+	direction := "backend"
+	command := domain.StudentOnboardingTurnCommand{
+		Schema: domain.StudentOnboardingTurnSchema, StudentID: studentID, StudentCommandID: uuid.NewString(), DialogID: uuid.NewString(), PersonalTeacherID: uuid.NewString(), TeacherTurnSequence: 1,
+		CanonicalStudentMessageID: uuid.NewString(), SourceEventID: uuid.NewString(), TeacherJobID: uuid.NewString(), AIExecutionID: integrationTurnString(uuid.NewString()),
+		ExpectedDraftVersion: expectedDraftVersion, Slots: []domain.StudentOnboardingTurnSlot{{SlotCode: domain.StudentOnboardingSlotDirectionCode, CodeValue: &direction, Origin: domain.StudentOnboardingTurnOriginExplicitText, ConfidenceBasisPoints: &confidence}},
+	}
+	command.DialogCausationID, command.CorrelationID = command.CanonicalStudentMessageID, command.CanonicalStudentMessageID
+	command.CausationID = *command.AIExecutionID
+	if finalize {
+		profile := int64(0)
+		command.FinalizeCurrentV1, command.ExpectedProfileVersion = true, &profile
+	}
+	return command
+}
+
+func integrationOnboardingActionTurn(studentID string, expectedDraftVersion int64) domain.StudentOnboardingTurnCommand {
+	confidence := 10000
+	direction := "backend"
+	actionReceiptID := uuid.NewString()
+	command := domain.StudentOnboardingTurnCommand{
+		Schema: domain.StudentOnboardingTurnSchema, StudentID: studentID, StudentCommandID: uuid.NewString(), DialogID: uuid.NewString(), PersonalTeacherID: uuid.NewString(), TeacherTurnSequence: 1,
+		CanonicalStudentMessageID: uuid.NewString(), ActionReceiptID: &actionReceiptID, SourceEventID: uuid.NewString(), TeacherJobID: uuid.NewString(),
+		ExpectedDraftVersion: expectedDraftVersion, Slots: []domain.StudentOnboardingTurnSlot{{SlotCode: domain.StudentOnboardingSlotDirectionCode, CodeValue: &direction, Origin: domain.StudentOnboardingTurnOriginExplicitUI, ConfidenceBasisPoints: &confidence}},
+	}
+	command.DialogCausationID, command.CorrelationID, command.CausationID = command.CanonicalStudentMessageID, actionReceiptID, command.TeacherJobID
+	return command
+}
+
+func integrationTurnString(value string) *string { return &value }

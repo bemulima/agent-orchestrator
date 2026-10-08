@@ -1,0 +1,740 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	domainservice "github.com/example/ms-student-service/internal/domain/service"
+	"github.com/google/uuid"
+)
+
+const (
+	practiceTaskTaskTypePracticeTaskMilestone = int16(10)
+	taskExecutionModeBrowserPreview           = "BROWSER_PREVIEW"
+	taskEvaluationModeAuto                    = "AUTO"
+	taskUIModePreview                         = "PREVIEW"
+	taskSubmissionModeSnapshot                = "SNAPSHOT"
+	blockingReasonMilestonePrerequisites      = "MILESTONE_PREREQUISITES_NOT_MET"
+)
+
+func (useCase StudentUseCase) GetRuntimeTask(ctx context.Context, taskID, studentID, answerID string) (*domain.RuntimeTaskSnapshot, error) {
+	if strings.TrimSpace(answerID) != "" {
+		binding, err := useCase.Students.GetTaskBindingByAnswerID(ctx, answerID)
+		if err == nil {
+			var snapshot domain.RuntimeTaskSnapshot
+			if decodeErr := json.Unmarshal(binding.TaskSnapshotJSON, &snapshot); decodeErr != nil {
+				return nil, decodeErr
+			}
+			return &snapshot, nil
+		}
+	}
+
+	project, err := useCase.Students.GetStudentPracticeTaskByWorkspaceTaskID(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if studentID != "" && project.StudentID != studentID {
+		return nil, domain.ErrNotFound
+	}
+
+	if currentPart, err := useCase.loadActivePartRuntimeContextForProject(ctx, project, true); err == nil {
+		bundle, bundleErr := useCase.buildPartBundleFromContext(currentPart, nil)
+		if bundleErr != nil {
+			return nil, bundleErr
+		}
+		return buildRuntimeTaskSnapshotFromPart(*currentPart, bundle.Access)
+	} else if err != nil && err != domain.ErrNotFound {
+		return nil, err
+	}
+
+	current, err := useCase.loadCurrentMilestoneContext(ctx, project.StudentID, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	access, err := useCase.resolveCurrentMilestoneAccess(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	return buildRuntimeTaskSnapshot(*current, *access)
+}
+
+func (useCase StudentUseCase) GetRuntimeLesson(ctx context.Context, lessonID, studentID string) (*domain.RuntimeLesson, error) {
+	project, err := useCase.Students.GetStudentPracticeTaskByWorkspaceLessonID(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	if studentID != "" && project.StudentID != studentID {
+		return nil, domain.ErrNotFound
+	}
+
+	if currentPart, err := useCase.loadActivePartRuntimeContextForProject(ctx, project, false); err == nil {
+		description := currentPart.runtimeContext.PracticeTask.Theme
+		if currentPart.part.Description != nil && strings.TrimSpace(*currentPart.part.Description) != "" {
+			description = *currentPart.part.Description
+		}
+		return &domain.RuntimeLesson{
+			ID:          project.WorkspaceLessonID,
+			CourseID:    project.PracticeTaskID,
+			Title:       currentPart.part.Title,
+			Description: description,
+			Order:       1,
+			Status:      domain.TaskStatusActive,
+		}, nil
+	} else if err != nil && err != domain.ErrNotFound {
+		return nil, err
+	}
+
+	current, err := useCase.loadCurrentMilestoneContext(ctx, project.StudentID, project.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	title := current.project.Title
+	if current.currentPracticeTaskMilestone != nil && strings.TrimSpace(current.currentPracticeTaskMilestone.Title) != "" {
+		title = current.currentPracticeTaskMilestone.Title
+	}
+	description := current.project.Theme
+	if current.currentPracticeTaskMilestone != nil && current.currentPracticeTaskMilestone.Description != nil && strings.TrimSpace(*current.currentPracticeTaskMilestone.Description) != "" {
+		description = *current.currentPracticeTaskMilestone.Description
+	}
+
+	return &domain.RuntimeLesson{
+		ID:          project.WorkspaceLessonID,
+		CourseID:    project.PracticeTaskID,
+		Title:       title,
+		Description: description,
+		Order:       1,
+		Status:      domain.TaskStatusActive,
+	}, nil
+}
+
+func (useCase StudentUseCase) GetRuntimeTaskAccess(ctx context.Context, taskID, studentID string) (*domain.MilestoneAccess, error) {
+	project, err := useCase.Students.GetStudentPracticeTaskByWorkspaceTaskID(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if studentID != "" && project.StudentID != studentID {
+		return nil, domain.ErrNotFound
+	}
+	if currentPart, err := useCase.loadActivePartRuntimeContextForProject(ctx, project, false); err == nil {
+		bundle, bundleErr := useCase.buildPartBundleFromContext(currentPart, nil)
+		if bundleErr != nil {
+			return nil, bundleErr
+		}
+		return &bundle.Access, nil
+	} else if err != nil && err != domain.ErrNotFound {
+		return nil, err
+	}
+	current, err := useCase.loadCurrentMilestoneContext(ctx, project.StudentID, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	return useCase.resolveCurrentMilestoneAccess(ctx, current)
+}
+
+func (useCase StudentUseCase) BindRuntimeAnswer(ctx context.Context, studentID, taskID, answerID string, sandbox *domain.SandboxSession) (*domain.RuntimeTaskSnapshot, error) {
+	project, err := useCase.Students.GetStudentPracticeTaskByWorkspaceTaskID(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if project.StudentID != studentID {
+		return nil, domain.ErrNotFound
+	}
+
+	if currentPart, err := useCase.loadActivePartRuntimeContextForProject(ctx, project, true); err == nil {
+		bundle, bundleErr := useCase.buildPartBundleFromContext(currentPart, nil)
+		if bundleErr != nil {
+			return nil, bundleErr
+		}
+		if bundle.Access.Locked {
+			return nil, firstLockedPartError(bundle)
+		}
+		if sandbox != nil && useCase.Sandbox != nil {
+			if err := useCase.seedMissingPartStarterFiles(ctx, currentPart, sandbox); err != nil {
+				return nil, err
+			}
+		}
+
+		snapshot, err := buildRuntimeTaskSnapshotFromPart(*currentPart, bundle.Access)
+		if err != nil {
+			return nil, err
+		}
+		snapshotJSON, err := json.Marshal(snapshot)
+		if err != nil {
+			return nil, err
+		}
+
+		now := time.Now().UTC()
+		representative := currentPartRepresentativeMilestone(currentPart)
+		if representative == nil {
+			return nil, domain.ErrNotFound
+		}
+		if representative.TaskAnswerID == nil || *representative.TaskAnswerID != answerID {
+			milestoneCopy := *representative
+			milestoneCopy.TaskAnswerID = &answerID
+			milestoneCopy.UpdatedAt = now
+			milestoneCopy.Status = domain.StudentMilestoneStatusInProgress
+			if sandbox != nil {
+				milestoneCopy.SandboxID = &sandbox.SandboxID
+			}
+			if err := useCase.Students.UpdateStudentPracticeTaskMilestone(ctx, milestoneCopy); err != nil {
+				return nil, err
+			}
+		}
+
+		binding := domain.StudentPracticeTaskTaskBinding{
+			ID:                             uuid.NewString(),
+			StudentPracticeTaskID:          currentPart.studentPracticeTask.ID,
+			StudentPracticeTaskMilestoneID: representative.ID,
+			TaskAnswerID:                   answerID,
+			TaskID:                         currentPart.studentPracticeTask.WorkspaceTaskID,
+			LessonID:                       currentPart.studentPracticeTask.WorkspaceLessonID,
+			TaskSnapshotJSON:               snapshotJSON,
+			CreatedAt:                      now,
+			UpdatedAt:                      now,
+		}
+		if err := useCase.Students.SaveTaskBinding(ctx, binding); err != nil {
+			return nil, err
+		}
+
+		projectCopy := *currentPart.studentPracticeTask
+		projectCopy.CurrentTaskAnswerID = &answerID
+		projectCopy.UpdatedAt = now
+		if sandbox != nil {
+			projectCopy.ActiveSandboxID = &sandbox.SandboxID
+			projectCopy.PreviewURL = nullableStringPointer(sandbox.PreviewURL)
+		}
+		if err := useCase.Students.UpdateStudentPracticeTask(ctx, projectCopy); err != nil {
+			return nil, err
+		}
+		return snapshot, nil
+	} else if err != nil && err != domain.ErrNotFound {
+		return nil, err
+	}
+
+	current, err := useCase.loadCurrentMilestoneContext(ctx, studentID, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	access, err := useCase.resolveCurrentMilestoneAccess(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	if access.Locked {
+		return nil, &domain.MilestoneLockedError{
+			StudentPracticeTaskID:          current.studentPracticeTask.ID,
+			StudentPracticeTaskMilestoneID: current.currentStudentMilestone.ID,
+			BlockingReason:                 access.BlockingReason,
+			Prerequisites:                  access.Prerequisites,
+		}
+	}
+
+	if sandbox != nil && useCase.Sandbox != nil {
+		if err := useCase.seedMissingStarterFiles(ctx, current, sandbox); err != nil {
+			return nil, err
+		}
+	}
+
+	snapshot, err := buildRuntimeTaskSnapshot(*current, *access)
+	if err != nil {
+		return nil, err
+	}
+	snapshotJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	if current.currentStudentMilestone.TaskAnswerID == nil || *current.currentStudentMilestone.TaskAnswerID != answerID {
+		currentMilestone := *current.currentStudentMilestone
+		currentMilestone.TaskAnswerID = &answerID
+		currentMilestone.UpdatedAt = now
+		currentMilestone.Status = domain.StudentMilestoneStatusInProgress
+		if sandbox != nil {
+			currentMilestone.SandboxID = &sandbox.SandboxID
+		}
+		current.currentStudentMilestone = &currentMilestone
+		if err := useCase.Students.UpdateStudentPracticeTaskMilestone(ctx, currentMilestone); err != nil {
+			return nil, err
+		}
+	}
+
+	binding := domain.StudentPracticeTaskTaskBinding{
+		ID:                             uuid.NewString(),
+		StudentPracticeTaskID:          current.studentPracticeTask.ID,
+		StudentPracticeTaskMilestoneID: current.currentStudentMilestone.ID,
+		TaskAnswerID:                   answerID,
+		TaskID:                         current.studentPracticeTask.WorkspaceTaskID,
+		LessonID:                       current.studentPracticeTask.WorkspaceLessonID,
+		TaskSnapshotJSON:               snapshotJSON,
+		CreatedAt:                      now,
+		UpdatedAt:                      now,
+	}
+	if err := useCase.Students.SaveTaskBinding(ctx, binding); err != nil {
+		return nil, err
+	}
+
+	projectCopy := *current.studentPracticeTask
+	projectCopy.CurrentTaskAnswerID = &answerID
+	projectCopy.UpdatedAt = now
+	if sandbox != nil {
+		projectCopy.ActiveSandboxID = &sandbox.SandboxID
+		projectCopy.PreviewURL = nullableStringPointer(sandbox.PreviewURL)
+	}
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, projectCopy); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (useCase StudentUseCase) FinalizeRuntimeAnswer(ctx context.Context, input domain.RuntimeFinalizeInput) error {
+	binding, err := useCase.Students.GetTaskBindingByAnswerID(ctx, input.AnswerID)
+	if err != nil {
+		return err
+	}
+	var snapshot domain.RuntimeTaskSnapshot
+	if len(bytes.TrimSpace(binding.TaskSnapshotJSON)) > 0 {
+		if err := json.Unmarshal(binding.TaskSnapshotJSON, &snapshot); err != nil {
+			return err
+		}
+		if strings.EqualFold(strings.TrimSpace(snapshot.TaskKind), practiceTaskTaskKindPart) {
+			return useCase.finalizeRuntimePartAnswer(ctx, binding, snapshot, input)
+		}
+	}
+
+	project, err := useCase.Students.GetStudentPracticeTask(ctx, binding.StudentPracticeTaskID)
+	if err != nil {
+		return err
+	}
+	milestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, binding.StudentPracticeTaskID)
+	if err != nil {
+		return err
+	}
+
+	var currentMilestone *domain.StudentPracticeTaskMilestone
+	for index := range milestones {
+		if milestones[index].ID == binding.StudentPracticeTaskMilestoneID {
+			item := milestones[index]
+			currentMilestone = &item
+			break
+		}
+	}
+	if currentMilestone == nil {
+		return domain.ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	alreadyFinalizedForAnswer := currentMilestone.TaskAnswerID != nil &&
+		*currentMilestone.TaskAnswerID == input.AnswerID &&
+		isFinalizedMilestoneStatus(currentMilestone.Status) &&
+		len(bytes.TrimSpace(currentMilestone.BestResultJSON)) > 0
+
+	currentMilestone.TaskAnswerID = &input.AnswerID
+	currentMilestone.UpdatedAt = now
+	if input.SandboxID != nil {
+		currentMilestone.SandboxID = input.SandboxID
+	}
+	if !alreadyFinalizedForAnswer {
+		currentMilestone.AttemptsCount++
+	}
+	if len(input.RawResult) > 0 {
+		// MVP keeps the latest finalized validation payload as milestone best_result_json.
+		// History itself lives in student answer rows plus student_practice_task_task_binding entries.
+		currentMilestone.BestResultJSON = input.RawResult
+	}
+	if input.Passed {
+		currentMilestone.Status = domain.StudentMilestoneStatusPassed
+		currentMilestone.PassedAt = &now
+	} else {
+		currentMilestone.Status = domain.StudentMilestoneStatusFailed
+		currentMilestone.PassedAt = nil
+	}
+	if err := useCase.Students.UpdateStudentPracticeTaskMilestone(ctx, *currentMilestone); err != nil {
+		return err
+	}
+
+	project.UpdatedAt = now
+	project.CurrentTaskAnswerID = &input.AnswerID
+	if input.SandboxID != nil {
+		project.ActiveSandboxID = input.SandboxID
+	}
+	if input.PreviewURL != nil {
+		project.PreviewURL = input.PreviewURL
+	}
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, *project); err != nil {
+		return err
+	}
+
+	if !alreadyFinalizedForAnswer && input.FileStorageID != nil && *input.FileStorageID != "" {
+		metaJSON, _ := json.Marshal(map[string]any{
+			"task_answer_id":                     input.AnswerID,
+			"student_practice_task_milestone_id": currentMilestone.ID,
+			"status":                             input.Status,
+		})
+		artifact := domain.StudentPracticeTaskArtifact{
+			ID:                    uuid.NewString(),
+			StudentPracticeTaskID: project.ID,
+			ArtifactType:          "task_answer_submission",
+			StorageFileID:         *input.FileStorageID,
+			PreviewURL:            input.PreviewURL,
+			MetaJSON:              metaJSON,
+			CreatedAt:             now,
+		}
+		if err := useCase.Students.CreateArtifact(ctx, artifact); err != nil {
+			return err
+		}
+	}
+
+	if input.Passed {
+		if err := useCase.advanceProjectAfterRuntimePass(ctx, project, currentMilestone.ID, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (useCase StudentUseCase) resolveCurrentMilestoneAccess(ctx context.Context, current *currentMilestoneContext) (*domain.MilestoneAccess, error) {
+	runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, current.studentPracticeTask)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		requiredSkillTags  []string
+		matchedLessonIDs   []string
+		unmatchedSkillTags []string
+	)
+	skillTagsByCode := map[string]struct{}{}
+	for _, item := range runtimeContext.MilestoneSkillTags {
+		if item.MilestoneKindCode != current.currentPracticeTaskMilestone.MilestoneKindCode {
+			continue
+		}
+		requiredSkillTags = append(requiredSkillTags, item.SkillTagCode)
+		skillTagsByCode[item.SkillTagCode] = struct{}{}
+	}
+
+	matchedLessonsSet := map[string]struct{}{}
+	skillMatched := map[string]bool{}
+	for _, skillTag := range requiredSkillTags {
+		for _, lessonTag := range runtimeContext.LessonSkillTags {
+			if lessonTag.SkillTagCode != skillTag {
+				continue
+			}
+			skillMatched[skillTag] = true
+			matchedLessonsSet[lessonTag.LessonID] = struct{}{}
+		}
+	}
+
+	for _, skillTag := range requiredSkillTags {
+		if !skillMatched[skillTag] {
+			unmatchedSkillTags = append(unmatchedSkillTags, skillTag)
+		}
+	}
+
+	matchedLessonIDs = sortedStringKeys(matchedLessonsSet)
+	completedLessonsSet := map[string]struct{}{}
+	if useCase.Completion != nil && len(matchedLessonIDs) > 0 {
+		completedLessonsSet, err = useCase.Completion.GetCompletedLessonIDs(ctx, current.studentPracticeTask.StudentID, matchedLessonIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	completedLessonIDs := sortedStringKeys(completedLessonsSet)
+	unmetLessonIDs := diffStrings(matchedLessonIDs, completedLessonIDs)
+
+	status := domain.MilestoneRuntimeStatusAvailable
+	switch current.currentStudentMilestone.Status {
+	case domain.StudentMilestoneStatusPassed:
+		status = domain.MilestoneRuntimeStatusPassed
+	case domain.StudentMilestoneStatusSkipped:
+		status = domain.MilestoneRuntimeStatusSkipped
+	case domain.StudentMilestoneStatusInProgress:
+		status = domain.MilestoneRuntimeStatusInProgress
+	case domain.StudentMilestoneStatusFailed:
+		status = domain.MilestoneRuntimeStatusFailed
+	}
+
+	locked := len(unmetLessonIDs) > 0 || len(unmatchedSkillTags) > 0
+	blockingReason := ""
+	if locked {
+		status = domain.MilestoneRuntimeStatusLocked
+		blockingReason = blockingReasonMilestonePrerequisites
+	}
+
+	if current.currentStudentMilestone.TaskAnswerID != nil && status == domain.MilestoneRuntimeStatusAvailable {
+		status = domain.MilestoneRuntimeStatusInProgress
+	}
+
+	access := &domain.MilestoneAccess{
+		Status:              status,
+		Locked:              locked,
+		BlockingReason:      blockingReason,
+		CurrentTaskID:       current.studentPracticeTask.WorkspaceTaskID,
+		CurrentLessonID:     current.studentPracticeTask.WorkspaceLessonID,
+		CurrentTaskAnswerID: current.studentPracticeTask.CurrentTaskAnswerID,
+		CurrentSandboxID:    current.studentPracticeTask.ActiveSandboxID,
+		PreviewURL:          current.studentPracticeTask.PreviewURL,
+		Prerequisites: domain.MilestonePrerequisites{
+			RequiredSkillTags:  dedupeStrings(requiredSkillTags),
+			MatchedLessonIDs:   matchedLessonIDs,
+			CompletedLessonIDs: completedLessonIDs,
+			UnmetLessonIDs:     unmetLessonIDs,
+			UnmatchedSkillTags: dedupeStrings(unmatchedSkillTags),
+		},
+	}
+
+	if runtimeContext.PracticeTask.ID != "" && access.CurrentLessonID == "" {
+		access.CurrentLessonID = current.studentPracticeTask.WorkspaceLessonID
+	}
+	return access, nil
+}
+
+func (useCase StudentUseCase) seedMissingStarterFiles(ctx context.Context, current *currentMilestoneContext, sandbox *domain.SandboxSession) error {
+	if useCase.Sandbox == nil || sandbox == nil {
+		return nil
+	}
+	files, err := useCase.Sandbox.GetSnapshot(ctx, sandbox.SandboxID)
+	if err != nil {
+		return err
+	}
+	existing := map[string]struct{}{}
+	for _, file := range files {
+		existing[file.Path] = struct{}{}
+	}
+	for _, file := range current.preview.Starter.Files {
+		if _, ok := existing[file.Path]; ok {
+			continue
+		}
+		if err := useCase.Sandbox.CreateFile(ctx, sandbox.SandboxID, current.studentPracticeTask.StudentID, file.Path, file.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildRuntimeTaskSnapshot(current currentMilestoneContext, access domain.MilestoneAccess) (*domain.RuntimeTaskSnapshot, error) {
+	runtimePlan, err := buildMilestoneRuntimePlan(current)
+	if err != nil {
+		return nil, err
+	}
+	learningTargets, err := domain.NormalizeLearningTargetRefs(current.currentPracticeTaskMilestone.LearningTargets)
+	if err != nil {
+		return nil, err
+	}
+
+	description := strings.TrimSpace(derefString(current.currentPracticeTaskMilestone.Description))
+	if acceptance := extractAcceptanceChecklist(current.currentPracticeTaskMilestone.AcceptanceCriteriaJSON); len(acceptance) > 0 {
+		acceptanceText := strings.Join(acceptance, "\n- ")
+		if description != "" {
+			description += "\n\nAcceptance criteria:\n- " + acceptanceText
+		} else {
+			description = "Acceptance criteria:\n- " + acceptanceText
+		}
+	}
+
+	return &domain.RuntimeTaskSnapshot{
+		ID:                     current.studentPracticeTask.WorkspaceTaskID,
+		LessonID:               current.studentPracticeTask.WorkspaceLessonID,
+		CourseID:               current.project.ID,
+		Title:                  current.currentPracticeTaskMilestone.Title,
+		Description:            description,
+		LearningTargets:        learningTargets,
+		Status:                 domain.TaskStatusActive,
+		Type:                   practiceTaskTaskTypePracticeTaskMilestone,
+		TaskKind:               "practice_task_milestone",
+		CodeStructureTypeCode:  runtimePlan.CodeStructureTypeCode,
+		CodeStructure:          runtimePlan.ContractJSON,
+		ComposeConfig:          runtimePlan.ComposeConfig,
+		ExecutionMode:          taskExecutionModeBrowserPreview,
+		EvaluationMode:         taskEvaluationModeAuto,
+		UIMode:                 taskUIModePreview,
+		SubmissionMode:         taskSubmissionModeSnapshot,
+		RequiresSandbox:        true,
+		ExposesPreview:         true,
+		ExposesTerminal:        false,
+		SupportsLiveValidation: true,
+		AllowedErrorsCount:     0,
+		Access:                 access,
+	}, nil
+}
+
+func (useCase StudentUseCase) advanceProjectAfterRuntimePass(ctx context.Context, project *domain.StudentPracticeTask, passedStudentMilestoneID string, now time.Time) error {
+	milestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, project.ID)
+	if err != nil {
+		return err
+	}
+	if allMilestonesCompleted(milestones) {
+		runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, project)
+		if err != nil {
+			return err
+		}
+		variant, err := selectedRuntimeVariant(runtimeContext, project.PracticeTaskSolutionVariantID)
+		if err != nil {
+			return err
+		}
+		_, reviewConfigured, err := parsePracticeTaskReviewPolicy(variant.ReviewPolicyJSON)
+		if err != nil {
+			return err
+		}
+		if reviewConfigured {
+			project.Status = domain.StudentPracticeTaskStatusReadyForReview
+			project.CompletedAt = nil
+		} else {
+			project.Status = domain.StudentPracticeTaskStatusCompleted
+			project.CompletedAt = &now
+		}
+		project.UpdatedAt = now
+		return useCase.Students.UpdateStudentPracticeTask(ctx, *project)
+	}
+	return nil
+}
+
+func sortedStringKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	return sortStrings(result)
+}
+
+func sortStrings(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	result := append([]string(nil), values...)
+	for left := 0; left < len(result); left++ {
+		for right := left + 1; right < len(result); right++ {
+			if result[right] < result[left] {
+				result[left], result[right] = result[right], result[left]
+			}
+		}
+	}
+	return result
+}
+
+func diffStrings(source []string, completed []string) []string {
+	completedSet := map[string]struct{}{}
+	for _, item := range completed {
+		completedSet[item] = struct{}{}
+	}
+	result := make([]string, 0, len(source))
+	for _, item := range source {
+		if _, ok := completedSet[item]; ok {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func isFinalizedMilestoneStatus(status int16) bool {
+	return status == domain.StudentMilestoneStatusPassed ||
+		status == domain.StudentMilestoneStatusFailed ||
+		status == domain.StudentMilestoneStatusSkipped
+}
+
+func dedupeStrings(values []string) []string {
+	set := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, item := range values {
+		if _, ok := set[item]; ok {
+			continue
+		}
+		set[item] = struct{}{}
+		result = append(result, item)
+	}
+	return sortStrings(result)
+}
+
+func extractAcceptanceChecklist(payload json.RawMessage) []string {
+	if len(payload) == 0 {
+		return nil
+	}
+	var parsed struct {
+		Checklist []string `json:"checklist"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return nil
+	}
+	return parsed.Checklist
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func nullableStringPointer(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func (useCase StudentUseCase) resolveRoadmapStatuses(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+	practiceTaskMilestones []domain.PracticeTaskRuntimeMilestone,
+	studentMilestones []domain.StudentPracticeTaskMilestone,
+	milestoneSkillTags []domain.MilestoneKindSkillTag,
+	lessonSkillTags []domain.LessonSkillTag,
+) (map[string]string, string, error) {
+	studentMilestonesByPracticeTaskRuntimeMilestoneID := map[string]domain.StudentPracticeTaskMilestone{}
+	for _, item := range studentMilestones {
+		studentMilestonesByPracticeTaskRuntimeMilestoneID[item.PracticeTaskPartMilestoneID] = item
+	}
+
+	runtimeContext := &domain.PracticeTaskRuntimeContext{
+		PracticeTaskMilestones: practiceTaskMilestones,
+		MilestoneSkillTags:     milestoneSkillTags,
+		LessonSkillTags:        lessonSkillTags,
+	}
+	lessonIDs := runtimeContextLessonIDs(runtimeContext)
+	completedLessonsSet := map[string]struct{}{}
+	var err error
+	if useCase.Completion != nil && len(lessonIDs) > 0 {
+		completedLessonsSet, err = useCase.Completion.GetCompletedLessonIDs(ctx, project.StudentID, lessonIDs)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
+	result := map[string]string{}
+	currentMilestoneID := ""
+	for _, milestone := range domainservice.SortMilestonesForStudent(practiceTaskMilestones) {
+		studentMilestone, ok := studentMilestonesByPracticeTaskRuntimeMilestoneID[milestone.ID]
+		if !ok {
+			continue
+		}
+
+		status := domain.RoadmapStatusLabel(studentMilestone.Status)
+		if studentMilestone.Status == domain.StudentMilestoneStatusNotStarted {
+			prerequisites := resolvePartMilestonePrerequisites(runtimeContext, milestone, completedLessonsSet)
+			if len(prerequisites.UnmetLessonIDs) > 0 || len(prerequisites.UnmatchedSkillTags) > 0 {
+				status = domain.MilestoneRuntimeStatusLocked
+			} else if parentID := parentPartMilestoneID(milestone); parentID != "" && !roadmapMilestoneCompleted(studentMilestonesByPracticeTaskRuntimeMilestoneID[parentID]) {
+				status = domain.MilestoneRuntimeStatusLocked
+			} else if previousID := previousRouteMilestoneID(practiceTaskMilestones, milestone); previousID != "" && !roadmapMilestoneCompleted(studentMilestonesByPracticeTaskRuntimeMilestoneID[previousID]) {
+				status = domain.MilestoneRuntimeStatusLocked
+			} else {
+				status = domain.MilestoneRuntimeStatusAvailable
+			}
+		}
+		result[milestone.ID] = status
+		if currentMilestoneID == "" && status != domain.MilestoneRuntimeStatusPassed && status != domain.MilestoneRuntimeStatusSkipped {
+			currentMilestoneID = milestone.ID
+		}
+	}
+	return result, currentMilestoneID, nil
+}
+
+func roadmapMilestoneCompleted(item domain.StudentPracticeTaskMilestone) bool {
+	return item.ID != "" && isMilestoneCompleted(item.Status)
+}

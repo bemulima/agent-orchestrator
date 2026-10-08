@@ -1,0 +1,142 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+)
+
+// Requires a disposable database already migrated through 024.  The default
+// helper only bootstraps migration 001 on an empty database, so this is not run
+// as part of ordinary verification.
+func TestPracticeLearningActionReservedCancelLeavesPathStableAndSourceImmutable(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx, studentID, now := context.Background(), uuid.NewString(), time.Now().UTC()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_action WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_context WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path_request WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path WHERE student_id=$1`, studentID)
+	})
+	paths := &postgres.LearningJourneyRepoPG{Pool: pool}
+	revisionID := uuid.NewString()
+	path := integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), revisionID, now)
+	path.Items[0].ReferenceType, path.Items[0].ReferenceID, path.Items[0].Status = "practice", revisionID, domain.LearningPathItemReady
+	path.Items[0].Targets = []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.interfaces", Version: "v1"}}
+	path, _, err := paths.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatalf("create path: %v", err)
+	}
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	instanceID := uuid.NewString()
+	input, err := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{
+		Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: studentID, TaskInstanceID: instanceID, TaskRevisionID: revisionID,
+		TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), SurfaceClassification: "practice", LearningPathID: path.ID,
+		IdempotencyKey: instanceID, LearningActionID: uuid.NewString(), LearningTargets: path.Items[0].Targets, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("normalize reserve: %v", err)
+	}
+	binding, replayed, err := actions.ReservePracticeLearningAction(ctx, input)
+	if err != nil || replayed || binding.LifecycleStatus != domain.PracticeLearningActionReserved {
+		t.Fatalf("reserve: binding=%+v replayed=%v err=%v", binding, replayed, err)
+	}
+	before, err := paths.GetLearningPathByID(ctx, studentID, path.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, replayed, err := actions.CancelPracticeLearningAction(ctx, studentID, input.TaskInstanceID, binding.LearningActionID, domain.PracticeLearningActionCancelReason, now.Add(time.Second))
+	if err != nil || replayed || cancelled.LifecycleStatus != domain.PracticeLearningActionCancelled {
+		t.Fatalf("cancel reservation: binding=%+v replayed=%v err=%v", cancelled, replayed, err)
+	}
+	after, err := paths.GetLearningPathByID(ctx, studentID, path.ID)
+	if err != nil || before.Version != after.Version || before.Items[0].Status != after.Items[0].Status {
+		t.Fatalf("reserved cancel changed path: before=%+v after=%+v err=%v", before, after, err)
+	}
+	_, err = pool.Exec(ctx, `UPDATE student_learning_action SET source_kind='course_answer' WHERE id=$1`, binding.LearningActionID)
+	if err == nil {
+		t.Fatal("practice source conversion must fail")
+	}
+}
+
+// Requires a disposable database migrated through 025. It proves the v2
+// receipt/action/path transaction and exact replay boundary; no services run.
+func TestPracticeLearningActionEvidenceV2ClosesOnceAndReplays(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx, studentID, now := context.Background(), uuid.NewString(), time.Now().UTC()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM student_practice_target_mastery_audit WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_practice_target_evidence WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_practice_evidence_receipt WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_action WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_context WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path_request WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_target_mastery WHERE student_id=$1`, studentID)
+	})
+	paths := &postgres.LearningJourneyRepoPG{Pool: pool}
+	revisionID := uuid.NewString()
+	path := integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), revisionID, now)
+	target := domain.LearningTargetRef{Type: domain.LearningTargetCapability, Key: "go.errors.wrap", Version: "v1"}
+	path.Items[0].ReferenceType, path.Items[0].ReferenceID, path.Items[0].Status, path.Items[0].Targets = "practice", revisionID, domain.LearningPathItemReady, []domain.LearningTargetRef{target}
+	path, _, err := paths.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	instanceID := uuid.NewString()
+	reserve, err := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: studentID, TaskInstanceID: instanceID, TaskRevisionID: revisionID, TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), SurfaceClassification: "practice", LearningPathID: path.ID, IdempotencyKey: instanceID, LearningActionID: uuid.NewString(), LearningTargets: []domain.LearningTargetRef{target}, OccurredAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, _, err := actions.ReservePracticeLearningAction(ctx, reserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, _, err = actions.OpenPracticeLearningAction(ctx, studentID, instanceID, binding.LearningActionID, now.Add(time.Second))
+	if err != nil || binding.LifecycleStatus != domain.PracticeLearningActionOpen {
+		t.Fatalf("open binding=%+v err=%v", binding, err)
+	}
+	evidenceID := uuid.NewString()
+	evidence, err := domain.NormalizePracticeCompetencyEvidenceBundleV2(studentID, instanceID, evidenceID, domain.PracticeCompetencyEvidenceBundleV2{Schema: domain.PracticeCompetencyEvidenceSchemaV2, EvidenceID: evidenceID, LearningActionID: binding.LearningActionID, StudentID: studentID, TaskInstanceID: instanceID, TaskRevisionID: revisionID, TaskRevisionDigest: reserve.TaskRevisionDigest, WorkspaceDigest: "sha256:" + strings.Repeat("c", 64), SubmissionID: evidenceID, Outcome: "passed", AssistancePolicyVersion: "practice-assistance-v1", Evidence: []domain.PracticeCompetencyEvidence{{Target: target, Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{"implementation"}}}, OccurredAt: now.Add(2 * time.Second), PolicyVersion: domain.PracticeCompetencyEvidencePolicyV2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now.Add(3*time.Second))
+	if err != nil || !inserted {
+		t.Fatalf("close inserted=%v err=%v", inserted, err)
+	}
+	replayed, err := actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now.Add(4*time.Second))
+	if err != nil || replayed {
+		t.Fatalf("replay inserted=%v err=%v", replayed, err)
+	}
+	closed, err := actions.GetPracticeLearningAction(ctx, studentID, instanceID)
+	if err != nil || closed.LifecycleStatus != domain.PracticeLearningActionClosed {
+		t.Fatalf("closed=%+v err=%v", closed, err)
+	}
+	completed, err := paths.GetLearningPathByID(ctx, studentID, path.ID)
+	if err != nil || completed.Items[0].Status != domain.LearningPathItemCompleted {
+		t.Fatalf("path=%+v err=%v", completed, err)
+	}
+	differentID := uuid.NewString()
+	evidence.EvidenceID, evidence.SubmissionID = differentID, differentID
+	evidence, err = domain.NormalizePracticeCompetencyEvidenceBundleV2(studentID, instanceID, differentID, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now.Add(5*time.Second)); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("different evidence on closed action err=%v", err)
+	}
+}

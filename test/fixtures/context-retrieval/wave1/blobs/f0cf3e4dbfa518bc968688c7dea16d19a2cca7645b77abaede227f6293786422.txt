@@ -1,0 +1,95 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	natsgo "github.com/nats-io/nats.go"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const teacherSubjectPrefix = "teacher."
+
+// Publisher lazily connects to NATS and waits for JetStream acknowledgements.
+// An initial broker outage does not prevent the HTTP service from starting;
+// unpublished events remain in PostgreSQL and every later relay attempt retries.
+type Publisher struct {
+	URL            string
+	Name           string
+	ConnectTimeout time.Duration
+
+	mu         sync.Mutex
+	connection *natsgo.Conn
+	jetStream  natsgo.JetStreamContext
+}
+
+// Publish sends the canonical envelope with event_id as JetStream deduplication key.
+func (publisher *Publisher) Publish(ctx context.Context, event domain.IntegrationEvent) error {
+	if publisher == nil || strings.TrimSpace(publisher.URL) == "" || publisher.ConnectTimeout <= 0 {
+		return errors.New("invalid NATS publisher configuration")
+	}
+	if !strings.HasPrefix(event.Subject, teacherSubjectPrefix) || event.EventID == "" || !json.Valid(event.Payload) {
+		return errors.New("invalid teacher integration event")
+	}
+	jetStream, err := publisher.connectionContext()
+	if err != nil {
+		return err
+	}
+	message := natsgo.NewMsg(event.Subject)
+	message.Data = event.Payload
+	message.Header.Set(natsgo.MsgIdHdr, event.EventID)
+	message.Header.Set("X-Event-ID", event.EventID)
+	message.Header.Set("X-Correlation-ID", event.CorrelationID)
+	if event.CausationID != "" {
+		message.Header.Set("X-Causation-ID", event.CausationID)
+	}
+	message.Header.Set("X-Schema-Version", strconv.Itoa(event.SchemaVersion))
+	_, err = jetStream.PublishMsg(message, natsgo.Context(ctx))
+	return err
+}
+
+// Close closes the current connection. A later Publish reconnects lazily.
+func (publisher *Publisher) Close() {
+	if publisher == nil {
+		return
+	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if publisher.connection != nil {
+		publisher.connection.Close()
+	}
+	publisher.connection = nil
+	publisher.jetStream = nil
+}
+
+func (publisher *Publisher) connectionContext() (natsgo.JetStreamContext, error) {
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if publisher.connection != nil && !publisher.connection.IsClosed() && publisher.jetStream != nil {
+		return publisher.jetStream, nil
+	}
+	connection, err := natsgo.Connect(
+		publisher.URL,
+		natsgo.Name(publisher.Name),
+		natsgo.Timeout(publisher.ConnectTimeout),
+		natsgo.ReconnectWait(time.Second),
+		natsgo.MaxReconnects(-1),
+	)
+	if err != nil {
+		return nil, err
+	}
+	jetStream, err := connection.JetStream()
+	if err != nil {
+		connection.Close()
+		return nil, err
+	}
+	publisher.connection = connection
+	publisher.jetStream = jetStream
+	return jetStream, nil
+}

@@ -1,0 +1,390 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/migrations"
+	"github.com/jackc/pgx/v5"
+)
+
+const (
+	studentMigrationTestURL   = "STUDENT_MIGRATIONS_TEST_DATABASE_URL"
+	studentMigrationTestReset = "STUDENT_MIGRATIONS_TEST_ALLOW_SCHEMA_RESET"
+	studentMigrationLockName  = "ms-go-student-migrations-v1"
+)
+
+// This opt-in suite drops and recreates public. The target database must be
+// disposable and end in _migration_test; the second explicit opt-in prevents
+// an accidental reset from a merely configured URL.
+func TestStudentMigrationRunnerPostgresIntegration(t *testing.T) {
+	databaseURL := studentMigrationTestDatabaseURL(t)
+
+	t.Run("fresh_schema_full_migration_replay_and_lock_release", func(t *testing.T) {
+		resetStudentMigrationSchema(t, databaseURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		runner := newStudentMigrationRunner(t, ctx, databaseURL, studentMigrationDirectory())
+		defer runner.Close()
+		completed, err := runner.Up(ctx)
+		if err != nil {
+			t.Fatalf("apply fresh Student migrations: %v", err)
+		}
+		status, err := runner.Status(ctx)
+		if err != nil {
+			t.Fatalf("read migrated status: %v", err)
+		}
+		if status.Applied != status.Available || len(completed) != status.Available {
+			t.Fatalf("fresh status = %+v, newly applied = %d", status, len(completed))
+		}
+		assertMigration016Postcondition(t, ctx, databaseURL)
+
+		replayed, err := runner.Up(ctx)
+		if err != nil {
+			t.Fatalf("replay completed migrations: %v", err)
+		}
+		if len(replayed) != 0 {
+			t.Fatalf("replay applied %d migrations, want none", len(replayed))
+		}
+		assertStudentMigrationLockReleased(t, ctx, databaseURL)
+	})
+
+	t.Run("checksum_gap_and_unknown_history_fail_closed", func(t *testing.T) {
+		for _, testCase := range []struct {
+			name   string
+			mutate func(context.Context, *pgx.Conn) error
+		}{
+			{
+				name: "checksum",
+				mutate: func(ctx context.Context, conn *pgx.Conn) error {
+					_, err := conn.Exec(ctx, `UPDATE student_schema_migrations SET sha256 = $1 WHERE filename = '001_first.sql'`, strings.Repeat("0", 64))
+					return err
+				},
+			},
+			{
+				name: "gap",
+				mutate: func(ctx context.Context, conn *pgx.Conn) error {
+					_, err := conn.Exec(ctx, `DELETE FROM student_schema_migrations WHERE filename = '001_first.sql'`)
+					return err
+				},
+			},
+			{
+				name: "unknown",
+				mutate: func(ctx context.Context, conn *pgx.Conn) error {
+					_, err := conn.Exec(ctx, `INSERT INTO student_schema_migrations (filename, sha256) VALUES ('999_unknown.sql', $1)`, strings.Repeat("a", 64))
+					return err
+				},
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				resetStudentMigrationSchema(t, databaseURL)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				runner := newStudentMigrationRunner(t, ctx, databaseURL, writeStudentMigrationFixtures(t))
+				defer runner.Close()
+				if applied, err := runner.Up(ctx); err != nil || len(applied) != 2 {
+					t.Fatalf("seed fixture migrations: applied=%v err=%v", applied, err)
+				}
+				conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+				defer conn.Close(ctx)
+				if err := testCase.mutate(ctx, conn); err != nil {
+					t.Fatalf("corrupt migration history: %v", err)
+				}
+				if _, err := runner.Up(ctx); err == nil {
+					t.Fatal("runner accepted invalid migration history")
+				}
+				assertStudentMigrationLockReleased(t, ctx, databaseURL)
+			})
+		}
+	})
+
+	t.Run("nonempty_schema_without_history_is_refused", func(t *testing.T) {
+		resetStudentMigrationSchema(t, databaseURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+		if _, err := conn.Exec(ctx, `CREATE TABLE retained_student_data (id integer PRIMARY KEY)`); err != nil {
+			conn.Close(ctx)
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO retained_student_data VALUES (7)`); err != nil {
+			conn.Close(ctx)
+			t.Fatal(err)
+		}
+		conn.Close(ctx)
+
+		runner := newStudentMigrationRunner(t, ctx, databaseURL, writeStudentMigrationFixtures(t))
+		defer runner.Close()
+		if _, err := runner.Up(ctx); err == nil || !strings.Contains(err.Error(), "refusing to adopt") {
+			t.Fatalf("nonempty untracked schema error = %v", err)
+		}
+		assertStudentMigrationLockReleased(t, ctx, databaseURL)
+		assertStudentMigrationTableCount(t, ctx, databaseURL, "retained_student_data", 1)
+	})
+
+	t.Run("empty_history_with_existing_schema_is_refused", func(t *testing.T) {
+		resetStudentMigrationSchema(t, databaseURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+		_, err := conn.Exec(ctx, `CREATE TABLE student_schema_migrations (filename text PRIMARY KEY, sha256 char(64) NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`)
+		if err == nil {
+			_, err = conn.Exec(ctx, `CREATE TABLE retained_student_data (id integer PRIMARY KEY)`)
+		}
+		conn.Close(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		runner := newStudentMigrationRunner(t, ctx, databaseURL, writeStudentMigrationFixtures(t))
+		defer runner.Close()
+		if _, err := runner.Up(ctx); err == nil || !strings.Contains(err.Error(), "ledger is empty") {
+			t.Fatalf("empty-ledger existing schema error = %v", err)
+		}
+		assertStudentMigrationLockReleased(t, ctx, databaseURL)
+		assertStudentMigrationTableCount(t, ctx, databaseURL, "retained_student_data", 0)
+	})
+
+	t.Run("explicit_transaction_failure_rolls_back_schema_and_ledger", func(t *testing.T) {
+		t.Run("migration_sql_failure", func(t *testing.T) {
+			resetStudentMigrationSchema(t, databaseURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			directory := t.TempDir()
+			writeMigrationFile(t, directory, "001_failing.sql", `BEGIN;
+CREATE TABLE rollback_probe (id integer PRIMARY KEY);
+SELECT 1 / 0;
+COMMIT;
+`)
+			runner := newStudentMigrationRunner(t, ctx, databaseURL, directory)
+			defer runner.Close()
+			if _, err := runner.Up(ctx); err == nil {
+				t.Fatal("expected explicit-transaction migration failure")
+			}
+			assertStudentMigrationLockReleased(t, ctx, databaseURL)
+			conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+			defer conn.Close(ctx)
+			var historyExists, probeExists bool
+			if err := conn.QueryRow(ctx, `SELECT to_regclass('public.student_schema_migrations') IS NOT NULL, to_regclass('public.rollback_probe') IS NOT NULL`).Scan(&historyExists, &probeExists); err != nil {
+				t.Fatal(err)
+			}
+			if historyExists || probeExists {
+				t.Fatalf("failed migration left schema split: ledger=%t probe=%t", historyExists, probeExists)
+			}
+		})
+
+		t.Run("checksum_insert_failure", func(t *testing.T) {
+			resetStudentMigrationSchema(t, databaseURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+			_, err := conn.Exec(ctx, `CREATE TABLE student_schema_migrations (filename text PRIMARY KEY CHECK (filename <> '001_checksum_fails.sql'), sha256 char(64) NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`)
+			conn.Close(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			directory := t.TempDir()
+			writeMigrationFile(t, directory, "001_checksum_fails.sql", `BEGIN;
+CREATE TABLE checksum_failure_probe (id integer PRIMARY KEY);
+COMMIT;
+`)
+			runner := newStudentMigrationRunner(t, ctx, databaseURL, directory)
+			defer runner.Close()
+			if _, err := runner.Up(ctx); err == nil {
+				t.Fatal("expected migration ledger insert failure")
+			}
+			assertStudentMigrationLockReleased(t, ctx, databaseURL)
+			conn = connectStudentMigrationTestDB(t, ctx, databaseURL)
+			defer conn.Close(ctx)
+			var ledgerRows int
+			var probeExists bool
+			if err := conn.QueryRow(ctx, `SELECT count(*) FROM student_schema_migrations`).Scan(&ledgerRows); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.QueryRow(ctx, `SELECT to_regclass('public.checksum_failure_probe') IS NOT NULL`).Scan(&probeExists); err != nil {
+				t.Fatal(err)
+			}
+			if ledgerRows != 0 || probeExists {
+				t.Fatalf("checksum failure left SQL/ledger split: ledger rows=%d probe=%t", ledgerRows, probeExists)
+			}
+		})
+	})
+
+	t.Run("two_runners_serialize_and_release_session_lock", func(t *testing.T) {
+		resetStudentMigrationSchema(t, databaseURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		directory := t.TempDir()
+		writeMigrationFile(t, directory, "001_serialized.sql", `CREATE TABLE migration_serialization_probe (id integer PRIMARY KEY);
+INSERT INTO migration_serialization_probe (id) VALUES (1);
+SELECT pg_sleep(0.5);
+`)
+		first := newStudentMigrationRunner(t, ctx, databaseURL, directory)
+		defer first.Close()
+		second := newStudentMigrationRunner(t, ctx, databaseURL, directory)
+		defer second.Close()
+
+		start := make(chan struct{})
+		type result struct {
+			applied []string
+			err     error
+		}
+		results := make(chan result, 2)
+		var workers sync.WaitGroup
+		for _, runner := range []*migrations.Runner{first, second} {
+			workers.Add(1)
+			go func(runner *migrations.Runner) {
+				defer workers.Done()
+				<-start
+				applied, err := runner.Up(ctx)
+				results <- result{applied: applied, err: err}
+			}(runner)
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		totalApplied := 0
+		for item := range results {
+			if item.err != nil {
+				t.Fatalf("concurrent Up failed: %v", item.err)
+			}
+			totalApplied += len(item.applied)
+		}
+		if totalApplied != 1 {
+			t.Fatalf("concurrent runners applied %d migrations, want exactly one", totalApplied)
+		}
+		assertStudentMigrationTableCount(t, ctx, databaseURL, "migration_serialization_probe", 1)
+		assertStudentMigrationLockReleased(t, ctx, databaseURL)
+	})
+}
+
+func studentMigrationTestDatabaseURL(t *testing.T) string {
+	t.Helper()
+	databaseURL := os.Getenv(studentMigrationTestURL)
+	if databaseURL == "" || os.Getenv(studentMigrationTestReset) != "1" {
+		t.Skipf("set %s and %s=1 to opt into the destructive disposable-database migration test", studentMigrationTestURL, studentMigrationTestReset)
+	}
+	config, err := pgx.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatalf("parse migration test database URL: %v", err)
+	}
+	if !isLoopbackPostgresTestURL(databaseURL) || !isAllowedLoopbackTestHost(config.Host) {
+		t.Fatalf("refusing schema reset for non-loopback PostgreSQL host; use 127.0.0.1, localhost, or ::1")
+	}
+	if !strings.HasSuffix(config.Database, "_migration_test") {
+		t.Fatalf("refusing schema reset for database %q; database name must end in _migration_test", config.Database)
+	}
+	return databaseURL
+}
+
+func studentMigrationDirectory() string {
+	return filepath.Join("..", "..", "db", "migrations")
+}
+
+func newStudentMigrationRunner(t *testing.T, ctx context.Context, databaseURL, directory string) *migrations.Runner {
+	t.Helper()
+	runner, err := migrations.New(ctx, databaseURL, directory)
+	if err != nil {
+		t.Fatalf("create migration runner: %v", err)
+	}
+	return runner
+}
+
+func resetStudentMigrationSchema(t *testing.T, databaseURL string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS public CASCADE`); err != nil {
+		t.Fatalf("drop disposable public schema: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatalf("recreate disposable public schema: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `GRANT ALL ON SCHEMA public TO CURRENT_USER`); err != nil {
+		t.Fatalf("grant disposable public schema access: %v", err)
+	}
+}
+
+func connectStudentMigrationTestDB(t *testing.T, ctx context.Context, databaseURL string) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect disposable migration test database: %v", err)
+	}
+	return conn
+}
+
+func assertMigration016Postcondition(t *testing.T, ctx context.Context, databaseURL string) {
+	t.Helper()
+	conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+	defer conn.Close(ctx)
+	var ledgerRows, onboardingRows int
+	var onboardingTableExists bool
+	if err := conn.QueryRow(ctx, `
+SELECT (SELECT count(*) FROM student_schema_migrations WHERE filename = '016_student_onboarding.sql'),
+       (SELECT count(*) FROM student_onboarding),
+       (SELECT to_regclass('public.student_onboarding') IS NOT NULL)
+`).Scan(&ledgerRows, &onboardingRows, &onboardingTableExists); err != nil {
+		t.Fatalf("read migration 016 postcondition: %v", err)
+	}
+	if ledgerRows != 1 || onboardingRows != 0 || !onboardingTableExists {
+		t.Fatalf("migration 016 postcondition = ledger rows %d, onboarding rows %d, table exists %t", ledgerRows, onboardingRows, onboardingTableExists)
+	}
+}
+
+func assertStudentMigrationLockReleased(t *testing.T, ctx context.Context, databaseURL string) {
+	t.Helper()
+	conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+	defer conn.Close(ctx)
+	var acquired bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, studentMigrationLockName).Scan(&acquired); err != nil {
+		t.Fatalf("probe migration lock release: %v", err)
+	}
+	if !acquired {
+		t.Fatal("migration session advisory lock remained held")
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, studentMigrationLockName); err != nil {
+		t.Fatalf("release migration lock probe: %v", err)
+	}
+}
+
+func assertStudentMigrationTableCount(t *testing.T, ctx context.Context, databaseURL, table string, expected int) {
+	t.Helper()
+	conn := connectStudentMigrationTestDB(t, ctx, databaseURL)
+	defer conn.Close(ctx)
+	query := fmt.Sprintf(`SELECT count(*) FROM %s`, pgx.Identifier{table}.Sanitize())
+	var count int
+	if err := conn.QueryRow(ctx, query).Scan(&count); err != nil {
+		t.Fatalf("count rows in %s: %v", table, err)
+	}
+	if count != expected {
+		t.Fatalf("%s rows = %d, want %d", table, count, expected)
+	}
+}
+
+func writeStudentMigrationFixtures(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	writeMigrationFile(t, directory, "001_first.sql", `CREATE TABLE migration_fixture_first (id integer PRIMARY KEY);`)
+	writeMigrationFile(t, directory, "002_second.sql", `CREATE TABLE migration_fixture_second (id integer PRIMARY KEY);`)
+	return directory
+}
+
+func writeMigrationFile(t *testing.T, directory, filename, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(directory, filename), []byte(contents), 0o600); err != nil {
+		t.Fatalf("write migration fixture: %v", err)
+	}
+}

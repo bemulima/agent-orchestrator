@@ -1,0 +1,170 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/transport/http/api/v1/middleware"
+	"github.com/example/mc-course-service/internal/transport/http/api/v1/parsers"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+// LessonHandler handles lesson endpoints.
+type LessonHandler struct {
+	Validator   *validator.Validate
+	GetUC       lesson.GetLesson
+	ListUC      lesson.ListLessonsByCourse
+	MaterialsUC lesson.GetLessonMaterials
+	Access      contentaccess.Service
+}
+
+// List returns lessons for a course id.
+func (h LessonHandler) List(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	fieldsParam := r.URL.Query().Get("fields")
+
+	// Parse and validate fields
+	f := queryfields.Parse(fieldsParam, queryfields.LessonAllowedFields)
+	responseIncludesID := f.Has("id")
+	queryFields := f.Including("id")
+
+	// Parse filters and sort from query parameters
+	filters, err := parsers.ParseLessonFilters(r, h.Validator)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sort := parsers.ParseSortOptions(r)
+
+	if courseID != "" {
+		if filters.CourseID != nil && *filters.CourseID != courseID {
+			http.Error(w, "course_id does not match path", http.StatusBadRequest)
+			return
+		}
+		filters.CourseID = &courseID
+	} else if filters.CourseID != nil {
+		courseID = *filters.CourseID
+	}
+
+	_, role, authenticated := middleware.UserFromContext(r.Context())
+	privileged := authenticated && isPositionPrivilegedRole(role)
+	if !privileged {
+		active := domain.LessonStatusActive
+		filters.Status = &active
+		switch {
+		case filters.CourseID != nil:
+			err = h.Access.RequireCourse(r.Context(), *filters.CourseID)
+		case filters.ModuleID != nil:
+			err = h.Access.RequireModule(r.Context(), *filters.ModuleID)
+		case filters.SectionID != nil:
+			err = h.Access.RequireSection(r.Context(), *filters.SectionID)
+		default:
+			err = domain.ErrNotFound
+		}
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+	}
+
+	lessons, total, err := h.ListUC.HandleWithFields(r.Context(), courseID, queryFields, filters, sort)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure we return empty array instead of null
+	if lessons == nil {
+		lessons = []map[string]any{}
+	}
+	if !privileged && len(lessons) > 0 {
+		lessonIDs := make([]string, 0, len(lessons))
+		for _, item := range lessons {
+			if lessonID, ok := item["id"].(string); ok && lessonID != "" {
+				lessonIDs = append(lessonIDs, lessonID)
+			}
+		}
+		decisions, err := h.Access.ResolveLessons(r.Context(), lessonIDs, false)
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+		for _, item := range lessons {
+			lessonID, _ := item["id"].(string)
+			decision, ok := decisions[lessonID]
+			if !ok {
+				decision.Effective = domain.DefaultLessonReadAccess
+			}
+			item["effective_read_access"] = decision.Effective
+			item["can_read"] = decision.CanRead
+			if decision.SourceType != "" {
+				item["read_access_source_type"] = decision.SourceType
+			}
+			if !decision.CanRead {
+				delete(item, "description")
+				delete(item, "translations")
+				delete(item, "compose_config")
+			}
+			if !responseIncludesID {
+				delete(item, "id")
+			}
+		}
+	} else if !responseIncludesID {
+		for _, item := range lessons {
+			delete(item, "id")
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"lessons": lessons,
+		"meta":    buildPaginationMeta(filters.Page, filters.Limit, total),
+	})
+}
+
+// Get handles GET /lessons/{lessonID}.
+func (h LessonHandler) Get(w http.ResponseWriter, r *http.Request) {
+	lessonID := chi.URLParam(r, "lessonID")
+	var readDecision contentaccess.LessonReadDecision
+	if !isPrivilegedRequest(r) {
+		var err error
+		readDecision, err = h.Access.AuthorizeLesson(r.Context(), lessonID, r.URL.Query().Get(relationAccessQueryParam))
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+	} else {
+		readDecision = contentaccess.LessonReadDecision{Effective: domain.DefaultLessonReadAccess, CanRead: true}
+	}
+	fieldsParam := r.URL.Query().Get("fields")
+
+	// Parse and validate fields
+	f := queryfields.Parse(fieldsParam, queryfields.LessonAllowedFields)
+
+	result, err := h.GetUC.HandleWithFields(r.Context(), lessonID, f)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result["effective_read_access"] = readDecision.Effective
+	result["can_read"] = readDecision.CanRead
+	if readDecision.SourceType != "" {
+		result["read_access_source_type"] = readDecision.SourceType
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}

@@ -1,0 +1,517 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/example/ms-student-service/internal/config"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/http/aiprompt"
+	"github.com/example/ms-student-service/internal/infrastructure/http/catalogclient"
+	"github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	"github.com/example/ms-student-service/internal/infrastructure/http/filestorage"
+	"github.com/example/ms-student-service/internal/infrastructure/http/practiceruntime"
+	sandboxadapter "github.com/example/ms-student-service/internal/infrastructure/http/sandbox"
+	sandboxruntimeadapter "github.com/example/ms-student-service/internal/infrastructure/http/sandboxclient"
+	validationruntimeadapter "github.com/example/ms-student-service/internal/infrastructure/http/validationclient"
+	natsadapter "github.com/example/ms-student-service/internal/infrastructure/messaging/nats"
+	pgadapter "github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/example/ms-student-service/internal/infrastructure/runtime/builders"
+	studentruntimeadapter "github.com/example/ms-student-service/internal/infrastructure/runtime/studentruntime"
+	taskprovideradapter "github.com/example/ms-student-service/internal/infrastructure/runtime/taskprovider"
+	validatoradapter "github.com/example/ms-student-service/internal/infrastructure/runtime/validators"
+	httpadapter "github.com/example/ms-student-service/internal/transport/http"
+	adminhandlers "github.com/example/ms-student-service/internal/transport/http/admin/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	internalapi "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	natsconsumer "github.com/example/ms-student-service/internal/transport/message/nats"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+	hybridapplication "github.com/example/ms-student-service/internal/usecase/hybridapplication"
+	outboxuc "github.com/example/ms-student-service/internal/usecase/outbox"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+)
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+type uuidGenerator struct{}
+
+func (uuidGenerator) NewID() string { return uuid.NewString() }
+
+func main() {
+	logger, _ := zap.NewProduction()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config validation error: %v", err)
+	}
+
+	ctx := context.Background()
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("db error: %v", err)
+	}
+	defer pool.Close()
+
+	natsConn, err := nats.Connect(cfg.NATSURL)
+	if err != nil {
+		logger.Fatal("nats connection error", zap.Error(err))
+	}
+	defer func() {
+		if natsConn != nil {
+			if err := natsConn.Drain(); err != nil {
+				logger.Warn("nats drain error", zap.Error(err))
+			}
+		}
+	}()
+
+	validator := validator.New()
+	publisher := &natsadapter.EventPublisher{Conn: natsConn}
+	commandPublisher := &natsadapter.CommandPublisher{Conn: natsConn}
+	answerRepo := pgadapter.StudentTaskAnswerRepoPG{Pool: pool}
+	autoReviewRepo := pgadapter.AutoReviewRepoPG{Pool: pool}
+	manualReviewRepo := pgadapter.ManualReviewRepoPG{Pool: pool}
+	taskTestAnswerVariantRepo := pgadapter.TaskTestAnswerVariantRepoPG{Pool: pool}
+	studentPracticeTaskRepo := &pgadapter.StudentPracticeTaskRepoPG{Pool: pool}
+	studentPositionRepo := &pgadapter.StudentPositionRepoPG{Pool: pool}
+	studentOnboardingRepo := &pgadapter.StudentOnboardingRepoPG{Pool: pool}
+	courseAssignmentRepo := &pgadapter.CourseAssignmentRepoPG{Pool: pool}
+	assignmentAccess := studentuc.GetStudentCourses{Assignments: courseAssignmentRepo}
+	courseClient := courseclient.Client{
+		BaseURL: cfg.CourseServiceBaseURL, InternalToken: cfg.CourseServiceInternalToken,
+		AssignmentAccess: assignmentAccess,
+	}
+	// Learning-path writers discover migration 025 inside their transaction.  That
+	// keeps standalone repository construction safe and lets flag-off deploys
+	// continue fencing reservations created before traffic was drained.
+	learningJourneyRepo := &pgadapter.LearningJourneyRepoPG{Pool: pool}
+	if cfg.OnboardingPathAdmissionEnabled {
+		var admissionSchemaInstalled bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass('public.student_onboarding_path_admission') IS NOT NULL`).Scan(&admissionSchemaInstalled); err != nil {
+			logger.Fatal("check S9 onboarding path admission schema", zap.Error(err))
+		}
+		if !admissionSchemaInstalled {
+			logger.Fatal("S9 onboarding path admission schema is required when enabled")
+		}
+	}
+	onboardingPathAdmissions := &pgadapter.OnboardingPathAdmissionRepoPG{Pool: pool}
+	diagnosticAssessmentRepo := &pgadapter.DiagnosticAssessmentRepoPG{Pool: pool}
+	learningEvidenceRepo := &pgadapter.LearningEvidenceRepoPG{Pool: pool}
+	learningActionRepo := &pgadapter.LearningActionLifecycleRepoPG{Pool: pool}
+	outboxRepo := &pgadapter.OutboxRepoPG{Pool: pool}
+	outboxPublisher := &natsadapter.OutboxPublisher{Conn: natsConn}
+	outboxRelay := outboxuc.Relay{
+		Outbox:         outboxRepo,
+		Publisher:      outboxPublisher,
+		Clock:          systemClock{},
+		WorkerID:       "student-" + uuid.NewString(),
+		BatchSize:      cfg.OutboxBatchSize,
+		LockTTL:        time.Duration(cfg.OutboxLockTTLSeconds) * time.Second,
+		PublishTimeout: time.Duration(cfg.OutboxPublishTimeoutSeconds) * time.Second,
+		RetryBaseDelay: time.Duration(cfg.OutboxRetryBaseSeconds) * time.Second,
+		RetryMaxDelay:  time.Duration(cfg.OutboxRetryMaxSeconds) * time.Second,
+	}
+	if err := outboxRelay.Validate(); err != nil {
+		logger.Fatal("outbox relay configuration error", zap.Error(err))
+	}
+	relayContext, stopRelay := context.WithCancel(context.Background())
+	var relayWaitGroup sync.WaitGroup
+	relayWaitGroup.Add(1)
+	go func() {
+		defer relayWaitGroup.Done()
+		runOutboxRelay(
+			relayContext,
+			logger,
+			outboxRelay,
+			time.Duration(cfg.OutboxPollIntervalMS)*time.Millisecond,
+		)
+	}()
+	defer func() {
+		stopRelay()
+		relayWaitGroup.Wait()
+	}()
+
+	// Create sandbox client
+	sandboxNATSClient := natsadapter.NewSandboxClient(natsConn, domain.SubjectSandboxArchiveAndUpload)
+	sandboxClient := sandboxadapter.NewCombinedClient(cfg.SandboxServiceBaseURL, cfg.SandboxServiceInternalToken, sandboxNATSClient)
+	sandboxCreator := sandboxadapter.NewSandboxCreator(cfg.SandboxServiceBaseURL, cfg.SandboxServiceInternalToken)
+
+	// Create validator factory
+	validatorFactory := validatoradapter.NewFactory(
+		natsConn,
+		cfg.HTMLValidatorURL,
+		cfg.HTMLValidatorSubject,
+		cfg.CSSValidatorSubject,
+		cfg.PHPValidatorURL,
+		cfg.NodeValidatorURL,
+		cfg.ReactValidatorURL,
+	)
+	validationOrchestrator := validatoradapter.NewOrchestratorClient(cfg.ValidationOrchestratorURL, cfg.ValidationOrchestratorInternalToken)
+	publicationFiles, err := filestorage.NewClient(cfg.FileStorageURL, cfg.FileStorageInternalToken, cfg.PracticeTaskPublicationEncryptionKey)
+	if err != nil {
+		logger.Fatal("practice task publication filestorage configuration error", zap.Error(err))
+	}
+
+	catalogClient := catalogclient.Client{BaseURL: cfg.PracticeTaskOrchestratorURL, InternalToken: cfg.PracticeTaskInternalToken}
+	runtimeSandbox := sandboxruntimeadapter.Client{BaseURL: cfg.SandboxServiceBaseURL, InternalToken: cfg.SandboxServiceInternalToken}
+	buildUseCase := studentuc.BuildUseCase{Builders: builders.NewRegistry()}
+	studentUseCase := studentuc.StudentUseCase{
+		Catalog:       catalogClient,
+		Students:      studentPracticeTaskRepo,
+		Answers:       answerRepo,
+		Builders:      buildUseCase,
+		Completion:    courseclient.CompletionClient{BaseURL: cfg.CourseServiceBaseURL, InternalToken: cfg.CourseServiceInternalToken},
+		CourseContent: courseClient,
+		Sandbox:       runtimeSandbox,
+		Validation: validationruntimeadapter.Client{
+			BaseURL:       cfg.ValidationOrchestratorURL,
+			InternalToken: cfg.ValidationOrchestratorInternalToken,
+		},
+		AIReview:         aiprompt.Client{BaseURL: cfg.AIPromptServiceURL, InternalToken: cfg.AIPromptInternalToken},
+		Publications:     studentPracticeTaskRepo,
+		PublicationFiles: publicationFiles,
+	}
+	studentPositionUseCase := studentuc.PositionUseCase{Positions: studentPositionRepo}
+	getStudentOnboarding := studentuc.GetStudentOnboarding{Profiles: studentOnboardingRepo}
+	putStudentOnboarding := studentuc.PutStudentOnboarding{Profiles: studentOnboardingRepo, Clock: systemClock{}}
+	getStudentOnboardingDraft := studentuc.GetStudentOnboardingDraft{Drafts: studentOnboardingRepo}
+	putStudentOnboardingDraft := studentuc.PutStudentOnboardingDraft{Drafts: studentOnboardingRepo, Clock: systemClock{}}
+	finalizeStudentOnboardingDraft := studentuc.FinalizeStudentOnboardingDraft{Drafts: studentOnboardingRepo, Clock: systemClock{}}
+	applyStudentOnboardingTurn := studentuc.ApplyStudentOnboardingTurn{Turns: studentOnboardingRepo, Clock: systemClock{}, EffectsEnabled: cfg.TeacherOnboardingTurnV2Enabled}
+	getStudentOnboardingTurn := studentuc.GetStudentOnboardingTurn{Turns: studentOnboardingRepo}
+	proveStudentOnboardingTurnNoEffect := studentuc.ProveStudentOnboardingTurnNoEffect{Turns: studentOnboardingRepo, Clock: systemClock{}}
+	assignCourse := studentuc.AssignCourse{Assignments: courseAssignmentRepo, Clock: systemClock{}, IDs: uuidGenerator{}}
+	getStudentCourses := assignmentAccess
+	getLearnerOverview := studentuc.GetLearnerOverview{Profiles: studentOnboardingRepo, Mastery: learningEvidenceRepo, Journey: learningJourneyRepo}
+	getStudentPlanningReadiness := studentuc.GetStudentPlanningReadiness{Reader: studentOnboardingRepo}
+	getLearningWorkspace := studentuc.GetLearningWorkspace{Reader: learningJourneyRepo, Enabled: cfg.LearningWorkspaceSnapshotEnabled}
+	teacherAssistanceUseCase := studentuc.ApplyTeacherAssistance{Evidence: learningEvidenceRepo}
+	practiceEvidenceUseCase := studentuc.ApplyPracticeEvidence{Evidence: learningEvidenceRepo}
+	practiceLearningEvidenceUseCase := studentuc.ApplyPracticeLearningActionEvidence{Actions: learningActionRepo, Clock: systemClock{}}
+	targetMasteryUseCase := studentuc.GetTargetMastery{Mastery: learningEvidenceRepo}
+	learningActionContextUseCase := studentuc.GetLearningActionContext{Actions: learningActionRepo}
+	learningActionCodeContextUseCase := studentuc.GetLearningActionCodeContext{Actions: learningActionRepo, Sandbox: runtimeSandbox}
+	replaceLearningPath := studentuc.ReplaceLearningPath{Revisions: courseClient, Journey: learningJourneyRepo, Clock: systemClock{}, IDs: uuidGenerator{}}
+	assignedLessons := studentuc.AssignedLessonContext{Paths: learningJourneyRepo}
+	learningPaths := studentuc.LearningPaths{Paths: learningJourneyRepo, Clock: systemClock{}}
+	learningPathPlanning := studentuc.LearningPathPlanning{Revisions: courseClient, Paths: learningJourneyRepo, Clock: systemClock{}}
+	hybridApplication := hybridapplication.Service{Applications: learningJourneyRepo, Clock: systemClock{}}
+	hybridIntentHandler := &handlers.StudentHybridIntentHandler{Intents: hybridApplication}
+	practiceLearningActions := studentuc.PracticeLearningActions{Actions: learningActionRepo, Clock: systemClock{}, IDs: uuidGenerator{}}
+	completeLearningPath := studentuc.CompleteLearningPath{Journey: learningJourneyRepo, Clock: systemClock{}}
+	onboardingPathAdmission := studentuc.OnboardingPathAdmissionService{Revisions: courseClient, Admissions: onboardingPathAdmissions, Clock: systemClock{}, IDs: uuidGenerator{}, Enabled: cfg.OnboardingPathAdmissionEnabled}
+	captureDiagnostic := studentuc.CaptureDiagnosticSnapshot{
+		Journey: learningJourneyRepo, Mastery: targetMasteryUseCase, Clock: systemClock{}, IDs: uuidGenerator{},
+	}
+	learningSessions := studentuc.LearningSessions{Journey: learningJourneyRepo, Clock: systemClock{}, IDs: uuidGenerator{}}
+	diagnosticAssessments := studentuc.DiagnosticAssessments{
+		Attempts: diagnosticAssessmentRepo,
+		Catalog:  courseclient.DiagnosticCatalogClient{BaseURL: cfg.CourseServiceBaseURL, InternalToken: cfg.CourseDiagnosticCatalogToken},
+		Tasks:    courseClient, Clock: systemClock{},
+	}
+	studentRuntimeBridge := studentruntimeadapter.LocalBridge{Students: studentUseCase}
+	taskProvider := taskprovideradapter.Composite{Primary: studentRuntimeBridge, Secondary: courseClient}
+	progressionService := &answer.ProgressionService{
+		TaskProvider:       taskProvider,
+		Lessons:            courseClient,
+		Answers:            answerRepo,
+		PracticeTaskAccess: studentUseCase,
+	}
+
+	startUC := answer.StartTaskAnswer{LessonAssignments: answerRepo, TaskProvider: taskProvider, Answers: answerRepo, LearningActions: learningActionRepo, Publisher: publisher, SandboxCreator: sandboxCreator, Progression: progressionService, PracticeTaskRuntime: studentRuntimeBridge}
+	submitUC := answer.SubmitTaskAnswer{Answers: answerRepo, TaskProvider: taskProvider, Progression: progressionService}
+	finalValidationUC := answer.FinalValidation{
+		Answers:                answerRepo,
+		TaskTestAnswers:        taskTestAnswerVariantRepo,
+		TaskProvider:           taskProvider,
+		Progression:            progressionService,
+		SandboxClient:          sandboxClient,
+		ValidatorFactory:       validatorFactory,
+		ValidationOrchestrator: validationOrchestrator,
+		Publisher:              publisher,
+		CommandPublisher:       commandPublisher,
+		AutoReviews:            autoReviewRepo,
+		LearningActions:        learningActionRepo,
+		PracticeTaskRuntime:    studentRuntimeBridge,
+	}
+	studentUseCase.AnswerStarter = startUC
+	studentUseCase.FinalValidator = finalValidationUC
+	listUC := answer.ListStudentAnswers{Answers: answerRepo}
+	getUC := answer.GetStudentAnswer{Answers: answerRepo, AutoReviews: autoReviewRepo, ManualReviews: manualReviewRepo}
+	listResultsUC := answer.ListStudentResults{Answers: answerRepo, TaskProvider: taskProvider, SandboxResolver: sandboxClient}
+	getResultUC := answer.GetStudentResult{GetAnswer: getUC, Answers: answerRepo, TaskProvider: taskProvider, SandboxResolver: sandboxClient}
+	manualUC := answer.ApplyManualReview{Answers: answerRepo, ManualReviews: manualReviewRepo, LearningActions: learningActionRepo, Publisher: publisher}
+	autoUC := answer.ApplyAutoReview{Answers: answerRepo, AutoReviews: autoReviewRepo, ManualReviews: manualReviewRepo, LearningActions: learningActionRepo, Publisher: publisher}
+
+	inprocessUC := answer.InProcessAnswer{
+		Answers:         answerRepo,
+		AllowedServices: []string{"ms-go-sandbox"},
+	}
+	activityUC := answer.ActivityAnswer{
+		Answers:         answerRepo,
+		TaskProvider:    taskProvider,
+		LearningActions: learningActionRepo,
+	}
+
+	answerHandler := &handlers.AnswerHandler{
+		Validator:   validator,
+		Start:       startUC,
+		Progress:    progressionService,
+		Submit:      submitUC,
+		SubmitById:  finalValidationUC,
+		List:        listUC,
+		Get:         getUC,
+		ListResults: listResultsUC,
+		GetResult:   getResultUC,
+		Manual:      manualUC,
+	}
+	studentRuntimeHandler := &handlers.StudentRuntimeHandler{
+		Students: studentUseCase,
+	}
+	studentPracticeTaskHandler := &handlers.StudentPracticeTaskHandler{
+		Validator:  validator,
+		Students:   studentUseCase,
+		Runtime:    *studentRuntimeHandler,
+		Progress:   progressionService,
+		Start:      startUC,
+		Submit:     submitUC,
+		SubmitById: finalValidationUC,
+		Get:        getUC,
+	}
+	studentPositionHandler := &handlers.StudentPositionHandler{
+		Validator: validator,
+		Positions: studentPositionUseCase,
+	}
+	studentOnboardingHandler := &handlers.StudentOnboardingHandler{
+		Get: getStudentOnboarding, Put: putStudentOnboarding,
+		GetDraft: getStudentOnboardingDraft, PutDraft: putStudentOnboardingDraft,
+		FinalizeDraft: finalizeStudentOnboardingDraft,
+	}
+	studentCourseAssignmentHandler := &handlers.StudentCourseAssignmentHandler{Courses: getStudentCourses}
+	nextAction := studentuc.NextActionResolver{Reader: learningJourneyRepo, Runtime: practiceruntime.Client{BaseURL: cfg.PracticeRuntimeURL, InternalToken: cfg.PracticeRuntimeInternalToken}}
+	studentLearningJourneyHandler := &handlers.StudentLearningJourneyHandler{
+		AssignedLessons: assignedLessons,
+		NextAction:      nextAction,
+		Completion:      studentuc.LessonCompletion{Repository: learningJourneyRepo, Clock: systemClock{}}, Paths: studentuc.GetLearningPath{Journey: learningJourneyRepo}, PathCollection: learningPaths,
+		Diagnostics: learningJourneyRepo, Sessions: learningSessions,
+	}
+	diagnosticAssessmentHandler := &handlers.DiagnosticAssessmentHandler{Assessments: diagnosticAssessments}
+
+	internalHandler := internalapi.NewHandler(
+		answerRepo, studentPracticeTaskRepo, targetMasteryUseCase, learningActionContextUseCase, getLearnerOverview,
+	)
+	internalHandler.AssignedLessons = assignedLessons
+	internalHandler.NextAction = nextAction
+	internalHandler.LearningPaths = replaceLearningPath
+	internalHandler.LearningPathCompletion = completeLearningPath
+	internalHandler.LearningPathPlanning = learningPathPlanning
+	internalHandler.Diagnostics = captureDiagnostic
+	internalHandler.LearningSessions = learningSessions
+	internalHandler.LearningCode = learningActionCodeContextUseCase
+	internalHandler.CourseAssignments = assignCourse
+	internalHandler.PracticeEvidence = practiceEvidenceUseCase
+	internalHandler.PracticeLearningActions = practiceLearningActions
+	internalHandler.PracticeLearningEvidence = practiceLearningEvidenceUseCase
+	internalHandler.DiagnosticAssessments = &diagnosticAssessments
+	internalHandler.OnboardingDrafts = getStudentOnboardingDraft
+	internalHandler.OnboardingDraftWrites = putStudentOnboardingDraft
+	internalHandler.OnboardingFinalization = finalizeStudentOnboardingDraft
+	internalHandler.OnboardingProfiles = getStudentOnboarding
+	internalHandler.OnboardingTurnApply = applyStudentOnboardingTurn
+	internalHandler.OnboardingTurns = getStudentOnboardingTurn
+	internalHandler.OnboardingTurnProofs = proveStudentOnboardingTurnNoEffect
+	internalHandler.PlanningReadiness = getStudentPlanningReadiness
+	internalHandler.PlanningSnapshot = studentuc.GetPlanningSnapshot{Reader: learningJourneyRepo}
+	internalHandler.HybridApplication = hybridApplication
+	// S10 is intentionally read-only and defaults off. The use case returns a
+	// disabled error before it asks PostgreSQL for a workspace projection.
+	internalHandler.LearningWorkspace = getLearningWorkspace
+	// Keep the Planner-only contract explicit while flag-off; the use case exits before
+	// any admission-table query and returns the documented disabled error.
+	internalHandler.OnboardingPathAdmissions = onboardingPathAdmission
+	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
+		AnswerHandler:                  answerHandler,
+		StudentPositionHandler:         studentPositionHandler,
+		StudentPracticeTaskHandler:     studentPracticeTaskHandler,
+		StudentRuntimeHandler:          studentRuntimeHandler,
+		StudentOnboardingHandler:       studentOnboardingHandler,
+		StudentLearningJourneyHandler:  studentLearningJourneyHandler,
+		StudentCourseAssignmentHandler: studentCourseAssignmentHandler,
+		DiagnosticAssessmentHandler:    diagnosticAssessmentHandler,
+		HybridIntentHandler:            hybridIntentHandler,
+		AdminReviewHandlers: adminhandlers.ReviewHandlers{
+			ManualReview:                   answerHandler.ManualReview,
+			ListPendingPracticeTaskReviews: studentPracticeTaskHandler.ListPendingPracticeTaskFinalReviews,
+			GetPracticeTaskReview:          studentPracticeTaskHandler.GetPracticeTaskFinalReviewForReviewer,
+			ReviewPracticeTaskSubmission:   studentPracticeTaskHandler.ReviewPracticeTaskFinalSubmission,
+			RetryPracticeTaskAIReview:      studentPracticeTaskHandler.RetryPracticeTaskAIReview,
+		},
+		InternalHandler:              internalHandler,
+		InternalToken:                cfg.CourseServiceInternalToken,
+		LearningPlannerInternalToken: cfg.LearningPlannerInternalToken,
+		TeacherInternalToken:         cfg.TeacherInternalToken,
+		PracticeTaskInternalToken:    cfg.PracticeTaskInternalToken,
+		LegacyPracticeWritesEnabled:  cfg.LegacyPracticeRuntimeWritesEnabled,
+	})
+
+	subscriber := natsconsumer.AutoReviewSubscriber{
+		Conn:    natsConn,
+		Subject: domain.SubjectTaskAnswerAutoChecked,
+		Queue:   "ms-student-service",
+		Handler: func(ctx context.Context, msg []byte) error {
+			var payload struct {
+				StudentTaskAnswerID string         `json:"student_task_answer_id"`
+				ValidatorName       string         `json:"validator_name"`
+				AutoScore           *float64       `json:"auto_score"`
+				Passed              bool           `json:"passed"`
+				Feedback            *string        `json:"feedback"`
+				RawResult           map[string]any `json:"raw_result"`
+				CheckedAt           *time.Time     `json:"checked_at"`
+			}
+			if err := json.Unmarshal(msg, &payload); err != nil {
+				return err
+			}
+			_, err := autoUC.Handle(ctx, answer.ApplyAutoReviewInput{
+				StudentTaskAnswerID: payload.StudentTaskAnswerID,
+				ValidatorName:       payload.ValidatorName,
+				AutoScore:           payload.AutoScore,
+				Passed:              payload.Passed,
+				Feedback:            payload.Feedback,
+				RawResult:           payload.RawResult,
+				CheckedAt:           payload.CheckedAt,
+			})
+			return err
+		},
+	}
+	if err := subscriber.Subscribe(ctx); err != nil {
+		logger.Fatal("nats subscribe error", zap.Error(err))
+	}
+
+	// Subscribe to inprocess command
+	inprocessSubscriber := natsconsumer.InProcessSubscriber{
+		Conn:    natsConn,
+		Subject: domain.SubjectTaskAnswerInProcess,
+		Queue:   "ms-student-service",
+		Handler: func(ctx context.Context, msg []byte, headers map[string]string) error {
+			var payload struct {
+				AnswerID      string `json:"answerId"`
+				FileStorageID string `json:"fileStorageId"`
+			}
+			if err := json.Unmarshal(msg, &payload); err != nil {
+				return err
+			}
+
+			// Validate required fields
+			if payload.AnswerID == "" || payload.FileStorageID == "" {
+				return domain.ErrValidation
+			}
+
+			// Extract headers
+			userID := headers["x-user-id"]
+			userRole := headers["x-user-role"]
+			serviceName := headers["x-service-name"]
+
+			if userID == "" || userRole == "" || serviceName == "" {
+				return domain.ErrValidation
+			}
+
+			return inprocessUC.Handle(ctx, answer.InProcessAnswerInput{
+				AnswerID:      payload.AnswerID,
+				FileStorageID: payload.FileStorageID,
+				StudentID:     userID,
+				UserRole:      userRole,
+				ServiceName:   serviceName,
+			})
+		},
+	}
+	if err := inprocessSubscriber.Subscribe(ctx); err != nil {
+		logger.Fatal("nats inprocess subscribe error", zap.Error(err))
+	}
+
+	// Subscribe to activity command
+	activitySubscriber := natsconsumer.ActivitySubscriber{
+		Conn:    natsConn,
+		Subject: domain.SubjectTaskAnswerActivity,
+		Queue:   "ms-student-service",
+		Handler: func(ctx context.Context, msg []byte) error {
+			var payload struct {
+				AnswerID string `json:"answerId"`
+				UserID   string `json:"userId"`
+			}
+			if err := json.Unmarshal(msg, &payload); err != nil {
+				return err
+			}
+			if payload.AnswerID == "" || payload.UserID == "" {
+				return domain.ErrValidation
+			}
+			return activityUC.Handle(ctx, answer.ActivityAnswerInput{
+				AnswerID:  payload.AnswerID,
+				StudentID: payload.UserID,
+			})
+		},
+	}
+	if err := activitySubscriber.Subscribe(ctx); err != nil {
+		logger.Fatal("nats activity subscribe error", zap.Error(err))
+	}
+
+	teacherAssistanceSubscriber := natsconsumer.TeacherAssistanceSubscriber{
+		Conn:    natsConn,
+		Handler: teacherAssistanceUseCase.Handle,
+	}
+	if err := teacherAssistanceSubscriber.Subscribe(ctx); err != nil {
+		logger.Fatal("nats teacher assistance subscribe error", zap.Error(err))
+	}
+
+	srv := &http.Server{Addr: cfg.HTTPListenAddress(), Handler: router}
+
+	go func() {
+		logger.Info("starting http server", zap.String("port", cfg.HTTPPort))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("http server error", zap.Error(err))
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	logger.Info("shutting down")
+	ctxShutdown, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeout)*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctxShutdown); err != nil {
+		logger.Error("shutdown error", zap.Error(err))
+	}
+}
+
+func runOutboxRelay(ctx context.Context, logger *zap.Logger, relay outboxuc.Relay, interval time.Duration) {
+	if interval <= 0 {
+		logger.Error("invalid outbox poll interval", zap.Duration("interval", interval))
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			claimed, err := relay.ProcessBatch(ctx)
+			if err != nil {
+				logger.Warn("student outbox relay batch failed", zap.Int("claimed", claimed), zap.Error(err))
+			}
+		}
+	}
+}

@@ -1,0 +1,430 @@
+package domain
+
+import (
+	"errors"
+	"math"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+var (
+	ErrInvalidStudentContext   = errors.New("invalid student context")
+	ErrStudentContextNotFound  = errors.New("student context not found")
+	ErrStudentStateUnavailable = errors.New("student state unavailable")
+	ErrLearningActionClosed    = errors.New("learning action is closed")
+)
+
+const StudentLearnerOverviewVersion = "student-learner-overview-v2"
+
+const StudentLearningActionCodeContextVersion = "student-learning-action-code-context-v1"
+
+const SandboxValidationObservationVersion = "sandbox-validation-observation-v1"
+
+// LearningActionStatus is the Student-owned action lifecycle projection.
+type LearningActionStatus string
+
+const (
+	LearningActionStatusOpen   LearningActionStatus = "OPEN"
+	LearningActionStatusClosed LearningActionStatus = "CLOSED"
+)
+
+// TargetMasteryState is read from Student and never mutated by Teacher.
+type TargetMasteryState string
+
+const (
+	TargetMasteryUnknown    TargetMasteryState = "UNKNOWN"
+	TargetMasteryExposed    TargetMasteryState = "EXPOSED"
+	TargetMasteryUnderstood TargetMasteryState = "UNDERSTOOD"
+	TargetMasteryPracticed  TargetMasteryState = "PRACTICED"
+	TargetMasteryApplied    TargetMasteryState = "APPLIED"
+	TargetMasteryMastered   TargetMasteryState = "MASTERED"
+)
+
+// StudentLearningActionSnapshot is a bounded Student-owned fact projection.
+// It contains no answer identity, outcome, evidence rows, or mastery audit.
+type StudentLearningActionSnapshot struct {
+	LearningActionID string
+	StudentID        string
+	TaskID           string
+	ContextType      LearningContextType
+	ContextID        string
+	LearningTargets  []LearningTargetRef
+	Status           LearningActionStatus
+	OpenedAt         time.Time
+}
+
+type StudentCodeFile struct {
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated"`
+}
+
+type StudentValidationObservation struct {
+	Available     bool       `json:"available"`
+	Kind          string     `json:"kind"`
+	Passed        bool       `json:"passed"`
+	IssueCount    int        `json:"issue_count"`
+	CheckedAt     *time.Time `json:"checked_at,omitempty"`
+	PolicyVersion string     `json:"policy_version"`
+}
+
+// StudentLearningActionCodeContext is a bounded Student-sanitized workspace
+// projection. It contains no answer/Sandbox identity or validator output.
+type StudentLearningActionCodeContext struct {
+	LearningActionID string                       `json:"learning_action_id"`
+	StudentID        string                       `json:"student_id"`
+	TaskID           string                       `json:"task_id"`
+	Available        bool                         `json:"available"`
+	Files            []StudentCodeFile            `json:"files"`
+	OmittedFileCount int                          `json:"omitted_file_count"`
+	Truncated        bool                         `json:"truncated"`
+	PolicyVersion    string                       `json:"policy_version"`
+	Validation       StudentValidationObservation `json:"validation"`
+}
+
+// StudentTargetMastery is one current projection for an exact target.
+type StudentTargetMastery struct {
+	Target                  LearningTargetRef
+	State                   TargetMasteryState
+	MasteryScore            float64
+	Confidence              float64
+	IndependentSuccessCount int
+	AssistedSuccessCount    int
+	FailureCount            int
+	EvidenceCount           int
+	LastSeenAt              *time.Time
+	LastPracticedAt         *time.Time
+	LastFailedAt            *time.Time
+	PolicyVersion           string
+}
+
+// StudentOnboardingSnapshot is declared preference data, not diagnosed level
+// or mastery evidence.
+type StudentOnboardingSnapshot struct {
+	DirectionCode          string   `json:"direction_code"`
+	SelfAssessedExperience string   `json:"self_assessed_experience"`
+	KnownStacks            []string `json:"known_stacks"`
+	DesiredStacks          []string `json:"desired_stacks"`
+	GoalCode               string   `json:"goal_code"`
+	GoalText               string   `json:"goal_text,omitempty"`
+	PreferredLanguage      string   `json:"preferred_language"`
+	WeeklyMinutes          int      `json:"weekly_minutes"`
+	PreferredPace          string   `json:"preferred_pace"`
+	ProfileVersion         string   `json:"profile_version"`
+	Version                int64    `json:"version"`
+}
+
+// StudentLearnerOverview is the bounded Student-owned projection used only for
+// general teacher dialogs.
+type StudentLearnerOverview struct {
+	StudentID      string
+	Version        string
+	Onboarding     *StudentOnboardingSnapshot
+	RecentMastery  []StudentTargetMastery
+	LearningPath   *StudentLearningPath
+	Diagnostic     *StudentDiagnosticSnapshot
+	RecentSessions []StudentLearningSession
+}
+
+// StudentContext is an in-memory request snapshot for deterministic teacher
+// policy and later model orchestration. It is never persisted as student state.
+type StudentContext struct {
+	StudentID          string
+	LearningActionID   string
+	TaskID             string
+	ContextType        LearningContextType
+	ContextID          string
+	LearningTargets    []LearningTargetRef
+	RelevantMastery    []StudentTargetMastery
+	Onboarding         *StudentOnboardingSnapshot
+	LearningPath       *StudentLearningPath
+	Diagnostic         *StudentDiagnosticSnapshot
+	RecentSessions     []StudentLearningSession
+	CodeContext        *StudentLearningActionCodeContext
+	PracticeTask       *PracticeTaskContext
+	PracticeValidation *PracticeTeacherValidationContext
+}
+
+func NewGeneralStudentContext(overview StudentLearnerOverview) (StudentContext, error) {
+	overview.StudentID = strings.TrimSpace(overview.StudentID)
+	overview.Version = strings.TrimSpace(overview.Version)
+	if !validUUID(overview.StudentID) || overview.Version != StudentLearnerOverviewVersion || len(overview.RecentMastery) > 20 {
+		return StudentContext{}, ErrInvalidStudentContext
+	}
+	var onboarding *StudentOnboardingSnapshot
+	if overview.Onboarding != nil {
+		normalized, normalizeErr := NormalizeStudentOnboardingSnapshot(*overview.Onboarding)
+		if normalizeErr != nil {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		onboarding = &normalized
+	}
+	mastery := make([]StudentTargetMastery, len(overview.RecentMastery))
+	seen := make(map[string]struct{}, len(mastery))
+	for index, item := range overview.RecentMastery {
+		targets, err := normalizeLearningTargetRefs([]LearningTargetRef{item.Target}, 1)
+		if err != nil || !validTargetMastery(item) || item.State == TargetMasteryUnknown {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		identity := targetIdentity(targets[0])
+		if _, exists := seen[identity]; exists {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		seen[identity] = struct{}{}
+		item.Target = targets[0]
+		item.LastSeenAt = utcTimePointer(item.LastSeenAt)
+		item.LastPracticedAt = utcTimePointer(item.LastPracticedAt)
+		item.LastFailedAt = utcTimePointer(item.LastFailedAt)
+		mastery[index] = item
+	}
+	var path *StudentLearningPath
+	if overview.LearningPath != nil {
+		normalized, err := NormalizeStudentLearningPath(*overview.LearningPath, overview.StudentID)
+		if err != nil {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		path = &normalized
+	}
+	var diagnostic *StudentDiagnosticSnapshot
+	if overview.Diagnostic != nil {
+		normalized, err := NormalizeStudentDiagnosticSnapshot(*overview.Diagnostic, overview.StudentID)
+		if err != nil {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		diagnostic = &normalized
+	}
+	sessions, err := NormalizeStudentLearningSessions(overview.RecentSessions, overview.StudentID)
+	if err != nil {
+		return StudentContext{}, ErrInvalidStudentContext
+	}
+	return StudentContext{
+		StudentID: overview.StudentID, ContextType: LearningContextGeneral,
+		RelevantMastery: mastery, Onboarding: onboarding, LearningPath: path,
+		Diagnostic: diagnostic, RecentSessions: sessions,
+	}, nil
+}
+
+// NormalizeStudentOnboardingSnapshot validates the authoritative profile
+// without consulting the learner-overview legacy diagnostic field. The latter
+// is compatibility history and is never official completion proof.
+func NormalizeStudentOnboardingSnapshot(input StudentOnboardingSnapshot) (StudentOnboardingSnapshot, error) {
+	input.DirectionCode = strings.ToLower(strings.TrimSpace(input.DirectionCode))
+	input.SelfAssessedExperience = strings.ToLower(strings.TrimSpace(input.SelfAssessedExperience))
+	input.GoalCode = strings.ToLower(strings.TrimSpace(input.GoalCode))
+	input.GoalText = strings.TrimSpace(input.GoalText)
+	input.PreferredLanguage = strings.ToLower(strings.TrimSpace(input.PreferredLanguage))
+	input.PreferredPace = strings.ToLower(strings.TrimSpace(input.PreferredPace))
+	input.ProfileVersion = strings.TrimSpace(input.ProfileVersion)
+	known, knownErr := normalizeProfileValues(input.KnownStacks)
+	desired, desiredErr := normalizeProfileValues(input.DesiredStacks)
+	if knownErr != nil || desiredErr != nil || len(desired) == 0 ||
+		!validValue(input.DirectionCode, 64) || !validValue(input.SelfAssessedExperience, 64) ||
+		!validValue(input.GoalCode, 64) || len(input.GoalText) > 2000 ||
+		!validValue(input.PreferredLanguage, 16) || !validValue(input.PreferredPace, 64) ||
+		input.ProfileVersion != "student-onboarding-v1" || input.Version < 1 ||
+		input.WeeklyMinutes < 15 || input.WeeklyMinutes > 10080 {
+		return StudentOnboardingSnapshot{}, ErrInvalidStudentContext
+	}
+	input.KnownStacks = known
+	input.DesiredStacks = desired
+	return input, nil
+}
+
+func NewLessonStudentContext(overview StudentLearnerOverview, lessonID string) (StudentContext, error) {
+	contextValue, err := NewGeneralStudentContext(overview)
+	lessonID = strings.TrimSpace(lessonID)
+	if err != nil || !validUUID(lessonID) {
+		return StudentContext{}, ErrInvalidStudentContext
+	}
+	contextValue.ContextType = LearningContextLesson
+	contextValue.ContextID = lessonID
+	return contextValue, nil
+}
+
+func normalizeProfileValues(values []string) ([]string, error) {
+	if len(values) > 20 {
+		return nil, ErrInvalidStudentContext
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if !validValue(value, 64) {
+			return nil, ErrInvalidStudentContext
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+// NormalizeStudentLearningActionSnapshot validates the trusted action identity
+// before any mastery query is issued.
+func NormalizeStudentLearningActionSnapshot(input StudentLearningActionSnapshot) (StudentLearningActionSnapshot, error) {
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	input.OpenedAt = input.OpenedAt.UTC()
+	if !validUUID(input.LearningActionID) || !validUUID(input.StudentID) || !validUUID(input.TaskID) ||
+		!validClosedActionContextType(input.ContextType) || !validUUID(input.ContextID) || input.OpenedAt.IsZero() ||
+		(input.Status != LearningActionStatusOpen && input.Status != LearningActionStatusClosed) {
+		return StudentLearningActionSnapshot{}, ErrInvalidStudentContext
+	}
+	targets, err := normalizeLearningTargetRefs(input.LearningTargets, 100)
+	if err != nil {
+		return StudentLearningActionSnapshot{}, ErrInvalidStudentContext
+	}
+	input.LearningTargets = targets
+	return input, nil
+}
+
+func NormalizeStudentLearningActionCodeContext(input StudentLearningActionCodeContext, studentID, learningActionID, taskID string) (StudentLearningActionCodeContext, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.Validation.Kind = strings.ToLower(strings.TrimSpace(input.Validation.Kind))
+	input.Validation.PolicyVersion = strings.TrimSpace(input.Validation.PolicyVersion)
+	if input.Validation.CheckedAt != nil {
+		checkedAt := input.Validation.CheckedAt.UTC()
+		input.Validation.CheckedAt = &checkedAt
+	}
+	if input.StudentID != strings.TrimSpace(studentID) || input.LearningActionID != strings.TrimSpace(learningActionID) ||
+		input.TaskID != strings.TrimSpace(taskID) || !validUUID(input.StudentID) || !validUUID(input.LearningActionID) ||
+		!validUUID(input.TaskID) || input.PolicyVersion != StudentLearningActionCodeContextVersion || len(input.Files) > 12 ||
+		input.Validation.PolicyVersion != SandboxValidationObservationVersion || !validStudentValidationObservation(input.Validation) ||
+		input.OmittedFileCount < 0 || input.OmittedFileCount > 100_000 || (!input.Available && (len(input.Files) != 0 || input.OmittedFileCount != 0 || input.Truncated || input.Validation.Available)) {
+		return StudentLearningActionCodeContext{}, ErrInvalidStudentContext
+	}
+	files := make([]StudentCodeFile, len(input.Files))
+	seen, totalBytes, anyFileTruncated := make(map[string]struct{}, len(input.Files)), 0, false
+	for index, file := range input.Files {
+		file.Path = strings.TrimSpace(strings.ReplaceAll(file.Path, "\\", "/"))
+		if file.Path == "" || len(file.Path) > 300 || strings.HasPrefix(file.Path, "/") ||
+			strings.Contains("/"+file.Path+"/", "/../") || strings.ContainsRune(file.Path, '\x00') ||
+			!utf8.ValidString(file.Path) || !utf8.ValidString(file.Content) || strings.ContainsRune(file.Content, '\x00') ||
+			len(file.Content) > 16<<10 {
+			return StudentLearningActionCodeContext{}, ErrInvalidStudentContext
+		}
+		if _, exists := seen[file.Path]; exists {
+			return StudentLearningActionCodeContext{}, ErrInvalidStudentContext
+		}
+		seen[file.Path] = struct{}{}
+		totalBytes += len(file.Content)
+		anyFileTruncated = anyFileTruncated || file.Truncated
+		files[index] = file
+	}
+	if totalBytes > 64<<10 || input.Truncated != (input.OmittedFileCount > 0 || anyFileTruncated) {
+		return StudentLearningActionCodeContext{}, ErrInvalidStudentContext
+	}
+	input.Files = files
+	return input, nil
+}
+
+func validStudentValidationObservation(input StudentValidationObservation) bool {
+	if input.IssueCount < 0 || input.IssueCount > 10_000 {
+		return false
+	}
+	if !input.Available {
+		return input.Kind == "" && !input.Passed && input.IssueCount == 0 && input.CheckedAt == nil
+	}
+	return (input.Kind == "validation" || input.Kind == "tests") && input.CheckedAt != nil && !input.CheckedAt.IsZero()
+}
+
+func WithStudentCodeContext(contextValue StudentContext, input StudentLearningActionCodeContext) (StudentContext, error) {
+	if contextValue.ContextType == LearningContextGeneral || contextValue.ContextType == LearningContextLesson ||
+		contextValue.LearningActionID == "" || contextValue.TaskID == "" {
+		return StudentContext{}, ErrInvalidStudentContext
+	}
+	normalized, err := NormalizeStudentLearningActionCodeContext(
+		input, contextValue.StudentID, contextValue.LearningActionID, contextValue.TaskID,
+	)
+	if err != nil {
+		return StudentContext{}, err
+	}
+	contextValue.CodeContext = &normalized
+	return contextValue, nil
+}
+
+// NewStudentContext validates the exact ordered mastery response against the
+// frozen target snapshot and returns defensive copies.
+func NewStudentContext(
+	snapshot StudentLearningActionSnapshot,
+	mastery []StudentTargetMastery,
+) (StudentContext, error) {
+	normalized, err := NormalizeStudentLearningActionSnapshot(snapshot)
+	if err != nil {
+		return StudentContext{}, err
+	}
+	if normalized.Status != LearningActionStatusOpen {
+		return StudentContext{}, ErrLearningActionClosed
+	}
+	if len(mastery) != len(normalized.LearningTargets) {
+		return StudentContext{}, ErrInvalidStudentContext
+	}
+	normalizedMastery := make([]StudentTargetMastery, len(mastery))
+	for index, item := range mastery {
+		targets, targetErr := normalizeLearningTargetRefs([]LearningTargetRef{item.Target}, 1)
+		if targetErr != nil || targetIdentity(targets[0]) != targetIdentity(normalized.LearningTargets[index]) ||
+			!validTargetMastery(item) {
+			return StudentContext{}, ErrInvalidStudentContext
+		}
+		item.Target = targets[0]
+		item.PolicyVersion = strings.TrimSpace(item.PolicyVersion)
+		item.LastSeenAt = utcTimePointer(item.LastSeenAt)
+		item.LastPracticedAt = utcTimePointer(item.LastPracticedAt)
+		item.LastFailedAt = utcTimePointer(item.LastFailedAt)
+		normalizedMastery[index] = item
+	}
+	return StudentContext{
+		StudentID:        normalized.StudentID,
+		LearningActionID: normalized.LearningActionID,
+		TaskID:           normalized.TaskID,
+		ContextType:      normalized.ContextType,
+		ContextID:        normalized.ContextID,
+		LearningTargets:  append([]LearningTargetRef(nil), normalized.LearningTargets...),
+		RelevantMastery:  normalizedMastery,
+	}, nil
+}
+
+func validTargetMastery(item StudentTargetMastery) bool {
+	if !validTargetMasteryState(item.State) || !validValue(strings.TrimSpace(item.PolicyVersion), 64) ||
+		item.MasteryScore < 0 || item.MasteryScore > 1 || math.IsNaN(item.MasteryScore) || math.IsInf(item.MasteryScore, 0) ||
+		item.Confidence < 0 || item.Confidence > 1 || math.IsNaN(item.Confidence) || math.IsInf(item.Confidence, 0) ||
+		item.IndependentSuccessCount < 0 || item.AssistedSuccessCount < 0 || item.FailureCount < 0 || item.EvidenceCount < 0 ||
+		item.IndependentSuccessCount+item.AssistedSuccessCount+item.FailureCount != item.EvidenceCount {
+		return false
+	}
+	if item.State == TargetMasteryUnknown {
+		return item.EvidenceCount == 0 && item.MasteryScore == 0 && item.Confidence == 0 &&
+			item.LastSeenAt == nil && item.LastPracticedAt == nil && item.LastFailedAt == nil
+	}
+	return item.EvidenceCount > 0 && item.LastSeenAt != nil && !item.LastSeenAt.IsZero()
+}
+
+func validTargetMasteryState(value TargetMasteryState) bool {
+	switch value {
+	case TargetMasteryUnknown, TargetMasteryExposed, TargetMasteryUnderstood,
+		TargetMasteryPracticed, TargetMasteryApplied, TargetMasteryMastered:
+		return true
+	default:
+		return false
+	}
+}
+
+func targetIdentity(target LearningTargetRef) string {
+	return string(target.Type) + "\x00" + target.Key + "\x00" + target.Version
+}
+
+func utcTimePointer(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	normalized := value.UTC()
+	return &normalized
+}

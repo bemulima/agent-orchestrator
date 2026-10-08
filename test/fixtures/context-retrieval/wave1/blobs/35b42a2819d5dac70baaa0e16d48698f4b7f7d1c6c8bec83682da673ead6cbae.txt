@@ -1,0 +1,467 @@
+package domain
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+type TaskCapabilityInput struct {
+	Type                   *string
+	TaskKind               *string
+	ExecutionMode          *string
+	EvaluationMode         *string
+	UIMode                 *string
+	SubmissionMode         *string
+	RequiresSandbox        *bool
+	ExposesPreview         *bool
+	ExposesTerminal        *bool
+	SupportsLiveValidation *bool
+}
+
+type TaskCapabilities struct {
+	Type                   int16
+	ExecutionMode          int16
+	EvaluationMode         int16
+	UIMode                 int16
+	SubmissionMode         int16
+	RequiresSandbox        bool
+	ExposesPreview         bool
+	ExposesTerminal        bool
+	SupportsLiveValidation bool
+}
+
+func InferTaskCapabilities(codeStructureTypeCode string, codeStructure json.RawMessage, in TaskCapabilityInput) (TaskCapabilities, error) {
+	base := defaultTaskCapabilities(codeStructureTypeCode, codeStructure)
+	if rawType := resolveTaskTypeInput(in); rawType != nil {
+		taskType, err := ParseTaskType(*rawType)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+		base = defaultTaskCapabilitiesByType(taskType)
+	}
+	return applyTaskCapabilityInput(base, in)
+}
+
+// ValidatePHPCoreLiveValidationCapability prevents task metadata from
+// advertising php.core live feedback when its ValidationContractV1 exposes
+// php.core only on Submit. Legacy contracts keep their existing validation
+// path.
+func ValidatePHPCoreLiveValidationCapability(codeStructure json.RawMessage, supportsLiveValidation bool) error {
+	if !supportsLiveValidation || len(codeStructure) == 0 {
+		return nil
+	}
+
+	var contract validationContractCapabilities
+	if err := json.Unmarshal(codeStructure, &contract); err != nil {
+		return nil
+	}
+	if contract.Version <= 0 || contract.Kind == "" || len(contract.Stages) == 0 {
+		return nil
+	}
+
+	hasPHPCore := false
+	for _, stage := range contract.Stages {
+		if stage.Engine != "php.core" {
+			continue
+		}
+		hasPHPCore = true
+		if stage.Mode == "" || stage.Mode == ValidationStageModeBoth || stage.Mode == ValidationStageModeLive {
+			return nil
+		}
+	}
+	if !hasPHPCore {
+		return nil
+	}
+
+	return fmt.Errorf("%w: supports_live_validation=true requires php.core in live or both mode", ErrValidation)
+}
+
+func MergeTaskCapabilities(current Task, in TaskCapabilityInput) (TaskCapabilities, error) {
+	base := TaskCapabilities{
+		Type:                   fallbackInt16(current.Type, TaskTypeFrontendPreview),
+		ExecutionMode:          fallbackInt16(current.ExecutionMode, TaskExecutionModeBrowserPreview),
+		EvaluationMode:         fallbackInt16(current.EvaluationMode, TaskEvaluationModeAuto),
+		UIMode:                 fallbackInt16(current.UIMode, TaskUIModePreview),
+		SubmissionMode:         fallbackInt16(current.SubmissionMode, TaskSubmissionModeSnapshot),
+		RequiresSandbox:        current.RequiresSandbox,
+		ExposesPreview:         current.ExposesPreview,
+		ExposesTerminal:        current.ExposesTerminal,
+		SupportsLiveValidation: current.SupportsLiveValidation,
+	}
+	if current.Type == 0 {
+		base = defaultTaskCapabilities("", current.CodeStructure)
+	}
+	if rawType := resolveTaskTypeInput(in); rawType != nil {
+		taskType, err := ParseTaskType(*rawType)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+		base = defaultTaskCapabilitiesByType(taskType)
+	}
+	return applyTaskCapabilityInput(base, in)
+}
+
+func defaultTaskCapabilities(codeStructureTypeCode string, codeStructure json.RawMessage) TaskCapabilities {
+	if inferred, ok := inferTaskCapabilitiesFromValidationContract(codeStructure); ok {
+		return inferred
+	}
+
+	return defaultTaskCapabilitiesByCodeStructureType(codeStructureTypeCode)
+}
+
+func ApplyTaskCapabilities(task *Task, caps TaskCapabilities) {
+	task.Type = caps.Type
+	task.ExecutionMode = caps.ExecutionMode
+	task.EvaluationMode = caps.EvaluationMode
+	task.UIMode = caps.UIMode
+	task.SubmissionMode = caps.SubmissionMode
+	task.RequiresSandbox = caps.RequiresSandbox
+	task.ExposesPreview = caps.ExposesPreview
+	task.ExposesTerminal = caps.ExposesTerminal
+	task.SupportsLiveValidation = caps.SupportsLiveValidation
+}
+
+func applyTaskCapabilityInput(base TaskCapabilities, in TaskCapabilityInput) (TaskCapabilities, error) {
+	result := base
+	var err error
+
+	if in.ExecutionMode != nil {
+		result.ExecutionMode, err = ParseTaskExecutionMode(*in.ExecutionMode)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+	}
+	if in.EvaluationMode != nil {
+		result.EvaluationMode, err = ParseTaskEvaluationMode(*in.EvaluationMode)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+	}
+	if in.UIMode != nil {
+		result.UIMode, err = ParseTaskUIMode(*in.UIMode)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+	}
+	if in.SubmissionMode != nil {
+		result.SubmissionMode, err = ParseTaskSubmissionMode(*in.SubmissionMode)
+		if err != nil {
+			return TaskCapabilities{}, err
+		}
+	}
+	if in.RequiresSandbox != nil {
+		result.RequiresSandbox = *in.RequiresSandbox
+	}
+	if in.ExposesPreview != nil {
+		result.ExposesPreview = *in.ExposesPreview
+	}
+	if in.ExposesTerminal != nil {
+		result.ExposesTerminal = *in.ExposesTerminal
+	}
+	if in.SupportsLiveValidation != nil {
+		result.SupportsLiveValidation = *in.SupportsLiveValidation
+	}
+	if result.ExecutionMode == TaskExecutionModeNoRun {
+		result.RequiresSandbox = false
+		result.ExposesPreview = false
+		result.ExposesTerminal = false
+	}
+	return result, nil
+}
+
+func defaultTaskCapabilitiesByCodeStructureType(codeStructureTypeCode string) TaskCapabilities {
+	switch normalizeCodeStructureTypeCode(codeStructureTypeCode) {
+	case "HTML_BASIC_DOCUMENT", "CSS_BASIC_STYLESHEET", "REACT_COMPONENT_BASIC":
+		return defaultTaskCapabilitiesByType(TaskTypeFrontendPreview)
+	case "PHP_BASIC_SCRIPT":
+		return defaultTaskCapabilitiesByType(TaskTypeFullstackPage)
+	case "NEXTJS_BASIC":
+		caps := defaultTaskCapabilitiesByType(TaskTypeFullstackPage)
+		caps.EvaluationMode = TaskEvaluationModeManual
+		caps.SupportsLiveValidation = false
+		return caps
+	case "EXPRESSJS_BASIC":
+		caps := defaultTaskCapabilitiesByType(TaskTypeAPIEndpoint)
+		caps.EvaluationMode = TaskEvaluationModeHybrid
+		return caps
+	case "JAVASCRIPT_BASIC", "JAVASCRIPT_BASIC_SCRIPT", "TYPESCRIPT_BASIC", "TYPESCRIPT_BASIC_SCRIPT", "NODEJS_BASIC_SCRIPT", "JAVA_BASIC_SCRIPT", "KOTLIN_BASIC_SCRIPT":
+		return defaultTaskCapabilitiesByType(TaskTypeCLIProgramming)
+	case "QUIZ_TEXT_BASIC":
+		return defaultTaskCapabilitiesByType(TaskTypeQuizTheory)
+	case CodeStructureTypeTestSingleChoiceBasic:
+		return defaultTaskCapabilitiesByType(TaskTypeTest)
+	case CodeStructureTypeTestOrderingBasic:
+		return defaultTaskCapabilitiesByType(TaskTypeOrdering)
+	case CodeStructureTypeTestClassificationBasic:
+		return defaultTaskCapabilitiesByType(TaskTypeClassification)
+	default:
+		return defaultTaskCapabilitiesByType(TaskTypeFrontendPreview)
+	}
+}
+
+type validationContractCapabilities struct {
+	Version int                                   `json:"version"`
+	Kind    string                                `json:"kind"`
+	Stages  []validationContractStageCapabilities `json:"stages"`
+}
+
+type validationContractStageCapabilities struct {
+	Engine string `json:"engine"`
+	Mode   string `json:"mode"`
+}
+
+func inferTaskCapabilitiesFromValidationContract(codeStructure json.RawMessage) (TaskCapabilities, bool) {
+	if len(codeStructure) == 0 {
+		return TaskCapabilities{}, false
+	}
+
+	var contract validationContractCapabilities
+	if err := json.Unmarshal(codeStructure, &contract); err != nil {
+		return TaskCapabilities{}, false
+	}
+
+	if contract.Version <= 0 || contract.Kind == "" || len(contract.Stages) == 0 {
+		return TaskCapabilities{}, false
+	}
+
+	hasFrontend := false
+	hasBackendPage := false
+	hasAPI := false
+	hasCLI := false
+	hasLiveStages := false
+
+	for _, stage := range contract.Stages {
+		if isFrontendEngine(stage.Engine) {
+			hasFrontend = true
+		}
+		if isBackendPageEngine(stage.Engine) {
+			hasBackendPage = true
+		}
+		if isAPIEngine(stage.Engine) {
+			hasAPI = true
+		}
+		if isCLIEngine(stage.Engine) {
+			hasCLI = true
+		}
+
+		if stage.Mode == "" || stage.Mode == ValidationStageModeBoth || stage.Mode == ValidationStageModeLive {
+			hasLiveStages = true
+		}
+	}
+
+	var taskType int16
+	switch {
+	case hasAPI && !hasFrontend && !hasBackendPage:
+		taskType = TaskTypeAPIEndpoint
+	case hasBackendPage || (hasFrontend && hasAPI):
+		taskType = TaskTypeFullstackPage
+	case hasCLI && !hasFrontend && !hasBackendPage && !hasAPI:
+		taskType = TaskTypeCLIProgramming
+	default:
+		taskType = TaskTypeFrontendPreview
+	}
+
+	caps := defaultTaskCapabilitiesByType(taskType)
+	caps.SupportsLiveValidation = hasLiveStages && caps.RequiresSandbox
+	return caps, true
+}
+
+const (
+	ValidationStageModeLive  = "live"
+	ValidationStageModeFinal = "final"
+	ValidationStageModeBoth  = "both"
+)
+
+func isFrontendEngine(engine string) bool {
+	switch engine {
+	case "html.dom", "css.ast", "scss.ast", "react.ast", "browser.runtime":
+		return true
+	default:
+		return strings.HasPrefix(engine, "nextjs.")
+	}
+}
+
+func isBackendPageEngine(engine string) bool {
+	switch engine {
+	case "php.core":
+		return true
+	default:
+		return strings.HasPrefix(engine, "php.") || strings.HasPrefix(engine, "nextjs.")
+	}
+}
+
+func isAPIEngine(engine string) bool {
+	switch engine {
+	case "node.express", "node.fastify", "node.nest", "http.runtime":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCLIEngine(engine string) bool {
+	switch engine {
+	case "js.ast", "ts.ast", "ts.runtime", "java.compile", "java.runtime", "kotlin.compile", "kotlin.runtime":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultTaskCapabilitiesByType(taskType int16) TaskCapabilities {
+	switch taskType {
+	case TaskTypeFrontendPreview:
+		return TaskCapabilities{
+			Type:                   TaskTypeFrontendPreview,
+			ExecutionMode:          TaskExecutionModeBrowserPreview,
+			EvaluationMode:         TaskEvaluationModeAuto,
+			UIMode:                 TaskUIModePreview,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         true,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: true,
+		}
+	case TaskTypeFullstackPage:
+		return TaskCapabilities{
+			Type:                   TaskTypeFullstackPage,
+			ExecutionMode:          TaskExecutionModeBrowserPreview,
+			EvaluationMode:         TaskEvaluationModeManual,
+			UIMode:                 TaskUIModePreview,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         true,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: false,
+		}
+	case TaskTypeCLIProgramming:
+		return TaskCapabilities{
+			Type:                   TaskTypeCLIProgramming,
+			ExecutionMode:          TaskExecutionModeTerminalRun,
+			EvaluationMode:         TaskEvaluationModeAuto,
+			UIMode:                 TaskUIModeTerminal,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        true,
+			SupportsLiveValidation: true,
+		}
+	case TaskTypeAPIEndpoint:
+		return TaskCapabilities{
+			Type:                   TaskTypeAPIEndpoint,
+			ExecutionMode:          TaskExecutionModeHTTPAPI,
+			EvaluationMode:         TaskEvaluationModeHybrid,
+			UIMode:                 TaskUIModeReport,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: true,
+		}
+	case TaskTypeDebugFix:
+		return TaskCapabilities{
+			Type:                   TaskTypeDebugFix,
+			ExecutionMode:          TaskExecutionModeTerminalRun,
+			EvaluationMode:         TaskEvaluationModeAuto,
+			UIMode:                 TaskUIModeReport,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        true,
+			SupportsLiveValidation: true,
+		}
+	case TaskTypeRefactorQuality:
+		return TaskCapabilities{
+			Type:                   TaskTypeRefactorQuality,
+			ExecutionMode:          TaskExecutionModeTerminalRun,
+			EvaluationMode:         TaskEvaluationModeHybrid,
+			UIMode:                 TaskUIModeReport,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        true,
+			SupportsLiveValidation: true,
+		}
+	case TaskTypeGitCLI:
+		return TaskCapabilities{
+			Type:                   TaskTypeGitCLI,
+			ExecutionMode:          TaskExecutionModeTerminalRun,
+			EvaluationMode:         TaskEvaluationModeManual,
+			UIMode:                 TaskUIModeTerminal,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        true,
+			SupportsLiveValidation: false,
+		}
+	case TaskTypeSQLQuery:
+		return TaskCapabilities{
+			Type:                   TaskTypeSQLQuery,
+			ExecutionMode:          TaskExecutionModeTerminalRun,
+			EvaluationMode:         TaskEvaluationModeManual,
+			UIMode:                 TaskUIModeTerminal,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         false,
+			ExposesTerminal:        true,
+			SupportsLiveValidation: false,
+		}
+	case TaskTypeQuizTheory:
+		return TaskCapabilities{
+			Type:                   TaskTypeQuizTheory,
+			ExecutionMode:          TaskExecutionModeNoRun,
+			EvaluationMode:         TaskEvaluationModeAuto,
+			UIMode:                 TaskUIModeQuiz,
+			SubmissionMode:         TaskSubmissionModeAnswerPayload,
+			RequiresSandbox:        false,
+			ExposesPreview:         false,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: false,
+		}
+	case TaskTypePracticeTaskMilestone:
+		return TaskCapabilities{
+			Type:                   TaskTypePracticeTaskMilestone,
+			ExecutionMode:          TaskExecutionModeBrowserPreview,
+			EvaluationMode:         TaskEvaluationModeManual,
+			UIMode:                 TaskUIModePreview,
+			SubmissionMode:         TaskSubmissionModeSnapshot,
+			RequiresSandbox:        true,
+			ExposesPreview:         true,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: false,
+		}
+	case TaskTypeTest, TaskTypeOrdering, TaskTypeClassification:
+		return TaskCapabilities{
+			Type:                   taskType,
+			ExecutionMode:          TaskExecutionModeNoRun,
+			EvaluationMode:         TaskEvaluationModeAuto,
+			UIMode:                 TaskUIModeQuiz,
+			SubmissionMode:         TaskSubmissionModeAnswerPayload,
+			RequiresSandbox:        false,
+			ExposesPreview:         false,
+			ExposesTerminal:        false,
+			SupportsLiveValidation: false,
+		}
+	default:
+		return defaultTaskCapabilitiesByType(TaskTypeFrontendPreview)
+	}
+}
+
+func resolveTaskTypeInput(in TaskCapabilityInput) *string {
+	if in.Type != nil {
+		return in.Type
+	}
+	return in.TaskKind
+}
+
+func normalizeCodeStructureTypeCode(raw string) string {
+	return strings.ToUpper(strings.TrimSpace(raw))
+}
+
+func fallbackInt16(value, fallback int16) int16 {
+	if value == 0 {
+		return fallback
+	}
+	return value
+}

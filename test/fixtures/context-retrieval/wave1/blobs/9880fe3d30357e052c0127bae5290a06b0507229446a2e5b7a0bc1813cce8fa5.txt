@@ -1,0 +1,256 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+// PersonalTeacherRepository persists PersonalTeacher records in PostgreSQL.
+type PersonalTeacherRepository struct {
+	Pool *pgxpool.Pool
+}
+
+// Ensure atomically creates the student's teacher and per-student soul or
+// returns the existing canonical pair.
+func (repository PersonalTeacherRepository) Ensure(
+	ctx context.Context,
+	teacher domain.PersonalTeacher,
+	soul domain.TeacherSoul,
+) (domain.PersonalTeacher, domain.TeacherSoul, error) {
+	if repository.Pool == nil || teacher.ID != soul.PersonalTeacherID || teacher.StudentID != soul.StudentID {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, errors.New("invalid personal teacher aggregate")
+	}
+	normalizedSoul, err := domain.NormalizeTeacherSoul(soul)
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	row := tx.QueryRow(ctx, `
+		INSERT INTO personal_teacher (
+			id,
+			student_id,
+			teacher_profile_id,
+			language,
+			communication_style,
+			pedagogy_profile,
+			hint_policy,
+			intervention_mode,
+			version,
+			created_at,
+			updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (student_id) DO UPDATE
+		SET student_id = EXCLUDED.student_id
+		RETURNING
+			id,
+			student_id,
+			teacher_profile_id,
+			language,
+			communication_style,
+			pedagogy_profile,
+			hint_policy,
+			intervention_mode,
+			version,
+			created_at,
+			updated_at
+	`,
+		teacher.ID,
+		teacher.StudentID,
+		teacher.TeacherProfileID,
+		teacher.Language,
+		teacher.CommunicationStyle,
+		teacher.PedagogyProfile,
+		teacher.HintPolicy,
+		teacher.InterventionMode,
+		teacher.Version,
+		teacher.CreatedAt,
+		teacher.UpdatedAt,
+	)
+	storedTeacher, err := scanPersonalTeacher(row)
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO personal_teacher_soul (
+			personal_teacher_id,student_id,display_name,persona_code,voice_style,
+			relationship_style,encouragement_style,version,created_at,updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (student_id) DO NOTHING
+	`, storedTeacher.ID, storedTeacher.StudentID, normalizedSoul.DisplayName, normalizedSoul.PersonaCode,
+		normalizedSoul.VoiceStyle, normalizedSoul.RelationshipStyle, normalizedSoul.EncouragementStyle,
+		normalizedSoul.Version, normalizedSoul.CreatedAt, normalizedSoul.UpdatedAt)
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	storedSoul, err := scanTeacherSoul(tx.QueryRow(ctx, `
+		SELECT personal_teacher_id,student_id,display_name,persona_code,voice_style,
+		       relationship_style,encouragement_style,version,created_at,updated_at
+		FROM personal_teacher_soul WHERE student_id=$1
+	`, storedTeacher.StudentID))
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	if storedSoul.PersonalTeacherID != storedTeacher.ID {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, errors.New("personal teacher soul identity mismatch")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherSoul{}, err
+	}
+	return storedTeacher, storedSoul, nil
+}
+
+// GetByStudentID returns the student's PersonalTeacher.
+func (repository PersonalTeacherRepository) GetByStudentID(ctx context.Context, studentID string) (domain.PersonalTeacher, error) {
+	row := repository.Pool.QueryRow(ctx, `
+		SELECT
+			id,
+			student_id,
+			teacher_profile_id,
+			language,
+			communication_style,
+			pedagogy_profile,
+			hint_policy,
+			intervention_mode,
+			version,
+			created_at,
+			updated_at
+		FROM personal_teacher
+		WHERE student_id = $1
+	`, studentID)
+	return scanPersonalTeacher(row)
+}
+
+// Update changes settings only when expectedVersion is current.
+func (repository PersonalTeacherRepository) Update(ctx context.Context, teacher domain.PersonalTeacher, expectedVersion int64) (domain.PersonalTeacher, error) {
+	row := repository.Pool.QueryRow(ctx, `
+		UPDATE personal_teacher
+		SET
+			teacher_profile_id = $2,
+			language = $3,
+			communication_style = $4,
+			pedagogy_profile = $5,
+			hint_policy = $6,
+			intervention_mode = $7,
+			version = version + 1,
+			updated_at = $8
+		WHERE student_id = $1 AND version = $9
+		RETURNING
+			id,
+			student_id,
+			teacher_profile_id,
+			language,
+			communication_style,
+			pedagogy_profile,
+			hint_policy,
+			intervention_mode,
+			version,
+			created_at,
+			updated_at
+	`,
+		teacher.StudentID,
+		teacher.TeacherProfileID,
+		teacher.Language,
+		teacher.CommunicationStyle,
+		teacher.PedagogyProfile,
+		teacher.HintPolicy,
+		teacher.InterventionMode,
+		teacher.UpdatedAt,
+		expectedVersion,
+	)
+	updated, err := scanPersonalTeacher(row)
+	if errors.Is(err, domain.ErrPersonalTeacherNotFound) {
+		return domain.PersonalTeacher{}, domain.ErrVersionConflict
+	}
+	return updated, err
+}
+
+// GetSoulByStudentID returns only the soul bound to the student's teacher.
+func (repository PersonalTeacherRepository) GetSoulByStudentID(ctx context.Context, studentID string) (domain.TeacherSoul, error) {
+	if repository.Pool == nil {
+		return domain.TeacherSoul{}, errors.New("personal teacher repository pool is required")
+	}
+	return scanTeacherSoul(repository.Pool.QueryRow(ctx, `
+		SELECT personal_teacher_id,student_id,display_name,persona_code,voice_style,
+		       relationship_style,encouragement_style,version,created_at,updated_at
+		FROM personal_teacher_soul WHERE student_id=$1
+	`, studentID))
+}
+
+// UpdateSoul changes the per-student soul only at the expected soul version.
+func (repository PersonalTeacherRepository) UpdateSoul(
+	ctx context.Context,
+	soul domain.TeacherSoul,
+	expectedVersion int64,
+) (domain.TeacherSoul, error) {
+	if repository.Pool == nil {
+		return domain.TeacherSoul{}, errors.New("personal teacher repository pool is required")
+	}
+	normalized, err := domain.NormalizeTeacherSoul(soul)
+	if err != nil {
+		return domain.TeacherSoul{}, err
+	}
+	updated, err := scanTeacherSoul(repository.Pool.QueryRow(ctx, `
+		UPDATE personal_teacher_soul SET
+			display_name=$3,persona_code=$4,voice_style=$5,relationship_style=$6,
+			encouragement_style=$7,version=version+1,updated_at=$8
+		WHERE personal_teacher_id=$1 AND student_id=$2 AND version=$9
+		RETURNING personal_teacher_id,student_id,display_name,persona_code,voice_style,
+		          relationship_style,encouragement_style,version,created_at,updated_at
+	`, normalized.PersonalTeacherID, normalized.StudentID, normalized.DisplayName, normalized.PersonaCode,
+		normalized.VoiceStyle, normalized.RelationshipStyle, normalized.EncouragementStyle,
+		normalized.UpdatedAt, expectedVersion))
+	if errors.Is(err, domain.ErrTeacherSoulNotFound) {
+		return domain.TeacherSoul{}, domain.ErrVersionConflict
+	}
+	return updated, err
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPersonalTeacher(row rowScanner) (domain.PersonalTeacher, error) {
+	var teacher domain.PersonalTeacher
+	err := row.Scan(
+		&teacher.ID,
+		&teacher.StudentID,
+		&teacher.TeacherProfileID,
+		&teacher.Language,
+		&teacher.CommunicationStyle,
+		&teacher.PedagogyProfile,
+		&teacher.HintPolicy,
+		&teacher.InterventionMode,
+		&teacher.Version,
+		&teacher.CreatedAt,
+		&teacher.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.PersonalTeacher{}, domain.ErrPersonalTeacherNotFound
+	}
+	return teacher, err
+}
+
+func scanTeacherSoul(row rowScanner) (domain.TeacherSoul, error) {
+	var soul domain.TeacherSoul
+	err := row.Scan(
+		&soul.PersonalTeacherID, &soul.StudentID, &soul.DisplayName, &soul.PersonaCode,
+		&soul.VoiceStyle, &soul.RelationshipStyle, &soul.EncouragementStyle,
+		&soul.Version, &soul.CreatedAt, &soul.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherSoul{}, domain.ErrTeacherSoulNotFound
+	}
+	if err != nil {
+		return domain.TeacherSoul{}, err
+	}
+	return domain.NormalizeTeacherSoul(soul)
+}

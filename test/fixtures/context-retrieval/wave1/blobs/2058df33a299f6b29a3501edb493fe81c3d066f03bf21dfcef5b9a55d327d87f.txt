@@ -1,0 +1,499 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.PlanningSnapshotReader = (*LearningJourneyRepoPG)(nil)
+
+// ReadPlanningSnapshot observes only Student-owned facts in one PostgreSQL
+// snapshot. It never reserves, locks for mutation, writes a receipt, or contacts
+// Course/Practice/Runtime. Capture time is observation provenance, not a revision.
+func (repo *LearningJourneyRepoPG) ReadPlanningSnapshot(ctx context.Context, studentID, pathID string, targets []domain.LearningTargetRef) (domain.PlanningSnapshotSource, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.PlanningSnapshotSource{}, errors.New("learning journey repository pool is required")
+	}
+	if !domain.IsCanonicalPracticeLearningActionUUID(studentID) || !domain.IsCanonicalPracticeLearningActionUUID(pathID) {
+		return domain.PlanningSnapshotSource{}, domain.ErrValidation
+	}
+	normalized, e := domain.NormalizePlanningSnapshotTargets(targets)
+	if e != nil {
+		return domain.PlanningSnapshotSource{}, e
+	}
+	tx, e := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if e != nil {
+		return domain.PlanningSnapshotSource{}, e
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	source, e := readPlanningSnapshotSource(ctx, tx, studentID, pathID, normalized)
+	if e != nil {
+		return domain.PlanningSnapshotSource{}, e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return domain.PlanningSnapshotSource{}, e
+	}
+	return source, nil
+}
+
+func readPlanningSnapshotSource(ctx context.Context, q learningPathQuerier, studentID, pathID string, targets []domain.LearningTargetRef) (domain.PlanningSnapshotSource, error) {
+	source := domain.PlanningSnapshotSource{StudentID: studentID, RequestedTargets: targets}
+	path, e := readPlanningSnapshotPath(ctx, q, studentID, pathID)
+	if e != nil {
+		return source, e
+	}
+	source.Path = path
+	source.Context, e = getLearningContext(ctx, q, studentID, false)
+	if e != nil {
+		return source, e
+	}
+	source.Path.IsSelected = source.Context.SelectedLearningPathID == path.ID
+	source.Profile, e = scanStudentOnboarding(q.QueryRow(ctx, `SELECT `+studentOnboardingColumns+` FROM student_onboarding WHERE student_id=$1`, studentID))
+	if errors.Is(e, pgx.ErrNoRows) {
+		return source, domain.ErrNotFound
+	}
+	if e != nil {
+		return source, e
+	}
+	source.Profile.GoalText = "" // free-form declarations are not planning snapshot metadata
+	if e = q.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&source.CapturedAt); e != nil {
+		return source, e
+	}
+	source.CapturedAt = source.CapturedAt.UTC()
+	source.PendingIntent, e = readPlanningSnapshotIntent(ctx, q, studentID, pathID, path.Version)
+	if e != nil {
+		return source, e
+	}
+	budget := planningSnapshotReadBudget{}
+	if e = budget.add(source); e != nil {
+		return source, e
+	}
+	source.Mastery, e = readPlanningSnapshotMastery(ctx, q, studentID, targets, &budget)
+	if e != nil {
+		return source, e
+	}
+	source.Evidence, e = readPlanningSnapshotEvidence(ctx, q, studentID, targets, &budget)
+	if e != nil {
+		return source, e
+	}
+	source.ActivityFacts, e = readPlanningSnapshotFacts(ctx, q, path, &budget)
+	if e != nil {
+		return source, e
+	}
+	source.CourseBindings, e = readPlanningSnapshotCourseBindings(ctx, q, path, &budget)
+	if e != nil {
+		return source, e
+	}
+	source.PracticeBindings, e = readPlanningSnapshotPracticeBindings(ctx, q, path, &budget)
+	if e != nil {
+		return source, e
+	}
+	raw, e := json.Marshal(source)
+	if e != nil {
+		return source, e
+	}
+	if len(raw) > domain.MaximumPlanningSnapshotPayloadBytes {
+		return source, domain.ErrValidation
+	}
+	return source, nil
+}
+
+// This exact current-revision learner intent is observed in the same owner
+// transaction as path, profile and evidence. Historical/stale/consumed intents
+// cannot authorize the current snapshot. Migration032 is a rollout prerequisite.
+func readPlanningSnapshotIntent(ctx context.Context, q learningPathQuerier, studentID, pathID string, revision int64) (*domain.HybridLearningIntentProjection, error) {
+	rows, err := q.Query(ctx, `SELECT intent_id::text,student_id::text,learning_path_id::text,expected_path_revision,projection_json FROM student_learning_intent WHERE student_id=$1 AND learning_path_id=$2 AND expected_path_revision=$3 AND consumed_at IS NULL ORDER BY intent_id LIMIT 2`, studentID, pathID, revision)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result *domain.HybridLearningIntentProjection
+	for rows.Next() {
+		if result != nil {
+			return nil, domain.ErrConflict
+		}
+		var id, sid, pid string
+		var expected int64
+		var raw []byte
+		if err := rows.Scan(&id, &sid, &pid, &expected, &raw); err != nil {
+			return nil, err
+		}
+		if len(raw) > domain.MaximumPlanningSnapshotRequestBytes {
+			return nil, domain.ErrValidation
+		}
+		var intent domain.HybridLearningIntentProjection
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&intent) != nil || decoder.Decode(&struct{}{}) != io.EOF || intent.IntentID != id || intent.StudentID != sid || intent.LearningPathID != pid || intent.ExpectedPathRevision != expected || domain.ValidateHybridLearningIntent(intent) != nil {
+			return nil, domain.ErrValidation
+		}
+		result = &intent
+	}
+	return result, rows.Err()
+}
+
+// Reuse the existing header scanner/normalizer, but whitelist item columns:
+// neither lesson_content_json nor task/answer content is needed for this read.
+func readPlanningSnapshotPath(ctx context.Context, q learningPathQuerier, studentID, pathID string) (domain.StudentLearningPath, error) {
+	p, e := scanLearningPath(q.QueryRow(ctx, `SELECT `+learningPathColumns+` FROM student_learning_path WHERE student_id=$1 AND id=$2`, studentID, pathID))
+	if errors.Is(e, pgx.ErrNoRows) {
+		return p, domain.ErrNotFound
+	}
+	if e != nil {
+		return p, e
+	}
+	rows, e := q.Query(ctx, `SELECT reference_type,reference_id,position,status,targets_json,reason_code,id::text,COALESCE(lesson_revision_id::text,''),frozen_requirements FROM student_learning_path_item WHERE student_learning_path_id=$1 ORDER BY position`, pathID)
+	if e != nil {
+		return p, e
+	}
+	defer rows.Close()
+	bytesRead := 0
+	for rows.Next() {
+		var i domain.LearningPathItem
+		var targets, requirements []byte
+		if e = rows.Scan(&i.ReferenceType, &i.ReferenceID, &i.Position, &i.Status, &targets, &i.ReasonCode, &i.ID, &i.LessonRevisionID, &requirements); e != nil {
+			return p, e
+		}
+		bytesRead += len(targets) + len(requirements)
+		if bytesRead > domain.MaximumPlanningSnapshotPayloadBytes {
+			return p, domain.ErrValidation
+		}
+		if json.Unmarshal(targets, &i.Targets) != nil || json.Unmarshal(requirements, &i.FrozenRequirements) != nil {
+			return p, domain.ErrValidation
+		}
+		p.Items = append(p.Items, i)
+	}
+	if e = rows.Err(); e != nil {
+		return p, e
+	}
+	normalized, e := domain.NormalizeStudentLearningPath(p)
+	if e != nil {
+		return p, domain.ErrValidation
+	}
+	return normalized, nil
+}
+
+type planningSnapshotReadBudget struct{ bytes int }
+
+func (b *planningSnapshotReadBudget) add(v any) error {
+	raw, e := json.Marshal(v)
+	if e != nil {
+		return domain.ErrValidation
+	}
+	b.bytes += len(raw) + 2
+	if b.bytes > domain.MaximumPlanningSnapshotPayloadBytes {
+		return fmt.Errorf("planning snapshot payload exceeds technical byte bound: %w", domain.ErrValidation)
+	}
+	return nil
+}
+
+const planningSnapshotRequestedCTE = `WITH requested AS (SELECT item->>'type' AS type,item->>'key' AS key,COALESCE(item->>'version','') AS version FROM jsonb_array_elements($2::jsonb) AS item) `
+
+func readPlanningSnapshotMastery(ctx context.Context, q learningPathQuerier, studentID string, targets []domain.LearningTargetRef, b *planningSnapshotReadBudget) ([]domain.StudentTargetMastery, error) {
+	raw, _ := json.Marshal(targets)
+	rows, e := q.Query(ctx, planningSnapshotRequestedCTE+`SELECT m.student_id,m.target_type,m.target_key,m.target_version,m.state,m.mastery_score,m.confidence,m.independent_success_count,m.assisted_success_count,m.failure_count,m.evidence_count,m.last_seen_at,m.last_practiced_at,m.last_failed_at,m.policy_version FROM student_target_mastery m JOIN requested r ON r.type=m.target_type AND r.key=m.target_key AND r.version=m.target_version WHERE m.student_id=$1 ORDER BY m.target_type,m.target_key,m.target_version`, studentID, string(raw))
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	byTarget := map[string]domain.StudentTargetMastery{}
+	for rows.Next() {
+		m, e := scanTargetMastery(rows)
+		if e != nil {
+			return nil, e
+		}
+		byTarget[planningSnapshotTargetID(m.Target)] = m
+	}
+	if e = rows.Err(); e != nil {
+		return nil, e
+	}
+	result := make([]domain.StudentTargetMastery, 0, len(targets))
+	for _, r := range targets {
+		m, ok := byTarget[planningSnapshotTargetID(r)]
+		if !ok {
+			m = domain.StudentTargetMastery{StudentID: studentID, Target: r, State: domain.TargetMasteryUnknown, PolicyVersion: domain.MasteryPolicyVersion}
+		}
+		if e = b.add(m); e != nil {
+			return nil, e
+		}
+		result = append(result, m)
+	}
+	return result, nil
+}
+
+func readPlanningSnapshotEvidence(ctx context.Context, q learningPathQuerier, studentID string, targets []domain.LearningTargetRef, b *planningSnapshotReadBudget) ([]domain.PlanningEvidenceReference, error) {
+	raw, _ := json.Marshal(targets)
+	// Both complete histories are selected by learner+requested target, never by
+	// the current path or a "recent" LIMIT. Raw evidence scores/bodies stay local.
+	rows, e := q.Query(ctx, planningSnapshotRequestedCTE+`SELECT e.learning_action_id::text,e.task_id::text,e.target_type,e.target_key,e.target_version,e.evidence_class,e.outcome,e.support_context,e.evidence_kind,e.hints_used,e.max_hint_level,e.intervention_used,e.teacher_policy_version,e.mastery_policy_version,e.occurred_at,
+ COALESCE(a.student_id=e.student_id AND a.task_id=e.task_id AND a.source_kind='course_answer' AND a.closed_at IS NOT NULL AND a.outcome=e.outcome AND EXISTS(SELECT 1 FROM jsonb_array_elements(a.learning_targets) t WHERE t->>'type'=e.target_type AND t->>'key'=e.target_key AND COALESCE(t->>'version','')=e.target_version),false)
+ FROM student_learning_action_target_evidence e JOIN requested r ON r.type=e.target_type AND r.key=e.target_key AND r.version=e.target_version LEFT JOIN student_learning_action a ON a.id=e.learning_action_id WHERE e.student_id=$1 ORDER BY e.learning_action_id,e.target_type,e.target_key,e.target_version`, studentID, string(raw))
+	if e != nil {
+		return nil, e
+	}
+	result := []domain.PlanningEvidenceReference{}
+	for rows.Next() {
+		var x domain.PlanningEvidenceReference
+		var hint sql.NullInt32
+		var valid bool
+		x.SourceKind = "course_answer"
+		x.StudentID = studentID
+		if e = rows.Scan(&x.EvidenceID, &x.TaskID, &x.Target.Type, &x.Target.Key, &x.Target.Version, &x.EvidenceClass, &x.Outcome, &x.SupportContext, &x.Kind, &x.HintsUsed, &hint, &x.InterventionUsed, &x.TeacherPolicyVersion, &x.MasteryPolicyVersion, &x.OccurredAt, &valid); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		if !valid {
+			rows.Close()
+			return nil, domain.ErrValidation
+		}
+		x.LearningActionID = x.EvidenceID
+		if hint.Valid {
+			v := int(hint.Int32)
+			x.MaxHintLevel = &v
+		}
+		x.OccurredAt = x.OccurredAt.UTC()
+		if e = b.add(x); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		result = append(result, x)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return nil, e
+	}
+	rows, e = q.Query(ctx, planningSnapshotRequestedCTE+`SELECT e.evidence_id::text,COALESCE(p.learning_action_id::text,''),e.task_instance_id::text,p.task_revision_id::text,p.submission_id::text,e.target_type,e.target_key,e.target_version,p.outcome,e.support_context,e.evidence_kind,p.hints_used,p.max_hint_level,p.teacher_assistance_used,p.assistance_policy_version,e.occurred_at,p.request_hash,p.policy_version,COALESCE(a.surface_classification,''),
+ COALESCE(p.student_id=e.student_id AND p.task_instance_id=e.task_instance_id AND p.submission_id=p.evidence_id AND (p.learning_action_id IS NULL OR (a.student_id=e.student_id AND a.source_kind='practice_v2' AND a.practice_task_instance_id=e.task_instance_id AND a.practice_task_revision_id=p.task_revision_id AND a.lifecycle_status='CLOSED')),false)
+ FROM student_practice_target_evidence e JOIN requested r ON r.type=e.target_type AND r.key=e.target_key AND r.version=e.target_version LEFT JOIN student_practice_evidence_receipt p ON p.evidence_id=e.evidence_id LEFT JOIN student_learning_action a ON a.id=p.learning_action_id WHERE e.student_id=$1 ORDER BY e.evidence_id,e.target_type,e.target_key,e.target_version`, studentID, string(raw))
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var x domain.PlanningEvidenceReference
+		var hint sql.NullInt32
+		var valid bool
+		var policy string
+		x.EvidenceClass = domain.LearningEvidenceApplication
+		x.StudentID = studentID
+		x.MasteryPolicyVersion = domain.MasteryPolicyVersion
+		if e = rows.Scan(&x.EvidenceID, &x.LearningActionID, &x.TaskInstanceID, &x.TaskRevisionID, &x.SubmissionID, &x.Target.Type, &x.Target.Key, &x.Target.Version, &x.Outcome, &x.SupportContext, &x.Kind, &x.HintsUsed, &hint, &x.InterventionUsed, &x.TeacherPolicyVersion, &x.OccurredAt, &x.ReceiptHash, &policy, &x.SurfaceClassification, &valid); e != nil {
+			return nil, e
+		}
+		if !valid {
+			return nil, domain.ErrValidation
+		}
+		switch policy {
+		case domain.PracticeCompetencyEvidencePolicyV2:
+			x.SourceKind = "practice_v2"
+		case "practice-competency-evidence-v1":
+			x.SourceKind = "practice_legacy"
+		default:
+			return nil, domain.ErrValidation
+		}
+		if hint.Valid {
+			v := int(hint.Int32)
+			x.MaxHintLevel = &v
+		}
+		x.OccurredAt = x.OccurredAt.UTC()
+		if e = b.add(x); e != nil {
+			return nil, e
+		}
+		result = append(result, x)
+	}
+	return result, rows.Err()
+}
+
+func readPlanningSnapshotFacts(ctx context.Context, q learningPathQuerier, path domain.StudentLearningPath, b *planningSnapshotReadBudget) ([]domain.LessonActivityFact, error) {
+	rows, e := q.Query(ctx, `SELECT f.source_type,f.fact_id::text,f.student_id::text,f.item_id::text,f.requirement_id::text,f.occurred_at FROM student_lesson_activity_fact f JOIN student_learning_path_item i ON i.id=f.item_id WHERE i.student_learning_path_id=$1 ORDER BY f.source_type,f.fact_id`, path.ID)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	result := []domain.LessonActivityFact{}
+	for rows.Next() {
+		var f domain.LessonActivityFact
+		if e = rows.Scan(&f.Type, &f.FactID, &f.StudentID, &f.ItemID, &f.RequirementID, &f.OccurredAt); e != nil {
+			return nil, e
+		}
+		f.OccurredAt = f.OccurredAt.UTC()
+		f, e = planningSnapshotFactWithRequirement(path, f)
+		if e != nil {
+			return nil, e
+		}
+		if e = b.add(f); e != nil {
+			return nil, e
+		}
+		result = append(result, f)
+	}
+	return result, rows.Err()
+}
+func planningSnapshotFactWithRequirement(path domain.StudentLearningPath, f domain.LessonActivityFact) (domain.LessonActivityFact, error) {
+	if f.StudentID != path.StudentID || !domain.IsCanonicalPracticeLearningActionUUID(f.FactID) || f.OccurredAt.IsZero() {
+		return f, domain.ErrValidation
+	}
+	for _, i := range path.Items {
+		if i.ID != f.ItemID {
+			continue
+		}
+		for _, r := range i.FrozenRequirements {
+			if r.ID == f.RequirementID && r.Type == f.Type && r.Satisfied {
+				f.SourceID = r.SourceReference.ID
+				f.SourceRevisionID = r.SourceReference.RevisionID
+				return f, nil
+			}
+		}
+	}
+	return f, domain.ErrValidation
+}
+
+func readPlanningSnapshotCourseBindings(ctx context.Context, q learningPathQuerier, path domain.StudentLearningPath, b *planningSnapshotReadBudget) ([]domain.PlanningCourseActionBinding, error) {
+	rows, e := q.Query(ctx, `SELECT a.id::text,a.student_id::text,a.student_task_answer_id::text,a.task_id::text,COALESCE(a.learning_path_item_id::text,''),COALESCE(a.requirement_id::text,''),a.lifecycle_status,a.learning_targets,a.opened_at,a.closed_at,n.status,
+ COALESCE(a.student_id=n.student_id AND a.task_id=n.task_id AND a.learning_path_item_id=n.learning_path_item_id AND a.requirement_id=n.requirement_id,false)
+ FROM student_learning_action a LEFT JOIN student_task_answer n ON n.id=a.student_task_answer_id WHERE a.source_kind='course_answer' AND (a.learning_path_item_id IN (SELECT id FROM student_learning_path_item WHERE student_learning_path_id=$1) OR n.learning_path_item_id IN (SELECT id FROM student_learning_path_item WHERE student_learning_path_id=$1)) ORDER BY a.id`, path.ID)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	result := []domain.PlanningCourseActionBinding{}
+	for rows.Next() {
+		var x domain.PlanningCourseActionBinding
+		var raw []byte
+		var valid bool
+		if e = rows.Scan(&x.LearningActionID, &x.StudentID, &x.AnswerID, &x.TaskID, &x.LearningPathItemID, &x.RequirementID, &x.LifecycleStatus, &raw, &x.OpenedAt, &x.ClosedAt, &x.AnswerStatus, &valid); e != nil {
+			return nil, e
+		}
+		if !valid || x.StudentID != path.StudentID {
+			return nil, domain.ErrValidation
+		}
+		if json.Unmarshal(raw, &x.LearningTargets) != nil {
+			return nil, domain.ErrValidation
+		}
+		x.OpenedAt = x.OpenedAt.UTC()
+		if x.ClosedAt != nil {
+			v := x.ClosedAt.UTC()
+			x.ClosedAt = &v
+		}
+		if !planningSnapshotCourseBindingMatches(path, x) {
+			return nil, domain.ErrValidation
+		}
+		if e = b.add(x); e != nil {
+			return nil, e
+		}
+		result = append(result, x)
+	}
+	return result, rows.Err()
+}
+func planningSnapshotCourseBindingMatches(path domain.StudentLearningPath, x domain.PlanningCourseActionBinding) bool {
+	for _, i := range path.Items {
+		if i.ID != x.LearningPathItemID {
+			continue
+		}
+		for _, r := range i.FrozenRequirements {
+			if r.ID == x.RequirementID && (r.Type == "quiz_passed" || r.Type == "task_passed") && r.SourceReference.ID == x.TaskID {
+				return true
+			}
+		}
+	}
+	return false
+}
+func readPlanningSnapshotPracticeBindings(ctx context.Context, q learningPathQuerier, path domain.StudentLearningPath, b *planningSnapshotReadBudget) ([]domain.PracticeLearningActionBinding, error) {
+	rows, e := q.Query(ctx, `SELECT practice_task_instance_id::text FROM student_learning_action WHERE source_kind='practice_v2' AND learning_path_id=$1 ORDER BY id`, path.ID)
+	if e != nil {
+		return nil, e
+	}
+	instances := []string{}
+	for rows.Next() {
+		var id string
+		if e = rows.Scan(&id); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		instances = append(instances, id)
+		if len(instances)*36 > domain.MaximumPlanningSnapshotPayloadBytes {
+			rows.Close()
+			return nil, domain.ErrValidation
+		}
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return nil, e
+	}
+	result := []domain.PracticeLearningActionBinding{}
+	for _, id := range instances {
+		x, e := getPracticeLearningAction(ctx, q, "student_instance", path.StudentID+"\x00"+id, false)
+		if e != nil {
+			return nil, e
+		}
+		include, err := planningSnapshotCurrentPracticeBinding(path, x)
+		if err != nil {
+			return nil, err
+		}
+		if !include {
+			continue
+		}
+		if e = b.add(x); e != nil {
+			return nil, e
+		}
+		result = append(result, x)
+	}
+	return result, nil
+}
+func planningSnapshotPracticeBindingMatches(path domain.StudentLearningPath, x domain.PracticeLearningActionBinding) bool {
+	if x.StudentID != path.StudentID || x.LearningPathID != path.ID {
+		return false
+	}
+	active := x.LifecycleStatus == domain.PracticeLearningActionReserved || x.LifecycleStatus == domain.PracticeLearningActionOpen
+	for _, i := range path.Items {
+		if active && i.Position != x.LearningPathPositionReservation {
+			continue
+		}
+		if x.LearningPathItemID != "" {
+			if i.ID != x.LearningPathItemID {
+				continue
+			}
+			for _, r := range i.FrozenRequirements {
+				if r.ID == x.RequirementID && r.Type == "practice_completed" && r.SourceReference.ID == x.TaskRevisionID && r.SourceReference.RevisionID == x.TaskRevisionID {
+					return true
+				}
+			}
+		} else if i.ReferenceType == "practice" && i.ReferenceID == x.TaskRevisionID {
+			return true
+		}
+	}
+	return false
+}
+func planningSnapshotTargetID(r domain.LearningTargetRef) string {
+	return string(r.Type) + "\x00" + r.Key + "\x00" + r.Version
+}
+
+// Terminal detached history is not current protected work. Its relevant mastery
+// history still participates independently in complete requested evidence refs.
+// Active work is never silently discarded by this current-projection filter.
+func planningSnapshotCurrentPracticeBinding(path domain.StudentLearningPath, x domain.PracticeLearningActionBinding) (bool, error) {
+	if x.StudentID != path.StudentID || x.LearningPathID != path.ID {
+		return false, domain.ErrValidation
+	}
+	switch x.LifecycleStatus {
+	case domain.PracticeLearningActionReserved, domain.PracticeLearningActionOpen:
+		if !planningSnapshotPracticeBindingMatches(path, x) {
+			return false, domain.ErrValidation
+		}
+		return true, nil
+	case domain.PracticeLearningActionClosed, domain.PracticeLearningActionCancelled:
+		return planningSnapshotPracticeBindingMatches(path, x), nil
+	default:
+		return false, domain.ErrValidation
+	}
+}

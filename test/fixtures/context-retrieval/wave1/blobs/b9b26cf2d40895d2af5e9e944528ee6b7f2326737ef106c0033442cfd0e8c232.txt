@@ -1,0 +1,307 @@
+package domain
+
+import (
+	"errors"
+	"math"
+	"strings"
+	"time"
+)
+
+const MasteryPolicyVersion = "student-mastery-v1"
+
+// LearningEvidenceClass freezes whether a task checks knowledge or applies it.
+// The value is derived from trusted Course metadata when the action opens.
+type LearningEvidenceClass string
+
+const (
+	LearningEvidenceKnowledgeCheck LearningEvidenceClass = "knowledge_check"
+	LearningEvidenceApplication    LearningEvidenceClass = "application"
+)
+
+// LearningActionOutcome is the immutable official result of one action cycle.
+type LearningActionOutcome string
+
+const (
+	LearningActionPassed LearningActionOutcome = "passed"
+	LearningActionFailed LearningActionOutcome = "failed"
+)
+
+// LearningActionTargetEvidenceKind is the normalized combination of the
+// student-owned outcome and teacher-owned assistance context.
+type LearningActionTargetEvidenceKind string
+
+const (
+	EvidenceFailedKnowledgeCheck     LearningActionTargetEvidenceKind = "failed_knowledge_check"
+	EvidenceAssistedUnderstanding    LearningActionTargetEvidenceKind = "assisted_understanding"
+	EvidenceIndependentUnderstanding LearningActionTargetEvidenceKind = "independent_understanding"
+	EvidenceFailedApplication        LearningActionTargetEvidenceKind = "failed_application"
+	EvidenceAssistedApplication      LearningActionTargetEvidenceKind = "assisted_application"
+	EvidenceIndependentApplication   LearningActionTargetEvidenceKind = "independent_application"
+)
+
+// TargetMasteryState is the student-owned mastery projection for one exact target.
+type TargetMasteryState string
+
+const (
+	TargetMasteryUnknown    TargetMasteryState = "UNKNOWN"
+	TargetMasteryExposed    TargetMasteryState = "EXPOSED"
+	TargetMasteryUnderstood TargetMasteryState = "UNDERSTOOD"
+	TargetMasteryPracticed  TargetMasteryState = "PRACTICED"
+	TargetMasteryApplied    TargetMasteryState = "APPLIED"
+	TargetMasteryMastered   TargetMasteryState = "MASTERED"
+)
+
+// LearningActionTargetEvidence is one immutable, policy-versioned reducer input.
+type LearningActionTargetEvidence struct {
+	LearningActionID     string
+	StudentID            string
+	TaskID               string
+	Target               LearningTargetRef
+	EvidenceClass        LearningEvidenceClass
+	Outcome              LearningActionOutcome
+	SupportContext       TeacherSupportContext
+	Kind                 LearningActionTargetEvidenceKind
+	HintsUsed            int
+	MaxHintLevel         *int
+	InterventionUsed     bool
+	TeacherPolicyVersion string
+	MasteryPolicyVersion string
+	OccurredAt           time.Time
+}
+
+// StudentTargetMastery is the deterministic current projection over all
+// normalized action evidence for one exact target identity.
+type StudentTargetMastery struct {
+	StudentID               string
+	Target                  LearningTargetRef
+	State                   TargetMasteryState
+	MasteryScore            float64
+	Confidence              float64
+	IndependentSuccessCount int
+	AssistedSuccessCount    int
+	FailureCount            int
+	EvidenceCount           int
+	LastSeenAt              time.Time
+	LastPracticedAt         *time.Time
+	LastFailedAt            *time.Time
+	PolicyVersion           string
+}
+
+// LearningActionOutcomeForAnswerStatus maps the authoritative terminal answer
+// status to an immutable action result.
+func LearningActionOutcomeForAnswerStatus(status int) (LearningActionOutcome, error) {
+	switch status {
+	case StudentTaskAnswerStatusPassed:
+		return LearningActionPassed, nil
+	case StudentTaskAnswerStatusFailed:
+		return LearningActionFailed, nil
+	default:
+		return "", errors.New("learning action requires a terminal answer status")
+	}
+}
+
+// BuildLearningActionTargetEvidence validates the action/assistance join and
+// derives one objective evidence row per frozen target. Legacy actions without
+// an evidence class or immutable outcome remain assistance-only.
+func BuildLearningActionTargetEvidence(action StudentLearningAction, assistance TeacherAssistance) ([]LearningActionTargetEvidence, error) {
+	if action.ID != assistance.LearningActionID || action.StudentID != assistance.StudentID ||
+		action.ContextType != assistance.ContextType || action.ContextID != assistance.ContextID ||
+		action.ClosedAt == nil || action.ClosedAt.IsZero() {
+		return nil, errors.New("teacher assistance does not match the closed learning action")
+	}
+	targets, err := NormalizeLearningTargetRefs(action.LearningTargets)
+	if err != nil || len(targets) == 0 {
+		return nil, errors.New("teacher assistance requires the action target snapshot")
+	}
+	observedTargets := make(map[string]struct{}, len(targets))
+	for _, observation := range assistance.Observations {
+		normalizedTarget, normalizeErr := NormalizeLearningTargetRef(observation.Target)
+		if normalizeErr != nil {
+			return nil, errors.New("teacher assistance contains an invalid target")
+		}
+		observedTargets[targetIdentity(normalizedTarget)] = struct{}{}
+	}
+	if len(observedTargets) != len(targets) {
+		return nil, errors.New("teacher assistance target set does not match the action snapshot")
+	}
+	for _, target := range targets {
+		if _, exists := observedTargets[targetIdentity(target)]; !exists {
+			return nil, errors.New("teacher assistance target set does not match the action snapshot")
+		}
+	}
+
+	// Existing actions created before the evidence policy was deployed cannot be
+	// classified safely. Preserve their assistance facts without inventing mastery.
+	if action.EvidenceClass == "" || action.Outcome == "" {
+		return nil, nil
+	}
+	if !validLearningEvidenceClass(action.EvidenceClass) || !validLearningActionOutcome(action.Outcome) ||
+		strings.TrimSpace(action.OutcomePolicyVersion) != MasteryPolicyVersion {
+		return nil, errors.New("learning action outcome policy is invalid")
+	}
+
+	kind, err := deriveTargetEvidenceKind(action.EvidenceClass, action.Outcome, assistance.SupportContext)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]LearningActionTargetEvidence, 0, len(targets))
+	for _, target := range targets {
+		result = append(result, LearningActionTargetEvidence{
+			LearningActionID:     action.ID,
+			StudentID:            action.StudentID,
+			TaskID:               action.TaskID,
+			Target:               target,
+			EvidenceClass:        action.EvidenceClass,
+			Outcome:              action.Outcome,
+			SupportContext:       assistance.SupportContext,
+			Kind:                 kind,
+			HintsUsed:            assistance.HintsUsed,
+			MaxHintLevel:         assistance.MaxHintLevel,
+			InterventionUsed:     assistance.InterventionUsed,
+			TeacherPolicyVersion: assistance.PolicyVersion,
+			MasteryPolicyVersion: MasteryPolicyVersion,
+			OccurredAt:           action.ClosedAt.UTC(),
+		})
+	}
+	return result, nil
+}
+
+// ReduceStudentTargetMastery recomputes a replay-safe v1 projection. The
+// reducer is intentionally cumulative and monotonic; later policy versions may
+// add time decay or explicit reassessment without rewriting v1 evidence.
+func ReduceStudentTargetMastery(evidence []LearningActionTargetEvidence) (StudentTargetMastery, error) {
+	if len(evidence) == 0 {
+		return StudentTargetMastery{}, errors.New("mastery evidence is required")
+	}
+	first := evidence[0]
+	if first.StudentID == "" {
+		return StudentTargetMastery{}, errors.New("mastery evidence student is required")
+	}
+	target, err := NormalizeLearningTargetRef(first.Target)
+	if err != nil {
+		return StudentTargetMastery{}, err
+	}
+
+	projection := StudentTargetMastery{
+		StudentID:     first.StudentID,
+		Target:        target,
+		State:         TargetMasteryExposed,
+		PolicyVersion: MasteryPolicyVersion,
+	}
+	seenActions := make(map[string]struct{}, len(evidence))
+	independentApplicationTasks := make(map[string]struct{})
+	applicationEvidence := 0
+	understandingSuccess := 0
+	independentApplications := 0
+
+	for _, item := range evidence {
+		normalizedTarget, targetErr := NormalizeLearningTargetRef(item.Target)
+		expectedKind, kindErr := deriveTargetEvidenceKind(item.EvidenceClass, item.Outcome, item.SupportContext)
+		if targetErr != nil || item.StudentID != projection.StudentID || targetIdentity(normalizedTarget) != targetIdentity(target) ||
+			item.LearningActionID == "" || item.TaskID == "" || strings.TrimSpace(item.TeacherPolicyVersion) == "" ||
+			item.MasteryPolicyVersion != MasteryPolicyVersion || item.OccurredAt.IsZero() || kindErr != nil || expectedKind != item.Kind {
+			return StudentTargetMastery{}, errors.New("inconsistent mastery evidence")
+		}
+		if _, duplicate := seenActions[item.LearningActionID]; duplicate {
+			return StudentTargetMastery{}, errors.New("duplicate action mastery evidence")
+		}
+		seenActions[item.LearningActionID] = struct{}{}
+		projection.EvidenceCount++
+		if projection.LastSeenAt.IsZero() || item.OccurredAt.After(projection.LastSeenAt) {
+			projection.LastSeenAt = item.OccurredAt.UTC()
+		}
+		if item.EvidenceClass == LearningEvidenceApplication {
+			applicationEvidence++
+			if projection.LastPracticedAt == nil || item.OccurredAt.After(*projection.LastPracticedAt) {
+				occurredAt := item.OccurredAt.UTC()
+				projection.LastPracticedAt = &occurredAt
+			}
+		}
+
+		switch item.Kind {
+		case EvidenceIndependentUnderstanding:
+			projection.IndependentSuccessCount++
+			understandingSuccess++
+		case EvidenceIndependentApplication:
+			projection.IndependentSuccessCount++
+			independentApplications++
+			independentApplicationTasks[item.TaskID] = struct{}{}
+		case EvidenceAssistedUnderstanding:
+			projection.AssistedSuccessCount++
+			understandingSuccess++
+		case EvidenceAssistedApplication:
+			projection.AssistedSuccessCount++
+		case EvidenceFailedKnowledgeCheck, EvidenceFailedApplication:
+			projection.FailureCount++
+			if projection.LastFailedAt == nil || item.OccurredAt.After(*projection.LastFailedAt) {
+				occurredAt := item.OccurredAt.UTC()
+				projection.LastFailedAt = &occurredAt
+			}
+		}
+	}
+
+	if independentApplications >= 3 && len(independentApplicationTasks) >= 2 {
+		projection.State = TargetMasteryMastered
+	} else if independentApplications > 0 {
+		projection.State = TargetMasteryApplied
+	} else if applicationEvidence > 0 {
+		projection.State = TargetMasteryPracticed
+	} else if understandingSuccess > 0 {
+		projection.State = TargetMasteryUnderstood
+	}
+
+	projection.MasteryScore = roundMastery(
+		(float64(projection.IndependentSuccessCount) + 0.5*float64(projection.AssistedSuccessCount)) /
+			float64(projection.EvidenceCount),
+	)
+	projection.Confidence = roundMastery(float64(projection.EvidenceCount) / float64(projection.EvidenceCount+2))
+	return projection, nil
+}
+
+func deriveTargetEvidenceKind(class LearningEvidenceClass, outcome LearningActionOutcome, support TeacherSupportContext) (LearningActionTargetEvidenceKind, error) {
+	if !validLearningEvidenceClass(class) || !validLearningActionOutcome(outcome) || !validTeacherSupportContext(support) {
+		return "", errors.New("invalid learning evidence inputs")
+	}
+	if class == LearningEvidenceKnowledgeCheck {
+		if outcome == LearningActionFailed {
+			return EvidenceFailedKnowledgeCheck, nil
+		}
+		if support == TeacherSupportIndependent {
+			return EvidenceIndependentUnderstanding, nil
+		}
+		return EvidenceAssistedUnderstanding, nil
+	}
+	if outcome == LearningActionFailed {
+		return EvidenceFailedApplication, nil
+	}
+	if support == TeacherSupportIndependent {
+		return EvidenceIndependentApplication, nil
+	}
+	return EvidenceAssistedApplication, nil
+}
+
+func targetIdentity(target LearningTargetRef) string {
+	return string(target.Type) + "\x00" + target.Key + "\x00" + target.Version
+}
+
+func validLearningEvidenceClass(value LearningEvidenceClass) bool {
+	return value == LearningEvidenceKnowledgeCheck || value == LearningEvidenceApplication
+}
+
+// IsLearningEvidenceClass reports whether a persisted action classification is supported.
+func IsLearningEvidenceClass(value LearningEvidenceClass) bool {
+	return validLearningEvidenceClass(value)
+}
+
+func validLearningActionOutcome(value LearningActionOutcome) bool {
+	return value == LearningActionPassed || value == LearningActionFailed
+}
+
+// IsLearningActionOutcome reports whether a persisted terminal outcome is supported.
+func IsLearningActionOutcome(value LearningActionOutcome) bool {
+	return validLearningActionOutcome(value)
+}
+
+func roundMastery(value float64) float64 {
+	return math.Round(value*100000) / 100000
+}

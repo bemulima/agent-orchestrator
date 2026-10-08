@@ -1,0 +1,129 @@
+package handlers_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	studenthttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/student"
+	apiv1 "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1"
+	"github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/handlers"
+	"github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/middleware"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/nextbestaction"
+)
+
+func TestAuthoritativeNextActionWithCurrentLiveStudent(t *testing.T) {
+	studentID := strings.TrimSpace(os.Getenv("NBA_PROOF_STUDENT_ID"))
+	baseURL := strings.TrimSpace(os.Getenv("NBA_LIVE_STUDENT_URL"))
+	token := strings.TrimSpace(os.Getenv("NBA_LIVE_TEACHER_TOKEN"))
+	if studentID == "" || baseURL == "" || token == "" {
+		t.Skip("NBA_PROOF_STUDENT_ID, NBA_LIVE_STUDENT_URL and NBA_LIVE_TEACHER_TOKEN required")
+	}
+	client := studenthttp.Client{BaseURL: baseURL, LearningWorkspaceToken: token, HTTPClient: &http.Client{Timeout: 2 * time.Second}}
+	owner, err := client.GetNextAction(context.Background(), studentID)
+	require.NoError(t, err)
+	response := serveNextActionForStudent(nextbestaction.Get{Enabled: true, Actions: client}, studentID)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	expected, err := json.Marshal(owner)
+	require.NoError(t, err)
+	require.JSONEq(t, string(expected), response.Body.String())
+	require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+}
+
+// TestNextBestActionWithLiveStudentHTTP exercises the real strict Student
+// client, deterministic use case, and authenticated public Teacher handler.
+// It is opt-in because the Student base URL and dedicated Teacher token are
+// supplied only by the isolated S10 disposable acceptance topology.
+func TestNextBestActionWithLiveStudentHTTP(t *testing.T) {
+	studentBaseURL := strings.TrimSpace(os.Getenv("S10_STUDENT_LIVE_BASE_URL"))
+	studentToken := strings.TrimSpace(os.Getenv("S10_STUDENT_TEACHER_TOKEN"))
+	if studentBaseURL == "" || studentToken == "" {
+		t.Skip("S10_STUDENT_LIVE_BASE_URL and S10_STUDENT_TEACHER_TOKEN are required for live Student acceptance")
+	}
+
+	for _, testCase := range []struct {
+		name      string
+		studentID string
+		status    int
+		kind      string
+		lessonID  string
+		errorCode string
+	}{
+		{
+			name: "ready lesson starts", studentID: "10000000-0000-4000-8000-000000000001",
+			status: http.StatusOK, kind: "START_LESSON", lessonID: "40000000-0000-4000-8000-000000000001",
+		},
+		{
+			name: "in progress lesson continues", studentID: "10000000-0000-4000-8000-000000000002",
+			status: http.StatusOK, kind: "CONTINUE_LESSON", lessonID: "40000000-0000-4000-8000-000000000002",
+		},
+		{
+			name: "terminal path is managed", studentID: "10000000-0000-4000-8000-000000000003",
+			status: http.StatusOK,
+		},
+		{
+			name: "no selected path is not ready", studentID: "10000000-0000-4000-8000-000000000004",
+			status: http.StatusOK,
+		},
+		{
+			name: "inconsistent selected path is unavailable", studentID: "10000000-0000-4000-8000-000000000005",
+			status: http.StatusServiceUnavailable, errorCode: "nba_state_unavailable",
+		},
+		{
+			name: "cross student selected path is unavailable", studentID: "10000000-0000-4000-8000-000000000006",
+			status: http.StatusServiceUnavailable, errorCode: "nba_state_unavailable",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := studenthttp.Client{
+				BaseURL:                studentBaseURL,
+				LearningWorkspaceToken: studentToken,
+				HTTPClient:             &http.Client{Timeout: 2 * time.Second},
+			}
+			response := serveNextActionForStudent(
+				nextbestaction.Get{Enabled: true, Actions: client},
+				testCase.studentID,
+			)
+			require.Equal(t, testCase.status, response.Code, response.Body.String())
+			require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			if testCase.errorCode != "" {
+				require.JSONEq(t, `{"error":"`+testCase.errorCode+`"}`, response.Body.String())
+				return
+			}
+			require.Contains(t, response.Body.String(), `"schema":"student-next-action.v1"`)
+			if testCase.kind != "" {
+				require.Contains(t, response.Body.String(), `"kind":"`+testCase.kind+`"`)
+			}
+			if testCase.lessonID != "" {
+				require.Contains(t, response.Body.String(), `"lesson_id":"`+testCase.lessonID+`"`)
+			}
+		})
+	}
+}
+
+func serveNextActionForStudent(getter interface {
+	Execute(context.Context, string) (domain.TeacherNextAction, error)
+}, studentID string) *httptest.ResponseRecorder {
+	api := apiv1.NewRouter(
+		&handlers.PersonalTeacherHandler{}, &handlers.TeacherDialogHandler{}, nil, nil, nil, nil,
+		&handlers.NextBestActionHandler{Getter: getter},
+	)
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware)
+	router.Mount("/", api)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/teacher/me/next-action", nil)
+	request.Header.Set("X-User-ID", studentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	router.ServeHTTP(response, request)
+	return response
+}

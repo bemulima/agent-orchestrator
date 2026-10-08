@@ -1,0 +1,99 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/jackc/pgx/v5"
+)
+
+// EnqueuePlanningStateChangedOutbox joins the caller's owner transaction. It is
+// shared with durable learner intent; it does not commit or decide significance.
+func EnqueuePlanningStateChangedOutbox(ctx context.Context, tx pgx.Tx, studentID, pathID string, pathVersion int64, kind, identity string, targets []domain.LearningTargetRef, occurredAt time.Time) error {
+	event, err := domain.NewPlanningStateChangedEvent(studentID, pathID, pathVersion, kind, identity, targets, occurredAt)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `INSERT INTO student_outbox(event_id,subject,schema_version,student_id,correlation_id,causation_id,occurred_at,payload,next_attempt_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$7,$7) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.Subject, event.SchemaVersion, event.StudentID, event.CorrelationID, event.CausationID, event.OccurredAt, string(event.Payload))
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		var exact bool
+		if err := tx.QueryRow(ctx, `SELECT subject=$2 AND payload=$3::jsonb FROM student_outbox WHERE event_id=$1`, event.EventID, event.Subject, string(event.Payload)).Scan(&exact); err != nil {
+			return err
+		}
+		if !exact {
+			return domain.ErrConflict
+		}
+	}
+	return nil
+}
+
+// Objective evidence can affect every active owned path containing an exact
+// target, including unselected paths. There is no selected-context shortcut,
+// confidence predicate, numeric score, or quality/significance judgment here.
+func enqueueObjectivePlanningState(ctx context.Context, tx pgx.Tx, studentID, identity string, targets []domain.LearningTargetRef, occurredAt time.Time) error {
+	if len(targets) == 0 {
+		return nil
+	} // legacy assistance without objective evidence
+	normalized, err := domain.NormalizePlanningSnapshotTargets(targets)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `WITH requested AS (SELECT value AS target FROM jsonb_array_elements($2::jsonb))
+ SELECT p.id::text,p.version,jsonb_agg(DISTINCT r.target)
+ FROM student_learning_path p
+ JOIN student_learning_path_item i ON i.student_learning_path_id=p.id
+ CROSS JOIN LATERAL jsonb_array_elements(i.targets_json) t
+ JOIN requested r ON t->>'type'=r.target->>'type' AND t->>'key'=r.target->>'key' AND COALESCE(t->>'version','')=COALESCE(r.target->>'version','')
+ WHERE p.student_id=$1 AND p.status='ACTIVE'
+ GROUP BY p.id,p.version ORDER BY p.id`, studentID, string(raw))
+	if err != nil {
+		return err
+	}
+	type pathTargets struct {
+		id      string
+		version int64
+		targets []domain.LearningTargetRef
+	}
+	paths := []pathTargets{}
+	for rows.Next() {
+		var path pathTargets
+		var raw []byte
+		if err := rows.Scan(&path.id, &path.version, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := json.Unmarshal(raw, &path.targets); err != nil {
+			rows.Close()
+			return domain.ErrValidation
+		}
+		paths = append(paths, path)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if err := EnqueuePlanningStateChangedOutbox(ctx, tx, studentID, path.id, path.version, domain.TriggerPlanningObjectiveEvidence, identity, path.targets, occurredAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func objectivePlanningTargets(evidence []domain.LearningActionTargetEvidence) []domain.LearningTargetRef {
+	targets := make([]domain.LearningTargetRef, 0, len(evidence))
+	for _, item := range evidence {
+		targets = append(targets, item.Target)
+	}
+	return targets
+}

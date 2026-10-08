@@ -1,0 +1,667 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	natsgo "github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/config"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	aipromptadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/aiprompt"
+	courseadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/course"
+	dialogadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	learningplanneradapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/learningplanner"
+	practiceadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/practice"
+	statisticadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/statistic"
+	studentadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/student"
+	telegramadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/telegram"
+	natsadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/messaging/nats"
+	pgadapter "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/persistence/postgres"
+	httptransport "github.com/bemulima/ms-go-teacher-agent/internal/transport/http"
+	adminhandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/admin/v1/handlers"
+	apihandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/handlers"
+	telegramtransport "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/integrations/telegram"
+	privatehandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/private/handlers"
+	messageadapter "github.com/bemulima/ms-go-teacher-agent/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/assistance"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/courseplannotification"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/curriculum"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/intervention"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/learningsession"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/nextbestaction"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/onboarding"
+	outboxuc "github.com/bemulima/ms-go-teacher-agent/internal/usecase/outbox"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/personalteacher"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/studentcontext"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+	telegramuc "github.com/bemulima/ms-go-teacher-agent/internal/usecase/telegram"
+)
+
+type uuidGenerator struct{}
+
+func (uuidGenerator) NewID() string { return uuid.NewString() }
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+func main() {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = logger.Sync() }()
+
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Fatal("load configuration", zap.Error(err))
+	}
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("validate configuration", zap.Error(err))
+	}
+
+	startupContext, startupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer startupCancel()
+	pool, err := pgadapter.NewPool(startupContext, cfg.DatabaseURL)
+	if err != nil {
+		logger.Fatal("connect to postgres", zap.Error(err))
+	}
+	defer pool.Close()
+	// S8 is deployed independently from its migration.  Detect the ledger once
+	// at startup: an S7 database must not receive a claim query mentioning a
+	// table it does not have, while an installed ledger must keep draining after
+	// new S8 admissions are switched off.
+	var handoffSchemaInstalled bool
+	if err := pool.QueryRow(startupContext, `SELECT to_regclass('teacher_onboarding_plan_handoff') IS NOT NULL`).Scan(&handoffSchemaInstalled); err != nil {
+		logger.Fatal("check teacher onboarding handoff schema", zap.Error(err))
+	}
+	var pathOutcomeSchemaInstalled bool
+	if err := pool.QueryRow(startupContext, `SELECT to_regclass('teacher_onboarding_path_outcome_inbox') IS NOT NULL`).Scan(&pathOutcomeSchemaInstalled); err != nil {
+		logger.Fatal("check teacher onboarding path outcome schema", zap.Error(err))
+	}
+	if cfg.OnboardingPathOutcomeEnabled && !pathOutcomeSchemaInstalled {
+		logger.Fatal("teacher onboarding path outcome schema is not ready")
+	}
+	var sessionContractInstalled bool
+	if err := pool.QueryRow(startupContext, `
+SELECT EXISTS (
+ SELECT 1 FROM information_schema.columns
+ WHERE table_schema=current_schema() AND table_name='teacher_onboarding_interaction' AND column_name='session_schema_version'
+) AND EXISTS (
+ SELECT 1 FROM pg_trigger
+ WHERE tgrelid=to_regclass('teacher_onboarding_interaction')
+   AND tgname='trg_protect_teacher_onboarding_session_schema_version' AND NOT tgisinternal
+) AND to_regclass('teacher_onboarding_terminal_session') IS NOT NULL
+  AND EXISTS (
+   SELECT 1 FROM pg_trigger
+   WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+     AND tgname='trg_protect_teacher_onboarding_terminal_session' AND NOT tgisinternal
+) AND EXISTS (
+   SELECT 1 FROM pg_trigger
+   WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+     AND tgname='trg_protect_teacher_onboarding_terminal_session_delete' AND NOT tgisinternal
+) AND EXISTS (
+   SELECT 1 FROM pg_trigger
+   WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+     AND tgname='trg_protect_teacher_onboarding_terminal_session_truncate' AND NOT tgisinternal
+)`).Scan(&sessionContractInstalled); err != nil {
+		logger.Fatal("check teacher onboarding session contract", zap.Error(err))
+	}
+	if !sessionContractInstalled {
+		logger.Fatal("teacher onboarding session contract migration 023 is not ready")
+	}
+	handoffCredentialConfigured := strings.TrimSpace(cfg.LearningPlannerTeacherToken) != ""
+	if handoffSchemaInstalled && !handoffCredentialConfigured {
+		var pendingHandoffs bool
+		if err := pool.QueryRow(startupContext, `SELECT EXISTS (SELECT 1 FROM teacher_onboarding_plan_handoff WHERE status IN ('queued','dispatching','accepted','message_pending','active_path'))`).Scan(&pendingHandoffs); err != nil {
+			logger.Fatal("check pending teacher onboarding handoffs", zap.Error(err))
+		}
+		if pendingHandoffs {
+			logger.Warn("S8 ledger drain is blocked: LEARNING_PLANNER_TEACHER_TOKEN is not configured")
+		}
+	}
+	consumerConnection, err := natsgo.Connect(
+		cfg.NATSURL,
+		natsgo.Name("ms-go-teacher-agent-consumers"),
+		natsgo.Timeout(time.Duration(cfg.NATSConnectTimeoutSeconds)*time.Second),
+		natsgo.MaxReconnects(-1),
+		natsgo.ReconnectWait(time.Second),
+	)
+	if err != nil {
+		logger.Fatal("connect to nats for learning action consumer", zap.Error(err))
+	}
+	defer func() {
+		if err := consumerConnection.Drain(); err != nil {
+			logger.Warn("drain learning action consumer", zap.Error(err))
+		}
+	}()
+
+	teachers := pgadapter.PersonalTeacherRepository{Pool: pool}
+	decisions := pgadapter.TeacherDecisionRepository{Pool: pool}
+	assistanceRepository := pgadapter.LearningActionAssistanceRepository{Pool: pool}
+	// Migration 021 is deliberately optional while S8 is dark. Keep an S7
+	// database free of ledger references; after 021 exists, retain the fence so
+	// previously admitted work drains safely even if new admissions are off.
+	dialogJobRepository := pgadapter.TeacherDialogJobRepository{Pool: pool, DenseOrderingEnabled: cfg.TeacherDialogDenseOrderingEnabled, HandoffEnabled: handoffSchemaInstalled}
+	contextSummaryRepository := pgadapter.TeacherContextSummaryRepository{Pool: pool}
+	contextMutationRepository := pgadapter.TeacherContextMutationRepository{Pool: pool}
+	interventionRepository := pgadapter.InterventionRepository{Pool: pool}
+	coursePlanNotificationRepository := pgadapter.CoursePlanNotificationRepository{Pool: pool}
+	telegramRepository := pgadapter.TelegramRepository{Pool: pool}
+	onboardingActionRepository := pgadapter.OnboardingActionRepository{Pool: pool}
+	onboardingTurnRepository := pgadapter.TeacherOnboardingTurnRepository{Pool: pool}
+	onboardingHandoffRepository := pgadapter.TeacherOnboardingHandoffRepository{Pool: pool}
+	onboardingTerminalSessionRepository := pgadapter.TeacherOnboardingTerminalSessionRepository{Pool: pool}
+	onboardingPathOutcomeRepository := pgadapter.TeacherOnboardingPathOutcomeRepository{Pool: pool}
+	outboxRepository := pgadapter.OutboxRepository{Pool: pool}
+	eventPublisher := &natsadapter.Publisher{
+		URL:            cfg.NATSURL,
+		Name:           "ms-go-teacher-agent-outbox",
+		ConnectTimeout: time.Duration(cfg.NATSConnectTimeoutSeconds) * time.Second,
+	}
+	defer eventPublisher.Close()
+	outboxRelay := outboxuc.Relay{
+		Outbox:         outboxRepository,
+		Publisher:      eventPublisher,
+		Clock:          systemClock{},
+		WorkerID:       "teacher-agent-" + uuid.NewString(),
+		BatchSize:      cfg.OutboxBatchSize,
+		LockTTL:        time.Duration(cfg.OutboxLockTTLSeconds) * time.Second,
+		PublishTimeout: time.Duration(cfg.OutboxPublishTimeoutSeconds) * time.Second,
+		RetryBaseDelay: time.Duration(cfg.OutboxRetryBaseSeconds) * time.Second,
+		RetryMaxDelay:  time.Duration(cfg.OutboxRetryMaxSeconds) * time.Second,
+	}
+	outboxPollInterval := time.Duration(cfg.OutboxPollIntervalMS) * time.Millisecond
+	relayContext, stopRelay := context.WithCancel(context.Background())
+	var relayWaitGroup sync.WaitGroup
+	relayWaitGroup.Add(1)
+	go func() {
+		defer relayWaitGroup.Done()
+		runOutboxRelay(relayContext, logger, outboxRelay, outboxPollInterval)
+	}()
+	defer func() {
+		stopRelay()
+		relayWaitGroup.Wait()
+	}()
+
+	ensureTeacher := personalteacher.Ensure{Teachers: teachers, IDs: uuidGenerator{}, Clock: systemClock{}}
+	ensureTeacherSoul := personalteacher.EnsureSoul{Teachers: teachers, IDs: uuidGenerator{}, Clock: systemClock{}}
+	getTeacher := personalteacher.Get{Teachers: teachers}
+	getTeacherSoul := personalteacher.GetSoul{Teachers: teachers}
+	updateTeacher := personalteacher.Update{Teachers: teachers, Clock: systemClock{}}
+	updateTeacherSoul := personalteacher.UpdateSoul{Teachers: teachers, Clock: systemClock{}}
+	finalizeAssistance := assistance.Finalize{
+		Teachers:   ensureTeacher,
+		Decisions:  decisions,
+		Assistance: assistanceRepository,
+		IDs:        uuidGenerator{},
+		Clock:      systemClock{},
+	}
+	consumerContext, stopConsumer := context.WithCancel(context.Background())
+	defer stopConsumer()
+	learningActionSubscriber := messageadapter.LearningActionClosedSubscriber{
+		Conn:    consumerConnection,
+		Handler: finalizeAssistance.Handle,
+		Logger:  logger,
+	}
+	if err := learningActionSubscriber.Subscribe(consumerContext); err != nil {
+		logger.Fatal("subscribe to learning action closures", zap.Error(err))
+	}
+
+	dependencyHTTPClient := &http.Client{Timeout: time.Duration(cfg.DependencyTimeoutSeconds) * time.Second}
+	aiPromptHTTPClient := &http.Client{Timeout: time.Duration(cfg.AIPromptTimeoutSeconds) * time.Second}
+	studentClient := studentadapter.Client{
+		BaseURL: cfg.StudentServiceBaseURL, InternalToken: cfg.StudentServiceInternalToken,
+		LearningWorkspaceToken: cfg.StudentServiceTeacherToken,
+		HTTPClient:             dependencyHTTPClient,
+	}
+	learningPlannerClient := learningplanneradapter.Client{
+		BaseURL: cfg.LearningPlannerBaseURL, InternalToken: cfg.LearningPlannerInternalToken,
+		HandoffToken: cfg.LearningPlannerTeacherToken, HTTPClient: dependencyHTTPClient,
+	}
+	practiceClient := practiceadapter.Client{
+		BaseURL: cfg.PracticeServiceBaseURL, InternalToken: cfg.PracticeServiceInternalToken,
+		HTTPClient: dependencyHTTPClient,
+	}
+	courseClient := courseadapter.Client{
+		BaseURL: cfg.CourseServiceBaseURL, InternalToken: cfg.CourseServiceInternalToken,
+		HTTPClient: dependencyHTTPClient,
+	}
+	dialogClient := dialogadapter.Client{
+		BaseURL: cfg.DialogServiceBaseURL, InternalToken: cfg.DialogServiceInternalToken,
+		SpaceKey:   cfg.DialogSpaceKey,
+		HTTPClient: dependencyHTTPClient,
+	}
+	coursePlanNotificationHandler := courseplannotification.Handler{
+		Teachers: ensureTeacher, Store: coursePlanNotificationRepository, Dialogs: dialogClient, Clock: systemClock{},
+	}
+	coursePlanOutcomeSubscriber := messageadapter.CoursePlanOutcomeSubscriber{
+		Conn: consumerConnection, Handler: coursePlanNotificationHandler.Handle, Logger: logger,
+	}
+	if err := coursePlanOutcomeSubscriber.Subscribe(consumerContext); err != nil {
+		logger.Fatal("subscribe to course plan outcomes", zap.Error(err))
+	}
+	if cfg.OnboardingPathOutcomeEnabled && pathOutcomeSchemaInstalled {
+		pathOutcomeSubscriber := messageadapter.PlannerOnboardingPathOutcomeSubscriber{
+			Conn: consumerConnection,
+			Handler: (onboarding.PathOutcomeHandler{
+				Handoffs: onboardingHandoffRepository, Outcomes: onboardingPathOutcomeRepository,
+				Readiness: learningPlannerClient, Dialogs: dialogClient, Clock: systemClock{},
+			}).Handle,
+			Logger: logger,
+		}
+		if err := pathOutcomeSubscriber.Subscribe(consumerContext); err != nil {
+			logger.Fatal("subscribe to planner onboarding path outcomes", zap.Error(err))
+		}
+	}
+	statisticClient := statisticadapter.Client{
+		BaseURL: cfg.StatisticServiceBaseURL, InternalToken: cfg.StatisticServiceInternalToken,
+		HTTPClient: dependencyHTTPClient,
+	}
+	aiPromptClient := aipromptadapter.Client{
+		BaseURL: cfg.AIPromptServiceBaseURL, InternalToken: cfg.AIPromptServiceInternalToken,
+		HTTPClient: aiPromptHTTPClient,
+	}
+	dialogIntake := teacherdialog.Intake{Jobs: dialogJobRepository, Clock: systemClock{}}
+	dialogRequestSubscriber := messageadapter.DialogTeacherRequestedSubscriber{
+		Conn: consumerConnection, Handler: dialogIntake.Handle, Logger: logger,
+	}
+	if err := dialogRequestSubscriber.Subscribe(consumerContext); err != nil {
+		logger.Fatal("subscribe to dialog teacher requests", zap.Error(err))
+	}
+	contextMutationHandler := teacherdialog.ContextMutationHandler{Mutations: contextMutationRepository, Clock: systemClock{}}
+	contextMutationSubscriber := messageadapter.DialogTeacherContextMutatedSubscriber{
+		Conn: consumerConnection, Handler: contextMutationHandler.Handle, Logger: logger,
+	}
+	if err := contextMutationSubscriber.Subscribe(consumerContext); err != nil {
+		logger.Fatal("subscribe to dialog teacher context mutations", zap.Error(err))
+	}
+	interventionRegistry, err := intervention.NewRegistry(
+		domain.DefaultInterventionMode,
+		intervention.ThresholdPolicy{Mode: "balanced", MinimumFailures: 3, MinimumActiveSeconds: 480},
+		intervention.ThresholdPolicy{Mode: "quiet", MinimumFailures: 5, MinimumActiveSeconds: 900},
+		intervention.ThresholdPolicy{Mode: "proactive", MinimumFailures: 3, MinimumActiveSeconds: 300, OfferAfterIdleSeconds: 900},
+	)
+	if err != nil {
+		logger.Fatal("configure intervention policies", zap.Error(err))
+	}
+	interventionEngine := intervention.Engine{
+		Teachers: ensureTeacher, Policies: interventionRegistry, Store: interventionRepository,
+		Dialogs: dialogClient, IDs: uuidGenerator{}, Clock: systemClock{},
+	}
+	activitySubscriber := messageadapter.LearningActivitySubscriber{
+		Conn: consumerConnection, Handler: interventionEngine.Handle, Logger: logger,
+	}
+	if err := activitySubscriber.Subscribe(consumerContext); err != nil {
+		logger.Fatal("subscribe to interesting learning activity", zap.Error(err))
+	}
+	pedagogyRegistry, err := teacherdialog.NewPedagogyRegistry(
+		domain.DefaultPedagogyMethodCode,
+		teacherdialog.ProgressiveHintMethod{},
+	)
+	if err != nil {
+		logger.Fatal("configure pedagogy methods", zap.Error(err))
+	}
+	dialogWorker := teacherdialog.Worker{
+		Jobs: dialogJobRepository, Teachers: getTeacher, Souls: getTeacherSoul,
+		NextActions: studentClient,
+		StudentContext: studentcontext.Build{
+			Actions: studentClient, Code: studentClient, Mastery: studentClient, Overview: studentClient,
+			Practice: practiceClient, PracticeValidation: practiceClient,
+		},
+		PromptContext: teacherdialog.ContextBuilder{Summaries: contextSummaryRepository, Summarizer: aiPromptClient},
+		CourseLessons: courseClient, AssignedLessons: studentClient,
+		DialogReader: dialogClient, DialogAppender: dialogClient, Decisions: decisions,
+		Pedagogy: pedagogyRegistry, Generator: aiPromptClient,
+		ChannelDelivery:    telegramRepository,
+		PracticeAssistance: practiceClient,
+		IDs:                uuidGenerator{}, Clock: systemClock{}, WorkerID: "teacher-dialog-" + uuid.NewString(),
+		LeaseTTL:                  time.Duration(cfg.TeacherDialogWorkerLeaseSeconds) * time.Second,
+		LeaseRenewInterval:        time.Duration(cfg.TeacherDialogLeaseRenewSeconds) * time.Second,
+		MaxAttempts:               cfg.TeacherDialogMaxAttempts,
+		RetryBaseDelay:            time.Duration(cfg.TeacherDialogRetryBaseSeconds) * time.Second,
+		RetryMaxDelay:             time.Duration(cfg.TeacherDialogRetryMaxSeconds) * time.Second,
+		UnifiedCoordinatorEnabled: cfg.UnifiedCoordinatorEnabled,
+		OnboardingCoordinator: teacherdialog.OnboardingCoordinator{
+			Jobs: dialogJobRepository, Turns: onboardingTurnRepository, Receipts: onboardingActionRepository,
+			StudentTurns: studentClient, Students: studentClient, Semantic: aiPromptClient, DialogReader: dialogClient, Appender: dialogClient,
+			Readiness: learningPlannerClient, Deliveries: dialogJobRepository, ProductResponses: dialogJobRepository,
+			Handoffs: onboardingHandoffRepository, PlannerHandoffEnabled: cfg.OnboardingPlannerHandoffEnabled, Clock: systemClock{},
+		},
+	}
+	dialogWorkerContext, stopDialogWorker := context.WithCancel(context.Background())
+	var dialogWorkerWaitGroup sync.WaitGroup
+	dialogWorkerWaitGroup.Add(cfg.TeacherDialogWorkerConcurrency)
+	for workerIndex := 0; workerIndex < cfg.TeacherDialogWorkerConcurrency; workerIndex++ {
+		workerInstance := dialogWorker
+		workerInstance.WorkerID = fmt.Sprintf("%s-%d", dialogWorker.WorkerID, workerIndex)
+		go func() {
+			defer dialogWorkerWaitGroup.Done()
+			runTeacherDialogWorker(
+				dialogWorkerContext, logger, workerInstance,
+				time.Duration(cfg.TeacherDialogWorkerPollIntervalMS)*time.Millisecond,
+				cfg.TeacherDialogWorkerBatchSize,
+			)
+		}()
+	}
+	defer func() {
+		stopDialogWorker()
+		dialogWorkerWaitGroup.Wait()
+	}()
+	if handoffSchemaInstalled && handoffCredentialConfigured {
+		handoffWorker := onboarding.HandoffWorker{
+			Store: onboardingHandoffRepository, Planner: learningPlannerClient, Readiness: learningPlannerClient,
+			Responses: dialogClient, Proactive: dialogClient, ChannelDelivery: telegramRepository,
+			IDs: uuidGenerator{}, Clock: systemClock{}, WorkerID: "onboarding-handoff-" + uuid.NewString(),
+			LeaseTTL:       time.Duration(cfg.OnboardingHandoffLeaseSeconds) * time.Second,
+			RetryBaseDelay: time.Duration(cfg.OnboardingHandoffRetryBaseSeconds) * time.Second,
+			RetryMaxDelay:  time.Duration(cfg.OnboardingHandoffRetryMaxSeconds) * time.Second,
+			MaxAttempts:    cfg.OnboardingHandoffMaxAttempts,
+		}
+		handoffWorkerContext, stopHandoffWorker := context.WithCancel(context.Background())
+		var handoffWorkerWaitGroup sync.WaitGroup
+		handoffWorkerWaitGroup.Add(1)
+		go func() {
+			defer handoffWorkerWaitGroup.Done()
+			runOnboardingHandoffWorker(handoffWorkerContext, logger, &handoffWorker, time.Duration(cfg.OnboardingHandoffPollIntervalMS)*time.Millisecond)
+		}()
+		defer func() {
+			stopHandoffWorker()
+			handoffWorkerWaitGroup.Wait()
+		}()
+	}
+	var apiTelegramHandler *apihandlers.TelegramChannelHandler
+	var telegramWebhookHandler *telegramtransport.Handler
+	if cfg.TelegramEnabled() {
+		telegramService := &telegramuc.Service{
+			Teachers: ensureTeacher, Dialogs: dialogClient, Messages: dialogClient, Store: telegramRepository,
+			Tokens: uuidGenerator{}, Clock: systemClock{}, BotUsername: cfg.TelegramBotUsername,
+		}
+		apiTelegramHandler = &apihandlers.TelegramChannelHandler{Links: telegramService, Enabled: true}
+		telegramWebhookHandler = &telegramtransport.Handler{Secret: cfg.TelegramWebhookSecret, Processor: telegramService}
+		telegramWorker := telegramuc.DeliveryWorker{
+			Store:  telegramRepository,
+			Sender: telegramadapter.Client{BaseURL: cfg.TelegramAPIBaseURL, BotToken: cfg.TelegramBotToken, HTTPClient: dependencyHTTPClient},
+			Tokens: uuidGenerator{}, Clock: systemClock{},
+			LeaseTTL:       time.Duration(cfg.TelegramWorkerLeaseSeconds) * time.Second,
+			RetryBaseDelay: time.Duration(cfg.TelegramRetryBaseSeconds) * time.Second,
+			RetryMaxDelay:  time.Duration(cfg.TelegramRetryMaxSeconds) * time.Second,
+		}
+		telegramWorkerContext, stopTelegramWorker := context.WithCancel(context.Background())
+		var telegramWorkerWaitGroup sync.WaitGroup
+		telegramWorkerWaitGroup.Add(1)
+		go func() {
+			defer telegramWorkerWaitGroup.Done()
+			runTelegramWorker(telegramWorkerContext, logger, telegramWorker, time.Duration(cfg.TelegramWorkerPollIntervalMS)*time.Millisecond)
+		}()
+		defer func() {
+			stopTelegramWorker()
+			telegramWorkerWaitGroup.Wait()
+		}()
+	}
+
+	apiTeacherHandler := &apihandlers.PersonalTeacherHandler{
+		EnsureUC:     ensureTeacher,
+		UpdateUC:     updateTeacher,
+		SoulUC:       ensureTeacherSoul,
+		SoulUpdateUC: updateTeacherSoul,
+	}
+	apiTeacherDialogHandler := &apihandlers.TeacherDialogHandler{
+		ProvisionUC: teacherdialog.Provision{Teachers: ensureTeacher, Dialogs: dialogClient},
+	}
+	curriculumPlanner := curriculum.Planner{
+		Teachers: ensureTeacher, Overview: studentClient,
+		Plans: learningPlannerClient,
+	}
+	apiCurriculumHandler := &apihandlers.CurriculumHandler{Planner: curriculumPlanner, Diagnostic: curriculum.Diagnostic{Gateway: learningPlannerClient, Overview: studentClient, Plans: learningPlannerClient}}
+	apiLearningSessionHandler := &apihandlers.LearningSessionHandler{Summarizer: learningsession.Summarizer{
+		Teachers: ensureTeacher, Sessions: studentClient, Analytics: statisticClient, Dialogs: dialogClient,
+		Curriculum: curriculumPlanner,
+	}}
+	onboardingService := &onboarding.Service{
+		Teachers: ensureTeacher, Dialogs: dialogClient, Sources: dialogClient,
+		StructuredMessages: dialogClient, PlainMessages: dialogClient, Students: studentClient,
+		CanonicalMessages: dialogClient, CanonicalActionsEnabled: cfg.OnboardingCanonicalActionsEnabled, UnifiedCoordinatorEnabled: cfg.UnifiedCoordinatorEnabled,
+		Readiness: learningPlannerClient, ProductAwareEnabled: cfg.ProductAwareOnboardingEnabled,
+		Handoffs: onboardingHandoffRepository, PlannerHandoffEnabled: cfg.OnboardingPlannerHandoffEnabled,
+		TerminalSessions: onboardingTerminalSessionRepository,
+		PathOutcomes:     onboardingPathOutcomeRepository, PathOutcomeEnabled: cfg.OnboardingPathOutcomeEnabled,
+		Receipts: onboardingActionRepository, Interactions: onboardingTurnRepository, IDs: uuidGenerator{}, Clock: systemClock{},
+		LeaseTTL: time.Duration(cfg.OnboardingActionLeaseSeconds) * time.Second,
+	}
+	apiOnboardingHandler := &apihandlers.TeacherOnboardingHandler{Ensurer: onboardingService, Actions: onboardingService}
+	apiNextBestActionHandler := &apihandlers.NextBestActionHandler{Getter: nextbestaction.Get{
+		Enabled: cfg.NextBestActionEnabled, Actions: studentClient,
+	}}
+	adminTeacherHandler := &adminhandlers.PersonalTeacherHandler{GetUC: getTeacher, SoulUC: getTeacherSoul}
+	readyCheck := func(ctx context.Context) error {
+		if err := pool.Ping(ctx); err != nil {
+			return err
+		}
+		var denseSchemaReady, productSchemaReady, handoffSchemaReady, sessionContractReady bool
+		if err := pool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='teacher_dialog_job' AND column_name='teacher_turn_schema_version'
+) AND to_regclass('teacher_dialog_turn_cursor') IS NOT NULL
+AS dense_ready,
+EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='teacher_onboarding_interaction' AND column_name='closed_reason'
+) AS product_ready,
+to_regclass('teacher_onboarding_plan_handoff') IS NOT NULL AS handoff_ready,
+EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema=current_schema() AND table_name='teacher_onboarding_interaction' AND column_name='session_schema_version'
+) AND EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgrelid=to_regclass('teacher_onboarding_interaction')
+      AND tgname='trg_protect_teacher_onboarding_session_schema_version' AND NOT tgisinternal
+) AND to_regclass('teacher_onboarding_terminal_session') IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+      AND tgname='trg_protect_teacher_onboarding_terminal_session' AND NOT tgisinternal
+) AND EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+      AND tgname='trg_protect_teacher_onboarding_terminal_session_delete' AND NOT tgisinternal
+) AND EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgrelid=to_regclass('teacher_onboarding_terminal_session')
+      AND tgname='trg_protect_teacher_onboarding_terminal_session_truncate' AND NOT tgisinternal
+) AS session_contract_ready
+`).Scan(&denseSchemaReady, &productSchemaReady, &handoffSchemaReady, &sessionContractReady); err != nil {
+			return err
+		}
+		if !denseSchemaReady {
+			return errors.New("teacher dialog dense-turn schema is not ready")
+		}
+		if err := dialogJobRepository.CheckDenseOrderingReadiness(ctx); err != nil {
+			return err
+		}
+		if cfg.ProductAwareOnboardingEnabled && !productSchemaReady {
+			return errors.New("teacher product-aware onboarding schema is not ready")
+		}
+		if cfg.OnboardingPlannerHandoffEnabled && !handoffSchemaReady {
+			return errors.New("teacher onboarding handoff schema is not ready")
+		}
+		if !sessionContractReady {
+			return errors.New("teacher onboarding session contract migration 023 is not ready")
+		}
+		if handoffSchemaReady && !handoffCredentialConfigured {
+			var pendingHandoffs bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM teacher_onboarding_plan_handoff WHERE status IN ('queued','dispatching','accepted','message_pending','active_path'))`).Scan(&pendingHandoffs); err != nil {
+				return err
+			}
+			if pendingHandoffs {
+				return errors.New("teacher onboarding handoff ledger cannot drain without LEARNING_PLANNER_TEACHER_TOKEN")
+			}
+		}
+		return nil
+	}
+	healthHandler := &privatehandlers.HealthHandler{
+		Ready: readyCheck,
+		ReadinessFailureCode: func(err error) string {
+			if errors.Is(err, pgadapter.ErrDenseTeacherOrderingDisabledWithPendingV2) {
+				return "dense_teacher_ordering_disabled_with_pending_v2"
+			}
+			return ""
+		},
+		Capabilities: map[string]string{
+			"teacher_dialog_v2_reader":           "true",
+			"teacher_dialog_dense_claiming":      fmt.Sprintf("%t", cfg.TeacherDialogDenseOrderingEnabled),
+			"teacher_product_aware_onboarding":   fmt.Sprintf("%t", cfg.ProductAwareOnboardingEnabled),
+			"teacher_onboarding_planner_handoff": fmt.Sprintf("%t", cfg.OnboardingPlannerHandoffEnabled),
+			"teacher_onboarding_path_outcome":    fmt.Sprintf("%t", cfg.OnboardingPathOutcomeEnabled && pathOutcomeSchemaInstalled),
+			"teacher_next_best_action":           fmt.Sprintf("%t", cfg.NextBestActionEnabled),
+			"teacher_dialog_rollout_sequence":    "teacher-schema-reader-then-claim-then-dialog-producer",
+		},
+	}
+
+	router := httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher:   apiTeacherHandler,
+		APITeacherDialog:     apiTeacherDialogHandler,
+		APICurriculum:        apiCurriculumHandler,
+		APILearningSession:   apiLearningSessionHandler,
+		APITelegram:          apiTelegramHandler,
+		APIOnboarding:        apiOnboardingHandler,
+		APINextBestAction:    apiNextBestActionHandler,
+		AdminPersonalTeacher: adminTeacherHandler,
+		PrivateHealth:        healthHandler,
+		InternalToken:        cfg.InternalAPIToken,
+		TelegramWebhook:      telegramWebhookHandler,
+	})
+	server := &http.Server{
+		Addr:              net.JoinHostPort(cfg.HTTPBindAddress, cfg.HTTPPort),
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+	}()
+	logger.Info("teacher-agent listening", zap.String("address", server.Addr))
+
+	signalContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	select {
+	case serverErr := <-serverErrors:
+		if !errors.Is(serverErr, http.ErrServerClosed) {
+			logger.Fatal("http server failed", zap.Error(serverErr))
+		}
+	case <-signalContext.Done():
+		shutdownTimeout := time.Duration(cfg.ShutdownTimeout) * time.Second
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 10 * time.Second
+		}
+		shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownContext); err != nil {
+			logger.Error("graceful shutdown failed", zap.Error(err))
+		}
+	}
+}
+
+func runOnboardingHandoffWorker(ctx context.Context, logger *zap.Logger, worker *onboarding.HandoffWorker, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		for {
+			claimed, err := worker.ProcessNext(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("onboarding handoff attempt failed", zap.Error(err))
+			}
+			if !claimed || ctx.Err() != nil {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runTelegramWorker(ctx context.Context, logger *zap.Logger, worker telegramuc.DeliveryWorker, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		for {
+			claimed, err := worker.ProcessNext(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("Telegram delivery attempt failed", zap.Error(err))
+			}
+			if !claimed || ctx.Err() != nil {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runOutboxRelay(ctx context.Context, logger *zap.Logger, relay outboxuc.Relay, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			claimed, err := relay.ProcessBatch(ctx)
+			if err != nil {
+				logger.Warn("outbox relay batch failed", zap.Int("claimed", claimed), zap.Error(err))
+			}
+		}
+	}
+}
+
+func runTeacherDialogWorker(
+	ctx context.Context,
+	logger *zap.Logger,
+	worker teacherdialog.Worker,
+	interval time.Duration,
+	batchSize int,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		for processed := 0; processed < batchSize; processed++ {
+			claimed, err := worker.ProcessNext(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("teacher dialog job attempt failed", zap.Error(err))
+			}
+			if !claimed {
+				break
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

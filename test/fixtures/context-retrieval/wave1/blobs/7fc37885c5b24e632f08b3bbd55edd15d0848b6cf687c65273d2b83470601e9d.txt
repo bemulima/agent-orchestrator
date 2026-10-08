@@ -1,0 +1,110 @@
+package sandbox
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/messaging/nats"
+)
+
+// CombinedClient combines HTTP and NATS clients for sandbox access.
+type CombinedClient struct {
+	httpClient *Client
+	natsClient *nats.SandboxClient
+}
+
+// NewCombinedClient creates a combined sandbox client.
+func NewCombinedClient(httpBaseURL, httpToken string, natsClient *nats.SandboxClient) *CombinedClient {
+	return &CombinedClient{
+		httpClient: NewClient(httpBaseURL, httpToken),
+		natsClient: natsClient,
+	}
+}
+
+// GetSnapshot fetches workspace files snapshot via HTTP.
+func (c *CombinedClient) GetSnapshot(ctx context.Context, sandboxID string) (WorkspaceSnapshot, error) {
+	return c.httpClient.GetSnapshot(ctx, sandboxID)
+}
+
+// FindByUserAndTask finds sandbox ID by user, task, and answer via HTTP.
+func (c *CombinedClient) FindByUserAndTask(ctx context.Context, userID, taskID, answerID string) (string, error) {
+	endpoint := fmt.Sprintf("%s/internal/sandboxes?user_id=%s&task_id=%s&answer_id=%s", c.httpClient.BaseURL, userID, taskID, answerID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if c.httpClient.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", c.httpClient.InternalToken)
+	}
+
+	resp, err := c.httpClient.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", domain.ErrSandboxNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("find sandbox failed: %s", resp.Status)
+	}
+
+	var result struct {
+		SandboxID string `json:"sandboxId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	return result.SandboxID, nil
+}
+
+// ArchiveAndUpload requests archive and upload via NATS.
+func (c *CombinedClient) ArchiveAndUpload(ctx context.Context, sandboxID, answerID string) (string, error) {
+	// Prefer NATS RPC when available, fallback to HTTP internal endpoint when there are no subscribers.
+	if c.natsClient != nil {
+		if id, err := c.natsClient.ArchiveAndUpload(ctx, sandboxID, answerID); err == nil {
+			return id, nil
+		}
+	}
+	return c.archiveAndUploadHTTP(ctx, sandboxID, answerID)
+}
+
+func (c *CombinedClient) archiveAndUploadHTTP(ctx context.Context, sandboxID, answerID string) (string, error) {
+	endpoint := fmt.Sprintf("%s/internal/sandboxes/%s/archive-and-upload", c.httpClient.BaseURL, sandboxID)
+	body, _ := json.Marshal(map[string]string{"answerId": answerID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.httpClient.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", c.httpClient.InternalToken)
+	}
+
+	resp, err := c.httpClient.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("archive/upload failed: %s", resp.Status)
+	}
+
+	var result struct {
+		FileStorageID string `json:"fileStorageId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if result.FileStorageID == "" {
+		return "", fmt.Errorf("archive/upload response missing fileStorageId")
+	}
+	return result.FileStorageID, nil
+}

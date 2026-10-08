@@ -1,0 +1,289 @@
+package postgres
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"time"
+)
+
+func persistedItemID(pathID string, item domain.LearningPathItem) string {
+	if item.ID != "" {
+		return item.ID
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(pathID+":"+item.ReferenceType+":"+item.ReferenceID)).String()
+}
+func requirementsJSON(item domain.LearningPathItem) []byte {
+	r := item.FrozenRequirements
+	if r == nil {
+		r = []domain.LessonRequirement{}
+	}
+	b, _ := json.Marshal(r)
+	return b
+}
+func nullableContent(b json.RawMessage) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+func (repo *LearningJourneyRepoPG) GetLessonItem(ctx context.Context, studentID, itemID string) (domain.LearningPathItem, error) {
+	var pathID string
+	err := repo.Pool.QueryRow(ctx, `SELECT p.id::text FROM student_learning_path p JOIN student_learning_path_item i ON i.student_learning_path_id=p.id WHERE p.student_id=$1 AND i.id=$2`, studentID, itemID).Scan(&pathID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LearningPathItem{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	p, err := getLearningPathByID(ctx, repo.Pool, studentID, pathID, false)
+	if err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	for _, i := range p.Items {
+		if i.ID == itemID {
+			return i, nil
+		}
+	}
+	return domain.LearningPathItem{}, domain.ErrNotFound
+}
+func (repo *LearningJourneyRepoPG) ApplyLessonFact(ctx context.Context, f domain.LessonActivityFact) (domain.LearningPathItem, bool, error) {
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.LearningPathItem{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	item, changed, err := applyLessonFactTx(ctx, tx, f)
+	if err != nil {
+		return item, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return item, false, err
+	}
+	return item, changed, nil
+}
+func applyLessonFactTx(ctx context.Context, tx pgx.Tx, f domain.LessonActivityFact) (domain.LearningPathItem, bool, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "learning-path:"+f.StudentID); err != nil {
+		return domain.LearningPathItem{}, false, err
+	}
+	var pathID string
+	err := tx.QueryRow(ctx, `SELECT p.id::text FROM student_learning_path p JOIN student_learning_path_item i ON i.student_learning_path_id=p.id WHERE p.student_id=$1 AND i.id=$2`, f.StudentID, f.ItemID).Scan(&pathID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LearningPathItem{}, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.LearningPathItem{}, false, err
+	}
+	path, err := getLearningPathByID(ctx, tx, f.StudentID, pathID, true)
+	if err != nil {
+		return domain.LearningPathItem{}, false, err
+	}
+	var item domain.LearningPathItem
+	index := -1
+	for j, i := range path.Items {
+		if i.ID == f.ItemID {
+			item = i
+			index = j
+			break
+		}
+	}
+	if index < 0 {
+		return item, false, domain.ErrNotFound
+	}
+	// The receipt is authoritative and immutable across later route changes.
+	b, _ := json.Marshal(struct{ Student, Item, Requirement, Type, Source, Revision string }{f.StudentID, f.ItemID, f.RequirementID, f.Type, f.SourceID, f.SourceRevisionID})
+	h := sha256.Sum256(b)
+	hash := "sha256:" + hex.EncodeToString(h[:])
+	var old string
+	err = tx.QueryRow(ctx, `SELECT request_hash FROM student_lesson_activity_fact WHERE source_type=$1 AND fact_id=$2`, f.Type, f.FactID).Scan(&old)
+	if err == nil {
+		if old != hash {
+			return item, false, domain.ErrConflict
+		}
+		return item, false, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return item, false, err
+	}
+	if path.Status != domain.LearningPathStatusActive && path.Status != domain.LearningPathStatusPaused {
+		return item, false, domain.ErrConflict
+	}
+	// A theory acknowledgement is a new learner command; authoritative late
+	// assessment/Practice outcomes are facts and deliberately bypass admission.
+	// Exact accepted fact replay has already returned above.
+	if f.Type == "theory_acknowledged" {
+		if _, err := validateLessonCommandAdmissionTx(ctx, tx, f.StudentID, f.ItemID, f.RequirementID); err != nil {
+			return item, false, err
+		}
+	}
+	updated, changed, err := domain.SatisfyLessonRequirement(item, f)
+	if err != nil {
+		return item, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO student_lesson_activity_fact(source_type,fact_id,student_id,item_id,requirement_id,request_hash,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, f.Type, f.FactID, f.StudentID, f.ItemID, f.RequirementID, hash, f.OccurredAt); err != nil {
+		return item, false, err
+	}
+	if !changed {
+		return item, false, nil
+	}
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_path_item SET status=$2,reason_code=$3,frozen_requirements=$4 WHERE id=$1`, item.ID, updated.Status, updated.ReasonCode, requirementsJSON(updated)); err != nil {
+		return item, false, err
+	}
+	path.Items[index] = updated
+	path.Version++
+	previousUpdate := path.UpdatedAt
+	path.UpdatedAt = time.Now().UTC()
+	if path.UpdatedAt.Before(previousUpdate) {
+		path.UpdatedAt = previousUpdate
+	}
+	if path.UpdatedAt.Before(path.CreatedAt) {
+		path.UpdatedAt = path.CreatedAt
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_path SET version=$2,updated_at=$3 WHERE id=$1`, path.ID, path.Version, path.UpdatedAt); err != nil {
+		return item, false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_context SET version=version+1,updated_at=$2 WHERE student_id=$1`, f.StudentID, path.UpdatedAt); err != nil {
+		return item, false, err
+	}
+	if err = insertLearningPathRevision(ctx, tx, path); err != nil {
+		return item, false, err
+	}
+	return updated, true, nil
+}
+
+func (repo *LearningJourneyRepoPG) ReplayLearningPathCreation(ctx context.Context, student, key, plan, hash string) (domain.StudentLearningPath, bool, error) {
+	path, s, p, h, err := getLearningPathByRequest(ctx, repo.Pool, "idempotency_key", key)
+	if errors.Is(err, domain.ErrNotFound) {
+		return path, false, nil
+	}
+	if err != nil {
+		return path, false, err
+	}
+	if s != student || p != plan || h != hash {
+		return path, false, domain.ErrConflict
+	}
+	return path, true, nil
+}
+func (repo *LearningJourneyRepoPG) ReplayLearningPathCommand(ctx context.Context, c domain.LearningPathPlanningCommand) (domain.LearningPathPlanningCommandResult, bool, error) {
+	result, r, err := getLearningPathCommandReceipt(ctx, repo.Pool, "idempotency_key", c.IdempotencyKey)
+	if errors.Is(err, domain.ErrNotFound) {
+		return result, false, nil
+	}
+	if err != nil {
+		return result, false, err
+	}
+	if r.StudentID != c.StudentID || r.LearningPathID != c.LearningPathID || r.PlanningRequestID != c.PlanningRequestID || r.Kind != c.Kind || r.ExpectedPathVersion != c.ExpectedPathVersion || r.RequestHash != c.RequestHash {
+		return result, false, domain.ErrConflict
+	}
+	return result, true, nil
+}
+
+func activateLessonItemTx(ctx context.Context, tx pgx.Tx, studentID, itemID string, now time.Time) error {
+	var pathID string
+	err := tx.QueryRow(ctx, `SELECT p.id::text FROM student_learning_path p JOIN student_learning_path_item i ON i.student_learning_path_id=p.id WHERE p.student_id=$1 AND i.id=$2`, studentID, itemID).Scan(&pathID)
+	if err != nil {
+		return err
+	}
+	path, err := getLearningPathByID(ctx, tx, studentID, pathID, true)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for j, i := range path.Items {
+		if i.ID != itemID {
+			continue
+		}
+		if i.Status == domain.LearningPathItemPlanned || i.Status == domain.LearningPathItemReady {
+			path.Items[j].Status = domain.LearningPathItemInProgress
+			path.Items[j].ReasonCode = "lesson_activity_started"
+			changed = true
+		}
+		break
+	}
+	if !changed {
+		return nil
+	}
+	if now.Before(path.UpdatedAt) {
+		now = path.UpdatedAt
+	}
+	path.Version++
+	path.UpdatedAt = now
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_path_item SET status='IN_PROGRESS',reason_code='lesson_activity_started' WHERE id=$1`, itemID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_path SET version=$2,updated_at=$3 WHERE id=$1`, path.ID, path.Version, now); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE student_learning_context SET version=version+1,updated_at=$2 WHERE student_id=$1`, studentID, now); err != nil {
+		return err
+	}
+	return insertLearningPathRevision(ctx, tx, path)
+}
+
+// validateLessonCommandAdmissionTx is for new learner commands only. Reads and
+// correlated official outcomes retain their own ownership/lifecycle boundary.
+func validateLessonCommandAdmissionTx(ctx context.Context, tx pgx.Tx, studentID, itemID, requirementID string) (domain.LearningPathItem, error) {
+	if err := lockStudentAdmissionFence(ctx, tx, studentID); err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	var pathID string
+	err := tx.QueryRow(ctx, `SELECT p.id::text FROM student_learning_path p JOIN student_learning_path_item i ON i.student_learning_path_id=p.id WHERE p.student_id=$1 AND i.id=$2`, studentID, itemID).Scan(&pathID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LearningPathItem{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	path, err := getLearningPathByID(ctx, tx, studentID, pathID, true)
+	if err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	journey, err := getLearningContext(ctx, tx, studentID, true)
+	if err != nil {
+		return domain.LearningPathItem{}, err
+	}
+	if path.Status != domain.LearningPathStatusActive || journey.SelectedLearningPathID != path.ID {
+		return domain.LearningPathItem{}, domain.ErrConflict
+	}
+	for _, item := range path.Items {
+		if item.ID != itemID {
+			continue
+		}
+		if !lessonCommandProgressionAllowed(path.Items, item.Position) {
+			return item, domain.ErrConflict
+		}
+		for _, r := range item.FrozenRequirements {
+			if r.ID == requirementID {
+				if r.Satisfied {
+					return item, domain.ErrConflict
+				}
+				return item, nil
+			}
+		}
+		return item, domain.ErrNotFound
+	}
+	return domain.LearningPathItem{}, domain.ErrNotFound
+}
+
+// Existing NBA item progression is an admission constraint. The semantic
+// ordering used to present requirements is not an inter-requirement prerequisite.
+func lessonCommandProgressionAllowed(items []domain.LearningPathItem, position int) bool {
+	found := false
+	for _, item := range items {
+		if item.Position == position {
+			found = item.Status == domain.LearningPathItemPlanned || item.Status == domain.LearningPathItemReady || item.Status == domain.LearningPathItemInProgress
+			continue
+		}
+		if item.Status == domain.LearningPathItemInProgress || (item.Position < position && item.Status != domain.LearningPathItemCompleted && item.Status != domain.LearningPathItemSkippedMastered) {
+			return false
+		}
+	}
+	return found
+}

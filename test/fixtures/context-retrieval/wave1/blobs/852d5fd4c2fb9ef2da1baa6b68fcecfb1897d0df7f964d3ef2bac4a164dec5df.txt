@@ -1,0 +1,468 @@
+package postgres
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	jobrepository "github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+func denseTurnRequest(fixture *teacherDecisionIntegrationFixture, dialogID, eventID string, sequence int64) domain.DialogTeacherRequest {
+	return domain.DialogTeacherRequest{
+		SchemaVersion: 2, EventID: eventID, DialogID: dialogID, EventSequence: sequence,
+		TeacherTurnSequence: sequence, SourceMessageID: uuid.NewString(), SourceSequence: sequence,
+		CanonicalStudentMessageID: "", CorrelationID: "", DialogCausationID: "", CausationID: eventID,
+		StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID,
+		ContextType: domain.LearningContextGeneral, SourceChannel: domain.DialogMessageChannelWeb,
+		OccurredAt: time.Now().UTC(),
+	}
+}
+
+func acceptDenseJob(t *testing.T, repository TeacherDialogJobRepository, fixture *teacherDecisionIntegrationFixture, dialogID string, sequence int64) domain.TeacherDialogJob {
+	t.Helper()
+	request := denseTurnRequest(fixture, dialogID, uuid.NewString(), sequence)
+	request.CanonicalStudentMessageID = request.SourceMessageID
+	request.CorrelationID = request.SourceMessageID
+	request.DialogCausationID = request.CanonicalStudentMessageID
+	job, err := domain.NewTeacherDialogJob(request, time.Now().UTC())
+	require.NoError(t, err)
+	accepted, err := repository.Accept(context.Background(), job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	return job
+}
+
+func claimDenseJob(t *testing.T, jobRepository TeacherDialogJobRepository, worker string, now time.Time) (domain.TeacherDialogJob, bool) {
+	t.Helper()
+	job, claimed, err := jobRepository.Claim(context.Background(), jobrepository.TeacherDialogClaim{
+		ClaimToken: uuid.NewString(), WorkerID: worker, Now: now, LockedUntil: now.Add(time.Minute),
+	})
+	require.NoError(t, err)
+	return job, claimed
+}
+
+func TestTeacherDialogDenseTurnReverseArrivalAndAtomicDelivery(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	second := acceptDenseJob(t, repository, fixture, dialogID, 2)
+	first := acceptDenseJob(t, repository, fixture, dialogID, 1)
+
+	claimed, ok := claimDenseJob(t, repository, "worker-first", time.Now().UTC())
+	require.True(t, ok)
+	require.Equal(t, first.Request.EventID, claimed.Request.EventID)
+
+	decision, event := fixture.decision(uuid.NewString(), first.Request.EventID, domain.LearningContextGeneral, "", "", dialogID)
+	require.NoError(t, repository.SaveGenerated(context.Background(), first.Request.EventID, claimed.ClaimToken, decision, event, "first response", uuid.NewString(), time.Now().UTC()))
+	messageID := uuid.NewString()
+	require.NoError(t, repository.CompleteDelivery(context.Background(), first.Request.EventID, claimed.ClaimToken, messageID, time.Now().UTC()))
+	// Replaying after the transaction committed is idempotent and does not
+	// increment the cursor a second time.
+	require.NoError(t, repository.CompleteDelivery(context.Background(), first.Request.EventID, claimed.ClaimToken, messageID, time.Now().UTC()))
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), cursor.NextTeacherTurnSequence)
+
+	claimedSecond, ok := claimDenseJob(t, repository, "worker-second", time.Now().UTC())
+	require.True(t, ok)
+	require.Equal(t, second.Request.EventID, claimedSecond.Request.EventID)
+}
+
+func TestTeacherDialogV1DeliveryKeepsLegacyTerminalLedgerUnchanged(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	request := domain.DialogTeacherRequest{
+		EventID: uuid.NewString(), DialogID: uuid.NewString(), EventSequence: 1,
+		SourceMessageID: uuid.NewString(), SourceSequence: 1, StudentID: fixture.studentID,
+		PersonalTeacherID: fixture.teacherID, ContextType: domain.LearningContextGeneral,
+		SourceChannel: domain.DialogMessageChannelWeb, OccurredAt: time.Now().UTC(),
+	}
+	job, err := domain.NewTeacherDialogJob(request, time.Now().UTC())
+	require.NoError(t, err)
+	accepted, err := repository.Accept(context.Background(), job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	claimed, ok := claimDenseJob(t, repository, "legacy-worker", time.Now().UTC())
+	require.True(t, ok)
+	proof := domain.TeacherDialogNoEffectProof{ID: uuid.NewString(), SourceEventID: request.EventID, TeacherJobID: claimed.TeacherJobID, RecordedAt: time.Now().UTC()}
+	outcome := domain.TeacherDialogRecoverableOutcome{ID: uuid.NewString(), SourceEventID: request.EventID, TeacherJobID: claimed.TeacherJobID, CreatedAt: time.Now().UTC()}
+	require.ErrorIs(t, repository.RecordFailedNoEffect(context.Background(), request.EventID, claimed.ClaimToken, proof, outcome, "legacy_no_effect", time.Now().UTC()), domain.ErrInvalidTeacherDialogJob)
+	decision, event := fixture.decision(uuid.NewString(), request.EventID, domain.LearningContextGeneral, "", "", request.DialogID)
+	require.NoError(t, repository.SaveGenerated(context.Background(), request.EventID, claimed.ClaimToken, decision, event, "legacy response", uuid.NewString(), time.Now().UTC()))
+	require.NoError(t, repository.CompleteDelivery(context.Background(), request.EventID, claimed.ClaimToken, uuid.NewString(), time.Now().UTC()))
+	var outcomes int
+	var terminalOutcome, teacherResponseMessageID *string
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT count(*) FROM teacher_dialog_turn_outcome WHERE source_event_id=$1`, request.EventID).Scan(&outcomes))
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT terminal_outcome,teacher_response_message_id::text FROM teacher_dialog_job WHERE event_id=$1`, request.EventID).Scan(&terminalOutcome, &teacherResponseMessageID))
+	require.Equal(t, 0, outcomes)
+	require.Nil(t, terminalOutcome)
+	require.Nil(t, teacherResponseMessageID)
+}
+
+func TestTeacherDialogDenseTurnDuplicateAcceptIsNoOp(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	duplicate, err := domain.NewTeacherDialogJob(job.Request, time.Now().UTC())
+	require.NoError(t, err)
+	accepted, err := repository.Accept(context.Background(), duplicate)
+	require.NoError(t, err)
+	require.False(t, accepted)
+	_, claimed := claimDenseJob(t, repository, "worker", time.Now().UTC())
+	require.True(t, claimed)
+}
+
+func TestTeacherOnboardingDeliveryClosesReservedThenActivatesNextAndKeepsDialogRequestImmutable(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	ctx := context.Background()
+	var s5TableExists bool
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT to_regclass('public.teacher_onboarding_turn') IS NOT NULL`).Scan(&s5TableExists))
+	if !s5TableExists {
+		t.Skip("migration 019 is not applied to TEACHER_TEST_DATABASE_URL")
+	}
+	t.Cleanup(func() {
+		// Register after the shared fixture cleanup so these FK-bound S5 rows are
+		// removed first. This leaves the pre-S5 integration fixture reusable.
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM teacher_onboarding_turn WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`, fixture.teacherID)
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM teacher_onboarding_interaction WHERE personal_teacher_id=$1`, fixture.teacherID)
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM teacher_onboarding_action_receipt WHERE personal_teacher_id=$1`, fixture.teacherID)
+	})
+
+	jobRepository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	turns := TeacherOnboardingTurnRepository{Pool: fixture.pool}
+	receipts := OnboardingActionRepository{Pool: fixture.pool}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	dialogID, promptID, canonicalMessageID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+
+	promptBody, promptUI, err := domain.BuildTeacherOnboardingPrompt(domain.OnboardingStepDirection, "ru", 0)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: dialogID, StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	prompt := domain.DialogMessage{ID: promptID, DialogID: dialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb,
+		PersonalTeacherID: fixture.teacherID, Body: promptBody, AssistantUI: promptUI, Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now}
+	interaction, err := domain.NewS5OnboardingInteraction(binding, prompt, domain.OnboardingStepDirection, 0, 0, 1, now)
+	require.NoError(t, err)
+	_, created, err := turns.EnsureActiveInteraction(ctx, interaction)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	firstReceipt := materializedCanonicalReceipt(t, receipts, fixture, dialogID, promptID, 1, "onboarding.direction.d0.v1", "direction.backend", canonicalMessageID, now)
+	firstRequest := s5ActionRequest(fixture, dialogID, uuid.NewString(), canonicalMessageID, promptID, firstReceipt.IdempotencyKey, 1, 1, now)
+	firstJob, err := domain.NewTeacherDialogJob(firstRequest, now)
+	require.NoError(t, err)
+	accepted, err := jobRepository.Accept(ctx, firstJob)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	claimed, ok := claimDenseJob(t, jobRepository, "s5-first", now.Add(time.Second))
+	require.True(t, ok)
+	require.Empty(t, claimed.Request.StudentCommandID, "Dialog v2 request must stay body-free")
+
+	interaction, err = turns.ReserveInteraction(ctx, interaction.ID, claimed.TeacherJobID, domain.TeacherOnboardingCoordinatorAction, firstReceipt.IdempotencyKey, now.Add(2*time.Second))
+	require.NoError(t, err)
+	_, _, err = turns.EnsureTurn(ctx, domain.TeacherOnboardingTurn{TeacherJobID: claimed.TeacherJobID, SourceEventID: claimed.Request.EventID, InteractionID: interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorAction, Stage: domain.TeacherOnboardingTurnReceived, ActionReceiptID: firstReceipt.IdempotencyKey,
+		StudentCommandID: firstReceipt.StudentCommandID, ResponseCommandID: domain.DeterministicOnboardingUUID("response", claimed.TeacherJobID),
+		StudentEffectState: domain.TeacherOnboardingEffectNotAttempted, CreatedAt: now, UpdatedAt: now}, claimed.ClaimToken)
+	require.NoError(t, err)
+	require.NoError(t, turns.Advance(ctx, claimed.TeacherJobID, claimed.ClaimToken, domain.TeacherOnboardingTurnReceived, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingEffectNotAttempted, "", "", now.Add(3*time.Second)))
+	require.NoError(t, turns.Advance(ctx, claimed.TeacherJobID, claimed.ClaimToken, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingEffectAccepted, "", "", now.Add(4*time.Second)))
+	require.NoError(t, turns.Advance(ctx, claimed.TeacherJobID, claimed.ClaimToken, domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnResponseStaged, domain.TeacherOnboardingEffectAccepted, "", "", now.Add(5*time.Second)))
+
+	nextBody, nextUI, err := domain.BuildTeacherOnboardingPrompt(domain.OnboardingStepExperience, "ru", 1)
+	require.NoError(t, err)
+	require.NoError(t, jobRepository.SaveCoordinatedResponse(ctx, claimed.Request.EventID, claimed.ClaimToken, domain.TeacherCoordinatedDialogResponse{Mode: string(domain.TeacherOnboardingCoordinatorAction), Body: nextBody, AssistantUI: nextUI}, now.Add(6*time.Second)))
+	claimedDelivery, ok := claimDenseJob(t, jobRepository, "s5-delivery", now.Add(7*time.Second))
+	require.True(t, ok)
+	responseMessageID := uuid.NewString()
+	response := domain.DialogMessage{ID: responseMessageID, DialogID: dialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb,
+		PersonalTeacherID: fixture.teacherID, ReplyToMessageID: canonicalMessageID, Body: nextBody, AssistantUI: nextUI, Status: 1, Version: 1, MessageSequence: 3, LastEventSequence: 3, CreatedAt: now.Add(7 * time.Second)}
+	nextInteraction, err := domain.NewS5OnboardingInteractionForResponse(binding, response, canonicalMessageID, domain.OnboardingStepExperience, 1, 0, 1, now.Add(7*time.Second))
+	require.NoError(t, err)
+
+	// This simulates a local failure after Dialog has already accepted the
+	// deterministic append. The local transaction must leave the prior
+	// reservation in place so the same append command can be replayed safely.
+	wrongBody, wrongUI, err := domain.BuildTeacherOnboardingPrompt(domain.OnboardingStepKnownStack, "ru", 1)
+	require.NoError(t, err)
+	wrongResponse := response
+	wrongResponse.Body, wrongResponse.AssistantUI = wrongBody, wrongUI
+	wrongNext, err := domain.NewS5OnboardingInteractionForResponse(binding, wrongResponse, canonicalMessageID, domain.OnboardingStepKnownStack, 1, 0, 1, now.Add(7*time.Second))
+	require.NoError(t, err)
+	require.ErrorIs(t, jobRepository.CompleteOnboardingDelivery(ctx, claimedDelivery.Request.EventID, claimedDelivery.ClaimToken, responseMessageID, &wrongNext, false, now.Add(8*time.Second)), domain.ErrTeacherOnboardingConflict)
+	var previousState string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT state FROM teacher_onboarding_interaction WHERE interaction_id=$1`, interaction.ID).Scan(&previousState))
+	require.Equal(t, "reserved", previousState)
+
+	require.NoError(t, jobRepository.CompleteOnboardingDelivery(ctx, claimedDelivery.Request.EventID, claimedDelivery.ClaimToken, responseMessageID, &nextInteraction, false, now.Add(9*time.Second)))
+	// Retry after the local transaction committed represents Dialog's 200
+	// idempotent append replay; no second interaction or cursor advance occurs.
+	require.NoError(t, jobRepository.CompleteOnboardingDelivery(ctx, claimedDelivery.Request.EventID, claimedDelivery.ClaimToken, responseMessageID, &nextInteraction, false, now.Add(10*time.Second)))
+	turn, found, err := turns.GetTurn(ctx, claimed.TeacherJobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingTurnDelivered, turn.Stage)
+	var completedState, activeState, outcomeCommand string
+	var activeSessionSchemaVersion int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT state FROM teacher_onboarding_interaction WHERE interaction_id=$1`, interaction.ID).Scan(&completedState))
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT state,session_schema_version FROM teacher_onboarding_interaction WHERE interaction_id=$1`, nextInteraction.ID).Scan(&activeState, &activeSessionSchemaVersion))
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT student_command_id::text FROM teacher_dialog_turn_outcome WHERE source_event_id=$1`, claimed.Request.EventID).Scan(&outcomeCommand))
+	require.Equal(t, "completed", completedState)
+	require.Equal(t, "active", activeState)
+	require.Equal(t, interaction.SessionSchemaVersion, activeSessionSchemaVersion, "the next prompt must inherit its source session schema version")
+	require.Equal(t, firstReceipt.StudentCommandID, outcomeCommand)
+
+	secondCanonicalMessageID := uuid.NewString()
+	secondReceipt := materializedCanonicalReceipt(t, receipts, fixture, dialogID, responseMessageID, 1, "onboarding.experience.d1.v1", "experience.basic", secondCanonicalMessageID, now.Add(11*time.Second))
+	secondRequest := s5ActionRequest(fixture, dialogID, uuid.NewString(), secondCanonicalMessageID, responseMessageID, secondReceipt.IdempotencyKey, 2, 2, now.Add(11*time.Second))
+	secondJob, err := domain.NewTeacherDialogJob(secondRequest, now.Add(11*time.Second))
+	require.NoError(t, err)
+	accepted, err = jobRepository.Accept(ctx, secondJob)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	// JetStream redelivery is the exact original Dialog v2 event: it cannot be
+	// changed by the local S5 receipt/turn command state.
+	accepted, err = jobRepository.Accept(ctx, secondJob)
+	require.NoError(t, err)
+	require.False(t, accepted)
+	claimedSecond, ok := claimDenseJob(t, jobRepository, "s5-second", now.Add(12*time.Second))
+	require.True(t, ok)
+	_, err = turns.ReserveInteraction(ctx, nextInteraction.ID, claimedSecond.TeacherJobID, domain.TeacherOnboardingCoordinatorAction, secondReceipt.IdempotencyKey, now.Add(12*time.Second))
+	require.NoError(t, err, "the next UI can be consumed by exactly one subsequent action")
+	var requestCommandID *string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT student_command_id::text FROM teacher_dialog_job WHERE event_id=$1`, claimed.Request.EventID).Scan(&requestCommandID))
+	require.Nil(t, requestCommandID, "S5 must not hydrate the immutable Dialog request row")
+}
+
+func TestTeacherOnboardingDeliveredNoEffectStaleWarningPreservesProofWithoutInteractionMutation(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	ctx := context.Background()
+	var s5TableExists bool
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT to_regclass('public.teacher_onboarding_turn') IS NOT NULL`).Scan(&s5TableExists))
+	if !s5TableExists {
+		t.Skip("migration 019 is not applied to TEACHER_TEST_DATABASE_URL")
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM teacher_onboarding_turn WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`, fixture.teacherID)
+	})
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	dialogID, eventID, sourceID, replyToID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	request := domain.DialogTeacherRequest{
+		SchemaVersion: 2, EventID: eventID, DialogID: dialogID, EventSequence: 1, TeacherTurnSequence: 1,
+		SourceMessageID: sourceID, SourceSequence: 1, SourceMessageVersion: 1, ReplyToMessageID: replyToID,
+		CanonicalStudentMessageID: sourceID, CorrelationID: sourceID, DialogCausationID: sourceID, CausationID: eventID,
+		SourceChannel: domain.DialogMessageChannelWeb, StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID,
+		ContextType: domain.LearningContextGeneral, OccurredAt: now,
+	}
+	job, err := domain.NewTeacherDialogJob(request, now)
+	require.NoError(t, err)
+	jobs := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	turns := TeacherOnboardingTurnRepository{Pool: fixture.pool}
+	accepted, err := jobs.Accept(ctx, job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	claimed, ok := claimDenseJob(t, jobs, "s5-stale-warning", now.Add(time.Second))
+	require.True(t, ok)
+	proofID := uuid.NewString()
+	_, _, err = turns.EnsureTurn(ctx, domain.TeacherOnboardingTurn{
+		TeacherJobID: claimed.TeacherJobID, SourceEventID: claimed.Request.EventID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnReceived,
+		CausalAIExecutionID: domain.DeterministicOnboardingUUID("semantic-ai", claimed.TeacherJobID),
+		StudentCommandID:    domain.DeterministicOnboardingUUID("semantic-student", claimed.TeacherJobID), ResponseCommandID: domain.DeterministicOnboardingUUID("response", claimed.TeacherJobID),
+		StudentEffectState: domain.TeacherOnboardingEffectNotAttempted, CreatedAt: now, UpdatedAt: now,
+	}, claimed.ClaimToken)
+	require.NoError(t, err)
+	require.NoError(t, turns.Advance(ctx, claimed.TeacherJobID, claimed.ClaimToken, domain.TeacherOnboardingTurnReceived, domain.TeacherOnboardingTurnResponseStaged, domain.TeacherOnboardingEffectNoEffect, proofID, "", now.Add(2*time.Second)))
+	require.NoError(t, jobs.SaveCoordinatedResponse(ctx, claimed.Request.EventID, claimed.ClaimToken, domain.TeacherCoordinatedDialogResponse{Mode: string(domain.TeacherOnboardingCoordinatorText), Body: "Пожалуйста, используйте текущий вопрос."}, now.Add(3*time.Second)))
+	delivery, ok := claimDenseJob(t, jobs, "s5-stale-delivery", now.Add(4*time.Second))
+	require.True(t, ok)
+	messageID := uuid.NewString()
+	require.NoError(t, jobs.CompleteOnboardingDelivery(ctx, delivery.Request.EventID, delivery.ClaimToken, messageID, nil, false, now.Add(5*time.Second)))
+
+	turn, found, err := turns.GetTurn(ctx, claimed.TeacherJobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingTurnDelivered, turn.Stage)
+	require.Empty(t, turn.InteractionID, "a stale warning must not close/open an interaction")
+	require.Equal(t, proofID, turn.NoEffectProofID)
+	var cursorProof, outcomeProof string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT last_no_effect_proof_id::text FROM teacher_dialog_turn_cursor WHERE dialog_id=$1`, dialogID).Scan(&cursorProof))
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT no_effect_proof_id::text FROM teacher_dialog_turn_outcome WHERE source_event_id=$1`, claimed.Request.EventID).Scan(&outcomeProof))
+	require.Equal(t, proofID, cursorProof)
+	require.Equal(t, proofID, outcomeProof)
+	var interactions int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT count(*) FROM teacher_onboarding_interaction WHERE dialog_id=$1`, dialogID).Scan(&interactions))
+	require.Zero(t, interactions)
+}
+
+func materializedCanonicalReceipt(t *testing.T, store OnboardingActionRepository, fixture *teacherDecisionIntegrationFixture, dialogID, promptID string, promptVersion int, blockID, actionID, canonicalMessageID string, now time.Time) domain.OnboardingActionReceipt {
+	t.Helper()
+	request := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: dialogID, MessageID: promptID, MessageVersion: promptVersion, BlockID: blockID, ActionID: actionID, IdempotencyKey: uuid.NewString()}
+	receipt, err := domain.NewOnboardingActionReceiptForMode(request, fixture.studentID, fixture.teacherID, uuid.NewString(), now, now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	_, created, err := store.Claim(context.Background(), receipt)
+	require.NoError(t, err)
+	require.True(t, created)
+	stored, err := store.CompleteCanonical(context.Background(), receipt.IdempotencyKey, receipt.ClaimToken, canonicalMessageID, now.Add(time.Second))
+	require.NoError(t, err)
+	return stored
+}
+
+func s5ActionRequest(fixture *teacherDecisionIntegrationFixture, dialogID, eventID, canonicalMessageID, replyToMessageID, actionReceiptID string, eventSequence, turnSequence int64, occurredAt time.Time) domain.DialogTeacherRequest {
+	return domain.DialogTeacherRequest{
+		SchemaVersion: 2, EventID: eventID, DialogID: dialogID, EventSequence: eventSequence, TeacherTurnSequence: turnSequence,
+		SourceMessageID: canonicalMessageID, SourceSequence: eventSequence + 1, SourceMessageVersion: 1, ReplyToMessageID: replyToMessageID,
+		CanonicalStudentMessageID: canonicalMessageID, CorrelationID: actionReceiptID, DialogCausationID: canonicalMessageID,
+		ActionReceiptID: actionReceiptID, SourceChannel: domain.DialogMessageChannelWeb, StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID,
+		ContextType: domain.LearningContextGeneral, OccurredAt: occurredAt,
+	}
+}
+
+func TestTeacherDialogDenseTurnFlagOffStoresButDoesNotClaimV2(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: false}
+	job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	_, claimed := claimDenseJob(t, repository, "legacy-worker", time.Now().UTC())
+	require.False(t, claimed)
+	var schemaVersion int
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT teacher_turn_schema_version FROM teacher_dialog_job WHERE event_id=$1`, job.Request.EventID).Scan(&schemaVersion))
+	require.Equal(t, 2, schemaVersion)
+}
+
+func TestTeacherDialogDenseTurnLeaseExpiryAndRetryKeepCursorBlocked(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	first := acceptDenseJob(t, repository, fixture, dialogID, 1)
+	_ = acceptDenseJob(t, repository, fixture, dialogID, 2)
+	now := time.Now().UTC()
+	claimed, ok := claimDenseJob(t, repository, "slow-worker", now)
+	require.True(t, ok)
+	_, stillBlocked := claimDenseJob(t, repository, "other-worker", now)
+	require.False(t, stillBlocked)
+	require.ErrorIs(t, repository.RenewLease(context.Background(), first.Request.EventID, claimed.ClaimToken, now.Add(10*time.Second), now.Add(2*time.Minute)), nil)
+	require.NoError(t, repository.Retry(context.Background(), first.Request.EventID, claimed.ClaimToken, "temporary", now.Add(2*time.Minute), now.Add(10*time.Second)))
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), cursor.NextTeacherTurnSequence)
+	_, ok = claimDenseJob(t, repository, "retry-worker", now.Add(3*time.Minute))
+	require.True(t, ok)
+}
+
+func TestTeacherDialogDenseTurnFailedNoEffectPersistsProofAndAdvances(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	job := acceptDenseJob(t, repository, fixture, dialogID, 1)
+	claimed, ok := claimDenseJob(t, repository, "worker", time.Now().UTC())
+	require.True(t, ok)
+	now := time.Now().UTC()
+	proof := domain.TeacherDialogNoEffectProof{ID: uuid.NewString(), SourceEventID: job.Request.EventID, TeacherJobID: claimed.TeacherJobID, StudentCommandID: uuid.NewString(), RecordedAt: now}
+	outcome := domain.TeacherDialogRecoverableOutcome{ID: uuid.NewString(), SourceEventID: job.Request.EventID, TeacherJobID: claimed.TeacherJobID, TurnCorrelationID: job.Request.CorrelationID, CreatedAt: now}
+	require.NoError(t, repository.RecordFailedNoEffect(context.Background(), job.Request.EventID, claimed.ClaimToken, proof, outcome, "student_unavailable", now))
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), cursor.NextTeacherTurnSequence)
+	var status, storedProof, storedOutcome, storedCommand, storedTurnCorrelation, outcomeProof string
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT status,no_effect_proof_id::text,recoverable_outcome_id::text,student_command_id::text FROM teacher_dialog_job WHERE event_id=$1`, job.Request.EventID).Scan(&status, &storedProof, &storedOutcome, &storedCommand))
+	require.Equal(t, "completed", status)
+	require.Equal(t, proof.ID, storedProof)
+	require.Equal(t, outcome.ID, storedOutcome)
+	require.Equal(t, proof.StudentCommandID, storedCommand)
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT turn_correlation_id::text,no_effect_proof_id::text FROM teacher_dialog_turn_outcome WHERE source_event_id=$1`, job.Request.EventID).Scan(&storedTurnCorrelation, &outcomeProof))
+	require.Equal(t, job.Request.CorrelationID, storedTurnCorrelation)
+	require.Equal(t, proof.ID, outcomeProof)
+}
+
+func TestTeacherDialogDenseTurnReconciliationDoesNotAdvance(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	first := acceptDenseJob(t, repository, fixture, dialogID, 1)
+	_ = acceptDenseJob(t, repository, fixture, dialogID, 2)
+	claimed, ok := claimDenseJob(t, repository, "worker", time.Now().UTC())
+	require.True(t, ok)
+	require.NoError(t, repository.MarkReconciliation(context.Background(), first.Request.EventID, claimed.ClaimToken, domain.TeacherTurnUnknown, "ambiguous", time.Now().UTC()))
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), cursor.NextTeacherTurnSequence)
+	_, claimedAgain := claimDenseJob(t, repository, "worker-2", time.Now().UTC())
+	require.False(t, claimedAgain)
+}
+
+func TestTeacherDialogDenseTurnPartialReconciliationDoesNotAdvance(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	first := acceptDenseJob(t, repository, fixture, dialogID, 1)
+	_ = acceptDenseJob(t, repository, fixture, dialogID, 2)
+	claimed, ok := claimDenseJob(t, repository, "worker", time.Now().UTC())
+	require.True(t, ok)
+	require.NoError(t, repository.MarkReconciliation(context.Background(), first.Request.EventID, claimed.ClaimToken, domain.TeacherTurnPartial, "partial_delivery", time.Now().UTC()))
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), cursor.NextTeacherTurnSequence)
+	var state string
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT reconciliation_state FROM teacher_dialog_job WHERE event_id=$1`, first.Request.EventID).Scan(&state))
+	require.Equal(t, string(domain.TeacherTurnPartial), state)
+}
+
+func TestTeacherDialogDenseTurnCursorMismatchFailsClosedAfterGeneratedResponse(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	dialogID := uuid.NewString()
+	job := acceptDenseJob(t, repository, fixture, dialogID, 1)
+	claimed, ok := claimDenseJob(t, repository, "worker", time.Now().UTC())
+	require.True(t, ok)
+	decision, event := fixture.decision(uuid.NewString(), job.Request.EventID, domain.LearningContextGeneral, "", "", dialogID)
+	require.NoError(t, repository.SaveGenerated(context.Background(), job.Request.EventID, claimed.ClaimToken, decision, event, "response before cursor CAS", uuid.NewString(), time.Now().UTC()))
+	_, err := fixture.pool.Exec(context.Background(), `UPDATE teacher_dialog_turn_cursor SET next_teacher_turn_sequence=2 WHERE dialog_id=$1`, dialogID)
+	require.NoError(t, err)
+	messageID := uuid.NewString()
+	require.ErrorIs(t, repository.CompleteDelivery(context.Background(), job.Request.EventID, claimed.ClaimToken, messageID, time.Now().UTC()), domain.ErrTeacherDialogCursorBlocked)
+	var status, storedMessage string
+	require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT status,teacher_response_message_id::text FROM teacher_dialog_job WHERE event_id=$1`, job.Request.EventID).Scan(&status, &storedMessage))
+	require.Equal(t, string(domain.TeacherDialogJobBlocked), status)
+	require.Equal(t, messageID, storedMessage)
+	cursor, err := repository.GetCursor(context.Background(), dialogID)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), cursor.NextTeacherTurnSequence)
+}
+
+func TestTeacherDialogDenseTurnTwoDialogsCanClaimInParallel(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	first := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	second := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	start := make(chan struct{})
+	results := make(chan string, 2)
+	var waitGroup sync.WaitGroup
+	for index, expected := range []string{first.Request.EventID, second.Request.EventID} {
+		waitGroup.Add(1)
+		go func(_ int, expected string) {
+			defer waitGroup.Done()
+			<-start
+			job, claimed := claimDenseJob(t, repository, "parallel-"+uuid.NewString(), time.Now().UTC())
+			if claimed && job.Request.EventID == expected {
+				results <- expected
+				return
+			}
+			results <- job.Request.EventID
+		}(index, expected)
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	seen := map[string]bool{}
+	for value := range results {
+		seen[value] = true
+	}
+	require.True(t, seen[first.Request.EventID])
+	require.True(t, seen[second.Request.EventID])
+}

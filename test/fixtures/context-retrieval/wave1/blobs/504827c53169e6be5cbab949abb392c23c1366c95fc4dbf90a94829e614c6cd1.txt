@@ -1,0 +1,183 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+)
+
+const (
+	PlannerOnboardingPathOutcomeQueue   = "ms-teacher-planner-onboarding-path-outcome"
+	PlannerOnboardingPathOutcomeDurable = "ms-teacher-planner-onboarding-path-outcome-v1"
+	plannerOnboardingPathOutcomeSubject = domain.TeacherOnboardingPathOutcomeSubject
+	maximumPlannerPathOutcomeBytes      = 64 * 1024
+)
+
+type plannerOnboardingPathOutcomeEnvelope struct {
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	CorrelationID string          `json:"correlation_id"`
+	CausationID   string          `json:"causation_id"`
+	StudentID     string          `json:"student_id"`
+	OccurredAt    string          `json:"occurred_at"`
+	SchemaVersion int             `json:"schema_version"`
+	Data          json.RawMessage `json:"data"`
+}
+
+type plannerOnboardingPathOutcomeData struct {
+	Schema         string  `json:"schema"`
+	ExecutionID    string  `json:"execution_id"`
+	HandoffID      string  `json:"handoff_id"`
+	StudentID      string  `json:"student_id"`
+	DialogID       string  `json:"dialog_id"`
+	TeacherJobID   string  `json:"teacher_job_id"`
+	Status         string  `json:"status"`
+	CourseID       *string `json:"course_id,omitempty"`
+	LearningPathID *string `json:"learning_path_id,omitempty"`
+	FirstLessonID  *string `json:"first_lesson_id,omitempty"`
+}
+
+// DecodePlannerOnboardingPathOutcome validates the frozen S9 v1 wire and
+// rejects unknown envelope/data fields and status-inappropriate identifiers.
+func DecodePlannerOnboardingPathOutcome(payload []byte) (domain.TeacherOnboardingPathOutcome, error) {
+	if len(payload) == 0 || len(payload) > maximumPlannerPathOutcomeBytes {
+		return domain.TeacherOnboardingPathOutcome{}, errors.New("planner onboarding path outcome payload is out of bounds")
+	}
+	var envelope plannerOnboardingPathOutcomeEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.TeacherOnboardingPathOutcome{}, fmt.Errorf("decode planner onboarding path outcome: %w", err)
+	}
+	if envelope.SchemaVersion != domain.TeacherOnboardingPathOutcomeVersion ||
+		envelope.EventType != domain.TeacherOnboardingPathOutcomeSubject || len(envelope.Data) == 0 {
+		return domain.TeacherOnboardingPathOutcome{}, errors.New("invalid planner onboarding path outcome envelope")
+	}
+	var data plannerOnboardingPathOutcomeData
+	if err := decodeStrictJSON(envelope.Data, &data); err != nil {
+		return domain.TeacherOnboardingPathOutcome{}, fmt.Errorf("decode planner onboarding path outcome data: %w", err)
+	}
+	if data.Schema != domain.TeacherOnboardingPathOutcomeSchema ||
+		data.StudentID != envelope.StudentID || data.ExecutionID != envelope.CorrelationID || data.HandoffID != envelope.CausationID {
+		return domain.TeacherOnboardingPathOutcome{}, errors.New("inconsistent planner onboarding path outcome identities")
+	}
+	if err := rejectStatusInappropriatePlannerPathIDs(envelope.Data, data.Status); err != nil {
+		return domain.TeacherOnboardingPathOutcome{}, err
+	}
+	courseID, pathID, lessonID := optionalPlannerPathIDs(data)
+	occurredAt, err := parsePlannerPathOutcomeOccurredAt(envelope.OccurredAt)
+	if err != nil {
+		return domain.TeacherOnboardingPathOutcome{}, err
+	}
+	return domain.NormalizeTeacherOnboardingPathOutcome(domain.TeacherOnboardingPathOutcome{
+		EventID: envelope.EventID, EventType: envelope.EventType, CorrelationID: envelope.CorrelationID,
+		CausationID: envelope.CausationID, StudentID: envelope.StudentID, OccurredAt: occurredAt,
+		ExecutionID: data.ExecutionID, HandoffID: data.HandoffID, DialogID: data.DialogID,
+		TeacherJobID: data.TeacherJobID, Status: data.Status, CourseID: courseID,
+		LearningPathID: pathID, FirstLessonID: lessonID,
+	})
+}
+
+// The frozen v1 contract requires PATH_READY-only identifiers to be absent
+// for terminal non-ready outcomes. A pointer field alone cannot distinguish
+// an omitted key from an explicit JSON null, so inspect the already strict
+// decoded object for key presence before domain normalization.
+func rejectStatusInappropriatePlannerPathIDs(raw json.RawMessage, status string) error {
+	if status == domain.TeacherOnboardingPathReady {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return errors.New("invalid planner onboarding path outcome data")
+	}
+	for _, key := range []string{"course_id", "learning_path_id", "first_lesson_id"} {
+		if _, present := fields[key]; present {
+			return errors.New("non-ready planner onboarding path outcome must omit path identifiers")
+		}
+	}
+	return nil
+}
+
+func optionalPlannerPathIDs(data plannerOnboardingPathOutcomeData) (string, string, string) {
+	var courseID, pathID, lessonID string
+	if data.CourseID != nil {
+		courseID = *data.CourseID
+	}
+	if data.LearningPathID != nil {
+		pathID = *data.LearningPathID
+	}
+	if data.FirstLessonID != nil {
+		lessonID = *data.FirstLessonID
+	}
+	return courseID, pathID, lessonID
+}
+
+func parsePlannerPathOutcomeOccurredAt(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.Location() != time.UTC || parsed.Format(time.RFC3339Nano) != value {
+		return time.Time{}, errors.New("invalid planner onboarding path outcome occurred_at")
+	}
+	return parsed, nil
+}
+
+type PlannerOnboardingPathOutcomeSubscriber struct {
+	Conn       *natsgo.Conn
+	Handler    func(context.Context, domain.TeacherOnboardingPathOutcome) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber PlannerOnboardingPathOutcomeSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil || subscriber.Handler == nil {
+		return errors.New("planner onboarding path outcome subscriber dependencies are required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	stream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = stream.QueueSubscribe(plannerOnboardingPathOutcomeSubject, PlannerOnboardingPathOutcomeQueue, func(message *natsgo.Msg) {
+		outcome, decodeErr := DecodePlannerOnboardingPathOutcome(message.Data)
+		if decodeErr != nil {
+			logger.Warn("terminate invalid planner onboarding path outcome", zap.Error(decodeErr))
+			_ = message.Term()
+			return
+		}
+		processed, handleErr := subscriber.Handler(ctx, outcome)
+		if handleErr != nil {
+			if errors.Is(handleErr, domain.ErrInvalidTeacherOnboardingPathOutcome) {
+				logger.Warn("terminate rejected planner onboarding path outcome", zap.String("event_id", outcome.EventID), zap.Error(handleErr))
+				_ = message.Term()
+				return
+			}
+			logger.Warn("retry planner onboarding path outcome", zap.String("event_id", outcome.EventID), zap.Error(handleErr))
+			_ = message.NakWithDelay(retryDelay)
+			return
+		}
+		if err := message.AckSync(); err != nil {
+			logger.Warn("ack planner onboarding path outcome", zap.String("event_id", outcome.EventID), zap.Error(err))
+			return
+		}
+		logger.Debug("planner onboarding path outcome handled", zap.String("event_id", outcome.EventID), zap.Bool("processed", processed))
+	}, natsgo.BindStream(LearningPlannerEventsStream), natsgo.Durable(PlannerOnboardingPathOutcomeDurable), natsgo.ManualAck(), natsgo.AckExplicit(), natsgo.DeliverAll(), natsgo.AckWait(ackWait))
+	if err != nil {
+		return err
+	}
+	return nil
+}

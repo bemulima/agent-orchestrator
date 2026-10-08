@@ -1,0 +1,485 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+// TaskHandler owns the private task-read endpoints.
+type TaskHandler struct {
+	GetDetailsUC                  task.GetTaskDetails
+	GetInternalCourseStructureUC  task.GetInternalCourseStructure
+	GetInternalCompletedLessonsUC task.GetInternalCompletedLessons
+}
+
+// GetInternalTask returns task metadata for internal consumers.
+func (h TaskHandler) GetInternalTask(w http.ResponseWriter, r *http.Request) {
+	h.renderTask(w, r, true, true)
+}
+
+// GetInternalCourseStructure returns ordered lessons/tasks for one course.
+func (h TaskHandler) GetInternalCourseStructure(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	if courseID == "" {
+		http.Error(w, "courseID is required", http.StatusBadRequest)
+		return
+	}
+	if h.GetInternalCourseStructureUC.Lessons == nil || h.GetInternalCourseStructureUC.Tasks == nil {
+		http.Error(w, "internal dependencies are not configured", http.StatusInternalServerError)
+		return
+	}
+	response, err := h.GetInternalCourseStructureUC.Handle(r.Context(), courseID)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// GetInternalDiagnosticAssessments returns only explicitly opted-in assessments without answer keys.
+func (h TaskHandler) GetInternalDiagnosticAssessments(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	if courseID == "" || uuid.Validate(courseID) != nil {
+		http.Error(w, "courseID must be a UUID", http.StatusBadRequest)
+		return
+	}
+	if h.GetInternalCourseStructureUC.Lessons == nil || h.GetInternalCourseStructureUC.Tasks == nil {
+		http.Error(w, "internal dependencies are not configured", http.StatusInternalServerError)
+		return
+	}
+	response, err := h.GetInternalCourseStructureUC.Handle(r.Context(), courseID)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	catalog, err := response.DiagnosticOnly()
+	if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(catalog)
+}
+
+// GetInternalCompletedLessons returns completed lesson ids for one student and selected lesson ids.
+func (h TaskHandler) GetInternalCompletedLessons(w http.ResponseWriter, r *http.Request) {
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+
+	lessonIDs := splitCSVQuery(r.URL.Query().Get("lesson_ids"))
+	if len(lessonIDs) == 0 {
+		http.Error(w, "lesson_ids is required", http.StatusBadRequest)
+		return
+	}
+	if h.GetInternalCompletedLessonsUC.Lessons == nil || h.GetInternalCompletedLessonsUC.Tasks == nil || h.GetInternalCompletedLessonsUC.Progress == nil {
+		http.Error(w, "internal dependencies are not configured", http.StatusInternalServerError)
+		return
+	}
+
+	response, err := h.GetInternalCompletedLessonsUC.Handle(r.Context(), userID, lessonIDs)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err == domain.ErrForbidden {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (h TaskHandler) renderTask(w http.ResponseWriter, r *http.Request, includeInternal bool, includeCorrectAnswers bool) {
+	if h.GetDetailsUC.Tasks == nil {
+		http.Error(w, "task details are not configured", http.StatusInternalServerError)
+		return
+	}
+
+	taskID := chi.URLParam(r, "taskID")
+	details, err := h.GetDetailsUC.Handle(r.Context(), taskID, includeInternal)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp := buildTaskResponse(details.Task, details.Tests, details.StarterFiles, includeInternal, includeCorrectAnswers, details.CodeStructureTypeCode)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type taskResponse struct {
+	ID                     string                       `json:"id"`
+	LessonID               string                       `json:"lesson_id"`
+	Title                  string                       `json:"title"`
+	Description            string                       `json:"description"`
+	Translations           []taskTranslationResponse    `json:"translations,omitempty"`
+	LearningTargets        []taskLearningTargetResponse `json:"learning_targets,omitempty"`
+	CodeStructureTypeID    string                       `json:"code_structure_type_id"`
+	CodeStructureType      *string                      `json:"code_structure_type_code,omitempty"`
+	CodeStructure          json.RawMessage              `json:"code_structure"`
+	ComposeConfig          json.RawMessage              `json:"compose_config"`
+	Type                   int16                        `json:"type"`
+	AssessmentPurpose      string                       `json:"assessment_purpose"`
+	TaskKind               string                       `json:"task_kind"`
+	ExecutionMode          string                       `json:"execution_mode"`
+	EvaluationMode         string                       `json:"evaluation_mode"`
+	UIMode                 string                       `json:"ui_mode"`
+	SubmissionMode         string                       `json:"submission_mode"`
+	RequiresSandbox        bool                         `json:"requires_sandbox"`
+	ExposesPreview         bool                         `json:"exposes_preview"`
+	ExposesTerminal        bool                         `json:"exposes_terminal"`
+	SupportsLiveValidation bool                         `json:"supports_live_validation"`
+	AllowedErrorsCount     int                          `json:"allowed_errors_count"`
+	Order                  int                          `json:"order"`
+	Status                 int                          `json:"status"`
+	Version                int                          `json:"version"`
+	CreatedAt              time.Time                    `json:"created_at"`
+	UpdatedAt              time.Time                    `json:"updated_at"`
+	MaxAttempts            *int                         `json:"max_attempts,omitempty"`
+	DeadlineAt             *time.Time                   `json:"deadline_at,omitempty"`
+	Tests                  []taskTestResponse           `json:"tests,omitempty"`
+	StarterFiles           []taskStarterFileResponse    `json:"starter_files,omitempty"`
+}
+
+type taskTranslationResponse struct {
+	TaskID      string `json:"task_id"`
+	I18nID      int    `json:"i18n_id"`
+	Lang        string `json:"lang,omitempty"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+type taskTestResponse struct {
+	ID           string                        `json:"id"`
+	SourceKey    string                        `json:"source_key,omitempty"`
+	TaskID       string                        `json:"task_id"`
+	Kind         string                        `json:"kind"`
+	Title        string                        `json:"title"`
+	Description  string                        `json:"description"`
+	Translations []taskTestTranslationResponse `json:"translations,omitempty"`
+	Order        int                           `json:"order"`
+	Groups       []taskTestGroupResponse       `json:"groups,omitempty"`
+	Variants     []taskTestVariantResponse     `json:"variants,omitempty"`
+}
+
+type taskTestGroupResponse struct {
+	ID           string                             `json:"id"`
+	SourceKey    string                             `json:"source_key,omitempty"`
+	TaskTestID   string                             `json:"task_test_id"`
+	Title        string                             `json:"title"`
+	Translations []taskTestGroupTranslationResponse `json:"translations,omitempty"`
+	Order        int                                `json:"order"`
+}
+
+type taskTestGroupTranslationResponse struct {
+	TaskTestGroupID string `json:"task_test_group_id"`
+	I18nID          int    `json:"i18n_id"`
+	Lang            string `json:"lang,omitempty"`
+	Title           string `json:"title"`
+}
+
+type taskTestTranslationResponse struct {
+	TaskTestID  string `json:"task_test_id"`
+	I18nID      int    `json:"i18n_id"`
+	Lang        string `json:"lang,omitempty"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+type taskTestVariantResponse struct {
+	ID             string                               `json:"id"`
+	SourceKey      string                               `json:"source_key,omitempty"`
+	TaskTestID     string                               `json:"task_test_id"`
+	Text           string                               `json:"text"`
+	IsCorrect      *bool                                `json:"is_correct,omitempty"`
+	CorrectOrder   *int                                 `json:"correct_order,omitempty"`
+	GroupID        *string                              `json:"group_id,omitempty"`
+	GroupSourceKey *string                              `json:"group_source_key,omitempty"`
+	Translations   []taskTestVariantTranslationResponse `json:"translations,omitempty"`
+	Order          int                                  `json:"order"`
+}
+
+type taskTestVariantTranslationResponse struct {
+	TaskTestVariantID string `json:"task_test_variant_id"`
+	I18nID            int    `json:"i18n_id"`
+	Lang              string `json:"lang,omitempty"`
+	Text              string `json:"text"`
+}
+
+type taskStarterFileResponse struct {
+	Type          int16  `json:"type"`
+	FileStorageID string `json:"filestorage_id"`
+	Order         int    `json:"order"`
+}
+
+type taskLearningTargetResponse struct {
+	Type    domain.LearningTargetType `json:"type"`
+	Key     string                    `json:"key"`
+	Version string                    `json:"version,omitempty"`
+}
+
+func buildTaskResponse(t *domain.Task, tests []domain.TaskTest, starterFiles []domain.TaskFileStorage, includeInternal bool, includeCorrectAnswers bool, codeStructureTypeCode *string) taskResponse {
+	compose := t.ResolvedComposeConfig
+	if compose == nil {
+		compose = t.ComposeConfig
+	}
+	resp := taskResponse{
+		ID:                     t.ID,
+		LessonID:               t.LessonID,
+		Title:                  t.Title,
+		Description:            t.Description,
+		Translations:           mapTaskTranslationResponse(t.Translations),
+		LearningTargets:        mapTaskLearningTargetResponse(t.LearningTargets),
+		CodeStructureTypeID:    t.CodeStructureTypeID,
+		CodeStructure:          t.CodeStructure,
+		ComposeConfig:          compose,
+		Type:                   t.Type,
+		AssessmentPurpose:      domain.AssessmentPurposeValue(t.AssessmentPurpose),
+		TaskKind:               domain.TaskTypeName(t.Type),
+		ExecutionMode:          domain.TaskExecutionModeName(t.ExecutionMode),
+		EvaluationMode:         domain.TaskEvaluationModeName(t.EvaluationMode),
+		UIMode:                 domain.TaskUIModeName(t.UIMode),
+		SubmissionMode:         domain.TaskSubmissionModeName(t.SubmissionMode),
+		RequiresSandbox:        t.RequiresSandbox,
+		ExposesPreview:         t.ExposesPreview,
+		ExposesTerminal:        t.ExposesTerminal,
+		SupportsLiveValidation: t.SupportsLiveValidation,
+		AllowedErrorsCount:     t.AllowedErrorsCount,
+		Order:                  t.Order,
+		Status:                 t.Status,
+		Version:                t.Version,
+		CreatedAt:              t.CreatedAt,
+		UpdatedAt:              t.UpdatedAt,
+		MaxAttempts:            t.MaxAttempts,
+		DeadlineAt:             t.DeadlineAt,
+		Tests:                  mapTaskTestResponse(tests, includeCorrectAnswers),
+		StarterFiles:           mapTaskStarterFileResponse(starterFiles),
+	}
+	if includeInternal {
+		resp.CodeStructureType = codeStructureTypeCode
+	}
+	return resp
+}
+
+func splitCSVQuery(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func mapTaskStarterFileResponse(items []domain.TaskFileStorage) []taskStarterFileResponse {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]taskStarterFileResponse, 0, len(items))
+	for _, item := range items {
+		result = append(result, taskStarterFileResponse{
+			Type:          item.Type,
+			FileStorageID: item.FileStorageID,
+			Order:         item.Order,
+		})
+	}
+	return result
+}
+
+func mapTaskLearningTargetResponse(items []domain.TaskLearningTarget) []taskLearningTargetResponse {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]taskLearningTargetResponse, 0, len(items))
+	for _, item := range items {
+		result = append(result, taskLearningTargetResponse{
+			Type:    item.Type,
+			Key:     item.Key,
+			Version: item.Version,
+		})
+	}
+	return result
+}
+
+func mapTaskTranslationResponse(translations []domain.TaskI18n) []taskTranslationResponse {
+	if len(translations) == 0 {
+		return nil
+	}
+
+	result := make([]taskTranslationResponse, 0, len(translations))
+	for _, translation := range translations {
+		result = append(result, taskTranslationResponse{
+			TaskID:      translation.TaskID,
+			I18nID:      translation.I18nID,
+			Lang:        translation.Language,
+			Title:       translation.Title,
+			Description: translation.Description,
+		})
+	}
+	return result
+}
+
+func mapTaskTestResponse(tests []domain.TaskTest, includeCorrectAnswers bool) []taskTestResponse {
+	if len(tests) == 0 {
+		return nil
+	}
+	result := make([]taskTestResponse, 0, len(tests))
+	for _, test := range tests {
+		result = append(result, taskTestResponse{
+			ID:           test.ID,
+			SourceKey:    test.SourceKey,
+			TaskID:       test.TaskID,
+			Kind:         test.Kind,
+			Title:        test.Title,
+			Description:  test.Description,
+			Translations: mapTaskTestTranslationResponse(test.Translations),
+			Order:        test.Order,
+			Groups:       mapTaskTestGroupResponse(test.Groups),
+			Variants:     mapTaskTestVariantResponse(test.Variants, includeCorrectAnswers),
+		})
+	}
+	return result
+}
+
+func mapTaskTestGroupResponse(groups []domain.TaskTestGroup) []taskTestGroupResponse {
+	if len(groups) == 0 {
+		return nil
+	}
+	result := make([]taskTestGroupResponse, 0, len(groups))
+	for _, group := range groups {
+		translations := make([]taskTestGroupTranslationResponse, 0, len(group.Translations))
+		for _, translation := range group.Translations {
+			translations = append(translations, taskTestGroupTranslationResponse{
+				TaskTestGroupID: translation.TaskTestGroupID,
+				I18nID:          translation.I18nID,
+				Lang:            translation.Language,
+				Title:           translation.Title,
+			})
+		}
+		result = append(result, taskTestGroupResponse{
+			ID:           group.ID,
+			SourceKey:    group.SourceKey,
+			TaskTestID:   group.TaskTestID,
+			Title:        group.Title,
+			Translations: translations,
+			Order:        group.Order,
+		})
+	}
+	return result
+}
+
+func mapTaskTestTranslationResponse(translations []domain.TaskTestI18n) []taskTestTranslationResponse {
+	if len(translations) == 0 {
+		return nil
+	}
+	result := make([]taskTestTranslationResponse, 0, len(translations))
+	for _, translation := range translations {
+		result = append(result, taskTestTranslationResponse{
+			TaskTestID:  translation.TaskTestID,
+			I18nID:      translation.I18nID,
+			Lang:        translation.Language,
+			Title:       translation.Title,
+			Description: translation.Description,
+		})
+	}
+	return result
+}
+
+func mapTaskTestVariantResponse(variants []domain.TaskTestVariant, includeCorrectAnswers bool) []taskTestVariantResponse {
+	if len(variants) == 0 {
+		return nil
+	}
+	result := make([]taskTestVariantResponse, 0, len(variants))
+	for _, variant := range variants {
+		item := taskTestVariantResponse{
+			ID:           variant.ID,
+			SourceKey:    variant.SourceKey,
+			TaskTestID:   variant.TaskTestID,
+			Text:         variant.Text,
+			Translations: mapTaskTestVariantTranslationResponse(variant.Translations),
+			Order:        variant.Order,
+		}
+		if includeCorrectAnswers {
+			isCorrect := variant.IsCorrect
+			item.IsCorrect = &isCorrect
+			item.CorrectOrder = variant.CorrectOrder
+			if variant.GroupID != "" {
+				groupID := variant.GroupID
+				item.GroupID = &groupID
+			}
+			if variant.GroupSourceKey != "" {
+				groupSourceKey := variant.GroupSourceKey
+				item.GroupSourceKey = &groupSourceKey
+			}
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func mapTaskTestVariantTranslationResponse(translations []domain.TaskTestVariantI18n) []taskTestVariantTranslationResponse {
+	if len(translations) == 0 {
+		return nil
+	}
+	result := make([]taskTestVariantTranslationResponse, 0, len(translations))
+	for _, translation := range translations {
+		result = append(result, taskTestVariantTranslationResponse{
+			TaskTestVariantID: translation.TaskTestVariantID,
+			I18nID:            translation.I18nID,
+			Lang:              translation.Language,
+			Text:              translation.Text,
+		})
+	}
+	return result
+}

@@ -1,0 +1,126 @@
+package student
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type learningActionCodeSandboxStub struct {
+	session                  *domain.SandboxSession
+	files                    []domain.WorkspaceFile
+	validation               domain.LearningActionValidationObservation
+	err                      error
+	studentID, taskID, reply string
+}
+
+func (stub *learningActionCodeSandboxStub) FindSandboxForAnswer(_ context.Context, studentID, taskID, answerID string) (*domain.SandboxSession, error) {
+	stub.studentID, stub.taskID, stub.reply = studentID, taskID, answerID
+	return stub.session, stub.err
+}
+
+func (stub *learningActionCodeSandboxStub) GetSnapshot(context.Context, string) ([]domain.WorkspaceFile, error) {
+	return stub.files, stub.err
+}
+
+func (stub *learningActionCodeSandboxStub) GetValidationObservation(context.Context, string) (domain.LearningActionValidationObservation, error) {
+	return stub.validation, stub.err
+}
+
+func TestGetLearningActionCodeContextUsesExactAnswerAndSanitizesSnapshot(t *testing.T) {
+	studentID := "11111111-1111-4111-8111-111111111111"
+	actionID := "22222222-2222-4222-8222-222222222222"
+	answerID := "33333333-3333-4333-8333-333333333333"
+	taskID := "44444444-4444-4444-8444-444444444444"
+	checkedAt := time.Now().UTC()
+	sandbox := &learningActionCodeSandboxStub{
+		session: &domain.SandboxSession{SandboxID: "private-sandbox-id"},
+		validation: domain.LearningActionValidationObservation{
+			Available: true, Kind: "validation", Passed: false, IssueCount: 2, CheckedAt: &checkedAt,
+			PolicyVersion: domain.SandboxValidationObservationVersion,
+		},
+		files: []domain.WorkspaceFile{
+			{Path: "main.go", Content: "package main\nconst apiKey = \"secret\""},
+			{Path: ".env", Content: "TOKEN=secret"},
+			{Path: "node_modules/pkg/index.js", Content: "dependency"},
+			{Path: "large.txt", Content: strings.Repeat("x", maximumTeacherCodeFileBytes+10)},
+		},
+	}
+	useCase := GetLearningActionCodeContext{
+		Actions: learningActionReaderStub{action: domain.StudentLearningAction{
+			ID: actionID, StudentTaskAnswerID: answerID, StudentID: studentID, TaskID: taskID,
+			ContextType: domain.LearningContextLessonTask, ContextID: taskID, OpenedAt: time.Now().UTC(),
+		}},
+		Sandbox: sandbox,
+	}
+	result, err := useCase.Handle(context.Background(), studentID, actionID)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if !result.Available || result.PolicyVersion != domain.LearningActionCodeContextPolicyVersion || len(result.Files) != 2 || result.OmittedFileCount != 2 || !result.Truncated {
+		t.Fatalf("unexpected bounded context: %+v", result)
+	}
+	if !result.Validation.Available || result.Validation.Passed || result.Validation.IssueCount != 2 {
+		t.Fatalf("bounded validation observation expected, got %+v", result.Validation)
+	}
+	if sandbox.studentID != studentID || sandbox.taskID != taskID || sandbox.reply != answerID {
+		t.Fatalf("sandbox lookup did not use exact private answer binding: %+v", sandbox)
+	}
+	if result.Files[1].Path != "main.go" || strings.Contains(result.Files[1].Content, "secret") || !strings.Contains(result.Files[1].Content, "REDACTED") {
+		t.Fatalf("secret-safe source projection expected, got %+v", result.Files)
+	}
+	if len(result.Files[0].Content) != maximumTeacherCodeFileBytes || !result.Files[0].Truncated {
+		t.Fatalf("per-file truncation was not applied: %+v", result.Files[0])
+	}
+}
+
+func TestGetLearningActionCodeContextRepresentsMissingSandboxWithoutLeakingIdentity(t *testing.T) {
+	studentID := "11111111-1111-4111-8111-111111111111"
+	actionID := "22222222-2222-4222-8222-222222222222"
+	sandbox := &learningActionCodeSandboxStub{err: domain.ErrNotFound}
+	result, err := (GetLearningActionCodeContext{
+		Actions: learningActionReaderStub{action: domain.StudentLearningAction{
+			ID: actionID, StudentTaskAnswerID: "33333333-3333-4333-8333-333333333333", StudentID: studentID,
+			TaskID: "44444444-4444-4444-8444-444444444444", ContextType: domain.LearningContextLessonTask,
+			ContextID: "44444444-4444-4444-8444-444444444444", OpenedAt: time.Now().UTC(),
+		}}, Sandbox: sandbox,
+	}).Handle(context.Background(), studentID, actionID)
+	if err != nil || result.Available || len(result.Files) != 0 || result.Truncated {
+		t.Fatalf("missing sandbox must be a valid unavailable projection: result=%+v err=%v", result, err)
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(result.PolicyVersion)), "sandbox") {
+		t.Fatalf("policy version must not expose a sandbox identity: %+v", result)
+	}
+}
+
+func TestGetLearningActionCodeContextRejectsClosedAction(t *testing.T) {
+	closedAt := time.Now().UTC()
+	_, err := (GetLearningActionCodeContext{
+		Actions: learningActionReaderStub{action: domain.StudentLearningAction{
+			ID: "22222222-2222-4222-8222-222222222222", StudentTaskAnswerID: "33333333-3333-4333-8333-333333333333",
+			StudentID: "11111111-1111-4111-8111-111111111111", TaskID: "44444444-4444-4444-8444-444444444444",
+			ContextType: domain.LearningContextLessonTask, ContextID: "44444444-4444-4444-8444-444444444444",
+			OpenedAt: closedAt.Add(-time.Minute), ClosedAt: &closedAt,
+		}}, Sandbox: &learningActionCodeSandboxStub{},
+	}).Handle(context.Background(), "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("closed action error=%v, want conflict", err)
+	}
+}
+
+func TestGetLearningActionCodeContextFailsClosedForPracticeBindingWithoutAnswer(t *testing.T) {
+	sandbox := &learningActionCodeSandboxStub{}
+	_, err := (GetLearningActionCodeContext{
+		Actions: learningActionReaderStub{action: domain.StudentLearningAction{
+			ID: "22222222-2222-4222-8222-222222222222", StudentID: "11111111-1111-4111-8111-111111111111",
+			ContextType: domain.LearningContextPracticeTask, ContextID: "33333333-3333-4333-8333-333333333333",
+		}}, Sandbox: sandbox,
+	}).Handle(context.Background(), "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+	if !errors.Is(err, domain.ErrNotFound) || sandbox.reply != "" {
+		t.Fatalf("practice binding must not be mapped to a Sandbox answer: err=%v sandbox=%+v", err, sandbox)
+	}
+}

@@ -1,0 +1,143 @@
+package domain
+
+import "testing"
+
+func TestNextActionPrecedence(t *testing.T) {
+	req := func(kind string, done bool) LessonRequirement {
+		return LessonRequirement{ID: kind, Type: kind, Required: true, Satisfied: done}
+	}
+	cases := []struct {
+		name                 string
+		items                []LearningPathItem
+		runtime              *PracticeExecutionProjection
+		kind, status, reason string
+	}{
+		{"A_new_path", []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", ReferenceID: "lesson", Status: LearningPathItemReady}}, nil, "START_LESSON", "READY", "lesson_ready"},
+		{"B_theory_active", []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", ReferenceID: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{req("theory_acknowledged", false)}}}, nil, "CONTINUE_LESSON", "READY", "theory_required"},
+		{"C_quiz_remaining", []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{req("theory_acknowledged", true), req("quiz_passed", false)}}}, nil, "TAKE_QUIZ", "READY", "quiz_required"},
+		{"D_practice_active", []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}, &PracticeExecutionProjection{Status: "READY", SuggestedAction: "RESUME_PRACTICE", ReasonCode: "workspace_active", Version: "v1"}, "RESUME_PRACTICE", "READY", "workspace_active"},
+		{"E_failed_validation", []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}, &PracticeExecutionProjection{Status: "READY", SuggestedAction: "REVIEW_VALIDATION_RESULT", ReasonCode: "validation_failed", Version: "v2", AvailableActions: []string{"REVIEW_VALIDATION_RESULT", "RETRY_PRACTICE"}}, "REVIEW_VALIDATION_RESULT", "READY", "validation_failed"},
+		{"F_validation_running", []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}, &PracticeExecutionProjection{Status: "BLOCKED", ReasonCode: "validation_running", Version: "v3"}, "", "WAITING", "validation_running"},
+		{"G_completed_next", []LearningPathItem{{ID: "done", ReferenceType: "practice", Status: LearningPathItemCompleted}, {ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemReady}}, nil, "START_LESSON", "READY", "lesson_ready"},
+		{"K_optional", []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{{ID: "optional", Type: "practice_completed"}, req("quiz_passed", false)}}}, nil, "TAKE_QUIZ", "READY", "quiz_required"},
+		{"L_project_milestone", []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}, &PracticeExecutionProjection{Status: "READY", SuggestedAction: "RESUME_PRACTICE", ReasonCode: "milestone_available", Version: "v4", MilestoneID: "milestone"}, "RESUME_PRACTICE", "READY", "milestone_available"},
+		{"M_completed", []LearningPathItem{{ID: "done", ReferenceType: "lesson", Status: LearningPathItemCompleted}}, nil, "", "NO_PROGRESSION", "path_items_completed"},
+		{"active_before_ready", []LearningPathItem{{ID: "ready", ReferenceType: "lesson", Status: LearningPathItemReady}, {ID: "active", ReferenceType: "lesson", Status: LearningPathItemInProgress}}, nil, "CONTINUE_LESSON", "READY", "lesson_active"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := NextActionSnapshot{Context: StudentLearningContext{Version: 1}, SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Version: 1, Items: c.items}}
+			projections := map[string]PracticeExecutionProjection{}
+			if c.runtime != nil {
+				projections["instance"] = *c.runtime
+				s.Bindings = []PracticeLearningActionBinding{{TaskInstanceID: "instance", LearningPathID: "path", LearningPathItemID: "practice", LifecycleStatus: PracticeLearningActionOpen}}
+			}
+			got := ResolveNextAction(s, projections)
+			kind := ""
+			if got.Primary != nil {
+				kind = got.Primary.Kind
+			}
+			if kind != c.kind || got.Status != c.status || got.ReasonCode != c.reason {
+				t.Fatalf("got %#v primary %#v", got, got.Primary)
+			}
+			if got.SourceVersions.StateDigest == "" {
+				t.Fatal("missing provenance")
+			}
+		})
+	}
+}
+func TestNextActionRevisionAndUnavailable(t *testing.T) {
+	s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Version: 1, Items: []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}}, Bindings: []PracticeLearningActionBinding{{TaskInstanceID: "instance", LearningPathID: "path", LearningPathItemID: "practice", LifecycleStatus: PracticeLearningActionOpen}}}
+	got := ResolveNextAction(s, nil)
+	if got.Status != "WAITING" || got.Primary != nil {
+		t.Fatal(got)
+	}
+	s.SelectedPath.Version = 2
+	next := ResolveNextAction(s, nil)
+	if got.SourceVersions.StateDigest == next.SourceVersions.StateDigest {
+		t.Fatal("H/I stale revision digest unchanged")
+	}
+}
+func TestNextActionPrimarySecondary(t *testing.T) {
+	s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Items: []LearningPathItem{{ID: "practice", ReferenceType: "practice", Status: LearningPathItemInProgress}}}, Bindings: []PracticeLearningActionBinding{{TaskInstanceID: "instance", LearningPathID: "path", LearningPathItemID: "practice", LifecycleStatus: PracticeLearningActionOpen}}}
+	got := ResolveNextAction(s, map[string]PracticeExecutionProjection{"instance": {Status: "READY", SuggestedAction: "REVIEW_VALIDATION_RESULT", AvailableActions: []string{"REVIEW_VALIDATION_RESULT", "RETRY_PRACTICE"}}})
+	if got.Primary == nil || got.Primary.Kind != "REVIEW_VALIDATION_RESULT" || len(got.SecondaryActions) < 2 {
+		t.Fatal(got)
+	}
+}
+func TestNextActionLifecycleAndSemanticRequirementOrder(t *testing.T) {
+	s := NextActionSnapshot{LifecycleReason: "onboarding_required"}
+	got := ResolveNextAction(s, nil)
+	if got.Status != "PLANNING_REQUIRED" {
+		t.Fatal(got)
+	}
+	s.LifecycleReason = ""
+	s.SelectedPath = &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Items: []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{{ID: "p", Type: "practice_completed", Required: true}, {ID: "q", Type: "quiz_passed", Required: true}, {ID: "t", Type: "theory_acknowledged", Required: true}}}}}
+	got = ResolveNextAction(s, nil)
+	if got.Primary == nil || got.Primary.Kind != "CONTINUE_LESSON" {
+		t.Fatal(got)
+	}
+}
+
+func TestNextActionOfficialAttempt(t *testing.T) {
+	for _, c := range []struct {
+		status           int
+		kind, projection string
+	}{{StudentTaskAnswerStatusUnderReview, "", "WAITING"}, {StudentTaskAnswerStatusInProgress, "TAKE_QUIZ", "READY"}, {StudentTaskAnswerStatusFailed, "RETRY_TASK", "READY"}, {StudentTaskAnswerStatusPassed, "", "WAITING"}} {
+		s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Items: []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{{ID: "quiz", Type: "quiz_passed", Required: true}}}}}, Answers: []NextActionAnswerState{{LearningPathItemID: "lesson", RequirementID: "quiz", AnswerID: "answer", Status: c.status}}}
+		got := ResolveNextAction(s, nil)
+		if got.Status != c.projection {
+			t.Fatal(got)
+		}
+		if c.kind != "" && (got.Primary == nil || got.Primary.Kind != c.kind || got.Primary.Target.AnswerID != "answer") {
+			t.Fatal(got)
+		}
+	}
+}
+func TestNextActionOptionalRuntimeDoesNotBlock(t *testing.T) {
+	s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Items: []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemInProgress, FrozenRequirements: []LessonRequirement{{ID: "optional", Type: "practice_completed", Required: false}, {ID: "quiz", Type: "quiz_passed", Required: true}}}}}, Bindings: []PracticeLearningActionBinding{{LearningPathID: "path", LearningPathItemID: "lesson", RequirementID: "optional", TaskInstanceID: "instance", LifecycleStatus: PracticeLearningActionOpen}}}
+	got := ResolveNextAction(s, map[string]PracticeExecutionProjection{"instance": {Status: "BLOCKED", ReasonCode: "validation_running"}})
+	if got.Primary == nil || got.Primary.Kind != "TAKE_QUIZ" {
+		t.Fatal(got)
+	}
+}
+func TestNextActionEligiblePlanned(t *testing.T) {
+	for _, kind := range []string{"lesson", "practice"} {
+		s := NextActionSnapshot{SelectedPath: &StudentLearningPath{Status: LearningPathStatusActive, Items: []LearningPathItem{{Status: LearningPathItemCompleted}, {ReferenceType: kind, Status: LearningPathItemPlanned}}}}
+		got := ResolveNextAction(s, nil)
+		want := "START_LESSON"
+		if kind == "practice" {
+			want = "START_PRACTICE"
+		}
+		if got.Primary == nil || got.Primary.Kind != want {
+			t.Fatal(got)
+		}
+	}
+}
+
+func TestNextActionReplanUsesNewRoute(t *testing.T) {
+	s := NextActionSnapshot{Context: StudentLearningContext{Version: 1}, SelectedPath: &StudentLearningPath{ID: "path", CourseID: "old-course", Status: LearningPathStatusActive, Version: 1, Items: []LearningPathItem{{ID: "done", ReferenceType: "lesson", Status: LearningPathItemCompleted}, {ID: "old-item", ReferenceType: "lesson", ReferenceID: "old-lesson", Status: LearningPathItemPlanned}}}}
+	before := ResolveNextAction(s, nil)
+	s.Context.Version = 2
+	s.SelectedPath.Version = 2
+	s.SelectedPath.CourseID = "new-course"
+	s.SelectedPath.Items[1] = LearningPathItem{ID: "new-item", ReferenceType: "practice", ReferenceID: "new-revision", Status: LearningPathItemPlanned}
+	after := ResolveNextAction(s, nil)
+	if before.Primary == nil || before.Primary.Target.LessonID != "old-lesson" || after.Primary == nil || after.Primary.Kind != "START_PRACTICE" || after.Primary.Target.PracticeRevisionID != "new-revision" || after.Primary.Target.CourseID != "new-course" || after.SourceVersions.PathVersion != 2 || before.SourceVersions.StateDigest == after.SourceVersions.StateDigest {
+		t.Fatal(before, after)
+	}
+}
+func TestNextActionOptionalOtherPathDoesNotBlock(t *testing.T) {
+	s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive, Items: []LearningPathItem{{ID: "lesson", ReferenceType: "lesson", Status: LearningPathItemReady}}}, Bindings: []PracticeLearningActionBinding{{LearningPathID: "other", LearningPathItemID: "other-item", RequirementID: "optional", TaskInstanceID: "instance", LifecycleStatus: PracticeLearningActionOpen}}, BindingRequirements: map[string]LessonRequirement{"other-item:optional": {ID: "optional", Required: false}}}
+	got := ResolveNextAction(s, nil)
+	if got.Primary == nil || got.Primary.Kind != "START_LESSON" {
+		t.Fatal(got)
+	}
+}
+func TestNextActionBlockedBeforeActive(t *testing.T) {
+	s := NextActionSnapshot{SelectedPath: &StudentLearningPath{ID: "path", Status: LearningPathStatusActive}, Bindings: []PracticeLearningActionBinding{{TaskInstanceID: "a-active", LearningPathID: "path", LifecycleStatus: PracticeLearningActionOpen}, {TaskInstanceID: "z-blocked", LearningPathID: "path", LifecycleStatus: PracticeLearningActionOpen}}}
+	got := ResolveNextAction(s, map[string]PracticeExecutionProjection{"a-active": {Status: "READY", SuggestedAction: "RESUME_PRACTICE", ReasonCode: "practice_active"}, "z-blocked": {Status: "BLOCKED", ReasonCode: "validation_running"}})
+	if got.Status != "WAITING" || got.Primary != nil || got.ReasonCode != "validation_running" {
+		t.Fatal(got)
+	}
+}

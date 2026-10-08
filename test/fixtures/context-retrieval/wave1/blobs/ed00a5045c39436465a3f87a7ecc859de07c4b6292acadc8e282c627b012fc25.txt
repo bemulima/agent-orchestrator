@@ -1,0 +1,446 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LearningActionLifecycleRepoPG commits answer state and action events atomically.
+type LearningActionLifecycleRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (repo LearningActionLifecycleRepoPG) CreateAnswer(
+	ctx context.Context,
+	answer domain.StudentTaskAnswer,
+	maxAttempts *int,
+	action domain.StudentLearningAction,
+) (domain.StudentTaskAnswer, domain.StudentLearningAction, error) {
+	if repo.Pool == nil || action.StudentTaskAnswerID != answer.ID || action.StudentID != answer.StudentID || action.TaskID != answer.TaskID {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	if !domain.IsLearningEvidenceClass(action.EvidenceClass) {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	targets, err := json.Marshal(action.LearningTargets)
+	if err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := validateLessonAssessmentStartTx(ctx, tx, answer); err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	if answer.LearningPathItemID != "" {
+		if err := activateLessonItemTx(ctx, tx, answer.StudentID, answer.LearningPathItemID, answer.StartedAt); err != nil {
+			return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+		}
+	}
+
+	err = tx.QueryRow(ctx, `
+WITH stats AS (
+    SELECT COALESCE(MAX(attempt), 0) AS last_attempt, COUNT(*) AS count
+    FROM student_task_answer
+    WHERE task_id = $1 AND student_id = $2
+ AND learning_path_item_id IS NOT DISTINCT FROM NULLIF($14, '')::uuid
+ AND requirement_id IS NOT DISTINCT FROM NULLIF($15, '')::uuid
+), inserted AS (
+    INSERT INTO student_task_answer (
+        id, student_id, task_id, filestorage_id, answer_payload,
+        started_at, ended_at, status, attempt, created_at, updated_at, learning_path_item_id, requirement_id, frozen_task_json
+    )
+    SELECT $3, $4, $5, $6, $7, $8, $9, $10, stats.last_attempt + 1, $11, $12, NULLIF($14, '')::uuid, NULLIF($15, '')::uuid, $16::jsonb
+    FROM stats
+    WHERE $13::int IS NULL OR stats.count < $13
+    RETURNING attempt
+)
+SELECT attempt FROM inserted
+`,
+		answer.TaskID,
+		answer.StudentID,
+		answer.ID,
+		answer.StudentID,
+		answer.TaskID,
+		answer.FilestorageID,
+		answer.AnswerPayload,
+		answer.StartedAt,
+		answer.EndedAt,
+		answer.Status,
+		answer.CreatedAt,
+		answer.UpdatedAt,
+		maxAttempts, answer.LearningPathItemID, answer.RequirementID, answer.FrozenTaskJSON,
+	).Scan(&answer.Attempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, domain.ErrMaxAttempts
+	}
+	if err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	action.Cycle = 1
+	if err := insertLearningAction(ctx, tx, action, targets); err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentTaskAnswer{}, domain.StudentLearningAction{}, err
+	}
+	return answer, action, nil
+}
+
+func (repo LearningActionLifecycleRepoPG) EnsureActive(ctx context.Context, action domain.StudentLearningAction) (domain.StudentLearningAction, error) {
+	if repo.Pool == nil || !domain.IsLearningEvidenceClass(action.EvidenceClass) {
+		return domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	active, err := repo.GetActiveByAnswer(ctx, action.StudentTaskAnswerID)
+	if err == nil {
+		return active, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentLearningAction{}, err
+	}
+	targets, err := json.Marshal(action.LearningTargets)
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	answer, err := guardCourseActionOpeningTx(ctx, tx, domain.StudentTaskAnswer{ID: action.StudentTaskAnswerID, StudentID: action.StudentID, TaskID: action.TaskID})
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	if answer.LearningPathItemID != "" {
+		if err := activateLessonItemTx(ctx, tx, answer.StudentID, answer.LearningPathItemID, action.OpenedAt); err != nil {
+			return domain.StudentLearningAction{}, err
+		}
+	}
+	err = tx.QueryRow(ctx, `
+INSERT INTO student_learning_action (
+    id, student_task_answer_id, student_id, task_id, cycle,
+    context_type, context_id, learning_targets, evidence_class, opened_at, created_at, learning_path_item_id, requirement_id
+)
+SELECT $1, $2, $3, $4, COALESCE(MAX(cycle), 0) + 1, $5, $6, $7::jsonb, $8, $9, $9,
+ (SELECT learning_path_item_id FROM student_task_answer WHERE id=$2),
+ (SELECT requirement_id FROM student_task_answer WHERE id=$2)
+FROM student_learning_action
+WHERE student_task_answer_id = $2
+RETURNING cycle
+`, action.ID, action.StudentTaskAnswerID, action.StudentID, action.TaskID, action.ContextType, action.ContextID, string(targets), action.EvidenceClass, action.OpenedAt).Scan(&action.Cycle)
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentLearningAction{}, err
+		}
+		return action, nil
+	}
+	_ = tx.Rollback(ctx)
+	if active, activeErr := repo.GetActiveByAnswer(ctx, action.StudentTaskAnswerID); activeErr == nil {
+		return active, nil
+	}
+	return domain.StudentLearningAction{}, err
+}
+
+func (repo LearningActionLifecycleRepoPG) GetActiveByAnswer(ctx context.Context, answerID string) (domain.StudentLearningAction, error) {
+	if repo.Pool == nil {
+		return domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	return scanLearningAction(repo.Pool.QueryRow(ctx, `
+SELECT id, student_task_answer_id, student_id, task_id, cycle, context_type,
+       context_id, learning_targets, evidence_class, outcome,
+       outcome_policy_version, opened_at, closed_at
+FROM student_learning_action
+WHERE student_task_answer_id = $1 AND closed_at IS NULL
+`, answerID))
+}
+
+// GetByStudentAndID enforces action ownership in the database lookup so a
+// missing and a foreign action have the same not-found result.
+func (repo LearningActionLifecycleRepoPG) GetByStudentAndID(
+	ctx context.Context,
+	studentID string,
+	learningActionID string,
+) (domain.StudentLearningAction, error) {
+	if repo.Pool == nil {
+		return domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	return scanLearningAction(repo.Pool.QueryRow(ctx, `
+SELECT id, student_task_answer_id, student_id, task_id, cycle, context_type,
+       context_id, learning_targets, evidence_class, outcome,
+       outcome_policy_version, opened_at, closed_at
+FROM student_learning_action
+WHERE id = $1 AND student_id = $2 AND source_kind = 'course_answer'
+`, learningActionID, studentID))
+}
+
+func (repo LearningActionLifecycleRepoPG) ReopenAnswer(
+	ctx context.Context,
+	answer domain.StudentTaskAnswer,
+	action domain.StudentLearningAction,
+) (domain.StudentLearningAction, error) {
+	if repo.Pool == nil || action.StudentTaskAnswerID != answer.ID || action.StudentID != answer.StudentID || action.TaskID != answer.TaskID {
+		return domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	if !domain.IsLearningEvidenceClass(action.EvidenceClass) {
+		return domain.StudentLearningAction{}, domain.ErrValidation
+	}
+	targets, err := json.Marshal(action.LearningTargets)
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	answer, err = guardCourseActionOpeningTx(ctx, tx, answer)
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	if answer.LearningPathItemID != "" {
+		if err := activateLessonItemTx(ctx, tx, answer.StudentID, answer.LearningPathItemID, action.OpenedAt); err != nil {
+			return domain.StudentLearningAction{}, err
+		}
+	}
+	if err := updateAnswer(ctx, tx, answer); err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	err = tx.QueryRow(ctx, `
+INSERT INTO student_learning_action (
+    id, student_task_answer_id, student_id, task_id, cycle,
+    context_type, context_id, learning_targets, evidence_class, opened_at, created_at, learning_path_item_id, requirement_id
+)
+SELECT $1, $2, $3, $4, COALESCE(MAX(cycle), 0) + 1, $5, $6, $7::jsonb, $8, $9, $9,
+ (SELECT learning_path_item_id FROM student_task_answer WHERE id=$2),
+ (SELECT requirement_id FROM student_task_answer WHERE id=$2)
+FROM student_learning_action
+WHERE student_task_answer_id = $2
+RETURNING cycle
+`, action.ID, action.StudentTaskAnswerID, action.StudentID, action.TaskID, action.ContextType, action.ContextID, string(targets), action.EvidenceClass, action.OpenedAt).Scan(&action.Cycle)
+	if err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	return action, nil
+}
+
+func (repo LearningActionLifecycleRepoPG) CloseAnswer(
+	ctx context.Context,
+	answer domain.StudentTaskAnswer,
+	action domain.StudentLearningAction,
+	event domain.IntegrationEvent,
+) error {
+	if repo.Pool == nil || action.StudentTaskAnswerID != answer.ID || event.Subject != domain.SubjectLearningActionClosed ||
+		event.CorrelationID != action.ID || event.CausationID != answer.ID || event.StudentID != answer.StudentID ||
+		action.OutcomePolicyVersion != domain.MasteryPolicyVersion {
+		return domain.ErrValidation
+	}
+	expectedOutcome, err := domain.LearningActionOutcomeForAnswerStatus(answer.Status)
+	if err != nil || !domain.IsLearningActionOutcome(action.Outcome) || action.Outcome != expectedOutcome {
+		return domain.ErrValidation
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// All action writers acquire the planning fence before action/answer rows.
+	// PASSED closure applies a fact under this same fence; acquiring it late
+	// would invert the ordering against a concurrent new/reopened cycle.
+	if err := lockStudentAdmissionFence(ctx, tx, answer.StudentID); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE student_learning_action
+SET closed_at = $2, outcome = $4, outcome_policy_version = $5
+WHERE id = $1 AND student_task_answer_id = $3 AND closed_at IS NULL
+`, action.ID, event.OccurredAt, answer.ID, action.Outcome, action.OutcomePolicyVersion)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrInvalidStatus
+	}
+	if err := updateAnswer(ctx, tx, answer); err != nil {
+		return err
+	}
+	if answer.Status == domain.StudentTaskAnswerStatusPassed {
+		// Correlation and scoring snapshot are immutable persisted attempt identity.
+		var itemID, requirementID string
+		var frozen json.RawMessage
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(learning_path_item_id::text,''), COALESCE(requirement_id::text,''), frozen_task_json FROM student_task_answer WHERE id=$1 AND student_id=$2 AND task_id=$3 FOR UPDATE`, answer.ID, answer.StudentID, answer.TaskID).Scan(&itemID, &requirementID, &frozen); err != nil {
+			return err
+		}
+		if itemID != "" || requirementID != "" {
+			var snapshot struct {
+				ID         string `json:"id"`
+				Type       string `json:"_completion_fact_type"`
+				RevisionID string `json:"_completion_source_revision_id"`
+			}
+			if json.Unmarshal(frozen, &snapshot) != nil || snapshot.ID != answer.TaskID || itemID == "" || requirementID == "" || (snapshot.Type != "quiz_passed" && snapshot.Type != "task_passed") {
+				return domain.ErrValidation
+			}
+			if _, _, err := applyLessonFactTx(ctx, tx, domain.LessonActivityFact{StudentID: answer.StudentID, ItemID: itemID, RequirementID: requirementID, Type: snapshot.Type, SourceID: answer.TaskID, SourceRevisionID: snapshot.RevisionID, FactID: answer.ID, OccurredAt: event.OccurredAt}); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO student_outbox (
+    event_id, subject, schema_version, student_id, correlation_id,
+    causation_id, occurred_at, payload, next_attempt_at, created_at
+) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8::jsonb, $7, $7)
+`, event.EventID, event.Subject, event.SchemaVersion, event.StudentID, event.CorrelationID, event.CausationID, event.OccurredAt, string(event.Payload))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func insertLearningAction(ctx context.Context, tx pgx.Tx, action domain.StudentLearningAction, targets []byte) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_learning_action (
+    id, student_task_answer_id, student_id, task_id, cycle,
+    context_type, context_id, learning_targets, evidence_class, opened_at, created_at, learning_path_item_id, requirement_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $10,
+ (SELECT learning_path_item_id FROM student_task_answer WHERE id=$2),
+ (SELECT requirement_id FROM student_task_answer WHERE id=$2))
+`, action.ID, action.StudentTaskAnswerID, action.StudentID, action.TaskID, action.Cycle, action.ContextType, action.ContextID, string(targets), action.EvidenceClass, action.OpenedAt)
+	return err
+}
+
+func updateAnswer(ctx context.Context, tx pgx.Tx, answer domain.StudentTaskAnswer) error {
+	_, err := tx.Exec(ctx, `
+UPDATE student_task_answer
+SET filestorage_id = $1, answer_payload = $2, ended_at = $3,
+    status = $4, attempt = $5, updated_at = $6
+WHERE id = $7
+`, answer.FilestorageID, answer.AnswerPayload, answer.EndedAt, answer.Status, answer.Attempt, answer.UpdatedAt, answer.ID)
+	return err
+}
+
+type learningActionRow interface {
+	Scan(dest ...any) error
+}
+
+func scanLearningAction(row learningActionRow) (domain.StudentLearningAction, error) {
+	var action domain.StudentLearningAction
+	var targets json.RawMessage
+	var evidenceClass, outcome, outcomePolicyVersion sql.NullString
+	if err := row.Scan(
+		&action.ID,
+		&action.StudentTaskAnswerID,
+		&action.StudentID,
+		&action.TaskID,
+		&action.Cycle,
+		&action.ContextType,
+		&action.ContextID,
+		&targets,
+		&evidenceClass,
+		&outcome,
+		&outcomePolicyVersion,
+		&action.OpenedAt,
+		&action.ClosedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.StudentLearningAction{}, domain.ErrNotFound
+		}
+		return domain.StudentLearningAction{}, err
+	}
+	if err := json.Unmarshal(targets, &action.LearningTargets); err != nil {
+		return domain.StudentLearningAction{}, err
+	}
+	if evidenceClass.Valid {
+		action.EvidenceClass = domain.LearningEvidenceClass(evidenceClass.String)
+	}
+	if outcome.Valid {
+		action.Outcome = domain.LearningActionOutcome(outcome.String)
+	}
+	if outcomePolicyVersion.Valid {
+		action.OutcomePolicyVersion = outcomePolicyVersion.String
+	}
+	return action, nil
+}
+
+var _ repository.LearningActionLifecycleRepository = (*LearningActionLifecycleRepoPG)(nil)
+var _ repository.LearningActionReader = (*LearningActionLifecycleRepoPG)(nil)
+
+// Serialize correlated starts with path facts/replans and recheck frozen membership
+// after acquiring the lock, so stale reads cannot start a removed assignment.
+func validateLessonAssessmentStartTx(ctx context.Context, tx pgx.Tx, answer domain.StudentTaskAnswer) error {
+	if answer.LearningPathItemID == "" && answer.RequirementID == "" {
+		return nil
+	}
+	if answer.LearningPathItemID == "" || answer.RequirementID == "" {
+		return domain.ErrValidation
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "learning-path:"+answer.StudentID); err != nil {
+		return err
+	}
+	var pathStatus, itemStatus string
+	var requirements json.RawMessage
+	err := tx.QueryRow(ctx, `SELECT p.status,i.status,i.frozen_requirements FROM student_learning_path_item i JOIN student_learning_path p ON p.id=i.student_learning_path_id WHERE i.id=$1 AND p.student_id=$2 FOR UPDATE OF p,i`, answer.LearningPathItemID, answer.StudentID).Scan(&pathStatus, &itemStatus, &requirements)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if (pathStatus != string(domain.LearningPathStatusActive) && pathStatus != string(domain.LearningPathStatusPaused)) || itemStatus == string(domain.LearningPathItemCompleted) || itemStatus == string(domain.LearningPathItemSkippedMastered) {
+		return domain.ErrInvalidStatus
+	}
+	if _, err := validateLessonCommandAdmissionTx(ctx, tx, answer.StudentID, answer.LearningPathItemID, answer.RequirementID); err != nil {
+		return err
+	}
+	var list []domain.LessonRequirement
+	var snapshot struct {
+		ID         string `json:"id"`
+		Type       string `json:"_completion_fact_type"`
+		RevisionID string `json:"_completion_source_revision_id"`
+	}
+	if json.Unmarshal(requirements, &list) != nil || json.Unmarshal(answer.FrozenTaskJSON, &snapshot) != nil || snapshot.ID != answer.TaskID {
+		return domain.ErrValidation
+	}
+	for _, r := range list {
+		if r.ID != answer.RequirementID {
+			continue
+		}
+		if r.Satisfied || r.SourceReference.ID != answer.TaskID || r.Type != snapshot.Type || r.SourceReference.RevisionID != snapshot.RevisionID || (r.Type != "quiz_passed" && r.Type != "task_passed") {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	return domain.ErrNotFound
+}
+
+// Opening/reopening must serialize with planning before loading the immutable
+// persisted assignment. A stale pre-transaction answer cannot recreate an OPEN
+// action after planning removed its item or changed its admissibility.
+func guardCourseActionOpeningTx(ctx context.Context, tx pgx.Tx, answer domain.StudentTaskAnswer) (domain.StudentTaskAnswer, error) {
+	if err := lockStudentAdmissionFence(ctx, tx, answer.StudentID); err != nil {
+		return domain.StudentTaskAnswer{}, err
+	}
+	err := tx.QueryRow(ctx, `SELECT COALESCE(learning_path_item_id::text,''),COALESCE(requirement_id::text,''),frozen_task_json
+ FROM student_task_answer WHERE id=$1 AND student_id=$2 AND task_id=$3 FOR UPDATE`, answer.ID, answer.StudentID, answer.TaskID).Scan(&answer.LearningPathItemID, &answer.RequirementID, &answer.FrozenTaskJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentTaskAnswer{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentTaskAnswer{}, err
+	}
+	if err := validateLessonAssessmentStartTx(ctx, tx, answer); err != nil {
+		return domain.StudentTaskAnswer{}, err
+	}
+	return answer, nil
+}

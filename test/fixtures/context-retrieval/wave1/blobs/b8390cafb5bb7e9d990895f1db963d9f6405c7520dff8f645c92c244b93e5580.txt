@@ -1,0 +1,102 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/middleware"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/curriculum"
+)
+
+type curriculumPlanner interface {
+	Execute(context.Context, curriculum.PlanInput) (curriculum.PlanResult, error)
+}
+
+type diagnosticPlanner interface {
+	Complete(context.Context, string, string) (domain.TeacherDiagnosticPlacementState, error)
+	Plan(context.Context, string, string) (domain.TeacherDiagnosticPlacementState, error)
+}
+
+type CurriculumHandler struct {
+	Planner    curriculumPlanner
+	Diagnostic diagnosticPlanner
+}
+
+func (handler CurriculumHandler) Plan(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var request struct {
+		DiagnosticPlanID string                     `json:"diagnostic_plan_id"`
+		GoalCode         string                     `json:"goal_code"`
+		DesiredOutcome   string                     `json:"desired_outcome"`
+		RequestedTargets []domain.LearningTargetRef `json:"requested_targets"`
+		Constraints      curriculum.PlanConstraints `json:"constraints"`
+		Reason           curriculum.PlanReason      `json:"reason"`
+	}
+	body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<10))
+	if readErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || fields == nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	if _, diagnostic := fields["diagnostic_plan_id"]; diagnostic {
+		if len(fields) != 1 || request.DiagnosticPlanID == "" || r.Header.Get("Idempotency-Key") != request.DiagnosticPlanID {
+			writeError(w, http.StatusBadRequest, "diagnostic planning accepts only diagnostic_plan_id")
+			return
+		}
+		if handler.Diagnostic == nil {
+			writeError(w, http.StatusServiceUnavailable, "diagnostic planner unavailable")
+			return
+		}
+		result, err := handler.Diagnostic.Plan(r.Context(), studentID, request.DiagnosticPlanID)
+		writeDiagnosticPlacementResult(w, result, err)
+		return
+	}
+	if handler.Planner == nil {
+		writeError(w, http.StatusServiceUnavailable, "curriculum planner unavailable")
+		return
+	}
+	reason := request.Reason
+	if reason == "" {
+		reason = curriculum.PlanReasonInitial
+	}
+	result, err := handler.Planner.Execute(r.Context(), curriculum.PlanInput{
+		StudentID: studentID, IdempotencyKey: strings.TrimSpace(r.Header.Get("Idempotency-Key")),
+		GoalCode: request.GoalCode, DesiredOutcome: request.DesiredOutcome,
+		Targets: request.RequestedTargets, Constraints: request.Constraints, Reason: reason,
+	})
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusAccepted, result)
+	case errors.Is(err, domain.ErrTeacherGenerationConflict):
+		writeError(w, http.StatusConflict, "learning path version conflict")
+	case errors.Is(err, domain.ErrInvalidCurriculum), errors.Is(err, domain.ErrInvalidStudentContext):
+		writeError(w, http.StatusUnprocessableEntity, "curriculum cannot be planned from current state")
+	case errors.Is(err, domain.ErrCurriculumUnavailable), errors.Is(err, domain.ErrStudentStateUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "curriculum dependency unavailable")
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to plan learning path")
+	}
+}

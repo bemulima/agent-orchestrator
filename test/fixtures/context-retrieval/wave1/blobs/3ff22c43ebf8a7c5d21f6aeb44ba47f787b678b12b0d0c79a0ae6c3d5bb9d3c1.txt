@@ -1,0 +1,129 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// OutboxRepository leases and updates durable events in PostgreSQL.
+type OutboxRepository struct {
+	Pool *pgxpool.Pool
+}
+
+// Claim leases pending events using SKIP LOCKED so multiple relay replicas may run safely.
+func (outbox OutboxRepository) Claim(ctx context.Context, claim repository.OutboxClaim) ([]domain.IntegrationEvent, error) {
+	if outbox.Pool == nil || strings.TrimSpace(claim.WorkerID) == "" || claim.Limit <= 0 ||
+		claim.Now.IsZero() || !claim.LockedUntil.After(claim.Now) {
+		return nil, errors.New("invalid outbox claim")
+	}
+	rows, err := outbox.Pool.Query(ctx, `
+		WITH candidates AS (
+			SELECT event_id
+			FROM teacher_outbox
+			WHERE published_at IS NULL
+			  AND next_attempt_at <= $1
+			  AND (locked_until IS NULL OR locked_until <= $1)
+			ORDER BY occurred_at, event_id
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		)
+		UPDATE teacher_outbox AS event
+		SET
+			locked_by = $3,
+			locked_until = $4,
+			attempts = event.attempts + 1
+		FROM candidates
+		WHERE event.event_id = candidates.event_id
+		RETURNING
+			event.event_id,
+			event.subject,
+			event.correlation_id,
+			COALESCE(event.causation_id, ''),
+			event.student_id,
+			event.occurred_at,
+			event.schema_version,
+			event.payload,
+			event.attempts
+	`, claim.Now.UTC(), claim.Limit, claim.WorkerID, claim.LockedUntil.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]domain.IntegrationEvent, 0, claim.Limit)
+	for rows.Next() {
+		var event domain.IntegrationEvent
+		var payload []byte
+		if err := rows.Scan(
+			&event.EventID,
+			&event.Subject,
+			&event.CorrelationID,
+			&event.CausationID,
+			&event.StudentID,
+			&event.OccurredAt,
+			&event.SchemaVersion,
+			&payload,
+			&event.Attempts,
+		); err != nil {
+			return nil, err
+		}
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("outbox event %s contains invalid JSON", event.EventID)
+		}
+		event.Payload = json.RawMessage(payload)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// MarkPublished completes a leased event after a JetStream acknowledgement.
+func (outbox OutboxRepository) MarkPublished(ctx context.Context, eventID, workerID string, publishedAt time.Time) error {
+	command, err := outbox.Pool.Exec(ctx, `
+		UPDATE teacher_outbox
+		SET
+			published_at = $3,
+			locked_by = NULL,
+			locked_until = NULL,
+			last_error = NULL
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL
+	`, eventID, workerID, publishedAt.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return errors.New("outbox publication lease was lost")
+	}
+	return nil
+}
+
+// MarkFailed releases a lease and schedules a bounded retry.
+func (outbox OutboxRepository) MarkFailed(ctx context.Context, eventID, workerID, message string, retryAt time.Time) error {
+	command, err := outbox.Pool.Exec(ctx, `
+		UPDATE teacher_outbox
+		SET
+			next_attempt_at = $3,
+			locked_by = NULL,
+			locked_until = NULL,
+			last_error = $4
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL
+	`, eventID, workerID, retryAt.UTC(), message)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return errors.New("outbox failure lease was lost")
+	}
+	return nil
+}

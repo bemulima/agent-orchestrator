@@ -1,0 +1,283 @@
+package learningplanner
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/curriculum"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCreateOnboardingPlanHandoffUsesDedicatedStrictContract(t *testing.T) {
+	intent := handoffClientIntent(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, http.MethodPost, request.Method)
+		require.Equal(t, "/internal/students/"+readinessStudentID+"/onboarding-plan-handoffs", request.URL.Path)
+		require.Equal(t, "handoff-secret", request.Header.Get("X-Internal-Token"))
+		require.Equal(t, intent.CommandID, request.Header.Get("Idempotency-Key"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+		require.Equal(t, map[string]any{
+			"schema":             "teacher-onboarding-plan-handoff-request.v1",
+			"expected_state_ref": map[string]any{"kind": "accepted_draft", "version": float64(4)},
+			"dialog_id":          intent.DialogID, "teacher_job_id": intent.CommandTeacherJobID,
+		}, body)
+		for _, forbidden := range []string{"profile", "desired_stacks", "graph", "goal", "course_id", "learning_path_id"} {
+			require.NotContains(t, body, forbidden)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusCreated)
+		_, _ = writer.Write([]byte(`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T10:00:00Z","replayed":false}`))
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "readiness-secret", HandoffToken: "handoff-secret", HTTPClient: server.Client()}
+	result, err := client.CreateOnboardingPlanHandoff(context.Background(), intent)
+	require.NoError(t, err)
+	require.Equal(t, "66666666-6666-4666-8666-666666666666", result.HandoffID)
+	require.Equal(t, "2026-09-11T10:00:00Z", result.ReadinessObservedAt)
+}
+
+func TestCreateOnboardingPlanHandoffParsesExactConflictCodes(t *testing.T) {
+	for _, testCase := range []struct {
+		name, body string
+		want       error
+	}{
+		{name: "active path", body: `{"error":{"code":"active_path_exists"}}`, want: domain.ErrTeacherOnboardingHandoffActivePath},
+		{name: "state changed", body: `{"error":{"code":"state_changed"}}`, want: domain.ErrTeacherOnboardingHandoffStateChanged},
+		{name: "idempotency", body: `{"error":{"code":"idempotency_conflict"}}`, want: domain.ErrTeacherOnboardingHandoffConflict},
+		{name: "unknown", body: `{"error":{"code":"future_conflict"}}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+		{name: "malformed", body: `{"error":{"code":"state_changed"},"extra":true}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusConflict)
+				_, _ = writer.Write([]byte(testCase.body))
+			}))
+			defer server.Close()
+			intent := handoffClientIntent(t)
+			client := Client{BaseURL: server.URL, HandoffToken: "handoff-secret", HTTPClient: server.Client()}
+			_, err := client.CreateOnboardingPlanHandoff(context.Background(), intent)
+			require.ErrorIs(t, err, testCase.want)
+		})
+	}
+}
+
+func TestCreateOnboardingPlanHandoffStrictlyParsesStructuralErrors(t *testing.T) {
+	for _, testCase := range []struct {
+		name, contentType, body string
+		status                  int
+		want                    error
+	}{
+		{name: "known bad student", status: http.StatusBadRequest, contentType: "application/json", body: `{"error":{"code":"invalid_student_id"}}`, want: domain.ErrTeacherOnboardingHandoffRejected},
+		{name: "known not ready", status: http.StatusUnprocessableEntity, contentType: "application/json", body: `{"error":{"code":"not_ready"}}`, want: domain.ErrTeacherOnboardingHandoffRejected},
+		{name: "unknown 422", status: http.StatusUnprocessableEntity, contentType: "application/json", body: `{"error":{"code":"future_rejection"}}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+		{name: "wrong status for known code", status: http.StatusUnprocessableEntity, contentType: "application/json", body: `{"error":{"code":"state_changed"}}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+		{name: "wrong content type", status: http.StatusConflict, contentType: "text/plain", body: `{"error":{"code":"state_changed"}}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+		{name: "trailing JSON", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"state_changed"}} {}`, want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+		{name: "oversized", status: http.StatusUnprocessableEntity, contentType: "application/json", body: strings.Repeat("x", maximumHandoffResponseBytes+1), want: domain.ErrTeacherOnboardingHandoffInvalidResponse},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", testCase.contentType)
+				writer.WriteHeader(testCase.status)
+				_, _ = writer.Write([]byte(testCase.body))
+			}))
+			defer server.Close()
+			client := Client{BaseURL: server.URL, HandoffToken: "handoff-secret", HTTPClient: server.Client()}
+			_, err := client.CreateOnboardingPlanHandoff(context.Background(), handoffClientIntent(t))
+			require.ErrorIs(t, err, testCase.want)
+		})
+	}
+}
+
+func TestCreateOnboardingPlanHandoffRejectsMalformedSuccess(t *testing.T) {
+	for _, body := range []string{
+		`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","replayed":false}`,
+		`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T12:00:00+02:00","replayed":false}`,
+		`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T10:00:00Z","replayed":false,"path_id":"77777777-7777-4777-8777-777777777777"}`,
+		`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T10:00:00Z"}`,
+		`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T10:00:00Z","replayed":null}`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			_, _ = writer.Write([]byte(body))
+		}))
+		intent := handoffClientIntent(t)
+		client := Client{BaseURL: server.URL, HandoffToken: "handoff-secret", HTTPClient: server.Client()}
+		_, err := client.CreateOnboardingPlanHandoff(context.Background(), intent)
+		require.ErrorIs(t, err, domain.ErrTeacherOnboardingHandoffInvalidResponse)
+		server.Close()
+	}
+}
+
+func TestCreateOnboardingPlanHandoffRequiresReplayStatusCoupling(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"schema":"teacher-onboarding-plan-handoff.v1","handoff_id":"66666666-6666-4666-8666-666666666666","status":"ACCEPTED","state_ref":{"kind":"accepted_draft","version":4},"goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"},"execution_status":"NOT_STARTED","content_status":"NOT_CREATED","readiness_observed_at":"2026-09-11T10:00:00Z","replayed":false}`))
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, HandoffToken: "handoff-secret", HTTPClient: server.Client()}
+	_, err := client.CreateOnboardingPlanHandoff(context.Background(), handoffClientIntent(t))
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingHandoffInvalidResponse)
+}
+
+func handoffClientIntent(t *testing.T) domain.TeacherOnboardingHandoffIntent {
+	t.Helper()
+	now := time.Date(2026, 9, 11, 9, 0, 0, 0, time.UTC)
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(
+		domain.PersonalTeacher{ID: "22222222-2222-4222-8222-222222222222", StudentID: readinessStudentID},
+		domain.TeacherDialogBinding{ID: "33333333-3333-4333-8333-333333333333", StudentID: readinessStudentID, PersonalTeacherID: "22222222-2222-4222-8222-222222222222", ContextType: domain.LearningContextGeneral},
+		domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+			ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+			StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+			ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion}},
+		"ru", "", "", now,
+	)
+	require.NoError(t, err)
+	intent.Status, intent.ClaimToken, intent.LockedBy, intent.LockedUntil, intent.Attempts = domain.TeacherOnboardingHandoffDispatching, "55555555-5555-4555-8555-555555555555", "worker", now.Add(time.Minute), 1
+	intent, err = domain.NewTeacherOnboardingHandoffIntent(intent)
+	require.NoError(t, err)
+	return intent
+}
+
+const readinessStudentID = "11111111-1111-4111-8111-111111111111"
+
+func TestResolveLearningReadinessUsesExactFencedReadOnlyContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, http.MethodPost, request.Method)
+		require.Equal(t, "/internal/students/"+readinessStudentID+"/learning-readiness", request.URL.Path)
+		require.Equal(t, "teacher-secret", request.Header.Get("X-Internal-Token"))
+		require.Empty(t, request.Header.Get("Idempotency-Key"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+		require.Equal(t, "learning-readiness-request.v1", body["schema"])
+		require.Equal(t, map[string]any{"kind": "accepted_draft", "version": float64(4)}, body["expected_state_ref"])
+		for _, forbidden := range []string{"profile", "goal", "graph", "desired_stacks", "mastery", "active_path"} {
+			require.NotContains(t, body, forbidden)
+		}
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = writer.Write([]byte(`{"schema":"learning-readiness.v1","result":"READY","reason_codes":["FOUNDATION_GRAPH_RESOLVED"],"resolver_version":"learning-readiness-resolver-v1","state_ref":{"kind":"accepted_draft","version":4},"readiness_scope":"PUBLISHED_GRAPH_RESOLUTION","executable":false,"content_status":"NOT_CREATED","goal":{"code":"programming.foundation","version":"v1","graph_version":"programming-foundation-graph-v1"}}`))
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "teacher-secret", HTTPClient: server.Client()}
+	result, err := client.ResolveLearningReadiness(context.Background(), readinessStudentID, domain.TeacherStudentReadinessStateRef{Kind: "accepted_draft", Version: 4})
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherFoundationGoalCode, result.Goal.Code)
+}
+
+func TestResolveLearningReadinessRejectsStaleOperationalAndMalformedResults(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantStale   bool
+	}{
+		{name: "stale", status: http.StatusConflict, contentType: "application/json", body: `{}`, wantStale: true},
+		{name: "planner 5xx", status: http.StatusServiceUnavailable, contentType: "application/json", body: `{}`},
+		{name: "planner 422", status: http.StatusUnprocessableEntity, contentType: "application/json", body: `{}`},
+		{name: "wrong content type", status: http.StatusOK, contentType: "text/plain", body: `{}`},
+		{name: "unknown field", status: http.StatusOK, contentType: "application/json", body: `{"unexpected":true}`},
+		{name: "wrong state ref", status: http.StatusOK, contentType: "application/json", body: `{"schema":"learning-readiness.v1","result":"NEEDS_CLARIFICATION","reason_codes":["PROFILE_INCOMPLETE"],"resolver_version":"learning-readiness-resolver-v1","state_ref":{"kind":"accepted_draft","version":5},"readiness_scope":"PUBLISHED_GRAPH_RESOLUTION","executable":false,"content_status":"NOT_CREATED"}`, wantStale: true},
+		{name: "impossible result reason", status: http.StatusOK, contentType: "application/json", body: `{"schema":"learning-readiness.v1","result":"READY","reason_codes":["PROFILE_INCOMPLETE"],"resolver_version":"learning-readiness-resolver-v1","state_ref":{"kind":"accepted_draft","version":4},"readiness_scope":"PUBLISHED_GRAPH_RESOLUTION","executable":false,"content_status":"NOT_CREATED"}`},
+		{name: "oversized", status: http.StatusOK, contentType: "application/json", body: strings.Repeat("x", maximumReadinessResponseBytes+1)},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", testCase.contentType)
+				writer.WriteHeader(testCase.status)
+				_, _ = writer.Write([]byte(testCase.body))
+			}))
+			defer server.Close()
+			client := Client{BaseURL: server.URL, InternalToken: "teacher-secret", HTTPClient: server.Client()}
+			_, err := client.ResolveLearningReadiness(context.Background(), readinessStudentID, domain.TeacherStudentReadinessStateRef{Kind: "accepted_draft", Version: 4})
+			if testCase.wantStale {
+				require.ErrorIs(t, err, domain.ErrTeacherLearningReadinessStale)
+			} else {
+				require.ErrorIs(t, err, domain.ErrTeacherLearningReadinessUnavailable)
+			}
+		})
+	}
+}
+
+func TestCreateCoursePlanDelegatesIntentWithoutMasteryOrPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/internal/students/11111111-1111-4111-8111-111111111111/course-plans", request.URL.Path)
+		require.Equal(t, "teacher-secret", request.Header.Get("X-Internal-Token"))
+		require.Equal(t, "22222222-2222-4222-8222-222222222222", request.Header.Get("Idempotency-Key"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+		require.Equal(t, "go.backend", body["goal_code"])
+		require.Equal(t, "Build a Go API", body["desired_outcome"])
+		require.NotContains(t, body, "mastery")
+		require.NotContains(t, body, "learning_path")
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusAccepted)
+		_, _ = writer.Write([]byte(`{"request_id":"33333333-3333-4333-8333-333333333333","goal_code":"go.backend","status":"PLANNING","reused":false,"attempts":0,"created_at":"2026-09-05T10:00:00Z","updated_at":"2026-09-05T10:00:00Z","source":"TEACHER","reason":"INITIAL"}`))
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, InternalToken: "teacher-secret", HTTPClient: server.Client()}
+	result, err := client.CreateCoursePlan(context.Background(), curriculum.PlanInput{
+		StudentID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: "22222222-2222-4222-8222-222222222222",
+		GoalCode: "go.backend", DesiredOutcome: "Build a Go API",
+		Targets:     []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.http", Version: "v1"}},
+		Constraints: curriculum.PlanConstraints{Language: "ru", WeeklyMinutes: 180},
+		AuditRefs:   curriculum.PlanAuditRefs{DialogID: "44444444-4444-4444-8444-444444444444"},
+		Reason:      curriculum.PlanReasonInitial,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "33333333-3333-4333-8333-333333333333", result.RequestID)
+	require.Equal(t, "PLANNING", result.Status)
+}
+
+func TestCreateCoursePlanRejectsResponseContractDrift(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"request_id":"33333333-3333-4333-8333-333333333333","goal_code":"go.backend","status":"PLANNING","reused":false,"attempts":0,"created_at":"2026-09-05T10:00:00Z","updated_at":"2026-09-05T10:00:00Z","source":"TEACHER","reason":"INITIAL","unexpected":true}`))
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "teacher-secret", HTTPClient: server.Client()}
+	_, err := client.CreateCoursePlan(context.Background(), curriculum.PlanInput{
+		StudentID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: "22222222-2222-4222-8222-222222222222",
+		GoalCode: "go.backend", DesiredOutcome: "Build a Go API", Reason: curriculum.PlanReasonInitial,
+	})
+	require.Error(t, err)
+}
+
+func TestCreateCoursePlanAcceptsCanonicalTerminalReplays(t *testing.T) {
+	for _, status := range []string{"COMPLETED", "FAILED"} {
+		t.Run(status, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if status == "COMPLETED" {
+					_, _ = writer.Write([]byte(`{"request_id":"33333333-3333-4333-8333-333333333333","goal_code":"go.backend","status":"COMPLETED","result_code":"COURSE_REUSED","course_id":"44444444-4444-4444-8444-444444444444","learning_path_id":"66666666-6666-4666-8666-666666666666","reused":true,"attempts":2,"created_at":"2026-09-05T10:00:00Z","updated_at":"2026-09-05T10:02:00Z","completed_at":"2026-09-05T10:02:00Z","source":"TEACHER","reason":"INITIAL"}`))
+					return
+				}
+				_, _ = writer.Write([]byte(`{"request_id":"33333333-3333-4333-8333-333333333333","goal_code":"go.backend","status":"FAILED","reused":false,"attempts":2,"created_at":"2026-09-05T10:00:00Z","updated_at":"2026-09-05T10:02:00Z","completed_at":"2026-09-05T10:02:00Z","source":"TEACHER","reason":"INITIAL"}`))
+			}))
+			defer server.Close()
+			client := Client{BaseURL: server.URL, InternalToken: "teacher-secret", HTTPClient: server.Client()}
+			result, err := client.CreateCoursePlan(context.Background(), curriculum.PlanInput{
+				StudentID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: "22222222-2222-4222-8222-222222222222", GoalCode: "go.backend", DesiredOutcome: "Build a Go API", Reason: curriculum.PlanReasonInitial,
+			})
+			require.NoError(t, err)
+			require.Equal(t, status, result.Status)
+			if status == "COMPLETED" {
+				require.Equal(t, "COURSE_REUSED", result.ResultCode)
+				require.Equal(t, "44444444-4444-4444-8444-444444444444", result.CourseID)
+				require.True(t, result.Reused)
+			}
+		})
+	}
+}

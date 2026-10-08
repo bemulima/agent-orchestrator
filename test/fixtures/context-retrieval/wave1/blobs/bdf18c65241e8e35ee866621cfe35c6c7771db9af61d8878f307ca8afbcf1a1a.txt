@@ -1,0 +1,153 @@
+package nats
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const (
+	TaskAnswerEventsStream        = "TASKANSWER_EVENTS"
+	LearningActionConsumerQueue   = "ms-teacher-learning-action-closed"
+	LearningActionConsumerDurable = "ms-teacher-learning-action-closed-v1"
+)
+
+type learningActionEnvelope struct {
+	EventID       string                   `json:"event_id"`
+	EventType     string                   `json:"event_type"`
+	CorrelationID string                   `json:"correlation_id"`
+	CausationID   string                   `json:"causation_id"`
+	StudentID     string                   `json:"student_id"`
+	OccurredAt    time.Time                `json:"occurred_at"`
+	SchemaVersion int                      `json:"schema_version"`
+	Data          learningActionClosedData `json:"data"`
+}
+
+type learningActionClosedData struct {
+	LearningActionID string                     `json:"learning_action_id"`
+	ContextType      domain.LearningContextType `json:"context_type"`
+	ContextID        string                     `json:"context_id"`
+	LearningTargets  []domain.LearningTargetRef `json:"learning_targets"`
+}
+
+// DecodeLearningActionClosed validates the exact student-owned v1 envelope.
+func DecodeLearningActionClosed(payload []byte) (domain.LearningActionClosed, error) {
+	var envelope learningActionEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.LearningActionClosed{}, fmt.Errorf("decode learning action closure: %w", err)
+	}
+	if envelope.EventType != domain.SubjectLearningActionClosed {
+		return domain.LearningActionClosed{}, errors.New("unsupported learning action event type")
+	}
+	if envelope.SchemaVersion != domain.LearningActionClosedSchemaVersion {
+		return domain.LearningActionClosed{}, errors.New("unsupported learning action schema version")
+	}
+	return domain.NewLearningActionClosed(domain.LearningActionClosed{
+		EventID:          envelope.EventID,
+		StudentID:        envelope.StudentID,
+		CorrelationID:    envelope.CorrelationID,
+		CausationID:      envelope.CausationID,
+		LearningActionID: envelope.Data.LearningActionID,
+		ContextType:      envelope.Data.ContextType,
+		ContextID:        envelope.Data.ContextID,
+		LearningTargets:  envelope.Data.LearningTargets,
+		OccurredAt:       envelope.OccurredAt,
+	})
+}
+
+func decodeStrictJSON(payload []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+// LearningActionClosedSubscriber consumes the student trigger with durable,
+// explicit acknowledgement. Invalid contracts terminate; transient failures retry.
+type LearningActionClosedSubscriber struct {
+	Conn       *nats.Conn
+	Handler    func(context.Context, domain.LearningActionClosed) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+// Subscribe installs the durable queue consumer and flushes the registration.
+func (subscriber LearningActionClosedSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil {
+		return errors.New("learning action subscriber connection is required")
+	}
+	if subscriber.Handler == nil {
+		return errors.New("learning action subscriber handler is required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	jetStream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = jetStream.QueueSubscribe(
+		domain.SubjectLearningActionClosed,
+		LearningActionConsumerQueue,
+		func(message *nats.Msg) {
+			closure, decodeErr := DecodeLearningActionClosed(message.Data)
+			if decodeErr != nil {
+				logger.Warn("terminate invalid learning action closure", zap.Error(decodeErr))
+				if termErr := message.Term(); termErr != nil {
+					logger.Warn("terminate learning action closure", zap.Error(termErr))
+				}
+				return
+			}
+			processed, handleErr := subscriber.Handler(ctx, closure)
+			if handleErr != nil {
+				logger.Warn("retry learning action closure", zap.String("event_id", closure.EventID), zap.Error(handleErr))
+				if nakErr := message.NakWithDelay(retryDelay); nakErr != nil {
+					logger.Warn("nak learning action closure", zap.String("event_id", closure.EventID), zap.Error(nakErr))
+				}
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				logger.Warn("ack learning action closure", zap.String("event_id", closure.EventID), zap.Error(ackErr))
+				return
+			}
+			logger.Debug("learning action closure handled", zap.String("event_id", closure.EventID), zap.Bool("processed", processed))
+		},
+		nats.BindStream(TaskAnswerEventsStream),
+		nats.Durable(LearningActionConsumerDurable),
+		nats.ManualAck(),
+		nats.AckExplicit(),
+		nats.DeliverAll(),
+		nats.AckWait(ackWait),
+	)
+	if err != nil {
+		return err
+	}
+	return subscriber.Conn.FlushTimeout(5 * time.Second)
+}

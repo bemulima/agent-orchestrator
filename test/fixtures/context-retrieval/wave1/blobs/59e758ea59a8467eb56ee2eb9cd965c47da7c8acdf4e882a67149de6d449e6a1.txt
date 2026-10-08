@@ -1,0 +1,124 @@
+package domain
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+
+	"github.com/google/uuid"
+)
+
+const SubjectDiagnosticResultCommitted = "student.diagnostic-result.committed.v1"
+
+// DiagnosticResultCommittedData carries references only. The authoritative
+// aggregate remains behind Student's dedicated Planner HTTP boundary.
+type DiagnosticResultCommittedData struct {
+	PlanID       string `json:"plan_id"`
+	PlanRevision int    `json:"plan_revision"`
+	PlanDigest   string `json:"plan_digest"`
+	ResultDigest string `json:"result_digest"`
+}
+
+func DiagnosticResultCommittedEventID(planID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(SubjectDiagnosticResultCommitted+":"+planID)).String()
+}
+
+func NewDiagnosticResultCommittedEvent(result DiagnosticAssessmentResult, completionRequestID string) (IntegrationEvent, error) {
+	result, err := NormalizeDiagnosticAssessmentResult(result)
+	if err != nil || result.AttemptID != result.PlanID || !validDiagnosticUUID(completionRequestID) {
+		return IntegrationEvent{}, ErrValidation
+	}
+	return NewIntegrationEvent(DiagnosticResultCommittedEventID(result.PlanID), SubjectDiagnosticResultCommitted,
+		result.PlanID, completionRequestID, result.StudentID, result.CompletedAt, 1,
+		DiagnosticResultCommittedData{result.PlanID, result.PlanRevision, result.PlanDigest, result.ResultDigest})
+}
+
+// ValidateDiagnosticResultCommittedEvent protects the relay from malformed or
+// misbound stored payloads before any publication. The limit is independent of
+// the database's JSON representation and permits only the exact reference data.
+func ValidateDiagnosticResultCommittedEvent(event IntegrationEvent) error {
+	if event.Subject != SubjectDiagnosticResultCommitted || len(event.Payload) == 0 || len(event.Payload) > 8192 {
+		return ErrValidation
+	}
+	dec := json.NewDecoder(bytes.NewReader(event.Payload))
+	if err := diagnosticEventObject(dec, 0); err != nil {
+		return ErrValidation
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return ErrValidation
+	}
+	var envelope EventEnvelope
+	if err := decodeDiagnosticEvent(event.Payload, &envelope); err != nil {
+		return ErrValidation
+	}
+	var data DiagnosticResultCommittedData
+	if err := decodeDiagnosticEvent(envelope.Data, &data); err != nil || !validDiagnosticUUID(data.PlanID) || data.PlanRevision < 1 || !diagnosticSHA256.MatchString(data.PlanDigest) || !diagnosticSHA256.MatchString(data.ResultDigest) {
+		return ErrValidation
+	}
+	if envelope.EventType != SubjectDiagnosticResultCommitted || envelope.SchemaVersion != 1 || envelope.EventID != DiagnosticResultCommittedEventID(data.PlanID) || envelope.CorrelationID != data.PlanID || !validDiagnosticUUID(envelope.StudentID) || !validDiagnosticUUID(envelope.CausationID) || !canonicalDiagnosticTimestamp(envelope.OccurredAt) ||
+		event.EventID != envelope.EventID || event.SchemaVersion != envelope.SchemaVersion || event.StudentID != envelope.StudentID || event.CorrelationID != envelope.CorrelationID || event.CausationID != envelope.CausationID || !event.OccurredAt.Equal(envelope.OccurredAt) {
+		return ErrValidation
+	}
+	return nil
+}
+
+func decodeDiagnosticEvent(raw []byte, target any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return ErrValidation
+	}
+	return nil
+}
+
+// The event has exactly two object levels and scalar values. Token inspection
+// rejects duplicate keys before Go's ordinary decoder could overwrite them.
+func diagnosticEventObject(dec *json.Decoder, depth int) error {
+	if depth > 1 {
+		return ErrValidation
+	}
+	opening, err := dec.Token()
+	if err != nil || opening != json.Delim('{') {
+		return ErrValidation
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		token, err := dec.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] {
+			return ErrValidation
+		}
+		if depth == 0 {
+			switch key {
+			case "event_id", "event_type", "correlation_id", "causation_id", "student_id", "occurred_at", "schema_version", "data":
+			default:
+				return ErrValidation
+			}
+		} else {
+			switch key {
+			case "plan_id", "plan_revision", "plan_digest", "result_digest":
+			default:
+				return ErrValidation
+			}
+		}
+		seen[key] = true
+		if depth == 0 && key == "data" {
+			if err := diagnosticEventObject(dec, depth+1); err != nil {
+				return err
+			}
+		} else {
+			value, err := dec.Token()
+			if _, composite := value.(json.Delim); err != nil || composite || value == nil {
+				return ErrValidation
+			}
+		}
+	}
+	closing, err := dec.Token()
+	if err != nil || closing != json.Delim('}') {
+		return ErrValidation
+	}
+	return nil
+}

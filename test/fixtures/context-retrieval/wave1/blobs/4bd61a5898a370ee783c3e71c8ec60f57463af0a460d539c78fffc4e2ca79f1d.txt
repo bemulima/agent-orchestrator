@@ -1,0 +1,241 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"github.com/example/mc-course-service/internal/domain"
+	privatehttp "github.com/example/mc-course-service/internal/transport/http/private"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/generatedcourse"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/example/mc-course-service/internal/usecase/lessonrevision"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Root alone starts this helper in an already migrated disposable test database.
+// Authored fixture text/answer is synthetic; hierarchy, revisions and HTTP are real.
+// Unique fixture rows are retained for root evidence readback and database disposal.
+func TestT14ServeLessonRevisionHTTP(t *testing.T) {
+	if os.Getenv("T14_SERVE_COURSE") != "true" {
+		t.Skip("owned T14 Course gate absent")
+	}
+	ready, stop, result := os.Getenv("T14_COURSE_READY_FILE"), os.Getenv("T14_COURSE_STOP_FILE"), os.Getenv("T14_COURSE_RESULT_FILE")
+	token := os.Getenv("T14_COURSE_TOKEN")
+	cfg, e := pgxpool.ParseConfig(os.Getenv("T14_COURSE_TEST_DATABASE_URL"))
+	if e != nil || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") || ready == "" || stop == "" || result == "" || token == "" {
+		t.Fatal("SETUP: missing owned Course configuration")
+	}
+	if _, e = os.Stat(stop); !os.IsNotExist(e) {
+		t.Fatal("SETUP: stop marker must be absent")
+	}
+	ctx := context.Background()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal("SETUP: Course pool unavailable")
+	}
+	defer pool.Close()
+	if pool.Ping(ctx) != nil {
+		t.Fatal("SETUP: Course database unavailable")
+	}
+	var count int
+	if pool.QueryRow(ctx, `SELECT count(*) FROM code_structure_type WHERE code='QUIZ_TEXT_BASIC'`).Scan(&count) != nil || count != 1 {
+		t.Fatal("SETUP: missing Course reference seed")
+	}
+	lessons := LessonRepoPG{Pool: pool}
+	translations := LessonI18nRepoPG{Pool: pool}
+	tasks := TaskRepoPG{Pool: pool}
+	examples := LessonExampleRepoPG{Pool: pool}
+	revisions := lessonrevision.Definitions{
+		Revisions: LessonRevisionRepoPG{Pool: pool}, Lessons: lessons, Translations: translations,
+		Tasks: tasks, Tests: TaskTestRepoPG{Pool: pool}, Files: TaskFileStorageRepoPG{Pool: pool},
+		Examples: examples, Tx: LessonRevisionTxPG{Pool: pool},
+	}
+	ensure := generatedcourse.Ensure{
+		Revisions: revisions, Generated: GeneratedCourseRepoPG{Pool: pool},
+		Courses: CourseRepoPG{Pool: pool}, CourseI18n: CourseI18nRepoPG{Pool: pool},
+		Modules: ModuleRepoPG{Pool: pool}, ModuleI18n: ModuleI18nRepoPG{Pool: pool}, CourseModules: CourseModuleRepoPG{Pool: pool},
+		Sections: SectionRepoPG{Pool: pool}, SectionI18n: SectionI18nRepoPG{Pool: pool}, ModuleSections: ModuleSectionRepoPG{Pool: pool},
+		Lessons: lessons, LessonI18n: translations, SectionLessons: SectionLessonRepoPG{Pool: pool},
+		Examples: examples, Tasks: tasks, TaskI18n: TaskI18nRepoPG{Pool: pool}, TaskTargets: TaskLearningTargetRepoPG{Pool: pool},
+		StructureTypes: CodeStructureTypeRepoPG{Pool: pool}, I18n: I18nRepoPG{Pool: pool}, Tx: TxManagerPG{Pool: pool},
+		IDs: t14CourseIDs{}, Clock: t14CourseClock{},
+	}
+
+	authored := t14AuthoredFixture()
+	nonce := sha256.Sum256([]byte(uuid.NewString()))
+	authored.Fingerprint = hex.EncodeToString(nonce[:])
+	// Synthetic R1 source deliberately differs from R2 in every projected field.
+	authored.Modules[0].Sections[0].Lessons[0].Title = "Frozen R1 exact title"
+	authored.Modules[0].Sections[0].Lessons[0].Excerpt = "Frozen R1 exact excerpt"
+	authored.Modules[0].Sections[0].Lessons[0].DescriptionMarkdown = "# Frozen R1\n\nKeep the exact selected fragment unchanged."
+	created, e := ensure.Handle(ctx, uuid.NewString(), authored)
+	if e != nil || len(created.Lessons) != 1 {
+		t.Fatal("SETUP: actual Course authored fixture usecase failed")
+	}
+	lessonID, courseID := created.Lessons[0].LessonID, created.CourseID
+	r1, e := revisions.Get(ctx, created.Lessons[0].LessonRevisionID)
+	if e != nil {
+		t.Fatal("SETUP: actual Course R1 receipt missing")
+	}
+	// The mounted assigned lesson screen requires an authored theory activity.
+	// Configure it through Course's existing owner usecase while retaining the
+	// generated quiz activity. Resolve publishes a new immutable chosen R1;
+	// neither the initial generated receipt nor its immutable definition changes.
+	initialGeneratedRevision := r1.LessonRevisionID
+	policy := append([]domain.LessonActivity(nil), r1.Activities...)
+	policy = append(policy, domain.LessonActivity{ActivityID: uuid.NewString(), Type: domain.ActivityTheoryAcknowledged, Required: true, SourceReference: domain.ActivitySourceReference{ID: lessonID}})
+	if e = revisions.SetPolicy(ctx, lessonID, policy); e != nil {
+		t.Fatal("SETUP: actual Course authored theory policy usecase failed")
+	}
+	r1, e = revisions.Resolve(ctx, lessonID)
+	if e != nil || r1.LessonRevisionID == initialGeneratedRevision {
+		t.Fatal("SETUP: authored theory policy did not publish a new immutable R1")
+	}
+	initial, e := revisions.Get(ctx, initialGeneratedRevision)
+	if e != nil || len(initial.Activities) != len(policy)-1 || len(r1.Activities) != len(policy) {
+		t.Fatal("SETUP: original generated revision changed or required policy missing")
+	}
+	digest := func(r *domain.LessonRevision) string {
+		raw, _ := json.Marshal([3]string{r.Content.Title, r.Content.Excerpt, r.Content.Description})
+		s := sha256.Sum256(raw)
+		return "sha256:" + hex.EncodeToString(s[:])
+	}
+	var mu sync.Mutex
+	var r2 *domain.LessonRevision
+	metadata := func() map[string]any {
+		v := map[string]any{"url": "", "course_id": courseID, "lesson_id": lessonID, "revision_r1": r1.LessonRevisionID, "digest_r1": digest(r1), "initial_generated_revision": initialGeneratedRevision, "theory_requirement_authored": true, "classification": "actual generated-course owner usecase/PG; actual Definitions.SetPolicy preserves quiz and adds authored required theory; Resolve publishes immutable chosen R1 while initial generated receipt is retained; registered revision HTTP; synthetic authored text and quiz; no NATS or LLM"}
+		if r2 != nil {
+			v["revision_r2"] = r2.LessonRevisionID
+			v["digest_r2"] = digest(r2)
+		}
+		return v
+	}
+	registered := chi.NewRouter()
+	registered.Mount("/internal", privatehttp.NewRouter(nil, &privatehandlers.LessonHandler{RevisionsUC: revisions, TeacherContextUC: lesson.GetTeacherContext{Lessons: lessons, LessonI18n: translations}}, nil, nil, token, "", ""))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__t14/publish-r2", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(401)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if r2 == nil {
+			_, err := (lesson.UpdateLesson{Lessons: lessons, Tasks: tasks, LessonI18n: translations, Tx: TxManagerPG{Pool: pool}}).Handle(r.Context(), lesson.UpdateLessonInput{LessonID: lessonID, Title: "Published R2 title", Excerpt: "Published R2 excerpt", Description: "# Published R2\n\nThe replacement fragment differs.", Status: domain.LessonStatusActive})
+			if err == nil {
+				r2, err = revisions.Resolve(r.Context(), lessonID)
+			}
+			if err != nil {
+				w.WriteHeader(500)
+				return
+			}
+			old, err := revisions.Get(r.Context(), r1.LessonRevisionID)
+			if err != nil || digest(old) != digest(r1) || r2.LessonRevisionID == r1.LessonRevisionID || digest(r2) == digest(r1) {
+				w.WriteHeader(500)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(metadata())
+	})
+	mux.HandleFunc("GET /__t14/inspect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(401)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(metadata())
+	})
+	mux.Handle("/", registered)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	v := metadata()
+	v["url"] = server.URL
+	t14CourseWrite(t, ready, v)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("owned Course deadline exceeded")
+		case <-ticker.C:
+			if _, err := os.Stat(stop); err == nil {
+				mu.Lock()
+				v = metadata()
+				mu.Unlock()
+				v["url"] = server.URL
+				t14CourseWrite(t, result, v)
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal("owned stop read failed")
+			}
+		}
+	}
+}
+func t14CourseWrite(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, e := json.MarshalIndent(value, "", "  ")
+	if e != nil || os.WriteFile(path+".tmp", append(raw, '\n'), 0600) != nil || os.Rename(path+".tmp", path) != nil {
+		t.Fatal("safe metadata export failed")
+	}
+}
+
+type t14CourseIDs struct{}
+
+func (t14CourseIDs) NewID() string { return uuid.NewString() }
+
+type t14CourseClock struct{}
+
+func (t14CourseClock) Now() time.Time { return time.Now().UTC() }
+func t14AuthoredFixture() domain.GeneratedCourse {
+	firstTarget := domain.CourseTargetRef{Type: domain.LearningTargetConcept, Key: "go.syntax", Version: "v1"}
+	secondTarget := domain.CourseTargetRef{Type: domain.LearningTargetCapability, Key: "go.errors", Version: "v1"}
+	return domain.GeneratedCourse{
+		Fingerprint:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		FingerprintVersion: "course-fingerprint-v1", GoalCode: "go.backend", GoalVersion: "v1",
+		Title: "Go Backend", Description: "Go for backend developers.", Language: "ru",
+		Status: "ACTIVE", CatalogVisible: false, PlannerVersion: "course-planner-v1",
+		PedagogyProfile: "standard-v1", PresentationStyle: "standard-v1", GenerationPolicy: "shared-v1",
+		Modules: []domain.GeneratedCourseModule{{
+			Code: "foundation", Title: "Foundation", Order: 0,
+			Sections: []domain.GeneratedCourseSection{{
+				Code: "language", Title: "Language", Order: 0,
+				Lessons: []domain.GeneratedCourseLesson{{
+					Code: "errors", Title: "Errors", Excerpt: "Explicit errors.", Order: 0, Status: "ACTIVE",
+					Targets:       []domain.CourseTargetRef{firstTarget, secondTarget},
+					Prerequisites: []domain.CourseTargetRef{firstTarget},
+					TransitionKnowledge: []domain.CourseTransitionKnowledge{{
+						SourceStack: "php", Target: secondTarget, Similarity: "Control flow.",
+						Difference: "Explicit values.", AnalogyBoundary: "No unwinding.",
+					}},
+					PedagogyStrategies:  []domain.CoursePedagogyStrategyRef{{Code: "explicit_instruction", Version: 1}},
+					DescriptionMarkdown: "# Explicit errors\n\nHandle errors as values.",
+					Examples: []domain.GeneratedCourseExample{{
+						Title: "Check an error", DescriptionMarkdown: "```go\nif err != nil {}\n```",
+						PrimaryStack: "go", Stacks: []string{"go"}, TargetConcepts: []string{"errors"},
+					}},
+					Tasks: []domain.GeneratedCourseTask{{
+						Title: "Error check", DescriptionMarkdown: "How are errors handled?",
+						ExpectedAnswers: []string{"as values"},
+					}},
+				}},
+			}},
+		}},
+	}
+}

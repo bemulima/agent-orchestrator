@@ -1,0 +1,189 @@
+-- S8 keeps Planner admission separate from executable course planning. This
+-- Teacher-owned ledger is a bounded command/outbox and notification checkpoint;
+-- it contains no Student profile, prompt/model body, or opaque graph payload.
+BEGIN;
+
+ALTER TABLE teacher_onboarding_interaction
+    DROP CONSTRAINT teacher_onboarding_interaction_state_check,
+    DROP CONSTRAINT teacher_onboarding_interaction_check;
+
+ALTER TABLE teacher_onboarding_interaction
+    ADD CONSTRAINT teacher_onboarding_interaction_state_check
+        CHECK (state IN ('active', 'reserved', 'superseded', 'completed', 'closed', 'handoff_pending')),
+    ADD CONSTRAINT teacher_onboarding_interaction_check
+        CHECK (
+            (state = 'active'
+                AND reserved_teacher_job_id IS NULL AND reserved_action_receipt_id IS NULL
+                AND reservation_mode IS NULL AND superseded_by_interaction_id IS NULL AND completed_at IS NULL
+                AND closed_reason IS NULL AND closed_at IS NULL)
+            OR (state = 'reserved'
+                AND reserved_teacher_job_id IS NOT NULL
+                AND reservation_mode IN ('onboarding_action', 'onboarding_text')
+                AND superseded_by_interaction_id IS NULL AND completed_at IS NULL
+                AND closed_reason IS NULL AND closed_at IS NULL
+                AND ((reservation_mode = 'onboarding_action' AND reserved_action_receipt_id IS NOT NULL)
+                    OR (reservation_mode = 'onboarding_text' AND reserved_action_receipt_id IS NULL)))
+            OR (state = 'handoff_pending'
+                AND reserved_teacher_job_id IS NOT NULL
+                AND reservation_mode IN ('onboarding_action', 'onboarding_text')
+                AND superseded_by_interaction_id IS NULL AND completed_at IS NULL
+                AND closed_reason = 'planning_ready' AND closed_at IS NOT NULL
+                AND ((reservation_mode = 'onboarding_action' AND reserved_action_receipt_id IS NOT NULL)
+                    OR (reservation_mode = 'onboarding_text' AND reserved_action_receipt_id IS NULL)))
+            OR (state = 'superseded'
+                AND reserved_teacher_job_id IS NULL AND reserved_action_receipt_id IS NULL
+                AND reservation_mode IS NULL AND superseded_by_interaction_id IS NOT NULL AND completed_at IS NULL
+                AND closed_reason IS NULL AND closed_at IS NULL)
+            OR (state = 'completed'
+                AND reserved_teacher_job_id IS NOT NULL
+                AND reservation_mode IN ('onboarding_action', 'onboarding_text')
+                AND superseded_by_interaction_id IS NULL AND completed_at IS NOT NULL
+                AND closed_reason IS NULL AND closed_at IS NULL
+                AND ((reservation_mode = 'onboarding_action' AND reserved_action_receipt_id IS NOT NULL)
+                    OR (reservation_mode = 'onboarding_text' AND reserved_action_receipt_id IS NULL)))
+            OR (state = 'closed'
+                AND reserved_teacher_job_id IS NULL AND reserved_action_receipt_id IS NULL
+                AND reservation_mode IS NULL AND superseded_by_interaction_id IS NULL AND completed_at IS NULL
+                AND closed_reason IN ('planning_ready', 'active_path_exists') AND closed_at IS NOT NULL)
+        );
+
+CREATE TABLE teacher_onboarding_plan_handoff (
+    handoff_intent_id UUID PRIMARY KEY,
+    student_id TEXT NOT NULL CHECK (student_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+    personal_teacher_id UUID NOT NULL,
+    dialog_id UUID NOT NULL,
+    source_teacher_job_id UUID UNIQUE REFERENCES teacher_dialog_job(teacher_job_id) ON DELETE RESTRICT,
+    source_interaction_id UUID REFERENCES teacher_onboarding_interaction(interaction_id) ON DELETE RESTRICT,
+    command_id UUID NOT NULL UNIQUE,
+    command_teacher_job_id UUID NOT NULL,
+    request_hash CHAR(64) NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+    state_ref_kind VARCHAR(32) NOT NULL CHECK (state_ref_kind IN ('accepted_draft', 'finalized_profile')),
+    state_ref_version BIGINT NOT NULL CHECK (state_ref_version > 0),
+    goal_code VARCHAR(64) NOT NULL CHECK (goal_code IN ('programming.foundation', 'go.backend')),
+    goal_version VARCHAR(32) NOT NULL CHECK (goal_version = 'v1'),
+    graph_version VARCHAR(128) NOT NULL CHECK (graph_version IN ('programming-foundation-graph-v1', 'go-backend-graph-v1')),
+    locale VARCHAR(2) NOT NULL CHECK (locale IN ('ru', 'en')),
+    status VARCHAR(24) NOT NULL CHECK (status IN ('queued', 'dispatching', 'accepted', 'message_pending', 'delivered', 'active_path', 'blocked')),
+    claim_token UUID,
+    locked_by VARCHAR(128),
+    locked_until TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TIMESTAMPTZ NOT NULL,
+    planner_handoff_id UUID UNIQUE,
+    notification_command_id UUID NOT NULL UNIQUE,
+    notification_message_id UUID UNIQUE,
+    last_error_code VARCHAR(64),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    accepted_at TIMESTAMPTZ,
+    readiness_observed_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    FOREIGN KEY (personal_teacher_id, student_id) REFERENCES personal_teacher(id, student_id) ON DELETE RESTRICT,
+    CHECK ((source_teacher_job_id IS NULL) = (source_interaction_id IS NULL)),
+    CHECK ((goal_code = 'programming.foundation' AND graph_version = 'programming-foundation-graph-v1')
+        OR (goal_code = 'go.backend' AND graph_version = 'go-backend-graph-v1')),
+    CHECK ((status IN ('dispatching', 'message_pending')) = (claim_token IS NOT NULL AND locked_by IS NOT NULL AND locked_until IS NOT NULL)),
+    CHECK (status IN ('dispatching', 'message_pending') OR (claim_token IS NULL AND locked_by IS NULL AND locked_until IS NULL)),
+    CHECK ((planner_handoff_id IS NULL) = (accepted_at IS NULL)
+        AND (planner_handoff_id IS NULL) = (readiness_observed_at IS NULL)),
+    CHECK (status <> 'accepted' OR planner_handoff_id IS NOT NULL),
+    CHECK (status NOT IN ('queued', 'dispatching', 'active_path') OR planner_handoff_id IS NULL),
+    CHECK ((status = 'delivered') = (notification_message_id IS NOT NULL AND delivered_at IS NOT NULL)),
+    CHECK (status <> 'blocked' OR last_error_code IS NOT NULL)
+);
+
+-- The ledger's command/audit identity is write-once. Lifecycle checkpoints
+-- remain mutable so a claimed command can retry, receive Planner's ACK, and
+-- record its idempotent Dialog delivery without ever changing what was sent.
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_plan_handoff_identity()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF ROW(
+        OLD.handoff_intent_id, OLD.student_id, OLD.personal_teacher_id, OLD.dialog_id,
+        OLD.source_teacher_job_id, OLD.source_interaction_id, OLD.command_id,
+        OLD.command_teacher_job_id, OLD.request_hash, OLD.state_ref_kind,
+        OLD.state_ref_version, OLD.goal_code, OLD.goal_version, OLD.graph_version,
+        OLD.locale, OLD.notification_command_id
+    ) IS DISTINCT FROM ROW(
+        NEW.handoff_intent_id, NEW.student_id, NEW.personal_teacher_id, NEW.dialog_id,
+        NEW.source_teacher_job_id, NEW.source_interaction_id, NEW.command_id,
+        NEW.command_teacher_job_id, NEW.request_hash, NEW.state_ref_kind,
+        NEW.state_ref_version, NEW.goal_code, NEW.goal_version, NEW.graph_version,
+        NEW.locale, NEW.notification_command_id
+    ) THEN
+        RAISE EXCEPTION 'teacher onboarding handoff identity is immutable';
+    END IF;
+
+    -- Planner and Dialog acknowledgements are evidence, not mutable cache.
+    -- Their first complete write is permitted; subsequent retries may only
+    -- observe it, never clear it or substitute another acknowledgement.
+    IF OLD.planner_handoff_id IS NULL AND OLD.accepted_at IS NULL AND OLD.readiness_observed_at IS NULL
+       AND NEW.planner_handoff_id IS NOT NULL AND NEW.status <> 'accepted' THEN
+        RAISE EXCEPTION 'teacher onboarding Planner acknowledgement must be recorded on acceptance';
+    END IF;
+    IF (OLD.planner_handoff_id IS NOT NULL OR OLD.accepted_at IS NOT NULL OR OLD.readiness_observed_at IS NOT NULL)
+       AND ROW(OLD.planner_handoff_id, OLD.accepted_at, OLD.readiness_observed_at)
+           IS DISTINCT FROM ROW(NEW.planner_handoff_id, NEW.accepted_at, NEW.readiness_observed_at) THEN
+        RAISE EXCEPTION 'teacher onboarding Planner acknowledgement is immutable';
+    END IF;
+    IF OLD.notification_message_id IS NULL AND OLD.delivered_at IS NULL
+       AND NEW.notification_message_id IS NOT NULL AND NEW.status <> 'delivered' THEN
+        RAISE EXCEPTION 'teacher onboarding Dialog acknowledgement must be recorded on delivery';
+    END IF;
+    IF (OLD.notification_message_id IS NOT NULL OR OLD.delivered_at IS NOT NULL)
+       AND ROW(OLD.notification_message_id, OLD.delivered_at)
+           IS DISTINCT FROM ROW(NEW.notification_message_id, NEW.delivered_at) THEN
+        RAISE EXCEPTION 'teacher onboarding Dialog delivery acknowledgement is immutable';
+    END IF;
+
+    IF NOT (
+        (OLD.status = NEW.status)
+        OR (OLD.status = 'queued' AND NEW.status = 'dispatching')
+        OR (OLD.status = 'dispatching' AND NEW.status IN ('queued', 'accepted', 'active_path', 'blocked'))
+        OR (OLD.status IN ('accepted', 'active_path') AND NEW.status = 'message_pending')
+        OR (OLD.status = 'message_pending' AND NEW.status IN ('accepted', 'active_path', 'delivered', 'blocked'))
+    ) THEN
+        RAISE EXCEPTION 'teacher onboarding handoff status transition is invalid';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_plan_handoff_identity
+BEFORE UPDATE ON teacher_onboarding_plan_handoff
+FOR EACH ROW EXECUTE FUNCTION protect_teacher_onboarding_plan_handoff_identity();
+
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_plan_handoff_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'teacher onboarding handoff evidence cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_plan_handoff_delete
+BEFORE DELETE ON teacher_onboarding_plan_handoff
+FOR EACH ROW EXECUTE FUNCTION protect_teacher_onboarding_plan_handoff_delete();
+
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_plan_handoff_truncate()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'teacher onboarding handoff evidence cannot be truncated';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_plan_handoff_truncate
+BEFORE TRUNCATE ON teacher_onboarding_plan_handoff
+FOR EACH STATEMENT EXECUTE FUNCTION protect_teacher_onboarding_plan_handoff_truncate();
+
+CREATE UNIQUE INDEX teacher_onboarding_plan_handoff_student_state_key
+    ON teacher_onboarding_plan_handoff (student_id, state_ref_kind, state_ref_version);
+
+CREATE INDEX teacher_onboarding_plan_handoff_dispatch_idx
+    ON teacher_onboarding_plan_handoff (next_attempt_at, created_at, handoff_intent_id)
+    WHERE status IN ('queued', 'dispatching');
+
+CREATE INDEX teacher_onboarding_plan_handoff_message_idx
+    ON teacher_onboarding_plan_handoff (next_attempt_at, created_at, handoff_intent_id)
+    WHERE status IN ('accepted', 'active_path', 'message_pending');
+
+COMMIT;

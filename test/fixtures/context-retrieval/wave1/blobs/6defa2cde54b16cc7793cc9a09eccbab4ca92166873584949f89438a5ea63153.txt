@@ -1,0 +1,316 @@
+package answer
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+type assessmentQuestionEvaluation struct {
+	correct          bool
+	validationError  *ValidationError
+	item             map[string]any
+	selectedVariants []domain.TaskTestAnswerVariant
+}
+
+func evaluateStructuredAssessment(answerID, taskID string, task *TaskMetadata, payload json.RawMessage) (*ValidationResult, map[string]any, []domain.TaskTestAnswerVariant, error) {
+	if task == nil || len(task.Tests) == 0 {
+		return &ValidationResult{
+			Valid: false,
+			Errors: []ValidationError{
+				{Code: "TEST_DEFINITION_MISSING", Message: "Test questions are not configured"},
+			},
+		}, nil, nil, nil
+	}
+
+	body, err := decodeTaskTestAnswerPayload(task, payload)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	submissionsByTestID := make(map[string]taskTestAnswerPayloadItem, len(body.Answers))
+	for _, item := range body.Answers {
+		submissionsByTestID[item.TestID] = item
+	}
+
+	selectedVariants := make([]domain.TaskTestAnswerVariant, 0)
+	items := make([]map[string]any, 0, len(task.Tests))
+	errors := make([]ValidationError, 0)
+	correctCount := 0
+	incorrectCount := 0
+	mode := ""
+	now := time.Now().UTC()
+
+	for _, test := range task.Tests {
+		testID := strings.TrimSpace(test.ID)
+		submission, exists := submissionsByTestID[testID]
+		if !exists {
+			return nil, nil, nil, domain.ErrValidation
+		}
+
+		kind := assessmentKindForTest(task, test)
+		if mode == "" {
+			mode = kind
+		} else if mode != kind {
+			mode = "mixed"
+		}
+
+		var evaluation assessmentQuestionEvaluation
+		switch kind {
+		case assessmentKindSingleChoice:
+			evaluation, err = evaluateSingleChoiceQuestion(answerID, taskID, test, submission, now)
+		case assessmentKindOrdering:
+			evaluation, err = evaluateOrderingQuestion(answerID, taskID, test, submission, now)
+		case assessmentKindClassification:
+			evaluation, err = evaluateClassificationQuestion(answerID, taskID, test, submission, now)
+		default:
+			return nil, nil, nil, domain.ErrValidation
+		}
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		selectedVariants = append(selectedVariants, evaluation.selectedVariants...)
+		items = append(items, evaluation.item)
+		if evaluation.correct {
+			correctCount++
+			continue
+		}
+		incorrectCount++
+		if evaluation.validationError != nil {
+			errors = append(errors, *evaluation.validationError)
+		}
+	}
+
+	passed := incorrectCount <= task.AllowedErrorsCount
+	if !passed {
+		errors = append(errors, ValidationError{
+			Code:    "TEST_ALLOWED_ERRORS_EXCEEDED",
+			Message: fmt.Sprintf("Too many incorrect answers: %d (allowed %d)", incorrectCount, task.AllowedErrorsCount),
+		})
+	}
+
+	result := &ValidationResult{Valid: passed, Errors: errors}
+	rawResult := map[string]any{
+		"source":               "task_test",
+		"mode":                 mode,
+		"total_questions":      len(task.Tests),
+		"correct_answers":      correctCount,
+		"incorrect_answers":    incorrectCount,
+		"allowed_errors_count": task.AllowedErrorsCount,
+		"errors":               errors,
+		"items":                items,
+	}
+	return result, rawResult, selectedVariants, nil
+}
+
+// EvaluateDiagnosticStructuredAssessment is a pure placement scorer facade.
+// It neither creates a StudentTaskAnswer nor persists variants, reviews,
+// learning actions, progression, evidence, mastery, or events.
+func EvaluateDiagnosticStructuredAssessment(task *TaskMetadata, payload json.RawMessage) (bool, error) {
+	result, _, _, err := evaluateStructuredAssessment("diagnostic", "diagnostic", task, payload)
+	if err != nil || result == nil {
+		if err == nil {
+			err = domain.ErrValidation
+		}
+		return false, err
+	}
+	return result.Valid, nil
+}
+
+func evaluateSingleChoiceQuestion(answerID, taskID string, test TaskTestMetadata, submission taskTestAnswerPayloadItem, now time.Time) (assessmentQuestionEvaluation, error) {
+	var (
+		selectedVariant *TaskTestVariantMetadata
+		correctVariant  *TaskTestVariantMetadata
+	)
+	for index := range test.Variants {
+		variant := &test.Variants[index]
+		if strings.TrimSpace(variant.ID) == submission.VariantID {
+			selectedVariant = variant
+		}
+		if variant.IsCorrect {
+			correctVariant = variant
+		}
+	}
+	if selectedVariant == nil || correctVariant == nil {
+		return assessmentQuestionEvaluation{}, domain.ErrValidation
+	}
+
+	isCorrect := strings.TrimSpace(selectedVariant.ID) == strings.TrimSpace(correctVariant.ID)
+	evaluation := assessmentQuestionEvaluation{
+		correct: isCorrect,
+		item: map[string]any{
+			"test_id":               strings.TrimSpace(test.ID),
+			"title":                 test.Title,
+			"description":           test.Description,
+			"selected_variant_id":   strings.TrimSpace(selectedVariant.ID),
+			"selected_variant_text": selectedVariant.Text,
+			"correct_variant_id":    safeTaskVariantID(correctVariant),
+			"correct_variant_text":  safeTaskVariantText(correctVariant),
+			"correct":               isCorrect,
+		},
+		selectedVariants: []domain.TaskTestAnswerVariant{{
+			ID:                  uuid.NewString(),
+			StudentTaskAnswerID: answerID,
+			TaskID:              taskID,
+			TaskTestID:          strings.TrimSpace(test.ID),
+			TaskTestVariantID:   strings.TrimSpace(selectedVariant.ID),
+			IsCorrect:           isCorrect,
+			CreatedAt:           now,
+		}},
+	}
+	if !isCorrect {
+		evaluation.validationError = &ValidationError{
+			Code:    "TEST_VARIANT_INCORRECT",
+			Message: fmt.Sprintf("Incorrect answer for question: %s", test.Title),
+		}
+	}
+	return evaluation, nil
+}
+
+func evaluateOrderingQuestion(answerID, taskID string, test TaskTestMetadata, submission taskTestAnswerPayloadItem, now time.Time) (assessmentQuestionEvaluation, error) {
+	variantsByID := make(map[string]TaskTestVariantMetadata, len(test.Variants))
+	correctPositions := make(map[string]int, len(test.Variants))
+	seenPositions := make(map[int]struct{}, len(test.Variants))
+	for _, variant := range test.Variants {
+		variantID := strings.TrimSpace(variant.ID)
+		if variantID == "" || variant.CorrectOrder == nil || *variant.CorrectOrder < 1 || *variant.CorrectOrder > len(test.Variants) {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		if _, duplicate := variantsByID[variantID]; duplicate {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		if _, duplicate := seenPositions[*variant.CorrectOrder]; duplicate {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		variantsByID[variantID] = variant
+		correctPositions[variantID] = *variant.CorrectOrder
+		seenPositions[*variant.CorrectOrder] = struct{}{}
+	}
+
+	questionCorrect := true
+	selectedVariants := make([]domain.TaskTestAnswerVariant, 0, len(submission.OrderedVariantIDs))
+	for index, variantID := range submission.OrderedVariantIDs {
+		variantID = strings.TrimSpace(variantID)
+		if _, exists := variantsByID[variantID]; !exists {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		submittedOrder := index + 1
+		positionCorrect := correctPositions[variantID] == submittedOrder
+		if !positionCorrect {
+			questionCorrect = false
+		}
+		selectedVariants = append(selectedVariants, domain.TaskTestAnswerVariant{
+			ID:                  uuid.NewString(),
+			StudentTaskAnswerID: answerID,
+			TaskID:              taskID,
+			TaskTestID:          strings.TrimSpace(test.ID),
+			TaskTestVariantID:   variantID,
+			SubmittedOrder:      &submittedOrder,
+			IsCorrect:           positionCorrect,
+			CreatedAt:           now,
+		})
+	}
+
+	evaluation := assessmentQuestionEvaluation{
+		correct: questionCorrect,
+		item: map[string]any{
+			"test_id":               strings.TrimSpace(test.ID),
+			"title":                 test.Title,
+			"description":           test.Description,
+			"submitted_variant_ids": append([]string(nil), submission.OrderedVariantIDs...),
+			"correct":               questionCorrect,
+		},
+		selectedVariants: selectedVariants,
+	}
+	if !questionCorrect {
+		evaluation.validationError = &ValidationError{
+			Code:    "TEST_ORDER_INCORRECT",
+			Message: fmt.Sprintf("Incorrect order for question: %s", test.Title),
+		}
+	}
+	return evaluation, nil
+}
+
+func evaluateClassificationQuestion(answerID, taskID string, test TaskTestMetadata, submission taskTestAnswerPayloadItem, now time.Time) (assessmentQuestionEvaluation, error) {
+	groupsByID := make(map[string]struct{}, len(test.Groups))
+	for _, group := range test.Groups {
+		groupID := strings.TrimSpace(group.ID)
+		if groupID == "" {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		if _, duplicate := groupsByID[groupID]; duplicate {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		groupsByID[groupID] = struct{}{}
+	}
+
+	trustedGroupsByVariantID := make(map[string]string, len(test.Variants))
+	usedGroups := make(map[string]struct{}, len(test.Groups))
+	for _, variant := range test.Variants {
+		variantID := strings.TrimSpace(variant.ID)
+		groupID := strings.TrimSpace(variant.GroupID)
+		if variantID == "" || groupID == "" || variant.IsCorrect || variant.CorrectOrder != nil {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		if _, duplicate := trustedGroupsByVariantID[variantID]; duplicate {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		if _, exists := groupsByID[groupID]; !exists {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		trustedGroupsByVariantID[variantID] = groupID
+		usedGroups[groupID] = struct{}{}
+	}
+	if len(usedGroups) != len(groupsByID) {
+		return assessmentQuestionEvaluation{}, domain.ErrValidation
+	}
+
+	questionCorrect := true
+	selectedVariants := make([]domain.TaskTestAnswerVariant, 0, len(submission.GroupAssignments))
+	for _, assignment := range submission.GroupAssignments {
+		variantID := strings.TrimSpace(assignment.VariantID)
+		submittedGroupID := strings.TrimSpace(assignment.GroupID)
+		trustedGroupID, exists := trustedGroupsByVariantID[variantID]
+		if !exists {
+			return assessmentQuestionEvaluation{}, domain.ErrValidation
+		}
+		assignmentCorrect := submittedGroupID == trustedGroupID
+		if !assignmentCorrect {
+			questionCorrect = false
+		}
+		selectedVariants = append(selectedVariants, domain.TaskTestAnswerVariant{
+			ID:                  uuid.NewString(),
+			StudentTaskAnswerID: answerID,
+			TaskID:              taskID,
+			TaskTestID:          strings.TrimSpace(test.ID),
+			TaskTestVariantID:   variantID,
+			SubmittedGroupID:    &submittedGroupID,
+			IsCorrect:           assignmentCorrect,
+			CreatedAt:           now,
+		})
+	}
+
+	evaluation := assessmentQuestionEvaluation{
+		correct: questionCorrect,
+		item: map[string]any{
+			"test_id":                     strings.TrimSpace(test.ID),
+			"title":                       test.Title,
+			"description":                 test.Description,
+			"submitted_group_assignments": append([]taskTestGroupAssignmentPayload(nil), submission.GroupAssignments...),
+			"correct":                     questionCorrect,
+		},
+		selectedVariants: selectedVariants,
+	}
+	if !questionCorrect {
+		evaluation.validationError = &ValidationError{
+			Code:    "TEST_CLASSIFICATION_INCORRECT",
+			Message: fmt.Sprintf("Incorrect classification for question: %s", test.Title),
+		}
+	}
+	return evaluation, nil
+}

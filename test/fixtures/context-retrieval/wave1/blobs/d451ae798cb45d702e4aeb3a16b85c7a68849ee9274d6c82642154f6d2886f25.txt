@@ -1,0 +1,144 @@
+package assistance
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const finalizationPolicyVersion = "teacher-assistance-v1"
+
+// TeacherEnsurer resolves the canonical logical teacher for a student.
+type TeacherEnsurer interface {
+	Execute(ctx context.Context, studentID string) (domain.PersonalTeacher, error)
+}
+
+// Finalize converts teacher-owned decisions into one assistance summary after
+// the student service closes an action cycle.
+type Finalize struct {
+	Teachers   TeacherEnsurer
+	Decisions  repository.TeacherDecisionReader
+	Assistance repository.LearningActionAssistanceFinalizer
+	IDs        IDGenerator
+	Clock      Clock
+}
+
+// Handle returns false only when the source event was already processed.
+func (uc Finalize) Handle(ctx context.Context, input domain.LearningActionClosed) (bool, error) {
+	if uc.Assistance == nil {
+		return false, errors.New("learning action assistance finalizer is required")
+	}
+	closure, err := domain.NewLearningActionClosed(input)
+	if err != nil {
+		return false, err
+	}
+	if len(closure.LearningTargets) == 0 {
+		return uc.Assistance.Finalize(ctx, closure, nil, nil)
+	}
+	if uc.Teachers == nil || uc.Decisions == nil || uc.IDs == nil || uc.Clock == nil {
+		return false, errors.New("invalid finalize learning action assistance use case")
+	}
+
+	teacher, err := uc.Teachers.Execute(ctx, closure.StudentID)
+	if err != nil {
+		return false, err
+	}
+	decisions, err := uc.Decisions.ListByLearningAction(ctx, closure.StudentID, closure.LearningActionID)
+	if err != nil {
+		return false, err
+	}
+	supportContext, hintsUsed, maxHintLevel, interventionUsed := summarizeDecisions(decisions)
+	observations := buildObservations(closure.LearningTargets, supportContext, hintsUsed > 0, interventionUsed)
+
+	value, err := domain.NewLearningActionAssistance(domain.LearningActionAssistance{
+		ID:                uc.IDs.NewID(),
+		PersonalTeacherID: teacher.ID,
+		StudentID:         closure.StudentID,
+		CorrelationID:     closure.LearningActionID,
+		CausationID:       closure.EventID,
+		LearningActionID:  closure.LearningActionID,
+		ContextType:       closure.ContextType,
+		ContextID:         closure.ContextID,
+		SupportContext:    supportContext,
+		HintsUsed:         hintsUsed,
+		MaxHintLevel:      maxHintLevel,
+		InterventionUsed:  interventionUsed,
+		Observations:      observations,
+		PolicyVersion:     finalizationPolicyVersion,
+		CreatedAt:         uc.Clock.Now(),
+	})
+	if err != nil {
+		return false, err
+	}
+	event, err := domain.NewIntegrationEvent(
+		uc.IDs.NewID(),
+		domain.SubjectTeacherAssistanceObserved,
+		value.CorrelationID,
+		value.CausationID,
+		value.StudentID,
+		value.CreatedAt,
+		domain.TeacherAssistanceObservedSchemaVersion,
+		value.EventData(),
+	)
+	if err != nil {
+		return false, err
+	}
+	return uc.Assistance.Finalize(ctx, closure, &value, &event)
+}
+
+func summarizeDecisions(decisions []domain.TeacherDecision) (domain.TeacherSupportContext, int, *int, bool) {
+	supportContext := domain.TeacherSupportIndependent
+	hintsUsed := 0
+	maximumHintLevel := -1
+	interventionUsed := false
+	for _, decision := range decisions {
+		if decision.Action != domain.TeacherActionStaySilent {
+			supportContext = domain.TeacherSupportGuided
+		}
+		if decision.Action == domain.TeacherActionGiveHint {
+			hintsUsed++
+			if decision.HintLevel != nil && *decision.HintLevel > maximumHintLevel {
+				maximumHintLevel = *decision.HintLevel
+			}
+		}
+		if decision.Action == domain.TeacherActionIntervene {
+			interventionUsed = true
+		}
+	}
+	if hintsUsed == 0 {
+		return supportContext, 0, nil, interventionUsed
+	}
+	return supportContext, hintsUsed, &maximumHintLevel, interventionUsed
+}
+
+func buildObservations(
+	targets []domain.LearningTargetRef,
+	supportContext domain.TeacherSupportContext,
+	hintUsed bool,
+	interventionUsed bool,
+) []domain.TeacherAssistanceObservation {
+	perTarget := 1
+	if hintUsed {
+		perTarget++
+	}
+	if interventionUsed {
+		perTarget++
+	}
+	observations := make([]domain.TeacherAssistanceObservation, 0, len(targets)*perTarget)
+	for _, target := range targets {
+		kind := domain.TeacherObservationIndependentContext
+		if supportContext == domain.TeacherSupportGuided {
+			kind = domain.TeacherObservationGuidedContext
+		}
+		observations = append(observations, domain.TeacherAssistanceObservation{Target: target, Kind: kind})
+		if hintUsed {
+			observations = append(observations, domain.TeacherAssistanceObservation{Target: target, Kind: domain.TeacherObservationHintUsed})
+		}
+		if interventionUsed {
+			observations = append(observations, domain.TeacherAssistanceObservation{Target: target, Kind: domain.TeacherObservationIntervention})
+		}
+	}
+	return observations
+}

@@ -1,0 +1,603 @@
+package dialog
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumResponseBytes = 8 << 20
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	SpaceKey      string
+	HTTPClient    *http.Client
+}
+
+type ensureDialogResponse struct {
+	ID                 string          `json:"id"`
+	SpaceID            string          `json:"space_id"`
+	Type               int             `json:"type"`
+	Status             int             `json:"status"`
+	Title              string          `json:"title"`
+	StudentID          *string         `json:"student_id"`
+	PersonalTeacherID  *string         `json:"personal_teacher_id"`
+	ContextType        string          `json:"context_type"`
+	ContextID          *string         `json:"context_id"`
+	Version            int             `json:"version"`
+	MemberCount        int             `json:"member_count"`
+	MessageCount       int64           `json:"message_count"`
+	MaxMessageSequence int64           `json:"max_message_sequence"`
+	MaxEventSequence   int64           `json:"max_event_sequence"`
+	LastMessageID      *string         `json:"last_message_id"`
+	LastMessageAt      *time.Time      `json:"last_message_at"`
+	CurrentMember      json.RawMessage `json:"current_member"`
+	Members            json.RawMessage `json:"members"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
+type messageResponse struct {
+	ID                string                       `json:"id"`
+	DialogID          string                       `json:"dialog_id"`
+	AuthorType        string                       `json:"author_type"`
+	Channel           string                       `json:"channel"`
+	SenderID          *string                      `json:"sender_id"`
+	PersonalTeacherID *string                      `json:"personal_teacher_id"`
+	LearningActionID  *string                      `json:"learning_action_id"`
+	LessonContext     *domain.LessonMessageContext `json:"lesson_context"`
+	AssistantUI       json.RawMessage              `json:"assistant_ui"`
+	ReplyToMessageID  *string                      `json:"reply_to_message_id"`
+	Body              string                       `json:"body"`
+	Links             []linkResponse               `json:"links"`
+	Status            int                          `json:"status"`
+	Version           int                          `json:"version"`
+	MessageSequence   int64                        `json:"message_sequence"`
+	LastEventSequence int64                        `json:"last_event_sequence"`
+	Attachments       []attachmentResponse         `json:"attachments"`
+	EditedAt          *time.Time                   `json:"edited_at"`
+	DeletedAt         *time.Time                   `json:"deleted_at"`
+	CreatedAt         time.Time                    `json:"created_at"`
+	UpdatedAt         time.Time                    `json:"updated_at"`
+}
+
+type linkResponse struct {
+	URL string `json:"url"`
+}
+
+type attachmentResponse struct {
+	ID               string `json:"id"`
+	Kind             int    `json:"kind"`
+	Status           int    `json:"status"`
+	MIMEType         string `json:"mime_type"`
+	SizeBytes        int64  `json:"size_bytes"`
+	Width            *int   `json:"width"`
+	Height           *int   `json:"height"`
+	OriginalFilename string `json:"original_filename"`
+}
+
+type requestContextResponse struct {
+	DialogID          string            `json:"dialog_id"`
+	StudentID         string            `json:"student_id"`
+	PersonalTeacherID string            `json:"personal_teacher_id"`
+	ContextType       string            `json:"context_type"`
+	ContextID         *string           `json:"context_id"`
+	SourceMessageID   string            `json:"source_message_id"`
+	LearningActionID  *string           `json:"learning_action_id"`
+	Messages          []messageResponse `json:"messages"`
+}
+
+func (client Client) EnsureTeacherDialog(
+	ctx context.Context,
+	studentID string,
+	personalTeacherID string,
+	contextType domain.LearningContextType,
+	contextID string,
+) (domain.TeacherDialogBinding, error) {
+	studentID = strings.TrimSpace(studentID)
+	personalTeacherID = strings.TrimSpace(personalTeacherID)
+	contextID = strings.TrimSpace(contextID)
+	candidate := domain.TeacherDialogBinding{
+		ID: uuid.NewString(), StudentID: studentID, PersonalTeacherID: personalTeacherID,
+		ContextType: contextType, ContextID: contextID,
+	}
+	if _, err := domain.NewTeacherDialogBinding(candidate); err != nil {
+		return domain.TeacherDialogBinding{}, err
+	}
+	dialogContextType := string(contextType)
+	if contextType == domain.LearningContextGeneral {
+		dialogContextType = "general_teacher"
+	}
+	payload := map[string]any{
+		"space_key": client.SpaceKey, "student_id": studentID,
+		"personal_teacher_id": personalTeacherID, "context_type": dialogContextType,
+	}
+	if contextID != "" {
+		payload["context_id"] = contextID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return domain.TeacherDialogBinding{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/ensure")
+	if err != nil {
+		return domain.TeacherDialogBinding{}, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return domain.TeacherDialogBinding{}, unavailable(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	client.authorize(httpRequest)
+	response, err := client.do(httpRequest)
+	if err != nil {
+		return domain.TeacherDialogBinding{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		return domain.TeacherDialogBinding{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var responsePayload ensureDialogResponse
+	if err := decodeStrict(response.Body, &responsePayload); err != nil {
+		return domain.TeacherDialogBinding{}, unavailable(err)
+	}
+	returnedContextType, err := normalizeContextType(responsePayload.ContextType)
+	if err != nil || responsePayload.StudentID == nil || responsePayload.PersonalTeacherID == nil {
+		return domain.TeacherDialogBinding{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: responsePayload.ID, StudentID: *responsePayload.StudentID,
+		PersonalTeacherID: *responsePayload.PersonalTeacherID, ContextType: returnedContextType,
+		ContextID: optional(responsePayload.ContextID), Created: response.StatusCode == http.StatusCreated,
+	})
+	if err != nil || binding.StudentID != studentID || binding.PersonalTeacherID != personalTeacherID ||
+		binding.ContextType != contextType || binding.ContextID != contextID {
+		return domain.TeacherDialogBinding{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return binding, nil
+}
+
+func (client Client) GetTeacherRequestContext(ctx context.Context, request domain.DialogTeacherRequest, before int) (domain.DialogRequestContext, error) {
+	normalized, err := domain.NewDialogTeacherRequest(request)
+	if err != nil || before < 0 || before >= 50 {
+		return domain.DialogRequestContext{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.DialogID) +
+		"/request/" + url.PathEscape(normalized.SourceMessageID))
+	if err != nil {
+		return domain.DialogRequestContext{}, err
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return domain.DialogRequestContext{}, unavailable(err)
+	}
+	query := parsed.Query()
+	query.Set("personal_teacher_id", normalized.PersonalTeacherID)
+	query.Set("before", strconv.Itoa(before))
+	parsed.RawQuery = query.Encode()
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return domain.DialogRequestContext{}, unavailable(err)
+	}
+	client.authorize(httpRequest)
+	response, err := client.do(httpRequest)
+	if err != nil {
+		return domain.DialogRequestContext{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.DialogRequestContext{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var payload requestContextResponse
+	if err := decodeStrict(response.Body, &payload); err != nil {
+		return domain.DialogRequestContext{}, unavailable(err)
+	}
+	contextType, err := normalizeContextType(payload.ContextType)
+	if err != nil {
+		return domain.DialogRequestContext{}, unavailable(err)
+	}
+	messages := make([]domain.DialogMessage, 0, len(payload.Messages))
+	for _, item := range payload.Messages {
+		messages = append(messages, toDomainMessage(item))
+	}
+	result, err := domain.NewDialogRequestContext(domain.DialogRequestContext{
+		DialogID: payload.DialogID, StudentID: payload.StudentID, PersonalTeacherID: payload.PersonalTeacherID,
+		ContextType: contextType, ContextID: optional(payload.ContextID), SourceMessageID: payload.SourceMessageID,
+		LearningActionID: optional(payload.LearningActionID), Messages: messages,
+	})
+	if err != nil || result.DialogID != normalized.DialogID || result.StudentID != normalized.StudentID ||
+		result.PersonalTeacherID != normalized.PersonalTeacherID || result.ContextType != normalized.ContextType ||
+		result.ContextID != normalized.ContextID || result.SourceMessageID != normalized.SourceMessageID ||
+		result.LearningActionID != normalized.LearningActionID {
+		return domain.DialogRequestContext{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	source := result.Messages[len(result.Messages)-1]
+	if source.MessageSequence != normalized.SourceSequence || source.LastEventSequence < normalized.EventSequence {
+		return domain.DialogRequestContext{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return result, nil
+}
+
+func (client Client) AppendTeacherResponse(ctx context.Context, request domain.DialogTeacherRequest, idempotencyKey, body string) (domain.DialogMessage, error) {
+	return client.appendTeacherResponse(ctx, request, idempotencyKey, body, nil)
+}
+
+func (client Client) AppendTeacherCoordinatedResponse(ctx context.Context, request domain.DialogTeacherRequest, idempotencyKey string, response domain.TeacherCoordinatedDialogResponse) (domain.DialogMessage, error) {
+	normalized, err := domain.NewTeacherCoordinatedDialogResponse(response)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	return client.appendTeacherResponse(ctx, request, idempotencyKey, normalized.Body, normalized.AssistantUI)
+}
+
+func (client Client) appendTeacherResponse(ctx context.Context, request domain.DialogTeacherRequest, idempotencyKey, body string, assistantUI json.RawMessage) (domain.DialogMessage, error) {
+	normalized, err := domain.NewDialogTeacherRequest(request)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if _, err := uuid.Parse(idempotencyKey); err != nil || strings.TrimSpace(body) == "" {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	payloadValue := map[string]any{
+		"personal_teacher_id": normalized.PersonalTeacherID,
+		"source_message_id":   normalized.SourceMessageID,
+		"idempotency_key":     idempotencyKey,
+		"body":                body,
+	}
+	if len(assistantUI) != 0 {
+		payloadValue["assistant_ui"] = json.RawMessage(assistantUI)
+	}
+	payload, err := json.Marshal(payloadValue)
+	if err != nil {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.DialogID) + "/message")
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	client.authorize(httpRequest)
+	response, err := client.do(httpRequest)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		return domain.DialogMessage{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var responsePayload messageResponse
+	if err := decodeStrict(response.Body, &responsePayload); err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	message, err := domain.NewDialogTeacherResponse(normalized, toDomainMessage(responsePayload))
+	if err != nil || message.Body != body || !sameStagedAssistantUI(assistantUI, message.AssistantUI) {
+		return domain.DialogMessage{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return message, nil
+}
+
+func sameStagedAssistantUI(expected, actual json.RawMessage) bool {
+	if len(expected) == 0 {
+		return len(actual) == 0
+	}
+	expectedDigest, expectedErr := domain.DigestTeacherAssistantUI(expected)
+	actualDigest, actualErr := domain.DigestTeacherAssistantUI(actual)
+	return expectedErr == nil && actualErr == nil && expectedDigest == actualDigest
+}
+
+func (client Client) AppendTeacherProactive(ctx context.Context, binding domain.TeacherDialogBinding, idempotencyKey, body string) (domain.DialogMessage, error) {
+	return client.appendTeacherProactive(ctx, binding, idempotencyKey, body, nil)
+}
+
+func (client Client) AppendTeacherStructuredProactive(ctx context.Context, binding domain.TeacherDialogBinding, idempotencyKey, body string, assistantUI json.RawMessage) (domain.DialogMessage, error) {
+	if len(assistantUI) == 0 {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	message, err := client.appendTeacherProactive(ctx, binding, idempotencyKey, body, assistantUI)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	return domain.NewDialogTeacherStructuredProactive(binding, message, body, assistantUI)
+}
+
+func (client Client) appendTeacherProactive(ctx context.Context, binding domain.TeacherDialogBinding, idempotencyKey, body string, assistantUI json.RawMessage) (domain.DialogMessage, error) {
+	normalized, err := domain.NewTeacherDialogBinding(binding)
+	if err != nil || normalized.ContextType != domain.LearningContextGeneral {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	idempotencyKey, body = strings.TrimSpace(idempotencyKey), strings.TrimSpace(body)
+	if _, err := uuid.Parse(idempotencyKey); err != nil || body == "" {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	requestPayload := map[string]any{
+		"personal_teacher_id": normalized.PersonalTeacherID,
+		"idempotency_key":     idempotencyKey, "body": body,
+	}
+	if len(assistantUI) != 0 {
+		requestPayload["assistant_ui"] = assistantUI
+	}
+	payload, err := json.Marshal(requestPayload)
+	if err != nil {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.ID) + "/proactive-message")
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	client.authorize(httpRequest)
+	response, err := client.do(httpRequest)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		return domain.DialogMessage{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var responsePayload messageResponse
+	if err := decodeStrict(response.Body, &responsePayload); err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	message, err := domain.NewDialogTeacherProactive(normalized, toDomainMessage(responsePayload))
+	if err != nil || message.Body != body {
+		return domain.DialogMessage{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return message, nil
+}
+
+func (client Client) GetAssistantUISource(ctx context.Context, binding domain.TeacherDialogBinding, messageID string) (domain.DialogAssistantUISource, error) {
+	normalized, err := domain.NewTeacherDialogBinding(binding)
+	messageID = strings.TrimSpace(messageID)
+	if err != nil || normalized.ContextType != domain.LearningContextGeneral {
+		return domain.DialogAssistantUISource{}, domain.ErrInvalidDialogContext
+	}
+	if _, err := uuid.Parse(messageID); err != nil {
+		return domain.DialogAssistantUISource{}, domain.ErrInvalidDialogContext
+	}
+	payload, err := json.Marshal(map[string]any{
+		"student_id": normalized.StudentID, "personal_teacher_id": normalized.PersonalTeacherID, "message_id": messageID,
+	})
+	if err != nil {
+		return domain.DialogAssistantUISource{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.ID) + "/assistant-ui-source")
+	if err != nil {
+		return domain.DialogAssistantUISource{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.DialogAssistantUISource{}, unavailable(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.DialogAssistantUISource{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.DialogAssistantUISource{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var source domain.DialogAssistantUISource
+	if err := decodeStrict(response.Body, &source); err != nil {
+		return domain.DialogAssistantUISource{}, unavailable(err)
+	}
+	if source.Schema != domain.DialogAssistantUISourceSchema || source.DialogID != normalized.ID ||
+		source.StudentID != normalized.StudentID || source.PersonalTeacherID != normalized.PersonalTeacherID ||
+		source.ContextType != "general_teacher" || source.ContextID != nil || source.MessageID != messageID ||
+		source.MessageSequence < 1 || source.MessageVersion < 1 || len(source.AssistantUI) == 0 {
+		return domain.DialogAssistantUISource{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return source, nil
+}
+
+func (client Client) MaterializeCanonicalStudentTurn(ctx context.Context, input domain.CanonicalStudentTurnMaterialization) (domain.DialogMessage, error) {
+	normalized, err := input.Normalize()
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.DialogID) + "/canonical-student-turn")
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		return domain.DialogMessage{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var responsePayload messageResponse
+	if err := decodeStrict(response.Body, &responsePayload); err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	return domain.NewDialogCanonicalStudentTurn(domain.TeacherDialogBinding{ID: normalized.DialogID, StudentID: normalized.StudentID, PersonalTeacherID: normalized.PersonalTeacherID, ContextType: domain.LearningContextGeneral}, toDomainMessage(responsePayload), normalized)
+}
+
+func (client Client) AppendStudentChannelMessage(
+	ctx context.Context,
+	binding domain.TeacherDialogBinding,
+	idempotencyKey string,
+	channel domain.DialogMessageChannel,
+	body string,
+) (domain.DialogMessage, error) {
+	normalized, err := domain.NewTeacherDialogBinding(binding)
+	if err != nil || normalized.ContextType != domain.LearningContextGeneral || channel != domain.DialogMessageChannelTelegram {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if _, err := uuid.Parse(idempotencyKey); err != nil || strings.TrimSpace(body) == "" {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	payload, err := json.Marshal(map[string]any{
+		"student_id": normalized.StudentID, "personal_teacher_id": normalized.PersonalTeacherID,
+		"idempotency_key": idempotencyKey, "channel": channel, "body": body,
+	})
+	if err != nil {
+		return domain.DialogMessage{}, domain.ErrInvalidDialogContext
+	}
+	endpoint, err := client.endpoint("/internal/v1/teacher-dialog/" + url.PathEscape(normalized.ID) + "/student-channel-message")
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		return domain.DialogMessage{}, mapStatus(response.StatusCode, response.Status)
+	}
+	var responsePayload messageResponse
+	if err := decodeStrict(response.Body, &responsePayload); err != nil {
+		return domain.DialogMessage{}, unavailable(err)
+	}
+	message, err := domain.NewDialogStudentChannelMessage(normalized, toDomainMessage(responsePayload))
+	if err != nil || message.Body != body {
+		return domain.DialogMessage{}, unavailable(domain.ErrInvalidDialogContext)
+	}
+	return message, nil
+}
+
+func toDomainMessage(item messageResponse) domain.DialogMessage {
+	return domain.DialogMessage{
+		ID: item.ID, DialogID: item.DialogID, AuthorType: domain.DialogMessageAuthorType(item.AuthorType), Channel: domain.DialogMessageChannel(item.Channel),
+		SenderID: optional(item.SenderID), PersonalTeacherID: optional(item.PersonalTeacherID),
+		LearningActionID: optional(item.LearningActionID), ReplyToMessageID: optional(item.ReplyToMessageID),
+		LessonContext: item.LessonContext, AssistantUI: item.AssistantUI,
+		Body: item.Body, Status: item.Status, Version: item.Version, MessageSequence: item.MessageSequence,
+		LastEventSequence: item.LastEventSequence, CreatedAt: item.CreatedAt,
+	}
+}
+
+func normalizeContextType(value string) (domain.LearningContextType, error) {
+	switch value {
+	case "general_teacher":
+		return domain.LearningContextGeneral, nil
+	case string(domain.LearningContextLesson):
+		return domain.LearningContextLesson, nil
+	case string(domain.LearningContextLessonTask):
+		return domain.LearningContextLessonTask, nil
+	case string(domain.LearningContextPracticeTask):
+		return domain.LearningContextPracticeTask, nil
+	case string(domain.LearningContextProject):
+		return domain.LearningContextProject, nil
+	default:
+		return "", domain.ErrInvalidDialogContext
+	}
+}
+
+func optional(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func (client Client) endpoint(path string) (string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(client.BaseURL), "/")
+	if baseURL == "" || strings.TrimSpace(client.InternalToken) == "" {
+		return "", unavailable(errors.New("dialog service URL and internal token are required"))
+	}
+	parsed, err := url.ParseRequestURI(baseURL + path)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", unavailable(errors.New("invalid dialog service URL"))
+	}
+	return parsed.String(), nil
+}
+
+func (client Client) authorize(request *http.Request) {
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 3 * time.Second}
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	return response, nil
+}
+
+func decodeStrict(reader io.Reader, target any) error {
+	limited := &io.LimitedReader{R: reader, N: maximumResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("dialog response must contain one JSON value")
+	}
+	if limited.N == 0 {
+		return errors.New("dialog response exceeds size limit")
+	}
+	return nil
+}
+
+func mapStatus(statusCode int, status string) error {
+	switch statusCode {
+	case http.StatusNotFound:
+		return domain.ErrDialogRequestNotFound
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict:
+		return domain.ErrInvalidDialogContext
+	default:
+		return unavailable(fmt.Errorf("unexpected dialog response %s", status))
+	}
+}
+
+func unavailable(cause error) error {
+	return fmt.Errorf("%w: %v", domain.ErrDialogStateUnavailable, cause)
+}
+
+var _ repository.DialogRequestContextReader = Client{}
+var _ repository.DialogTeacherResponseAppender = Client{}
+var _ repository.DialogTeacherCoordinatedResponseAppender = Client{}
+var _ repository.DialogTeacherProactiveAppender = Client{}
+var _ repository.DialogTeacherStructuredProactiveAppender = Client{}
+var _ repository.DialogAssistantUISourceReader = Client{}
+var _ repository.DialogStudentChannelAppender = Client{}
+var _ repository.TeacherDialogProvisioner = Client{}

@@ -1,0 +1,135 @@
+package learningsession
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/curriculum"
+)
+
+type TeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+
+type DialogGateway interface {
+	repository.TeacherDialogProvisioner
+	repository.DialogTeacherProactiveAppender
+}
+
+type Summarizer struct {
+	Teachers   TeacherEnsurer
+	Sessions   repository.StudentLearningSessionGateway
+	Analytics  repository.LearningAnalyticsSummaryReader
+	Dialogs    DialogGateway
+	Curriculum CurriculumReplanner
+}
+
+type CurriculumReplanner interface {
+	ExecuteCurrent(context.Context, string, string, string, curriculum.PlanAuditRefs) (curriculum.PlanResult, error)
+}
+
+func (summarizer Summarizer) Execute(ctx context.Context, studentID, sessionID string) (domain.LearningSessionSummaryResult, error) {
+	studentID, sessionID = strings.TrimSpace(studentID), strings.TrimSpace(sessionID)
+	if summarizer.Teachers == nil || summarizer.Sessions == nil || summarizer.Analytics == nil || summarizer.Dialogs == nil || summarizer.Curriculum == nil {
+		return domain.LearningSessionSummaryResult{}, domain.ErrInvalidLearningSessionSummary
+	}
+	teacher, err := summarizer.Teachers.Execute(ctx, studentID)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	session, err := summarizer.Sessions.GetLearningSession(ctx, studentID, sessionID)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	if session.ID != sessionID || session.StudentID != studentID || session.EndedAt == nil || session.AnalyticsSessionID == "" {
+		return domain.LearningSessionSummaryResult{}, domain.ErrInvalidLearningSessionSummary
+	}
+	analytics, err := summarizer.Analytics.GetLearningSessionSummary(ctx, studentID, session.AnalyticsSessionID)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	analytics, err = domain.NormalizeLearningAnalyticsSummary(analytics, studentID, session.AnalyticsSessionID)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	summary, nextStep, reasonCode := formulate(teacher.Language, analytics)
+	body := summary + " " + nextStep
+	binding, err := summarizer.Dialogs.EnsureTeacherDialog(ctx, studentID, teacher.ID, domain.LearningContextGeneral, "")
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	message, err := summarizer.Dialogs.AppendTeacherProactive(ctx, binding, sessionID, body)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	updated, err := summarizer.Sessions.ApplyLearningSessionMetrics(ctx, studentID, sessionID, session.Version, analytics)
+	if err != nil {
+		return domain.LearningSessionSummaryResult{}, err
+	}
+	var planningRequestID string
+	if session.CourseID != "" {
+		plan, planErr := summarizer.Curriculum.ExecuteCurrent(ctx, studentID, session.CourseID, sessionID, curriculum.PlanAuditRefs{
+			DialogID: binding.ID, SourceMessageID: message.ID,
+		})
+		if planErr != nil {
+			return domain.LearningSessionSummaryResult{}, planErr
+		}
+		planningRequestID = plan.RequestID
+	}
+	return domain.LearningSessionSummaryResult{
+		Session: updated, Analytics: analytics, Summary: summary, NextStep: nextStep,
+		ReasonCode: reasonCode, PolicyVersion: domain.LearningSessionSummaryPolicyVersion,
+		DialogID: binding.ID, MessageID: message.ID,
+		PlanningRequestID: planningRequestID,
+	}, nil
+}
+
+func formulate(language string, analytics domain.LearningAnalyticsSummary) (string, string, string) {
+	minutes := (analytics.ActiveLearningSeconds + 59) / 60
+	english := strings.HasPrefix(strings.ToLower(strings.TrimSpace(language)), "en")
+	if english {
+		summary := fmt.Sprintf(
+			"Session summary: %d active minutes, %d lessons and %d tasks completed, %d questions, %d code runs, %d failed checks, %d passed tests, and %d hints.",
+			minutes, analytics.LessonCount, analytics.TaskCount, analytics.QuestionCount, analytics.CodeRunCount,
+			analytics.FailureCount, analytics.PassedTestCount, analytics.HintCount,
+		)
+		next, reason := englishNextStep(analytics)
+		return summary, next, reason
+	}
+	summary := fmt.Sprintf(
+		"Итог занятия: %d активных минут, завершено уроков — %d, задач — %d, вопросов — %d, запусков кода — %d, неуспешных проверок — %d, успешных тестов — %d, подсказок — %d.",
+		minutes, analytics.LessonCount, analytics.TaskCount, analytics.QuestionCount, analytics.CodeRunCount,
+		analytics.FailureCount, analytics.PassedTestCount, analytics.HintCount,
+	)
+	next, reason := russianNextStep(analytics)
+	return summary, next, reason
+}
+
+func englishNextStep(analytics domain.LearningAnalyticsSummary) (string, string) {
+	switch {
+	case analytics.StuckSignalCount > 0 || analytics.FailureCount > analytics.PassedTestCount:
+		return "Next: revisit the difficult step and solve one short similar exercise before moving on.", "stuck_or_failure_review"
+	case analytics.HintCount > 0:
+		return "Next: repeat a similar exercise without hints to verify independent understanding.", "verify_independent_understanding"
+	case analytics.LessonCount+analytics.TaskCount > 0:
+		return "Next: continue with the next ready item in your learning path.", "continue_learning_path"
+	default:
+		return "Next: start a short practical block aligned with the session goal.", "resume_goal_with_practice"
+	}
+}
+
+func russianNextStep(analytics domain.LearningAnalyticsSummary) (string, string) {
+	switch {
+	case analytics.StuckSignalCount > 0 || analytics.FailureCount > analytics.PassedTestCount:
+		return "Дальше: повтори сложный шаг и реши одно короткое похожее упражнение перед продолжением.", "stuck_or_failure_review"
+	case analytics.HintCount > 0:
+		return "Дальше: повтори похожее упражнение без подсказок, чтобы проверить самостоятельное понимание.", "verify_independent_understanding"
+	case analytics.LessonCount+analytics.TaskCount > 0:
+		return "Дальше: переходи к следующему готовому пункту своего learning path.", "continue_learning_path"
+	default:
+		return "Дальше: начни короткий практический блок по цели этого занятия.", "resume_goal_with_practice"
+	}
+}

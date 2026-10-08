@@ -1,0 +1,177 @@
+# HTTP contract
+
+The exact route registry is authoritative:
+
+- `internal/transport/http/admin/v1/router.go` — administrative content management.
+- `internal/transport/http/api/v1/router.go` — public and audience-aware read APIs.
+- `internal/transport/http/private/router.go` — service-to-service reads.
+- `internal/transport/http/router.go` — mounts and middleware.
+
+Administrative routes are mounted both without a prefix and under `/admin/v1`; the unprefixed surface is a compatibility contract. Public routes are under `/api/v1`. Internal routes are under `/internal` only when an internal token is configured.
+
+## Authorization
+
+`TEACHER`, `ADMIN`, and `MODERATOR` may read administrative content. Only `ADMIN` and `MODERATOR` may mutate content, hierarchy, tasks, starter files, or apply a knowledge-import batch.
+
+Public routes accept guests. A trusted `X-User-Role` is attached as the audience for lesson policy. Privileged administrative roles bypass lesson read restrictions; other audiences follow `GUEST`, `STUDENT`, `STUDENT_PRO`, or disabled access. See [Lesson read access](lesson-read-access.md).
+Public task projections redact assessment answer keys, including
+`expected_answers` nested in a text-quiz `code_structure`. Trusted evaluation
+consumers obtain the complete contract only from the internal task endpoint.
+
+General internal callers provide `X-Internal-Token` matching `INTERNAL_API_TOKEN`.
+The generated Course write accepts only the distinct
+`LEARNING_PLANNER_INTERNAL_TOKEN`; diagnostic assessment discovery is a
+separately rollout-gated read and accepts only
+`DIAGNOSTIC_CATALOG_INTERNAL_TOKEN`. Each configured token must be distinct.
+Token comparison is a service shared-secret boundary, not end-user
+authorization.
+
+`POST /internal/generated-courses` is the atomic Course ensure command owned by
+the Learning Planner integration. It requires the dedicated token and a UUID
+`Idempotency-Key`, accepts
+one fully generated normalized `ACTIVE` Course with `catalog_visible=false`
+and `ACTIVE` Lessons, and returns `course_id`, `reused`, and ordered lesson
+bindings with their authoritative targets. The command locks the idempotency
+key and `CourseFingerprint`, creates the ordinary Course hierarchy, localized
+lesson descriptions, examples, `quiz_theory` knowledge checks, target
+references, and planning provenance in one transaction, and reuses an exact
+existing fingerprint. Incomplete/planned content is rejected, so a partially
+generated course never becomes readable. Reusing one idempotency key with a
+different normalized body returns `409`.
+
+`GET /internal/course/get-internal-diagnostic-assessments/{courseID}` is a
+Learning Planner diagnostic-catalog read and requires the distinct
+`DIAGNOSTIC_CATALOG_INTERNAL_TOKEN`, not the general or Planner write token.
+When the read token is empty, the route is disabled. The catalog contains only
+active diagnostic assessment tasks of types `11`, `12`, or `13` with exact
+uppercase `evaluation_mode=AUTO`; an explicit diagnostic task with another or
+invalid mode fails the read with a validation error.
+
+The complete serialized generated Course document is limited to 16 MiB. The
+same limit is enforced by the transport and generated-Course use case, matching
+the Learning Planner producer contract. Human-readable title limits count
+Unicode characters rather than UTF-8 bytes.
+
+The same command supports Learning Planner's lazy practice materialization.
+For that flow the request contains one complete active Lesson under the normal
+Course hierarchy and uses fingerprint version
+`practice-material-fingerprint-v1`. Calls occur only when a student opens a
+missing route material. The target/policy/locale fingerprint enables reuse
+across compatible task instances; Course never stores the frozen route itself.
+
+`POST /internal/course/resolve-lesson-bindings` accepts up to 1,000 exact
+`course_source_key` / `lesson_source_key` pairs and returns the live UUID pair
+only when the lesson is actually placed in that course. It is a read-only
+cross-service identity boundary: callers must not derive IDs from source keys.
+Unresolved pairs are returned in `missing` so an importer can fail its own
+preflight before writing another service.
+
+`GET /internal/lesson/{lessonID}/teacher-context?language=<code>` returns only
+an active lesson's current Course-owned content snapshot. The response contains
+`lesson_id`, optional `course_id`/`section_id`, resolved `language`, `title`,
+`excerpt`, `description`, and `content_revision`; the revision is the lesson's
+UTC `updated_at` formatted as RFC3339Nano. An exact requested translation is
+used when present, otherwise the base lesson fields are returned with language
+`default`. Text is UTF-8 and bounded; a missing or inactive lesson returns 404.
+The endpoint exposes current state only and provides no historical lookup. It
+is intended for a trusted Teacher verifier; consumers must not send the whole
+snapshot to a model when only a student-selected fragment is needed.
+
+## Change rules
+
+- Update router tests and this contract when a mount, authorization rule, error shape, or route changes.
+- Treat removal of legacy unprefixed admin routes as a coordinated breaking change.
+- Verify public visibility through the full hierarchy; do not authorize a reusable lesson through an unrelated, more permissive course placement.
+- Keep `README.md` endpoint examples synchronized, but derive exact paths and parameters from route source files.
+
+## Immutable lesson assignments (cutover)
+
+`POST /internal/lessons/{lessonID}/revision` resolves the current active lesson
+into an immutable definition; no body is required. `GET
+/internal/lesson-revisions/{revisionID}` retrieves that exact persisted
+revision. Both require `X-Internal-Token`. Invalid identities/policies return
+422; missing/inactive lessons return 404. Definitions use
+`schema=lesson-revision.v1`, `lesson_id`, `lesson_revision_id`, `content`, and
+`activities`. Each activity has a stable UUID `activity_id`, `type`, `required`,
+and `source_reference: {id, revision_id}`. Types are `theory_acknowledged`,
+`quiz_passed`, `task_passed`, and `practice_completed`. Task/quiz references bind
+to the containing LessonRevision; practice references bind to an explicit
+PracticeRevision (`id` and `revision_id` both identify that exact revision). Content includes lesson text/localizations/examples and
+snapshotted task definitions. `content.tasks` uses the existing trusted
+internal Task JSON, including assessment answer keys. Student must omit answer
+keys when presenting learner content; these endpoints are never public.
+
+`PUT /admin/v1/lesson/{lessonID}/completion-policy` accepts
+`{"activities":[...]}` under the existing ADMIN/MODERATOR write authorization.
+It authors future snapshots only. Duplicate activity IDs, unknown types,
+missing practice revision UUIDs, foreign/inactive task references, and policies
+without any required activity are rejected. Optional activities do not block
+Student completion. Without an authored policy, each active task becomes a
+required passed activity; a taskless lesson requires explicit theory
+acknowledgement. Course never records learner satisfaction or item completion.
+
+Generated-Course receipts add `lessons[].lesson_revision_id`; Planner must carry
+that exact identity into Student assignment. Historical legacy assignments are
+not backfilled with current revisions. They retain legacy semantics until
+explicit reassignment. The old `/internal/course-progress/lessons` endpoint
+remains a legacy projection and cannot authorize new item completion.
+
+The explicit runtime fixture `test/runtime/lesson_completion_fixture.sql` is
+for a newly migrated disposable database only. It supplies a lesson and one
+single-choice assessment for Student's `test/runtime/lesson_completion_smoke.py`
+proof. The proof assigns R10 twice, publishes R11, changes the current answer
+key, and verifies that official attempts still score against the assigned R10.
+Practice's opt-in `TestPracticeCompletionReachesAssignedStudentRequirement`
+then drives the real Runtime and Student owners; its unrelated Catalog,
+Planner, Sandbox, and Validator dependencies are test doubles.
+
+## T23 starter upload routing proof
+
+The existing canonical admin upload is
+`POST /admin/v1/task/{taskID}/starter-files/upload`, using multipart `files`
+and corresponding relative `paths`. Course's existing `ADMIN`/`MODERATOR`
+write allowlist trusts the Gateway's `X-User-ID` and `X-User-Role` metadata.
+This proof changes no production route, authorization or archive policy.
+
+Root may launch `TestT23ServeStarterUploadProvider` with the `integration`
+build tag and `T23_COURSE_PROVIDER=1`. It requires the exact URL
+`postgres://postgres@127.0.0.1:58998/remediation_t23_course_integration_proof?sslmode=disable`.
+Root creates and migrates this isolated database before launch; the provider
+performs no DDL, retains all seeded rows, and stops on its marker or after a
+finite 20 minute lifetime. It composes the production admin router, task
+handler, upload use case, PostgreSQL repositories and transaction manager,
+and FileStorage HTTP client. Two fresh bounded CODE task metadata fixtures
+separate the canonical preflight from the frontend proof. Their code is
+never executed.
+
+Set `T23_COURSE_DATABASE_URL`, `T23_COURSE_PROVIDER_INFO_FILE`,
+`T23_COURSE_PROVIDER_STOP_FILE`, and `T23_COURSE_PROVIDER_EVENTS_FILE`.
+The three fresh evidence paths must reside inside the remediation report's
+`EVIDENCE/T23` directory. Root supplies distinct ephemeral `T23_ADMIN_TOKEN`,
+`T23_MODERATOR_TOKEN`, `T23_STUDENT_TOKEN`, `T23_TEACHER_TOKEN`, and
+`T23_PROOF_TOKEN` in process environment only. Optional `T23_BAD_TOKEN`
+must remain unauthorized. No tokens appear in readiness, request journals,
+or readback.
+
+Readiness schema `t23-starter-provider.v1` contains separate `course_origin`
+and `auth_origin` with their ports, `database`, `task_id`, `preflight_task_id`,
+`readback_url`, and evidence paths. Gateway renders an empty `AUTH_BASE_PATH`
+and sends its production `POST /auth/verify` JSON `{token}` to the named
+Auth collaborator. That collaborator returns `{user_id, claims:{role}}`
+only for a supplied actor token and returns 401 for missing or invalid tokens.
+The named FileStorage collaborator consumes the actual production client's
+bounded ZIP upload and activation calls, keeps ZIP bytes in memory, and
+records their hashes and entry names. These collaborators do not prove live
+Auth JWT validation, FileStorage/MinIO persistence or educational authoring.
+
+`GET /__t23/state?task_id=<owned task>` requires `X-Proof-Token` and returns
+actual PostgreSQL `bindings`, `binding_count`, `binding_sha256`, and
+`task_sha256` (row hashes include PostgreSQL `xmin` to detect same-value
+rewrites), global FileStorage `upload_count`/`activate_count` call counts,
+and the bound archive's `archive_id`, `archive_sha256`, `archive_activated`,
+and `zip_files` (`path`, `sha256`, `size`). It returns no file bodies.
+The Course journal records method, path, status, actor role, Accept-Language,
+multipart media type and presence of a boundary; it excludes credentials.
+Root owns the live Next BFF and production rendered Gateway proof, including
+canonical preflight, original duplicate-prefix 404, and auth/multipart
+negative checks against unchanged bindings and archive call counts.

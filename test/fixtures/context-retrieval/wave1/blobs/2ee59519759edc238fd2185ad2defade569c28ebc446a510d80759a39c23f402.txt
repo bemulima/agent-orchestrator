@@ -1,0 +1,181 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	publicapi "github.com/example/ms-student-service/internal/transport/http/api/v1"
+	publichandlers "github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	privateapi "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	"github.com/example/ms-student-service/internal/usecase/hybridapplication"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root starts this finite provider against retained official T20.3 ingress.
+// Snapshot reads, consequence applicability, atomic path mutation and receipts
+// use actual registered Student handlers/usecases/PostgreSQL. The provider
+// creates no initial or final evidence/mastery/path fixtures.
+func TestT204HybridApplicationOwnerProvider(t *testing.T) {
+	ready := os.Getenv("T204_OWNER_READY_FILE")
+	if ready == "" {
+		t.Skip("root-only actual Student application provider gate absent")
+	}
+	stop, eventFile, snapshotFile := os.Getenv("T204_OWNER_STOP_FILE"), os.Getenv("T204_OWNER_EVENT_FILE"), os.Getenv("T204_SNAPSHOT_FILE")
+	token := os.Getenv("T204_OWNER_TOKEN")
+	if stop == "" || eventFile == "" || snapshotFile == "" || token == "" {
+		t.Fatal("SETUP: dedicated token and fresh control/snapshot paths required")
+	}
+	paths := []string{ready, stop, snapshotFile, eventFile}
+	for i, path := range paths {
+		for _, previous := range paths[:i] {
+			if path == previous {
+				t.Fatal("SETUP: all paths must be distinct")
+			}
+		}
+		if path != eventFile {
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatal("SETUP: output and stop files must be absent")
+			}
+		}
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("STUDENT_T20_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_student_integration_proof" || cfg.ConnConfig.User != "postgres" || cfg.ConnConfig.TLSConfig != nil {
+		t.Fatal("SETUP: exact isolated native Student database required")
+	}
+	raw, err := os.ReadFile(eventFile)
+	if err != nil || len(raw) > domain.MaximumPlanningStateEventBytes {
+		t.Fatal("SETUP: retained actual official owner event unavailable")
+	}
+	var envelope domain.EventEnvelope
+	if json.Unmarshal(raw, &envelope) != nil {
+		t.Fatal("SETUP: malformed actual owner event")
+	}
+	event := domain.IntegrationEvent{EventID: envelope.EventID, Subject: envelope.EventType, CorrelationID: envelope.CorrelationID, CausationID: envelope.CausationID, StudentID: envelope.StudentID, OccurredAt: envelope.OccurredAt, SchemaVersion: envelope.SchemaVersion, Payload: raw}
+	if domain.ValidatePlanningStateChangedEvent(event) != nil {
+		t.Fatal("SETUP: retained owner event contract mismatch")
+	}
+	var data domain.PlanningStateChangedData
+	if json.Unmarshal(envelope.Data, &data) != nil {
+		t.Fatal("SETUP: exact owner path/targets missing")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var stored []byte
+	if err := pool.QueryRow(ctx, `SELECT payload::text FROM student_outbox WHERE event_id=$1 AND student_id=$2 AND subject=$3`, event.EventID, event.StudentID, event.Subject).Scan(&stored); err != nil {
+		t.Fatal("SETUP: actual committed owner event missing")
+	}
+	canonical := func(raw []byte) []byte {
+		var value any
+		if json.Unmarshal(raw, &value) != nil {
+			t.Fatal("SETUP: malformed event payload")
+		}
+		out, _ := json.Marshal(value)
+		return out
+	}
+	if !bytes.Equal(canonical(stored), canonical(raw)) {
+		t.Fatal("SETUP: exported event differs from committed owner fact")
+	}
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	getter := studentuc.GetPlanningSnapshot{Reader: journey}
+	snapshot, err := getter.Handle(ctx, event.StudentID, data.LearningPathID, domain.PlanningSnapshotRequest{Targets: data.Targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: data.TriggerKind, Reason: "actual_T204_application_owner", CorrelationID: event.EventID}})
+	if err != nil {
+		t.Fatalf("actual coherent owner snapshot preflight: %v", err)
+	}
+	general, teacher := uuid.NewString(), uuid.NewString()
+	if token == general || token == teacher {
+		t.Fatal("SETUP: distinct scoped internal tokens required")
+	}
+	service := hybridapplication.Service{Applications: journey, Clock: t204ProviderClock{}}
+	router := chi.NewRouter()
+	router.Mount("/internal", privateapi.NewRouter(&privatehandlers.Handler{PlanningSnapshot: getter, HybridApplication: service}, general, token, teacher))
+	public := chi.NewRouter()
+	public.Use(middleware.AuthMiddleware{}.Middleware)
+	publicapi.RegisterHybridIntentRoutes(public, &publichandlers.StudentHybridIntentHandler{Intents: service})
+	router.Mount("/api/v1", public)
+	// Read-only proof instrumentation for retained isolated owner UUIDs. Actual
+	// application commands enter only the production registered private route.
+	router.Get("/__t204/state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		studentID, pathID := r.URL.Query().Get("student_id"), r.URL.Query().Get("path_id")
+		if studentID == "" {
+			studentID, pathID = event.StudentID, data.LearningPathID
+		}
+		if !domain.IsCanonicalPracticeLearningActionUUID(studentID) || !domain.IsCanonicalPracticeLearningActionUUID(pathID) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		path, err := journey.GetLearningPathByID(r.Context(), studentID, pathID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var revisions, applications, receipts, intents, intentEvents int
+		if err := pool.QueryRow(r.Context(), `SELECT (SELECT count(*) FROM student_learning_path_revision WHERE student_learning_path_id=$1),(SELECT count(*) FROM student_hybrid_application WHERE learning_path_id=$1),(SELECT count(*) FROM student_hybrid_application_receipt r JOIN student_hybrid_application a USING(consequence_id) WHERE a.learning_path_id=$1),(SELECT count(*) FROM student_learning_intent WHERE learning_path_id=$1),(SELECT count(*) FROM student_outbox WHERE subject='student.planning-state.changed.v1' AND payload->'data'->>'learning_path_id'=$1::text AND payload->'data'->>'trigger_kind'='LEARNING_INTENT')`, pathID).Scan(&revisions, &applications, &receipts, &intents, &intentEvents); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "revisions": revisions, "applications": applications, "receipts": receipts, "intents": intents, "intent_events": intentEvents})
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	write := func(path string, value any) {
+		t.Helper()
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := file.Write(append(raw, '\n'))
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			t.Fatal("actual provider metadata export failed")
+		}
+	}
+	write(snapshotFile, snapshot)
+	write(ready, map[string]any{"url": server.URL, "token": token, "general_token": general, "teacher_token": teacher, "student_id": event.StudentID, "path_id": data.LearningPathID, "targets": data.Targets, "snapshot_ref": snapshot.References.SnapshotRef, "event_id": event.EventID, "classification": "actual registered Student snapshot/application HTTP/usecases/PostgreSQL; retained eight official evidence commits; no fixture state writes"})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("actual Student provider stop not received before finite deadline")
+		case <-ticker.C:
+			if _, err := os.Lstat(stop); err == nil {
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+type t204ProviderClock struct{}
+
+func (t204ProviderClock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }

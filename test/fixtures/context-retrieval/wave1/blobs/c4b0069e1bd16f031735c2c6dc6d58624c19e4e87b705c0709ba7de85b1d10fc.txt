@@ -1,0 +1,230 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	natsadapter "github.com/example/ms-student-service/internal/infrastructure/messaging/nats"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	privateapi "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	outboxuc "github.com/example/ms-student-service/internal/usecase/outbox"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// Root starts this finite provider after the official evidence/outbox proof.
+// It reads retained owner fixtures and exposes the real registered coherent
+// snapshot HTTP/usecase/PG boundary. Its authenticated relay publishes through
+// the real outbox adapter and updates delivery metadata only; it never creates
+// evidence, mastery or paths.
+func TestT202PlanningSnapshotOwnerProvider(t *testing.T) {
+	ready := os.Getenv("T202_OWNER_READY_FILE")
+	if ready == "" {
+		t.Skip("root-only T20.2 registered owner provider not requested")
+	}
+	stop, eventFile, token := os.Getenv("T202_OWNER_STOP_FILE"), os.Getenv("T202_OWNER_EVENT_FILE"), os.Getenv("T202_OWNER_TOKEN")
+	snapshotFile := os.Getenv("PLANNER_T20_SNAPSHOT_FILE")
+	if stop == "" || eventFile == "" || token == "" || ready == stop || ready == eventFile || stop == eventFile {
+		t.Fatal("SETUP: distinct fresh control paths, committed event and dedicated token required")
+	}
+	outputs := []string{ready, stop}
+	if snapshotFile != "" {
+		if snapshotFile == ready || snapshotFile == stop || snapshotFile == eventFile {
+			t.Fatal("SETUP: snapshot export path must be distinct")
+		}
+		outputs = append(outputs, snapshotFile)
+	}
+	for _, path := range outputs {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatal("SETUP: output and stop files must be absent")
+		}
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("STUDENT_T202_PLANNING_STATE_DATABASE_URL"))
+	if err != nil || (!t202ProviderAcceptanceDatabase(t, cfg, "student") && (cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_student_integration_proof" || cfg.ConnConfig.User != "postgres" || cfg.ConnConfig.TLSConfig != nil)) {
+		t.Fatal("SETUP: exact isolated native T20 Student database required")
+	}
+	raw, err := os.ReadFile(eventFile)
+	if err != nil || len(raw) > domain.MaximumPlanningStateEventBytes {
+		t.Fatal("SETUP: bounded committed planning event unavailable")
+	}
+	var envelope domain.EventEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&envelope) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		t.Fatal("SETUP: committed planning event envelope malformed")
+	}
+	event := domain.IntegrationEvent{EventID: envelope.EventID, Subject: envelope.EventType, CorrelationID: envelope.CorrelationID, CausationID: envelope.CausationID, StudentID: envelope.StudentID, OccurredAt: envelope.OccurredAt, SchemaVersion: envelope.SchemaVersion, Payload: raw}
+	if err := domain.ValidatePlanningStateChangedEvent(event); err != nil {
+		t.Fatal("SETUP: committed planning event violates owner contract")
+	}
+	var data domain.PlanningStateChangedData
+	if json.Unmarshal(envelope.Data, &data) != nil {
+		t.Fatal("SETUP: committed planning identities unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	broker, err := url.Parse(os.Getenv("T202_NATS_URL"))
+	if err != nil || (!t202ProviderAcceptanceNATS(t, os.Getenv("T202_NATS_URL")) && (broker.Scheme != "nats" || broker.Host != "127.0.0.1:59000" || broker.User != nil || broker.Path != "" || broker.RawQuery != "" || broker.Fragment != "")) {
+		t.Fatal("SETUP: exact owned native NATS required")
+	}
+	connection, err := natsgo.Connect(broker.String(), natsgo.Timeout(5*time.Second), natsgo.MaxReconnects(-1))
+	if err != nil {
+		t.Fatal("SETUP: actual owned NATS unavailable")
+	}
+	defer connection.Close()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: owner PostgreSQL connection failed")
+	}
+	defer pool.Close()
+	t202ProviderAcceptanceDatabaseIdentity(t, ctx, pool)
+	var committed []byte
+	if err := pool.QueryRow(ctx, `SELECT payload::text FROM student_outbox WHERE event_id=$1 AND student_id=$2 AND subject=$3`, event.EventID, event.StudentID, event.Subject).Scan(&committed); err != nil {
+		t.Fatal("SETUP: event was not committed by the owner outbox")
+	}
+	var stored any
+	if json.Unmarshal(committed, &stored) != nil {
+		t.Fatal("SETUP: stored owner event malformed")
+	}
+	canonicalStored, _ := json.Marshal(stored)
+	var exported any
+	_ = json.Unmarshal(raw, &exported)
+	canonicalExported, _ := json.Marshal(exported)
+	if !bytes.Equal(canonicalStored, canonicalExported) {
+		t.Fatal("SETUP: exported event differs from committed outbox")
+	}
+	getter := studentuc.GetPlanningSnapshot{Reader: &postgres.LearningJourneyRepoPG{Pool: pool}}
+	snapshot, err := getter.Handle(ctx, event.StudentID, data.LearningPathID, domain.PlanningSnapshotRequest{Targets: data.Targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "owner_event_proof", Reason: "T202_committed_objective_evidence", CorrelationID: event.EventID}})
+	if err != nil {
+		t.Fatalf("actual owner snapshot preflight: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Mount("/internal", privateapi.NewRouter(&privatehandlers.Handler{PlanningSnapshot: getter}, uuid.NewString(), token))
+	relay := outboxuc.Relay{Outbox: postgres.OutboxRepoPG{Pool: pool}, Publisher: &natsadapter.OutboxPublisher{Conn: connection}, Clock: t202ProviderClock{}, WorkerID: uuid.NewString(), BatchSize: 20, LockTTL: 3 * time.Minute, PublishTimeout: 5 * time.Second, RetryBaseDelay: time.Second, RetryMaxDelay: 5 * time.Second}
+	var relayMu sync.Mutex
+	router.Post("/__t202/relay", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		defer r.Body.Close()
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16))
+		if err != nil || string(bytes.TrimSpace(body)) != "{}" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		relayMu.Lock()
+		defer relayMu.Unlock()
+		count, err := relay.ProcessBatch(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"claimed": count, "published": err == nil})
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	write := func(path string, value any) {
+		t.Helper()
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := file.Write(append(raw, '\n'))
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			t.Fatal("owner proof metadata export failed")
+		}
+	}
+	if snapshotFile != "" {
+		write(snapshotFile, snapshot)
+	}
+	write(ready, map[string]any{"url": server.URL, "token": token, "student_id": event.StudentID, "path_id": data.LearningPathID, "targets": data.Targets, "snapshot_ref": snapshot.References.SnapshotRef, "event_id": event.EventID, "classification": "actual registered Student snapshot HTTP/usecase/PostgreSQL; previously committed official evidence and outbox; snapshot reads only; production relay updates delivery metadata only"})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("owner provider stop file not received before finite deadline")
+		case <-ticker.C:
+			if _, err := os.Lstat(stop); err == nil {
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+type t202ProviderClock struct{}
+
+func (t202ProviderClock) Now() time.Time { return time.Now().UTC() }
+
+// t202ProviderAcceptanceDatabase permits only the coordinator's explicit isolated fixture.
+// Frozen historical fixture defaults remain available when this gate is absent.
+func t202ProviderAcceptanceDatabase(t *testing.T, cfg *pgxpool.Config, owner string) bool {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return false
+	}
+	if !t202ProviderAcceptanceDatabaseMatches(cfg, owner) {
+		t.Fatal("SETUP: explicitly attested isolated acceptance database required")
+	}
+	return true
+}
+
+func t202ProviderAcceptanceDatabaseMatches(cfg *pgxpool.Config, owner string) bool {
+	port, err := strconv.Atoi(os.Getenv("INFRA_ACCEPTANCE_POSTGRES_PORT"))
+	name := os.Getenv("INFRA_ACCEPTANCE_" + strings.ToUpper(owner) + "_DATABASE_NAME")
+	host := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_HOST")
+	backend := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP")
+	return !(cfg == nil || err != nil || port < 1 || port > 65535 || host != "127.0.0.1" || net.ParseIP(backend) == nil || !regexp.MustCompile("^infra_acceptance_"+owner+"_[a-z0-9_]+_test$").MatchString(name) || cfg.ConnConfig.Host != host || int(cfg.ConnConfig.Port) != port || cfg.ConnConfig.Database != name || cfg.ConnConfig.User == "" || cfg.ConnConfig.TLSConfig != nil || len(cfg.ConnConfig.Fallbacks) != 0)
+}
+
+func t202ProviderAcceptanceDatabaseIdentity(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return
+	}
+	var database, backend string
+	if pool.QueryRow(ctx, `SELECT current_database(), host(inet_server_addr())`).Scan(&database, &backend) != nil || database != pool.Config().ConnConfig.Database || backend != os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP") {
+		t.Fatal("SETUP: isolated acceptance PostgreSQL backend attestation failed")
+	}
+}
+
+func t202ProviderAcceptanceNATS(t *testing.T, address string) bool {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return false
+	}
+	port, err := strconv.Atoi(os.Getenv("INFRA_ACCEPTANCE_NATS_PORT"))
+	broker, parseErr := url.Parse(address)
+	if err != nil || port < 1 || port > 65535 || parseErr != nil || broker.Scheme != "nats" || broker.Host != "127.0.0.1:"+strconv.Itoa(port) || broker.User != nil || broker.Path != "" || broker.RawQuery != "" || broker.Fragment != "" {
+		t.Fatal("SETUP: explicitly attested isolated acceptance broker required")
+	}
+	return true
+}

@@ -1,0 +1,76 @@
+package learningplanner
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/stretchr/testify/require"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+type diagnosticTransport func(*http.Request) (*http.Response, error)
+
+func (f diagnosticTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func placementPayload() map[string]any {
+	return map[string]any{"schema": "diagnostic-placement.v1", "student_id": "11111111-1111-4111-8111-111111111111", "course_id": "33333333-3333-4333-8333-333333333333", "course_content_revision": "revision", "policy_version": "diagnostic-fixed-v1", "attempt_id": "22222222-2222-4222-8222-222222222222", "plan_id": "22222222-2222-4222-8222-222222222222", "plan_revision": 1, "correct": 2, "total": 4, "percent": 50, "band": "CORE", "band_policy_version": "diagnostic-placement-band-v1", "plan_digest": "sha256:" + strings.Repeat("a", 64), "result_digest": "sha256:" + strings.Repeat("b", 64), "result_completed_at": "2026-10-03T00:00:00Z", "route_code": "START_CORE", "route_policy_version": "diagnostic-placement-route-v1", "decided_at": "2026-10-03T00:00:01Z", "decision_digest": "sha256:" + strings.Repeat("c", 64)}
+}
+func TestDiagnosticPlacementStrictIdentityAndOwnerCorruption(t *testing.T) {
+	for _, field := range []string{"", "student_id", "plan_id", "decision_digest", "result_digest", "policy_version", "route_code"} {
+		t.Run(field, func(t *testing.T) {
+			payload := placementPayload()
+			if field != "" {
+				payload[field] = "corrupt"
+			}
+			client := Client{BaseURL: "http://planner", InternalToken: "token", HTTPClient: &http.Client{Transport: diagnosticTransport(func(r *http.Request) (*http.Response, error) {
+				require.Equal(t, http.MethodPost, r.Method)
+				require.Equal(t, "22222222-2222-4222-8222-222222222222", r.Header.Get("Idempotency-Key"))
+				require.Equal(t, "token", r.Header.Get("X-Internal-Token"))
+				var request map[string]string
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				require.Equal(t, map[string]string{"schema": "diagnostic-placement-consume.v1"}, request)
+				body, _ := json.Marshal(payload)
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+			})}}
+			result, err := client.EnsureDiagnosticPlacement(context.Background(), "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+			if field == "" {
+				require.NoError(t, err)
+				require.Equal(t, "CORE", result.Band)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+func TestDiagnosticOwnerStatusClassification(t *testing.T) {
+	for _, status := range []int{404, 409, 422, 503} {
+		client := Client{BaseURL: "http://planner", InternalToken: "token", HTTPClient: &http.Client{Transport: diagnosticTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		})}}
+		_, err := client.EnsureDiagnosticPlacement(context.Background(), "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+		switch status {
+		case 409:
+			require.ErrorIs(t, err, domain.ErrTeacherGenerationConflict)
+		case 404, 422:
+			require.ErrorIs(t, err, domain.ErrInvalidCurriculum)
+		default:
+			require.ErrorIs(t, err, domain.ErrCurriculumUnavailable)
+		}
+	}
+}
+
+func TestDiagnosticPlanningStateRejectsContradictoryOwnerJob(t *testing.T) {
+	for _, status := range []string{"PLANNING", "FAILED", "COMPLETED"} {
+		t.Run(status, func(t *testing.T) {
+			body := `{"schema":"diagnostic-planning-state.v1","plan_id":"22222222-2222-4222-8222-222222222222","goal_code":"go.backend","onboarding_version":2,"direction_code":"backend","request":{"request_id":"33333333-3333-4333-8333-333333333333","status":"` + status + `","learning_path_id":"44444444-4444-4444-8444-444444444444","failure_code":"ATTEMPTS_EXHAUSTED"}}`
+			client := Client{BaseURL: "http://planner", InternalToken: "token", HTTPClient: &http.Client{Transport: diagnosticTransport(func(r *http.Request) (*http.Response, error) {
+				require.Equal(t, http.MethodGet, r.Method)
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}}
+			_, err := client.GetDiagnosticPlanningState(context.Background(), "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+			require.ErrorIs(t, err, domain.ErrCurriculumUnavailable)
+		})
+	}
+}

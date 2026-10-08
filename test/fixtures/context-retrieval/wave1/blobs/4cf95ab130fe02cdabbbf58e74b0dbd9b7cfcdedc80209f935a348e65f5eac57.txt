@@ -1,0 +1,366 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+const (
+	LearningPathPolicyVersion     = "student-learning-path-v1"
+	LearningPathListSchemaVersion = "student-learning-path-list.v1"
+	LearningContextSchemaVersion  = "student-learning-context.v1"
+	DiagnosticPolicyVersion       = "student-diagnostic-snapshot-v1"
+	LearningSessionVersion        = "student-learning-session-v1"
+)
+
+type LearningPathStatus string
+
+const (
+	LearningPathStatusActive    LearningPathStatus = "ACTIVE"
+	LearningPathStatusPaused    LearningPathStatus = "PAUSED"
+	LearningPathStatusCompleted LearningPathStatus = "COMPLETED"
+	LearningPathStatusArchived  LearningPathStatus = "ARCHIVED"
+)
+
+type LearningPathItemStatus string
+
+const (
+	LearningPathItemPlanned         LearningPathItemStatus = "PLANNED"
+	LearningPathItemReady           LearningPathItemStatus = "READY"
+	LearningPathItemInProgress      LearningPathItemStatus = "IN_PROGRESS"
+	LearningPathItemCompleted       LearningPathItemStatus = "COMPLETED"
+	LearningPathItemSkippedMastered LearningPathItemStatus = "SKIPPED_MASTERED"
+)
+
+// StudentLearningPath is the current Student-owned route. Course identity
+// and planning reason are supplied by Learning Planner, while Student owns storage,
+// optimistic concurrency, and the immutable revision audit.
+type StudentLearningPath struct {
+	ID                   string             `json:"id"`
+	StudentID            string             `json:"student_id"`
+	CourseID             string             `json:"course_id"`
+	GoalCode             string             `json:"goal_code"`
+	CurriculumRevision   string             `json:"curriculum_revision"`
+	CourseFingerprint    string             `json:"course_fingerprint"`
+	PolicyVersion        string             `json:"policy_version"`
+	PlannerPolicyVersion string             `json:"planner_policy_version"`
+	ReasonCode           string             `json:"reason_code"`
+	ReasonSummary        string             `json:"reason_summary"`
+	Status               LearningPathStatus `json:"status"`
+	IsPrimary            bool               `json:"is_primary"`
+	IsSelected           bool               `json:"is_selected"`
+	Version              int64              `json:"version"`
+	Items                []LearningPathItem `json:"items"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+}
+
+type LearningPathItem struct {
+	ID                 string                 `json:"learning_path_item_id,omitempty"`
+	LessonRevisionID   string                 `json:"lesson_revision_id,omitempty"`
+	FrozenRequirements []LessonRequirement    `json:"frozen_requirements,omitempty"`
+	LessonContent      json.RawMessage        `json:"-"`
+	ReferenceType      string                 `json:"reference_type"`
+	ReferenceID        string                 `json:"reference_id"`
+	Position           int                    `json:"position"`
+	Status             LearningPathItemStatus `json:"status"`
+	Targets            []LearningTargetRef    `json:"targets"`
+	ReasonCode         string                 `json:"reason_code"`
+}
+
+func NormalizeStudentLearningPath(input StudentLearningPath) (StudentLearningPath, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.GoalCode = normalizeOnboardingCode(input.GoalCode)
+	input.CurriculumRevision = strings.TrimSpace(input.CurriculumRevision)
+	input.CourseFingerprint = strings.TrimSpace(input.CourseFingerprint)
+	if input.CourseFingerprint == "" {
+		input.CourseFingerprint = input.CurriculumRevision
+	}
+	if input.CurriculumRevision == "" {
+		input.CurriculumRevision = input.CourseFingerprint
+	}
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.PlannerPolicyVersion = strings.TrimSpace(input.PlannerPolicyVersion)
+	input.ReasonCode = normalizeOnboardingCode(input.ReasonCode)
+	input.ReasonSummary = strings.TrimSpace(input.ReasonSummary)
+	if input.Status == "" {
+		input.Status = LearningPathStatusActive
+	}
+	input.CreatedAt = input.CreatedAt.UTC()
+	input.UpdatedAt = input.UpdatedAt.UTC()
+	if _, err := uuid.Parse(input.ID); err != nil || !validJourneyUUID(input.StudentID) || !validJourneyUUID(input.CourseID) ||
+		input.GoalCode == "" || len(input.GoalCode) > 64 || input.CurriculumRevision == "" || len(input.CurriculumRevision) > 128 ||
+		input.CourseFingerprint != input.CurriculumRevision ||
+		input.PolicyVersion != LearningPathPolicyVersion || input.PlannerPolicyVersion == "" || len(input.PlannerPolicyVersion) > 64 ||
+		input.ReasonCode == "" || len(input.ReasonCode) > 64 || !validLearningPathStatus(input.Status) ||
+		(input.IsPrimary && input.Status != LearningPathStatusActive) ||
+		input.ReasonSummary == "" || utf8.RuneCountInString(input.ReasonSummary) > 500 || input.Version < 1 ||
+		input.CreatedAt.IsZero() || input.UpdatedAt.Before(input.CreatedAt) || len(input.Items) < 1 || len(input.Items) > 500 {
+		return StudentLearningPath{}, errors.New("invalid student learning path")
+	}
+	items := make([]LearningPathItem, len(input.Items))
+	seen := make(map[string]struct{}, len(input.Items))
+	readyCount := 0
+	for index, item := range input.Items {
+		item.ReferenceType = normalizeOnboardingCode(item.ReferenceType)
+		item.ReferenceID = strings.TrimSpace(item.ReferenceID)
+		item.ReasonCode = normalizeOnboardingCode(item.ReasonCode)
+		targets, err := NormalizeLearningTargetRefs(item.Targets)
+		if err != nil || (item.ReferenceType != "lesson" && item.ReferenceType != "practice") ||
+			!validJourneyUUID(item.ReferenceID) || item.Position != index || !validPathItemStatus(item.Status) ||
+			item.ReasonCode == "" || len(item.ReasonCode) > 64 {
+			return StudentLearningPath{}, errors.New("invalid student learning path item")
+		}
+		if err := ValidateLessonAssignment(item); err != nil {
+			return StudentLearningPath{}, err
+		}
+		if len(item.FrozenRequirements) == 0 {
+			item.FrozenRequirements = nil
+		}
+		identity := learningPathItemIdentity(item)
+		if _, exists := seen[identity]; exists {
+			return StudentLearningPath{}, errors.New("duplicate student learning path item")
+		}
+		seen[identity] = struct{}{}
+		if item.Status == LearningPathItemReady {
+			readyCount++
+		}
+		item.Targets = targets
+		items[index] = item
+	}
+	if readyCount > 1 {
+		return StudentLearningPath{}, errors.New("multiple ready learning path items")
+	}
+	input.Items = items
+	return input, nil
+}
+
+func validLearningPathStatus(value LearningPathStatus) bool {
+	switch value {
+	case LearningPathStatusActive, LearningPathStatusPaused, LearningPathStatusCompleted, LearningPathStatusArchived:
+		return true
+	default:
+		return false
+	}
+}
+
+// StudentLearningContext is the optimistic Student-owned selection and path-lifecycle
+// aggregate. Version is the whole learner journey version, not a version local to
+// the selected pointer. A zero version represents no persisted aggregate yet.
+type StudentLearningContext struct {
+	Schema                 string     `json:"schema"`
+	StudentID              string     `json:"student_id"`
+	SelectedLearningPathID string     `json:"selected_learning_path_id,omitempty"`
+	Version                int64      `json:"version"`
+	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
+}
+
+func NormalizeStudentLearningContext(input StudentLearningContext) (StudentLearningContext, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.SelectedLearningPathID = strings.TrimSpace(input.SelectedLearningPathID)
+	if input.Schema == "" {
+		input.Schema = LearningContextSchemaVersion
+	}
+	if input.Schema != LearningContextSchemaVersion || !validJourneyUUID(input.StudentID) ||
+		!optionalJourneyUUID(input.SelectedLearningPathID) || input.Version < 0 {
+		return StudentLearningContext{}, errors.New("invalid student learning context")
+	}
+	if input.Version == 0 {
+		if input.SelectedLearningPathID != "" || input.UpdatedAt != nil {
+			return StudentLearningContext{}, errors.New("invalid empty student learning context")
+		}
+		return input, nil
+	}
+	if input.UpdatedAt == nil || input.UpdatedAt.IsZero() {
+		return StudentLearningContext{}, errors.New("invalid student learning context version")
+	}
+	updatedAt := input.UpdatedAt.UTC()
+	input.UpdatedAt = &updatedAt
+	return input, nil
+}
+
+type StudentLearningPathSummary struct {
+	ID                 string             `json:"id"`
+	CourseID           string             `json:"course_id"`
+	GoalCode           string             `json:"goal_code"`
+	Status             LearningPathStatus `json:"status"`
+	IsPrimary          bool               `json:"is_primary"`
+	IsSelected         bool               `json:"is_selected"`
+	Version            int64              `json:"version"`
+	CompletedItemCount int                `json:"completed_item_count"`
+	TotalItemCount     int                `json:"total_item_count"`
+	CurrentItem        *LearningPathItem  `json:"current_item,omitempty"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
+type StudentLearningPathList struct {
+	Schema         string                       `json:"schema"`
+	StudentID      string                       `json:"student_id"`
+	JourneyVersion int64                        `json:"journey_version"`
+	Items          []StudentLearningPathSummary `json:"items"`
+}
+
+type StudentLearningPathMutation struct {
+	Path    StudentLearningPath    `json:"path"`
+	Context StudentLearningContext `json:"context"`
+}
+
+func SummarizeStudentLearningPath(path StudentLearningPath, selectedPathID string) (StudentLearningPathSummary, error) {
+	normalized, err := NormalizeStudentLearningPath(path)
+	if err != nil {
+		return StudentLearningPathSummary{}, err
+	}
+	summary := StudentLearningPathSummary{
+		ID: normalized.ID, CourseID: normalized.CourseID, GoalCode: normalized.GoalCode,
+		Status: normalized.Status, IsPrimary: normalized.IsPrimary,
+		IsSelected: selectedPathID == normalized.ID, Version: normalized.Version,
+		TotalItemCount: len(normalized.Items), UpdatedAt: normalized.UpdatedAt,
+	}
+	for index := range normalized.Items {
+		item := normalized.Items[index]
+		if item.Status == LearningPathItemCompleted || item.Status == LearningPathItemSkippedMastered {
+			summary.CompletedItemCount++
+		}
+		if summary.CurrentItem == nil && (item.Status == LearningPathItemInProgress || item.Status == LearningPathItemReady) {
+			copy := item
+			summary.CurrentItem = &copy
+		}
+	}
+	return summary, nil
+}
+
+func validPathItemStatus(value LearningPathItemStatus) bool {
+	switch value {
+	case LearningPathItemPlanned, LearningPathItemReady, LearningPathItemInProgress,
+		LearningPathItemCompleted, LearningPathItemSkippedMastered:
+		return true
+	default:
+		return false
+	}
+}
+
+// StudentDiagnosticSnapshot records a bounded distribution of current
+// Student-owned mastery at a curriculum revision. UNKNOWN remains explicit.
+type StudentDiagnosticSnapshot struct {
+	ID                 string                   `json:"id"`
+	StudentID          string                   `json:"student_id"`
+	AssessmentID       string                   `json:"assessment_id"`
+	CurriculumRevision string                   `json:"curriculum_revision"`
+	PolicyVersion      string                   `json:"policy_version"`
+	Items              []DiagnosticSnapshotItem `json:"items"`
+	CompletedAt        time.Time                `json:"completed_at"`
+}
+
+type DiagnosticSnapshotItem struct {
+	Target       LearningTargetRef  `json:"target"`
+	State        TargetMasteryState `json:"state"`
+	MasteryScore float64            `json:"mastery_score"`
+	Confidence   float64            `json:"confidence"`
+}
+
+func NormalizeStudentDiagnosticSnapshot(input StudentDiagnosticSnapshot) (StudentDiagnosticSnapshot, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.AssessmentID = strings.TrimSpace(input.AssessmentID)
+	input.CurriculumRevision = strings.TrimSpace(input.CurriculumRevision)
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.CompletedAt = input.CompletedAt.UTC()
+	if !validJourneyUUID(input.ID) || !validJourneyUUID(input.StudentID) || !validJourneyUUID(input.AssessmentID) ||
+		input.CurriculumRevision == "" || len(input.CurriculumRevision) > 128 ||
+		input.PolicyVersion != DiagnosticPolicyVersion || input.CompletedAt.IsZero() || len(input.Items) < 1 || len(input.Items) > 500 {
+		return StudentDiagnosticSnapshot{}, errors.New("invalid diagnostic snapshot")
+	}
+	items := make([]DiagnosticSnapshotItem, len(input.Items))
+	seen := make(map[string]struct{}, len(input.Items))
+	for index, item := range input.Items {
+		target, err := NormalizeLearningTargetRef(item.Target)
+		identity := targetIdentity(target)
+		if err != nil || !validDiagnosticMasteryState(item.State) || item.MasteryScore < 0 || item.MasteryScore > 1 ||
+			item.Confidence < 0 || item.Confidence > 1 {
+			return StudentDiagnosticSnapshot{}, errors.New("invalid diagnostic item")
+		}
+		if _, exists := seen[identity]; exists {
+			return StudentDiagnosticSnapshot{}, errors.New("duplicate diagnostic item")
+		}
+		seen[identity] = struct{}{}
+		item.Target = target
+		items[index] = item
+	}
+	input.Items = items
+	return input, nil
+}
+
+func validDiagnosticMasteryState(value TargetMasteryState) bool {
+	return value == TargetMasteryUnknown || validLearnerOverviewMasteryState(value)
+}
+
+type StudentLearningSession struct {
+	ID                       string     `json:"id"`
+	StudentID                string     `json:"student_id"`
+	Goal                     string     `json:"goal"`
+	CourseID                 string     `json:"course_id,omitempty"`
+	LessonID                 string     `json:"lesson_id,omitempty"`
+	TaskID                   string     `json:"task_id,omitempty"`
+	AnalyticsSessionID       string     `json:"analytics_session_id,omitempty"`
+	ActiveLearningSeconds    int        `json:"active_learning_seconds"`
+	LessonCount              int        `json:"lesson_count"`
+	TaskCount                int        `json:"task_count"`
+	QuestionCount            int        `json:"question_count"`
+	SelectedExplanationCount int        `json:"selected_explanation_count"`
+	CodeRunCount             int        `json:"code_run_count"`
+	FailureCount             int        `json:"failure_count"`
+	PassedTestCount          int        `json:"passed_test_count"`
+	HintCount                int        `json:"hint_count"`
+	TeacherInterventionCount int        `json:"teacher_intervention_count"`
+	StuckSignalCount         int        `json:"stuck_signal_count"`
+	Version                  int64      `json:"version"`
+	SchemaVersion            string     `json:"schema_version"`
+	StartedAt                time.Time  `json:"started_at"`
+	EndedAt                  *time.Time `json:"ended_at,omitempty"`
+	UpdatedAt                time.Time  `json:"updated_at"`
+}
+
+func NormalizeStudentLearningSession(input StudentLearningSession) (StudentLearningSession, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.Goal = strings.TrimSpace(input.Goal)
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.LessonID = strings.TrimSpace(input.LessonID)
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.AnalyticsSessionID = strings.TrimSpace(input.AnalyticsSessionID)
+	input.SchemaVersion = strings.TrimSpace(input.SchemaVersion)
+	input.StartedAt = input.StartedAt.UTC()
+	input.UpdatedAt = input.UpdatedAt.UTC()
+	if !validJourneyUUID(input.ID) || !validJourneyUUID(input.StudentID) || input.Goal == "" || utf8.RuneCountInString(input.Goal) > 300 ||
+		!optionalJourneyUUID(input.CourseID) || !optionalJourneyUUID(input.LessonID) || !optionalJourneyUUID(input.TaskID) ||
+		!optionalJourneyUUID(input.AnalyticsSessionID) || input.SchemaVersion != LearningSessionVersion || input.Version < 1 ||
+		input.StartedAt.IsZero() || input.UpdatedAt.Before(input.StartedAt) || input.ActiveLearningSeconds < 0 ||
+		input.LessonCount < 0 || input.TaskCount < 0 || input.QuestionCount < 0 || input.SelectedExplanationCount < 0 ||
+		input.CodeRunCount < 0 || input.FailureCount < 0 || input.PassedTestCount < 0 || input.HintCount < 0 ||
+		input.TeacherInterventionCount < 0 || input.StuckSignalCount < 0 {
+		return StudentLearningSession{}, errors.New("invalid learning session")
+	}
+	if input.EndedAt != nil {
+		ended := input.EndedAt.UTC()
+		if ended.Before(input.StartedAt) || input.UpdatedAt.Before(ended) {
+			return StudentLearningSession{}, errors.New("invalid learning session interval")
+		}
+		input.EndedAt = &ended
+	}
+	return input, nil
+}
+
+func validJourneyUUID(value string) bool {
+	_, err := uuid.Parse(strings.TrimSpace(value))
+	return err == nil
+}
+
+func optionalJourneyUUID(value string) bool { return value == "" || validJourneyUUID(value) }

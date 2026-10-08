@@ -1,0 +1,131 @@
+package domain
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+const AssignedLessonContextSchema = "student-assigned-lesson-context.v1"
+const AssignedLessonContextMaxBytes = 2 << 20
+
+type AssignedLessonContent struct {
+	Title       string `json:"title"`
+	Excerpt     string `json:"excerpt"`
+	Description string `json:"description"`
+}
+
+// AssignedLessonContext contains only exact frozen learner-visible strings.
+// Tasks, translations, and private evaluation material never enter this projection.
+type AssignedLessonContext struct {
+	Schema             string                `json:"schema"`
+	StudentID          string                `json:"student_id"`
+	LearningPathID     string                `json:"learning_path_id"`
+	LearningPathItemID string                `json:"learning_path_item_id"`
+	CourseID           string                `json:"course_id"`
+	LessonID           string                `json:"lesson_id"`
+	LessonRevisionID   string                `json:"lesson_revision_id"`
+	ContentDigest      string                `json:"content_digest"`
+	Content            AssignedLessonContent `json:"content"`
+}
+
+func canonicalAssignedUUID(value string) bool {
+	id, err := uuid.Parse(value)
+	return err == nil && id != uuid.Nil && id.String() == value
+}
+
+// ProjectAssignedLessonContext selects one unambiguous assignment; lifecycle
+// eligibility belongs to commands and is deliberately not applied to this read.
+func ProjectAssignedLessonContext(path StudentLearningPath, itemID string) (AssignedLessonContext, error) {
+	if !canonicalAssignedUUID(path.ID) || !canonicalAssignedUUID(path.StudentID) || !canonicalAssignedUUID(path.CourseID) || !canonicalAssignedUUID(itemID) {
+		return AssignedLessonContext{}, ErrValidation
+	}
+	var item *LearningPathItem
+	for i := range path.Items {
+		if path.Items[i].ID == itemID {
+			if item != nil {
+				return AssignedLessonContext{}, ErrConflict
+			}
+			item = &path.Items[i]
+		}
+	}
+	if item == nil {
+		return AssignedLessonContext{}, ErrNotFound
+	}
+	if item.ReferenceType != "lesson" || !canonicalAssignedUUID(item.ReferenceID) || !canonicalAssignedUUID(item.LessonRevisionID) {
+		return AssignedLessonContext{}, ErrValidation
+	}
+	fields, err := assignedFrozenFields(item.LessonContent)
+	if err != nil {
+		return AssignedLessonContext{}, ErrValidation
+	}
+	// Identity fields are not required in Course's content object; when present
+	// they must agree with the enclosing frozen assignment.
+	for key, expected := range map[string]string{"course_id": path.CourseID, "lesson_id": item.ReferenceID, "lesson_revision_id": item.LessonRevisionID, "learning_path_id": path.ID, "learning_path_item_id": item.ID} {
+		if raw, ok := fields[key]; ok {
+			var value string
+			if json.Unmarshal(raw, &value) != nil || value != expected {
+				return AssignedLessonContext{}, ErrValidation
+			}
+		}
+	}
+	var content AssignedLessonContent
+	for key, target := range map[string]*string{"title": &content.Title, "excerpt": &content.Excerpt, "description": &content.Description} {
+		raw, ok := fields[key]
+		if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, target) != nil || !utf8.ValidString(*target) {
+			return AssignedLessonContext{}, ErrValidation
+		}
+	}
+	if utf8.RuneCountInString(content.Title) > 1000 || utf8.RuneCountInString(content.Excerpt) > 4000 || len(content.Description) > 1<<20 {
+		return AssignedLessonContext{}, ErrValidation
+	}
+	exact, _ := json.Marshal([3]string{content.Title, content.Excerpt, content.Description})
+	digest := sha256.Sum256(exact)
+	result := AssignedLessonContext{Schema: AssignedLessonContextSchema, StudentID: path.StudentID, LearningPathID: path.ID, LearningPathItemID: item.ID, CourseID: path.CourseID, LessonID: item.ReferenceID, LessonRevisionID: item.LessonRevisionID, ContentDigest: "sha256:" + hex.EncodeToString(digest[:]), Content: content}
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded) > AssignedLessonContextMaxBytes {
+		return AssignedLessonContext{}, ErrValidation
+	}
+	return result, nil
+}
+
+// Retain only the top-level object during parsing, rejecting ambiguous duplicate
+// fields rather than choosing an arbitrary stored value.
+func assignedFrozenFields(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	if !utf8.Valid(raw) {
+		return nil, ErrValidation
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, ErrValidation
+	}
+	fields := map[string]json.RawMessage{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return nil, ErrValidation
+		}
+		if _, exists := fields[key]; exists {
+			return nil, ErrValidation
+		}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return nil, ErrValidation
+		}
+		fields[key] = value
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, ErrValidation
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return nil, ErrValidation
+	}
+	return fields, nil
+}

@@ -1,0 +1,176 @@
+package student
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+const (
+	maximumTeacherCodeFiles     = 12
+	maximumTeacherCodeFileBytes = 16 << 10
+	maximumTeacherCodeTotal     = 64 << 10
+)
+
+type LearningActionCodeSandbox interface {
+	FindSandboxForAnswer(ctx context.Context, studentID, taskID, answerID string) (*domain.SandboxSession, error)
+	GetSnapshot(ctx context.Context, sandboxID string) ([]domain.WorkspaceFile, error)
+	GetValidationObservation(ctx context.Context, sandboxID string) (domain.LearningActionValidationObservation, error)
+}
+
+// GetLearningActionCodeContext resolves and sanitizes the exact workspace for
+// one open Student-owned action. Answer and Sandbox identities stay private.
+type GetLearningActionCodeContext struct {
+	Actions repository.LearningActionReader
+	Sandbox LearningActionCodeSandbox
+}
+
+func (useCase GetLearningActionCodeContext) Handle(ctx context.Context, studentID, learningActionID string) (domain.LearningActionCodeContext, error) {
+	studentID, learningActionID = strings.TrimSpace(studentID), strings.TrimSpace(learningActionID)
+	if useCase.Actions == nil || useCase.Sandbox == nil {
+		return domain.LearningActionCodeContext{}, fmt.Errorf("learning action code context dependencies are required")
+	}
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.LearningActionCodeContext{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(learningActionID); err != nil {
+		return domain.LearningActionCodeContext{}, domain.ErrValidation
+	}
+	action, err := useCase.Actions.GetByStudentAndID(ctx, studentID, learningActionID)
+	if err != nil {
+		return domain.LearningActionCodeContext{}, err
+	}
+	if action.StudentID != studentID || action.ID != learningActionID {
+		return domain.LearningActionCodeContext{}, domain.ErrValidation
+	}
+	// Practice v2 bindings intentionally have no answer or Sandbox identity.
+	// Never try to derive one from their context/task instance.
+	if strings.TrimSpace(action.StudentTaskAnswerID) == "" || strings.TrimSpace(action.TaskID) == "" {
+		return domain.LearningActionCodeContext{}, domain.ErrNotFound
+	}
+	actionContext, err := domain.NewLearningActionContext(action)
+	if err != nil {
+		return domain.LearningActionCodeContext{}, fmt.Errorf("%w: invalid stored learning action", domain.ErrValidation)
+	}
+	if actionContext.Status != domain.LearningActionStatusOpen {
+		return domain.LearningActionCodeContext{}, domain.ErrConflict
+	}
+	base := domain.LearningActionCodeContext{
+		LearningActionID: action.ID,
+		StudentID:        action.StudentID,
+		TaskID:           action.TaskID,
+		PolicyVersion:    domain.LearningActionCodeContextPolicyVersion,
+		Validation: domain.LearningActionValidationObservation{
+			PolicyVersion: domain.SandboxValidationObservationVersion,
+		},
+	}
+	sandbox, err := useCase.Sandbox.FindSandboxForAnswer(ctx, action.StudentID, action.TaskID, action.StudentTaskAnswerID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.NewLearningActionCodeContext(base)
+	}
+	if err != nil {
+		return domain.LearningActionCodeContext{}, fmt.Errorf("find learning action sandbox: %w", err)
+	}
+	if sandbox == nil || strings.TrimSpace(sandbox.SandboxID) == "" {
+		return domain.LearningActionCodeContext{}, errors.New("learning action sandbox response is invalid")
+	}
+	files, err := useCase.Sandbox.GetSnapshot(ctx, sandbox.SandboxID)
+	if err != nil {
+		return domain.LearningActionCodeContext{}, fmt.Errorf("read learning action workspace: %w", err)
+	}
+	validation, err := useCase.Sandbox.GetValidationObservation(ctx, sandbox.SandboxID)
+	if err != nil {
+		return domain.LearningActionCodeContext{}, fmt.Errorf("read learning action validation observation: %w", err)
+	}
+	base.Available = true
+	base.Files, base.OmittedFileCount = boundedTeacherCodeFiles(files)
+	base.Truncated = base.OmittedFileCount > 0
+	base.Validation = validation
+	for _, file := range base.Files {
+		base.Truncated = base.Truncated || file.Truncated
+	}
+	return domain.NewLearningActionCodeContext(base)
+}
+
+func boundedTeacherCodeFiles(files []domain.WorkspaceFile) ([]domain.LearningActionCodeFile, int) {
+	type candidate struct {
+		path    string
+		content string
+	}
+	candidates := make([]candidate, 0, len(files))
+	omitted := 0
+	for _, file := range files {
+		filePath, ok := safeTeacherCodePath(file.Path)
+		if !ok || isSensitiveReviewPath(file.Path) || !utf8.ValidString(file.Content) || strings.ContainsRune(file.Content, '\x00') {
+			omitted++
+			continue
+		}
+		candidates = append(candidates, candidate{path: filePath, content: redactReviewSecrets(file.Content)})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].path < candidates[j].path })
+	result := make([]domain.LearningActionCodeFile, 0, min(len(candidates), maximumTeacherCodeFiles))
+	seen, total := make(map[string]struct{}, len(candidates)), 0
+	for _, item := range candidates {
+		if _, exists := seen[item.path]; exists {
+			omitted++
+			continue
+		}
+		seen[item.path] = struct{}{}
+		if len(result) == maximumTeacherCodeFiles || total == maximumTeacherCodeTotal {
+			omitted++
+			continue
+		}
+		limit := min(maximumTeacherCodeFileBytes, maximumTeacherCodeTotal-total)
+		content, truncated := truncateTeacherCode(item.content, limit)
+		result = append(result, domain.LearningActionCodeFile{Path: item.path, Content: content, Truncated: truncated})
+		total += len(content)
+	}
+	return result, omitted
+}
+
+func safeTeacherCodePath(value string) (string, bool) {
+	normalized := strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if normalized == "" || strings.HasPrefix(normalized, "/") || strings.ContainsRune(normalized, '\x00') || !utf8.ValidString(normalized) {
+		return "", false
+	}
+	normalized = path.Clean(normalized)
+	if normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") || len(normalized) > 300 {
+		return "", false
+	}
+	segments := strings.Split(strings.ToLower(normalized), "/")
+	for _, segment := range segments {
+		switch segment {
+		case ".git", "node_modules", "vendor", "dist", "build", "coverage", "target", ".next", "__pycache__", ".venv", "venv":
+			return "", false
+		}
+	}
+	base := segments[len(segments)-1]
+	if strings.HasSuffix(base, ".lock") || base == "package-lock.json" || base == "yarn.lock" || base == "pnpm-lock.yaml" ||
+		strings.HasSuffix(base, ".png") || strings.HasSuffix(base, ".jpg") || strings.HasSuffix(base, ".jpeg") ||
+		strings.HasSuffix(base, ".gif") || strings.HasSuffix(base, ".webp") || strings.HasSuffix(base, ".ico") ||
+		strings.HasSuffix(base, ".pdf") || strings.HasSuffix(base, ".zip") || strings.HasSuffix(base, ".gz") ||
+		strings.HasSuffix(base, ".woff") || strings.HasSuffix(base, ".woff2") || strings.HasSuffix(base, ".ttf") ||
+		strings.HasSuffix(base, ".exe") || strings.HasSuffix(base, ".dll") || strings.HasSuffix(base, ".so") {
+		return "", false
+	}
+	return normalized, true
+}
+
+func truncateTeacherCode(content string, limit int) (string, bool) {
+	if len(content) <= limit {
+		return content, false
+	}
+	content = content[:limit]
+	for !utf8.ValidString(content) {
+		content = content[:len(content)-1]
+	}
+	return content, true
+}

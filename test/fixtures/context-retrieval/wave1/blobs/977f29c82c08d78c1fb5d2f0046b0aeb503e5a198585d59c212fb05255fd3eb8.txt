@@ -1,0 +1,158 @@
+name: Testing policy canary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Testing Policy tier
+        type: choice
+        required: true
+        default: verify:pr
+        options:
+          - verify:pr
+          - verify:main
+          - verify:nightly
+          - verify:release
+
+permissions:
+  contents: read
+
+jobs:
+  testing-policy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+          cache: true
+
+      - name: Install and verify pinned golangci-lint
+        env:
+          GOBIN: ${{ github.workspace }}/.cache/bin
+          GOTOOLCHAIN: go1.24.4
+        run: |
+          set -euo pipefail
+          mkdir -p "$GOBIN"
+          go version | grep -F 'go1.24.4'
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          linter="$GOBIN/golangci-lint"
+          test -x "$linter"
+          linter_version="$("$linter" version)"
+          printf '%s\n' "$linter_version"
+          [[ "$linter_version" == *'has version v1.64.8 built with go1.24.4 '* ]]
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
+      - name: Verify resolved pinned golangci-lint
+        run: |
+          set -euo pipefail
+          expected="$GITHUB_WORKSPACE/.cache/bin/golangci-lint"
+          resolved="$(command -v golangci-lint)"
+          test "$resolved" = "$expected"
+          linter_version="$(golangci-lint version)"
+          printf '%s\n' "$linter_version"
+          [[ "$linter_version" == *'has version v1.64.8 built with go1.24.4 '* ]]
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.5'
+
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Check policy bundle checksum before execution
+        run: |
+          node -e 'const fs = require("node:fs"); const crypto = require("node:crypto"); const lock = JSON.parse(fs.readFileSync(".ai/testing/policy/policy-lock.json", "utf8")); const bundle = fs.readFileSync(".ai/testing/policy/policy-runner.cjs"); const actual = crypto.createHash("sha256").update(bundle).digest("hex"); if (actual !== lock.bundle_sha256) { console.error("Policy bundle checksum mismatch"); process.exit(1); } console.log("Policy bundle checksum PASS");'
+
+      - name: Verify policy bundle identity
+        run: node .ai/testing/policy/policy-runner.cjs verify-lock --lock .ai/testing/policy/policy-lock.json
+
+      - name: Validate testing manifest
+        run: node .ai/testing/policy/policy-runner.cjs validate --repo .
+
+      - name: Run selected Testing Policy tier
+        id: policy_run
+        continue-on-error: true
+        env:
+          POLICY_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          POLICY_HEAD_SHA: ${{ github.sha }}
+          POLICY_TIER_COMMAND: ${{ github.event_name == 'schedule' && 'verify:nightly' || github.event_name == 'pull_request' && 'verify:pr' || github.event_name == 'push' && 'verify:main' || inputs.command || 'verify:pr' }}
+        shell: bash
+        run: |
+          args=(node .ai/testing/policy/policy-runner.cjs verify --repo . --command "$POLICY_TIER_COMMAND" --output-dir . --run-id "$POLICY_RUN_ID" --head "$POLICY_HEAD_SHA")
+          if [[ -n "$POLICY_BASE_SHA" && "$POLICY_BASE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            args+=(--base "$POLICY_BASE_SHA")
+          fi
+          "${args[@]}"
+
+
+      - name: Validate policy result artifacts
+        id: result_validation
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mapfile -d '' results < <(find test-results -type f -name test-result.v1.json -print0 2>/dev/null)
+          if (( ${#results[@]} == 0 )); then
+            echo "No test-result.v1.json artifacts were generated"
+            exit 1
+          fi
+          for result in "${results[@]}"; do
+            node .ai/testing/policy/policy-runner.cjs validate-result --repo . --result "$result"
+          done
+
+      - name: Upload policy result artifacts
+        id: result_upload
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testing-policy-results
+          path: test-results/**
+          if-no-files-found: error
+          retention-days: ${{ inputs.command == 'verify:release' && 365 || inputs.command == 'verify:pr' && 30 || github.event_name == 'pull_request' && 30 || 90 }}
+
+      - name: Enforce policy result
+        if: always()
+        env:
+          POLICY_RUN_OUTCOME: ${{ steps.policy_run.outcome }}
+          RESULT_VALIDATION_OUTCOME: ${{ steps.result_validation.outcome }}
+          RESULT_UPLOAD_OUTCOME: ${{ steps.result_upload.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$RESULT_VALIDATION_OUTCOME" != success ]]; then
+            echo "Policy result validation failed (outcome: $RESULT_VALIDATION_OUTCOME)"
+            exit 1
+          fi
+          if [[ "$RESULT_UPLOAD_OUTCOME" != success ]]; then
+            echo "Policy result upload failed (outcome: $RESULT_UPLOAD_OUTCOME)"
+            exit 1
+          fi
+          mapfile -d '' results < <(find test-results -type f -name test-result.v1.json -print0 2>/dev/null)
+          if (( ${#results[@]} == 0 )); then
+            echo "No test-result.v1.json artifacts are available to enforce"
+            exit 1
+          fi
+          for result in "${results[@]}"; do
+            node .ai/testing/policy/policy-runner.cjs enforce-result --repo . --result "$result"
+          done
+          if [[ "$POLICY_RUN_OUTCOME" != success ]]; then
+            echo "Policy fast tier did not pass (outcome: $POLICY_RUN_OUTCOME)"
+            exit 1
+          fi

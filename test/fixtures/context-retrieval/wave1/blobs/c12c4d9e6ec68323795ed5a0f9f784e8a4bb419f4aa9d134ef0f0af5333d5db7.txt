@@ -1,0 +1,108 @@
+-- Best-effort rollback for course schema refactor
+-- NOTE: Per-version localized texts cannot be fully restored; we copy course_i18n into current/default versions.
+BEGIN;
+
+-- Restore legacy columns
+ALTER TABLE course ADD COLUMN IF NOT EXISTS compose_config jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS title varchar(255);
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS description text;
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS tech_label varchar(64);
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS main_tech varchar(64);
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS main_tech_version varchar(32);
+
+-- Recreate course_version_i18n
+CREATE TABLE IF NOT EXISTS course_version_i18n (
+    course_version_id uuid NOT NULL REFERENCES course_version(id) ON DELETE CASCADE,
+    i18n_id uuid NOT NULL REFERENCES i18n(id) ON DELETE CASCADE,
+    title varchar(255) NOT NULL,
+    description text NOT NULL,
+    PRIMARY KEY (course_version_id, i18n_id)
+);
+
+-- Backfill course.compose_config from current (or latest) version's compose_config
+WITH picked AS (
+    SELECT
+        c.id AS course_id,
+        cv.compose_config_id
+    FROM course c
+    LEFT JOIN LATERAL (
+        SELECT cv.compose_config_id
+        FROM course_version cv
+        WHERE cv.course_id = c.id
+        ORDER BY (cv.id = c.current_version_id) DESC, cv.published_at DESC NULLS LAST, cv.version DESC
+        LIMIT 1
+    ) cv ON TRUE
+)
+UPDATE course c
+SET compose_config = COALESCE(cc.config, '{}'::jsonb)
+FROM picked p
+LEFT JOIN compose_config cc ON cc.id = p.compose_config_id
+WHERE c.id = p.course_id;
+
+-- Backfill course_version title/description from course_i18n (prefer 'en', else any)
+WITH ranked AS (
+    SELECT
+        ci.course_id,
+        ci.title,
+        ci.description,
+        ROW_NUMBER() OVER (
+            PARTITION BY ci.course_id
+            ORDER BY CASE WHEN i.language = 'en' THEN 0 ELSE 1 END, i.language
+        ) AS rn
+    FROM course_i18n ci
+    JOIN i18n i ON i.id = ci.i18n_id
+)
+UPDATE course_version cv
+SET title = r.title,
+    description = r.description
+FROM ranked r
+WHERE cv.course_id = r.course_id AND r.rn = 1;
+
+-- Backfill tech labels from course.main_tech_id
+UPDATE course_version cv
+SET tech_label = t.label,
+    main_tech = t.label
+FROM course c
+JOIN tech t ON t.id = c.main_tech_id
+WHERE cv.course_id = c.id AND (cv.tech_label IS NULL OR cv.tech_label = '');
+
+-- Ensure required legacy columns are not null (fallback to empty strings)
+UPDATE course_version SET title = '' WHERE title IS NULL;
+UPDATE course_version SET description = '' WHERE description IS NULL;
+UPDATE course_version SET tech_label = '' WHERE tech_label IS NULL;
+
+ALTER TABLE course_version ALTER COLUMN title SET NOT NULL;
+ALTER TABLE course_version ALTER COLUMN description SET NOT NULL;
+ALTER TABLE course_version ALTER COLUMN tech_label SET NOT NULL;
+
+-- Recreate course_version_i18n from course_i18n for current/default versions
+INSERT INTO course_version_i18n (course_version_id, i18n_id, title, description)
+SELECT c.current_version_id, ci.i18n_id, ci.title, ci.description
+FROM course c
+JOIN course_i18n ci ON ci.course_id = c.id
+WHERE c.current_version_id IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+INSERT INTO course_version_i18n (course_version_id, i18n_id, title, description)
+SELECT cv.id, ci.i18n_id, ci.title, ci.description
+FROM course_version cv
+JOIN course c ON c.id = cv.course_id
+JOIN course_i18n ci ON ci.course_id = c.id
+WHERE cv.is_default = true
+ON CONFLICT DO NOTHING;
+
+-- Drop new constraints and columns
+ALTER TABLE course DROP CONSTRAINT IF EXISTS fk_course_main_tech;
+ALTER TABLE course_version DROP CONSTRAINT IF EXISTS fk_course_version_compose_config;
+
+ALTER TABLE course DROP COLUMN IF EXISTS main_tech_id;
+ALTER TABLE course_version DROP COLUMN IF EXISTS compose_config_id;
+
+DROP TABLE IF EXISTS compose_config_tech;
+DROP TABLE IF EXISTS course_tech;
+DROP TABLE IF EXISTS course_i18n;
+DROP TABLE IF EXISTS compose_config;
+DROP TABLE IF EXISTS tech;
+
+COMMIT;

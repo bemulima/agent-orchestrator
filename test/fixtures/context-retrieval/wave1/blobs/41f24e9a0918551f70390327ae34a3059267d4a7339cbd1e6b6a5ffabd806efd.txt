@@ -1,0 +1,192 @@
+package onboarding
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// HandoffWorker advances one durable boundary at a time: Planner acceptance
+// is committed before the idempotent Dialog notification is attempted.
+type HandoffWorker struct {
+	Store           repository.TeacherOnboardingHandoffStore
+	Planner         repository.TeacherOnboardingPlanHandoffGateway
+	Readiness       repository.TeacherLearningReadinessResolver
+	Responses       repository.DialogTeacherResponseAppender
+	Proactive       repository.DialogTeacherProactiveAppender
+	ChannelDelivery repository.TelegramDeliveryEnqueuer
+	IDs             IDGenerator
+	Clock           Clock
+	WorkerID        string
+	LeaseTTL        time.Duration
+	RetryBaseDelay  time.Duration
+	RetryMaxDelay   time.Duration
+	MaxAttempts     int
+
+	// lastClaimWasNotification provides bounded fairness between the two
+	// independent ledger queues. A notification still wins the first eligible
+	// pass (important for a dense source cursor), but a continuing notification
+	// backlog cannot indefinitely prevent READY handoffs from reaching Planner.
+	lastClaimWasNotification bool
+}
+
+func (worker *HandoffWorker) ProcessNext(ctx context.Context) (bool, error) {
+	if !worker.valid() {
+		return false, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	now := worker.Clock.Now().UTC()
+	if !worker.lastClaimWasNotification {
+		if claimed, err := worker.claimNotification(ctx, now); err != nil || claimed {
+			return claimed, err
+		}
+		return worker.claimDispatch(ctx, now)
+	}
+	if claimed, err := worker.claimDispatch(ctx, now); err != nil || claimed {
+		return claimed, err
+	}
+	return worker.claimNotification(ctx, now)
+}
+
+func (worker *HandoffWorker) claimDispatch(ctx context.Context, now time.Time) (bool, error) {
+	claimToken := worker.IDs.NewID()
+	intent, claimed, err := worker.Store.ClaimDispatch(ctx, claimToken, worker.WorkerID, now, now.Add(worker.LeaseTTL))
+	if err != nil || !claimed {
+		return claimed, err
+	}
+	worker.lastClaimWasNotification = false
+	return true, worker.dispatch(ctx, intent)
+}
+
+func (worker *HandoffWorker) claimNotification(ctx context.Context, now time.Time) (bool, error) {
+	claimToken := worker.IDs.NewID()
+	intent, claimed, err := worker.Store.ClaimNotification(ctx, claimToken, worker.WorkerID, now, now.Add(worker.LeaseTTL))
+	if err != nil || !claimed {
+		return claimed, err
+	}
+	worker.lastClaimWasNotification = true
+	return true, worker.notify(ctx, intent)
+}
+
+func (worker HandoffWorker) dispatch(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent) error {
+	result, err := worker.Planner.CreateOnboardingPlanHandoff(ctx, intent)
+	if err == nil {
+		return worker.Store.MarkAccepted(ctx, intent.ID, intent.ClaimToken, result, worker.Clock.Now().UTC())
+	}
+	if errors.Is(err, domain.ErrTeacherOnboardingHandoffActivePath) || errors.Is(err, domain.ErrTeacherOnboardingHandoffStateChanged) {
+		readiness, resolveErr := worker.Readiness.ResolveLearningReadiness(ctx, intent.StudentID, intent.StateRef)
+		if resolveErr == nil {
+			readiness, resolveErr = domain.NormalizeTeacherLearningReadiness(readiness, &intent.StateRef)
+		}
+		if resolveErr == nil && readiness.Result == domain.TeacherLearningReadinessNotReady && readiness.ReasonCodes[0] == domain.TeacherReadinessReasonActivePathExists {
+			return worker.Store.MarkActivePath(ctx, intent.ID, intent.ClaimToken, worker.Clock.Now().UTC())
+		}
+		if resolveErr == nil {
+			return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "planner_state_changed", worker.Clock.Now().UTC()))
+		}
+		if errors.Is(resolveErr, domain.ErrTeacherLearningReadinessStale) {
+			return errors.Join(err, resolveErr, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "student_state_stale", worker.Clock.Now().UTC()))
+		}
+		return worker.retryDispatch(ctx, intent, "planner_reconcile_unavailable", errors.Join(err, resolveErr))
+	}
+	if errors.Is(err, domain.ErrTeacherOnboardingHandoffConflict) {
+		return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "planner_handoff_conflict", worker.Clock.Now().UTC()))
+	}
+	if errors.Is(err, domain.ErrTeacherOnboardingHandoffRejected) {
+		return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "planner_handoff_rejected", worker.Clock.Now().UTC()))
+	}
+	if errors.Is(err, domain.ErrTeacherOnboardingHandoffInvalidResponse) {
+		return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "planner_response_invalid", worker.Clock.Now().UTC()))
+	}
+	return worker.retryDispatch(ctx, intent, "planner_handoff_unavailable", err)
+}
+
+func (worker HandoffWorker) notify(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent) error {
+	displayName, err := domain.TeacherOnboardingHandoffDisplayName(intent.Goal)
+	if err != nil {
+		return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "handoff_goal_invalid", worker.Clock.Now().UTC()))
+	}
+	body := domain.TeacherOnboardingHandoffActivePathBody(intent.Locale)
+	if intent.PlannerHandoffID != "" {
+		body, err = domain.TeacherOnboardingHandoffAcceptedBody(intent.Locale, displayName)
+		if err != nil {
+			return errors.Join(err, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "handoff_copy_invalid", worker.Clock.Now().UTC()))
+		}
+	}
+	var message domain.DialogMessage
+	if intent.SourceRequest != nil {
+		message, err = worker.Responses.AppendTeacherResponse(ctx, *intent.SourceRequest, intent.NotificationCommandID, body)
+		if err == nil {
+			message, err = domain.NewDialogTeacherResponse(*intent.SourceRequest, message)
+		}
+	} else {
+		binding, bindingErr := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+			ID: intent.DialogID, StudentID: intent.StudentID, PersonalTeacherID: intent.PersonalTeacherID, ContextType: domain.LearningContextGeneral,
+		})
+		if bindingErr != nil {
+			return errors.Join(bindingErr, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "dialog_binding_invalid", worker.Clock.Now().UTC()))
+		}
+		message, err = worker.Proactive.AppendTeacherProactive(ctx, binding, intent.NotificationCommandID, body)
+		if err == nil {
+			message, err = domain.NewDialogTeacherProactive(binding, message)
+		}
+	}
+	if err != nil {
+		return worker.retryNotification(ctx, intent, "dialog_notification_unavailable", err)
+	}
+	if message.Body != body {
+		return errors.Join(domain.ErrInvalidDialogContext, worker.Store.Block(ctx, intent.ID, intent.ClaimToken, "dialog_notification_invalid", worker.Clock.Now().UTC()))
+	}
+	if intent.SourceRequest != nil && message.Channel == domain.DialogMessageChannelTelegram {
+		if worker.ChannelDelivery == nil {
+			return worker.retryNotification(ctx, intent, "telegram_delivery_unavailable", domain.ErrTelegramUnavailable)
+		}
+		if err := worker.ChannelDelivery.EnqueueDelivery(ctx, intent.SourceRequest.SourceMessageID, intent.StudentID, body, worker.Clock.Now().UTC()); err != nil {
+			return worker.retryNotification(ctx, intent, "telegram_delivery_unavailable", err)
+		}
+	}
+	return worker.Store.MarkDelivered(ctx, intent.ID, intent.ClaimToken, message.ID, worker.Clock.Now().UTC())
+}
+
+func (worker HandoffWorker) retryDispatch(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent, code string, cause error) error {
+	now := worker.Clock.Now().UTC()
+	durableCtx := context.WithoutCancel(ctx)
+	if intent.Attempts >= worker.MaxAttempts {
+		return errors.Join(cause, worker.Store.Block(durableCtx, intent.ID, intent.ClaimToken, code+"_exhausted", now))
+	}
+	return errors.Join(cause, worker.Store.RetryDispatch(durableCtx, intent.ID, intent.ClaimToken, code, now.Add(worker.retryDelay(intent.Attempts)), now))
+}
+
+func (worker HandoffWorker) retryNotification(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent, code string, cause error) error {
+	now := worker.Clock.Now().UTC()
+	durableCtx := context.WithoutCancel(ctx)
+	if intent.Attempts >= worker.MaxAttempts {
+		return errors.Join(cause, worker.Store.Block(durableCtx, intent.ID, intent.ClaimToken, code+"_exhausted", now))
+	}
+	return errors.Join(cause, worker.Store.RetryNotification(durableCtx, intent.ID, intent.ClaimToken, code, now.Add(worker.retryDelay(intent.Attempts)), now))
+}
+
+func (worker HandoffWorker) retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := worker.RetryBaseDelay
+	for current := 1; current < attempt && delay < worker.RetryMaxDelay; current++ {
+		if delay > worker.RetryMaxDelay/2 {
+			return worker.RetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > worker.RetryMaxDelay {
+		return worker.RetryMaxDelay
+	}
+	return delay
+}
+
+func (worker HandoffWorker) valid() bool {
+	return worker.Store != nil && worker.Planner != nil && worker.Readiness != nil && worker.Responses != nil && worker.Proactive != nil &&
+		worker.IDs != nil && worker.Clock != nil && worker.WorkerID != "" && worker.LeaseTTL > 0 && worker.RetryBaseDelay > 0 &&
+		worker.RetryMaxDelay >= worker.RetryBaseDelay && worker.MaxAttempts > 0
+}

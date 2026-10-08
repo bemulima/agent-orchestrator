@@ -1,0 +1,141 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	PracticeCompetencyEvidenceSchemaV1 = "practice-task-competency-evidence.v1"
+	PracticeCompetencyEvidencePolicyV1 = "practice-competency-evidence-v1"
+	PracticeEvidenceReceiptSchemaV1    = "student-practice-evidence-receipt.v1"
+)
+
+type PracticeCompetencyEvidence struct {
+	Target       LearningTargetRef `json:"target"`
+	Correctness  float64           `json:"correctness"`
+	Independence float64           `json:"independence"`
+	Confidence   float64           `json:"confidence"`
+	StepIDs      []string          `json:"step_ids"`
+}
+
+type PracticeCompetencyEvidenceBundle struct {
+	Schema                  string                       `json:"schema"`
+	EvidenceID              string                       `json:"evidence_id"`
+	StudentID               string                       `json:"student_id"`
+	TaskInstanceID          string                       `json:"task_instance_id"`
+	TaskRevisionID          string                       `json:"task_revision_id"`
+	SubmissionID            string                       `json:"submission_id"`
+	Outcome                 string                       `json:"outcome"`
+	AssistancePolicyVersion string                       `json:"assistance_policy_version"`
+	HintsUsed               int                          `json:"hints_used"`
+	MaxHintLevel            *int                         `json:"max_hint_level,omitempty"`
+	TeacherAssistanceUsed   bool                         `json:"teacher_assistance_used"`
+	Evidence                []PracticeCompetencyEvidence `json:"evidence"`
+	OccurredAt              time.Time                    `json:"occurred_at"`
+	PolicyVersion           string                       `json:"policy_version"`
+	RequestHash             string                       `json:"-"`
+}
+
+type PracticeEvidenceReceipt struct {
+	Schema        string `json:"schema"`
+	EvidenceID    string `json:"evidence_id"`
+	Accepted      bool   `json:"accepted"`
+	PolicyVersion string `json:"policy_version"`
+}
+
+func NormalizePracticeCompetencyEvidenceBundle(studentID, idempotencyKey string, input PracticeCompetencyEvidenceBundle) (PracticeCompetencyEvidenceBundle, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.StudentID = strings.ToLower(strings.TrimSpace(input.StudentID))
+	input.EvidenceID = strings.ToLower(strings.TrimSpace(input.EvidenceID))
+	input.TaskInstanceID = strings.ToLower(strings.TrimSpace(input.TaskInstanceID))
+	input.TaskRevisionID = strings.ToLower(strings.TrimSpace(input.TaskRevisionID))
+	input.SubmissionID = strings.ToLower(strings.TrimSpace(input.SubmissionID))
+	input.Outcome = strings.ToLower(strings.TrimSpace(input.Outcome))
+	input.AssistancePolicyVersion = strings.TrimSpace(input.AssistancePolicyVersion)
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.OccurredAt = input.OccurredAt.UTC()
+	studentID = strings.ToLower(strings.TrimSpace(studentID))
+	idempotencyKey = strings.ToLower(strings.TrimSpace(idempotencyKey))
+	if input.Schema != PracticeCompetencyEvidenceSchemaV1 || input.PolicyVersion != PracticeCompetencyEvidencePolicyV1 ||
+		!canonicalPracticeEvidenceUUID(studentID) || input.StudentID != studentID || !canonicalPracticeEvidenceUUID(input.EvidenceID) ||
+		idempotencyKey != input.EvidenceID || !canonicalPracticeEvidenceUUID(input.TaskInstanceID) || !canonicalPracticeEvidenceUUID(input.TaskRevisionID) ||
+		!canonicalPracticeEvidenceUUID(input.SubmissionID) || input.SubmissionID != input.EvidenceID || input.Outcome != "passed" ||
+		input.AssistancePolicyVersion == "" || len(input.AssistancePolicyVersion) > 64 || input.HintsUsed < 0 || input.HintsUsed > 1000 ||
+		input.OccurredAt.IsZero() || len(input.Evidence) == 0 || len(input.Evidence) > 100 {
+		return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+	}
+	if (input.HintsUsed == 0) != (input.MaxHintLevel == nil) || input.MaxHintLevel != nil && (*input.MaxHintLevel < 1 || *input.MaxHintLevel > 7) {
+		return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+	}
+	seen := make(map[string]struct{}, len(input.Evidence))
+	for index := range input.Evidence {
+		item := &input.Evidence[index]
+		target, err := NormalizeLearningTargetRef(item.Target)
+		if err != nil || target.Version == "" || item.Correctness < 0 || item.Correctness > 1 || item.Independence < 0 || item.Independence > 1 || item.Confidence < 0 || item.Confidence > 1 || len(item.StepIDs) == 0 || len(item.StepIDs) > 100 {
+			return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+		}
+		item.Target = target
+		identity := targetIdentity(target)
+		if _, duplicate := seen[identity]; duplicate {
+			return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+		}
+		stepSeen := map[string]struct{}{}
+		for stepIndex := range item.StepIDs {
+			item.StepIDs[stepIndex] = strings.TrimSpace(item.StepIDs[stepIndex])
+			if item.StepIDs[stepIndex] == "" || len(item.StepIDs[stepIndex]) > 128 {
+				return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+			}
+			if _, duplicate := stepSeen[item.StepIDs[stepIndex]]; duplicate {
+				return PracticeCompetencyEvidenceBundle{}, ErrEvidenceContract
+			}
+			stepSeen[item.StepIDs[stepIndex]] = struct{}{}
+		}
+		seen[identity] = struct{}{}
+	}
+	copyForHash := input
+	copyForHash.RequestHash = ""
+	payload, err := json.Marshal(copyForHash)
+	if err != nil {
+		return PracticeCompetencyEvidenceBundle{}, err
+	}
+	digest := sha256.Sum256(payload)
+	input.RequestHash = "sha256:" + hex.EncodeToString(digest[:])
+	return input, nil
+}
+
+func PracticeEvidenceReducerInputs(input PracticeCompetencyEvidenceBundle) ([]LearningActionTargetEvidence, error) {
+	if input.RequestHash == "" {
+		return nil, errors.New("normalized practice evidence is required")
+	}
+	support := TeacherSupportIndependent
+	if input.HintsUsed > 0 || input.TeacherAssistanceUsed {
+		support = TeacherSupportGuided
+	}
+	kind, err := deriveTargetEvidenceKind(LearningEvidenceApplication, LearningActionPassed, support)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]LearningActionTargetEvidence, 0, len(input.Evidence))
+	for _, item := range input.Evidence {
+		result = append(result, LearningActionTargetEvidence{
+			LearningActionID: input.EvidenceID, StudentID: input.StudentID, TaskID: input.TaskInstanceID,
+			Target: item.Target, EvidenceClass: LearningEvidenceApplication, Outcome: LearningActionPassed,
+			SupportContext: support, Kind: kind, HintsUsed: input.HintsUsed, MaxHintLevel: input.MaxHintLevel,
+			InterventionUsed: input.TeacherAssistanceUsed, TeacherPolicyVersion: input.AssistancePolicyVersion,
+			MasteryPolicyVersion: MasteryPolicyVersion, OccurredAt: input.OccurredAt,
+		})
+	}
+	return result, nil
+}
+
+func canonicalPracticeEvidenceUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}

@@ -1,0 +1,184 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type fixedCourseCompletion struct {
+	completed map[string]struct{}
+}
+
+func (stub fixedCourseCompletion) GetCompletedLessonIDs(context.Context, string, []string) (map[string]struct{}, error) {
+	result := make(map[string]struct{}, len(stub.completed))
+	for lessonID := range stub.completed {
+		result[lessonID] = struct{}{}
+	}
+	return result, nil
+}
+
+func TestPartAccessUsesCurrentMilestoneInsteadOfFuturePrerequisites(t *testing.T) {
+	current := &partRuntimeContext{studentPracticeTask: &domain.StudentPracticeTask{}}
+	milestones := []domain.StudentPracticeTaskPartMilestone{
+		{
+			ID:     "html",
+			Status: domain.MilestoneRuntimeStatusAvailable,
+			Prerequisites: domain.MilestonePrerequisites{
+				MatchedLessonIDs:   []string{"lesson-html"},
+				CompletedLessonIDs: []string{"lesson-html"},
+				UsesExplicitRoute:  true,
+			},
+		},
+		{
+			ID:             "css",
+			Status:         domain.MilestoneRuntimeStatusLocked,
+			BlockingReason: blockingReasonMilestonePrerequisites,
+			Prerequisites: domain.MilestonePrerequisites{
+				MatchedLessonIDs:  []string{"lesson-css"},
+				UnmetLessonIDs:    []string{"lesson-css"},
+				UsesExplicitRoute: true,
+			},
+		},
+	}
+
+	access := buildPartAccess(current, milestones, derivePartStatus(milestones))
+	if access.Locked {
+		t.Fatalf("future CSS prerequisites must not block the current HTML milestone: %#v", access)
+	}
+	if len(access.Prerequisites.CompletedLessonIDs) != 1 || access.Prerequisites.CompletedLessonIDs[0] != "lesson-html" {
+		t.Fatalf("part access must describe the current milestone prerequisites: %#v", access.Prerequisites)
+	}
+	if status := derivePartStatus(milestones); status != domain.MilestoneRuntimeStatusAvailable {
+		t.Fatalf("part with an available current milestone must be available, got %s", status)
+	}
+}
+
+func TestPartRuntimeSnapshotContainsOnlyCurrentMilestone(t *testing.T) {
+	contract := domain.ValidationContract{
+		Version: 1,
+		Kind:    "workspace_contract",
+		Stages:  []domain.ValidationStage{{ID: "html", Engine: "html.dom"}},
+	}
+	current := partRuntimeContext{
+		studentPracticeTask: &domain.StudentPracticeTask{WorkspaceTaskID: "workspace-task", WorkspaceLessonID: "workspace-lesson"},
+		runtimeContext:      &domain.PracticeTaskRuntimeContext{PracticeTask: domain.PracticeTask{ID: "practice-task"}},
+		part:                &domain.PracticeTaskPart{ID: "catalog", Title: "Catalog"},
+		partMilestones: []domain.PracticeTaskRuntimeMilestone{
+			{ID: "html", IsActive: true},
+			{ID: "css", IsActive: true},
+		},
+		studentMilestonesByPartMilestoneID: map[string]domain.StudentPracticeTaskMilestone{
+			"html": {ID: "student-html", PracticeTaskPartMilestoneID: "html"},
+			"css":  {ID: "student-css", PracticeTaskPartMilestoneID: "css"},
+		},
+		build: &PartBuildPreview{
+			Milestones: []MilestoneBuildPreview{{
+				Milestone: domain.PracticeTaskRuntimeMilestone{
+					ID:                 "html",
+					Title:              "HTML catalog",
+					LearningTargets:    []domain.LearningTargetRef{{Type: domain.LearningTargetCapability, Key: "web.catalog.render-products", Version: "v1"}},
+					RuntimeProfileJSON: json.RawMessage(`{"code_structure_type_code":"HTML_BASIC_DOCUMENT","compose_config":{"version":"3.9","services":{}}}`),
+				},
+				Contract: contract,
+			}},
+			Contract: contract,
+		},
+	}
+
+	snapshot, err := buildRuntimeTaskSnapshotFromPart(current, domain.MilestoneAccess{})
+	if err != nil {
+		t.Fatalf("build current milestone snapshot: %v", err)
+	}
+	if len(snapshot.PartMilestoneIDs) != 1 || snapshot.PartMilestoneIDs[0] != "html" || len(snapshot.StudentMilestoneIDs) != 1 || snapshot.StudentMilestoneIDs[0] != "student-html" {
+		t.Fatalf("snapshot must bind only the current milestone: %#v", snapshot)
+	}
+	if len(snapshot.LearningTargets) != 1 || snapshot.LearningTargets[0].Key != "web.catalog.render-products" {
+		t.Fatalf("snapshot must project only the current milestone targets: %#v", snapshot.LearningTargets)
+	}
+}
+
+func TestLaterRouteMilestoneIsBlockedUntilPreviousMilestonePasses(t *testing.T) {
+	previous := domain.PracticeTaskRuntimeMilestone{
+		ID: "html", PartSortOrder: 10, SortOrder: 10, IsActive: true,
+		LessonBindings: []domain.PracticeTaskRuntimeLessonBinding{{LessonID: "lesson-html"}},
+	}
+	currentMilestone := domain.PracticeTaskRuntimeMilestone{ID: "javascript", PartSortOrder: 20, SortOrder: 20, IsActive: true}
+	current := &partRuntimeContext{
+		runtimeContext: &domain.PracticeTaskRuntimeContext{PracticeTaskMilestones: []domain.PracticeTaskRuntimeMilestone{previous, currentMilestone}},
+		part:           &domain.PracticeTaskPart{},
+		studentMilestonesByPartMilestoneID: map[string]domain.StudentPracticeTaskMilestone{
+			"html":       {ID: "student-html", Status: domain.StudentMilestoneStatusNotStarted},
+			"javascript": {ID: "student-javascript", Status: domain.StudentMilestoneStatusNotStarted},
+		},
+	}
+
+	if block := practiceTaskMilestoneLessonBlock(current, currentMilestone, domain.MilestonePrerequisites{}); block != blockingReasonPreviousMilestone {
+		t.Fatalf("later route milestone must wait for the previous milestone, got %q", block)
+	}
+	if redirect := practiceTaskMilestoneLessonRedirect(current, currentMilestone, blockingReasonPreviousMilestone); redirect != "lesson-html" {
+		t.Fatalf("later route must redirect to the blocking milestone lesson, got %q", redirect)
+	}
+}
+
+func TestRoadmapUsesExplicitLessonBindingsForLockedStatus(t *testing.T) {
+	milestone := domain.PracticeTaskRuntimeMilestone{
+		ID:        "html",
+		IsActive:  true,
+		SortOrder: 10,
+		LessonBindings: []domain.PracticeTaskRuntimeLessonBinding{{
+			LessonID: "lesson-html", Requirement: domain.PracticeTaskLessonRequirementRequired,
+		}},
+	}
+	studentMilestone := domain.StudentPracticeTaskMilestone{
+		ID: "student-html", PracticeTaskPartMilestoneID: "html", Status: domain.StudentMilestoneStatusNotStarted,
+	}
+	useCase := StudentUseCase{Completion: fixedCourseCompletion{completed: map[string]struct{}{}}}
+
+	statuses, _, err := useCase.resolveRoadmapStatuses(
+		context.Background(),
+		&domain.StudentPracticeTask{StudentID: "student"},
+		[]domain.PracticeTaskRuntimeMilestone{milestone},
+		[]domain.StudentPracticeTaskMilestone{studentMilestone},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("resolve roadmap statuses: %v", err)
+	}
+	if statuses[milestone.ID] != domain.MilestoneRuntimeStatusLocked {
+		t.Fatalf("required explicit lesson must lock roadmap milestone, got %#v", statuses)
+	}
+}
+
+func TestSplitPartValidationResultReadsValidationReportEnvelope(t *testing.T) {
+	raw := json.RawMessage(`{
+		"source":"validation_orchestrator",
+		"validation_report":{
+			"contract_kind":"workspace_contract",
+			"contract_version":1,
+			"passed":true,
+			"stages":[{
+				"stage_id":"runtime-html::html-structure",
+				"engine":"html.dom",
+				"status":"passed",
+				"passed":true,
+				"optional":false
+			}]
+		}
+	}`)
+
+	results, rawByMilestone, err := splitPartValidationResult(raw)
+	if err != nil {
+		t.Fatalf("split enveloped validation report: %v", err)
+	}
+	result, ok := results["runtime-html"]
+	if !ok || !result.Passed || len(result.Stages) != 1 || result.Stages[0].StageID != "html-structure" {
+		t.Fatalf("enveloped report was not assigned to its milestone: %#v", results)
+	}
+	if len(rawByMilestone["runtime-html"]) == 0 {
+		t.Fatalf("normalized milestone evidence was not retained: %#v", rawByMilestone)
+	}
+}

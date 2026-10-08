@@ -1,0 +1,208 @@
+package internalapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"reflect"
+	"unicode/utf8"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+// PlanningSnapshotGetter reads one owner observation. It is not a planning
+// evaluator, permission grant, progress command, or idempotency receipt writer.
+type PlanningSnapshotGetter interface {
+	Handle(context.Context, string, string, domain.PlanningSnapshotRequest) (domain.StudentPlanningSnapshot, error)
+}
+
+const planningSnapshotRequestLimit = domain.MaximumPlanningSnapshotRequestBytes
+const planningSnapshotResponseLimit = domain.MaximumPlanningSnapshotPayloadBytes
+
+// GetPlanningSnapshot is prepared independently of router registration. The
+// composition root and dedicated Planner route are wired after the owner RED.
+func (handler *Handler) GetPlanningSnapshot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, pathID := chi.URLParam(r, "studentID"), chi.URLParam(r, "pathID")
+	if !canonicalPlanningSnapshotID(studentID) || !canonicalPlanningSnapshotID(pathID) {
+		writePlanningSnapshotError(w, http.StatusBadRequest, "invalid_planning_snapshot_identity")
+		return
+	}
+	request, err := decodePlanningSnapshotRequest(w, r)
+	if err != nil {
+		writePlanningSnapshotError(w, http.StatusBadRequest, "invalid_planning_snapshot_request")
+		return
+	}
+	if handler.PlanningSnapshot == nil {
+		writePlanningSnapshotError(w, http.StatusServiceUnavailable, "planning_snapshot_unconfigured")
+		return
+	}
+	result, err := handler.PlanningSnapshot.Handle(r.Context(), studentID, pathID, request)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			writePlanningSnapshotError(w, http.StatusUnprocessableEntity, "invalid_planning_snapshot_request")
+		case errors.Is(err, domain.ErrNotFound):
+			writePlanningSnapshotError(w, http.StatusNotFound, "planning_snapshot_not_found")
+		case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidStatus):
+			writePlanningSnapshotError(w, http.StatusConflict, "planning_snapshot_conflict")
+		default:
+			writePlanningSnapshotError(w, http.StatusInternalServerError, "planning_snapshot_unavailable")
+		}
+		return
+	}
+	result, err = domain.NormalizeStudentPlanningSnapshot(result)
+	if err != nil || result.StudentID != studentID || result.LearningPathID != pathID ||
+		!reflect.DeepEqual(result.RequestedTargets, request.Targets) || result.TriggerContext != request.TriggerContext {
+		writePlanningSnapshotError(w, http.StatusInternalServerError, "planning_snapshot_unavailable")
+		return
+	}
+	// Marshal the typed whitelist completely before publishing any response.
+	// Technical oversize fails closed; no protected state is silently truncated.
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded) > planningSnapshotResponseLimit {
+		writePlanningSnapshotError(w, http.StatusInternalServerError, "planning_snapshot_unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
+}
+
+func canonicalPlanningSnapshotID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+func writePlanningSnapshotError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+}
+
+func decodePlanningSnapshotRequest(w http.ResponseWriter, r *http.Request) (domain.PlanningSnapshotRequest, error) {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, planningSnapshotRequestLimit))
+	if err != nil || !utf8.Valid(raw) {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	value, err := readPlanningSnapshotJSONValue(decoder, 0)
+	if err != nil {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	root, ok := value.(map[string]any)
+	if !ok || !planningSnapshotJSONKeys(root, "targets", "trigger_context") {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	targets, ok := root["targets"].([]any)
+	if !ok || len(targets) < 1 || len(targets) > 500 {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	for _, value := range targets {
+		target, ok := value.(map[string]any)
+		if !ok || !planningSnapshotJSONKeys(target, "type", "key", "version") {
+			return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+		}
+	}
+	trigger, ok := root["trigger_context"].(map[string]any)
+	if !ok || !planningSnapshotJSONKeys(trigger, "kind", "reason", "correlation_id") {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	if value, present := trigger["correlation_id"]; present {
+		correlationID, ok := value.(string)
+		if !ok || !canonicalPlanningSnapshotID(correlationID) {
+			return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+		}
+	}
+	var request domain.PlanningSnapshotRequest
+	decoder = json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.PlanningSnapshotRequest{}, domain.ErrValidation
+	}
+	return domain.NormalizePlanningSnapshotRequest(request)
+}
+
+// Token parsing rejects duplicate keys and null anywhere, including nested
+// target/trace fields. A typed decoder alone silently accepts both in Go.
+func readPlanningSnapshotJSONValue(decoder *json.Decoder, depth int) (any, error) {
+	if depth > 8 {
+		return nil, errors.New("invalid JSON nesting")
+	}
+	token, err := decoder.Token()
+	if err != nil || token == nil {
+		return nil, errors.New("invalid JSON value")
+	}
+	delimiter, compound := token.(json.Delim)
+	if !compound {
+		return token, nil
+	}
+	switch delimiter {
+	case '{':
+		object := map[string]any{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			key, ok := keyToken.(string)
+			if err != nil || !ok {
+				return nil, errors.New("invalid JSON key")
+			}
+			if _, duplicate := object[key]; duplicate {
+				return nil, errors.New("duplicate JSON key")
+			}
+			value, err := readPlanningSnapshotJSONValue(decoder, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = value
+		}
+		if close, err := decoder.Token(); err != nil || close != json.Delim('}') {
+			return nil, errors.New("invalid JSON object")
+		}
+		return object, nil
+	case '[':
+		array := []any{}
+		for decoder.More() {
+			value, err := readPlanningSnapshotJSONValue(decoder, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		if close, err := decoder.Token(); err != nil || close != json.Delim(']') {
+			return nil, errors.New("invalid JSON array")
+		}
+		return array, nil
+	default:
+		return nil, errors.New("invalid JSON delimiter")
+	}
+}
+
+func planningSnapshotJSONKeys(object map[string]any, allowed ...string) bool {
+	for key := range object {
+		found := false
+		for _, candidate := range allowed {
+			if key == candidate {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}

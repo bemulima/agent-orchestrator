@@ -1,0 +1,361 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TaskTestRepoPG stores test questions and variants for test tasks.
+type TaskTestRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+// ReplaceForTask replaces all questions for one task.
+func (r TaskTestRepoPG) ReplaceForTask(ctx context.Context, taskID string, tests []domain.TaskTest) error {
+	runner := getRunner(ctx, r.Pool)
+	if _, err := runner.Exec(ctx, `DELETE FROM task_test WHERE task_id=$1`, taskID); err != nil {
+		return mapPgError(err)
+	}
+
+	for _, test := range tests {
+		if _, err := runner.Exec(ctx, `
+INSERT INTO task_test (id, task_id, source_key, kind, "order", created_at, updated_at)
+VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7)
+`, test.ID, taskID, test.SourceKey, test.Kind, test.Order, test.CreatedAt, test.UpdatedAt); err != nil {
+			return mapPgError(err)
+		}
+
+		for _, translation := range test.Translations {
+			if _, err := runner.Exec(ctx, `
+INSERT INTO task_test_i18n (task_test_id, i18n_id, title, description)
+VALUES ($1,$2,$3,$4)
+`, test.ID, translation.I18nID, translation.Title, translation.Description); err != nil {
+				return mapPgError(err)
+			}
+		}
+
+		for _, group := range test.Groups {
+			if _, err := runner.Exec(ctx, `
+INSERT INTO task_test_group (id, task_test_id, source_key, "order", created_at, updated_at)
+VALUES ($1,$2,NULLIF($3,''),$4,$5,$6)
+`, group.ID, test.ID, group.SourceKey, group.Order, group.CreatedAt, group.UpdatedAt); err != nil {
+				return mapPgError(err)
+			}
+			for _, translation := range group.Translations {
+				if _, err := runner.Exec(ctx, `
+INSERT INTO task_test_group_i18n (task_test_group_id, i18n_id, title)
+VALUES ($1,$2,$3)
+`, group.ID, translation.I18nID, translation.Title); err != nil {
+					return mapPgError(err)
+				}
+			}
+		}
+
+		for _, variant := range test.Variants {
+			if _, err := runner.Exec(ctx, `
+INSERT INTO task_test_variant (id, task_test_id, source_key, "order", is_correct, correct_order, group_id, created_at, updated_at)
+VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,NULLIF($7,'')::uuid,$8,$9)
+`, variant.ID, test.ID, variant.SourceKey, variant.Order, variant.IsCorrect, variant.CorrectOrder, variant.GroupID, variant.CreatedAt, variant.UpdatedAt); err != nil {
+				return mapPgError(err)
+			}
+
+			for _, translation := range variant.Translations {
+				if _, err := runner.Exec(ctx, `
+INSERT INTO task_test_variant_i18n (task_test_variant_id, i18n_id, text)
+VALUES ($1,$2,$3)
+`, variant.ID, translation.I18nID, translation.Text); err != nil {
+					return mapPgError(err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// ListByTask returns all questions and answer options for one task.
+func (r TaskTestRepoPG) ListByTask(ctx context.Context, taskID string) ([]domain.TaskTest, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT
+    tt.id,
+    COALESCE(tt.source_key, ''),
+    tt.task_id,
+    tt.kind,
+    tt."order",
+    tt.created_at,
+    tt.updated_at,
+    COALESCE(primary_i18n.title, '') AS title,
+    COALESCE(primary_i18n.description, '') AS description
+FROM task_test tt
+LEFT JOIN LATERAL (
+    SELECT
+        tti.title,
+        tti.description
+    FROM task_test_i18n tti
+    JOIN i18n i ON i.id = tti.i18n_id
+    WHERE tti.task_test_id = tt.id
+    ORDER BY CASE i.language
+        WHEN 'ru' THEN 0
+        WHEN 'en' THEN 1
+        ELSE 2
+    END, i.language
+    LIMIT 1
+) primary_i18n ON TRUE
+WHERE tt.task_id = $1
+ORDER BY tt."order"
+	`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("query task assessments: %w", err)
+	}
+
+	tests := make([]domain.TaskTest, 0)
+	for rows.Next() {
+		var item domain.TaskTest
+		if err := rows.Scan(
+			&item.ID,
+			&item.SourceKey,
+			&item.TaskID,
+			&item.Kind,
+			&item.Order,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.Title,
+			&item.Description,
+		); err != nil {
+			return nil, err
+		}
+		tests = append(tests, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// pgx permits only one active query per transaction connection. Finish the
+	// parent result set before resolving the related question graph below.
+	rows.Close()
+
+	for index := range tests {
+		item := &tests[index]
+		translations, err := r.listTaskTestTranslations(ctx, item.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read task assessment translations: %w", err)
+		}
+		item.Translations = translations
+
+		groups, err := r.listTaskTestGroups(ctx, item.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read task assessment groups: %w", err)
+		}
+		item.Groups = groups
+
+		variants, err := r.listTaskTestVariants(ctx, item.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read task assessment variants: %w", err)
+		}
+		item.Variants = variants
+	}
+
+	return tests, nil
+}
+
+func (r TaskTestRepoPG) listTaskTestGroups(ctx context.Context, taskTestID string) ([]domain.TaskTestGroup, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT
+    ttg.id,
+    COALESCE(ttg.source_key, ''),
+    ttg.task_test_id,
+    ttg."order",
+    ttg.created_at,
+    ttg.updated_at,
+    COALESCE(primary_i18n.title, '') AS title
+FROM task_test_group ttg
+LEFT JOIN LATERAL (
+    SELECT ttgi.title
+    FROM task_test_group_i18n ttgi
+    JOIN i18n i ON i.id = ttgi.i18n_id
+    WHERE ttgi.task_test_group_id = ttg.id
+    ORDER BY CASE i.language WHEN 'ru' THEN 0 WHEN 'en' THEN 1 ELSE 2 END, i.language
+    LIMIT 1
+) primary_i18n ON TRUE
+WHERE ttg.task_test_id = $1
+ORDER BY ttg."order"
+`, taskTestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []domain.TaskTestGroup
+	for rows.Next() {
+		var item domain.TaskTestGroup
+		if err := rows.Scan(&item.ID, &item.SourceKey, &item.TaskTestID, &item.Order, &item.CreatedAt, &item.UpdatedAt, &item.Title); err != nil {
+			return nil, err
+		}
+		translations, err := r.listTaskTestGroupTranslations(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		item.Translations = translations
+		groups = append(groups, item)
+	}
+	rows.Close()
+	return groups, rows.Err()
+}
+
+func (r TaskTestRepoPG) listTaskTestGroupTranslations(ctx context.Context, groupID string) ([]domain.TaskTestGroupI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT ttgi.task_test_group_id, ttgi.i18n_id, i.language, ttgi.title
+FROM task_test_group_i18n ttgi
+JOIN i18n i ON i.id = ttgi.i18n_id
+WHERE ttgi.task_test_group_id = $1
+ORDER BY CASE i.language WHEN 'ru' THEN 0 WHEN 'en' THEN 1 ELSE 2 END, i.language
+`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var translations []domain.TaskTestGroupI18n
+	for rows.Next() {
+		var item domain.TaskTestGroupI18n
+		if err := rows.Scan(&item.TaskTestGroupID, &item.I18nID, &item.Language, &item.Title); err != nil {
+			return nil, err
+		}
+		translations = append(translations, item)
+	}
+	return translations, rows.Err()
+}
+
+func (r TaskTestRepoPG) listTaskTestTranslations(ctx context.Context, taskTestID string) ([]domain.TaskTestI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT tti.task_test_id, tti.i18n_id, i.language, tti.title, tti.description
+FROM task_test_i18n tti
+JOIN i18n i ON i.id = tti.i18n_id
+WHERE tti.task_test_id = $1
+ORDER BY CASE i.language
+    WHEN 'ru' THEN 0
+    WHEN 'en' THEN 1
+    ELSE 2
+END, i.language
+`, taskTestID)
+	if err != nil {
+		return nil, err
+	}
+	var translations []domain.TaskTestI18n
+	for rows.Next() {
+		var item domain.TaskTestI18n
+		if err := rows.Scan(&item.TaskTestID, &item.I18nID, &item.Language, &item.Title, &item.Description); err != nil {
+			return nil, err
+		}
+		translations = append(translations, item)
+	}
+	rows.Close()
+	return translations, rows.Err()
+}
+
+func (r TaskTestRepoPG) listTaskTestVariants(ctx context.Context, taskTestID string) ([]domain.TaskTestVariant, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT
+    ttv.id,
+    COALESCE(ttv.source_key, ''),
+    ttv.task_test_id,
+    ttv."order",
+    ttv.is_correct,
+    ttv.correct_order,
+    COALESCE(ttv.group_id::text, ''),
+    COALESCE(ttg.source_key, ''),
+    ttv.created_at,
+    ttv.updated_at,
+    COALESCE(primary_i18n.text, '') AS text
+FROM task_test_variant ttv
+LEFT JOIN task_test_group ttg ON ttg.id = ttv.group_id
+LEFT JOIN LATERAL (
+    SELECT ttvi.text
+    FROM task_test_variant_i18n ttvi
+    JOIN i18n i ON i.id = ttvi.i18n_id
+    WHERE ttvi.task_test_variant_id = ttv.id
+    ORDER BY CASE i.language
+        WHEN 'ru' THEN 0
+        WHEN 'en' THEN 1
+        ELSE 2
+    END, i.language
+    LIMIT 1
+) primary_i18n ON TRUE
+WHERE ttv.task_test_id = $1
+ORDER BY ttv."order"
+`, taskTestID)
+	if err != nil {
+		return nil, err
+	}
+	variants := make([]domain.TaskTestVariant, 0)
+	for rows.Next() {
+		var item domain.TaskTestVariant
+		if err := rows.Scan(
+			&item.ID,
+			&item.SourceKey,
+			&item.TaskTestID,
+			&item.Order,
+			&item.IsCorrect,
+			&item.CorrectOrder,
+			&item.GroupID,
+			&item.GroupSourceKey,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.Text,
+		); err != nil {
+			return nil, err
+		}
+		variants = append(variants, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	for index := range variants {
+		translations, err := r.listTaskTestVariantTranslations(ctx, variants[index].ID)
+		if err != nil {
+			return nil, fmt.Errorf("read assessment variant translations: %w", err)
+		}
+		variants[index].Translations = translations
+	}
+	return variants, nil
+}
+
+func (r TaskTestRepoPG) listTaskTestVariantTranslations(ctx context.Context, variantID string) ([]domain.TaskTestVariantI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT ttvi.task_test_variant_id, ttvi.i18n_id, i.language, ttvi.text
+FROM task_test_variant_i18n ttvi
+JOIN i18n i ON i.id = ttvi.i18n_id
+WHERE ttvi.task_test_variant_id = $1
+ORDER BY CASE i.language
+    WHEN 'ru' THEN 0
+    WHEN 'en' THEN 1
+    ELSE 2
+END, i.language
+`, variantID)
+	if err != nil {
+		return nil, err
+	}
+	var translations []domain.TaskTestVariantI18n
+	for rows.Next() {
+		var item domain.TaskTestVariantI18n
+		if err := rows.Scan(&item.TaskTestVariantID, &item.I18nID, &item.Language, &item.Text); err != nil {
+			return nil, err
+		}
+		translations = append(translations, item)
+	}
+	rows.Close()
+	return translations, rows.Err()
+}
+
+var _ repository.TaskTestRepository = (*TaskTestRepoPG)(nil)

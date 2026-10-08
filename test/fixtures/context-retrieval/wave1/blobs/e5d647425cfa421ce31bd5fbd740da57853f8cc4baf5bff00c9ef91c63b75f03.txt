@@ -1,0 +1,502 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var _ repository.LearningPathPlanningRepository = (*LearningJourneyRepoPG)(nil)
+
+func (repo *LearningJourneyRepoPG) GetLearningPathPlanningState(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+) (domain.LearningPathPlanningState, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.LearningPathPlanningState{}, errors.New("learning journey repository pool is required")
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, studentID); err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	path, err := getLearningPathByID(ctx, tx, studentID, pathID, false)
+	if err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	contextValue, err := getLearningContext(ctx, tx, studentID, false)
+	if err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	state, err := domain.NewLearningPathPlanningState(path, contextValue)
+	if err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	return state, nil
+}
+
+func (repo *LearningJourneyRepoPG) ApplyLearningPathPlanningCommand(
+	ctx context.Context,
+	command domain.LearningPathPlanningCommand,
+) (domain.LearningPathPlanningCommandResult, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.LearningPathPlanningCommandResult{}, false, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeLearningPathPlanningCommand(command)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, lockKey := range []string{
+		"learning-path-command:" + normalized.IdempotencyKey,
+		"learning-path-plan:" + normalized.PlanningRequestID,
+	} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+			return domain.LearningPathPlanningCommandResult{}, false, err
+		}
+	}
+	if err := lockStudentAdmissionFence(ctx, tx, normalized.StudentID); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	stored, receipt, err := getLearningPathCommandReceipt(ctx, tx, "idempotency_key", normalized.IdempotencyKey)
+	switch {
+	case err == nil:
+		if receipt.StudentID != normalized.StudentID || receipt.LearningPathID != normalized.LearningPathID ||
+			receipt.PlanningRequestID != normalized.PlanningRequestID || receipt.Kind != normalized.Kind ||
+			receipt.ExpectedPathVersion != normalized.ExpectedPathVersion || receipt.RequestHash != normalized.RequestHash {
+			return domain.LearningPathPlanningCommandResult{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.LearningPathPlanningCommandResult{}, false, err
+		}
+		return stored, true, nil
+	case !errors.Is(err, domain.ErrNotFound):
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	if _, _, err := getLearningPathCommandReceipt(ctx, tx, "planning_request_id", normalized.PlanningRequestID); err == nil {
+		return domain.LearningPathPlanningCommandResult{}, false, domain.ErrConflict
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+
+	if blocked, err := hasLiveOnboardingPathAdmission(ctx, tx, normalized.StudentID); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	} else if blocked {
+		return domain.LearningPathPlanningCommandResult{}, false, domain.ErrConflict
+	}
+
+	path, err := getLearningPathByID(ctx, tx, normalized.StudentID, normalized.LearningPathID, true)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	contextValue, err := getLearningContext(ctx, tx, normalized.StudentID, true)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	if path.Version != normalized.ExpectedPathVersion {
+		return domain.LearningPathPlanningCommandResult{}, false, domain.ErrConflict
+	}
+	if normalized.Kind == domain.LearningPathPlanningCommandNoGap &&
+		(path.CourseID != normalized.CourseID || path.GoalCode != normalized.GoalCode ||
+			path.CourseFingerprint != normalized.CourseFingerprint) {
+		return domain.LearningPathPlanningCommandResult{}, false, domain.ErrConflict
+	}
+	// Derive the normalized replacement before any writes. The persisted Course
+	// action is an independent guard even when item status has not caught up.
+	replacement := path
+	if normalized.Kind == domain.LearningPathPlanningCommandReplan {
+		replacement, _, err = domain.ApplyPlannerLearningPathReplan(path, normalized)
+		if err != nil {
+			return domain.LearningPathPlanningCommandResult{}, false, err
+		}
+	} else {
+		replacement.Items = append([]domain.LearningPathItem(nil), path.Items...)
+		for index := range replacement.Items {
+			if replacement.Items[index].Status != domain.LearningPathItemCompleted && replacement.Items[index].Status != domain.LearningPathItemSkippedMastered {
+				replacement.Items[index].Status = domain.LearningPathItemSkippedMastered
+			}
+		}
+		replacement.Status = domain.LearningPathStatusCompleted
+	}
+	if err := domain.GuardLearningPathPlanningMutation(path, replacement); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	if err := guardOpenCourseLearningActionPlanning(ctx, tx, path, replacement); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+
+	if err := guardPracticeLearningActionPlanning(ctx, tx, path, normalized, true); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+
+	changed := false
+	switch normalized.Kind {
+	case domain.LearningPathPlanningCommandReplan:
+		path, contextValue, changed, err = applyExactPathReplan(ctx, tx, path, contextValue, normalized)
+	case domain.LearningPathPlanningCommandNoGap:
+		path, contextValue, changed, err = applyExactPathNoGap(ctx, tx, path, contextValue, normalized)
+	default:
+		err = domain.ErrValidation
+	}
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	state, err := domain.NewLearningPathPlanningState(path, contextValue)
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	result, err := domain.NormalizeLearningPathPlanningCommandResult(domain.LearningPathPlanningCommandResult{
+		Schema: domain.LearningPathCommandResultSchema, PlanningRequestID: normalized.PlanningRequestID,
+		Command: normalized.Kind, Changed: changed, State: state,
+	})
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	if err := insertLearningPathCommandReceipt(ctx, tx, normalized, result); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, false, err
+	}
+	return result, false, nil
+}
+
+// guardPracticeLearningActionPlanning keeps Planner reconciliation from
+// deleting or rewriting the exact Practice binding while Practice provisions
+// or runs it.  It intentionally consults only Student-owned frozen fields.
+func guardPracticeLearningActionPlanning(
+	ctx context.Context,
+	tx pgx.Tx,
+	path domain.StudentLearningPath,
+	command domain.LearningPathPlanningCommand,
+	preserveByReconciliation bool,
+) error {
+	rows, err := tx.Query(ctx, `SELECT lifecycle_status, practice_task_revision_id::text, learning_targets,
+learning_path_position_at_reservation,COALESCE(learning_path_item_id::text,''),COALESCE(requirement_id::text,'')
+FROM student_learning_action
+WHERE source_kind='practice_v2' AND student_id=$1 AND learning_path_id=$2
+  AND lifecycle_status IN ('RESERVED','OPEN')`, path.StudentID, path.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var lifecycle, revisionID, itemID, requirementID string
+		var rawTargets []byte
+		var reservedPosition int
+		if err := rows.Scan(&lifecycle, &revisionID, &rawTargets, &reservedPosition, &itemID, &requirementID); err != nil {
+			return err
+		}
+		if lifecycle == string(domain.PracticeLearningActionReserved) {
+			return domain.ErrConflict
+		}
+		if command.Kind != domain.LearningPathPlanningCommandReplan {
+			return domain.ErrConflict
+		}
+		if itemID != "" {
+			preserved := false
+			for _, i := range command.DesiredItems {
+				if i.ID == itemID {
+					for _, r := range i.FrozenRequirements {
+						if r.ID == requirementID && r.Type == "practice_completed" && r.SourceReference.RevisionID == revisionID {
+							preserved = true
+						}
+					}
+				}
+			}
+			if !preserved {
+				return domain.ErrConflict
+			}
+			continue
+		}
+		var targets []domain.LearningTargetRef
+		if err := json.Unmarshal(rawTargets, &targets); err != nil {
+			return err
+		}
+		if !openPracticePathPlanningBindingPreserved(path.Items, command.DesiredItems, revisionID, reservedPosition, targets, preserveByReconciliation) {
+			return domain.ErrConflict
+		}
+	}
+	return rows.Err()
+}
+
+func openPracticePathPlanningBindingPreserved(current, desired []domain.LearningPathItem, revisionID string, reservedPosition int, targets []domain.LearningTargetRef, preserveByReconciliation bool) bool {
+	var currentItem *domain.LearningPathItem
+	for index := range current {
+		if current[index].ReferenceType == "practice" && current[index].ReferenceID == revisionID {
+			currentItem = &current[index]
+			break
+		}
+	}
+	if currentItem == nil || currentItem.Position != reservedPosition || currentItem.Status != domain.LearningPathItemInProgress {
+		return false
+	}
+	var desiredItem *domain.LearningPathItem
+	for index := range desired {
+		if desired[index].ReferenceType == "practice" && desired[index].ReferenceID == revisionID {
+			desiredItem = &desired[index]
+			break
+		}
+	}
+	return desiredItem != nil && desiredItem.Position == reservedPosition &&
+		domain.PracticeLearningTargetIdentitySetEqual(targets, desiredItem.Targets) &&
+		(preserveByReconciliation || desiredItem.Status == domain.LearningPathItemInProgress)
+}
+
+func applyExactPathReplan(
+	ctx context.Context,
+	tx pgx.Tx,
+	path domain.StudentLearningPath,
+	contextValue domain.StudentLearningContext,
+	command domain.LearningPathPlanningCommand,
+) (domain.StudentLearningPath, domain.StudentLearningContext, bool, error) {
+	path.IsSelected = contextValue.SelectedLearningPathID == path.ID
+	expectedPathVersion := path.Version
+	path, changed, err := domain.ApplyPlannerLearningPathReplan(path, command)
+	if err != nil {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, err
+	}
+	if !changed {
+		return path, contextValue, false, nil
+	}
+	if err := persistExactLearningPath(ctx, tx, path, expectedPathVersion); err != nil {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, err
+	}
+	contextValue, err = incrementLearningJourneyVersion(ctx, tx, contextValue, command.OccurredAt, contextValue.SelectedLearningPathID)
+	return path, contextValue, true, err
+}
+
+func applyExactPathNoGap(
+	ctx context.Context,
+	tx pgx.Tx,
+	path domain.StudentLearningPath,
+	contextValue domain.StudentLearningContext,
+	command domain.LearningPathPlanningCommand,
+) (domain.StudentLearningPath, domain.StudentLearningContext, bool, error) {
+	alreadyComplete := path.Status == domain.LearningPathStatusCompleted && path.ReasonCode == command.ReasonCode &&
+		path.ReasonSummary == command.ReasonSummary && path.PlannerPolicyVersion == command.PlannerPolicyVersion
+	for _, item := range path.Items {
+		if item.Status != domain.LearningPathItemCompleted && item.Status != domain.LearningPathItemSkippedMastered {
+			alreadyComplete = false
+			break
+		}
+	}
+	if alreadyComplete {
+		return path, contextValue, false, nil
+	}
+	if path.Status != domain.LearningPathStatusActive && path.Status != domain.LearningPathStatusPaused {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, domain.ErrConflict
+	}
+	selectedPathID := contextValue.SelectedLearningPathID
+	if selectedPathID == path.ID {
+		selectedPathID = ""
+		err := tx.QueryRow(ctx, `SELECT id FROM student_learning_path
+WHERE student_id=$1 AND id<>$2 AND status='ACTIVE'
+ORDER BY is_primary DESC, updated_at DESC, id DESC LIMIT 1`, path.StudentID, path.ID).Scan(&selectedPathID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, err
+		}
+	}
+	contextValue, err := incrementLearningJourneyVersion(ctx, tx, contextValue, command.OccurredAt, selectedPathID)
+	if err != nil {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, err
+	}
+	expectedPathVersion := path.Version
+	for index := range path.Items {
+		if path.Items[index].Status == domain.LearningPathItemCompleted ||
+			path.Items[index].Status == domain.LearningPathItemSkippedMastered {
+			continue
+		}
+		path.Items[index].Status = domain.LearningPathItemSkippedMastered
+		path.Items[index].ReasonCode = command.ReasonCode
+	}
+	path.Status = domain.LearningPathStatusCompleted
+	path.IsPrimary = false
+	path.IsSelected = false
+	path.PlannerPolicyVersion = command.PlannerPolicyVersion
+	path.ReasonCode = command.ReasonCode
+	path.ReasonSummary = command.ReasonSummary
+	path.Version++
+	path.UpdatedAt = command.OccurredAt
+	normalizedPath, err := domain.NormalizeStudentLearningPath(path)
+	if err != nil {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, domain.ErrValidation
+	}
+	if err := persistExactLearningPath(ctx, tx, normalizedPath, expectedPathVersion); err != nil {
+		return domain.StudentLearningPath{}, domain.StudentLearningContext{}, false, err
+	}
+	return normalizedPath, contextValue, true, nil
+}
+
+func persistExactLearningPath(
+	ctx context.Context,
+	tx pgx.Tx,
+	path domain.StudentLearningPath,
+	expectedPathVersion int64,
+) error {
+	command, err := tx.Exec(ctx, `UPDATE student_learning_path SET
+course_id=$3, goal_code=$4, curriculum_revision=$5, policy_version=$6,
+planner_policy_version=$7, reason_code=$8, reason_summary=$9, status=$10,
+is_primary=$11, version=$12, updated_at=$13
+WHERE id=$1 AND student_id=$2 AND version=$14`, path.ID, path.StudentID, path.CourseID, path.GoalCode,
+		path.CurriculumRevision, path.PolicyVersion, path.PlannerPolicyVersion, path.ReasonCode,
+		path.ReasonSummary, path.Status, path.IsPrimary, path.Version, path.UpdatedAt, expectedPathVersion)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM student_learning_path_item WHERE student_learning_path_id=$1`, path.ID); err != nil {
+		return err
+	}
+	return insertLearningPathItemsAndRevision(ctx, tx, path)
+}
+
+func incrementLearningJourneyVersion(
+	ctx context.Context,
+	tx pgx.Tx,
+	contextValue domain.StudentLearningContext,
+	now time.Time,
+	selectedPathID string,
+) (domain.StudentLearningContext, error) {
+	updated := domain.StudentLearningContext{Schema: domain.LearningContextSchemaVersion}
+	var updatedAt time.Time
+	err := tx.QueryRow(ctx, `UPDATE student_learning_context SET
+selected_learning_path_id=NULLIF($2,'')::uuid, selected_path_status='ACTIVE', version=version+1, updated_at=$3
+WHERE student_id=$1 AND version=$4
+RETURNING student_id, COALESCE(selected_learning_path_id::text,''), version, updated_at`,
+		contextValue.StudentID, selectedPathID, now, contextValue.Version).Scan(
+		&updated.StudentID, &updated.SelectedLearningPathID, &updated.Version, &updatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningContext{}, domain.ErrConflict
+	}
+	if err != nil {
+		return domain.StudentLearningContext{}, err
+	}
+	updated.UpdatedAt = &updatedAt
+	return domain.NormalizeStudentLearningContext(updated)
+}
+
+type learningPathCommandReceipt struct {
+	StudentID            string
+	LearningPathID       string
+	PlanningRequestID    string
+	Kind                 domain.LearningPathPlanningCommandKind
+	RequestHash          string
+	ExpectedPathVersion  int64
+	ResultPathVersion    int64
+	ResultJourneyVersion int64
+}
+
+func getLearningPathCommandReceipt(
+	ctx context.Context,
+	querier interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	},
+	column string,
+	value string,
+) (domain.LearningPathPlanningCommandResult, learningPathCommandReceipt, error) {
+	if column != "idempotency_key" && column != "planning_request_id" {
+		return domain.LearningPathPlanningCommandResult{}, learningPathCommandReceipt{}, domain.ErrValidation
+	}
+	var receipt learningPathCommandReceipt
+	var responseJSON []byte
+	err := querier.QueryRow(ctx, `SELECT student_id, student_learning_path_id, planning_request_id,
+command_kind, request_hash, expected_path_version, result_path_version, result_journey_version, response_json
+FROM student_learning_path_command WHERE `+column+`=$1`, value).Scan(
+		&receipt.StudentID, &receipt.LearningPathID, &receipt.PlanningRequestID, &receipt.Kind,
+		&receipt.RequestHash, &receipt.ExpectedPathVersion, &receipt.ResultPathVersion,
+		&receipt.ResultJourneyVersion, &responseJSON,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LearningPathPlanningCommandResult{}, learningPathCommandReceipt{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.LearningPathPlanningCommandResult{}, learningPathCommandReceipt{}, err
+	}
+	receipt.RequestHash = strings.TrimSpace(receipt.RequestHash)
+	var result domain.LearningPathPlanningCommandResult
+	if err := json.Unmarshal(responseJSON, &result); err != nil {
+		return domain.LearningPathPlanningCommandResult{}, learningPathCommandReceipt{}, err
+	}
+	result, err = domain.NormalizeLearningPathPlanningCommandResult(result)
+	if err == nil && (result.PlanningRequestID != receipt.PlanningRequestID || result.Command != receipt.Kind ||
+		result.State.StudentID != receipt.StudentID || result.State.LearningPathID != receipt.LearningPathID ||
+		result.State.PathVersion != receipt.ResultPathVersion || result.State.JourneyVersion != receipt.ResultJourneyVersion) {
+		return domain.LearningPathPlanningCommandResult{}, learningPathCommandReceipt{}, errors.New("invalid learning path command receipt response")
+	}
+	return result, receipt, err
+}
+
+func insertLearningPathCommandReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	command domain.LearningPathPlanningCommand,
+	result domain.LearningPathPlanningCommandResult,
+) error {
+	responseJSON, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO student_learning_path_command
+(idempotency_key, planning_request_id, student_id, student_learning_path_id, command_kind,
+request_hash, expected_path_version, result_path_version, result_journey_version, response_json, created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, command.IdempotencyKey, command.PlanningRequestID,
+		command.StudentID, command.LearningPathID, command.Kind, command.RequestHash, command.ExpectedPathVersion,
+		result.State.PathVersion, result.State.JourneyVersion, responseJSON, command.OccurredAt)
+	return mapLearningPathCommandError(err)
+}
+
+func mapLearningPathCommandError(err error) error {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+		return domain.ErrConflict
+	}
+	return err
+}
+
+// Course actions have no learning_path_id by schema. Their immutable item
+// correlation is the path boundary; unrelated paths remain independent.
+func guardOpenCourseLearningActionPlanning(ctx context.Context, tx pgx.Tx, current, replacement domain.StudentLearningPath) error {
+	structural := current.CourseID != replacement.CourseID || current.GoalCode != replacement.GoalCode ||
+		current.CourseFingerprint != replacement.CourseFingerprint || current.Status != replacement.Status ||
+		!reflect.DeepEqual(current.Items, replacement.Items)
+	if !structural {
+		return nil
+	}
+	var open bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM student_learning_action a
+ JOIN student_learning_path_item i ON i.id=a.learning_path_item_id
+ WHERE a.source_kind='course_answer' AND a.student_id=$1
+ AND a.lifecycle_status='OPEN' AND i.student_learning_path_id=$2
+)`, current.StudentID, current.ID).Scan(&open)
+	if err != nil {
+		return err
+	}
+	if open {
+		return domain.ErrConflict
+	}
+	return nil
+}

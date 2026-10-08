@@ -1,0 +1,265 @@
+package clickhouse
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/google/uuid"
+
+	"github.com/example/ms-go-statistic/internal/domain"
+)
+
+type SummaryRepository struct {
+	conn clickhouse.Conn
+}
+
+func NewSummaryRepository(conn clickhouse.Conn) *SummaryRepository {
+	return &SummaryRepository{conn: conn}
+}
+
+func (r *SummaryRepository) GetTaskSummary(ctx context.Context, filter domain.SummaryFilter) (*domain.TaskSummary, error) {
+	where, args, err := buildSummaryWhere(filter, true)
+	if err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf(`
+SELECT
+  task_id,
+  min(started_at) AS started_at,
+  max(ended_at) AS ended_at,
+  count() AS session_count,
+  sum(typing_events) AS typing_events,
+  sum(duration_seconds) AS total_duration_seconds,
+  sum(reading_seconds) AS reading_seconds,
+  if(count() = 0, 0.0, sum(duration_seconds) / count()) AS avg_duration_seconds
+FROM (
+  SELECT
+    task_id,
+    session_id,
+    min(event_ts) AS started_at,
+    max(event_ts) AS ended_at,
+    greatest(toFloat64(dateDiff('millisecond', min(event_ts), max(event_ts))) / 1000.0, 0.0) AS duration_seconds,
+    if(
+      minIf(event_ts, event_type IN ('key_press', 'typing_stats')) < min(event_ts),
+      0.0,
+      greatest(
+        toFloat64(dateDiff('millisecond', min(event_ts), minIf(event_ts, event_type IN ('key_press', 'typing_stats')))) / 1000.0,
+        0.0
+      )
+    ) AS reading_seconds,
+    countIf(event_type IN ('key_press', 'typing_stats')) AS typing_events
+  FROM stat_events
+  %s
+  GROUP BY task_id, session_id
+)
+GROUP BY task_id
+LIMIT 1
+`, where)
+
+	row := r.conn.QueryRow(ctx, query, args...)
+	var (
+		taskID               uuid.UUID
+		startedAt            time.Time
+		endedAt              time.Time
+		sessionCount         uint64
+		typingEvents         uint64
+		totalDurationSeconds float64
+		readingSeconds       float64
+		avgDurationSeconds   float64
+	)
+	if err := row.Scan(
+		&taskID,
+		&startedAt,
+		&endedAt,
+		&sessionCount,
+		&typingEvents,
+		&totalDurationSeconds,
+		&readingSeconds,
+		&avgDurationSeconds,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	solving := totalDurationSeconds - readingSeconds
+	if solving < 0 {
+		solving = 0
+	}
+
+	startedAtPtr := timePtr(startedAt)
+	endedAtPtr := timePtr(endedAt)
+
+	return &domain.TaskSummary{
+		TaskID:                taskID,
+		StartedAt:             startedAtPtr,
+		EndedAt:               endedAtPtr,
+		SessionCount:          int(sessionCount),
+		TypingEvents:          int(typingEvents),
+		TotalDurationSeconds:  totalDurationSeconds,
+		ReadingDurationSecond: readingSeconds,
+		SolvingDurationSecond: solving,
+		AvgDurationSeconds:    avgDurationSeconds,
+	}, nil
+}
+
+func (r *SummaryRepository) ListTaskSummaries(ctx context.Context, filter domain.SummaryFilter, limit, offset int) ([]domain.TaskSummary, error) {
+	where, args, err := buildSummaryWhere(filter, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`
+SELECT
+  task_id,
+  min(started_at) AS started_at,
+  max(ended_at) AS ended_at,
+  count() AS session_count,
+  sum(typing_events) AS typing_events,
+  sum(duration_seconds) AS total_duration_seconds,
+  sum(reading_seconds) AS reading_seconds,
+  if(count() = 0, 0.0, sum(duration_seconds) / count()) AS avg_duration_seconds
+FROM (
+  SELECT
+    task_id,
+    session_id,
+    min(event_ts) AS started_at,
+    max(event_ts) AS ended_at,
+    greatest(toFloat64(dateDiff('millisecond', min(event_ts), max(event_ts))) / 1000.0, 0.0) AS duration_seconds,
+    if(
+      minIf(event_ts, event_type IN ('key_press', 'typing_stats')) < min(event_ts),
+      0.0,
+      greatest(
+        toFloat64(dateDiff('millisecond', min(event_ts), minIf(event_ts, event_type IN ('key_press', 'typing_stats')))) / 1000.0,
+        0.0
+      )
+    ) AS reading_seconds,
+    countIf(event_type IN ('key_press', 'typing_stats')) AS typing_events
+  FROM stat_events
+  %s
+  GROUP BY task_id, session_id
+)
+GROUP BY task_id
+ORDER BY ended_at DESC
+LIMIT ? OFFSET ?
+`, where)
+
+	args = append(args, limit, offset)
+	rows, err := r.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	summaries := make([]domain.TaskSummary, 0)
+	for rows.Next() {
+		var (
+			taskID               uuid.UUID
+			startedAt            time.Time
+			endedAt              time.Time
+			sessionCount         uint64
+			typingEvents         uint64
+			totalDurationSeconds float64
+			readingSeconds       float64
+			avgDurationSeconds   float64
+		)
+		if err := rows.Scan(
+			&taskID,
+			&startedAt,
+			&endedAt,
+			&sessionCount,
+			&typingEvents,
+			&totalDurationSeconds,
+			&readingSeconds,
+			&avgDurationSeconds,
+		); err != nil {
+			return nil, err
+		}
+
+		solving := totalDurationSeconds - readingSeconds
+		if solving < 0 {
+			solving = 0
+		}
+
+		summaries = append(summaries, domain.TaskSummary{
+			TaskID:                taskID,
+			StartedAt:             timePtr(startedAt),
+			EndedAt:               timePtr(endedAt),
+			SessionCount:          int(sessionCount),
+			TypingEvents:          int(typingEvents),
+			TotalDurationSeconds:  totalDurationSeconds,
+			ReadingDurationSecond: readingSeconds,
+			SolvingDurationSecond: solving,
+			AvgDurationSeconds:    avgDurationSeconds,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return summaries, nil
+}
+
+func buildSummaryWhere(filter domain.SummaryFilter, requireTask bool) (string, []any, error) {
+	if filter.UserID == uuid.Nil {
+		return "", nil, fmt.Errorf("user_id is required")
+	}
+
+	conditions := []string{"user_id = ?"}
+	args := []any{filter.UserID}
+
+	if filter.CourseID != nil && *filter.CourseID != uuid.Nil {
+		conditions = append(conditions, "course_id = ?")
+		args = append(args, *filter.CourseID)
+	}
+	if filter.LessonID != nil && *filter.LessonID != uuid.Nil {
+		conditions = append(conditions, "lesson_id = ?")
+		args = append(args, *filter.LessonID)
+	}
+
+	if requireTask {
+		if filter.TaskID == nil || *filter.TaskID == uuid.Nil {
+			return "", nil, fmt.Errorf("task_id is required")
+		}
+	}
+	if filter.TaskID != nil && *filter.TaskID != uuid.Nil {
+		conditions = append(conditions, "task_id = ?")
+		args = append(args, *filter.TaskID)
+	}
+	if filter.From != nil {
+		conditions = append(conditions, "event_ts >= ?")
+		args = append(args, *filter.From)
+	}
+	if filter.To != nil {
+		conditions = append(conditions, "event_ts <= ?")
+		args = append(args, *filter.To)
+	}
+
+	return "WHERE " + strings.Join(conditions, " AND "), args, nil
+}
+
+func timePtr(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
+}
+
+var _ domain.SummaryRepository = (*SummaryRepository)(nil)

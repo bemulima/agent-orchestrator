@@ -1,0 +1,332 @@
+-- Refactor course schema: normalize i18n, tech, and compose_config
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS tech (
+    id uuid PRIMARY KEY,
+    label varchar(64) NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS compose_config (
+    id uuid PRIMARY KEY,
+    config jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_compose_config_config ON compose_config (config);
+
+CREATE TABLE IF NOT EXISTS compose_config_tech (
+    compose_config_id uuid NOT NULL REFERENCES compose_config(id) ON DELETE CASCADE,
+    tech_id uuid NOT NULL REFERENCES tech(id) ON DELETE CASCADE,
+    PRIMARY KEY (compose_config_id, tech_id)
+);
+
+CREATE TABLE IF NOT EXISTS course_tech (
+    course_id uuid NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    tech_id uuid NOT NULL REFERENCES tech(id) ON DELETE CASCADE,
+    PRIMARY KEY (course_id, tech_id)
+);
+
+CREATE TABLE IF NOT EXISTS course_i18n (
+    course_id uuid NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    i18n_id uuid NOT NULL REFERENCES i18n(id) ON DELETE CASCADE,
+    title varchar(255) NOT NULL,
+    description text NOT NULL,
+    PRIMARY KEY (course_id, i18n_id)
+);
+
+ALTER TABLE course ADD COLUMN IF NOT EXISTS main_tech_id uuid NULL;
+ALTER TABLE course ADD COLUMN IF NOT EXISTS current_version_id uuid NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_course_main_tech') THEN
+        ALTER TABLE course ADD CONSTRAINT fk_course_main_tech FOREIGN KEY (main_tech_id) REFERENCES tech(id);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_course_current_version') THEN
+        ALTER TABLE course ADD CONSTRAINT fk_course_current_version FOREIGN KEY (current_version_id) REFERENCES course_version(id);
+    END IF;
+END $$;
+
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS compose_config_id uuid NULL;
+ALTER TABLE course_version ADD COLUMN IF NOT EXISTS published_at timestamptz NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_course_version_compose_config') THEN
+        ALTER TABLE course_version ADD CONSTRAINT fk_course_version_compose_config FOREIGN KEY (compose_config_id) REFERENCES compose_config(id);
+    END IF;
+END $$;
+
+-- Seed tech from existing labels (if legacy columns exist)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'tech_label'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO tech (id, label, created_at)
+            SELECT uuid_generate_v4(), cv.tech_label, now()
+            FROM course_version cv
+            WHERE cv.tech_label IS NOT NULL AND cv.tech_label <> ''
+            ON CONFLICT (label) DO NOTHING
+        $sql$;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'main_tech'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO tech (id, label, created_at)
+            SELECT uuid_generate_v4(), cv.main_tech, now()
+            FROM course_version cv
+            WHERE cv.main_tech IS NOT NULL AND cv.main_tech <> ''
+            ON CONFLICT (label) DO NOTHING
+        $sql$;
+    END IF;
+END $$;
+
+-- Create compose_config rows per course_version and link (if legacy compose_config exists)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course' AND column_name = 'compose_config'
+    ) THEN
+        EXECUTE $sql$
+            WITH source AS (
+                SELECT
+                    cv.id AS course_version_id,
+                    COALESCE(c.compose_config, '{}'::jsonb) AS config
+                FROM course_version cv
+                JOIN course c ON c.id = cv.course_id
+            ),
+            ins AS (
+                INSERT INTO compose_config (id, config, created_at)
+                SELECT uuid_generate_v4(), config, now()
+                FROM source
+                ON CONFLICT (config) DO NOTHING
+            )
+            UPDATE course_version cv
+            SET compose_config_id = cc.id
+            FROM source s
+            JOIN compose_config cc ON cc.config = s.config
+            WHERE cv.id = s.course_version_id
+        $sql$;
+    END IF;
+END $$;
+
+-- Map course main tech from current/default version (if legacy columns exist)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'main_tech'
+    ) AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'tech_label'
+    ) THEN
+        EXECUTE $sql$
+            WITH ranked AS (
+                SELECT
+                    c.id AS course_id,
+                    COALESCE(cv.main_tech, cv.tech_label) AS label,
+                    cv.published_at,
+                    cv.version,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.id
+                        ORDER BY (cv.published_at IS NOT NULL) DESC, cv.published_at DESC NULLS LAST, cv.version DESC
+                    ) AS rn
+                FROM course c
+                JOIN course_version cv ON cv.course_id = c.id
+                WHERE cv.is_default = true OR cv.id = c.current_version_id
+            )
+            UPDATE course c
+            SET main_tech_id = t.id
+            FROM ranked r
+            JOIN tech t ON t.label = r.label
+            WHERE c.id = r.course_id AND r.rn = 1
+        $sql$;
+    ELSIF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'main_tech'
+    ) THEN
+        EXECUTE $sql$
+            WITH ranked AS (
+                SELECT
+                    c.id AS course_id,
+                    cv.main_tech AS label,
+                    cv.published_at,
+                    cv.version,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.id
+                        ORDER BY (cv.published_at IS NOT NULL) DESC, cv.published_at DESC NULLS LAST, cv.version DESC
+                    ) AS rn
+                FROM course c
+                JOIN course_version cv ON cv.course_id = c.id
+                WHERE cv.is_default = true OR cv.id = c.current_version_id
+            )
+            UPDATE course c
+            SET main_tech_id = t.id
+            FROM ranked r
+            JOIN tech t ON t.label = r.label
+            WHERE c.id = r.course_id AND r.rn = 1
+        $sql$;
+    ELSIF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'tech_label'
+    ) THEN
+        EXECUTE $sql$
+            WITH ranked AS (
+                SELECT
+                    c.id AS course_id,
+                    cv.tech_label AS label,
+                    cv.published_at,
+                    cv.version,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.id
+                        ORDER BY (cv.published_at IS NOT NULL) DESC, cv.published_at DESC NULLS LAST, cv.version DESC
+                    ) AS rn
+                FROM course c
+                JOIN course_version cv ON cv.course_id = c.id
+                WHERE cv.is_default = true OR cv.id = c.current_version_id
+            )
+            UPDATE course c
+            SET main_tech_id = t.id
+            FROM ranked r
+            JOIN tech t ON t.label = r.label
+            WHERE c.id = r.course_id AND r.rn = 1
+        $sql$;
+    END IF;
+END $$;
+
+-- Fill course_tech with all distinct techs from versions (if legacy columns exist)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'tech_label'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO course_tech (course_id, tech_id)
+            SELECT DISTINCT cv.course_id, t.id
+            FROM course_version cv
+            JOIN tech t ON t.label = cv.tech_label
+            WHERE cv.tech_label IS NOT NULL AND cv.tech_label <> ''
+            ON CONFLICT DO NOTHING
+        $sql$;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'main_tech'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO course_tech (course_id, tech_id)
+            SELECT DISTINCT cv.course_id, t.id
+            FROM course_version cv
+            JOIN tech t ON t.label = cv.main_tech
+            WHERE cv.main_tech IS NOT NULL AND cv.main_tech <> ''
+            ON CONFLICT DO NOTHING
+        $sql$;
+    END IF;
+END $$;
+
+-- Link compose_config to tech via versions (if legacy columns exist)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'tech_label'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO compose_config_tech (compose_config_id, tech_id)
+            SELECT DISTINCT cv.compose_config_id, t.id
+            FROM course_version cv
+            JOIN tech t ON t.label = cv.tech_label
+            WHERE cv.compose_config_id IS NOT NULL AND cv.tech_label IS NOT NULL AND cv.tech_label <> ''
+            ON CONFLICT DO NOTHING
+        $sql$;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'course_version' AND column_name = 'main_tech'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO compose_config_tech (compose_config_id, tech_id)
+            SELECT DISTINCT cv.compose_config_id, t.id
+            FROM course_version cv
+            JOIN tech t ON t.label = cv.main_tech
+            WHERE cv.compose_config_id IS NOT NULL AND cv.main_tech IS NOT NULL AND cv.main_tech <> ''
+            ON CONFLICT DO NOTHING
+        $sql$;
+    END IF;
+END $$;
+
+-- Migrate localized texts into course_i18n from default/current versions (if legacy table exists)
+DO $$
+BEGIN
+    IF to_regclass('public.course_version_i18n') IS NOT NULL THEN
+        EXECUTE $sql$
+            WITH candidates AS (
+                SELECT
+                    c.id AS course_id,
+                    cv.id AS course_version_id,
+                    cv.version,
+                    cv.published_at,
+                    cvi.i18n_id,
+                    cvi.title,
+                    cvi.description
+                FROM course c
+                JOIN course_version cv ON cv.course_id = c.id
+                JOIN course_version_i18n cvi ON cvi.course_version_id = cv.id
+                WHERE cv.is_default = true OR cv.id = c.current_version_id
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY course_id, i18n_id
+                        ORDER BY (published_at IS NOT NULL) DESC, published_at DESC NULLS LAST, version DESC
+                    ) AS rn
+                FROM candidates
+            )
+            INSERT INTO course_i18n (course_id, i18n_id, title, description)
+            SELECT course_id, i18n_id, title, description
+            FROM ranked
+            WHERE rn = 1
+            ON CONFLICT (course_id, i18n_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description
+        $sql$;
+    END IF;
+END $$;
+
+-- Drop old localized table and obsolete columns
+DROP TABLE IF EXISTS course_version_i18n;
+
+ALTER TABLE course DROP COLUMN IF EXISTS compose_config;
+ALTER TABLE course DROP COLUMN IF EXISTS title;
+ALTER TABLE course DROP COLUMN IF EXISTS description;
+
+ALTER TABLE course_version DROP COLUMN IF EXISTS title;
+ALTER TABLE course_version DROP COLUMN IF EXISTS description;
+ALTER TABLE course_version DROP COLUMN IF EXISTS tech_label;
+ALTER TABLE course_version DROP COLUMN IF EXISTS main_tech;
+ALTER TABLE course_version DROP COLUMN IF EXISTS main_tech_version;
+
+-- Indexes for new foreign keys
+CREATE INDEX IF NOT EXISTS idx_course_main_tech_id ON course(main_tech_id);
+CREATE INDEX IF NOT EXISTS idx_course_version_compose_config_id ON course_version(compose_config_id);
+CREATE INDEX IF NOT EXISTS idx_course_i18n_course_id ON course_i18n(course_id);
+CREATE INDEX IF NOT EXISTS idx_course_i18n_i18n_id ON course_i18n(i18n_id);
+CREATE INDEX IF NOT EXISTS idx_course_tech_course_id ON course_tech(course_id);
+CREATE INDEX IF NOT EXISTS idx_course_tech_tech_id ON course_tech(tech_id);
+CREATE INDEX IF NOT EXISTS idx_compose_config_tech_compose_config_id ON compose_config_tech(compose_config_id);
+CREATE INDEX IF NOT EXISTS idx_compose_config_tech_tech_id ON compose_config_tech(tech_id);
+
+COMMIT;

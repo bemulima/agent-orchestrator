@@ -1,0 +1,430 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	dialogclient "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	studentclient "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/student"
+	dialogevents "github.com/bemulima/ms-go-teacher-agent/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/studentcontext"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The repaired boundary is real: registered Student HTTP -> production client ->
+// actual Worker/PG intake/claim/save -> production Dialog context/append HTTP/PG.
+// Default soul and empty pedagogic learner overview are explicitly fixture ports.
+// The named generator below captures the verified bounded request in memory;
+// it emits a synthetic answer and never invokes or claims a live LLM.
+func TestT14FrozenLessonActualDialogChain(t *testing.T) {
+	if os.Getenv("T14_COMPOSED") != "true" {
+		t.Skip("owned T14 chain gate absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	var student struct {
+		URL       string `json:"url"`
+		StudentID string `json:"student_id"`
+		PathID    string `json:"learning_path_id"`
+		ItemID    string `json:"learning_path_item_id"`
+		CourseID  string `json:"course_id"`
+		LessonID  string `json:"lesson_id"`
+		Revision  string `json:"lesson_revision_id"`
+		Digest    string `json:"content_digest"`
+	}
+	var dialog struct {
+		URL       string          `json:"url"`
+		TeacherID string          `json:"personal_teacher_id"`
+		Envelope  json.RawMessage `json:"event_payload"`
+	}
+	var course struct {
+		URL string `json:"url"`
+	}
+	t14ChainRead(t, os.Getenv("T14_STUDENT_READY_FILE"), &student)
+	t14ChainRead(t, os.Getenv("T14_DIALOG_READY_FILE"), &dialog)
+	t14ChainRead(t, os.Getenv("T14_COURSE_READY_FILE"), &course)
+	browserSource := false
+	if eventFile := os.Getenv("T14_BROWSER_EVENT_FILE"); eventFile != "" {
+		var source struct {
+			Envelope json.RawMessage `json:"event_payload"`
+		}
+		t14ChainRead(t, eventFile, &source)
+		if len(source.Envelope) == 0 {
+			t.Fatal("SETUP: actual browser source envelope absent")
+		}
+		dialog.Envelope = source.Envelope
+		browserSource = true
+	}
+	st, dt, ct := os.Getenv("T14_STUDENT_TOKEN"), os.Getenv("T14_DIALOG_TOKEN"), os.Getenv("T14_COURSE_TOKEN")
+	if st == "" || dt == "" || ct == "" || os.Getenv("T14_CHAIN_RESULT_FILE") == "" {
+		t.Fatal("SETUP: missing owned chain configuration")
+	}
+	for _, base := range []string{student.URL, dialog.URL, course.URL} {
+		u, e := url.Parse(base)
+		if e != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" {
+			t.Fatal("SETUP: provider must be owned loopback")
+		}
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	call := func(method, endpoint, token string, input any, want int, out any) {
+		t.Helper()
+		raw, _ := json.Marshal(input)
+		r, e := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(raw))
+		if e != nil {
+			t.Fatal("owned HTTP command invalid")
+		}
+		r.Header.Set("X-Internal-Token", token)
+		r.Header.Set("Content-Type", "application/json")
+		resp, e := httpClient.Do(r)
+		if e != nil {
+			t.Fatal("owned provider unavailable")
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != want {
+			t.Fatalf("actual provider status=%d want=%d", resp.StatusCode, want)
+		}
+		if out != nil && json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(out) != nil {
+			t.Fatal("owned safe provider decode failed")
+		}
+	}
+	sc := studentclient.Client{BaseURL: student.URL, InternalToken: st, HTTPClient: httpClient}
+	dc := dialogclient.Client{BaseURL: dialog.URL, InternalToken: dt, HTTPClient: httpClient}
+	r1, e := sc.GetAssignedLessonContext(ctx, student.StudentID, student.PathID, student.ItemID)
+	if e != nil || r1.LessonRevisionID != student.Revision || r1.ContentDigest != student.Digest {
+		t.Fatal("SETUP: actual Student R1 business projection unavailable")
+	}
+	// Both actual registered public projection and preexisting T04 content route
+	// remain exact and usable. No teacher dependency changes the learner content.
+	publicRead := func(path string, output any) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, student.URL+path, nil)
+		if err != nil {
+			t.Fatal("owned public read invalid")
+		}
+		req.Header.Set("X-User-ID", student.StudentID)
+		req.Header.Set("X-User-Role", "STUDENT")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatal("actual Student public provider unavailable")
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != 200 || json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(output) != nil {
+			t.Fatal("actual registered Student public read failed")
+		}
+	}
+	var publicProjection domain.AssignedLessonContext
+	publicRead("/api/v1/student/learning-paths/"+student.PathID+"/items/"+student.ItemID+"/lesson-context", &publicProjection)
+	if !reflect.DeepEqual(publicProjection, r1) {
+		t.Fatal("public and private assigned projections differ")
+	}
+	var frozenContent domain.AssignedLessonContent
+	publicRead("/api/v1/student/learning-path-items/"+student.ItemID+"/content", &frozenContent)
+	if !reflect.DeepEqual(frozenContent, r1.Content) {
+		t.Fatal("preexisting frozen public content differs from assigned context")
+	}
+	var publication struct {
+		Revision string `json:"revision_r2"`
+		Digest   string `json:"digest_r2"`
+	}
+	call("POST", course.URL+"/__t14/publish-r2", ct, nil, 200, &publication)
+	if publication.Revision == student.Revision || publication.Digest == student.Digest {
+		t.Fatal("real Course publication did not create distinct R2")
+	}
+	var assignment struct {
+		New struct {
+			PathID   string `json:"learning_path_id"`
+			ItemID   string `json:"learning_path_item_id"`
+			Revision string `json:"lesson_revision_id"`
+			Digest   string `json:"content_digest"`
+		} `json:"new_assignment"`
+	}
+	call("POST", student.URL+"/__t14/assign-r2", st, nil, 200, &assignment)
+	r1Again, e := sc.GetAssignedLessonContext(ctx, student.StudentID, student.PathID, student.ItemID)
+	if e != nil || !reflect.DeepEqual(r1, r1Again) {
+		t.Fatal("actual frozen Student R1 changed after R2 publication")
+	}
+	publicRead("/api/v1/student/learning-paths/"+student.PathID+"/items/"+student.ItemID+"/lesson-context", &publicProjection)
+	publicRead("/api/v1/student/learning-path-items/"+student.ItemID+"/content", &frozenContent)
+	if !reflect.DeepEqual(publicProjection, r1) || !reflect.DeepEqual(frozenContent, r1.Content) {
+		t.Fatal("public frozen content/projection changed after actual R2 publish")
+	}
+	r2, e := sc.GetAssignedLessonContext(ctx, student.StudentID, assignment.New.PathID, assignment.New.ItemID)
+	if e != nil || r2.LessonRevisionID != publication.Revision || r2.ContentDigest != publication.Digest || r2.LearningPathItemID == r1.LearningPathItemID {
+		t.Fatal("actual new assignment does not freeze R2")
+	}
+	pool := teacherDecisionIntegrationPool(t)
+	now := time.Now().UTC()
+	_, e = pool.Exec(ctx, `INSERT INTO personal_teacher(id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,version,created_at,updated_at) VALUES($1,$2,'t14-fixture','ru','adaptive','adaptive','progressive','balanced',1,$3,$3)`, dialog.TeacherID, student.StudentID, now)
+	if e != nil {
+		t.Fatal("SETUP: synthetic Teacher identity persistence failed")
+	}
+	t.Cleanup(func() {
+		for _, q := range []string{`DELETE FROM teacher_dialog_job WHERE personal_teacher_id=$1`, `DELETE FROM teacher_outbox WHERE student_id IN (SELECT student_id FROM personal_teacher WHERE id=$1)`, `DELETE FROM teacher_decision WHERE personal_teacher_id=$1`, `DELETE FROM personal_teacher WHERE id=$1`} {
+			if _, e := pool.Exec(context.Background(), q, dialog.TeacherID); e != nil {
+				t.Error("owned Teacher cleanup failed")
+			}
+		}
+	})
+	soul, e := domain.NewTeacherSoul(dialog.TeacherID, student.StudentID, domain.DefaultTeacherSoulSettings(), now)
+	if e != nil {
+		t.Fatal("SETUP: declared default soul fixture invalid")
+	}
+	pedagogy, e := teacherdialog.NewPedagogyRegistry(domain.DefaultPedagogyMethodCode, teacherdialog.ProgressiveHintMethod{})
+	if e != nil {
+		t.Fatal("SETUP: production pedagogy unavailable")
+	}
+	generator := &t14BoundedGeneratorFixture{}
+	courseGuard := &t14MutableCourseForbidden{}
+	newWorker := func() teacherdialog.Worker {
+		return teacherdialog.Worker{Jobs: TeacherDialogJobRepository{Pool: pool}, Teachers: t14PGTeacherReader{Repo: PersonalTeacherRepository{Pool: pool}}, Souls: t14DefaultSoulFixture{Soul: soul}, StudentContext: t14EmptyLearnerOverviewFixture{}, PromptContext: teacherdialog.ContextBuilder{}, AssignedLessons: sc, CourseLessons: courseGuard, DialogReader: dc, DialogAppender: dc, Decisions: TeacherDecisionRepository{Pool: pool}, Pedagogy: pedagogy, Generator: generator, IDs: t13IDs{}, Clock: t14ChainClock{}, WorkerID: "t14-" + uuid.NewString(), LeaseTTL: 30 * time.Second, LeaseRenewInterval: 5 * time.Second, MaxAttempts: 3, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second}
+	}
+	deliveries := map[string]string{}
+	negativeCase := ""
+	process := func(envelope json.RawMessage, wantSuccess bool) domain.DialogTeacherRequest {
+		t.Helper()
+		req, e := dialogevents.DecodeDialogTeacherRequested(envelope)
+		if e != nil {
+			t.Fatal("actual Dialog envelope decoder rejected source")
+		}
+		job, e := domain.NewTeacherDialogJob(req, time.Now().UTC())
+		if e != nil {
+			t.Fatal("actual source job normalization failed")
+		}
+		accepted, e := (TeacherDialogJobRepository{Pool: pool}).Accept(ctx, job)
+		if e != nil || !accepted {
+			t.Fatal("actual PG source intake failed")
+		}
+		before := generator.Calls
+		worker := newWorker()
+		claimed, e := worker.ProcessNext(ctx)
+		if !claimed {
+			t.Fatal("actual PG claim failed")
+		}
+		if wantSuccess {
+			if e != nil || generator.Calls != before+1 {
+				var code string
+				_ = pool.QueryRow(ctx, `SELECT coalesce(error_code,'') FROM teacher_dialog_job WHERE event_id=$1`, req.EventID).Scan(&code)
+				t.Fatalf("actual frozen Worker did not reach named generator fixture: error_code=%s", code)
+			}
+			// CompleteDelivery's established terminal state is delivered. The
+			// separate completed state is not the successful append terminal.
+			// Read booleans and identifiers only; never expose a pending body.
+			var status, code, reconciliation, deliveredID, decisionID string
+			var responseCleared bool
+			readErr := pool.QueryRow(ctx, `SELECT status,coalesce(error_code,''),coalesce(reconciliation_state,''),response_body IS NULL,coalesce(delivered_message_id::text,''),coalesce(decision_id::text,'') FROM teacher_dialog_job WHERE event_id=$1`, req.EventID).Scan(&status, &code, &reconciliation, &responseCleared, &deliveredID, &decisionID)
+			if readErr != nil || status != string(domain.TeacherDialogJobDelivered) || !responseCleared || code != "" || reconciliation != "" || deliveredID == "" || decisionID == "" {
+				t.Fatalf("actual delivery assertion stage=readback read_ok=%t status=%s error_code=%s reconciliation=%s response_cleared=%t generator_calls=%d event_id=%s source_message_id=%s delivered_message_id=%s decision_id=%s", readErr == nil, status, code, reconciliation, responseCleared, generator.Calls, req.EventID, req.SourceMessageID, deliveredID, decisionID)
+			}
+			var dialogState t13DialogState
+			call("GET", dialog.URL+"/__t14/inspect", dt, nil, 200, &dialogState)
+			matches := 0
+			for _, reply := range dialogState.Replies {
+				if reply.Key == req.EventID && reply.ID == deliveredID && reply.Hash == t14Hash(t14FixtureReply) {
+					matches++
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("actual delivery assertion stage=Dialog_match status=%s generator_calls=%d event_id=%s source_message_id=%s delivered_message_id=%s exact_reply_matches=%d assistant_count=%d", status, generator.Calls, req.EventID, req.SourceMessageID, deliveredID, matches, dialogState.Count)
+			}
+			deliveries[req.EventID] = deliveredID
+
+		} else {
+			if e == nil || generator.Calls != before {
+				t.Fatal("invalid frozen context reached generation")
+			}
+			// These two owned columns have different types: event_id is UUID
+			// (005), causation_id is VARCHAR (002). Explicit casts preserve the
+			// exact same event identity without relying on inferred $1 type.
+			generated, decisions := -1, -1
+			countErr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM teacher_dialog_job WHERE event_id=$1::uuid AND response_body IS NOT NULL),(SELECT count(*) FROM teacher_decision WHERE causation_id=$1::text)`, req.EventID).Scan(&generated, &decisions)
+			if countErr != nil || generated != 0 || decisions != 0 {
+				var status, code string
+				var responsePresent bool
+				statusErr := pool.QueryRow(ctx, `SELECT status,coalesce(error_code,''),response_body IS NOT NULL FROM teacher_dialog_job WHERE event_id=$1::uuid`, req.EventID).Scan(&status, &code, &responsePresent)
+				errorClass, sqlstate := "none", ""
+				if countErr != nil {
+					errorClass = "non_postgres"
+					var pgError *pgconn.PgError
+					if errors.As(countErr, &pgError) {
+						errorClass = "postgres"
+						sqlstate = pgError.Code
+					}
+				}
+				t.Fatalf("blocked frozen assertion stage=negative_effect_read case=%s event_id=%s source_message_id=%s sqlstate=%s error_class=%s count_read_ok=%t status_read_ok=%t status=%s error_code=%s generator_calls=%d generated_response_count=%d decision_count=%d response_present=%t", negativeCase, req.EventID, req.SourceMessageID, sqlstate, errorClass, countErr == nil, statusErr == nil, status, code, generator.Calls, generated, decisions, responsePresent)
+			}
+
+			_, e = pool.Exec(ctx, `UPDATE teacher_dialog_job SET status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL WHERE event_id=$1`, req.EventID)
+			if e != nil {
+				t.Fatal("owned negative queue cleanup failed")
+			}
+		}
+		return req
+	}
+	first := process(dialog.Envelope, true)
+	if generator.Last.Lesson == nil || generator.Last.Lesson.ContentRevision != r1.LessonRevisionID || generator.Last.Lesson.ContentDigest != r1.ContentDigest || generator.Last.Lesson.SelectedText != "Keep the exact selected fragment unchanged." || generator.Last.Lesson.Title != "" || generator.Last.Lesson.Excerpt != "" {
+		t.Fatal("bounded generator request differs from exact R1 selected fragment")
+	}
+	// Reconstruct repository/client/Worker and replay identical source. Intake and
+	// completed job deduplicate; no second generation or assistant append occurs.
+	replayJob, e := domain.NewTeacherDialogJob(first, time.Now().UTC())
+	if e != nil {
+		t.Fatal("replay normalization failed")
+	}
+	accepted, e := (TeacherDialogJobRepository{Pool: pool}).Accept(ctx, replayJob)
+	if e != nil || accepted {
+		t.Fatal("identical PG intake replay did not deduplicate")
+	}
+	worker := newWorker()
+	claimed, e := worker.ProcessNext(ctx)
+	if e != nil || claimed || generator.Calls != 1 {
+		t.Fatal("reconstruction replay produced generation")
+	}
+	inspect := func() t13DialogState {
+		var state t13DialogState
+		call("GET", dialog.URL+"/__t14/inspect", dt, nil, 200, &state)
+		return state
+	}
+	initial := inspect()
+	if initial.Count != 1 || len(initial.Replies) != 1 || initial.Replies[0].Key != first.EventID || initial.Replies[0].Hash != t14Hash(t14FixtureReply) {
+		t.Fatal("actual Dialog does not contain one exact idempotent reply")
+	}
+	source := map[string]any{"schema": "lesson-message-context.v2", "mode": "selection", "course_id": student.CourseID, "lesson_id": student.LessonID, "content_revision": student.Revision, "learning_path_id": student.PathID, "learning_path_item_id": student.ItemID, "content_digest": student.Digest, "selected_text": "Keep the exact selected fragment unchanged."}
+	create := func(value map[string]any) json.RawMessage {
+		var out struct {
+			Envelope json.RawMessage `json:"event_payload"`
+		}
+		call("POST", dialog.URL+"/__t14/source", dt, map[string]any{"context": value}, 201, &out)
+		return out.Envelope
+	}
+	beforeRejected := inspect().Count
+	wrongLesson := map[string]any{}
+	for k, v := range source {
+		wrongLesson[k] = v
+	}
+	wrongLesson["lesson_id"] = uuid.NewString()
+	call("POST", dialog.URL+"/__t14/source", dt, map[string]any{"context": wrongLesson}, 400, nil)
+	call("POST", dialog.URL+"/__t14/source", dt, map[string]any{"context": nil}, 400, nil)
+	if inspect().Count != beforeRejected || generator.Calls != 1 {
+		t.Fatal("wrong lesson or missing context produced effects")
+	}
+	negatives := []struct {
+		Name, Field string
+		Value       any
+	}{{"wrong_path", "learning_path_id", uuid.NewString()}, {"wrong_item", "learning_path_item_id", uuid.NewString()}, {"wrong_course", "course_id", uuid.NewString()}, {"wrong_revision", "content_revision", uuid.NewString()}, {"wrong_digest", "content_digest", "sha256:" + strings.Repeat("a", 64)}, {"foreign_fragment", "selected_text", "The replacement fragment differs."}}
+	negativeNames := []string{"wrong_lesson_rejected_before_source", "missing_context_rejected_before_source", "foreign_owner_read"}
+	for _, n := range negatives {
+		clone := map[string]any{}
+		for k, v := range source {
+			clone[k] = v
+		}
+		clone[n.Field] = n.Value
+		negativeCase = n.Name
+		process(create(clone), false)
+		negativeNames = append(negativeNames, n.Name)
+	}
+	for _, args := range [][3]string{{uuid.NewString(), student.PathID, student.ItemID}, {student.StudentID, uuid.NewString(), student.ItemID}, {student.StudentID, student.PathID, uuid.NewString()}} {
+		if _, e := sc.GetAssignedLessonContext(ctx, args[0], args[1], args[2]); e == nil {
+			t.Fatal("actual Student accepted foreign or missing identity")
+		}
+	}
+	// The declared outage fixture returns 503 around the registered provider;
+	// healthy projection resumes unchanged. Source still comes from actual Dialog.
+	call("POST", student.URL+"/__t14/outage", st, map[string]bool{"enabled": true}, 204, nil)
+	negativeCase = "student_outage"
+	process(create(source), false)
+	call("POST", student.URL+"/__t14/outage", st, map[string]bool{"enabled": false}, 204, nil)
+	negativeNames = append(negativeNames, "student_outage")
+	overview := map[string]any{}
+	for k, v := range source {
+		overview[k] = v
+	}
+	overview["mode"] = "lesson_overview"
+	delete(overview, "selected_text")
+	second := process(create(overview), true)
+	if generator.Last.Lesson == nil || generator.Last.Lesson.Title != r1.Content.Title || generator.Last.Lesson.Excerpt != r1.Content.Excerpt || generator.Last.Lesson.SelectedText != "" || generator.Last.Lesson.ContentRevision != r1.LessonRevisionID {
+		t.Fatal("R1 bounded overview changed after R2 publish")
+	}
+	final := inspect()
+	if final.Count != 2 || len(final.Replies) != 2 || final.Replies[1].Key != second.EventID || final.Replies[1].Hash != t14Hash(t14FixtureReply) || courseGuard.Calls != 0 {
+		t.Fatal("frozen fail-closed cases produced mutable fallback or extra replies")
+	}
+	t14ChainWrite(t, os.Getenv("T14_CHAIN_RESULT_FILE"), map[string]any{"classification": "actual Course PG authored owner usecase publish immutable R1/R2; Student owner assignment/Course HTTP/PG/public-private projection; Dialog registered source create/PG outbox; actual Teacher decoder/PG accept-claim-save/Worker/production Student+Dialog clients; named bounded generator/default soul/empty overview fixtures; no NATS/LLM/browser claim", "revision_r1": student.Revision, "digest_r1": student.Digest, "revision_r2": publication.Revision, "digest_r2": publication.Digest, "old_assignment_exact_after_publish": true, "new_assignment_r2": true, "selected_fragment_exact": true, "overview_exact": true, "reconstruction_replay_stable": true, "course_fallback_calls": courseGuard.Calls, "generator_fixture_calls": generator.Calls, "assistant_count": final.Count, "reply_body_sha256": t14Hash(t14FixtureReply), "negative_cases": negativeNames, "delivered_message_ids": deliveries, "source_event_ids": []string{first.EventID, second.EventID}, "source_message_ids": []string{first.SourceMessageID, second.SourceMessageID}, "browser_source_event_used": browserSource, "public_projection_matches_frozen_content": true})
+}
+
+const t14FixtureReply = "Inspect the boundary condition in the selected fragment before changing the implementation."
+
+type t14BoundedGeneratorFixture struct {
+	Calls int
+	Last  domain.TeacherGenerationRequest
+}
+
+func (g *t14BoundedGeneratorFixture) Generate(_ context.Context, r domain.TeacherGenerationRequest) (domain.TeacherGeneratedResponse, error) {
+	g.Calls++
+	g.Last = r
+	now := time.Now().UTC()
+	return domain.TeacherGeneratedResponse{ExecutionID: uuid.NewString(), IdempotencyKey: r.IdempotencyKey, TemplateCode: domain.TeacherResponseTemplateCode, TemplateVersion: 1, ProviderCode: "t14-named-generator-fixture", ProviderModel: "bounded-synthetic-response", LanguageCode: r.LanguageCode, ResponseSchemaCode: domain.TeacherResponseSchemaCode, Body: t14FixtureReply, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, nil
+}
+func (g *t14BoundedGeneratorFixture) Replay(context.Context, string) (domain.TeacherGeneratedResponse, error) {
+	return domain.TeacherGeneratedResponse{}, errors.New("unexpected generator fixture replay")
+}
+
+type t14MutableCourseForbidden struct{ Calls int }
+
+func (g *t14MutableCourseForbidden) GetLessonContext(context.Context, string, string) (domain.CourseLessonContent, error) {
+	g.Calls++
+	return domain.CourseLessonContent{}, errors.New("forbidden mutable Course fallback")
+}
+
+type t14PGTeacherReader struct{ Repo PersonalTeacherRepository }
+
+func (r t14PGTeacherReader) Execute(ctx context.Context, s string) (domain.PersonalTeacher, error) {
+	return r.Repo.GetByStudentID(ctx, s)
+}
+
+type t14DefaultSoulFixture struct{ Soul domain.TeacherSoul }
+
+func (r t14DefaultSoulFixture) Execute(context.Context, string) (domain.TeacherSoul, error) {
+	return r.Soul, nil
+}
+
+type t14EmptyLearnerOverviewFixture struct{}
+
+func (t14EmptyLearnerOverviewFixture) Execute(_ context.Context, i studentcontext.BuildInput) (domain.StudentContext, error) {
+	return domain.StudentContext{StudentID: i.StudentID, ContextType: i.ContextType, ContextID: i.ContextID}, nil
+}
+
+type t14ChainClock struct{}
+
+func (t14ChainClock) Now() time.Time { return time.Now().UTC() }
+func t14Hash(s string) string        { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+func t14ChainRead(t *testing.T, path string, v any) {
+	t.Helper()
+	raw, e := os.ReadFile(path)
+	if e != nil || json.Unmarshal(raw, v) != nil {
+		t.Fatal("SETUP: safe chain metadata unavailable")
+	}
+}
+func t14ChainWrite(t *testing.T, path string, v any) {
+	t.Helper()
+	raw, e := json.MarshalIndent(v, "", "  ")
+	if e != nil || os.WriteFile(path+".tmp", append(raw, '\n'), 0600) != nil || os.Rename(path+".tmp", path) != nil {
+		t.Fatal("safe chain evidence export failed")
+	}
+}
+
+var _ repository.StudentAssignedLessonContextReader = studentclient.Client{}

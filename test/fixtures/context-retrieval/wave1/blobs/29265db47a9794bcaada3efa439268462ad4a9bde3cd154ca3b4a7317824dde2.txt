@@ -1,0 +1,547 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	aiprompthttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/aiprompt"
+	dialoghttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	studenthttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+)
+
+// This is deliberately a small cross-boundary S5 harness: the Teacher
+// ledger/cursor is real PostgreSQL, and the three service boundaries use their
+// real strict HTTP adapters against deterministic in-process servers. It
+// catches wiring mistakes that a coordinator mock cannot (notably request and
+// reply-anchor shape, staged/reclaimed delivery, and the zero-AI action path).
+func TestS5CoordinatorRealPostgresWithHTTPAdapters(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	ctx := context.Background()
+	var s5TableExists bool
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT to_regclass('public.teacher_onboarding_turn') IS NOT NULL`).Scan(&s5TableExists))
+	if !s5TableExists {
+		t.Skip("migration 019 is not applied to TEACHER_TEST_DATABASE_URL")
+	}
+	t.Cleanup(func() {
+		// This cleanup is registered after the shared fixture cleanup, hence it
+		// runs first. Migration 019 adds child FKs that must be removed before
+		// the fixture can delete its Teacher jobs/cursor.
+		cleanup := func(query string) {
+			_, err := fixture.pool.Exec(context.Background(), query, fixture.teacherID)
+			require.NoError(t, err)
+		}
+		cleanup(`DELETE FROM teacher_onboarding_turn WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`)
+		cleanup(`DELETE FROM teacher_onboarding_interaction WHERE personal_teacher_id=$1`)
+		cleanup(`DELETE FROM teacher_onboarding_action_receipt WHERE personal_teacher_id=$1`)
+	})
+
+	t.Run("text accepted replay and delivery", func(t *testing.T) {
+		harness := newS5CoordinatorHTTPHarness(t, fixture, domain.OnboardingStepExperience, false)
+		defer harness.close()
+		harness.requireSemanticReplay = true
+		job := harness.claimText(t)
+		handled, err := harness.coordinator.Process(ctx, job)
+		require.NoError(t, err)
+		require.True(t, handled)
+		require.Equal(t, 1, harness.aiCalls())
+		require.Equal(t, 1, harness.aiReplays())
+		require.Empty(t, harness.aiContractError())
+		require.Equal(t, 1, harness.studentApplyCalls())
+
+		delivery := harness.claimDelivery(t)
+		require.NoError(t, harness.coordinator.Deliver(ctx, delivery))
+		require.Equal(t, 1, harness.appendCalls(), "one deterministic response command is appended after the durable replay")
+		harness.requireDelivered(t, delivery.TeacherJobID, domain.TeacherOnboardingEffectAccepted, "")
+		harness.requireDeliveredLedger(t, delivery, "")
+		turn, found, err := harness.turns.GetTurn(ctx, delivery.TeacherJobID)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.True(t, harness.appendedWith(turn.ResponseCommandID))
+		response, err := domain.NewTeacherCoordinatedDialogResponse(domain.TeacherCoordinatedDialogResponse{Mode: delivery.CoordinatorMode, Body: delivery.ResponseBody, AssistantUI: delivery.ResponseAssistantUI})
+		require.NoError(t, err)
+		_, err = harness.dialogClient.AppendTeacherCoordinatedResponse(ctx, delivery.Request, turn.ResponseCommandID, response)
+		require.NoError(t, err, "the exact staged Dialog command must accept a 200 replay")
+		require.Equal(t, 1, harness.appendCalls())
+		require.Equal(t, 1, harness.appendReplays())
+	})
+
+	t.Run("canonical action has zero AI and no-effect replay", func(t *testing.T) {
+		harness := newS5CoordinatorHTTPHarness(t, fixture, domain.OnboardingStepDirection, true)
+		defer harness.close()
+		job := harness.claimAction(t)
+		handled, err := harness.coordinator.Process(ctx, job)
+		require.NoError(t, err)
+		require.True(t, handled)
+		require.Zero(t, harness.aiCalls(), "deterministic canonical action never reaches AI Prompt")
+		require.Equal(t, 1, harness.studentApplyCalls())
+		command := harness.onlyStudentCommand(t)
+		replayed, err := harness.studentClient.ApplyTeacherOnboardingTurn(ctx, fixture.studentID, command)
+		require.NoError(t, err)
+		require.True(t, replayed.Replayed, "same canonical action command is an exact Student replay")
+		require.Equal(t, 1, harness.studentApplyCalls(), "double-click/recovery must not create a second Student effect")
+		delivery := harness.claimDelivery(t)
+		require.NoError(t, harness.coordinator.Deliver(ctx, delivery))
+		harness.requireDelivered(t, delivery.TeacherJobID, domain.TeacherOnboardingEffectNoEffect, harness.noEffectProofID)
+		harness.requireDeliveredLedger(t, delivery, harness.noEffectProofID)
+	})
+}
+
+type s5CoordinatorHTTPHarness struct {
+	fixture *teacherDecisionIntegrationFixture
+	now     time.Time
+	step    domain.TeacherOnboardingStep
+	dialog  string
+	prompt  domain.DialogMessage
+	source  domain.DialogMessage
+	binding domain.TeacherDialogBinding
+	state   domain.TeacherStudentOnboardingState
+
+	jobs          TeacherDialogJobRepository
+	turns         TeacherOnboardingTurnRepository
+	receipts      OnboardingActionRepository
+	coordinator   teacherdialog.OnboardingCoordinator
+	studentClient studenthttp.Client
+	dialogClient  dialoghttp.Client
+
+	studentServer *httptest.Server
+	dialogServer  *httptest.Server
+	aiServer      *httptest.Server
+
+	mu                    sync.Mutex
+	aiCallCount           int
+	aiReplayCount         int
+	studentApplyCount     int
+	appendCallCount       int
+	appendReplayCount     int
+	commands              map[string]domain.TeacherStudentOnboardingTurnResult
+	commandPayloads       map[string]domain.TeacherStudentOnboardingTurnCommand
+	responses             map[string]string
+	appendKeys            map[string]bool
+	noEffect              bool
+	noEffectProofID       string
+	requireSemanticReplay bool
+	aiExecutionID         string
+	aiContractViolation   string
+}
+
+func newS5CoordinatorHTTPHarness(t *testing.T, fixture *teacherDecisionIntegrationFixture, step domain.TeacherOnboardingStep, noEffect bool) *s5CoordinatorHTTPHarness {
+	t.Helper()
+	now := time.Date(2026, 9, 10, 17, 0, 0, 0, time.UTC)
+	direction := "backend"
+	version := int64(1)
+	answers := domain.StudentOnboardingAnswers{DirectionCode: &direction}
+	createdAt, updatedAt := &now, &now
+	if step == domain.OnboardingStepDirection {
+		version, answers, createdAt, updatedAt = 0, domain.StudentOnboardingAnswers{}, nil, nil
+	}
+	state := domain.TeacherStudentOnboardingState{Schema: domain.TeacherStudentOnboardingStateSchema, ProfileVersion: 0, Draft: domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: fixture.studentID, Status: domain.StudentOnboardingDraftDraft,
+		StudentOnboardingAnswers: answers, Version: version, CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}}
+	body, ui, err := domain.BuildTeacherOnboardingPrompt(step, "ru", version)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: uuid.NewString(), StudentID: fixture.studentID, PersonalTeacherID: fixture.teacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	prompt := domain.DialogMessage{ID: uuid.NewString(), DialogID: binding.ID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb,
+		PersonalTeacherID: fixture.teacherID, Body: body, AssistantUI: ui, Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now}
+	source := domain.DialogMessage{ID: uuid.NewString(), DialogID: binding.ID, AuthorType: domain.DialogMessageAuthorUser, Channel: domain.DialogMessageChannelWeb,
+		SenderID: fixture.studentID, ReplyToMessageID: prompt.ID, Body: "Я знаю основы", Status: 1, Version: 1, MessageSequence: 2, LastEventSequence: 2, CreatedAt: now.Add(time.Second)}
+	harness := &s5CoordinatorHTTPHarness{
+		fixture: fixture, now: now, step: step, dialog: binding.ID, prompt: prompt, source: source, binding: binding, state: state,
+		jobs: TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}, turns: TeacherOnboardingTurnRepository{Pool: fixture.pool},
+		receipts: OnboardingActionRepository{Pool: fixture.pool}, commands: make(map[string]domain.TeacherStudentOnboardingTurnResult), commandPayloads: make(map[string]domain.TeacherStudentOnboardingTurnCommand),
+		responses: make(map[string]string), appendKeys: make(map[string]bool), noEffect: noEffect, noEffectProofID: uuid.NewString(),
+	}
+	harness.studentServer = httptest.NewServer(http.HandlerFunc(harness.serveStudent))
+	harness.dialogServer = httptest.NewServer(http.HandlerFunc(harness.serveDialog))
+	harness.aiServer = httptest.NewServer(http.HandlerFunc(harness.serveAI))
+	harness.studentClient = studenthttp.Client{BaseURL: harness.studentServer.URL, LearningWorkspaceToken: "student-token", HTTPClient: harness.studentServer.Client()}
+	harness.dialogClient = dialoghttp.Client{BaseURL: harness.dialogServer.URL, InternalToken: "dialog-token", HTTPClient: harness.dialogServer.Client()}
+	harness.coordinator = teacherdialog.OnboardingCoordinator{
+		Jobs: harness.jobs, Turns: harness.turns, Receipts: harness.receipts, StudentTurns: harness.studentClient, Students: harness.studentClient,
+		Semantic:     aiprompthttp.Client{BaseURL: harness.aiServer.URL, InternalToken: "ai-token", HTTPClient: harness.aiServer.Client()},
+		DialogReader: harness.dialogClient, Appender: harness.dialogClient, Deliveries: harness.jobs, Clock: s5CoordinatorClock{now: now},
+	}
+	return harness
+}
+
+func (h *s5CoordinatorHTTPHarness) close() {
+	h.studentServer.Close()
+	h.dialogServer.Close()
+	h.aiServer.Close()
+}
+
+func (h *s5CoordinatorHTTPHarness) claimText(t *testing.T) domain.TeacherDialogJob {
+	t.Helper()
+	request := h.request(uuid.NewString(), "", h.source.ID)
+	job, err := domain.NewTeacherDialogJob(request, h.now)
+	require.NoError(t, err)
+	accepted, err := h.jobs.Accept(context.Background(), job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	claimed, ok := claimDenseJob(t, h.jobs, "s5-http-text", h.now.Add(time.Second))
+	require.True(t, ok)
+	interaction, err := domain.NewS5OnboardingInteraction(h.binding, h.prompt, h.step, h.state.Draft.Version, h.state.ProfileVersion, 1, h.now)
+	require.NoError(t, err)
+	_, created, err := h.turns.EnsureActiveInteraction(context.Background(), interaction)
+	require.NoError(t, err)
+	require.True(t, created)
+	return claimed
+}
+
+func (h *s5CoordinatorHTTPHarness) claimAction(t *testing.T) domain.TeacherDialogJob {
+	t.Helper()
+	interaction, err := domain.NewS5OnboardingInteraction(h.binding, h.prompt, h.step, h.state.Draft.Version, h.state.ProfileVersion, 1, h.now)
+	require.NoError(t, err)
+	_, created, err := h.turns.EnsureActiveInteraction(context.Background(), interaction)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	canonicalMessageID := uuid.NewString()
+	receipt := materializedCanonicalReceipt(t, h.receipts, h.fixture, h.binding.ID, h.prompt.ID, 1, "onboarding.direction.d0.v1", "direction.backend", canonicalMessageID, h.now)
+	// A canonical action is its own Dialog user message, not a reinterpretation
+	// of a preceding free-text turn. Keep the fake request context identical to
+	// the materialized receipt/event contract.
+	h.source.ID = receipt.CanonicalStudentMessageID
+	h.source.Body = "I choose: Backend"
+	require.Equal(t, canonicalMessageID, h.source.ID)
+	request := h.request(uuid.NewString(), receipt.IdempotencyKey, receipt.CanonicalStudentMessageID)
+	request.CorrelationID = receipt.IdempotencyKey
+	job, err := domain.NewTeacherDialogJob(request, h.now)
+	require.NoError(t, err)
+	accepted, err := h.jobs.Accept(context.Background(), job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	claimed, ok := claimDenseJob(t, h.jobs, "s5-http-action", h.now.Add(time.Second))
+	require.True(t, ok)
+	return claimed
+}
+
+func (h *s5CoordinatorHTTPHarness) request(eventID, receiptID, sourceID string) domain.DialogTeacherRequest {
+	return domain.DialogTeacherRequest{SchemaVersion: 2, EventID: eventID, DialogID: h.binding.ID, EventSequence: 2, TeacherTurnSequence: 1,
+		SourceMessageID: sourceID, SourceSequence: 2, SourceMessageVersion: 1, ReplyToMessageID: h.prompt.ID,
+		CanonicalStudentMessageID: sourceID, CorrelationID: sourceID, DialogCausationID: sourceID, CausationID: eventID, ActionReceiptID: receiptID,
+		SourceChannel: domain.DialogMessageChannelWeb, StudentID: h.fixture.studentID, PersonalTeacherID: h.fixture.teacherID, ContextType: domain.LearningContextGeneral, OccurredAt: h.now.Add(time.Second)}
+}
+
+func (h *s5CoordinatorHTTPHarness) claimDelivery(t *testing.T) domain.TeacherDialogJob {
+	t.Helper()
+	claimed, ok := claimDenseJob(t, h.jobs, "s5-http-delivery", h.now.Add(2*time.Minute))
+	require.True(t, ok)
+	return claimed
+}
+
+func (h *s5CoordinatorHTTPHarness) requireDelivered(t *testing.T, teacherJobID string, effect domain.TeacherOnboardingStudentEffectState, proofID string) {
+	t.Helper()
+	turn, found, err := h.turns.GetTurn(context.Background(), teacherJobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingTurnDelivered, turn.Stage)
+	require.Equal(t, effect, turn.StudentEffectState)
+	require.Equal(t, proofID, turn.NoEffectProofID)
+}
+
+func (h *s5CoordinatorHTTPHarness) requireDeliveredLedger(t *testing.T, job domain.TeacherDialogJob, proofID string) {
+	t.Helper()
+	var nextSequence int64
+	var cursorResponseID, cursorProofID, outcomeResponseID, outcomeProofID, outcomeCommandID, jobResponseID string
+	require.NoError(t, h.fixture.pool.QueryRow(context.Background(), `
+SELECT next_teacher_turn_sequence,COALESCE(last_teacher_response_message_id::text,''),COALESCE(last_no_effect_proof_id::text,'')
+FROM teacher_dialog_turn_cursor WHERE dialog_id=$1
+`, job.Request.DialogID).Scan(&nextSequence, &cursorResponseID, &cursorProofID))
+	require.Equal(t, int64(2), nextSequence)
+	require.NoError(t, h.fixture.pool.QueryRow(context.Background(), `
+SELECT COALESCE(teacher_response_message_id::text,''),COALESCE(no_effect_proof_id::text,''),COALESCE(student_command_id::text,'')
+FROM teacher_dialog_turn_outcome WHERE source_event_id=$1
+`, job.Request.EventID).Scan(&outcomeResponseID, &outcomeProofID, &outcomeCommandID))
+	require.NoError(t, h.fixture.pool.QueryRow(context.Background(), `
+SELECT COALESCE(teacher_response_message_id::text,'') FROM teacher_dialog_job WHERE event_id=$1
+`, job.Request.EventID).Scan(&jobResponseID))
+	require.NotEmpty(t, cursorResponseID)
+	require.Equal(t, cursorResponseID, outcomeResponseID)
+	require.Equal(t, cursorResponseID, jobResponseID)
+	require.Equal(t, proofID, cursorProofID)
+	require.Equal(t, proofID, outcomeProofID)
+	command := h.onlyStudentCommand(t)
+	require.Equal(t, command.StudentCommandID, outcomeCommandID)
+	if proofID != "" {
+		var storedProofID, storedCommandID string
+		require.NoError(t, h.fixture.pool.QueryRow(context.Background(), `
+SELECT no_effect_proof_id::text,student_command_id::text
+FROM teacher_dialog_turn_proof WHERE source_event_id=$1
+`, job.Request.EventID).Scan(&storedProofID, &storedCommandID))
+		require.Equal(t, proofID, storedProofID)
+		require.Equal(t, command.StudentCommandID, storedCommandID)
+	}
+}
+
+func (h *s5CoordinatorHTTPHarness) aiCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aiCallCount
+}
+func (h *s5CoordinatorHTTPHarness) aiReplays() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aiReplayCount
+}
+func (h *s5CoordinatorHTTPHarness) aiContractError() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aiContractViolation
+}
+func (h *s5CoordinatorHTTPHarness) studentApplyCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.studentApplyCount
+}
+func (h *s5CoordinatorHTTPHarness) appendCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.appendCallCount
+}
+func (h *s5CoordinatorHTTPHarness) appendReplays() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.appendReplayCount
+}
+func (h *s5CoordinatorHTTPHarness) appendedWith(idempotencyKey string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.appendKeys[idempotencyKey]
+}
+
+func (h *s5CoordinatorHTTPHarness) onlyStudentCommand(t *testing.T) domain.TeacherStudentOnboardingTurnCommand {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	require.Len(t, h.commandPayloads, 1)
+	for _, command := range h.commandPayloads {
+		return command
+	}
+	panic("unreachable")
+}
+
+func (h *s5CoordinatorHTTPHarness) serveStudent(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "student-token" {
+		writer.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if strings.HasSuffix(request.URL.Path, "/onboarding/draft") && request.Method == http.MethodGet {
+		h.mu.Lock()
+		state := h.state
+		h.mu.Unlock()
+		writeS5HTTPJSON(writer, state)
+		return
+	}
+	if strings.HasSuffix(request.URL.Path, "/onboarding/turns") && request.Method == http.MethodPost {
+		var command domain.TeacherStudentOnboardingTurnCommand
+		if json.NewDecoder(request.Body).Decode(&command) != nil || request.Header.Get("Idempotency-Key") != command.StudentCommandID {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		h.mu.Lock()
+		result, replay := h.commands[command.StudentCommandID]
+		if !replay {
+			h.studentApplyCount++
+			h.commandPayloads[command.StudentCommandID] = command
+			result = domain.TeacherStudentOnboardingTurnResult{Schema: domain.TeacherStudentOnboardingTurnResultSchema, StudentCommandID: command.StudentCommandID, CanonicalStudentMessageID: command.CanonicalStudentMessageID}
+			if h.noEffect {
+				proof := h.noEffectProofID
+				result.StudentEffectState, result.NoEffectProofID = "no_effect", &proof
+			} else {
+				basic := "basic"
+				h.state.Draft.SelfAssessedExperience = &basic
+				h.state.Draft.Version++
+				updated := h.now.Add(time.Minute)
+				h.state.Draft.UpdatedAt = &updated
+				version := h.state.Draft.Version
+				result.StudentEffectState, result.ResultDraftVersion = "accepted", &version
+			}
+			h.commands[command.StudentCommandID] = result
+		} else {
+			result.Replayed = true
+		}
+		h.mu.Unlock()
+		writeS5HTTPJSON(writer, result)
+		return
+	}
+	if strings.Contains(request.URL.Path, "/onboarding/turns/") && request.Method == http.MethodGet {
+		commandID := request.URL.Path[strings.LastIndex(request.URL.Path, "/")+1:]
+		h.mu.Lock()
+		result, found := h.commands[commandID]
+		h.mu.Unlock()
+		if !found {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		result.Replayed = true
+		writeS5HTTPJSON(writer, result)
+		return
+	}
+	writer.WriteHeader(http.StatusNotFound)
+}
+
+func (h *s5CoordinatorHTTPHarness) serveAI(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "ai-token" {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/api/v1/prompts/confidential-executions/") {
+		key := strings.TrimPrefix(request.URL.Path, "/api/v1/prompts/confidential-executions/")
+		h.mu.Lock()
+		known := key != "" && key == h.aiExecutionID
+		if known {
+			h.aiReplayCount++
+		}
+		h.mu.Unlock()
+		if !known {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		h.writeSemanticExecution(writer, key, true)
+		return
+	}
+	if request.URL.Path != "/api/v1/prompts/execute-confidential" || request.Method != http.MethodPost {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	var payload struct {
+		IdempotencyKey string          `json:"idempotency_key"`
+		TemplateCode   string          `json:"template_code"`
+		LanguageCode   string          `json:"language_code"`
+		Variables      json.RawMessage `json:"variables"`
+	}
+	if json.NewDecoder(request.Body).Decode(&payload) != nil || payload.IdempotencyKey == "" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	contractViolation := ""
+	if _, err := uuid.Parse(payload.IdempotencyKey); err != nil || payload.TemplateCode != domain.TeacherOnboardingSemanticTemplateCode || payload.LanguageCode != "ru" {
+		contractViolation = "semantic identity/template/language mismatch"
+	}
+	var variables map[string]json.RawMessage
+	if contractViolation == "" && json.Unmarshal(payload.Variables, &variables) != nil {
+		contractViolation = "semantic variables are not an object"
+	}
+	if contractViolation == "" && (len(variables) != 4 || variables["student_turn"] == nil || variables["onboarding_state"] == nil || variables["dialog_context"] == nil || variables["semantic_stage"] == nil) {
+		contractViolation = "semantic variables have unexpected shape"
+	}
+	h.mu.Lock()
+	h.aiCallCount++
+	h.aiExecutionID = payload.IdempotencyKey
+	if contractViolation != "" {
+		h.aiContractViolation = contractViolation
+	}
+	pending := h.requireSemanticReplay
+	h.mu.Unlock()
+	if contractViolation != "" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if pending {
+		writer.Header().Set("Retry-After", "1")
+		writeS5HTTPStatusJSON(writer, http.StatusConflict, map[string]any{"error": map[string]string{"code": "execution_in_progress"}})
+		return
+	}
+	h.writeSemanticExecution(writer, payload.IdempotencyKey, false)
+}
+
+func (h *s5CoordinatorHTTPHarness) writeSemanticExecution(writer http.ResponseWriter, key string, cached bool) {
+	writeS5HTTPJSON(writer, map[string]any{
+		"execution_id": "opaque-test-row", "idempotency_key": key, "template_code": domain.TeacherOnboardingSemanticTemplateCode,
+		"template_version": 1, "provider_code": "fake", "provider_model": "fake-v1", "language_code": "ru", "response_schema_code": domain.TeacherOnboardingSemanticSchemaCode,
+		"parsed_response": map[string]any{"schema": domain.TeacherOnboardingSemanticSchemaCode, "response": "Понял.", "slot_candidates": []any{map[string]any{"slot": "self_assessed_experience", "code_value": "basic", "text_value": "", "string_list_value": []any{}, "integer_value": 0, "confidence_basis_points": 9000}}, "questions": []any{}, "uncertainties": []any{}},
+		"cached":          cached, "created_at": h.now.Format(time.RFC3339), "expires_at": h.now.Add(time.Hour).Format(time.RFC3339),
+	})
+}
+
+func (h *s5CoordinatorHTTPHarness) serveDialog(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "dialog-token" {
+		writer.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/request/") {
+		writeS5HTTPJSON(writer, map[string]any{"dialog_id": h.binding.ID, "student_id": h.fixture.studentID, "personal_teacher_id": h.fixture.teacherID, "context_type": "general_teacher", "context_id": nil, "source_message_id": h.source.ID, "learning_action_id": nil, "messages": []any{s5DialogMessageJSON(h.prompt), s5DialogMessageJSON(h.source)}})
+		return
+	}
+	if request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/message") {
+		var payload struct {
+			IdempotencyKey  string          `json:"idempotency_key"`
+			Body            string          `json:"body"`
+			AssistantUI     json.RawMessage `json:"assistant_ui"`
+			SourceMessageID string          `json:"source_message_id"`
+		}
+		if json.NewDecoder(request.Body).Decode(&payload) != nil || payload.IdempotencyKey == "" || payload.SourceMessageID != h.source.ID || strings.TrimSpace(payload.Body) == "" {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if _, err := uuid.Parse(payload.IdempotencyKey); err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		h.mu.Lock()
+		messageID, found := h.responses[payload.IdempotencyKey]
+		if !found {
+			messageID = uuid.NewString()
+			h.responses[payload.IdempotencyKey] = messageID
+			h.appendCallCount++
+			h.appendKeys[payload.IdempotencyKey] = true
+		} else {
+			h.appendReplayCount++
+		}
+		h.mu.Unlock()
+		response := domain.DialogMessage{ID: messageID, DialogID: h.binding.ID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: h.fixture.teacherID, ReplyToMessageID: h.source.ID, Body: payload.Body, AssistantUI: payload.AssistantUI, Status: 1, Version: 1, MessageSequence: 3, LastEventSequence: 3, CreatedAt: h.now.Add(2 * time.Minute)}
+		status := http.StatusCreated
+		if found {
+			status = http.StatusOK
+		}
+		writeS5HTTPStatusJSON(writer, status, s5DialogMessageJSON(response))
+		return
+	}
+	writer.WriteHeader(http.StatusNotFound)
+}
+
+func s5DialogMessageJSON(message domain.DialogMessage) map[string]any {
+	value := map[string]any{"id": message.ID, "dialog_id": message.DialogID, "author_type": message.AuthorType, "channel": message.Channel,
+		"sender_id": nil, "personal_teacher_id": nil, "learning_action_id": nil, "lesson_context": nil, "reply_to_message_id": nil,
+		"body": message.Body, "links": []any{}, "status": message.Status, "version": message.Version, "message_sequence": message.MessageSequence,
+		"last_event_sequence": message.LastEventSequence, "attachments": []any{}, "edited_at": nil, "deleted_at": nil, "created_at": message.CreatedAt.Format(time.RFC3339), "updated_at": message.CreatedAt.Format(time.RFC3339)}
+	if len(message.AssistantUI) != 0 {
+		value["assistant_ui"] = json.RawMessage(message.AssistantUI)
+	}
+	if message.AuthorType == domain.DialogMessageAuthorUser {
+		value["sender_id"] = message.SenderID
+	} else {
+		value["personal_teacher_id"] = message.PersonalTeacherID
+	}
+	if message.ReplyToMessageID != "" {
+		value["reply_to_message_id"] = message.ReplyToMessageID
+	}
+	return value
+}
+
+func writeS5HTTPJSON(writer http.ResponseWriter, value any) {
+	writeS5HTTPStatusJSON(writer, http.StatusOK, value)
+}
+
+func writeS5HTTPStatusJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+type s5CoordinatorClock struct{ now time.Time }
+
+func (clock s5CoordinatorClock) Now() time.Time { return clock.now }

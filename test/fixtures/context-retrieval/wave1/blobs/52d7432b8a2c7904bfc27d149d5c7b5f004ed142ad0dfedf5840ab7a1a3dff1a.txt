@@ -1,0 +1,85 @@
+package telegram
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const maximumUpdateBytes = 64 << 10
+
+type updateProcessor interface {
+	ProcessUpdate(context.Context, domain.TelegramInboundUpdate) (domain.TelegramInboundResult, error)
+}
+
+type Handler struct {
+	Secret    string
+	Processor updateProcessor
+}
+
+func (handler Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	provided := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+	if handler.Secret == "" || len(provided) != len(handler.Secret) || subtle.ConstantTimeCompare([]byte(provided), []byte(handler.Secret)) != 1 {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	limited := &io.LimitedReader{R: r.Body, N: maximumUpdateBytes + 1}
+	var payload struct {
+		UpdateID int64 `json:"update_id"`
+		Message  *struct {
+			Text string `json:"text"`
+			From struct {
+				ID    int64 `json:"id"`
+				IsBot bool  `json:"is_bot"`
+			} `json:"from"`
+			Chat struct {
+				ID   int64  `json:"id"`
+				Type string `json:"type"`
+			} `json:"chat"`
+		} `json:"message"`
+	}
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(&payload); err != nil || limited.N == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid update"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid update"})
+		return
+	}
+	if payload.Message == nil || handler.Processor == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	result, err := handler.Processor.ProcessUpdate(r.Context(), domain.TelegramInboundUpdate{
+		UpdateID: payload.UpdateID, TelegramUserID: payload.Message.From.ID, ChatID: payload.Message.Chat.ID,
+		ChatType: payload.Message.Chat.Type, Text: payload.Message.Text, SenderIsBot: payload.Message.From.IsBot,
+	})
+	if err != nil && !errors.Is(err, domain.ErrInvalidTelegramUpdate) && !errors.Is(err, domain.ErrTelegramLinkInvalid) &&
+		!errors.Is(err, domain.ErrTelegramLinkConflict) && !errors.Is(err, domain.ErrTelegramBindingNotFound) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telegram channel unavailable"})
+		return
+	}
+	if result.ReplyText != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"method": "sendMessage", "chat_id": payload.Message.Chat.ID, "text": result.ReplyText,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}

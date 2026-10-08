@@ -1,0 +1,514 @@
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/example/mc-course-service/internal/config"
+	filestorageadapter "github.com/example/mc-course-service/internal/infrastructure/filestorage"
+	"github.com/example/mc-course-service/internal/infrastructure/http/taskanswer"
+	natsadapter "github.com/example/mc-course-service/internal/infrastructure/messaging/nats"
+	pgadapter "github.com/example/mc-course-service/internal/infrastructure/persistence/postgres"
+	httpadapter "github.com/example/mc-course-service/internal/transport/http"
+	adminhandlers "github.com/example/mc-course-service/internal/transport/http/admin/v1/handlers"
+	handlers "github.com/example/mc-course-service/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/catalog"
+	"github.com/example/mc-course-service/internal/usecase/codestructuretype"
+	"github.com/example/mc-course-service/internal/usecase/composeconfig"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	"github.com/example/mc-course-service/internal/usecase/course"
+	"github.com/example/mc-course-service/internal/usecase/examplerelation"
+	"github.com/example/mc-course-service/internal/usecase/generatedcourse"
+	"github.com/example/mc-course-service/internal/usecase/knowledgeidentity"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/example/mc-course-service/internal/usecase/lessonexample"
+	"github.com/example/mc-course-service/internal/usecase/lessonrelation"
+	"github.com/example/mc-course-service/internal/usecase/lessonrevision"
+	moduleuc "github.com/example/mc-course-service/internal/usecase/module"
+	"github.com/example/mc-course-service/internal/usecase/position"
+	sectionuc "github.com/example/mc-course-service/internal/usecase/section"
+	"github.com/example/mc-course-service/internal/usecase/tag"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/example/mc-course-service/internal/usecase/tech"
+	"github.com/example/mc-course-service/internal/usecase/techversion"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+)
+
+type uuidGenerator struct{}
+
+func (uuidGenerator) NewID() string { return uuid.NewString() }
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now().UTC() }
+
+func main() {
+	ctx := context.Background()
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case migrateFreshCommand:
+			os.Exit(runFreshMigrationsCommand(ctx))
+		case provisionDiagnosticAssessmentFixtureCommand:
+			os.Exit(runDiagnosticAssessmentFixtureCommand(ctx))
+		}
+	}
+
+	logger, _ := zap.NewProduction()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("db error: %v", err)
+	}
+	defer pool.Close()
+	if len(os.Args) == 2 && os.Args[1] == "provision-verification-fixture" {
+		if err := runVerificationFixtureCommand(ctx, pool); err != nil {
+			pool.Close()
+			log.Print(err)
+			os.Exit(2)
+		}
+		return
+	}
+
+	natsConn, _ := nats.Connect(cfg.NATSURL)
+	defer func() {
+		if natsConn != nil {
+			if err := natsConn.Drain(); err != nil {
+				log.Printf("nats drain error: %v", err)
+			}
+		}
+	}()
+
+	validator := validator.New()
+	publisher := &natsadapter.Publisher{Conn: natsConn}
+	taskAnswerClient := taskanswer.Client{
+		BaseURL:       cfg.TaskAnswerServiceBaseURL,
+		InternalToken: cfg.TaskAnswerServiceInternalToken,
+	}
+	fileStorageClient := filestorageadapter.Client{
+		BaseURL: cfg.FileStorageServiceBaseURL,
+	}
+
+	courseRepo := pgadapter.CourseRepoPG{Pool: pool}
+	courseOutlineRepo := pgadapter.CourseOutlineRepoPG{Pool: pool}
+	catalogScopeRepo := pgadapter.CatalogScopeRepoPG{Pool: pool}
+	contentAccessRepo := pgadapter.ContentAccessRepoPG{Pool: pool}
+	contentAccessService := contentaccess.Service{Repository: contentAccessRepo, ReadAccess: contentAccessRepo}
+	trackRepo := pgadapter.TrackRepoPG{Pool: pool}
+	trackI18nRepo := pgadapter.TrackI18nRepoPG{Pool: pool}
+	courseLevelRepo := pgadapter.CourseLevelRepoPG{Pool: pool}
+	courseLevelI18nRepo := pgadapter.CourseLevelI18nRepoPG{Pool: pool}
+	courseGroupRepo := pgadapter.CourseGroupRepoPG{Pool: pool}
+	courseGroupI18nRepo := pgadapter.CourseGroupI18nRepoPG{Pool: pool}
+	trackLevelRepo := pgadapter.TrackLevelRepoPG{Pool: pool}
+	levelCourseGroupRepo := pgadapter.LevelCourseGroupRepoPG{Pool: pool}
+	courseGroupCourseRepo := pgadapter.CourseGroupCourseRepoPG{Pool: pool}
+	techRepo := pgadapter.TechRepoPG{Pool: pool}
+	techVersionRepo := pgadapter.TechVersionRepoPG{Pool: pool}
+	composeConfigRepo := pgadapter.ComposeConfigRepoPG{Pool: pool}
+	courseI18nRepo := pgadapter.CourseI18nRepoPG{Pool: pool}
+	i18nRepo := pgadapter.I18nRepoPG{Pool: pool}
+	courseTechRepo := pgadapter.CourseTechRepoPG{Pool: pool}
+	composeConfigTechRepo := pgadapter.ComposeConfigTechRepoPG{Pool: pool}
+	courseTagRepo := pgadapter.CourseTagRepoPG{Pool: pool}
+	positionRepo := pgadapter.PositionRepoPG{Pool: pool}
+	positionTechRepo := pgadapter.PositionTechRepoPG{Pool: pool}
+	positionCourseRepo := pgadapter.PositionCourseRepoPG{Pool: pool}
+	tagRepo := pgadapter.TagRepoPG{Pool: pool}
+	moduleRepo := pgadapter.ModuleRepoPG{Pool: pool}
+	moduleI18nRepo := pgadapter.ModuleI18nRepoPG{Pool: pool}
+	courseModuleRepo := pgadapter.CourseModuleRepoPG{Pool: pool}
+	lessonRepo := pgadapter.LessonRepoPG{Pool: pool}
+	lessonRelationRepo := pgadapter.LessonRelationRepoPG{Pool: pool}
+	lessonExampleRepo := pgadapter.LessonExampleRepoPG{Pool: pool}
+	lessonExampleRelationRepo := pgadapter.LessonExampleRelationRepoPG{Pool: pool}
+	sectionLessonRepo := pgadapter.SectionLessonRepoPG{Pool: pool}
+	lessonVersionRepo := pgadapter.LessonVersionRepoPG{Pool: pool}
+	sectionRepo := pgadapter.SectionRepoPG{Pool: pool}
+	sectionI18nRepo := pgadapter.SectionI18nRepoPG{Pool: pool}
+	moduleSectionRepo := pgadapter.ModuleSectionRepoPG{Pool: pool}
+	lessonI18nRepo := pgadapter.LessonI18nRepoPG{Pool: pool}
+	knowledgeIdentityRepo := pgadapter.KnowledgeIdentityRepoPG{Pool: pool}
+	generatedCourseRepo := pgadapter.GeneratedCourseRepoPG{Pool: pool}
+	taskI18nRepo := pgadapter.TaskI18nRepoPG{Pool: pool}
+	taskRepo := pgadapter.TaskRepoPG{Pool: pool}
+	taskTestRepo := pgadapter.TaskTestRepoPG{Pool: pool}
+	taskFileStorageRepo := pgadapter.TaskFileStorageRepoPG{Pool: pool}
+	taskLearningTargetRepo := pgadapter.TaskLearningTargetRepoPG{Pool: pool}
+	structureRepo := pgadapter.CodeStructureTypeRepoPG{Pool: pool}
+	txManager := pgadapter.TxManagerPG{Pool: pool}
+
+	createCourse := course.CreateCourse{
+		Courses:   courseRepo,
+		Publisher: publisher,
+		Tx:        txManager,
+	}
+	updateCourse := course.UpdateCourse{
+		Courses:   courseRepo,
+		Lessons:   lessonRepo,
+		Publisher: publisher,
+		Tx:        txManager,
+	}
+	deleteCourse := course.DeleteCourse{Courses: courseRepo, Publisher: publisher}
+	getCourse := course.GetCourse{Courses: courseRepo, CourseI18n: courseI18nRepo}
+	listCourses := course.ListCourses{Courses: courseRepo}
+	getCourseOutline := course.GetCourseOutline{Outlines: courseOutlineRepo, Access: contentAccessService}
+	listPublicCatalogScopes := catalog.ListPublicScopes{Scopes: catalogScopeRepo}
+
+	createTrackUC := catalog.CreateTrack{Tracks: trackRepo, TrackI18n: trackI18nRepo, I18n: i18nRepo, Tx: txManager}
+	updateTrackUC := catalog.UpdateTrack{Tracks: trackRepo, TrackI18n: trackI18nRepo, I18n: i18nRepo, Tx: txManager}
+	deleteTrackUC := catalog.DeleteTrack{Tracks: trackRepo}
+	getTrackUC := catalog.GetTrack{Tracks: trackRepo, TrackI18n: trackI18nRepo}
+	listTracksUC := catalog.ListTracks{Tracks: trackRepo}
+	createCourseLevelUC := catalog.CreateCourseLevel{Levels: courseLevelRepo, LevelI18n: courseLevelI18nRepo, I18n: i18nRepo, Tx: txManager}
+	updateCourseLevelUC := catalog.UpdateCourseLevel{Levels: courseLevelRepo, LevelI18n: courseLevelI18nRepo, I18n: i18nRepo, Tx: txManager}
+	deleteCourseLevelUC := catalog.DeleteCourseLevel{Levels: courseLevelRepo}
+	getCourseLevelUC := catalog.GetCourseLevel{Levels: courseLevelRepo, LevelI18n: courseLevelI18nRepo}
+	listCourseLevelsUC := catalog.ListCourseLevels{Levels: courseLevelRepo, Tracks: trackRepo}
+	createCourseGroupUC := catalog.CreateCourseGroup{Groups: courseGroupRepo, GroupI18n: courseGroupI18nRepo, I18n: i18nRepo, Tx: txManager}
+	updateCourseGroupUC := catalog.UpdateCourseGroup{Groups: courseGroupRepo, GroupI18n: courseGroupI18nRepo, I18n: i18nRepo, Tx: txManager}
+	deleteCourseGroupUC := catalog.DeleteCourseGroup{Groups: courseGroupRepo}
+	getCourseGroupUC := catalog.GetCourseGroup{Groups: courseGroupRepo, GroupI18n: courseGroupI18nRepo}
+	listCourseGroupsUC := catalog.ListCourseGroups{Groups: courseGroupRepo, Levels: courseLevelRepo}
+	addTrackLevelUC := catalog.AddTrackLevel{Tracks: trackRepo, Levels: courseLevelRepo, TrackLevels: trackLevelRepo, Tx: txManager}
+	deleteTrackLevelUC := catalog.DeleteTrackLevel{Tracks: trackRepo, Levels: courseLevelRepo, TrackLevels: trackLevelRepo, Tx: txManager}
+	replaceTrackLevelsUC := catalog.ReplaceTrackLevels{Tracks: trackRepo, Levels: courseLevelRepo, TrackLevels: trackLevelRepo, Tx: txManager}
+	addLevelCourseGroupUC := catalog.AddLevelCourseGroup{Levels: courseLevelRepo, Groups: courseGroupRepo, LevelCourseGroups: levelCourseGroupRepo, Tx: txManager}
+	deleteLevelCourseGroupUC := catalog.DeleteLevelCourseGroup{Levels: courseLevelRepo, Groups: courseGroupRepo, LevelCourseGroups: levelCourseGroupRepo, Tx: txManager}
+	replaceLevelCourseGroupsUC := catalog.ReplaceLevelCourseGroups{Levels: courseLevelRepo, Groups: courseGroupRepo, LevelCourseGroups: levelCourseGroupRepo, Tx: txManager}
+	addCourseGroupCourseUC := catalog.AddCourseGroupCourse{Groups: courseGroupRepo, Courses: courseRepo, CourseGroupCourses: courseGroupCourseRepo, Tx: txManager}
+	deleteCourseGroupCourseUC := catalog.DeleteCourseGroupCourse{Groups: courseGroupRepo, Courses: courseRepo, CourseGroupCourses: courseGroupCourseRepo, Tx: txManager}
+	replaceCourseGroupCoursesUC := catalog.ReplaceCourseGroupCourses{Groups: courseGroupRepo, Courses: courseRepo, CourseGroupCourses: courseGroupCourseRepo, Tx: txManager}
+
+	createModuleUC := moduleuc.CreateModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}
+	updateModuleUC := moduleuc.UpdateModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}
+	deleteModuleUC := moduleuc.DeleteModule{Modules: moduleRepo}
+	getModuleUC := moduleuc.GetModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo}
+	listModulesUC := moduleuc.ListModules{Modules: moduleRepo, Courses: courseRepo}
+	addCourseModuleUC := course.AddCourseModule{Courses: courseRepo, Modules: moduleRepo, CourseModules: courseModuleRepo, Tx: txManager}
+	replaceCourseModulesUC := course.ReplaceCourseModules{Courses: courseRepo, Modules: moduleRepo, CourseModules: courseModuleRepo, Tx: txManager}
+	deleteCourseModuleUC := course.DeleteCourseModule{Courses: courseRepo, Modules: moduleRepo, CourseModules: courseModuleRepo, Tx: txManager}
+
+	createSectionUC := sectionuc.CreateSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}
+	updateSectionUC := sectionuc.UpdateSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}
+	deleteSectionUC := sectionuc.DeleteSection{Sections: sectionRepo}
+	getSectionUC := sectionuc.GetSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo}
+	listSectionsUC := sectionuc.ListSectionsByModule{Sections: sectionRepo, Modules: moduleRepo}
+	addModuleSectionUC := moduleuc.AddModuleSection{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager}
+	replaceModuleSectionsUC := moduleuc.ReplaceModuleSections{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager}
+	deleteModuleSectionUC := moduleuc.DeleteModuleSection{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager}
+
+	createLesson := lesson.CreateLesson{
+		Lessons:        lessonRepo,
+		LessonVersions: lessonVersionRepo,
+		LessonI18n:     lessonI18nRepo,
+		Tasks:          taskRepo,
+		TechVersions:   techVersionRepo,
+		ComposeConfigs: composeConfigRepo,
+		Tx:             txManager,
+	}
+	updateLesson := lesson.UpdateLesson{
+		Courses:        courseRepo,
+		Lessons:        lessonRepo,
+		LessonVersions: lessonVersionRepo,
+		LessonI18n:     lessonI18nRepo,
+		Tasks:          taskRepo,
+		TechVersions:   techVersionRepo,
+		ComposeConfigs: composeConfigRepo,
+		Tx:             txManager,
+	}
+	deleteLesson := lesson.DeleteLesson{Lessons: lessonRepo}
+	getLesson := lesson.GetLesson{Lessons: lessonRepo}
+	lessonRevisionUC := lessonrevision.Definitions{Revisions: pgadapter.LessonRevisionRepoPG{Pool: pool}, Lessons: lessonRepo, Translations: lessonI18nRepo, Tasks: taskRepo, Tests: taskTestRepo, Files: taskFileStorageRepo, Examples: lessonExampleRepo, Tx: pgadapter.LessonRevisionTxPG{Pool: pool}}
+	getTeacherLessonContext := lesson.GetTeacherContext{Lessons: lessonRepo, LessonI18n: lessonI18nRepo}
+	getLessonMaterials := lesson.GetLessonMaterials{
+		Lessons:          lessonRepo,
+		LessonRelations:  lessonRelationRepo,
+		Examples:         lessonExampleRepo,
+		ExampleRelations: lessonExampleRelationRepo,
+		Tasks:            taskRepo,
+		TaskTests:        taskTestRepo,
+		Access:           contentAccessService,
+	}
+	listLessons := lesson.ListLessonsByCourse{Courses: courseRepo, Modules: moduleRepo, Sections: sectionRepo, Lessons: lessonRepo}
+	replaceLessonRelationsUC := lessonrelation.ReplaceLessonRelations{Lessons: lessonRepo, Relations: lessonRelationRepo, Tx: txManager}
+	listLessonRelationsUC := lessonrelation.ListLessonRelations{Lessons: lessonRepo, Relations: lessonRelationRepo}
+	deleteLessonRelationUC := lessonrelation.DeleteLessonRelation{Relations: lessonRelationRepo}
+	replaceLessonExamplesUC := lessonexample.ReplaceLessonExamples{Lessons: lessonRepo, Examples: lessonExampleRepo, I18n: i18nRepo, Tx: txManager}
+	listLessonExamplesUC := lessonexample.ListLessonExamples{Lessons: lessonRepo, Examples: lessonExampleRepo}
+	deleteLessonExampleUC := lessonexample.DeleteLessonExample{Examples: lessonExampleRepo}
+	replaceExampleRelationsUC := examplerelation.ReplaceExampleRelations{Examples: lessonExampleRepo, Relations: lessonExampleRelationRepo, Tx: txManager}
+	listExampleRelationsUC := examplerelation.ListExampleRelations{Examples: lessonExampleRepo, Relations: lessonExampleRelationRepo}
+	deleteExampleRelationUC := examplerelation.DeleteExampleRelation{Relations: lessonExampleRelationRepo}
+	addSectionLessonUC := sectionuc.AddSectionLesson{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager}
+	replaceSectionLessonsUC := sectionuc.ReplaceSectionLessons{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager}
+	deleteSectionLessonUC := sectionuc.DeleteSectionLesson{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager}
+
+	createTaskUC := task.CreateTask{Tasks: taskRepo, Lessons: lessonRepo, TaskI18n: taskI18nRepo, TaskTests: taskTestRepo, TaskFiles: taskFileStorageRepo, LearningTargets: taskLearningTargetRepo, Publisher: publisher, StructureRes: structureRepo, ComposeConfigs: composeConfigRepo, Tx: txManager}
+	updateTaskUC := task.UpdateTask{Tasks: taskRepo, Lessons: lessonRepo, TaskI18n: taskI18nRepo, TaskTests: taskTestRepo, TaskFiles: taskFileStorageRepo, LearningTargets: taskLearningTargetRepo, Publisher: publisher, ComposeConfigs: composeConfigRepo, StructureRes: structureRepo, Tx: txManager}
+	uploadStarterArchiveUC := task.UploadStarterArchive{
+		Tasks:     taskRepo,
+		TaskFiles: taskFileStorageRepo,
+		Uploader:  fileStorageClient,
+		Activator: fileStorageClient,
+		Tx:        txManager,
+	}
+	deleteTaskUC := task.DeleteTask{Tasks: taskRepo, Publisher: publisher}
+	getTaskUC := task.GetTask{Tasks: taskRepo, Structures: structureRepo}
+	getTaskDetailsUC := task.GetTaskDetails{Tasks: taskRepo, TaskTests: taskTestRepo, TaskFiles: taskFileStorageRepo, LearningTargets: taskLearningTargetRepo, Structures: structureRepo}
+	getInternalCourseStructureUC := task.GetInternalCourseStructure{Lessons: lessonRepo, Tasks: taskRepo}
+	getInternalCompletedLessonsUC := task.GetInternalCompletedLessons{Lessons: lessonRepo, Tasks: taskRepo, Progress: taskAnswerClient}
+	listTasksUC := task.ListTasksByLesson{Tasks: taskRepo}
+
+	createTechUC := tech.CreateTech{Techs: techRepo}
+	getTechUC := tech.GetTechByLabel{Techs: techRepo}
+	getTechByIDUC := tech.GetTechByID{Techs: techRepo}
+	updateTechUC := tech.UpdateTech{Techs: techRepo}
+	deleteTechUC := tech.DeleteTech{Techs: techRepo}
+	listTechUC := tech.ListTechs{Techs: techRepo}
+	listTechVersionUC := techversion.ListTechVersions{TechVersions: techVersionRepo}
+	createTechVersionUC := techversion.CreateTechVersion{TechVersions: techVersionRepo, Techs: techRepo}
+	updateTechVersionUC := techversion.UpdateTechVersion{TechVersions: techVersionRepo}
+	deleteTechVersionUC := techversion.DeleteTechVersion{TechVersions: techVersionRepo}
+	createTagUC := tag.CreateTag{Tags: tagRepo}
+	getTagByIDUC := tag.GetTagByID{Tags: tagRepo}
+	updateTagUC := tag.UpdateTag{Tags: tagRepo}
+	deleteTagUC := tag.DeleteTag{Tags: tagRepo}
+	listTagUC := tag.ListTags{Tags: tagRepo}
+	createComposeConfigUC := composeconfig.CreateComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo, Tx: txManager}
+	getComposeConfigUC := composeconfig.GetComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo}
+	updateComposeConfigUC := composeconfig.UpdateComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo, Tx: txManager}
+	listComposeConfigUC := composeconfig.ListComposeConfigs{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo}
+	deleteComposeConfigUC := composeconfig.DeleteComposeConfig{ComposeConfigs: composeConfigRepo}
+	upsertCourseI18nUC := course.UpsertCourseI18n{Courses: courseRepo, CourseI18n: courseI18nRepo, I18n: i18nRepo, Tx: txManager}
+	deleteCourseI18nUC := course.DeleteCourseI18n{CourseI18n: courseI18nRepo}
+	listI18nUC := course.ListI18n{I18n: i18nRepo}
+	listCourseI18nUC := course.ListCourseI18n{Courses: courseRepo, CourseI18n: courseI18nRepo}
+	updateCourseTagsUC := course.UpdateCourseTags{Courses: courseRepo, Tags: courseTagRepo, Tx: txManager}
+	updateCourseTechsUC := course.UpdateCourseTechs{Courses: courseRepo, Techs: courseTechRepo, Tx: txManager}
+	createPositionUC := position.CreatePosition{Positions: positionRepo}
+	getPositionUC := position.GetPosition{Positions: positionRepo, PositionTechs: positionTechRepo, PositionCourses: positionCourseRepo}
+	updatePositionUC := position.UpdatePosition{Positions: positionRepo}
+	deletePositionUC := position.DeletePosition{Positions: positionRepo}
+	listPositionUC := position.ListPositions{Positions: positionRepo, PositionTechs: positionTechRepo, PositionCourses: positionCourseRepo}
+	updatePositionTechsUC := position.UpdatePositionTechs{Positions: positionRepo, Techs: positionTechRepo, Tx: txManager}
+	updatePositionCoursesUC := position.UpdatePositionCourses{Positions: positionRepo, Courses: positionCourseRepo, Tx: txManager}
+	createCodeStructureTypeUC := codestructuretype.CreateCodeStructureType{Structures: structureRepo}
+	getCodeStructureTypeUC := codestructuretype.GetCodeStructureType{Structures: structureRepo}
+	updateCodeStructureTypeUC := codestructuretype.UpdateCodeStructureType{Structures: structureRepo}
+	deleteCodeStructureTypeUC := codestructuretype.DeleteCodeStructureType{Structures: structureRepo}
+	listCodeStructureTypesUC := codestructuretype.ListCodeStructureTypes{Structures: structureRepo}
+	resolveCourseLessonBindingsUC := knowledgeidentity.ResolveCourseLessonBindings{Bindings: knowledgeIdentityRepo}
+	ensureGeneratedCourseUC := generatedcourse.Ensure{Revisions: lessonRevisionUC,
+		Generated: generatedCourseRepo, Courses: courseRepo, CourseI18n: courseI18nRepo,
+		Modules: moduleRepo, ModuleI18n: moduleI18nRepo, CourseModules: courseModuleRepo,
+		Sections: sectionRepo, SectionI18n: sectionI18nRepo, ModuleSections: moduleSectionRepo,
+		Lessons: lessonRepo, LessonI18n: lessonI18nRepo, SectionLessons: sectionLessonRepo,
+		Examples: lessonExampleRepo, Tasks: taskRepo, TaskI18n: taskI18nRepo,
+		TaskTargets: taskLearningTargetRepo, StructureTypes: structureRepo,
+		I18n: i18nRepo, Tx: txManager, Publisher: publisher, IDs: uuidGenerator{}, Clock: systemClock{},
+	}
+
+	taskHandler := &handlers.TaskHandler{
+		Validator:    validator,
+		GetUC:        getTaskUC,
+		GetDetailsUC: getTaskDetailsUC,
+		ListUC:       listTasksUC,
+		Access:       contentAccessService,
+	}
+	lessonHandler := &handlers.LessonHandler{Validator: validator, GetUC: getLesson, ListUC: listLessons, MaterialsUC: getLessonMaterials, Access: contentAccessService}
+	lessonRelationsHandler := &handlers.LessonRelationsHandler{ListUC: listLessonRelationsUC, Access: contentAccessService}
+	lessonExamplesHandler := &handlers.LessonExamplesHandler{ListUC: listLessonExamplesUC, Access: contentAccessService}
+	exampleRelationsHandler := &handlers.ExampleRelationsHandler{ListUC: listExampleRelationsUC, Access: contentAccessService}
+	courseHandler := &handlers.CourseHandler{Validator: validator, Logger: logger, GetUC: getCourse, ListUC: listCourses, ScopeListUC: listPublicCatalogScopes, OutlineUC: getCourseOutline}
+	trackHandler := &handlers.TrackHandler{Validator: validator, GetUC: getTrackUC, ListUC: listTracksUC}
+	courseLevelHandler := &handlers.CourseLevelHandler{Validator: validator, GetUC: getCourseLevelUC, ListUC: listCourseLevelsUC}
+	courseGroupHandler := &handlers.CourseGroupHandler{Validator: validator, GetUC: getCourseGroupUC, ListUC: listCourseGroupsUC}
+	moduleHandler := &handlers.ModuleHandler{Validator: validator, GetUC: getModuleUC, ListUC: listModulesUC, Access: contentAccessService}
+	sectionHandler := &handlers.SectionHandler{Validator: validator, GetUC: getSectionUC, ListUC: listSectionsUC, Access: contentAccessService}
+	positionHandler := &handlers.PositionHandler{
+		Validator: validator,
+		GetUC:     getPositionUC,
+		ListUC:    listPositionUC,
+	}
+	adminTaskHandler := &adminhandlers.TaskHandler{
+		Validator:                     validator,
+		CreateUC:                      createTaskUC,
+		UpdateUC:                      updateTaskUC,
+		UploadStarterArchiveUC:        uploadStarterArchiveUC,
+		DeleteUC:                      deleteTaskUC,
+		GetUC:                         getTaskUC,
+		GetDetailsUC:                  getTaskDetailsUC,
+		ListUC:                        listTasksUC,
+		GetInternalCourseStructureUC:  getInternalCourseStructureUC,
+		GetInternalCompletedLessonsUC: getInternalCompletedLessonsUC,
+		Access:                        contentAccessService,
+	}
+	adminLessonHandler := &adminhandlers.LessonHandler{RevisionsUC: lessonRevisionUC, Validator: validator, CreateUC: createLesson, UpdateUC: updateLesson, DeleteUC: deleteLesson, GetUC: getLesson, ListUC: listLessons, MaterialsUC: getLessonMaterials, Access: contentAccessService}
+	adminLessonRelationsHandler := &adminhandlers.LessonRelationsHandler{Validator: validator, ReplaceUC: replaceLessonRelationsUC, ListUC: listLessonRelationsUC, DeleteUC: deleteLessonRelationUC, Access: contentAccessService}
+	adminLessonExamplesHandler := &adminhandlers.LessonExamplesHandler{Validator: validator, ReplaceUC: replaceLessonExamplesUC, ListUC: listLessonExamplesUC, DeleteUC: deleteLessonExampleUC, Access: contentAccessService}
+	adminExampleRelationsHandler := &adminhandlers.ExampleRelationsHandler{Validator: validator, ReplaceUC: replaceExampleRelationsUC, ListUC: listExampleRelationsUC, DeleteUC: deleteExampleRelationUC, Access: contentAccessService}
+	adminCourseHandler := &adminhandlers.CourseHandler{Validator: validator, Logger: logger, CreateUC: createCourse, UpdateUC: updateCourse, DeleteUC: deleteCourse, GetUC: getCourse, ListUC: listCourses, ScopeListUC: listPublicCatalogScopes, OutlineUC: getCourseOutline}
+	adminTrackHandler := &adminhandlers.TrackHandler{Validator: validator, CreateUC: createTrackUC, UpdateUC: updateTrackUC, DeleteUC: deleteTrackUC, GetUC: getTrackUC, ListUC: listTracksUC}
+	adminCourseLevelHandler := &adminhandlers.CourseLevelHandler{Validator: validator, CreateUC: createCourseLevelUC, UpdateUC: updateCourseLevelUC, DeleteUC: deleteCourseLevelUC, GetUC: getCourseLevelUC, ListUC: listCourseLevelsUC}
+	adminCourseGroupHandler := &adminhandlers.CourseGroupHandler{Validator: validator, CreateUC: createCourseGroupUC, UpdateUC: updateCourseGroupUC, DeleteUC: deleteCourseGroupUC, GetUC: getCourseGroupUC, ListUC: listCourseGroupsUC}
+	adminTrackRelationsHandler := &adminhandlers.TrackRelationsHandler{Validator: validator, AddLevelUC: addTrackLevelUC, DeleteLevelUC: deleteTrackLevelUC, ReplaceUC: replaceTrackLevelsUC}
+	adminLevelRelationsHandler := &adminhandlers.LevelRelationsHandler{Validator: validator, AddGroupUC: addLevelCourseGroupUC, DeleteGroupUC: deleteLevelCourseGroupUC, ReplaceUC: replaceLevelCourseGroupsUC}
+	adminCourseGroupRelationsHandler := &adminhandlers.CourseGroupRelationsHandler{Validator: validator, AddCourseUC: addCourseGroupCourseUC, DeleteCourseUC: deleteCourseGroupCourseUC, ReplaceUC: replaceCourseGroupCoursesUC}
+	adminModuleHandler := &adminhandlers.ModuleHandler{Validator: validator, CreateUC: createModuleUC, UpdateUC: updateModuleUC, DeleteUC: deleteModuleUC, GetUC: getModuleUC, ListUC: listModulesUC, Access: contentAccessService}
+	adminModuleRelationsHandler := &adminhandlers.ModuleRelationsHandler{Validator: validator, AddSectionUC: addModuleSectionUC, ReplaceSectionsUC: replaceModuleSectionsUC, DeleteSectionUC: deleteModuleSectionUC}
+	adminSectionHandler := &adminhandlers.SectionHandler{Validator: validator, CreateUC: createSectionUC, UpdateUC: updateSectionUC, DeleteUC: deleteSectionUC, GetUC: getSectionUC, ListUC: listSectionsUC, Access: contentAccessService}
+	adminSectionRelationsHandler := &adminhandlers.SectionRelationsHandler{Validator: validator, AddLessonUC: addSectionLessonUC, ReplaceLessonsUC: replaceSectionLessonsUC, DeleteLessonUC: deleteSectionLessonUC}
+	adminTechHandler := &adminhandlers.TechHandler{
+		Validator: validator,
+		CreateUC:  createTechUC,
+		GetUC:     getTechUC,
+		GetByIDUC: getTechByIDUC,
+		UpdateUC:  updateTechUC,
+		DeleteUC:  deleteTechUC,
+		ListUC:    listTechUC,
+	}
+	adminTechVersionHandler := &adminhandlers.TechVersionHandler{
+		Validator: validator,
+		CreateUC:  createTechVersionUC,
+		UpdateUC:  updateTechVersionUC,
+		DeleteUC:  deleteTechVersionUC,
+		ListUC:    listTechVersionUC,
+	}
+	adminTagHandler := &adminhandlers.TagHandler{
+		Validator: validator,
+		CreateUC:  createTagUC,
+		GetByIDUC: getTagByIDUC,
+		UpdateUC:  updateTagUC,
+		DeleteUC:  deleteTagUC,
+		ListUC:    listTagUC,
+	}
+	adminComposeConfigHandler := &adminhandlers.ComposeConfigHandler{
+		Validator: validator,
+		CreateUC:  createComposeConfigUC,
+		GetUC:     getComposeConfigUC,
+		UpdateUC:  updateComposeConfigUC,
+		ListUC:    listComposeConfigUC,
+		DeleteUC:  deleteComposeConfigUC,
+	}
+	adminCourseI18nHandler := &adminhandlers.CourseI18nHandler{
+		Validator:      validator,
+		UpsertUC:       upsertCourseI18nUC,
+		DeleteUC:       deleteCourseI18nUC,
+		ListUC:         listI18nUC,
+		ListByCourseUC: listCourseI18nUC,
+	}
+	adminCourseRelationsHandler := &adminhandlers.CourseRelationsHandler{Validator: validator, UpdateTagsUC: updateCourseTagsUC, UpdateTechsUC: updateCourseTechsUC, AddModuleUC: addCourseModuleUC, ReplaceModulesUC: replaceCourseModulesUC, DeleteModuleUC: deleteCourseModuleUC}
+	adminPositionHandler := &adminhandlers.PositionHandler{
+		Validator: validator,
+		CreateUC:  createPositionUC,
+		GetUC:     getPositionUC,
+		UpdateUC:  updatePositionUC,
+		DeleteUC:  deletePositionUC,
+		ListUC:    listPositionUC,
+	}
+	adminPositionRelationsHandler := &adminhandlers.PositionRelationsHandler{
+		Validator:       validator,
+		UpdateTechsUC:   updatePositionTechsUC,
+		UpdateCoursesUC: updatePositionCoursesUC,
+	}
+	adminCodeStructureTypeHandler := &adminhandlers.CodeStructureTypeHandler{
+		Validator: validator,
+		CreateUC:  createCodeStructureTypeUC,
+		GetUC:     getCodeStructureTypeUC,
+		UpdateUC:  updateCodeStructureTypeUC,
+		DeleteUC:  deleteCodeStructureTypeUC,
+		ListUC:    listCodeStructureTypesUC,
+	}
+	adminKnowledgeImportBatchHandler := &adminhandlers.KnowledgeImportBatchHandler{Tx: txManager}
+	privateTaskHandler := &privatehandlers.TaskHandler{
+		GetDetailsUC:                  getTaskDetailsUC,
+		GetInternalCourseStructureUC:  getInternalCourseStructureUC,
+		GetInternalCompletedLessonsUC: getInternalCompletedLessonsUC,
+	}
+	privateLessonHandler := &privatehandlers.LessonHandler{RevisionsUC: lessonRevisionUC, GetUC: getLesson, TeacherContextUC: getTeacherLessonContext}
+	privateKnowledgeIdentityHandler := &privatehandlers.KnowledgeIdentityHandler{ResolveUC: resolveCourseLessonBindingsUC}
+	privateGeneratedCourseHandler := &privatehandlers.GeneratedCourseHandler{Ensure: ensureGeneratedCourseUC}
+
+	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
+		CourseHandler:                    courseHandler,
+		TrackHandler:                     trackHandler,
+		CourseLevelHandler:               courseLevelHandler,
+		CourseGroupHandler:               courseGroupHandler,
+		ModuleHandler:                    moduleHandler,
+		SectionHandler:                   sectionHandler,
+		LessonHandler:                    lessonHandler,
+		LessonRelationsHandler:           lessonRelationsHandler,
+		LessonExamplesHandler:            lessonExamplesHandler,
+		ExampleRelationsHandler:          exampleRelationsHandler,
+		TaskHandler:                      taskHandler,
+		PositionHandler:                  positionHandler,
+		AdminCourseHandler:               adminCourseHandler,
+		AdminTrackHandler:                adminTrackHandler,
+		AdminCourseLevelHandler:          adminCourseLevelHandler,
+		AdminCourseGroupHandler:          adminCourseGroupHandler,
+		AdminTrackRelationsHandler:       adminTrackRelationsHandler,
+		AdminLevelRelationsHandler:       adminLevelRelationsHandler,
+		AdminCourseGroupRelationsHandler: adminCourseGroupRelationsHandler,
+		AdminModuleHandler:               adminModuleHandler,
+		AdminModuleRelationsHandler:      adminModuleRelationsHandler,
+		AdminSectionHandler:              adminSectionHandler,
+		AdminSectionRelationsHandler:     adminSectionRelationsHandler,
+		AdminLessonHandler:               adminLessonHandler,
+		AdminLessonRelationsHandler:      adminLessonRelationsHandler,
+		AdminLessonExamplesHandler:       adminLessonExamplesHandler,
+		AdminExampleRelationsHandler:     adminExampleRelationsHandler,
+		AdminTaskHandler:                 adminTaskHandler,
+		AdminTechHandler:                 adminTechHandler,
+		AdminTechVersionHandler:          adminTechVersionHandler,
+		AdminTagHandler:                  adminTagHandler,
+		AdminComposeConfigHandler:        adminComposeConfigHandler,
+		AdminCourseI18nHandler:           adminCourseI18nHandler,
+		AdminCourseRelationsHandler:      adminCourseRelationsHandler,
+		AdminPositionHandler:             adminPositionHandler,
+		AdminPositionRelationsHandler:    adminPositionRelationsHandler,
+		AdminCodeStructureTypeHandler:    adminCodeStructureTypeHandler,
+		AdminKnowledgeImportBatchHandler: adminKnowledgeImportBatchHandler,
+		PrivateTaskHandler:               privateTaskHandler,
+		PrivateLessonHandler:             privateLessonHandler,
+		PrivateKnowledgeIdentityHandler:  privateKnowledgeIdentityHandler,
+		PrivateGeneratedCourseHandler:    privateGeneratedCourseHandler,
+		Validator:                        validator,
+		InternalToken:                    cfg.InternalAPIToken,
+		LearningPlannerInternalToken:     cfg.LearningPlannerInternalToken,
+		DiagnosticCatalogInternalToken:   cfg.DiagnosticCatalogInternalToken,
+	})
+	adminKnowledgeImportBatchHandler.Dispatch = router
+
+	srv := &http.Server{Addr: net.JoinHostPort(cfg.HTTPHost, cfg.HTTPPort), Handler: router}
+
+	go func() {
+		logger.Info("starting http server", zap.String("port", cfg.HTTPPort))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("http server error", zap.Error(err))
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	logger.Info("shutting down")
+	ctxShutdown, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeout)*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctxShutdown); err != nil {
+		logger.Error("shutdown error", zap.Error(err))
+	}
+}

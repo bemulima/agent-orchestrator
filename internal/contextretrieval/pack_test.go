@@ -2,6 +2,7 @@ package contextretrieval
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -225,5 +226,33 @@ func TestDigestVerificationRejectsForgedAccounting(t *testing.T) {
 				t.Fatal("forged budget accounting accepted")
 			}
 		})
+	}
+}
+
+func TestWave1GoldPolicyEnvelope(t *testing.T) {
+	plan, sources, candidate := qualityFixture()
+	plan.Budget.MaxContextTokens = 8000
+	rows := []RetrievalDiagnostic{}
+	for i := 0; i < 300; i++ {
+		rows = append(rows, RetrievalDiagnostic{Code: "EXCLUDED_BY_POLICY", Status: Complete, SourceIdentity: sources[0].Identity, RelativePath: fmt.Sprintf(".ai/architecture/endpoints/long-owner-declared-operation-%04d-token-relation.mmd", i), Message: "EXCLUDED_BY_POLICY"})
+	}
+	// Non-complete, stale and facet-specific outcomes must remain addressable.
+	rows = append(rows, RetrievalDiagnostic{Code: "SECRET_CONTENT_EXCLUDED", Status: Partial, SourceIdentity: sources[0].Identity, RelativePath: "required_test.go", FacetID: "secret", Message: "withheld"}, RetrievalDiagnostic{Code: "EXCLUDED_BY_POLICY", Status: Complete, SourceIdentity: sources[0].Identity, RelativePath: "specific.go", FacetID: "specific", Message: "EXCLUDED_BY_POLICY"})
+	quality := AnalyzeQuality(plan, sources, []EvidenceCandidate{candidate})
+	pack, err := BuildPack(plan, sources, quality, nil, rows, BudgetUsed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pack.Evidence) != 1 || pack.BudgetUsed.ContextTokens > 8000 {
+		t.Fatalf("complete policy ledger displaced required evidence: status=%s tokens=%d", pack.Status, pack.BudgetUsed.ContextTokens)
+	}
+	summary, secret, specific := false, false, false
+	for _, d := range pack.UnresolvedQuestions {
+		summary = summary || (d.Code == "EXCLUDED_BY_POLICY" && strings.Contains(d.Message, "count=300") && strings.Contains(d.Message, "sha256:"))
+		secret = secret || d.FacetID == "secret" && d.RelativePath == "required_test.go"
+		specific = specific || d.FacetID == "specific" && d.RelativePath == "specific.go"
+	}
+	if !summary || !secret || !specific || VerifyDigest(pack) != nil || pack.Status == Complete {
+		t.Fatal("counts/binding/partial safety state lost")
 	}
 }

@@ -1,0 +1,176 @@
+package lessonrevision
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"testing"
+)
+
+const lessonID = "02966929-9801-4883-b664-58fe5ca1ef54"
+const taskID = "04266929-9801-4883-b664-58fe5ca1ef54"
+
+type memoryRevision struct {
+	receipts map[string][]domain.GeneratedLessonBinding
+	values   map[string][]byte
+	policies []domain.LessonActivity
+}
+
+func (m *memoryRevision) GetRevision(_ context.Context, id string) (*domain.LessonRevision, error) {
+	var v domain.LessonRevision
+	raw, ok := m.values[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	err := json.Unmarshal(raw, &v)
+	return &v, err
+}
+func (m *memoryRevision) GetPolicy(context.Context, string) ([]domain.LessonActivity, error) {
+	return append([]domain.LessonActivity(nil), m.policies...), nil
+}
+func (m *memoryRevision) SetPolicy(_ context.Context, _ string, a []domain.LessonActivity) error {
+	m.policies = a
+	return nil
+}
+func (m *memoryRevision) StoreRevision(ctx context.Context, _ string, v domain.LessonRevision) (*domain.LessonRevision, error) {
+	if _, ok := m.values[v.LessonRevisionID]; !ok {
+		m.values[v.LessonRevisionID], _ = json.Marshal(v)
+	}
+	return m.GetRevision(ctx, v.LessonRevisionID)
+}
+
+type lessonReader struct {
+	repository.LessonRepository
+	title string
+}
+
+func (r *lessonReader) Get(context.Context, string) (*domain.Lesson, error) {
+	return &domain.Lesson{ID: lessonID, Title: r.title, Status: 1}, nil
+}
+
+type taskReader struct {
+	repository.TaskRepository
+	tasks []domain.Task
+}
+
+func (r *taskReader) ListByLesson(context.Context, string) ([]domain.Task, error) {
+	return r.tasks, nil
+}
+
+type testReader struct {
+	repository.TaskTestRepository
+	correct bool
+}
+
+func (r *testReader) ListByTask(context.Context, string) ([]domain.TaskTest, error) {
+	return []domain.TaskTest{{ID: "question", Kind: "single_choice", Variants: []domain.TaskTestVariant{{ID: "variant", IsCorrect: r.correct}}}}, nil
+}
+
+type directTx struct{}
+
+func (directTx) WithTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
+func TestImmutableRevisionAndTheoryDefault(t *testing.T) {
+	ctx := context.Background()
+	storage := &memoryRevision{values: map[string][]byte{}}
+	lessons := &lessonReader{title: "R10"}
+	tasks := &taskReader{}
+	u := Definitions{Revisions: storage, Lessons: lessons, Tasks: tasks, Tx: directTx{}}
+	r10, err := u.Resolve(ctx, lessonID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r10.Activities) != 1 || r10.Activities[0].Type != domain.ActivityTheoryAcknowledged || !r10.Activities[0].Required {
+		t.Fatalf("theory %+v", r10.Activities)
+	}
+	again, err := u.Resolve(ctx, lessonID)
+	if err != nil || again.LessonRevisionID != r10.LessonRevisionID {
+		t.Fatal("resolve not idempotent", err)
+	}
+	lessons.title = "R11"
+	r11, err := u.Resolve(ctx, lessonID)
+	if err != nil || r11.LessonRevisionID == r10.LessonRevisionID {
+		t.Fatal("revision did not change", err)
+	}
+	stored, err := u.Get(ctx, r10.LessonRevisionID)
+	if err != nil || stored.Content.Title != "R10" {
+		t.Fatal("old definition mutated", err)
+	}
+}
+func TestRevisionPinsQuizAnswerKeysAndOptionalPolicy(t *testing.T) {
+	ctx := context.Background()
+	storage := &memoryRevision{values: map[string][]byte{}}
+	tasks := &taskReader{tasks: []domain.Task{{ID: taskID, LessonID: lessonID, Type: domain.TaskTypeTest, Status: 1}}}
+	tests := &testReader{correct: true}
+	u := Definitions{Revisions: storage, Lessons: &lessonReader{}, Tasks: tasks, Tests: tests, Tx: directTx{}}
+	r10, err := u.Resolve(ctx, lessonID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r10.Activities[0].Type != domain.ActivityQuizPassed || r10.Activities[0].SourceReference.RevisionID != r10.LessonRevisionID {
+		t.Fatal("quiz not bound")
+	}
+	tests.correct = false
+	r11, err := u.Resolve(ctx, lessonID)
+	if err != nil || r11.LessonRevisionID == r10.LessonRevisionID {
+		t.Fatal("answer keys absent from hash", err)
+	}
+	stored, _ := u.Get(ctx, r10.LessonRevisionID)
+	if !stored.Content.Tasks[0].Tests[0].Variants[0].IsCorrect {
+		t.Fatal("old key mutated")
+	}
+	policy := []domain.LessonActivity{{ActivityID: lessonID, Type: domain.ActivityTheoryAcknowledged, Required: true, SourceReference: domain.ActivitySourceReference{ID: lessonID}}, {ActivityID: taskID, Type: domain.ActivityQuizPassed, Required: false, SourceReference: domain.ActivitySourceReference{ID: taskID}}}
+	if err = u.SetPolicy(ctx, lessonID, policy); err != nil {
+		t.Fatal(err)
+	}
+	optional, err := u.Resolve(ctx, lessonID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range optional.Activities {
+		if a.Type == domain.ActivityQuizPassed && a.Required {
+			t.Fatal("optional quiz became required")
+		}
+	}
+}
+func TestPolicyRejectsTaskFromOtherLesson(t *testing.T) {
+	u := Definitions{Revisions: &memoryRevision{}, Lessons: &lessonReader{}, Tasks: &taskReader{}}
+	err := u.SetPolicy(context.Background(), lessonID, []domain.LessonActivity{{ActivityID: lessonID, Type: domain.ActivityQuizPassed, Required: true, SourceReference: domain.ActivitySourceReference{ID: taskID}}})
+	if err == nil {
+		t.Fatal("foreign task accepted")
+	}
+}
+
+func (m *memoryRevision) GetGeneratedReceipt(_ context.Context, key string) ([]domain.GeneratedLessonBinding, error) {
+	value, ok := m.receipts[key]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return value, nil
+}
+func (m *memoryRevision) StoreGeneratedReceipt(_ context.Context, key string, value []domain.GeneratedLessonBinding) ([]domain.GeneratedLessonBinding, error) {
+	if m.receipts == nil {
+		m.receipts = map[string][]domain.GeneratedLessonBinding{}
+	}
+	m.receipts[key] = value
+	return value, nil
+}
+func TestGeneratedReceiptReplayPinsOriginalRevision(t *testing.T) {
+	ctx := context.Background()
+	storage := &memoryRevision{values: map[string][]byte{}}
+	lessons := &lessonReader{title: "R10"}
+	u := Definitions{Revisions: storage, Lessons: lessons, Tasks: &taskReader{}, Tx: directTx{}}
+	first, err := u.FreezeGeneratedReceipt(ctx, "key", []domain.GeneratedLessonBinding{{LessonID: lessonID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lessons.title = "R11"
+	latest, err := u.Resolve(ctx, lessonID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := u.FreezeGeneratedReceipt(ctx, "key", []domain.GeneratedLessonBinding{{LessonID: lessonID}})
+	if err != nil || replay[0].LessonRevisionID != first[0].LessonRevisionID || replay[0].LessonRevisionID == latest.LessonRevisionID {
+		t.Fatal("request replay changed chosen revision", err)
+	}
+}

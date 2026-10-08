@@ -1,0 +1,457 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	courseclient "github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	privatehttp "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root alone prepares and launches this bounded disposable provider. All
+// business write ports are actual owner use cases and PostgreSQL. The two
+// learner profiles and explicitly named mastery projection are synthetic;
+// they do not claim production evidence ingestion or mastery reduction.
+func TestT19ServePlanningStudentHTTP(t *testing.T) {
+	if os.Getenv("T19_SERVE_STUDENT") != "true" {
+		t.Skip("owned T19 Student provider gate absent")
+	}
+	ready, stop, result := os.Getenv("T19_STUDENT_READY_FILE"), os.Getenv("T19_STUDENT_STOP_FILE"), os.Getenv("T19_STUDENT_RESULT_FILE")
+	token := os.Getenv("T19_STUDENT_TOKEN")
+	cfg, err := pgxpool.ParseConfig(os.Getenv("T19_STUDENT_TEST_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Database != "remediation_t19_student_integration_proof" || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998 || token == "" || ready == "" || stop == "" || result == "" || ready == stop || ready == result || stop == result {
+		t.Fatal("SETUP: exact owned Student configuration required")
+	}
+	for _, path := range []string{ready, stop, result} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatal("SETUP: metadata and stop paths must be absent")
+		}
+	}
+	var course struct {
+		URL      string `json:"url"`
+		Database string `json:"database"`
+	}
+	raw, err := os.ReadFile(os.Getenv("T19_COURSE_READY_FILE"))
+	if err != nil || json.Unmarshal(raw, &course) != nil {
+		t.Fatal("SETUP: owned Course metadata unavailable")
+	}
+	courseURL, err := url.Parse(course.URL)
+	if err != nil || courseURL.Scheme != "http" || courseURL.Hostname() != "127.0.0.1" || courseURL.Port() == "" || courseURL.User != nil || courseURL.Path != "" || courseURL.RawQuery != "" || courseURL.Fragment != "" || course.Database != "remediation_t19_course_test" || os.Getenv("T19_COURSE_TOKEN") == "" || os.Getenv("T19_COURSE_TOKEN") == token {
+		t.Fatal("SETUP: dedicated loopback Course and distinct provider tokens required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: Student pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact Student database unavailable")
+	}
+	clock, ids := t19StudentClock{}, t19StudentIDs{}
+	profiles := &StudentOnboardingRepoPG{Pool: pool}
+	mastery := &LearningEvidenceRepoPG{Pool: pool}
+	journey := &LearningJourneyRepoPG{Pool: pool}
+	assignments := &CourseAssignmentRepoPG{Pool: pool}
+	putProfile := studentuc.PutStudentOnboarding{Profiles: profiles, Clock: clock}
+	owner, existingOwner := uuid.NewString(), uuid.NewString()
+	owned := func(id string) bool { return id == owner || id == existingOwner }
+	for _, id := range []string{owner, existingOwner} {
+		profile, err := putProfile.Handle(ctx, studentuc.PutStudentOnboardingInput{StudentID: id, DirectionCode: "backend", SelfAssessedExperience: "beginner", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "learn_programming", PreferredLanguage: "ru", WeeklyMinutes: 120, PreferredPace: "steady"})
+		if err != nil || profile.Version != 1 {
+			t.Fatal("SETUP: actual onboarding fixture failed")
+		}
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	revisions := courseclient.Client{BaseURL: course.URL, InternalToken: os.Getenv("T19_COURSE_TOKEN"), HTTPClient: httpClient}
+	assign := studentuc.AssignCourse{Assignments: assignments, Clock: clock, IDs: ids}
+	replace := studentuc.ReplaceLearningPath{Revisions: revisions, Journey: journey, Clock: clock, IDs: ids}
+	planning := studentuc.LearningPathPlanning{Revisions: revisions, Paths: journey, Clock: clock}
+	registered := chi.NewRouter()
+	registered.Mount("/internal", privatehttp.NewRouter(&privatehandlers.Handler{
+		LearnerOverview: studentuc.GetLearnerOverview{Profiles: profiles, Mastery: mastery, Journey: journey},
+		Mastery:         studentuc.GetTargetMastery{Mastery: mastery}, CourseAssignments: assign, LearningPaths: replace,
+		LearningPathPlanning: planning, LearningPathCompletion: studentuc.CompleteLearningPath{Journey: journey, Clock: clock},
+		OnboardingProfiles: studentuc.GetStudentOnboarding{Profiles: profiles}, PlanningReadiness: studentuc.GetStudentPlanningReadiness{Reader: profiles},
+	}, token, token))
+	var mu sync.Mutex
+	assignmentCut, pathCut := false, false
+	assignmentCutCount, pathCutCount, profileReads, masteryReads, planningReads := 0, 0, 0, 0, 0
+	assignmentKeys, pathKeys := []string{}, []string{}
+	state := func(readCtx context.Context, id string) (map[string]any, error) {
+		profile, err := profiles.Get(readCtx, id)
+		if err != nil {
+			return nil, err
+		}
+		projection, err := mastery.ListRecentStudentTargetMastery(readCtx, id, 20)
+		if err != nil {
+			return nil, err
+		}
+		paths, err := journey.ListLearningPaths(readCtx, id, 100)
+		if err != nil {
+			return nil, err
+		}
+		courses, err := assignments.List(readCtx, id)
+		if err != nil {
+			return nil, err
+		}
+		value := map[string]any{"student_id": id, "database": database, "profile": profile, "mastery": projection, "paths": paths, "assignments": courses,
+			"classification": "actual registered Student learner overview/mastery/assignment/path HTTP and owner usecases/PG; synthetic profiles and explicitly named mastery projection; no LLM, JWT or live E2E"}
+		counts := map[string]int64{}
+		for _, table := range []string{"student_course_assignment", "student_learning_path", "student_learning_path_item", "student_learning_path_revision", "student_learning_path_request", "student_learning_path_command", "student_target_mastery", "student_learning_action", "student_learning_evidence", "student_lesson_activity_fact"} {
+			query := `SELECT count(*) FROM ` + table + ` WHERE student_id=$1`
+			if table == "student_learning_path_item" || table == "student_learning_path_revision" {
+				query = `SELECT count(*) FROM ` + table + ` WHERE student_learning_path_id IN (SELECT id FROM student_learning_path WHERE student_id=$1)`
+			}
+			var n int64
+			if err := pool.QueryRow(readCtx, query, id).Scan(&n); err != nil {
+				return nil, err
+			}
+			counts[table] = n
+		}
+		value["counts"] = counts
+		for key, query := range map[string]string{
+			"assignment_requests": `SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.idempotency_key),'[]'::jsonb) FROM student_course_assignment_request r JOIN student_course_assignment a ON a.id=r.assignment_id WHERE a.student_id=$1`,
+			"path_commands":       `SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.idempotency_key),'[]'::jsonb) FROM student_learning_path_command r WHERE r.student_id=$1`,
+			"path_revisions":      `SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.created_at,r.version),'[]'::jsonb) FROM student_learning_path_revision r JOIN student_learning_path p ON p.id=r.student_learning_path_id WHERE p.student_id=$1`,
+		} {
+			var raw json.RawMessage
+			if err := pool.QueryRow(readCtx, query, id).Scan(&raw); err != nil {
+				return nil, err
+			}
+			value[key] = raw
+		}
+		mu.Lock()
+		value["assignment_cut_enabled"], value["path_cut_enabled"] = assignmentCut, pathCut
+		value["assignment_cut_count"], value["path_cut_count"] = assignmentCutCount, pathCutCount
+		value["profile_reads"], value["mastery_reads"], value["planning_state_reads"] = profileReads, masteryReads, planningReads
+		value["assignment_http_keys"], value["path_http_keys"] = append([]string{}, assignmentKeys...), append([]string{}, pathKeys...)
+		mu.Unlock()
+		return value, nil
+	}
+	protected := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+	decode := func(w http.ResponseWriter, r *http.Request, value any) bool {
+		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024))
+		d.DisallowUnknownFields()
+		if d.Decode(value) != nil || d.Decode(&struct{}{}) != io.EOF {
+			w.WriteHeader(400)
+			return false
+		}
+		return true
+	}
+	encode := func(w http.ResponseWriter, value any, err error) {
+		if err != nil {
+			http.Error(w, "owned control failed", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__t19/state", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		id := r.URL.Query().Get("student_id")
+		if id == "" {
+			id = owner
+		}
+		if !owned(id) {
+			w.WriteHeader(404)
+			return
+		}
+		readCtx, finish := context.WithTimeout(r.Context(), 5*time.Second)
+		defer finish()
+		value, err := state(readCtx, id)
+		encode(w, value, err)
+	})
+	for _, kind := range []string{"assignment", "path"} {
+		kind := kind
+		mux.HandleFunc("POST /__t19/"+kind+"-cut", func(w http.ResponseWriter, r *http.Request) {
+			if !protected(w, r) {
+				return
+			}
+			var input struct {
+				Enabled *bool `json:"enabled"`
+			}
+			if !decode(w, r, &input) {
+				return
+			}
+			if input.Enabled == nil {
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			if kind == "assignment" {
+				assignmentCut = *input.Enabled
+			} else {
+				pathCut = *input.Enabled
+			}
+			mu.Unlock()
+			w.WriteHeader(204)
+		})
+	}
+	mux.HandleFunc("POST /__t19/profile", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var input struct {
+			StudentID     string   `json:"student_id"`
+			KnownStacks   []string `json:"known_stacks"`
+			DesiredStacks []string `json:"desired_stacks"`
+			GoalCode      string   `json:"goal_code"`
+			DirectionCode string   `json:"direction_code"`
+		}
+		if !decode(w, r, &input) {
+			return
+		}
+		if !owned(input.StudentID) {
+			w.WriteHeader(404)
+			return
+		}
+		current, err := profiles.Get(r.Context(), input.StudentID)
+		if err != nil {
+			encode(w, nil, err)
+			return
+		}
+		if input.GoalCode == "" {
+			input.GoalCode = current.GoalCode
+		}
+		if input.DirectionCode == "" {
+			input.DirectionCode = current.DirectionCode
+		}
+		profile, err := putProfile.Handle(r.Context(), studentuc.PutStudentOnboardingInput{StudentID: input.StudentID, ExpectedVersion: current.Version, DirectionCode: input.DirectionCode, SelfAssessedExperience: current.SelfAssessedExperience, KnownStacks: input.KnownStacks, DesiredStacks: input.DesiredStacks, GoalCode: input.GoalCode, GoalText: current.GoalText, PreferredLanguage: current.PreferredLanguage, WeeklyMinutes: current.WeeklyMinutes, PreferredPace: current.PreferredPace})
+		encode(w, profile, err)
+	})
+	mux.HandleFunc("POST /__t19/mastery", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var input struct {
+			StudentID     string                     `json:"student_id"`
+			Fixture       string                     `json:"fixture"`
+			PolicyVersion string                     `json:"policy_version"`
+			Targets       []domain.LearningTargetRef `json:"targets"`
+		}
+		if !decode(w, r, &input) {
+			return
+		}
+		if !owned(input.StudentID) {
+			w.WriteHeader(404)
+			return
+		}
+		targets, err := domain.NormalizeLearningTargetRefs(input.Targets)
+		if err != nil || len(targets) == 0 || len(targets) > 20 || input.Fixture != "t19-owned-mastered-projection-v1" || input.PolicyVersion != domain.MasteryPolicyVersion {
+			w.WriteHeader(400)
+			return
+		}
+		// An explicit test projection fixture, never an evidence/reducer substitute.
+		tx, err := pool.Begin(r.Context())
+		if err != nil {
+			encode(w, nil, err)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		for _, target := range targets {
+			_, err = tx.Exec(r.Context(), `INSERT INTO student_target_mastery (student_id,target_type,target_key,target_version,state,mastery_score,confidence,independent_success_count,assisted_success_count,failure_count,evidence_count,last_seen_at,last_practiced_at,policy_version) VALUES ($1,$2,$3,$4,'MASTERED',1,0.9,3,0,0,3,$5,$5,$6) ON CONFLICT (student_id,target_type,target_key,target_version) DO UPDATE SET state=EXCLUDED.state,mastery_score=EXCLUDED.mastery_score,confidence=EXCLUDED.confidence,independent_success_count=EXCLUDED.independent_success_count,assisted_success_count=0,failure_count=0,evidence_count=3,last_seen_at=EXCLUDED.last_seen_at,last_practiced_at=EXCLUDED.last_practiced_at,last_failed_at=NULL,policy_version=EXCLUDED.policy_version,updated_at=EXCLUDED.last_seen_at`, input.StudentID, target.Type, target.Key, target.Version, clock.Now(), domain.MasteryPolicyVersion)
+			if err != nil {
+				encode(w, nil, err)
+				return
+			}
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			encode(w, nil, err)
+			return
+		}
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("POST /__t19/existing-path", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var input struct {
+			StudentID         string                    `json:"student_id"`
+			CourseID          string                    `json:"course_id"`
+			CourseFingerprint string                    `json:"course_fingerprint"`
+			Items             []domain.LearningPathItem `json:"items"`
+		}
+		if !decode(w, r, &input) {
+			return
+		}
+		if input.StudentID != existingOwner {
+			w.WriteHeader(404)
+			return
+		}
+		current, err := profiles.Get(r.Context(), input.StudentID)
+		if err != nil {
+			encode(w, nil, err)
+			return
+		}
+		requestID := uuid.NewString()
+		_, _, err = assign.Handle(r.Context(), studentuc.AssignCourseInput{StudentID: input.StudentID, CourseID: input.CourseID, PlanningRequestID: requestID, IdempotencyKey: requestID, AssignedBy: domain.CourseAssignmentSourceLearningPlanner})
+		if err != nil {
+			encode(w, nil, err)
+			return
+		}
+		path, err := replace.Handle(r.Context(), studentuc.ReplaceLearningPathInput{StudentID: input.StudentID, PlanningRequestID: requestID, IdempotencyKey: requestID, CourseID: input.CourseID, GoalCode: current.GoalCode, CurriculumRevision: input.CourseFingerprint, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "t19_fixture", ReasonSummary: "T19 actual owner path fixture", Items: input.Items})
+		encode(w, path, err)
+	})
+	mux.HandleFunc("POST /__t19/advance-path", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var input struct {
+			StudentID string `json:"student_id"`
+			PathID    string `json:"path_id"`
+		}
+		if !decode(w, r, &input) {
+			return
+		}
+		if input.StudentID != existingOwner {
+			w.WriteHeader(404)
+			return
+		}
+		current, err := planning.Get(r.Context(), input.StudentID, input.PathID)
+		if err != nil {
+			encode(w, nil, err)
+			return
+		}
+		requestID := uuid.NewString()
+		advanced, err := planning.Replan(r.Context(), studentuc.LearningPathReplanInput{Schema: domain.LearningPathReplanRequestSchema, StudentID: input.StudentID, LearningPathID: input.PathID, PlanningRequestID: requestID, IdempotencyKey: requestID, CourseID: current.CourseID, GoalCode: current.GoalCode, CourseFingerprint: current.CourseFingerprint, PlannerPolicyVersion: current.PlannerPolicyVersion, ReasonCode: current.ReasonCode, ReasonSummary: "T19 actual owner path advance " + requestID, ExpectedPathVersion: current.PathVersion, DesiredItems: current.Items})
+		if err == nil && advanced.State.PathVersion != current.PathVersion+1 {
+			http.Error(w, "owned advance did not increment version", 500)
+			return
+		}
+		encode(w, advanced, err)
+	})
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		// The fault never substitutes a business port or response. It prevents
+		// the registered handler from running, strictly before its owner write.
+		if len(parts) >= 4 && parts[0] == "internal" && parts[1] == "students" && owned(parts[2]) && r.Header.Get("X-Internal-Token") == token {
+			mu.Lock()
+			cut := false
+			switch {
+			case r.Method == "GET" && len(parts) == 4 && parts[3] == "learner-overview":
+				profileReads++
+			case r.Method == "POST" && len(parts) == 5 && parts[3] == "mastery" && parts[4] == "query":
+				masteryReads++
+			case r.Method == "GET" && len(parts) == 6 && parts[3] == "learning-paths" && parts[5] == "planning-state":
+				planningReads++
+			case r.Method == "PUT" && len(parts) == 6 && parts[3] == "courses" && parts[5] == "assignment":
+				if key := r.Header.Get("Idempotency-Key"); t19StudentUUID(key) {
+					assignmentKeys = append(assignmentKeys, key)
+				}
+				if assignmentCut {
+					assignmentCutCount++
+					cut = true
+				}
+			case r.Method == "PUT" && len(parts) == 5 && parts[3] == "learning-paths":
+				if key := r.Header.Get("Idempotency-Key"); t19StudentUUID(key) {
+					pathKeys = append(pathKeys, key)
+				}
+				if pathCut {
+					pathCutCount++
+					cut = true
+				}
+			}
+			mu.Unlock()
+			if cut {
+				http.Error(w, "T19 owned pre-handler outage", 503)
+				return
+			}
+		}
+		registered.ServeHTTP(w, r)
+	}))
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.ReadHeaderTimeout, server.Config.ReadTimeout, server.Config.WriteTimeout, server.Config.IdleTimeout = 5*time.Second, 40*time.Second, 40*time.Second, 5*time.Second
+	server.Start()
+	defer server.Close()
+	defer server.CloseClientConnections()
+	metadata, err := state(ctx, owner)
+	if err != nil {
+		t.Fatal("SETUP: initial Student state unavailable")
+	}
+	metadata["url"], metadata["existing_student_id"] = server.URL, existingOwner
+	metadata["goal_code"], metadata["direction_code"], metadata["desired_stacks"], metadata["preferred_language"] = "learn_programming", "backend", []string{"go"}, "ru"
+	t19StudentWriteExclusive(t, ready, metadata)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("owned Student 20-minute deadline exceeded")
+		case <-ticker.C:
+			if _, err := os.Stat(stop); err == nil {
+				value, err := state(ctx, owner)
+				if err != nil {
+					t.Fatal("owned final Student state unavailable")
+				}
+				existing, err := state(ctx, existingOwner)
+				if err != nil {
+					t.Fatal("owned final existing Student state unavailable")
+				}
+				value["url"], value["existing_student_id"], value["existing_student_state"] = server.URL, existingOwner, existing
+				t19StudentWriteExclusive(t, result, value)
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal("owned Student stop read failed")
+			}
+		}
+	}
+}
+
+func t19StudentWriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe Student metadata encoding failed")
+	}
+	file, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal("exclusive Student metadata creation failed")
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil || os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic Student metadata publication failed")
+	}
+}
+
+type t19StudentClock struct{}
+
+func (t19StudentClock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+
+type t19StudentIDs struct{}
+
+func (t19StudentIDs) NewID() string { return uuid.NewString() }
+
+func t19StudentUUID(value string) bool {
+	_, err := uuid.Parse(value)
+	return err == nil && value != uuid.Nil.String()
+}

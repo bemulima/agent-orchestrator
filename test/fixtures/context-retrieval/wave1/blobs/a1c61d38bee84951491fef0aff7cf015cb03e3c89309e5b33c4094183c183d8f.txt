@@ -1,0 +1,183 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.NextActionSnapshotReader = (*LearningJourneyRepoPG)(nil)
+
+// ReadNextActionSnapshot reads Student facts in one read-only repeatable-read
+// transaction. Runtime state is obtained separately through its bounded owner
+// projection; this read never changes assignments, evidence or activity state.
+func (repo *LearningJourneyRepoPG) ReadNextActionSnapshot(ctx context.Context, studentID string) (domain.NextActionSnapshot, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.NextActionSnapshot{}, errors.New("learning journey repository pool is required")
+	}
+	if !domain.IsCanonicalPracticeLearningActionUUID(studentID) {
+		return domain.NextActionSnapshot{}, domain.ErrValidation
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return domain.NextActionSnapshot{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	source, err := readNextActionSnapshot(ctx, tx, studentID)
+	if err != nil {
+		return domain.NextActionSnapshot{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.NextActionSnapshot{}, err
+	}
+	return source, nil
+}
+
+func readNextActionSnapshot(ctx context.Context, q learningPathQuerier, studentID string) (domain.NextActionSnapshot, error) {
+	source := domain.NextActionSnapshot{StudentID: studentID}
+	contextValue, err := getLearningContext(ctx, q, studentID, false)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return domain.NextActionSnapshot{}, err
+	}
+	if err == nil {
+		source.Context = contextValue
+	}
+	if contextValue.SelectedLearningPathID != "" {
+		// Unlike the S10 workspace, NBA needs the exact selected route even when
+		// paused or completed. Ownership is enforced by getLearningPathByID.
+		path, err := getLearningPathByID(ctx, q, studentID, contextValue.SelectedLearningPathID, false)
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.NextActionSnapshot{}, domain.ErrStateChanged
+		}
+		if err != nil {
+			return domain.NextActionSnapshot{}, err
+		}
+		path.IsSelected = true
+		source.SelectedPath = &path
+		answers, err := q.Query(ctx, `SELECT DISTINCT ON (a.learning_path_item_id,a.requirement_id)
+a.learning_path_item_id::text,a.requirement_id::text,a.id::text,a.status
+FROM student_task_answer a
+JOIN student_learning_path_item i ON i.id=a.learning_path_item_id
+JOIN student_learning_path p ON p.id=i.student_learning_path_id AND p.student_id=a.student_id
+WHERE a.student_id=$1 AND p.id=$2 AND a.requirement_id IS NOT NULL
+ORDER BY a.learning_path_item_id,a.requirement_id,a.created_at DESC,a.attempt DESC,a.id DESC`, studentID, path.ID)
+		if err != nil {
+			return domain.NextActionSnapshot{}, err
+		}
+		for answers.Next() {
+			var answer domain.NextActionAnswerState
+			if err := answers.Scan(&answer.LearningPathItemID, &answer.RequirementID, &answer.AnswerID, &answer.Status); err != nil {
+				answers.Close()
+				return domain.NextActionSnapshot{}, err
+			}
+			source.Answers = append(source.Answers, answer)
+		}
+		err = answers.Err()
+		answers.Close()
+		if err != nil {
+			return domain.NextActionSnapshot{}, err
+		}
+	} else {
+		var profile, draft, planning, diagnostic, selectable, completed bool
+		// Diagnostic completion is append-only, so absence of its result is
+		// the authoritative unfinished-state fact. Expired admission fences do
+		// not create an indefinite planning wait.
+		err := q.QueryRow(ctx, `SELECT
+EXISTS(SELECT 1 FROM student_onboarding WHERE student_id=$1),
+EXISTS(SELECT 1 FROM student_onboarding_draft WHERE student_id=$1 AND status='DRAFT' AND version>0),
+EXISTS(SELECT 1 FROM student_onboarding_path_admission WHERE student_id=$1 AND status='RESERVED' AND expires_at>now()),
+EXISTS(SELECT 1 FROM (
+  SELECT a.id FROM student_diagnostic_assessment_attempt a
+  JOIN student_onboarding o ON o.student_id=a.student_id
+  WHERE a.student_id=$1 AND a.onboarding_version=o.version
+  ORDER BY a.plan_revision DESC, a.reserved_at DESC, a.id DESC LIMIT 1
+) current_diagnostic WHERE NOT EXISTS(
+  SELECT 1 FROM student_diagnostic_assessment_result r WHERE r.attempt_id=current_diagnostic.id)),
+EXISTS(SELECT 1 FROM student_learning_path WHERE student_id=$1 AND status IN ('ACTIVE','PAUSED')),
+EXISTS(SELECT 1 FROM student_learning_path WHERE student_id=$1 AND status='COMPLETED')`, studentID).Scan(&profile, &draft, &planning, &diagnostic, &selectable, &completed)
+		if err != nil {
+			return domain.NextActionSnapshot{}, err
+		}
+		switch {
+		case selectable:
+			source.LifecycleReason = "path_selection_required"
+		case planning:
+			source.LifecycleReason = "planning_in_progress"
+		case diagnostic:
+			source.LifecycleReason = "diagnostic_required"
+		case completed:
+			source.LifecycleReason = "path_completed"
+		case draft || !profile:
+			source.LifecycleReason = "onboarding_required"
+		}
+	}
+
+	// Read every owned active binding, including other paths and standalone
+	// activities. Required/optional precedence belongs to the domain resolver.
+	rows, err := q.Query(ctx, `SELECT practice_task_instance_id::text
+FROM student_learning_action
+WHERE student_id=$1 AND source_kind='practice_v2' AND lifecycle_status IN ('RESERVED','OPEN')
+ORDER BY created_at, id`, studentID)
+	if err != nil {
+		return domain.NextActionSnapshot{}, err
+	}
+	instances := []string{}
+	for rows.Next() {
+		var instanceID string
+		if err := rows.Scan(&instanceID); err != nil {
+			rows.Close()
+			return domain.NextActionSnapshot{}, err
+		}
+		instances = append(instances, instanceID)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return domain.NextActionSnapshot{}, err
+	}
+	for _, instanceID := range instances {
+		binding, err := getPracticeLearningAction(ctx, q, "student_instance", studentID+"\x00"+instanceID, false)
+		if err != nil {
+			return domain.NextActionSnapshot{}, err
+		}
+		source.Bindings = append(source.Bindings, binding)
+		if binding.LearningPathItemID != "" {
+			var raw []byte
+			err := q.QueryRow(ctx, `SELECT i.frozen_requirements
+FROM student_learning_path_item i JOIN student_learning_path p ON p.id=i.student_learning_path_id
+WHERE p.student_id=$1 AND p.id=$2 AND i.id=$3`, studentID, binding.LearningPathID, binding.LearningPathItemID).Scan(&raw)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NextActionSnapshot{}, domain.ErrStateChanged
+			}
+			if err != nil {
+				return domain.NextActionSnapshot{}, err
+			}
+			var requirements []domain.LessonRequirement
+			if err := json.Unmarshal(raw, &requirements); err != nil {
+				return domain.NextActionSnapshot{}, err
+			}
+			found := false
+			for _, requirement := range requirements {
+				if requirement.ID != binding.RequirementID {
+					continue
+				}
+				if requirement.Type != "practice_completed" || requirement.SourceReference.ID != binding.TaskRevisionID || requirement.SourceReference.RevisionID != binding.TaskRevisionID {
+					return domain.NextActionSnapshot{}, domain.ErrStateChanged
+				}
+				if source.BindingRequirements == nil {
+					source.BindingRequirements = map[string]domain.LessonRequirement{}
+				}
+				source.BindingRequirements[binding.LearningPathItemID+":"+binding.RequirementID] = requirement
+				found = true
+			}
+			if !found {
+				return domain.NextActionSnapshot{}, domain.ErrStateChanged
+			}
+		}
+	}
+	return source, nil
+}

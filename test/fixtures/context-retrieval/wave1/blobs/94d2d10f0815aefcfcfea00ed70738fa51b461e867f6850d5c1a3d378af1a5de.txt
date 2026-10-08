@@ -1,0 +1,714 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/http/practiceruntime"
+	studentnats "github.com/example/ms-student-service/internal/infrastructure/messaging/nats"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	publicapi "github.com/example/ms-student-service/internal/transport/http/api/v1"
+	publichandlers "github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	privateapi "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	studentconsumer "github.com/example/ms-student-service/internal/transport/message/nats"
+	"github.com/example/ms-student-service/internal/usecase/hybridapplication"
+	outboxuc "github.com/example/ms-student-service/internal/usecase/outbox"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+type t205Fixture struct {
+	StudentID          string                     `json:"student_id"`
+	PathID             string                     `json:"path_id"`
+	Targets            []domain.LearningTargetRef `json:"targets"`
+	Scope              domain.HybridScopeIdentity `json:"scope"`
+	ActiveItemID       string                     `json:"active_item_id"`
+	PendingItemID      string                     `json:"pending_item_id"`
+	TemplateItemID     string                     `json:"template_item_id"`
+	CompletedItemID    string                     `json:"completed_item_id,omitempty"`
+	TaskInstanceID     string                     `json:"task_instance_id"`
+	TaskRevisionID     string                     `json:"task_revision_id"`
+	TaskRevisionDigest string                     `json:"task_revision_digest"`
+	LearningActionID   string                     `json:"learning_action_id"`
+	RequirementID      string                     `json:"requirement_id"`
+	PathRevision       int64                      `json:"path_revision"`
+}
+type t205OwnerClock struct{}
+
+func (t205OwnerClock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+func (t205OwnerClock) NewID() string  { return uuid.NewString() }
+
+// Root alone starts this finite provider. Named initial authored metadata enters
+// real owner repositories; completed history enters the real theory-fact UC.
+// Official evidence, snapshot, intent, application and NBA use registered routes.
+// The Runtime execution projection is explicitly an upstream HTTP fixture.
+func TestT205HybridOwnerProvider(t *testing.T) {
+	ready, stop, token := os.Getenv("T205_OWNER_READY_FILE"), os.Getenv("T205_OWNER_STOP_FILE"), os.Getenv("T205_OWNER_TOKEN")
+	if ready == "" {
+		t.Skip("root-only T205 owner provider gate absent")
+	}
+	if stop == "" || token == "" || ready == stop || os.Getenv("T205_NATS_URL") != "nats://127.0.0.1:59000" {
+		t.Fatal("SETUP: exact isolated provider controls required")
+	}
+	for _, p := range []string{ready, stop} {
+		if _, e := os.Lstat(p); !os.IsNotExist(e) {
+			t.Fatal("SETUP: fresh control paths required")
+		}
+	}
+	cfg, e := pgxpool.ParseConfig(os.Getenv("STUDENT_T20_DATABASE_URL"))
+	if e != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_student_integration_proof" || cfg.ConnConfig.User != "postgres" || cfg.ConnConfig.TLSConfig != nil {
+		t.Fatal("SETUP: exact root-owned isolated PostgreSQL required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pool.Close()
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	clock := t205OwnerClock{}
+	fixtures := map[string]t205Fixture{}
+	owned := map[string]t205Fixture{}
+	for _, name := range []string{"no_change", "positive", "stale", "active_practice", "intent", "outage"} {
+		f := t205InitialOwnerFixture(t, ctx, pool, name)
+		fixtures[name] = f
+		owned[f.StudentID] = f
+	}
+	// Ordinary Course activation is fixture setup, before any scenario baseline.
+	course := t205OpenCourseFixture(t, ctx, pool, fixtures["no_change"])
+	initialA := fixtures["no_change"]
+	activeA, e := journey.GetLearningPathByID(ctx, initialA.StudentID, initialA.PathID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	initialA.PathRevision = activeA.Version
+	fixtures["no_change"] = initialA
+	owned[initialA.StudentID] = initialA
+	practiceToken, teacherToken, controlToken := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	runtimeToken := uuid.NewString()
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.Header.Get("X-Internal-Token") != runtimeToken {
+			w.WriteHeader(401)
+			return
+		}
+		sid := r.URL.Query().Get("student_id")
+		f, ok := owned[sid]
+		if !ok || f.LearningActionID == "" || r.URL.Path != "/internal/v2/task-instances/"+f.TaskInstanceID+"/execution-projection" {
+			w.WriteHeader(404)
+			return
+		}
+		projection := domain.PracticeExecutionProjection{Schema: "practice-execution-projection.v1", StudentID: sid, TaskInstanceID: f.TaskInstanceID, LearningActionID: f.LearningActionID, TaskRevisionID: f.TaskRevisionID, TaskRevisionDigest: f.TaskRevisionDigest, LearningPathID: f.PathID, LearningPathItemID: f.ActiveItemID, RequirementID: f.RequirementID, Status: "READY", SuggestedAction: "RESUME_PRACTICE", AvailableActions: []string{"RESUME_PRACTICE"}, ReasonCode: "named_t205_upstream_open_execution_fixture", Version: "named-t205-runtime-projection-v1"}
+		t205JSON(w, projection)
+	}))
+	defer runtimeServer.Close()
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	service := hybridapplication.Service{Applications: journey, Clock: clock}
+	getter := studentuc.GetPlanningSnapshot{Reader: journey}
+	nba := studentuc.NextActionResolver{Reader: journey, Runtime: practiceruntime.Client{BaseURL: runtimeServer.URL, InternalToken: runtimeToken}}
+	h := &privatehandlers.Handler{PlanningSnapshot: getter, HybridApplication: service, NextAction: nba, PracticeEvidence: studentuc.ApplyPracticeEvidence{Evidence: &postgres.LearningEvidenceRepoPG{Pool: pool}}, PracticeLearningActions: studentuc.PracticeLearningActions{Actions: actions, Clock: clock, IDs: clock}, PracticeLearningEvidence: studentuc.ApplyPracticeLearningActionEvidence{Actions: actions, Clock: clock}}
+	router := chi.NewRouter()
+	router.Mount("/internal", privateapi.NewRouter(h, practiceToken, token, teacherToken, practiceToken))
+	public := chi.NewRouter()
+	public.Use(middleware.AuthMiddleware{}.Middleware)
+	publicapi.RegisterHybridIntentRoutes(public, &publichandlers.StudentHybridIntentHandler{Intents: service})
+	public.Get("/student/next-action", (&publichandlers.StudentLearningJourneyHandler{NextAction: nba}).GetNextAction)
+	router.Mount("/api/v1", public)
+	nc, e := natsgo.Connect(os.Getenv("T205_NATS_URL"), natsgo.Timeout(3*time.Second))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer nc.Close()
+	teacherIngress := studentuc.ApplyTeacherAssistance{Evidence: &postgres.LearningEvidenceRepoPG{Pool: pool}}
+	subscriber := studentconsumer.TeacherAssistanceSubscriber{Conn: nc, Handler: func(c context.Context, a domain.TeacherAssistance) (bool, error) {
+		if a.StudentID != fixtures["no_change"].StudentID {
+			return false, domain.ErrEvidenceContract
+		}
+		return teacherIngress.Handle(c, a)
+	}, AckWait: time.Second, RetryDelay: 100 * time.Millisecond}
+	if e := subscriber.Subscribe(ctx); e != nil {
+		t.Fatalf("SETUP: real Teacher subscriber needs root TEACHER_EVENTS stream: %v", e)
+	}
+	relay := outboxuc.Relay{Outbox: postgres.OutboxRepoPG{Pool: pool}, Publisher: &studentnats.OutboxPublisher{Conn: nc}, Clock: clock, WorkerID: "t205-owned-" + uuid.NewString(), BatchSize: 32, LockTTL: time.Minute, PublishTimeout: time.Second, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Second}
+	var mu sync.Mutex
+	faults := map[string]map[string]bool{}
+	var relayMu sync.Mutex
+	control := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Internal-Token") != controlToken {
+			w.WriteHeader(401)
+			return false
+		}
+		return true
+	}
+	var failedMu sync.Mutex
+	var failedResult map[string]any
+	router.Post("/__t205/failed-course-fact", func(w http.ResponseWriter, r *http.Request) {
+		if !control(w, r) {
+			return
+		}
+		var in struct {
+			StudentID string `json:"student_id"`
+		}
+		if !t205Decode(w, r, &in) {
+			return
+		}
+		f := fixtures["no_change"]
+		if in.StudentID != f.StudentID {
+			w.WriteHeader(404)
+			return
+		}
+		failedMu.Lock()
+		defer failedMu.Unlock()
+		if failedResult != nil {
+			t205JSON(w, failedResult)
+			return
+		}
+		answer, action := course.Answer, course.Action
+		closedAt := clock.Now()
+		answer.Status = domain.StudentTaskAnswerStatusFailed
+		answer.EndedAt = &closedAt
+		answer.UpdatedAt = closedAt
+		// Closure envelope is built from the open-cycle identity; official outcome
+		// is persisted separately by CloseAnswer under its exact status guard.
+		closure, e := domain.NewLearningActionClosedEvent(uuid.NewString(), action, closedAt)
+		if e != nil {
+			http.Error(w, e.Error(), 500)
+			return
+		}
+		action.Outcome = domain.LearningActionFailed
+		action.OutcomePolicyVersion = domain.MasteryPolicyVersion
+		if e = actions.CloseAnswer(r.Context(), answer, action, closure); e != nil {
+			http.Error(w, e.Error(), 500)
+			return
+		}
+		data, _ := json.Marshal(map[string]any{"learning_action_id": action.ID, "context_type": action.ContextType, "context_id": action.ContextID, "support_context": domain.TeacherSupportIndependent, "hints_used": 0, "max_hint_level": nil, "intervention_used": false, "observations": []domain.TeacherAssistanceObservation{{Target: action.LearningTargets[0], Kind: domain.TeacherObservationIndependentContext}}, "policy_version": "teacher-assistance-v1"})
+		upstream := domain.EventEnvelope{EventID: uuid.NewString(), EventType: domain.SubjectTeacherAssistanceObserved, CorrelationID: action.ID, CausationID: closure.EventID, StudentID: f.StudentID, OccurredAt: closedAt, SchemaVersion: domain.TeacherAssistanceObservedSchemaVersion, Data: data}
+		raw, _ := json.Marshal(upstream)
+		if _, e := studentconsumer.DecodeTeacherAssistanceEvent(raw); e != nil {
+			http.Error(w, e.Error(), 500)
+			return
+		}
+		js, e := nc.JetStream()
+		if e != nil {
+			http.Error(w, e.Error(), 500)
+			return
+		}
+		msg := natsgo.NewMsg(domain.SubjectTeacherAssistanceObserved)
+		msg.Data = raw
+		msg.Header.Set(natsgo.MsgIdHdr, upstream.EventID)
+		if _, e = js.PublishMsg(msg, natsgo.Context(r.Context())); e != nil {
+			http.Error(w, e.Error(), 503)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var evidence, events int
+			e = pool.QueryRow(waitCtx, `SELECT (SELECT count(*) FROM student_learning_action_target_evidence WHERE learning_action_id=$1 AND outcome='failed' AND evidence_kind='failed_application'),(SELECT count(*) FROM student_outbox WHERE student_id=$2 AND subject=$3 AND causation_id=$1::text)`, action.ID, f.StudentID, domain.SubjectPlanningStateChanged).Scan(&evidence, &events)
+			if e == nil && evidence == 1 && events == 1 {
+				failedResult = map[string]any{"learning_action_id": action.ID, "closure_event_id": closure.EventID, "teacher_event_id": upstream.EventID, "classification": "named upstream Course failed execution and Teacher context; actual lifecycle and actual registered NATS subscriber/reducer"}
+				t205JSON(w, failedResult)
+				return
+			}
+			select {
+			case <-waitCtx.Done():
+				http.Error(w, "actual Teacher subscriber commit not observed", 504)
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+	router.Post("/__t205/control", func(w http.ResponseWriter, r *http.Request) {
+		if !control(w, r) {
+			return
+		}
+		var in struct {
+			StudentID string `json:"student_id"`
+			Fault     string `json:"fault"`
+			Enabled   bool   `json:"enabled"`
+		}
+		if !t205Decode(w, r, &in) {
+			return
+		}
+		if _, ok := owned[in.StudentID]; !ok {
+			w.WriteHeader(404)
+			return
+		}
+		switch in.Fault {
+		case "APPLY_UNAVAILABLE", "SNAPSHOT_UNAVAILABLE", "LOSE_NEXT_APPLY_RESPONSE":
+		default:
+			w.WriteHeader(400)
+			return
+		}
+		mu.Lock()
+		if faults[in.StudentID] == nil {
+			faults[in.StudentID] = map[string]bool{}
+		}
+		faults[in.StudentID][in.Fault] = in.Enabled
+		mu.Unlock()
+		t205JSON(w, map[string]any{"accepted": true})
+	})
+	router.Post("/__t205/relay", func(w http.ResponseWriter, r *http.Request) {
+		if !control(w, r) {
+			return
+		}
+		var in struct {
+			StudentID string `json:"student_id"`
+		}
+		if !t205Decode(w, r, &in) {
+			return
+		}
+		if _, ok := owned[in.StudentID]; !ok {
+			w.WriteHeader(404)
+			return
+		}
+		relayMu.Lock()
+		defer relayMu.Unlock()
+		ids := []string{}
+		for sid := range owned {
+			ids = append(ids, sid)
+		}
+		// Park only delivery metadata for these six owned fixtures. Unrelated due
+		// rows are refused, so the real global Claim cannot publish foreign facts.
+		if _, e := pool.Exec(r.Context(), `UPDATE student_outbox SET next_attempt_at=CASE WHEN student_id=$1 AND subject=$2 THEN clock_timestamp() ELSE clock_timestamp()+interval '1 day' END WHERE student_id=ANY($3::uuid[]) AND published_at IS NULL`, in.StudentID, domain.SubjectPlanningStateChanged, ids); e != nil {
+			http.Error(w, e.Error(), 500)
+			return
+		}
+		var foreign int
+		if e := pool.QueryRow(r.Context(), `SELECT count(*) FROM student_outbox WHERE published_at IS NULL AND next_attempt_at<=clock_timestamp() AND (locked_until IS NULL OR locked_until<=clock_timestamp()) AND NOT(student_id=ANY($1::uuid[]))`, ids).Scan(&foreign); e != nil || foreign != 0 {
+			http.Error(w, "unowned due delivery must be parked by root", 409)
+			return
+		}
+		count, e := relay.ProcessBatch(r.Context())
+		if e != nil {
+			http.Error(w, e.Error(), 503)
+			return
+		}
+		t205JSON(w, map[string]any{"claimed": count})
+	})
+	router.Get("/__t205/events", func(w http.ResponseWriter, r *http.Request) {
+		if !control(w, r) {
+			return
+		}
+		sid := r.URL.Query().Get("student_id")
+		if _, ok := owned[sid]; !ok {
+			w.WriteHeader(404)
+			return
+		}
+		rows, e := pool.Query(r.Context(), `SELECT payload FROM student_outbox WHERE student_id=$1 AND subject=$2 ORDER BY occurred_at,event_id`, sid, domain.SubjectPlanningStateChanged)
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		defer rows.Close()
+		events := []json.RawMessage{}
+		for rows.Next() {
+			var raw []byte
+			if rows.Scan(&raw) != nil {
+				w.WriteHeader(500)
+				return
+			}
+			events = append(events, json.RawMessage(raw))
+		}
+		if rows.Err() != nil {
+			w.WriteHeader(500)
+			return
+		}
+		t205JSON(w, events)
+	})
+	router.Get("/__t205/state", func(w http.ResponseWriter, r *http.Request) {
+		if !control(w, r) {
+			return
+		}
+		sid, pid := r.URL.Query().Get("student_id"), r.URL.Query().Get("path_id")
+		f, ok := owned[sid]
+		if !ok || pid != f.PathID {
+			w.WriteHeader(404)
+			return
+		}
+		path, e := journey.GetLearningPathByID(r.Context(), sid, pid)
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		contextValue, e := journey.GetLearningContext(r.Context(), sid)
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		var revisions, applications, receipts, intents, intentEvents, consumed int
+		e = pool.QueryRow(r.Context(), `SELECT (SELECT count(*) FROM student_learning_path_revision WHERE student_learning_path_id=$1),(SELECT count(*) FROM student_hybrid_application WHERE learning_path_id=$1),(SELECT count(*) FROM student_hybrid_application_receipt r JOIN student_hybrid_application a USING(consequence_id) WHERE a.learning_path_id=$1),(SELECT count(*) FROM student_learning_intent WHERE learning_path_id=$1),(SELECT count(*) FROM student_outbox WHERE student_id=$2 AND subject='student.planning-state.changed.v1' AND payload->'data'->>'trigger_kind'='LEARNING_INTENT'),(SELECT count(*) FROM student_learning_intent WHERE learning_path_id=$1 AND consumed_at IS NOT NULL)`, pid, sid).Scan(&revisions, &applications, &receipts, &intents, &intentEvents, &consumed)
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		digests := map[string]string{}
+		for _, item := range path.Items {
+			raw, _ := json.Marshal(struct {
+				Content      json.RawMessage
+				Requirements []domain.LessonRequirement
+			}{item.LessonContent, item.FrozenRequirements})
+			hash := sha256.Sum256(raw)
+			digests[item.ID] = "sha256:" + hex.EncodeToString(hash[:])
+		}
+		// Public path JSON omits private frozen content; only digests are exposed.
+		var binding any
+		if f.LearningActionID != "" {
+			b, e := actions.GetPracticeLearningAction(r.Context(), sid, f.TaskInstanceID)
+			if e != nil {
+				w.WriteHeader(500)
+				return
+			}
+			binding = b
+		}
+		snap, e := getter.Handle(r.Context(), sid, pid, domain.PlanningSnapshotRequest{Targets: f.Targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "OBJECTIVE_EVIDENCE", Reason: "actual_t205_readonly_probe"}})
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		t205JSON(w, map[string]any{"path": path, "context": contextValue, "revisions": revisions, "applications": applications, "receipts": receipts, "intents": intents, "intent_events": intentEvents, "consumed_intents": consumed, "private_digests": digests, "practice_binding": binding, "snapshot_refs": snap.References})
+	})
+	transport := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/internal/") {
+			parts := strings.Split(r.URL.Path, "/")
+			sid := ""
+			for n, p := range parts {
+				if p == "students" && n+1 < len(parts) {
+					sid = parts[n+1]
+					break
+				}
+			}
+			if _, ok := owned[sid]; !ok {
+				w.WriteHeader(404)
+				return
+			}
+			authorizedPlanner := r.Header.Get("X-Internal-Token") == token
+			apply, snapshot := strings.HasSuffix(r.URL.Path, "/hybrid-consequences"), strings.HasSuffix(r.URL.Path, "/planning-snapshot")
+			mu.Lock()
+			unavailable := authorizedPlanner && ((apply && faults[sid]["APPLY_UNAVAILABLE"]) || (snapshot && faults[sid]["SNAPSHOT_UNAVAILABLE"]))
+			lose := authorizedPlanner && apply && faults[sid]["LOSE_NEXT_APPLY_RESPONSE"]
+			if lose {
+				faults[sid]["LOSE_NEXT_APPLY_RESPONSE"] = false
+			}
+			mu.Unlock()
+			if unavailable {
+				w.WriteHeader(503)
+				return
+			}
+			if lose {
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, r)
+				if rec.Code >= 200 && rec.Code < 300 {
+					hijack, ok := w.(http.Hijacker)
+					if !ok {
+						http.Error(w, "loss injection unsupported", 500)
+						return
+					}
+					conn, _, e := hijack.Hijack()
+					if e == nil {
+						_ = conn.Close()
+					}
+					return
+				}
+				for k, v := range rec.Header() {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(rec.Code)
+				_, _ = w.Write(rec.Body.Bytes())
+				return
+			}
+		}
+		router.ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(transport)
+	defer server.Close()
+	raw, e := json.Marshal(map[string]any{"url": server.URL, "planner_token": token, "practice_token": practiceToken, "teacher_token": teacherToken, "control_token": controlToken, "fixtures": fixtures})
+	if e != nil {
+		t.Fatal(e)
+	}
+	file, e := os.OpenFile(ready, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if e != nil || closeErr != nil {
+		t.Fatal("ready export failed")
+	}
+	t.Log("actual registered owner provider ready; named authored metadata and upstream Runtime projection/gateway fixture disclosed")
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("SETUP: provider stop deadline reached")
+		case <-ticker.C:
+			if _, e := os.Lstat(stop); e == nil {
+				return
+			} else if !os.IsNotExist(e) {
+				t.Fatal(e)
+			}
+		}
+	}
+}
+func t205JSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+func t205Decode(w http.ResponseWriter, r *http.Request, value any) bool {
+	reject := func() bool { w.WriteHeader(http.StatusBadRequest); return false }
+	raw, e := io.ReadAll(io.LimitReader(r.Body, 65537))
+	if e != nil || len(raw) > 65536 {
+		return reject()
+	}
+	shape := reflect.TypeOf(value)
+	if shape == nil || shape.Kind() != reflect.Pointer || shape.Elem().Kind() != reflect.Struct {
+		return reject()
+	}
+	shape = shape.Elem()
+	required := map[string]bool{}
+	for n := 0; n < shape.NumField(); n++ {
+		key := shape.Field(n).Tag.Get("json")
+		if key == "" || strings.Contains(key, ",") {
+			return reject()
+		}
+		required[key] = false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	open, e := decoder.Token()
+	if e != nil || open != json.Delim('{') {
+		return reject()
+	}
+	for decoder.More() {
+		keyToken, e := decoder.Token()
+		if e != nil {
+			return reject()
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return reject()
+		}
+		seen, known := required[key]
+		if !known || seen {
+			return reject()
+		}
+		var field json.RawMessage
+		if decoder.Decode(&field) != nil || bytes.Equal(bytes.TrimSpace(field), []byte("null")) {
+			return reject()
+		}
+		required[key] = true
+		if key == "student_id" {
+			var sid string
+			if json.Unmarshal(field, &sid) != nil || !domain.IsCanonicalPracticeLearningActionUUID(sid) {
+				return reject()
+			}
+		}
+	}
+	close, e := decoder.Token()
+	if e != nil || close != json.Delim('}') || decoder.Decode(new(any)) != io.EOF {
+		return reject()
+	}
+	for _, present := range required {
+		if !present {
+			return reject()
+		}
+	}
+	strict := json.NewDecoder(bytes.NewReader(raw))
+	strict.DisallowUnknownFields()
+	if strict.Decode(value) != nil || strict.Decode(new(any)) != io.EOF {
+		return reject()
+	}
+	return true
+}
+
+// Named frozen Course execution metadata is admitted by the real lifecycle
+// before ready export. FAILED ingress itself therefore never hides activation.
+type t205OpenCourse struct {
+	Answer domain.StudentTaskAnswer
+	Action domain.StudentLearningAction
+}
+
+func t205OpenCourseFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, f t205Fixture) t205OpenCourse {
+	t.Helper()
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	path, e := journey.GetLearningPathByID(ctx, f.StudentID, f.PathID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	item := path.Items[1]
+	var req domain.LessonRequirement
+	for _, candidate := range item.FrozenRequirements {
+		if candidate.Type == "quiz_passed" && domain.IsCanonicalPracticeLearningActionUUID(candidate.SourceReference.ID) && domain.IsCanonicalPracticeLearningActionUUID(candidate.SourceReference.RevisionID) {
+			req = candidate
+			break
+		}
+	}
+	if req.ID == "" {
+		t.Fatal("SETUP: named frozen Course execution requirement absent")
+	}
+	now := (t205OwnerClock{}).Now()
+	frozen, _ := json.Marshal(map[string]string{"id": req.SourceReference.ID, "_completion_fact_type": "quiz_passed", "_completion_source_revision_id": req.SourceReference.RevisionID})
+	answer := domain.StudentTaskAnswer{ID: uuid.NewString(), StudentID: f.StudentID, TaskID: req.SourceReference.ID, LearningPathItemID: item.ID, RequirementID: req.ID, StartedAt: now, Status: domain.StudentTaskAnswerStatusInProgress, CreatedAt: now, UpdatedAt: now, AnswerPayload: json.RawMessage(`{}`), FrozenTaskJSON: frozen}
+	action, e := domain.NewStudentLearningAction(domain.StudentLearningAction{ID: uuid.NewString(), StudentTaskAnswerID: answer.ID, StudentID: f.StudentID, TaskID: answer.TaskID, ContextType: domain.LearningContextLessonTask, ContextID: answer.TaskID, LearningTargets: item.Targets, EvidenceClass: domain.LearningEvidenceApplication, OpenedAt: now})
+	if e != nil {
+		t.Fatal(e)
+	}
+	answer, action, e = (postgres.LearningActionLifecycleRepoPG{Pool: pool}).CreateAnswer(ctx, answer, nil, action)
+	if e != nil {
+		t.Fatalf("SETUP: real initial OPEN Course execution: %v", e)
+	}
+	return t205OpenCourse{Answer: answer, Action: action}
+}
+
+func t205InitialOwnerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) t205Fixture {
+	t.Helper()
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	clock := t205OwnerClock{}
+	now := clock.Now()
+	sid := uuid.NewString()
+	profile := domain.StudentOnboarding{StudentID: sid, DirectionCode: "backend", GoalCode: "go.backend", DesiredStacks: []string{"go"}, KnownStacks: []string{}, SelfAssessedExperience: "basic", PreferredLanguage: "en", WeeklyMinutes: 60, PreferredPace: "standard", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if _, e := (&postgres.StudentOnboardingRepoPG{Pool: pool}).Save(ctx, profile, 0); e != nil {
+		t.Fatal(e)
+	}
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "t205." + strings.ReplaceAll(name, "_", ".") + ".a", Version: "v1"}
+	templateTarget := target
+	templateTarget.Key = "t205." + strings.ReplaceAll(name, "_", ".") + ".z"
+	path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: sid, CourseID: uuid.NewString(), GoalCode: "go.backend", CourseFingerprint: "named-t205-frozen-course-" + name, PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", Status: domain.LearningPathStatusActive, Version: 1, ReasonCode: "initial_plan", ReasonSummary: "Named initial authored owner fixture; no evidence injected", CreatedAt: now, UpdatedAt: now}
+	for n := 0; n < 4; n++ {
+		item := domain.LearningPathItem{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), LessonRevisionID: uuid.NewString(), Position: n, Status: domain.LearningPathItemPlanned, ReasonCode: "current_gap", Targets: []domain.LearningTargetRef{target}, LessonContent: json.RawMessage(fmt.Sprintf(`{"title":"Named T205 %s frozen lesson %d","private_marker":"%s"}`, name, n, uuid.NewString())), FrozenRequirements: []domain.LessonRequirement{{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "theory_acknowledged", Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString()}}}}
+		if n == 3 {
+			item.Targets = []domain.LearningTargetRef{templateTarget}
+		}
+		if n == 0 {
+			item.Status = domain.LearningPathItemReady
+		}
+		path.Items = append(path.Items, item)
+	}
+	if name == "no_change" {
+		r := &path.Items[1].FrozenRequirements[0]
+		r.Type = "quiz_passed"
+		r.SourceReference.RevisionID = uuid.NewString()
+	}
+	if name == "active_practice" {
+		r := &path.Items[1].FrozenRequirements[0]
+		r.Type = "practice_completed"
+		r.SourceReference.RevisionID = uuid.NewString()
+		r.SourceReference.ID = r.SourceReference.RevisionID
+	}
+	var e error
+	var replay bool
+	path, replay, e = repo.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if e != nil || replay {
+		t.Fatalf("initial owner %s: %v", name, e)
+	}
+	if _, e = (studentuc.LessonCompletion{Repository: repo, Clock: clock}).AcknowledgeTheory(ctx, sid, path.Items[0].ID, path.Items[0].FrozenRequirements[0].ID, uuid.NewString()); e != nil {
+		t.Fatalf("real completed history %s: %v", name, e)
+	}
+	path, e = repo.GetLearningPathByID(ctx, sid, path.ID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	desired := append([]domain.LearningPathItem{}, path.Items...)
+	desired[0].Status = domain.LearningPathItemPlanned // owner reconciliation restores completed history exactly
+	desired[1].Status = domain.LearningPathItemReady
+	command := domain.LearningPathPlanningCommand{Schema: domain.LearningPathReplanRequestSchema, Kind: domain.LearningPathPlanningCommandReplan, StudentID: sid, LearningPathID: path.ID, PlanningRequestID: uuid.NewString(), IdempotencyKey: uuid.NewString(), CourseID: path.CourseID, GoalCode: path.GoalCode, CourseFingerprint: path.CourseFingerprint, PlannerPolicyVersion: path.PlannerPolicyVersion, ReasonCode: "current_gap", ReasonSummary: "Owner admission promotes next authored assignment after actual completed theory", ExpectedPathVersion: path.Version, DesiredItems: desired, RequestHash: strings.Repeat("b", 64), OccurredAt: clock.Now()}
+	if _, _, e = repo.ApplyLearningPathPlanningCommand(ctx, command); e != nil {
+		t.Fatalf("real next READY promotion %s: %v", name, e)
+	}
+	path, e = repo.GetLearningPathByID(ctx, sid, path.ID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	f := t205Fixture{StudentID: sid, PathID: path.ID, Targets: []domain.LearningTargetRef{target, templateTarget}, Scope: domain.HybridScopeIdentity{GoalCode: "go.backend", DirectionCode: "backend", DesiredStacks: []string{"go"}}, CompletedItemID: path.Items[0].ID, ActiveItemID: path.Items[1].ID, PendingItemID: path.Items[2].ID, TemplateItemID: path.Items[3].ID, PathRevision: path.Version}
+	if name == "active_practice" {
+		r := path.Items[1].FrozenRequirements[0]
+		f.RequirementID = r.ID
+		f.TaskRevisionID = r.SourceReference.RevisionID
+		f.TaskRevisionDigest = "sha256:" + strings.Repeat("c", 64)
+		f.TaskInstanceID = uuid.NewString()
+		uc := studentuc.PracticeLearningActions{Actions: postgres.LearningActionLifecycleRepoPG{Pool: pool}, Clock: clock, IDs: clock}
+		binding, e := uc.Reserve(ctx, domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: sid, TaskInstanceID: f.TaskInstanceID, IdempotencyKey: f.TaskInstanceID, TaskRevisionID: f.TaskRevisionID, TaskRevisionDigest: f.TaskRevisionDigest, SurfaceClassification: "project", LearningTargets: path.Items[1].Targets, LearningPathID: f.PathID, LearningPathItemID: f.ActiveItemID, RequirementID: f.RequirementID})
+		if e != nil {
+			t.Fatal(e)
+		}
+		binding, e = uc.Open(ctx, sid, f.TaskInstanceID, binding.LearningActionID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		f.LearningActionID = binding.LearningActionID
+		path, e = repo.GetLearningPathByID(ctx, sid, path.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		f.PathRevision = path.Version
+	}
+	return f
+}
+
+// Hook admission regression: accepted false must be explicit, identities exact,
+// and an oversized body cannot be truncated into an apparently valid request.
+func TestT205ProofHookDecoder(t *testing.T) {
+	sid := uuid.NewString()
+	valid := fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":false}`, sid)
+	cases := map[string]string{
+		"duplicate":         fmt.Sprintf(`{"student_id":%q,"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":true}`, sid, sid),
+		"case alias":        fmt.Sprintf(`{"Student_ID":%q,"fault":"APPLY_UNAVAILABLE","enabled":true}`, sid),
+		"null":              fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":null}`, sid),
+		"missing enabled":   fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE"}`, sid),
+		"missing identity":  `{"fault":"APPLY_UNAVAILABLE","enabled":true}`,
+		"type":              fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":"true"}`, sid),
+		"unknown":           fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":true,"extra":1}`, sid),
+		"multiple":          valid + ` {}`,
+		"noncanonical uuid": fmt.Sprintf(`{"student_id":%q,"fault":"APPLY_UNAVAILABLE","enabled":true}`, strings.ToUpper(sid)),
+		"oversize":          valid + strings.Repeat(" ", 65537),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			var value struct {
+				StudentID string `json:"student_id"`
+				Fault     string `json:"fault"`
+				Enabled   bool   `json:"enabled"`
+			}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/__t205/control", strings.NewReader(body))
+			if t205Decode(w, r, &value) || w.Code != http.StatusBadRequest {
+				t.Fatal("malformed proof hook command accepted")
+			}
+		})
+	}
+	t.Run("explicit false", func(t *testing.T) {
+		var value struct {
+			StudentID string `json:"student_id"`
+			Fault     string `json:"fault"`
+			Enabled   bool   `json:"enabled"`
+		}
+		w := httptest.NewRecorder()
+		if !t205Decode(w, httptest.NewRequest(http.MethodPost, "/__t205/control", strings.NewReader(valid)), &value) || value.StudentID != sid || value.Enabled {
+			t.Fatal("valid explicit false rejected")
+		}
+	})
+}

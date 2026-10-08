@@ -1,0 +1,418 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	dialogclient "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	practiceclient "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/practice"
+	dialogevents "github.com/bemulima/ms-go-teacher-agent/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/studentcontext"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+	"github.com/google/uuid"
+)
+
+var errT13BeforeAppend = errors.New("synthetic fault after assistance commit before Dialog append")
+var errT13LostAppend = errors.New("synthetic response loss after actual Dialog append commit")
+
+type t13CutAppender struct {
+	Inner repository.DialogTeacherResponseAppender
+	Cut   string
+	Calls int
+}
+
+func (a *t13CutAppender) AppendTeacherResponse(ctx context.Context, r domain.DialogTeacherRequest, key, body string) (domain.DialogMessage, error) {
+	a.Calls++
+	if a.Cut == "before" {
+		a.Cut = ""
+		return domain.DialogMessage{}, errT13BeforeAppend
+	}
+	result, e := a.Inner.AppendTeacherResponse(ctx, r, key, body)
+	if e == nil && a.Cut == "after" {
+		a.Cut = ""
+		return domain.DialogMessage{}, errT13LostAppend
+	}
+	return result, e
+}
+
+type t13Clock struct{ Time time.Time }
+
+func (c *t13Clock) Now() time.Time { return c.Time }
+
+type t13IDs struct{}
+
+func (t13IDs) NewID() string { return uuid.NewString() }
+
+type t13NoTeacher struct{}
+
+func (t13NoTeacher) Execute(context.Context, string) (domain.PersonalTeacher, error) {
+	return domain.PersonalTeacher{}, errors.New("unexpected generation identity read")
+}
+
+type t13NoSoul struct{}
+
+func (t13NoSoul) Execute(context.Context, string) (domain.TeacherSoul, error) {
+	return domain.TeacherSoul{}, errors.New("unexpected generation soul read")
+}
+
+type t13NoContext struct{}
+
+func (t13NoContext) Execute(context.Context, studentcontext.BuildInput) (domain.StudentContext, error) {
+	return domain.StudentContext{}, errors.New("unexpected generation context read")
+}
+
+type t13NoPrompt struct{}
+
+func (t13NoPrompt) Build(context.Context, domain.DialogRequestContext, string, time.Time) (domain.TeacherPromptDialogContext, error) {
+	return domain.TeacherPromptDialogContext{}, errors.New("unexpected generation prompt build")
+}
+
+type t13NoPlan struct{}
+
+func (t13NoPlan) Plan(domain.PersonalTeacher, domain.DialogTeacherRequest, domain.StudentContext, domain.DialogRequestContext, []domain.TeacherDecision) (domain.TeacherTeachingPlan, error) {
+	return domain.TeacherTeachingPlan{}, errors.New("unexpected generation plan")
+}
+
+type t13NoGenerator struct{ Calls int }
+
+func (g *t13NoGenerator) Generate(context.Context, domain.TeacherGenerationRequest) (domain.TeacherGeneratedResponse, error) {
+	g.Calls++
+	return domain.TeacherGeneratedResponse{}, errors.New("unexpected live generation")
+}
+func (g *t13NoGenerator) Replay(context.Context, string) (domain.TeacherGeneratedResponse, error) {
+	g.Calls++
+	return domain.TeacherGeneratedResponse{}, errors.New("unexpected generation replay")
+}
+
+type t13RuntimeState struct {
+	SubmissionAnchors int    `json:"synthetic_validating_submission_anchor_count"`
+	RunAnchors        int    `json:"synthetic_pending_run_anchor_count"`
+	OfficialOutcomes  int    `json:"official_outcome_count"`
+	Evidence          int    `json:"evidence_outbox_count"`
+	StudentID         string `json:"student_id"`
+	InstanceID        string `json:"task_instance_id"`
+	Status            string `json:"status"`
+	Version           int64  `json:"version"`
+	Count             int    `json:"receipt_count"`
+	Hints             int    `json:"hints_used"`
+	Receipts          []struct {
+		UsageID    string    `json:"usage_id"`
+		StudentID  string    `json:"student_id"`
+		InstanceID string    `json:"task_instance_id"`
+		StepID     string    `json:"step_id"`
+		Kind       string    `json:"kind"`
+		Hint       int       `json:"hint_level"`
+		Policy     string    `json:"policy_version"`
+		Time       time.Time `json:"occurred_at"`
+	} `json:"receipts"`
+}
+type t13DialogState struct {
+	Count   int `json:"assistant_count"`
+	Replies []struct {
+		ID   string `json:"message_id"`
+		Key  string `json:"append_key"`
+		Hash string `json:"body_sha256"`
+	} `json:"replies"`
+}
+
+// Root starts both real PG providers before this opt-in test. Generation is a
+// declared bounded pre-generated fixture staged using actual SaveGenerated:
+// no model/provider/LLM execution is claimed. Recovery uses production Worker,
+// Claim/lease recovery, repository objects and real Practice/Dialog clients.
+func TestT13AssistanceDialogRecovery(t *testing.T) {
+	if os.Getenv("T13_COMPOSED") != "true" {
+		t.Skip("owned T13 composed providers gate absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	var runtime struct {
+		URL        string `json:"url"`
+		StudentID  string `json:"student_id"`
+		InstanceID string `json:"task_instance_id"`
+		ActionID   string `json:"learning_action_id"`
+		StepID     string `json:"step_id"`
+	}
+	var dialog struct {
+		URL       string          `json:"url"`
+		TeacherID string          `json:"personal_teacher_id"`
+		Envelope  json.RawMessage `json:"event_payload"`
+	}
+	t13ReadMetadata(t, os.Getenv("T13_RUNTIME_READY_FILE"), &runtime)
+	t13ReadMetadata(t, os.Getenv("T13_DIALOG_READY_FILE"), &dialog)
+	internal, teacher, dialogToken := os.Getenv("T13_RUNTIME_TOKEN"), os.Getenv("T13_TEACHER_TOKEN"), os.Getenv("T13_DIALOG_TOKEN")
+	if internal == "" || teacher == "" || internal == teacher || dialogToken == "" || os.Getenv("T13_RECOVERY_RESULT_FILE") == "" {
+		t.Fatal("missing owned composed fixture configuration")
+	}
+	for _, base := range []string{runtime.URL, dialog.URL} {
+		u, e := url.Parse(base)
+		if e != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" {
+			t.Fatal("providers must use owned loopback HTTP")
+		}
+	}
+	request, e := dialogevents.DecodeDialogTeacherRequested(dialog.Envelope)
+	if e != nil || request.StudentID != runtime.StudentID || request.PersonalTeacherID != dialog.TeacherID || request.ContextID != runtime.InstanceID || request.LearningActionID != runtime.ActionID || request.ContextType != domain.LearningContextPracticeTask {
+		t.Fatal("actual Dialog event identities differ from Runtime fixture")
+	}
+	pool := teacherDecisionIntegrationPool(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, e = pool.Exec(ctx, `INSERT INTO personal_teacher(id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,version,created_at,updated_at) VALUES($1,$2,'t13-synthetic','en','bounded','adaptive','scaffold','manual',1,$3,$3)`, dialog.TeacherID, runtime.StudentID, now)
+	if e != nil {
+		t.Fatal("synthetic Teacher identity seed failed")
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		for _, query := range []string{`DELETE FROM teacher_dialog_job WHERE personal_teacher_id=$1`, `DELETE FROM teacher_outbox WHERE student_id IN (SELECT student_id FROM personal_teacher WHERE id=$1)`, `DELETE FROM teacher_decision WHERE personal_teacher_id=$1`, `DELETE FROM personal_teacher WHERE id=$1`} {
+			if _, err := pool.Exec(c, query, dialog.TeacherID); err != nil {
+				t.Error("owned Teacher cleanup failed")
+			}
+		}
+	})
+	jobs := TeacherDialogJobRepository{Pool: pool}
+	job, e := domain.NewTeacherDialogJob(request, now)
+	if e != nil {
+		t.Fatal("actual event job normalization failed")
+	}
+	accepted, e := jobs.Accept(ctx, job)
+	if e != nil || !accepted {
+		t.Fatal("actual job intake failed")
+	}
+	lease := 2 * time.Second
+	claimed, ok, e := jobs.Claim(ctx, repository.TeacherDialogClaim{ClaimToken: uuid.NewString(), WorkerID: "t13-stage", Now: now, LockedUntil: now.Add(lease)})
+	if e != nil || !ok || claimed.Request.EventID != request.EventID {
+		t.Fatal("actual staging claim failed")
+	}
+	level := 2
+	decision, e := domain.NewTeacherDecision(domain.TeacherDecision{ID: uuid.NewString(), PersonalTeacherID: dialog.TeacherID, StudentID: runtime.StudentID, CorrelationID: runtime.ActionID, CausationID: request.EventID, LearningActionID: runtime.ActionID, TeachingMode: domain.TeachingModePractice, ContextType: domain.LearningContextPracticeTask, ContextID: runtime.InstanceID, PracticeStepID: runtime.StepID, PedagogyMethod: "progressive-hint", PedagogyVersion: "v1", PedagogyStage: domain.PedagogyStage("orient"), Strategy: "scaffolding", Action: domain.TeacherActionGiveHint, HintLevel: &level, ReasonCode: "t13_synthetic", ReasonSummary: "Bounded pregenerated fixture", PolicyVersion: "teacher-dialog-policy-v1", CreatedAt: now})
+	if e != nil {
+		t.Fatal("bounded fixture decision invalid")
+	}
+	event, e := domain.NewIntegrationEvent(uuid.NewString(), domain.SubjectTeacherDecisionRecorded, decision.CorrelationID, decision.CausationID, decision.StudentID, now, domain.TeacherDecisionRecordedSchemaVersion, decision)
+	if e != nil {
+		t.Fatal("fixture decision event invalid")
+	}
+	// Private fixture text stays in process/owned DB and is exported as hash only.
+	body := "Check the boundary condition for the smallest input before changing the implementation."
+	digest := sha256.Sum256([]byte(body))
+	bodyHash := hex.EncodeToString(digest[:])
+	if e = jobs.SaveGenerated(ctx, request.EventID, claimed.ClaimToken, decision, event, body, uuid.NewString(), now); e != nil {
+		t.Fatal("actual SaveGenerated transaction failed")
+	}
+	generator := &t13NoGenerator{}
+	clock := &t13Clock{Time: now.Add(lease + time.Second)}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	newWorker := func(cut string) (teacherdialog.Worker, *t13CutAppender) {
+		dc := dialogclient.Client{BaseURL: dialog.URL, InternalToken: dialogToken, HTTPClient: httpClient}
+		appender := &t13CutAppender{Inner: dc, Cut: cut}
+		return teacherdialog.Worker{Jobs: TeacherDialogJobRepository{Pool: pool}, Teachers: t13NoTeacher{}, Souls: t13NoSoul{}, StudentContext: t13NoContext{}, PromptContext: t13NoPrompt{}, DialogReader: dc, DialogAppender: appender, Decisions: TeacherDecisionRepository{Pool: pool}, Pedagogy: t13NoPlan{}, Generator: generator, PracticeAssistance: practiceclient.Client{BaseURL: runtime.URL, InternalToken: teacher, HTTPClient: httpClient}, IDs: t13IDs{}, Clock: clock, WorkerID: "t13-reconstructed-" + uuid.NewString(), LeaseTTL: 30 * time.Second, LeaseRenewInterval: 5 * time.Second, MaxAttempts: 6, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Second}, appender
+	}
+	call := func(method, path, token string, input any, want int, output any) {
+		t.Helper()
+		raw, e := json.Marshal(input)
+		if e != nil {
+			t.Fatal("fixture command encode failed")
+		}
+		req, e := http.NewRequestWithContext(ctx, method, path, bytes.NewReader(raw))
+		if e != nil {
+			t.Fatal("fixture HTTP command invalid")
+		}
+		req.Header.Set("X-Internal-Token", token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, e := httpClient.Do(req)
+		if e != nil {
+			t.Fatal("fixture HTTP provider unavailable")
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != want {
+			t.Fatalf("actual provider status=%d want=%d", resp.StatusCode, want)
+		}
+		if output != nil {
+			if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(output) != nil {
+				t.Fatal("safe provider state decode failed")
+			}
+		}
+	}
+	readRuntime := func() t13RuntimeState {
+		var s t13RuntimeState
+		call(http.MethodGet, runtime.URL+"/__t13/inspect", internal, nil, 200, &s)
+		return s
+	}
+	readDialog := func() t13DialogState {
+		var s t13DialogState
+		call(http.MethodGet, dialog.URL+"/__t13/inspect", dialogToken, nil, 200, &s)
+		return s
+	}
+	assertPending := func(wantStatus string) {
+		t.Helper()
+		var status, storedBody, storedDecision string
+		if pool.QueryRow(ctx, `SELECT status,coalesce(response_body,''),coalesce(decision_id::text,'') FROM teacher_dialog_job WHERE event_id=$1`, request.EventID).Scan(&status, &storedBody, &storedDecision) != nil || status != wantStatus || storedBody != body || storedDecision != decision.ID {
+			t.Fatal("durable private pending response/decision changed")
+		}
+	}
+	worker, cut := newWorker("before")
+	processed, e := worker.ProcessNext(ctx)
+	if !processed || !errors.Is(e, errT13BeforeAppend) || cut.Calls != 1 {
+		t.Fatal("fault was not reached after actual assistance commit")
+	}
+	assertPending("delivery_pending")
+	first := readRuntime()
+	if first.Count != 1 || first.Hints != 1 || len(first.Receipts) != 1 || first.Receipts[0].UsageID != decision.ID || first.Receipts[0].StepID != runtime.StepID || first.Receipts[0].Time.IsZero() {
+		t.Fatal("actual Runtime first assistance fact/counter missing")
+	}
+	if readDialog().Count != 0 {
+		t.Fatal("before-append fault created a Dialog response")
+	}
+	proofs := map[string]any{"classification": "actual Teacher PG SaveGenerated/Worker/Claim + production Practice HTTP + Runtime usecase/PG + registered Dialog private HTTP/usecase/PG; synthetic pregenerated bounded response and lifecycle transitions; no LLM/Start/completion proof", "source_event_id": request.EventID, "decision_usage_id": decision.ID, "body_sha256": bodyHash, "generator_calls": 0, "first_receipt_time": first.Receipts[0].Time, "before_append_cut_reached": true, "staging_expired_lease_reclaimed": true}
+	assistance := func(usage, student, step, kind string, hint int) map[string]any {
+		return map[string]any{"usage_id": usage, "student_id": student, "assistance": map[string]any{"schema": "practice-task-assistance-usage.v1", "step_id": step, "kind": kind, "hint_level": hint}}
+	}
+	assistanceURL := runtime.URL + "/internal/task-instances/" + runtime.InstanceID + "/teacher-assistance"
+	exact := assistance(decision.ID, runtime.StudentID, runtime.StepID, "HINT", level)
+	// A separate HTTP request advances the server clock while preserving stable
+	// command identity. UC-only RED overlays may already have corrected PG replay.
+	time.Sleep(20 * time.Millisecond)
+	reqRaw, _ := json.Marshal(exact)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, assistanceURL, bytes.NewReader(reqRaw))
+	req.Header.Set("X-Internal-Token", teacher)
+	req.Header.Set("Content-Type", "application/json")
+	resp, e := httpClient.Do(req)
+	if e != nil {
+		t.Fatal("time-advance replay provider unavailable")
+	}
+	timeReplayStatus := resp.StatusCode
+	_ = resp.Body.Close()
+	proofs["time_advance_replay_http_status"] = timeReplayStatus
+	baseline := os.Getenv("T13_BASELINE_RED") == "true"
+	if !baseline && timeReplayStatus != 200 {
+		t.Fatal("exact time-advance assistance replay rejected")
+	}
+	call(http.MethodPost, assistanceURL, internal, exact, 401, nil)
+	call(http.MethodPost, assistanceURL, "synthetic-wrong-token", exact, 401, nil)
+	call(http.MethodPost, assistanceURL, teacher, assistance(decision.ID, uuid.NewString(), runtime.StepID, "HINT", level), 404, nil)
+	call(http.MethodPost, assistanceURL, teacher, assistance(decision.ID, runtime.StudentID, runtime.StepID, "HINT", level+1), 409, nil)
+	wrongStepStatus := 409
+	if baseline {
+		wrongStepStatus = 404
+	} // Original UC checks unknown step before receipt lookup.
+	call(http.MethodPost, assistanceURL, teacher, assistance(decision.ID, runtime.StudentID, uuid.NewString(), "HINT", level), wrongStepStatus, nil)
+	call(http.MethodPost, assistanceURL, teacher, assistance(decision.ID, runtime.StudentID, runtime.StepID, "TEACHER_EXPLANATION", 0), 409, nil)
+	negatives := readRuntime()
+	if negatives.Count != 1 || negatives.Hints != 1 || negatives.Version != first.Version || !negatives.Receipts[0].Time.Equal(first.Receipts[0].Time) {
+		t.Fatal("replay/negative request mutated facts or original time")
+	}
+	proofs["runtime_identity_payload_token_negative_checks"] = true
+	call(http.MethodPost, runtime.URL+"/__t13/control", teacher, map[string]any{"action": "lifecycle", "status": "IN_REVIEW"}, 401, nil)
+	var review t13RuntimeState
+	call(http.MethodPost, runtime.URL+"/__t13/control", internal, map[string]any{"action": "lifecycle", "status": "IN_REVIEW"}, 200, &review)
+	if review.StudentID != runtime.StudentID || review.Status != "IN_REVIEW" {
+		t.Fatal("synthetic lifecycle transition changed owner")
+	}
+	call(http.MethodPost, assistanceURL, teacher, assistance(uuid.NewString(), runtime.StudentID, runtime.StepID, "HINT", level), 409, nil)
+	clock.Time = clock.Time.Add(time.Second)
+	worker, cut = newWorker("after")
+	processed, e = worker.ProcessNext(ctx)
+	if baseline {
+		if !processed || !errors.Is(e, domain.ErrStudentStateUnavailable) || cut.Calls != 0 || readDialog().Count != 0 {
+			t.Fatal("RED did not reproduce actual lifecycle business error before append")
+		}
+		assertPending("delivery_pending")
+		retained := readRuntime()
+		if retained.Count != 1 || retained.Hints != 1 || !retained.Receipts[0].Time.Equal(first.Receipts[0].Time) {
+			t.Fatal("RED mutated accepted assistance")
+		}
+		proofs["baseline_red_lifecycle_conflict"] = true
+		proofs["runtime_receipt_count"] = retained.Count
+		proofs["runtime_hints_used"] = retained.Hints
+		proofs["dialog_assistant_count"] = 0
+		proofs["private_pending_body_retained"] = true
+		t13RecoveryWrite(t, proofs)
+		t.Error("RED: actual stored-response Worker recovery is rejected by original Runtime lifecycle guard after accepted assistance; Dialog append never reached")
+		return
+	}
+	if !processed || !errors.Is(e, errT13LostAppend) || cut.Calls != 1 {
+		t.Fatal("real append commit / synthetic response-loss cut not reached")
+	}
+	assertPending("delivery_pending")
+	committed := readDialog()
+	if committed.Count != 1 || len(committed.Replies) != 1 || committed.Replies[0].Key != request.EventID || committed.Replies[0].Hash != bodyHash {
+		t.Fatal("actual Dialog append is not exactly correlated")
+	}
+	afterReview := readRuntime()
+	if afterReview.Version != review.Version || afterReview.Count != 1 || afterReview.Hints != 1 || !afterReview.Receipts[0].Time.Equal(first.Receipts[0].Time) {
+		t.Fatal("review replay mutated stable assistance")
+	}
+	var completed t13RuntimeState
+	call(http.MethodPost, runtime.URL+"/__t13/control", internal, map[string]any{"action": "lifecycle", "status": "COMPLETED"}, 200, &completed)
+	clock.Time = clock.Time.Add(time.Second)
+	worker, _ = newWorker("")
+	processed, e = worker.ProcessNext(ctx)
+	if e != nil || !processed {
+		t.Fatal("actual reconstructed delivery recovery failed")
+	}
+	final := readRuntime()
+	finalDialog := readDialog()
+	if final.SubmissionAnchors != 1 || final.RunAnchors != 1 || final.OfficialOutcomes != 0 || final.Evidence != 0 || final.Version != completed.Version || final.Count != 1 || final.Hints != 1 || final.StudentID != runtime.StudentID || !final.Receipts[0].Time.Equal(first.Receipts[0].Time) || finalDialog.Count != 1 || finalDialog.Replies[0].ID != committed.Replies[0].ID || generator.Calls != 0 {
+		t.Fatal("recovery duplicated a fact/response, changed timestamp/owner, or regenerated")
+	}
+	var status, remaining, delivered string
+	var decisions, outboxCount int
+	if pool.QueryRow(ctx, `SELECT status,coalesce(response_body,''),coalesce(delivered_message_id::text,'') FROM teacher_dialog_job WHERE event_id=$1`, request.EventID).Scan(&status, &remaining, &delivered) != nil || status != "delivered" || remaining != "" || delivered != committed.Replies[0].ID {
+		t.Fatal("verified append did not clear private response and finish delivery")
+	}
+	if pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM teacher_decision WHERE id=$1),(SELECT count(*) FROM teacher_outbox WHERE causation_id=$2 AND subject='teacher.decision.recorded')`, decision.ID, request.EventID).Scan(&decisions, &outboxCount) != nil || decisions != 1 || outboxCount != 1 {
+		t.Fatal("SaveGenerated decision/outbox is not singular")
+	}
+	// Production Dialog HTTP rejects changed payload under the original append key.
+	appendURL := dialog.URL + "/internal/v1/teacher-dialog/" + request.DialogID + "/message"
+	call(http.MethodPost, appendURL, "synthetic-wrong-token", map[string]any{"personal_teacher_id": dialog.TeacherID, "source_message_id": request.SourceMessageID, "idempotency_key": request.EventID, "body": body}, 401, nil)
+	call(http.MethodPost, appendURL, dialogToken, map[string]any{"personal_teacher_id": dialog.TeacherID, "source_message_id": request.SourceMessageID, "idempotency_key": request.EventID, "body": body + " changed"}, 409, nil)
+	call(http.MethodPost, appendURL, dialogToken, map[string]any{"personal_teacher_id": uuid.NewString(), "source_message_id": request.SourceMessageID, "idempotency_key": uuid.NewString(), "body": body}, 403, nil)
+	if readDialog().Count != 1 {
+		t.Fatal("Dialog negative requests created responses")
+	}
+	call(http.MethodPost, assistanceURL, teacher, assistance(uuid.NewString(), runtime.StudentID, runtime.StepID, "HINT", level), 409, nil)
+	proofs["synthetic_validating_submission_anchor_count"] = final.SubmissionAnchors
+	proofs["synthetic_pending_run_anchor_count"] = final.RunAnchors
+	proofs["official_outcome_count"] = final.OfficialOutcomes
+	proofs["evidence_outbox_count"] = final.Evidence
+	proofs["runtime_receipt_count"] = final.Count
+	proofs["runtime_hints_used"] = final.Hints
+	proofs["stable_receipt_time"] = true
+	proofs["dialog_assistant_count"] = finalDialog.Count
+	proofs["dialog_response_id"] = delivered
+	proofs["dialog_append_key"] = request.EventID
+	proofs["decision_count"] = decisions
+	proofs["decision_outbox_count"] = outboxCount
+	proofs["private_pending_body_cleared_after_verified_append"] = true
+	proofs["after_append_response_loss_recovered"] = true
+	proofs["generator_calls"] = generator.Calls
+	proofs["fresh_fact_after_review_completed_rejected"] = true
+	proofs["dialog_token_payload_owner_negative_checks"] = true
+	t13RecoveryWrite(t, proofs)
+}
+func t13ReadMetadata(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, e := os.ReadFile(path)
+	if e != nil || json.Unmarshal(raw, value) != nil {
+		t.Fatal("owned safe provider metadata missing")
+	}
+}
+func t13RecoveryWrite(t *testing.T, value any) {
+	t.Helper()
+	raw, e := json.MarshalIndent(value, "", "  ")
+	path := os.Getenv("T13_RECOVERY_RESULT_FILE")
+	if e != nil || os.WriteFile(path+".tmp", append(raw, '\n'), 0600) != nil || os.Rename(path+".tmp", path) != nil {
+		t.Fatal("safe recovery proof export failed")
+	}
+}

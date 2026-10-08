@@ -24,7 +24,7 @@ func BuildPack(plan RetrievalPlan, sources []EvidenceSource, quality QualityResu
 		RetrievalPlan: plan, ForbiddenScope: plan.ForbiddenScope,
 		ApplicableRules: []string{}, RelevantSymbols: []string{}, RelevantCode: []string{}, Contracts: []string{}, Tests: []string{}, ArchitectureEvidence: []string{}, Dependencies: []EvidenceLink{},
 		Evidence: []EvidenceCandidate{}, Coverage: append([]CoverageResult{}, coverage...),
-		UnresolvedQuestions: qualityDiagnostics(append(append(append([]RetrievalDiagnostic{}, plan.Unresolved...), diagnostics...), quality.Diagnostics...)),
+		UnresolvedQuestions: compactPolicyExclusions(append(append(append([]RetrievalDiagnostic{}, plan.Unresolved...), diagnostics...), quality.Diagnostics...)),
 		AuthorityConflicts:  append([]AuthorityConflict{}, quality.Conflicts...), Omissions: append([]Omission{}, quality.Omissions...),
 		BudgetUsed:    BudgetUsed{ReservedPromptTokens: plan.Budget.ReservedPromptTokens, Estimator: TokenEstimator, ExpandCount: previous.ExpandCount},
 		ContentDigest: strings.Repeat("0", 64),
@@ -126,7 +126,14 @@ func BuildPack(plan RetrievalPlan, sources []EvidenceSource, quality QualityResu
 			state = OmittedByLimit
 		}
 		code := "REQUIRED_EVIDENCE_" + string(state)
-		if facet.Kind == "contract" || facet.QueryKind == QueryContract {
+		if state == ExcludedByPolicy {
+			for _, d := range diagnostics {
+				if d.Code == "SECRET_CONTENT_EXCLUDED" && d.SourceIdentity == facet.SourceIdentity && (d.RelativePath == facet.Path || (d.RelativePath != "" && strings.HasPrefix(facet.Path, d.RelativePath+"/"))) {
+					code = "REQUIRED_EVIDENCE_EXCLUDED_BY_SECURITY"
+				}
+			}
+		}
+		if (facet.Kind == "contract" || facet.QueryKind == QueryContract) && code != "REQUIRED_EVIDENCE_EXCLUDED_BY_SECURITY" {
 			code = "MISSING_REQUIRED_CONTRACT"
 		}
 		pack.UnresolvedQuestions = append(pack.UnresolvedQuestions, RetrievalDiagnostic{Code: code, Status: Partial, SourceIdentity: facet.SourceIdentity, RelativePath: facet.Path, FacetID: facet.ID, Message: "required facet has no selected current evidence; search state: " + string(state)})
@@ -430,4 +437,28 @@ func Markdown(pack ContextPack) (string, error) {
 		}
 	}
 	return output.String(), nil
+}
+
+// Successful named-file policy exclusions are an acquisition ledger, not task
+// failures. Bind the complete normalized ledger and its count per source. Keep
+// all facet-specific, incomplete, stale, secret-content and authority outcomes.
+func compactPolicyExclusions(values []RetrievalDiagnostic) []RetrievalDiagnostic {
+	normalized := qualityDiagnostics(values)
+	groups := map[string][]RetrievalDiagnostic{}
+	result := make([]RetrievalDiagnostic, 0, len(normalized))
+	for _, d := range normalized {
+		if d.Code == "EXCLUDED_BY_POLICY" && d.Status == Complete && d.FacetID == "" && d.EvidenceID == "" && d.RelativePath != "" {
+			groups[d.SourceIdentity] = append(groups[d.SourceIdentity], d)
+		} else {
+			result = append(result, d)
+		}
+	}
+	for source, ledger := range groups {
+		if len(ledger) == 1 {
+			result = append(result, ledger[0])
+			continue
+		}
+		result = append(result, RetrievalDiagnostic{Code: "EXCLUDED_BY_POLICY", Status: Complete, SourceIdentity: source, Message: fmt.Sprintf("named-path policy exclusions count=%d; complete ledger sha256:%s", len(ledger), qualityHash(ledger))})
+	}
+	return qualityDiagnostics(result)
 }

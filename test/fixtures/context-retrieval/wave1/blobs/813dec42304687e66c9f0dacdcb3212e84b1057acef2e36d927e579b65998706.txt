@@ -1,0 +1,937 @@
+package teacherdialog
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// These tests exercise the dark S5 text path without a provider: the only
+// semantic dependency is the typed AI Prompt port, and every persisted effect
+// remains behind the local turn/store seams.
+func TestOnboardingCoordinatorTextStagesOneSemanticTurnAndNextPrompt(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.semantic.replayCalls)
+	require.Equal(t, domain.DeterministicOnboardingUUID("semantic-ai", fixture.job.TeacherJobID), fixture.semantic.request.AIExecutionID)
+	require.Equal(t, "Я знаю основы Go.", fixture.semantic.request.Variables.StudentTurn.Text)
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Zero(t, fixture.studentTurns.getCalls)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Equal(t, string(domain.TeacherOnboardingCoordinatorText), fixture.jobs.responses[0].Mode)
+	require.NotEmpty(t, fixture.jobs.responses[0].AssistantUI, "accepted text answer creates only the registry next prompt")
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+	require.Equal(t, domain.TeacherOnboardingEffectAccepted, fixture.turns.turn.StudentEffectState)
+	require.Contains(t, fixture.jobs.responses[0].Body, "Какой основной стек")
+}
+
+func TestOnboardingCoordinatorTextAcceptedResponseUsesDraftLocale(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	language := "en"
+	fixture.studentStates.state.Draft.PreferredLanguage = &language
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Contains(t, fixture.jobs.responses[0].Body, "Which main stack")
+}
+
+func TestOnboardingCoordinatorTextHighImpactCandidateIsResponseOnly(t *testing.T) {
+	fixture := newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepDirection)
+	fixture.semantic.execution.Result.SlotCandidates[0].CodeValue = "data"
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.studentTurns.applyCalls, "high-impact direction stays a deterministic confirmation path")
+	require.Len(t, fixture.jobs.responses, 1)
+	require.NotEmpty(t, fixture.jobs.responses[0].AssistantUI, "the server registry, not model JSON, creates a confirmation UI")
+	require.Equal(t, domain.TeacherOnboardingSemanticDecisionConfirmation, fixture.turns.turn.SemanticDecision.Kind)
+	require.Equal(t, domain.TeacherOnboardingEffectNotAttempted, fixture.turns.turn.StudentEffectState)
+}
+
+func TestOnboardingCoordinatorTextReplaysAIAndStudentAfterAmbiguousTransport(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.semantic.interpretErr = errors.New("post acknowledgement lost")
+	fixture.studentTurns.applyErr = context.DeadlineExceeded
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.semantic.interpretCalls)
+	require.Equal(t, 1, fixture.semantic.replayCalls, "recovery must use the immutable causal AI key")
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Equal(t, 1, fixture.studentTurns.getCalls, "Student timeout is recovered only by exact receipt read")
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+}
+
+func TestOnboardingCoordinatorTextRecoversPersistedReplyWithoutAIReplay(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.semantic.execution.Result.SlotCandidates = []domain.TeacherOnboardingSemanticCandidate{}
+	fixture.semantic.execution.Result.Questions = []domain.TeacherOnboardingSemanticQuestion{}
+	fixture.semantic.execution.Result.Uncertainties = []domain.TeacherOnboardingSemanticUncertainty{}
+	fixture.semantic.execution.Result.Response = "Сохранённый ответ на вопрос."
+	decision, err := domain.NewTeacherOnboardingSemanticDecision(fixture.semantic.execution.Result, fixture.turns.interaction)
+	require.NoError(t, err)
+	fixture.turns.interaction.State = domain.TeacherOnboardingInteractionReserved
+	fixture.turns.interaction.ReservedTeacherJobID = fixture.job.TeacherJobID
+	fixture.turns.interaction.ReservationMode = domain.TeacherOnboardingCoordinatorText
+	fixture.turns.turn = domain.TeacherOnboardingTurn{
+		TeacherJobID: fixture.job.TeacherJobID, SourceEventID: fixture.job.Request.EventID, InteractionID: fixture.turns.interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnAIStaged,
+		CausalAIExecutionID: domain.DeterministicOnboardingUUID("semantic-ai", fixture.job.TeacherJobID),
+		StudentCommandID:    domain.DeterministicOnboardingUUID("semantic-student", fixture.job.TeacherJobID), ResponseCommandID: domain.DeterministicOnboardingUUID("response", fixture.job.TeacherJobID),
+		StudentEffectState: domain.TeacherOnboardingEffectNotAttempted, SemanticDecision: &decision,
+		CreatedAt: fixture.turns.interaction.CreatedAt, UpdatedAt: fixture.turns.interaction.UpdatedAt,
+	}
+	fixture.turns.hasTurn = true
+	fixture.turns.semanticResponse = fixture.semantic.execution.Result.Response
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.semantic.replayCalls)
+	require.Zero(t, fixture.studentTurns.applyCalls)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Equal(t, fixture.semantic.execution.Result.Response, fixture.jobs.responses[0].Body)
+}
+
+func TestOnboardingCoordinatorTextReclaimsAIStagedDecisionAndAppliesStudentExactlyOnce(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	decision, err := domain.NewTeacherOnboardingSemanticDecision(fixture.semantic.execution.Result, fixture.turns.interaction)
+	require.NoError(t, err)
+	fixture.turns.interaction.State = domain.TeacherOnboardingInteractionReserved
+	fixture.turns.interaction.ReservedTeacherJobID = fixture.job.TeacherJobID
+	fixture.turns.interaction.ReservationMode = domain.TeacherOnboardingCoordinatorText
+	fixture.turns.turn = domain.TeacherOnboardingTurn{
+		TeacherJobID: fixture.job.TeacherJobID, SourceEventID: fixture.job.Request.EventID, InteractionID: fixture.turns.interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnAIStaged,
+		CausalAIExecutionID: domain.DeterministicOnboardingUUID("semantic-ai", fixture.job.TeacherJobID),
+		StudentCommandID:    domain.DeterministicOnboardingUUID("semantic-student", fixture.job.TeacherJobID), ResponseCommandID: domain.DeterministicOnboardingUUID("response", fixture.job.TeacherJobID),
+		StudentEffectState: domain.TeacherOnboardingEffectNotAttempted, SemanticDecision: &decision,
+		CreatedAt: fixture.turns.interaction.CreatedAt, UpdatedAt: fixture.turns.interaction.UpdatedAt,
+	}
+	fixture.turns.hasTurn = true
+	fixture.turns.semanticResponse = fixture.semantic.execution.Result.Response
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.semantic.replayCalls)
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+	require.Equal(t, domain.TeacherOnboardingEffectAccepted, fixture.turns.turn.StudentEffectState)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.NotEmpty(t, fixture.jobs.responses[0].AssistantUI)
+}
+
+func TestOnboardingCoordinatorTextTangentPreservesCurrentInteractionWithoutStudentEffect(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.semantic.execution.Result.SlotCandidates = []domain.TeacherOnboardingSemanticCandidate{}
+	fixture.semantic.execution.Result.Questions = []domain.TeacherOnboardingSemanticQuestion{}
+	fixture.semantic.execution.Result.Uncertainties = []domain.TeacherOnboardingSemanticUncertainty{}
+	fixture.semantic.execution.Result.Response = "Отвечу на вопрос и вернёмся к оценке опыта."
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.studentTurns.applyCalls)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Empty(t, fixture.jobs.responses[0].AssistantUI, "a tangent may not manufacture UI from model output")
+	require.Equal(t, "Отвечу на вопрос и вернёмся к оценке опыта.", fixture.jobs.responses[0].Body, "validated user-visible semantic reply is staged only on the job")
+	require.Equal(t, domain.TeacherOnboardingEffectNotAttempted, fixture.turns.turn.StudentEffectState)
+	require.Equal(t, domain.TeacherOnboardingInteractionReserved, fixture.turns.interaction.State, "delivery atomically releases this reservation after Dialog accepts the response")
+}
+
+func TestOnboardingCoordinatorTextPersistsStudentNoEffectProof(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.studentTurns.noEffect = true
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, domain.TeacherOnboardingEffectNoEffect, fixture.turns.turn.StudentEffectState)
+	require.Equal(t, fixture.studentTurns.noEffectProofID, fixture.turns.turn.NoEffectProofID)
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+}
+
+func TestOnboardingCoordinatorTextKnownCompletedPromptStagesWarningWithoutAIOrStudent(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.turns.interaction.State = domain.TeacherOnboardingInteractionCompleted
+	fixture.turns.interaction.ReservedTeacherJobID = fixture.job.TeacherJobID
+	fixture.turns.interaction.ReservationMode = domain.TeacherOnboardingCoordinatorText
+	fixture.turns.interaction.CompletedAt = fixture.turns.interaction.CreatedAt.Add(time.Second)
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.semantic.interpretCalls)
+	require.Zero(t, fixture.studentTurns.applyCalls)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Empty(t, fixture.jobs.responses[0].AssistantUI)
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+	require.Empty(t, fixture.turns.turn.InteractionID)
+}
+
+func TestOnboardingCoordinatorTextDialogReaderFailureNeverStagesKnownPromptWarning(t *testing.T) {
+	fixture := newS5TextCoordinatorFixture(t)
+	fixture.coordinator.DialogReader = s5TextDialogContext{err: context.DeadlineExceeded}
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.True(t, handled)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Empty(t, fixture.jobs.responses)
+	require.False(t, fixture.turns.hasTurn)
+}
+
+func TestOnboardingCoordinatorCanonicalActionUsesReceiptAndZeroAI(t *testing.T) {
+	fixture := newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepDirection)
+	receiptID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.job.Request.ActionReceiptID = receiptID
+	fixture.job.Request.CorrelationID = receiptID
+	receipt := domain.OnboardingActionReceipt{
+		IdempotencyKey: receiptID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID,
+		DialogID: fixture.job.Request.DialogID, SourceMessageID: fixture.job.Request.ReplyToMessageID, SourceMessageVersion: 1,
+		BlockID: "onboarding.direction.d0.v1", ActionID: "direction.backend", Step: domain.OnboardingStepDirection, Status: domain.OnboardingReceiptMaterialized,
+		ExecutionMode: domain.OnboardingActionExecutionCanonical, StudentCommandID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		CanonicalStudentMessageID: fixture.job.Request.CanonicalStudentMessageID,
+	}
+	fixture.coordinator.Receipts = s5TextReceipts{receipt: receipt}
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.semantic.interpretCalls, "canonical UI action is deterministic")
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Equal(t, domain.TeacherOnboardingSlotDirection, fixture.studentTurns.command.Slots[0].SlotCode)
+	require.Equal(t, domain.TeacherStudentTurnExplicitUI, fixture.studentTurns.command.Slots[0].Origin)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.NotEmpty(t, fixture.jobs.responses[0].AssistantUI)
+}
+
+func TestProductAwareCoordinatorCallsPlannerAfterAcceptedEffectAndStagesFoundationTerminal(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.semantic.interpretCalls)
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Equal(t, 1, fixture.readiness.calls)
+	require.Equal(t, domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, fixture.readiness.refs[0])
+	require.Len(t, fixture.productResponses.responses, 1)
+	require.Contains(t, fixture.productResponses.responses[0].Body, domain.TeacherFoundationGoalDisplayName)
+	require.Contains(t, fixture.productResponses.responses[0].Body, "ещё не созданы")
+	require.Empty(t, fixture.productResponses.responses[0].AssistantUI)
+	require.Equal(t, domain.TeacherOnboardingTurnDeliveryPending, fixture.turns.turn.Stage)
+}
+
+func TestDurableHandoffCoordinatorTransfersReadyTurnWithoutStagingS7Response(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	fixture.turns.interaction.SessionSchemaVersion = 3
+	handoffs := &s8CoordinatorHandoffs{}
+	fixture.coordinator.Handoffs = handoffs
+	fixture.coordinator.PlannerHandoffEnabled = false
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Equal(t, 1, fixture.readiness.calls)
+	require.Equal(t, 1, handoffs.calls)
+	require.Equal(t, fixture.job.Request.EventID, handoffs.enqueue.EventID)
+	require.Equal(t, fixture.job.ClaimToken, handoffs.enqueue.ClaimToken)
+	require.Equal(t, fixture.job.TeacherJobID, handoffs.enqueue.Intent.SourceTeacherJobID)
+	require.Equal(t, fixture.turns.interaction.ID, handoffs.enqueue.Intent.SourceInteractionID)
+	require.Equal(t, domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, handoffs.enqueue.Intent.StateRef)
+	require.Equal(t, domain.TeacherFoundationGoalCode, handoffs.enqueue.Intent.Goal.Code)
+	require.Empty(t, fixture.productResponses.responses, "S8 owns the READY notification after durable Planner acceptance")
+	require.Empty(t, fixture.jobs.responses, "the source job is transferred, not staged for S7 delivery")
+}
+
+func TestPersistedV2TurnDoesNotUpgradeToHandoffFromCurrentFlag(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	handoffs := &s8CoordinatorHandoffs{}
+	fixture.coordinator.Handoffs = handoffs
+	fixture.coordinator.PlannerHandoffEnabled = true
+
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, handoffs.calls)
+	require.Len(t, fixture.productResponses.responses, 1)
+}
+
+func TestProductAwareTerminalDeliveryClosesPromptAcrossCrashRetry(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Len(t, fixture.productResponses.responses, 1)
+
+	response := fixture.productResponses.responses[0]
+	fixture.job.CoordinatorMode = response.Mode
+	fixture.job.ResponseBody = response.Body
+	fixture.job.ResponseAssistantUI = response.AssistantUI
+	appender := &s7DeliveryAppender{message: domain.DialogMessage{ID: "99999999-9999-4999-8999-999999999999"}}
+	deliveries := &s7DeliveryRecorder{failOnce: true}
+	fixture.coordinator.Appender = appender
+	fixture.coordinator.Deliveries = deliveries
+
+	err = fixture.coordinator.Deliver(context.Background(), fixture.job)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	err = fixture.coordinator.Deliver(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.Equal(t, 2, appender.calls)
+	require.Equal(t, appender.keys[0], appender.keys[1], "retry reuses the exact durable response command")
+	require.Equal(t, 2, deliveries.calls)
+	require.False(t, deliveries.preserve)
+	require.Nil(t, deliveries.next)
+	require.Equal(t, 1, fixture.readiness.calls, "delivery recovery never calls Planner after response staging")
+}
+
+func TestProductAwareCoordinatorRetriesPlanner409OnlyAfterExactReceiptRecovery(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	fixture.readiness.errors = []error{domain.ErrTeacherLearningReadinessStale, nil}
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 2, fixture.readiness.calls)
+	require.GreaterOrEqual(t, fixture.studentTurns.getCalls, 2)
+	require.Len(t, fixture.productResponses.responses, 1)
+}
+
+func TestProductAwareCoordinatorPlannerFailureLeavesAcceptedTurnUnstagedAndRetryable(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	fixture.readiness.errors = []error{domain.ErrTeacherLearningReadinessUnavailable}
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.True(t, handled)
+	require.ErrorIs(t, err, domain.ErrTeacherLearningReadinessUnavailable)
+	require.Equal(t, domain.TeacherOnboardingEffectAccepted, fixture.turns.turn.StudentEffectState)
+	require.Equal(t, domain.TeacherOnboardingTurnStudentStaged, fixture.turns.turn.Stage)
+	require.Empty(t, fixture.productResponses.responses)
+	require.Empty(t, fixture.jobs.responses)
+}
+
+func TestProductAwareCoordinatorNoEffectMakesZeroPlannerCalls(t *testing.T) {
+	fixture := newProductAwareActionFixture(t)
+	fixture.studentTurns.noEffect = true
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Zero(t, fixture.readiness.calls)
+	require.Empty(t, fixture.productResponses.responses)
+	require.Len(t, fixture.jobs.responses, 1)
+}
+
+func TestProductAwareMultipleFactNoEffectPreservesPromptWithoutPlanner(t *testing.T) {
+	fixture := newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepGoal)
+	proofID := "99999999-9999-4999-8999-999999999999"
+	decision, err := domain.NormalizeTeacherOnboardingSemanticDecision(domain.TeacherOnboardingSemanticDecision{
+		Kind: domain.TeacherOnboardingSemanticDecisionMutation, PolicyVersion: domain.TeacherOnboardingPromptPolicyV2,
+		Candidates: []domain.TeacherOnboardingSemanticCandidate{
+			{Slot: domain.TeacherOnboardingSlotGoalCode, CodeValue: "learn_programming", StringListValue: []string{}, ConfidenceBasisPoints: 9800},
+			{Slot: domain.TeacherOnboardingSlotExperience, CodeValue: "beginner", StringListValue: []string{}, ConfidenceBasisPoints: 9700},
+		},
+	})
+	require.NoError(t, err)
+	turn := domain.TeacherOnboardingTurn{
+		TeacherJobID: fixture.job.TeacherJobID, SourceEventID: fixture.job.Request.EventID, InteractionID: fixture.turns.interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnStudentStaged,
+		CausalAIExecutionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", StudentCommandID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		ResponseCommandID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", StudentEffectState: domain.TeacherOnboardingEffectNoEffect,
+		NoEffectProofID: proofID, SemanticDecision: &decision, CreatedAt: fixture.turns.interaction.CreatedAt, UpdatedAt: fixture.turns.interaction.CreatedAt,
+	}
+	turn, err = domain.NewTeacherOnboardingTurn(turn)
+	require.NoError(t, err)
+	fixture.turns.turn, fixture.turns.hasTurn = turn, true
+	readiness := &s7Readiness{}
+	fixture.coordinator.Readiness = readiness
+
+	err = fixture.coordinator.stageTextResponse(context.Background(), fixture.job, turn, fixture.turns.interaction, decision, "ignored model wording", domain.TeacherOnboardingPromptPolicyV2)
+	require.NoError(t, err)
+	require.Zero(t, readiness.calls)
+	require.Equal(t, domain.TeacherOnboardingTurnResponseStaged, fixture.turns.turn.Stage)
+	require.Equal(t, domain.TeacherOnboardingEffectNoEffect, fixture.turns.turn.StudentEffectState)
+	require.Len(t, fixture.jobs.responses, 1)
+	require.Empty(t, fixture.jobs.responses[0].AssistantUI)
+}
+
+func TestProductAwareCoordinatorAppliesMultipleLowRiskFactsInOneAtomicStudentPatch(t *testing.T) {
+	fixture := newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepDirection)
+	body, ui, err := domain.BuildProductAwareTeacherOnboardingPrompt(domain.OnboardingStepGoal, "ru", 0)
+	require.NoError(t, err)
+	now := fixture.turns.interaction.CreatedAt
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: fixture.job.Request.DialogID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	prompt := domain.DialogMessage{ID: fixture.job.Request.ReplyToMessageID, DialogID: fixture.job.Request.DialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, Body: body, AssistantUI: ui, Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now}
+	interaction, err := domain.NewS5OnboardingInteraction(binding, prompt, domain.OnboardingStepGoal, 0, 0, 2, now)
+	require.NoError(t, err)
+	fixture.turns.interaction = interaction
+	source := domain.DialogMessage{ID: fixture.job.Request.SourceMessageID, DialogID: fixture.job.Request.DialogID, AuthorType: domain.DialogMessageAuthorUser, Channel: domain.DialogMessageChannelWeb, SenderID: fixture.job.Request.StudentID, ReplyToMessageID: prompt.ID, Body: "Хочу научиться программировать, начинаю с нуля, материалы на русском.", Status: 1, Version: 1, MessageSequence: 2, LastEventSequence: 2, CreatedAt: now}
+	fixture.coordinator.DialogReader = s5TextDialogContext{value: domain.DialogRequestContext{DialogID: fixture.job.Request.DialogID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral, SourceMessageID: source.ID, Messages: []domain.DialogMessage{prompt, source}}}
+	fixture.semantic.execution.Result, err = domain.NormalizeTeacherOnboardingSemanticResult(domain.TeacherOnboardingSemanticResult{Schema: domain.TeacherOnboardingSemanticSchemaCode, Response: "Понял.", SlotCandidates: []domain.TeacherOnboardingSemanticCandidate{
+		{Slot: domain.TeacherOnboardingSlotGoalCode, CodeValue: "learn_programming", StringListValue: []string{}, ConfidenceBasisPoints: 9800},
+		{Slot: domain.TeacherOnboardingSlotExperience, CodeValue: "beginner", StringListValue: []string{}, ConfidenceBasisPoints: 9700},
+		{Slot: domain.TeacherOnboardingSlotLanguage, CodeValue: "ru", StringListValue: []string{}, ConfidenceBasisPoints: 9600},
+	}, Questions: []domain.TeacherOnboardingSemanticQuestion{}, Uncertainties: []domain.TeacherOnboardingSemanticUncertainty{}})
+	require.NoError(t, err)
+	readiness := &s7Readiness{result: domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessNeedsClarification,
+		ReasonCodes: []string{domain.TeacherReadinessReasonProfileIncomplete}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 1}, ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated}}
+	productResponses := &s7ProductResponses{turns: fixture.turns}
+	fixture.coordinator.Readiness, fixture.coordinator.ProductResponses = readiness, productResponses
+	handled, err := fixture.coordinator.Process(context.Background(), fixture.job)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, 1, fixture.studentTurns.applyCalls)
+	require.Len(t, fixture.studentTurns.command.Slots, 3)
+	require.Equal(t, int64(1), fixture.studentStates.state.Draft.Version)
+	require.Len(t, productResponses.responses, 1)
+	require.Contains(t, productResponses.responses[0].Body, "направление")
+	require.NotContains(t, productResponses.responses[0].Body, "цель")
+}
+
+func newProductAwareActionFixture(t *testing.T) s7ProductFixture {
+	t.Helper()
+	fixture := newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepDirection)
+	goal, experience, language := "learn_programming", "beginner", "ru"
+	fixture.studentStates.state.Draft.Version = 3
+	fixture.studentStates.state.Draft.GoalCode = &goal
+	fixture.studentStates.state.Draft.SelfAssessedExperience = &experience
+	fixture.studentStates.state.Draft.PreferredLanguage = &language
+	now := fixture.turns.interaction.CreatedAt
+	fixture.studentStates.state.Draft.CreatedAt, fixture.studentStates.state.Draft.UpdatedAt = &now, &now
+	body, ui, err := domain.BuildProductAwareTeacherOnboardingPrompt(domain.OnboardingStepDirection, "ru", 3)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: fixture.job.Request.DialogID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	prompt := domain.DialogMessage{ID: fixture.job.Request.ReplyToMessageID, DialogID: fixture.job.Request.DialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, Body: body, AssistantUI: ui, Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now}
+	interaction, err := domain.NewS5OnboardingInteraction(binding, prompt, domain.OnboardingStepDirection, 3, 0, 2, now)
+	require.NoError(t, err)
+	fixture.turns.interaction = interaction
+	source := domain.DialogMessage{ID: fixture.job.Request.SourceMessageID, DialogID: fixture.job.Request.DialogID, AuthorType: domain.DialogMessageAuthorUser, Channel: domain.DialogMessageChannelWeb, SenderID: fixture.job.Request.StudentID, ReplyToMessageID: prompt.ID, Body: "Выбираю: Не знаю", Status: 1, Version: 1, MessageSequence: 2, LastEventSequence: 2, CreatedAt: now}
+	fixture.coordinator.DialogReader = s5TextDialogContext{value: domain.DialogRequestContext{DialogID: fixture.job.Request.DialogID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral, SourceMessageID: source.ID, Messages: []domain.DialogMessage{prompt, source}}}
+	receiptID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.job.Request.ActionReceiptID, fixture.job.Request.CorrelationID = receiptID, receiptID
+	receipt := domain.OnboardingActionReceipt{IdempotencyKey: receiptID, StudentID: fixture.job.Request.StudentID, PersonalTeacherID: fixture.job.Request.PersonalTeacherID, DialogID: fixture.job.Request.DialogID,
+		SourceMessageID: prompt.ID, SourceMessageVersion: 1, BlockID: "onboarding.direction.d3.v2", ActionID: "direction.undecided", Step: domain.OnboardingStepDirection,
+		Status: domain.OnboardingReceiptMaterialized, ExecutionMode: domain.OnboardingActionExecutionCanonical, StudentCommandID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", CanonicalStudentMessageID: fixture.job.Request.CanonicalStudentMessageID}
+	fixture.coordinator.Receipts = s5TextReceipts{receipt: receipt}
+	readiness := &s7Readiness{result: domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion}}}
+	productResponses := &s7ProductResponses{turns: fixture.turns}
+	fixture.coordinator.Readiness, fixture.coordinator.ProductResponses = readiness, productResponses
+	return s7ProductFixture{s5TextCoordinatorFixture: fixture, readiness: readiness, productResponses: productResponses}
+}
+
+type s7ProductFixture struct {
+	s5TextCoordinatorFixture
+	readiness        *s7Readiness
+	productResponses *s7ProductResponses
+}
+
+type s8CoordinatorHandoffs struct {
+	enqueue repository.TeacherOnboardingHandoffEnqueue
+	calls   int
+}
+
+func (store *s8CoordinatorHandoffs) Enqueue(_ context.Context, input repository.TeacherOnboardingHandoffEnqueue, _ time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	store.calls++
+	store.enqueue = input
+	return input.Intent, true, nil
+}
+func (*s8CoordinatorHandoffs) GetByStudentState(context.Context, string, domain.TeacherStudentReadinessStateRef, domain.TeacherLearningReadinessGoal) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*s8CoordinatorHandoffs) ClaimDispatch(context.Context, string, string, time.Time, time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*s8CoordinatorHandoffs) RetryDispatch(context.Context, string, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (*s8CoordinatorHandoffs) MarkAccepted(context.Context, string, string, domain.TeacherOnboardingPlanHandoff, time.Time) error {
+	return nil
+}
+func (*s8CoordinatorHandoffs) ClaimNotification(context.Context, string, string, time.Time, time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*s8CoordinatorHandoffs) RetryNotification(context.Context, string, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (*s8CoordinatorHandoffs) MarkDelivered(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+func (*s8CoordinatorHandoffs) MarkActivePath(context.Context, string, string, time.Time) error {
+	return nil
+}
+func (*s8CoordinatorHandoffs) Block(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+
+type s7Readiness struct {
+	result domain.TeacherLearningReadiness
+	errors []error
+	refs   []domain.TeacherStudentReadinessStateRef
+	calls  int
+}
+
+func (stub *s7Readiness) ResolveLearningReadiness(_ context.Context, _ string, ref domain.TeacherStudentReadinessStateRef) (domain.TeacherLearningReadiness, error) {
+	stub.refs = append(stub.refs, ref)
+	index := stub.calls
+	stub.calls++
+	if index < len(stub.errors) && stub.errors[index] != nil {
+		return domain.TeacherLearningReadiness{}, stub.errors[index]
+	}
+	return stub.result, nil
+}
+
+type s7ProductResponses struct {
+	turns     *s5TextTurns
+	responses []domain.TeacherCoordinatedDialogResponse
+}
+
+type s7DeliveryAppender struct {
+	message domain.DialogMessage
+	keys    []string
+	calls   int
+}
+
+func (appender *s7DeliveryAppender) AppendTeacherCoordinatedResponse(_ context.Context, _ domain.DialogTeacherRequest, key string, _ domain.TeacherCoordinatedDialogResponse) (domain.DialogMessage, error) {
+	appender.calls++
+	appender.keys = append(appender.keys, key)
+	return appender.message, nil
+}
+
+type s7DeliveryRecorder struct {
+	failOnce bool
+	calls    int
+	next     *domain.TeacherOnboardingInteraction
+	preserve bool
+}
+
+func (store *s7DeliveryRecorder) CompleteOnboardingDelivery(_ context.Context, _, _, _ string, next *domain.TeacherOnboardingInteraction, preserve bool, _ time.Time) error {
+	store.calls++
+	store.next, store.preserve = next, preserve
+	if store.failOnce {
+		store.failOnce = false
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func (store *s7ProductResponses) StageProductAwareOnboardingResponse(_ context.Context, _, _ string, response domain.TeacherCoordinatedDialogResponse, now time.Time) error {
+	store.responses = append(store.responses, response)
+	store.turns.turn.Stage = domain.TeacherOnboardingTurnDeliveryPending
+	store.turns.turn.UpdatedAt = now
+	return nil
+}
+
+type s5TextCoordinatorFixture struct {
+	coordinator   OnboardingCoordinator
+	job           domain.TeacherDialogJob
+	jobs          *s5TextJobs
+	turns         *s5TextTurns
+	studentTurns  *s5TextStudentTurns
+	semantic      *s5TextSemantic
+	studentStates *s5TextStudentStates
+}
+
+func newS5TextCoordinatorFixture(t *testing.T) s5TextCoordinatorFixture {
+	return newS5TextCoordinatorFixtureForStep(t, domain.OnboardingStepExperience)
+}
+
+func newS5TextCoordinatorFixtureForStep(t *testing.T, step domain.TeacherOnboardingStep) s5TextCoordinatorFixture {
+	t.Helper()
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	const (
+		studentID = "11111111-1111-4111-8111-111111111111"
+		teacherID = "22222222-2222-4222-8222-222222222222"
+		dialogID  = "33333333-3333-4333-8333-333333333333"
+		promptID  = "44444444-4444-4444-8444-444444444444"
+		messageID = "55555555-5555-4555-8555-555555555555"
+		jobID     = "66666666-6666-4666-8666-666666666666"
+		eventID   = "77777777-7777-4777-8777-777777777777"
+		claimID   = "88888888-8888-4888-8888-888888888888"
+	)
+	direction := "backend"
+	version := int64(1)
+	answers := domain.StudentOnboardingAnswers{DirectionCode: &direction}
+	createdAt, updatedAt := &now, &now
+	if step == domain.OnboardingStepDirection {
+		version = 0
+		answers = domain.StudentOnboardingAnswers{}
+		createdAt, updatedAt = nil, nil
+	}
+	state := domain.TeacherStudentOnboardingState{
+		Schema: domain.TeacherStudentOnboardingStateSchema, ProfileVersion: 0,
+		Draft: domain.StudentOnboardingDraft{
+			Schema: domain.StudentOnboardingDraftSchema, StudentID: studentID, Status: domain.StudentOnboardingDraftDraft,
+			StudentOnboardingAnswers: answers,
+			Version:                  version, CreatedAt: createdAt, UpdatedAt: updatedAt,
+		},
+	}
+	body, ui, err := domain.BuildTeacherOnboardingPrompt(step, "ru", state.Draft.Version)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral,
+	})
+	require.NoError(t, err)
+	prompt := domain.DialogMessage{
+		ID: promptID, DialogID: dialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb,
+		PersonalTeacherID: teacherID, Body: body, AssistantUI: ui, Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now,
+	}
+	interaction, err := domain.NewS5OnboardingInteraction(binding, prompt, step, state.Draft.Version, 0, 1, now)
+	require.NoError(t, err)
+	source := domain.DialogMessage{
+		ID: messageID, DialogID: dialogID, AuthorType: domain.DialogMessageAuthorUser, Channel: domain.DialogMessageChannelWeb,
+		SenderID: studentID, ReplyToMessageID: promptID, Body: "Я знаю основы Go.", Status: 1, Version: 1, MessageSequence: 2, LastEventSequence: 2, CreatedAt: now,
+	}
+	request := domain.DialogTeacherRequest{
+		SchemaVersion: 2, EventID: eventID, DialogID: dialogID, EventSequence: 2, TeacherTurnSequence: 1,
+		SourceMessageID: messageID, SourceSequence: 2, SourceMessageVersion: 1, ReplyToMessageID: promptID,
+		CanonicalStudentMessageID: messageID, CorrelationID: messageID, DialogCausationID: messageID, CausationID: eventID,
+		SourceChannel: domain.DialogMessageChannelWeb, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral, OccurredAt: now,
+	}
+	job := domain.TeacherDialogJob{TeacherJobID: jobID, Request: request, ClaimToken: claimID, CoordinatorMode: "legacy"}
+	slot, found := domain.TeacherOnboardingSlotForStep(step)
+	require.True(t, found)
+	code := "basic"
+	if slot == domain.TeacherOnboardingSlotDirection {
+		code = "backend"
+	}
+	result, err := domain.NormalizeTeacherOnboardingSemanticResult(domain.TeacherOnboardingSemanticResult{
+		Schema: domain.TeacherOnboardingSemanticSchemaCode, Response: "Понял, зафиксирую базовый уровень и продолжим.",
+		SlotCandidates: []domain.TeacherOnboardingSemanticCandidate{{
+			Slot: slot, CodeValue: code, TextValue: "", StringListValue: []string{}, IntegerValue: 0, ConfidenceBasisPoints: 9000,
+		}},
+		Questions: []domain.TeacherOnboardingSemanticQuestion{}, Uncertainties: []domain.TeacherOnboardingSemanticUncertainty{},
+	})
+	require.NoError(t, err)
+	_, err = domain.NewTeacherOnboardingSemanticDecision(result, interaction)
+	require.NoError(t, err, "the fixture must be a persistable bounded semantic decision")
+	jobs := &s5TextJobs{}
+	turns := &s5TextTurns{interaction: interaction}
+	studentStates := &s5TextStudentStates{state: state}
+	studentTurns := &s5TextStudentTurns{states: studentStates}
+	semantic := &s5TextSemantic{execution: domain.TeacherOnboardingSemanticExecution{Result: result, LanguageCode: "ru", TemplateVersion: 1}}
+	contextReader := s5TextDialogContext{value: domain.DialogRequestContext{
+		DialogID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral,
+		SourceMessageID: messageID, Messages: []domain.DialogMessage{prompt, source},
+	}}
+	coordinator := OnboardingCoordinator{
+		Jobs: jobs, Turns: turns, StudentTurns: studentTurns, Students: studentStates, Semantic: semantic,
+		DialogReader: contextReader, Appender: s5TextAppender{}, Deliveries: s5TextDeliveries{}, Clock: s5TextClock{now: now},
+	}
+	return s5TextCoordinatorFixture{coordinator: coordinator, job: job, jobs: jobs, turns: turns, studentTurns: studentTurns, semantic: semantic, studentStates: studentStates}
+}
+
+type s5TextClock struct{ now time.Time }
+
+func (clock s5TextClock) Now() time.Time { return clock.now }
+
+type s5TextJobs struct {
+	responses []domain.TeacherCoordinatedDialogResponse
+}
+
+type s5TextReceipts struct {
+	receipt domain.OnboardingActionReceipt
+}
+
+func (store s5TextReceipts) Get(_ context.Context, id string) (domain.OnboardingActionReceipt, bool, error) {
+	return store.receipt, store.receipt.IdempotencyKey == id, nil
+}
+
+func (jobs *s5TextJobs) Accept(context.Context, domain.TeacherDialogJob) (bool, error) {
+	return false, nil
+}
+func (jobs *s5TextJobs) Claim(context.Context, repository.TeacherDialogClaim) (domain.TeacherDialogJob, bool, error) {
+	return domain.TeacherDialogJob{}, false, nil
+}
+func (jobs *s5TextJobs) RenewLease(context.Context, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) SaveGenerated(context.Context, string, string, domain.TeacherDecision, domain.IntegrationEvent, string, string, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) SaveCoordinatedResponse(_ context.Context, _, _ string, response domain.TeacherCoordinatedDialogResponse, _ time.Time) error {
+	jobs.responses = append(jobs.responses, response)
+	return nil
+}
+func (jobs *s5TextJobs) CompleteDelivery(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) RecordFailedNoEffect(context.Context, string, string, domain.TeacherDialogNoEffectProof, domain.TeacherDialogRecoverableOutcome, string, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) MarkReconciliation(context.Context, string, string, domain.TeacherTurnReconciliationState, string, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) GetCursor(context.Context, string) (domain.TeacherDialogTurnCursor, error) {
+	return domain.TeacherDialogTurnCursor{}, nil
+}
+func (jobs *s5TextJobs) Retry(context.Context, string, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (jobs *s5TextJobs) Block(context.Context, string, string, string, time.Time) error { return nil }
+
+type s5TextTurns struct {
+	interaction      domain.TeacherOnboardingInteraction
+	turn             domain.TeacherOnboardingTurn
+	hasTurn          bool
+	semanticResponse string
+}
+
+func (store *s5TextTurns) EnsureTurn(_ context.Context, turn domain.TeacherOnboardingTurn, _ string) (domain.TeacherOnboardingTurn, bool, error) {
+	if store.hasTurn {
+		return store.turn, false, nil
+	}
+	normalized, err := domain.NewTeacherOnboardingTurn(turn)
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	store.turn, store.hasTurn = normalized, true
+	return store.turn, true, nil
+}
+func (store *s5TextTurns) GetTurn(_ context.Context, teacherJobID string) (domain.TeacherOnboardingTurn, bool, error) {
+	return store.turn, store.hasTurn && store.turn.TeacherJobID == teacherJobID, nil
+}
+func (store *s5TextTurns) EnsureActiveInteraction(_ context.Context, interaction domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingInteraction, bool, error) {
+	store.interaction = interaction
+	return interaction, true, nil
+}
+func (store *s5TextTurns) GetActiveInteraction(_ context.Context, dialogID, promptID, teacherID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	found := store.interaction.DialogID == dialogID && store.interaction.PromptMessageID == promptID && store.interaction.PersonalTeacherID == teacherID &&
+		(store.interaction.State == domain.TeacherOnboardingInteractionActive || store.interaction.State == domain.TeacherOnboardingInteractionReserved)
+	return store.interaction, found, nil
+}
+func (store *s5TextTurns) GetInteraction(_ context.Context, dialogID, promptID, teacherID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	found := store.interaction.DialogID == dialogID && store.interaction.PromptMessageID == promptID && store.interaction.PersonalTeacherID == teacherID
+	return store.interaction, found, nil
+}
+func (*s5TextTurns) GetConfirmationProposal(context.Context, domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingSemanticDecision, bool, error) {
+	return domain.TeacherOnboardingSemanticDecision{}, false, nil
+}
+func (store *s5TextTurns) ReserveInteraction(_ context.Context, interactionID, teacherJobID string, mode domain.TeacherOnboardingCoordinatorMode, receiptID string, now time.Time) (domain.TeacherOnboardingInteraction, error) {
+	if store.interaction.ID != interactionID || (store.interaction.State == domain.TeacherOnboardingInteractionReserved && store.interaction.ReservedTeacherJobID != teacherJobID) {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrTeacherOnboardingConflict
+	}
+	store.interaction.State = domain.TeacherOnboardingInteractionReserved
+	store.interaction.ReservedTeacherJobID = teacherJobID
+	store.interaction.ReservedActionReceiptID = receiptID
+	store.interaction.ReservationMode = mode
+	store.interaction.UpdatedAt = now
+	value, err := domain.NormalizeTeacherOnboardingInteraction(store.interaction)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	store.interaction = value
+	return value, nil
+}
+func (store *s5TextTurns) CloseActiveInteractionForTerminal(_ context.Context, dialogID, teacherID string, reason domain.TeacherOnboardingInteractionClosedReason, now time.Time) (domain.TeacherOnboardingInteraction, bool, error) {
+	if store.interaction.DialogID != dialogID || store.interaction.PersonalTeacherID != teacherID ||
+		(store.interaction.State != domain.TeacherOnboardingInteractionActive && store.interaction.State != domain.TeacherOnboardingInteractionReserved) {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	if store.interaction.State == domain.TeacherOnboardingInteractionReserved {
+		return store.interaction, true, nil
+	}
+	store.interaction.State = domain.TeacherOnboardingInteractionClosed
+	store.interaction.ClosedReason = reason
+	store.interaction.ClosedAt = now
+	store.interaction.UpdatedAt = now
+	return store.interaction, true, nil
+}
+func (store *s5TextTurns) SaveSemanticDecision(_ context.Context, teacherJobID, _ string, decision domain.TeacherOnboardingSemanticDecision, response string, now time.Time) (string, error) {
+	if !store.hasTurn || store.turn.TeacherJobID != teacherJobID || store.turn.Stage != domain.TeacherOnboardingTurnAIStaged {
+		return "", domain.ErrTeacherOnboardingConflict
+	}
+	normalized, err := domain.NormalizeTeacherOnboardingSemanticDecision(decision)
+	if err != nil {
+		return "", err
+	}
+	if store.turn.SemanticDecision != nil && store.turn.SemanticDecision.Digest != normalized.Digest {
+		return "", domain.ErrTeacherOnboardingConflict
+	}
+	store.turn.SemanticDecision = &normalized
+	store.turn.UpdatedAt = now
+	if response != "" {
+		store.semanticResponse = response
+	}
+	if store.semanticResponse == "" {
+		return "", domain.ErrTeacherOnboardingConflict
+	}
+	return store.semanticResponse, nil
+}
+func (store *s5TextTurns) Advance(_ context.Context, teacherJobID, _ string, expected, next domain.TeacherOnboardingTurnStage, effect domain.TeacherOnboardingStudentEffectState, proofID, outcomeID string, now time.Time) error {
+	if !store.hasTurn || store.turn.TeacherJobID != teacherJobID || store.turn.Stage != expected || !domain.CanAdvanceTeacherOnboardingTurn(expected, next) {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	store.turn.Stage, store.turn.StudentEffectState, store.turn.NoEffectProofID, store.turn.RecoverableOutcomeID, store.turn.UpdatedAt = next, effect, proofID, outcomeID, now
+	if _, err := domain.NewTeacherOnboardingTurn(store.turn); err != nil {
+		return err
+	}
+	return nil
+}
+
+type s5TextStudentStates struct {
+	state domain.TeacherStudentOnboardingState
+}
+
+func (states *s5TextStudentStates) GetTeacherOnboardingState(context.Context, string) (domain.TeacherStudentOnboardingState, error) {
+	return states.state, nil
+}
+func (states *s5TextStudentStates) ReplaceTeacherOnboardingDraft(context.Context, string, string, int64, domain.StudentOnboardingAnswers) (domain.StudentOnboardingDraft, error) {
+	return domain.StudentOnboardingDraft{}, domain.ErrTeacherOnboardingConflict
+}
+func (states *s5TextStudentStates) FinalizeTeacherOnboardingDraft(context.Context, string, string, int64, int64) (domain.StudentOnboardingFinalizeResponse, error) {
+	return domain.StudentOnboardingFinalizeResponse{}, domain.ErrTeacherOnboardingConflict
+}
+
+type s5TextStudentTurns struct {
+	states          *s5TextStudentStates
+	applyErr        error
+	applyCalls      int
+	getCalls        int
+	command         domain.TeacherStudentOnboardingTurnCommand
+	noEffect        bool
+	noEffectProofID string
+	applied         bool
+}
+
+func (turns *s5TextStudentTurns) ApplyTeacherOnboardingTurn(_ context.Context, _ string, command domain.TeacherStudentOnboardingTurnCommand) (domain.TeacherStudentOnboardingTurnResult, error) {
+	turns.applyCalls++
+	turns.command = command
+	if turns.applyErr != nil {
+		return domain.TeacherStudentOnboardingTurnResult{}, turns.applyErr
+	}
+	turns.applyState(command)
+	return turns.result(command), nil
+}
+func (turns *s5TextStudentTurns) GetTeacherOnboardingTurn(_ context.Context, _ string, commandID string) (domain.TeacherStudentOnboardingTurnResult, error) {
+	turns.getCalls++
+	if turns.command.StudentCommandID == "" || turns.command.StudentCommandID != commandID {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrTeacherOnboardingTurnUnknown
+	}
+	turns.applyState(turns.command)
+	return turns.result(turns.command), nil
+}
+func (turns *s5TextStudentTurns) ProveTeacherOnboardingTurnNoEffect(context.Context, string, string, domain.TeacherStudentOnboardingTurnNoEffectProof) (domain.TeacherStudentOnboardingTurnResult, error) {
+	return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrTeacherOnboardingConflict
+}
+func (turns *s5TextStudentTurns) applyState(command domain.TeacherStudentOnboardingTurnCommand) {
+	if turns.noEffect || turns.applied {
+		return
+	}
+	for _, slot := range command.Slots {
+		switch slot.SlotCode {
+		case domain.TeacherOnboardingSlotDirection:
+			value := *slot.CodeValue
+			turns.states.state.Draft.DirectionCode = &value
+		case domain.TeacherOnboardingSlotExperience:
+			value := *slot.CodeValue
+			turns.states.state.Draft.SelfAssessedExperience = &value
+		case domain.TeacherOnboardingSlotGoalCode:
+			value := *slot.CodeValue
+			turns.states.state.Draft.GoalCode = &value
+		case domain.TeacherOnboardingSlotLanguage:
+			value := *slot.CodeValue
+			turns.states.state.Draft.PreferredLanguage = &value
+		case domain.TeacherOnboardingSlotDesiredStacks:
+			values := append([]string(nil), (*slot.StacksValue)...)
+			turns.states.state.Draft.DesiredStacks = &values
+		}
+	}
+	turns.states.state.Draft.Version++
+	if turns.states.state.Draft.CreatedAt == nil {
+		now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+		turns.states.state.Draft.CreatedAt = &now
+		turns.states.state.Draft.UpdatedAt = &now
+	}
+	turns.applied = true
+}
+func (turns *s5TextStudentTurns) result(command domain.TeacherStudentOnboardingTurnCommand) domain.TeacherStudentOnboardingTurnResult {
+	if turns.noEffect {
+		if turns.noEffectProofID == "" {
+			turns.noEffectProofID = "99999999-9999-4999-8999-999999999999"
+		}
+		proofID := turns.noEffectProofID
+		return domain.TeacherStudentOnboardingTurnResult{
+			Schema: domain.TeacherStudentOnboardingTurnResultSchema, StudentCommandID: command.StudentCommandID,
+			CanonicalStudentMessageID: command.CanonicalStudentMessageID, StudentEffectState: "no_effect", NoEffectProofID: &proofID,
+		}
+	}
+	version := turns.states.state.Draft.Version
+	return domain.TeacherStudentOnboardingTurnResult{
+		Schema: domain.TeacherStudentOnboardingTurnResultSchema, StudentCommandID: command.StudentCommandID,
+		CanonicalStudentMessageID: command.CanonicalStudentMessageID, StudentEffectState: "accepted", ResultDraftVersion: &version,
+	}
+}
+
+type s5TextSemantic struct {
+	execution      domain.TeacherOnboardingSemanticExecution
+	interpretErr   error
+	interpretCalls int
+	replayCalls    int
+	request        domain.TeacherOnboardingSemanticRequest
+}
+
+func (semantic *s5TextSemantic) InterpretOnboardingSemantic(_ context.Context, request domain.TeacherOnboardingSemanticRequest) (domain.TeacherOnboardingSemanticExecution, error) {
+	semantic.interpretCalls++
+	semantic.request = request
+	return semantic.execution, semantic.interpretErr
+}
+func (semantic *s5TextSemantic) ReplayOnboardingSemantic(context.Context, string) (domain.TeacherOnboardingSemanticExecution, error) {
+	semantic.replayCalls++
+	return semantic.execution, nil
+}
+
+type s5TextDialogContext struct {
+	value domain.DialogRequestContext
+	err   error
+}
+
+func (reader s5TextDialogContext) GetTeacherRequestContext(context.Context, domain.DialogTeacherRequest, int) (domain.DialogRequestContext, error) {
+	return reader.value, reader.err
+}
+
+type s5TextAppender struct{}
+
+func (s5TextAppender) AppendTeacherCoordinatedResponse(context.Context, domain.DialogTeacherRequest, string, domain.TeacherCoordinatedDialogResponse) (domain.DialogMessage, error) {
+	return domain.DialogMessage{}, domain.ErrTeacherOnboardingConflict
+}
+
+type s5TextDeliveries struct{}
+
+func (s5TextDeliveries) CompleteOnboardingDelivery(context.Context, string, string, string, *domain.TeacherOnboardingInteraction, bool, time.Time) error {
+	return domain.ErrTeacherOnboardingConflict
+}
+
+var (
+	_ repository.TeacherDialogJob                         = (*s5TextJobs)(nil)
+	_ repository.OnboardingActionReceiptLookup            = s5TextReceipts{}
+	_ repository.TeacherOnboardingTurnStore               = (*s5TextTurns)(nil)
+	_ repository.StudentOnboardingGateway                 = (*s5TextStudentStates)(nil)
+	_ repository.TeacherStudentOnboardingTurnGateway      = (*s5TextStudentTurns)(nil)
+	_ repository.TeacherOnboardingSemanticInterpreter     = (*s5TextSemantic)(nil)
+	_ repository.DialogRequestContextReader               = s5TextDialogContext{}
+	_ repository.DialogTeacherCoordinatedResponseAppender = s5TextAppender{}
+	_ repository.TeacherOnboardingDeliveryStore           = s5TextDeliveries{}
+)

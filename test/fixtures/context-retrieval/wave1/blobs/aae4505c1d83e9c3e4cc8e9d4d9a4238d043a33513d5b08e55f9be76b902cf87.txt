@@ -1,0 +1,123 @@
+package learningplanner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+func (c Client) diagnosticRequest(ctx context.Context, method, studentID, planID, suffix string, output any) error {
+	if !canonicalUUID(studentID) || !canonicalUUID(planID) || c.HTTPClient == nil || strings.TrimSpace(c.BaseURL) == "" || strings.TrimSpace(c.InternalToken) == "" {
+		return domain.ErrCurriculumUnavailable
+	}
+	var body io.Reader
+	if method == http.MethodPost {
+		body = strings.NewReader(`{"schema":"diagnostic-placement-consume.v1"}`)
+	}
+	endpoint := strings.TrimRight(c.BaseURL, "/") + "/internal/students/" + url.PathEscape(studentID) + "/diagnostic-assessment-plans/" + url.PathEscape(planID) + "/" + suffix
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return domain.ErrCurriculumUnavailable
+	}
+	request.Header.Set("X-Internal-Token", c.InternalToken)
+	request.Header.Set("Accept", "application/json")
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", planID)
+	}
+	response, err := c.do(request)
+	if err != nil {
+		return domain.ErrCurriculumUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	switch response.StatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusForbidden, http.StatusUnprocessableEntity:
+		return domain.ErrInvalidCurriculum
+	case http.StatusConflict:
+		return domain.ErrTeacherGenerationConflict
+	}
+	if response.StatusCode != http.StatusOK || !jsonMediaType(response.Header.Get("Content-Type")) {
+		return domain.ErrCurriculumUnavailable
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, (64<<10)+1))
+	if err != nil || len(payload) > 64<<10 {
+		return domain.ErrCurriculumUnavailable
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(output) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.ErrCurriculumUnavailable
+	}
+	return nil
+}
+
+func (c Client) EnsureDiagnosticPlacement(ctx context.Context, studentID, planID string) (domain.DiagnosticPlacementSummary, error) {
+	var wire struct {
+		Schema                string    `json:"schema"`
+		StudentID             string    `json:"student_id"`
+		CourseID              string    `json:"course_id"`
+		CourseContentRevision string    `json:"course_content_revision"`
+		PolicyVersion         string    `json:"policy_version"`
+		AttemptID             string    `json:"attempt_id"`
+		PlanID                string    `json:"plan_id"`
+		PlanRevision          int       `json:"plan_revision"`
+		Correct               int       `json:"correct"`
+		Total                 int       `json:"total"`
+		Percent               int       `json:"percent"`
+		Band                  string    `json:"band"`
+		BandPolicyVersion     string    `json:"band_policy_version"`
+		PlanDigest            string    `json:"plan_digest"`
+		ResultDigest          string    `json:"result_digest"`
+		ResultCompletedAt     time.Time `json:"result_completed_at"`
+		RouteCode             string    `json:"route_code"`
+		RoutePolicyVersion    string    `json:"route_policy_version"`
+		DecidedAt             time.Time `json:"decided_at"`
+		DecisionDigest        string    `json:"decision_digest"`
+	}
+	if err := c.diagnosticRequest(ctx, http.MethodPost, studentID, planID, "placement", &wire); err != nil {
+		return domain.DiagnosticPlacementSummary{}, err
+	}
+	if wire.Schema != "diagnostic-placement.v1" || wire.StudentID != studentID || wire.PlanID != planID || wire.AttemptID != planID || !canonicalUUID(wire.CourseID) || wire.Total <= 0 || wire.Correct < 0 || wire.Correct > wire.Total || wire.Percent < 0 || wire.Percent > 100 || wire.PlanRevision < 1 || wire.ResultCompletedAt.IsZero() || wire.DecidedAt.IsZero() || !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(wire.DecisionDigest) || wire.RoutePolicyVersion != "diagnostic-placement-route-v1" {
+		return domain.DiagnosticPlacementSummary{}, domain.ErrCurriculumUnavailable
+	}
+	valid := map[string]string{"FOUNDATION": "START_FOUNDATION", "CORE": "START_CORE", "ADVANCED": "START_ADVANCED"}
+	digest := regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+	if wire.PolicyVersion != "diagnostic-fixed-v1" || wire.BandPolicyVersion != "diagnostic-placement-band-v1" || !digest.MatchString(wire.ResultDigest) || !digest.MatchString(wire.PlanDigest) || strings.TrimSpace(wire.CourseContentRevision) == "" || wire.Total < 3 || wire.Total > 5 || wire.Percent != wire.Correct*100/wire.Total || wire.DecidedAt.Before(wire.ResultCompletedAt) {
+		return domain.DiagnosticPlacementSummary{}, domain.ErrCurriculumUnavailable
+	}
+	if valid[wire.Band] == "" || valid[wire.Band] != wire.RouteCode {
+		return domain.DiagnosticPlacementSummary{}, domain.ErrCurriculumUnavailable
+	}
+	return domain.DiagnosticPlacementSummary{Band: wire.Band, RouteCode: wire.RouteCode, RoutePolicyVersion: wire.RoutePolicyVersion, DecisionDigest: wire.DecisionDigest}, nil
+}
+
+func (c Client) GetDiagnosticPlanningState(ctx context.Context, studentID, planID string) (domain.DiagnosticPlanningState, error) {
+	var state domain.DiagnosticPlanningState
+	if err := c.diagnosticRequest(ctx, http.MethodGet, studentID, planID, "planning-state", &state); err != nil {
+		return state, err
+	}
+	if state.Schema != "diagnostic-planning-state.v1" || state.PlanID != planID || state.GoalCode == "" || len(state.GoalCode) > 64 || state.OnboardingVersion < 1 || state.DirectionCode == "" {
+		return state, domain.ErrCurriculumUnavailable
+	}
+	if state.Request != nil {
+		r := state.Request
+		if !canonicalUUID(r.RequestID) || (r.Status != "REQUESTED" && r.Status != "PLANNING" && r.Status != "COMPLETED" && r.Status != "FAILED") || (r.LearningPathID != "" && !canonicalUUID(r.LearningPathID)) {
+			return state, domain.ErrCurriculumUnavailable
+		}
+		if len(r.FailureCode) > 64 || len(r.ResultCode) > 64 ||
+			((r.Status == "REQUESTED" || r.Status == "PLANNING") && (r.ResultCode != "" || r.FailureCode != "" || r.LearningPathID != "")) ||
+			(r.Status == "FAILED" && (r.FailureCode == "" || r.ResultCode != "" || r.LearningPathID != "")) ||
+			(r.Status == "COMPLETED" && (r.FailureCode != "" || (r.LearningPathID == "" && r.ResultCode != "NO_GAP"))) {
+			return state, domain.ErrCurriculumUnavailable
+		}
+	}
+	return state, nil
+}

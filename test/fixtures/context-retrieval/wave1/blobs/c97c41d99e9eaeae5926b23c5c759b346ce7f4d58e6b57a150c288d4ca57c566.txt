@@ -1,0 +1,162 @@
+package task
+
+import (
+	"context"
+	"sort"
+
+	"github.com/example/mc-course-service/internal/domain"
+)
+
+// TaskProgress aggregates student progress for one task.
+type TaskProgress struct {
+	TaskID         string
+	HasPassed      bool
+	HasUnderReview bool
+	LatestStatus   int
+	LatestAnswerID string
+}
+
+// TaskProgressProvider fetches aggregated progress for tasks from external services.
+type TaskProgressProvider interface {
+	GetProgressByTaskIDs(ctx context.Context, userID string, taskIDs []string) (map[string]TaskProgress, error)
+}
+
+type lessonGetter interface {
+	Get(ctx context.Context, id string) (*domain.Lesson, error)
+}
+
+type lessonTaskLister interface {
+	ListByLesson(ctx context.Context, lessonID string) ([]domain.Task, error)
+}
+
+// InternalCompletedLessonsResponse contains completed lesson ids for one student.
+type InternalCompletedLessonsResponse struct {
+	UserID             string   `json:"user_id"`
+	CompletedLessonIDs []string `json:"completed_lesson_ids"`
+}
+
+// GetInternalCompletedLessons resolves lesson completion using active lesson/task metadata and task-answer progress.
+type GetInternalCompletedLessons struct {
+	Lessons  lessonGetter
+	Tasks    lessonTaskLister
+	Progress TaskProgressProvider
+}
+
+// Handle returns completed lesson ids for the given user and lessons.
+func (uc GetInternalCompletedLessons) Handle(ctx context.Context, userID string, lessonIDs []string) (*InternalCompletedLessonsResponse, error) {
+	if userID == "" || uc.Lessons == nil || uc.Tasks == nil || uc.Progress == nil {
+		return nil, domain.ErrValidation
+	}
+
+	uniqueLessonIDs := uniqueStrings(lessonIDs)
+	response := &InternalCompletedLessonsResponse{
+		UserID:             userID,
+		CompletedLessonIDs: make([]string, 0, len(uniqueLessonIDs)),
+	}
+	if len(uniqueLessonIDs) == 0 {
+		return response, nil
+	}
+
+	type lessonState struct {
+		activeTasks []domain.Task
+		canComplete bool
+	}
+
+	states := make(map[string]lessonState, len(uniqueLessonIDs))
+	taskIDs := make([]string, 0)
+
+	for _, lessonID := range uniqueLessonIDs {
+		lessonItem, err := uc.Lessons.Get(ctx, lessonID)
+		if err != nil {
+			if err == domain.ErrNotFound {
+				continue
+			}
+			return nil, err
+		}
+
+		if lessonItem.Status != domain.LessonStatusActive {
+			states[lessonID] = lessonState{canComplete: false}
+			continue
+		}
+
+		tasks, err := uc.Tasks.ListByLesson(ctx, lessonID)
+		if err != nil {
+			return nil, err
+		}
+
+		activeTasks := make([]domain.Task, 0, len(tasks))
+		for _, taskItem := range tasks {
+			if taskItem.Status != domain.TaskStatusActive {
+				continue
+			}
+			activeTasks = append(activeTasks, taskItem)
+			taskIDs = append(taskIDs, taskItem.ID)
+		}
+
+		states[lessonID] = lessonState{
+			activeTasks: activeTasks,
+			canComplete: true,
+		}
+	}
+
+	progressMap, err := uc.Progress.GetProgressByTaskIDs(ctx, userID, uniqueStrings(taskIDs))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, lessonID := range uniqueLessonIDs {
+		state, ok := states[lessonID]
+		if !ok || !state.canComplete {
+			continue
+		}
+		if len(state.activeTasks) == 0 {
+			response.CompletedLessonIDs = append(response.CompletedLessonIDs, lessonID)
+			continue
+		}
+
+		completed := true
+		for _, taskItem := range state.activeTasks {
+			if !isCompletedLessonTask(taskItem, progressMap[taskItem.ID]) {
+				completed = false
+				break
+			}
+		}
+		if completed {
+			response.CompletedLessonIDs = append(response.CompletedLessonIDs, lessonID)
+		}
+	}
+
+	sort.Strings(response.CompletedLessonIDs)
+	return response, nil
+}
+
+func isCompletedLessonTask(taskItem domain.Task, progress TaskProgress) bool {
+	if progress.HasPassed {
+		return true
+	}
+	switch taskItem.EvaluationMode {
+	case domain.TaskEvaluationModeManual, domain.TaskEvaluationModeHybrid:
+		return progress.HasUnderReview
+	default:
+		return false
+	}
+}
+
+func uniqueStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result
+}

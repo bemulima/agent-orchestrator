@@ -1,0 +1,119 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os/signal"
+	"syscall"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/example/ms-go-statistic/internal/config"
+	"github.com/example/ms-go-statistic/internal/infrastructure/logging"
+	"github.com/example/ms-go-statistic/internal/infrastructure/messaging/nats"
+	"github.com/example/ms-go-statistic/internal/infrastructure/persistence/clickhouse"
+	httptransport "github.com/example/ms-go-statistic/internal/transport/http"
+	apiv1 "github.com/example/ms-go-statistic/internal/transport/http/api/v1"
+	"github.com/example/ms-go-statistic/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-go-statistic/internal/usecase"
+	pkglog "github.com/example/ms-go-statistic/pkg/log"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	application, err := newApplication(ctx)
+	if err != nil {
+		log.Fatalf("failed to init app: %v", err)
+	}
+	if err := application.Run(ctx); err != nil {
+		log.Fatalf("app stopped with error: %v", err)
+	}
+}
+
+// application owns process composition and lifecycle; domain and use cases
+// receive only their ports from this composition root.
+type application struct {
+	cfg               *config.Config
+	logger            pkglog.Logger
+	chClient          *clickhouse.Client
+	eventSink         *clickhouse.BufferedEventSink
+	activityPublisher *nats.InterestingActivityPublisher
+	echo              *echo.Echo
+}
+
+func newApplication(ctx context.Context) (*application, error) {
+	cfg := config.MustLoad()
+	logger := pkglog.New(cfg.AppEnv)
+
+	chClient, err := clickhouse.NewClient(ctx, cfg.ClickHouseDSN)
+	if err != nil {
+		return nil, err
+	}
+
+	repo := clickhouse.NewEventRepository(chClient.Conn())
+	summaryRepo := clickhouse.NewSummaryRepository(chClient.Conn())
+	sessionSummaryRepo := clickhouse.NewLearningSessionSummaryRepository(chClient.Conn())
+	sink := clickhouse.NewBufferedEventSink(repo, cfg.BatchSize, cfg.BatchFlushTimeout, cfg.BufferSize, logger)
+	var activityPublisher *nats.InterestingActivityPublisher
+	if cfg.NATSURL != "" {
+		activityPublisher, err = nats.NewInterestingActivityPublisher(cfg.NATSURL, cfg.NATSPublishTimeout)
+		if err != nil {
+			sink.Close()
+			_ = chClient.Conn().Close()
+			return nil, err
+		}
+	}
+	service := usecase.NewEventService(sink, logging.NewZerologErrorLogger(logger), activityPublisher)
+	summaryService := usecase.NewSummaryService(summaryRepo)
+	sessionSummaryService := usecase.NewLearningSessionSummaryService(sessionSummaryRepo)
+	handler := handlers.NewStatHandler(service, summaryService, sessionSummaryService, logger)
+	router := httptransport.NewRouter(cfg, apiv1.NewRouter(handler), sessionSummaryService)
+
+	e := echo.New()
+	router.Setup(e)
+
+	return &application{
+		cfg:               cfg,
+		logger:            logger,
+		chClient:          chClient,
+		eventSink:         sink,
+		activityPublisher: activityPublisher,
+		echo:              e,
+	}, nil
+}
+
+func (a *application) Run(ctx context.Context) error {
+	defer a.eventSink.Close()
+	if a.activityPublisher != nil {
+		defer a.activityPublisher.Close()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
+		defer cancel()
+		_ = a.echo.Shutdown(shutdownCtx)
+	}()
+
+	go func() {
+		addr := fmt.Sprintf("%s:%s", a.cfg.HTTPHost, a.cfg.HTTPPort)
+		a.logger.Info().Msgf("starting http server on %s", addr)
+		errCh <- a.echo.Start(addr)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}

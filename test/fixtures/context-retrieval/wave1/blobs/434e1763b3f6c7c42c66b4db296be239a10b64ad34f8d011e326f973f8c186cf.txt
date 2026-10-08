@@ -1,0 +1,104 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type txTestRunner struct{}
+
+func (txTestRunner) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (txTestRunner) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
+func (txTestRunner) QueryRow(context.Context, string, ...any) pgx.Row        { return nil }
+
+type txTestBeginner struct {
+	tx    *txTestPGX
+	begun int
+}
+
+func (b *txTestBeginner) Begin(context.Context) (pgx.Tx, error) {
+	b.begun++
+	return b.tx, nil
+}
+
+type txTestPGX struct {
+	pgx.Tx
+	commits   int
+	rollbacks int
+}
+
+func (tx *txTestPGX) Commit(context.Context) error {
+	tx.commits++
+	return nil
+}
+
+func (tx *txTestPGX) Rollback(context.Context) error {
+	tx.rollbacks++
+	return nil
+}
+
+func TestTxManagerReusesExistingTransaction(t *testing.T) {
+	runner := txTestRunner{}
+	ctx := context.WithValue(context.Background(), txKey{}, DBRunner(runner))
+	called := false
+
+	err := (TxManagerPG{}).WithTx(ctx, func(nested repository.Context) error {
+		called = true
+		if getRunner(nested, nil) != runner {
+			t.Fatal("nested transaction did not preserve the existing runner")
+		}
+		return nil
+	})
+
+	if err != nil || !called {
+		t.Fatalf("nested transaction failed: called=%v err=%v", called, err)
+	}
+}
+
+func TestTxManagerRunsCallbacksOnlyAfterCommit(t *testing.T) {
+	tx := &txTestPGX{}
+	beginner := &txTestBeginner{tx: tx}
+	callbackCalled := false
+
+	err := (TxManagerPG{Pool: beginner}).WithTx(context.Background(), func(ctx repository.Context) error {
+		if !repository.DeferAfterCommit(ctx, func() { callbackCalled = true }) {
+			t.Fatal("callback was not deferred")
+		}
+		if callbackCalled {
+			t.Fatal("callback ran before commit")
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("transaction failed: %v", err)
+	}
+	if beginner.begun != 1 || tx.commits != 1 || !callbackCalled {
+		t.Fatalf("unexpected transaction state: begun=%d commits=%d callback=%v", beginner.begun, tx.commits, callbackCalled)
+	}
+}
+
+func TestTxManagerDiscardsCallbacksOnRollback(t *testing.T) {
+	tx := &txTestPGX{}
+	callbackCalled := false
+	expected := errors.New("stop")
+
+	err := (TxManagerPG{Pool: &txTestBeginner{tx: tx}}).WithTx(context.Background(), func(ctx repository.Context) error {
+		repository.DeferAfterCommit(ctx, func() { callbackCalled = true })
+		return expected
+	})
+
+	if !errors.Is(err, expected) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tx.commits != 0 || tx.rollbacks != 1 || callbackCalled {
+		t.Fatalf("rollback leaked work: commits=%d rollbacks=%d callback=%v", tx.commits, tx.rollbacks, callbackCalled)
+	}
+}

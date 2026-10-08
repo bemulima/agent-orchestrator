@@ -1,0 +1,225 @@
+package contentaccess
+
+import (
+	"context"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+)
+
+// Service applies the public Course visibility policy. Administrative and
+// internal routes bypass it before calling these methods.
+type Service struct {
+	Repository repository.ContentAccessRepository
+	ReadAccess repository.LessonReadAccessRepository
+}
+
+func (s Service) Configured() bool {
+	return s.Repository != nil
+}
+
+func (s Service) RequireCourse(ctx context.Context, courseID string) error {
+	return require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		return repo.CanViewCourse(ctx, strings.TrimSpace(courseID))
+	})
+}
+
+func (s Service) RequireModule(ctx context.Context, moduleID string) error {
+	return require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		return repo.CanViewModule(ctx, strings.TrimSpace(moduleID))
+	})
+}
+
+func (s Service) RequireSection(ctx context.Context, sectionID string) error {
+	return require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		return repo.CanViewSection(ctx, strings.TrimSpace(sectionID))
+	})
+}
+
+func (s Service) RequireLesson(ctx context.Context, lessonID, relationID string) error {
+	_, err := s.AuthorizeLesson(ctx, lessonID, relationID)
+	return err
+}
+
+// AuthorizeLesson applies both structural navigation and inherited audience
+// policy and returns the effective decision for response metadata.
+func (s Service) AuthorizeLesson(ctx context.Context, lessonID, relationID string) (LessonReadDecision, error) {
+	lessonID = strings.TrimSpace(lessonID)
+	relationID = strings.TrimSpace(relationID)
+	err := require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		if relationID != "" {
+			return repo.CanViewLessonViaRelation(ctx, lessonID, relationID)
+		}
+		return repo.CanViewLesson(ctx, lessonID)
+	})
+	if err != nil {
+		return LessonReadDecision{}, err
+	}
+	if isPrivilegedAudience(audienceFromContext(ctx)) {
+		return LessonReadDecision{Effective: domain.DefaultLessonReadAccess, CanRead: true}, nil
+	}
+	decisions, err := s.ResolveLessons(ctx, []string{lessonID}, relationID != "")
+	if err != nil {
+		return LessonReadDecision{}, err
+	}
+	decision, ok := decisions[lessonID]
+	if !ok {
+		return LessonReadDecision{}, domain.ErrNotFound
+	}
+	if !decision.CanRead {
+		return decision, lessonReadAccessError(audienceFromContext(ctx), decision.Effective)
+	}
+	return decision, nil
+}
+
+// LessonReadDecision is safe to expose in public lesson list responses.
+type LessonReadDecision struct {
+	Effective  domain.LessonReadAccess `json:"effective_read_access"`
+	SourceType string                  `json:"read_access_source_type,omitempty"`
+	SourceID   string                  `json:"read_access_source_id,omitempty"`
+	CanRead    bool                    `json:"can_read"`
+}
+
+// ResolveLessons evaluates inherited policy in one batch, avoiding one query
+// per lesson on catalog pages.
+func (s Service) ResolveLessons(ctx context.Context, lessonIDs []string, includeHiddenCourses bool) (map[string]LessonReadDecision, error) {
+	if s.ReadAccess == nil {
+		return defaultLessonDecisions(lessonIDs), nil
+	}
+	resolutions, err := s.ReadAccess.ResolveLessonReadAccess(ctx, lessonIDs, includeHiddenCourses)
+	if err != nil {
+		return nil, err
+	}
+	return decisionsForAudience(ctx, resolutions), nil
+}
+
+// ResolveCourseLessons evaluates inherited policy only through placements in
+// one visible course. This prevents a reusable lesson from borrowing a more
+// permissive policy from another course while rendering course navigation.
+func (s Service) ResolveCourseLessons(ctx context.Context, courseID string, lessonIDs []string) (map[string]LessonReadDecision, error) {
+	if s.ReadAccess == nil {
+		return defaultLessonDecisions(lessonIDs), nil
+	}
+	resolver, ok := s.ReadAccess.(repository.CourseLessonReadAccessRepository)
+	if !ok {
+		return s.ResolveLessons(ctx, lessonIDs, false)
+	}
+	resolutions, err := resolver.ResolveCourseLessonReadAccess(ctx, strings.TrimSpace(courseID), lessonIDs)
+	if err != nil {
+		return nil, err
+	}
+	return decisionsForAudience(ctx, resolutions), nil
+}
+
+func defaultLessonDecisions(lessonIDs []string) map[string]LessonReadDecision {
+	result := make(map[string]LessonReadDecision, len(lessonIDs))
+	for _, lessonID := range lessonIDs {
+		result[lessonID] = LessonReadDecision{Effective: domain.DefaultLessonReadAccess, CanRead: true}
+	}
+	return result
+}
+
+func decisionsForAudience(ctx context.Context, resolutions map[string]domain.LessonReadAccessResolution) map[string]LessonReadDecision {
+	result := make(map[string]LessonReadDecision, len(resolutions))
+	audience := audienceFromContext(ctx)
+	for lessonID, resolution := range resolutions {
+		result[lessonID] = LessonReadDecision{
+			Effective:  resolution.Effective,
+			SourceType: resolution.SourceType,
+			SourceID:   resolution.SourceID,
+			CanRead:    canReadLesson(audience, resolution.Effective),
+		}
+	}
+	return result
+}
+
+type audienceContextKey struct{}
+
+// WithAudience attaches the gateway role to access checks. An empty role is a
+// guest, so public routes remain usable without authentication.
+func WithAudience(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, audienceContextKey{}, strings.ToUpper(strings.TrimSpace(role)))
+}
+
+func audienceFromContext(ctx context.Context) string {
+	role, _ := ctx.Value(audienceContextKey{}).(string)
+	if role == "" {
+		return "GUEST"
+	}
+	return role
+}
+
+func isPrivilegedAudience(role string) bool {
+	switch role {
+	case "ADMIN", "MODERATOR", "TEACHER":
+		return true
+	default:
+		return false
+	}
+}
+
+func canReadLesson(role string, access domain.LessonReadAccess) bool {
+	if isPrivilegedAudience(role) {
+		return true
+	}
+	switch access {
+	case domain.LessonReadAccessGuest:
+		return true
+	case domain.LessonReadAccessStudent:
+		return role == "STUDENT" || role == "STUDENT_PRO"
+	case domain.LessonReadAccessStudentPro:
+		return role == "STUDENT_PRO"
+	default:
+		return false
+	}
+}
+
+func lessonReadAccessError(role string, required domain.LessonReadAccess) error {
+	code := "lesson_reading_forbidden"
+	switch {
+	case required == domain.LessonReadAccessDisabled:
+		code = "lesson_reading_disabled"
+	case role == "GUEST":
+		code = "lesson_authentication_required"
+	case required == domain.LessonReadAccessStudentPro:
+		code = "lesson_pro_required"
+	}
+	return &domain.LessonReadAccessError{Code: code, Required: required}
+}
+
+func (s Service) RequireTask(ctx context.Context, taskID, relationID string) error {
+	return require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		if strings.TrimSpace(relationID) != "" {
+			return repo.CanViewTaskViaRelation(ctx, strings.TrimSpace(taskID), strings.TrimSpace(relationID))
+		}
+		return repo.CanViewTask(ctx, strings.TrimSpace(taskID))
+	})
+}
+
+func (s Service) RequireExample(ctx context.Context, exampleID, relationID string) error {
+	return require(ctx, s.Repository, func(repo repository.ContentAccessRepository) (bool, error) {
+		if strings.TrimSpace(relationID) != "" {
+			return repo.CanViewExampleViaRelation(ctx, strings.TrimSpace(exampleID), strings.TrimSpace(relationID))
+		}
+		return repo.CanViewExample(ctx, strings.TrimSpace(exampleID))
+	})
+}
+
+func require(
+	_ context.Context,
+	repo repository.ContentAccessRepository,
+	check func(repository.ContentAccessRepository) (bool, error),
+) error {
+	if repo == nil {
+		return domain.ErrValidation
+	}
+	allowed, err := check(repo)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return domain.ErrNotFound
+	}
+	return nil
+}

@@ -1,0 +1,223 @@
+package catalog
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/google/uuid"
+)
+
+type CreateCourseGroupInput struct {
+	ID               string
+	Slug             string
+	SourceKey        string
+	Status           *int
+	LessonReadAccess *domain.LessonReadAccess
+	Translations     []domain.CourseGroupI18n
+}
+
+type CreateCourseGroup struct {
+	Groups    repository.CourseGroupRepository
+	GroupI18n repository.CourseGroupI18nRepository
+	I18n      repository.I18nRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc CreateCourseGroup) Handle(ctx context.Context, in CreateCourseGroupInput) (domain.CourseGroup, error) {
+	var item domain.CourseGroup
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		id := strings.TrimSpace(in.ID)
+		if id == "" {
+			id = uuid.NewString()
+		} else if _, err := uuid.Parse(id); err != nil {
+			return domain.ErrValidation
+		}
+		slug := strings.TrimSpace(in.Slug)
+		if slug == "" {
+			return domain.ErrValidation
+		}
+		status := domain.CatalogStatusActive
+		if in.Status != nil {
+			status = *in.Status
+		}
+		if !isValidCatalogStatus(status) {
+			return domain.ErrValidation
+		}
+		sourceKey, err := domain.NormalizeContentSourceKey(in.SourceKey)
+		if err != nil {
+			return err
+		}
+		translations, err := normalizeGroupTranslations(in.Translations)
+		if err != nil {
+			return err
+		}
+		translationIDs := make([]int, 0, len(translations))
+		for _, translation := range translations {
+			translationIDs = append(translationIDs, translation.I18nID)
+		}
+		if err := validateCatalogTranslationLanguages(ctx, uc.I18n, translationIDs, status == domain.CatalogStatusActive); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if err := domain.ValidateLessonReadAccess(in.LessonReadAccess); err != nil {
+			return err
+		}
+		item = domain.CourseGroup{ID: id, Slug: slug, SourceKey: sourceKey, Status: status, LessonReadAccess: in.LessonReadAccess, CreatedAt: now, UpdatedAt: now}
+		if err := uc.Groups.Create(ctx, item); err != nil {
+			return err
+		}
+		for _, translation := range translations {
+			translation.GroupID = item.ID
+			if err := uc.GroupI18n.Upsert(ctx, translation); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return domain.CourseGroup{}, err
+	}
+	return item, nil
+}
+
+type UpdateCourseGroupInput struct {
+	ID                  string
+	Slug                string
+	Status              int
+	LessonReadAccess    *domain.LessonReadAccess
+	LessonReadAccessSet bool
+	Translations        []domain.CourseGroupI18n
+}
+
+type UpdateCourseGroup struct {
+	Groups    repository.CourseGroupRepository
+	GroupI18n repository.CourseGroupI18nRepository
+	I18n      repository.I18nRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc UpdateCourseGroup) Handle(ctx context.Context, in UpdateCourseGroupInput) (*domain.CourseGroup, error) {
+	id, err := normalizeCatalogID(in.ID)
+	if err != nil {
+		return nil, err
+	}
+	in.ID = id
+	var item *domain.CourseGroup
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		var err error
+		item, err = uc.Groups.Get(ctx, in.ID)
+		if err != nil {
+			return err
+		}
+		slug := strings.TrimSpace(in.Slug)
+		if slug == "" || !isValidCatalogStatus(in.Status) {
+			return domain.ErrValidation
+		}
+		item.Slug = slug
+		item.Status = in.Status
+		if in.LessonReadAccessSet {
+			if err := domain.ValidateLessonReadAccess(in.LessonReadAccess); err != nil {
+				return err
+			}
+			item.LessonReadAccess = in.LessonReadAccess
+		}
+		item.UpdatedAt = time.Now().UTC()
+		translations, err := normalizeGroupTranslations(in.Translations)
+		if err != nil {
+			return err
+		}
+		translationIDs := make([]int, 0, len(translations))
+		for _, translation := range translations {
+			translationIDs = append(translationIDs, translation.I18nID)
+		}
+		if in.Status == domain.CatalogStatusActive && uc.GroupI18n != nil {
+			existing, err := uc.GroupI18n.ListByGroup(ctx, item.ID)
+			if err != nil {
+				return err
+			}
+			existingIDs := make([]int, 0, len(existing))
+			for _, translation := range existing {
+				existingIDs = append(existingIDs, translation.I18nID)
+			}
+			translationIDs = uniqueCatalogTranslationIDs(existingIDs, translationIDs)
+		}
+		if err := validateCatalogTranslationLanguages(ctx, uc.I18n, translationIDs, in.Status == domain.CatalogStatusActive); err != nil {
+			return err
+		}
+		if err := uc.Groups.Update(ctx, *item); err != nil {
+			return err
+		}
+		for _, translation := range translations {
+			translation.GroupID = item.ID
+			if err := uc.GroupI18n.Upsert(ctx, translation); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+type GetCourseGroup struct {
+	Groups    repository.CourseGroupRepository
+	GroupI18n repository.CourseGroupI18nRepository
+}
+
+func (uc GetCourseGroup) Handle(ctx context.Context, id string) (*domain.CourseGroup, []domain.CourseGroupI18n, error) {
+	id, err := normalizeCatalogID(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	item, err := uc.Groups.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	translations, err := uc.GroupI18n.ListByGroup(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return item, translations, nil
+}
+
+type ListCourseGroups struct {
+	Groups repository.CourseGroupRepository
+	Levels repository.CourseLevelRepository
+}
+
+func (uc ListCourseGroups) Handle(ctx context.Context, filter filters.CourseGroupFilters) ([]domain.CourseGroup, error) {
+	if filter.LevelID != nil && uc.Levels != nil {
+		if _, err := uc.Levels.Get(ctx, *filter.LevelID); err != nil {
+			return nil, err
+		}
+	}
+	return uc.Groups.List(ctx, filter)
+}
+
+type DeleteCourseGroup struct {
+	Groups repository.CourseGroupRepository
+}
+
+func (uc DeleteCourseGroup) Handle(ctx context.Context, id string) error {
+	id, err := normalizeCatalogID(id)
+	if err != nil {
+		return err
+	}
+	return uc.Groups.Delete(ctx, id)
+}

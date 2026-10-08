@@ -1,0 +1,965 @@
+// Package diagnosticfixture owns the deterministic Course content used by the
+// isolated V2 diagnostic bootstrap verification. It deliberately does not
+// contain a learner attempt, answer payload, or placement state.
+package diagnosticfixture
+
+import (
+	"bytes"
+	"context"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/usecase/course"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	moduleuc "github.com/example/mc-course-service/internal/usecase/module"
+	sectionuc "github.com/example/mc-course-service/internal/usecase/section"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/google/uuid"
+)
+
+// ErrDrift means an existing fixture conflicts with the versioned contract.
+var ErrDrift = errors.New("diagnostic assessment fixture drift")
+
+//go:embed fixture.v1.json
+var fixtureFiles embed.FS
+
+var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,254}$`)
+
+type Text struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+type LessonText struct {
+	Title       string `json:"title"`
+	Excerpt     string `json:"excerpt"`
+	Description string `json:"description"`
+}
+
+type IDs struct {
+	Course  string `json:"course"`
+	Module  string `json:"module"`
+	Section string `json:"section"`
+	Lesson  string `json:"lesson"`
+}
+
+type LearningTarget struct {
+	Type    string `json:"type"`
+	Key     string `json:"key"`
+	Version string `json:"version"`
+}
+
+type Variant struct {
+	ID        string `json:"id"`
+	SourceKey string `json:"source_key"`
+	Order     int    `json:"order"`
+	IsCorrect bool   `json:"is_correct"`
+	EN        string `json:"en"`
+	RU        string `json:"ru"`
+}
+
+type Question struct {
+	ID        string    `json:"id"`
+	SourceKey string    `json:"source_key"`
+	Kind      string    `json:"kind"`
+	Order     int       `json:"order"`
+	EN        Text      `json:"en"`
+	RU        Text      `json:"ru"`
+	Variants  []Variant `json:"variants"`
+}
+
+type FixtureTask struct {
+	ID                     string           `json:"id"`
+	SourceKey              string           `json:"source_key"`
+	Type                   string           `json:"type"`
+	AssessmentPurpose      string           `json:"assessment_purpose"`
+	ExecutionMode          string           `json:"execution_mode"`
+	EvaluationMode         string           `json:"evaluation_mode"`
+	UIMode                 string           `json:"ui_mode"`
+	SubmissionMode         string           `json:"submission_mode"`
+	RequiresSandbox        bool             `json:"requires_sandbox"`
+	ExposesPreview         bool             `json:"exposes_preview"`
+	ExposesTerminal        bool             `json:"exposes_terminal"`
+	SupportsLiveValidation bool             `json:"supports_live_validation"`
+	EN                     Text             `json:"en"`
+	RU                     Text             `json:"ru"`
+	LearningTargets        []LearningTarget `json:"learning_targets"`
+	Tests                  []Question       `json:"tests"`
+}
+
+// Definition is the source-owned, versioned V2 diagnostic content contract.
+type Definition struct {
+	FixtureID      string                `json:"fixture_id"`
+	FixtureVersion int                   `json:"fixture_version"`
+	Slug           string                `json:"slug"`
+	IDs            IDs                   `json:"ids"`
+	Languages      []string              `json:"languages"`
+	Course         map[string]Text       `json:"course"`
+	Module         map[string]Text       `json:"module"`
+	Section        map[string]Text       `json:"section"`
+	Lesson         map[string]LessonText `json:"lesson"`
+	Tasks          []FixtureTask         `json:"tasks"`
+}
+
+// LoadDefinition loads the embedded versioned content contract.
+func LoadDefinition() (Definition, error) {
+	raw, err := fixtureFiles.ReadFile("fixture.v1.json")
+	if err != nil {
+		return Definition{}, err
+	}
+	var definition Definition
+	if err := json.Unmarshal(raw, &definition); err != nil {
+		return Definition{}, err
+	}
+	if err := definition.Validate(); err != nil {
+		return Definition{}, err
+	}
+	return definition, nil
+}
+
+func (d Definition) Validate() error {
+	if d.FixtureID != "diagnostic_assessment_smoke" || d.FixtureVersion != 1 || d.Slug != "diagnostic-assessment-smoke-v1" || !slugPattern.MatchString(d.Slug) {
+		return errors.New("invalid diagnostic fixture identity")
+	}
+	if len(d.Languages) != 2 || d.Languages[0] != "en" || d.Languages[1] != "ru" {
+		return errors.New("diagnostic fixture languages must be en, ru")
+	}
+	for entity, texts := range map[string]map[string]Text{"course": d.Course, "module": d.Module, "section": d.Section} {
+		if err := validateTexts(entity, texts, d.Languages); err != nil {
+			return err
+		}
+	}
+	if len(d.Lesson) != len(d.Languages) {
+		return errors.New("invalid diagnostic lesson translations")
+	}
+	for _, language := range d.Languages {
+		text, ok := d.Lesson[language]
+		if !ok || strings.TrimSpace(text.Title) == "" || strings.TrimSpace(text.Excerpt) == "" || strings.TrimSpace(text.Description) == "" {
+			return fmt.Errorf("invalid diagnostic lesson translation for %s", language)
+		}
+	}
+
+	seenIDs := map[string]struct{}{}
+	for name, id := range map[string]string{"course": d.IDs.Course, "module": d.IDs.Module, "section": d.IDs.Section, "lesson": d.IDs.Lesson} {
+		if err := rememberID(seenIDs, name, id); err != nil {
+			return err
+		}
+	}
+	if len(d.Tasks) != 3 {
+		return errors.New("diagnostic fixture requires exactly three tasks")
+	}
+	seenKeys := map[string]struct{}{}
+	for taskIndex, item := range d.Tasks {
+		if err := rememberID(seenIDs, fmt.Sprintf("task[%d]", taskIndex), item.ID); err != nil {
+			return err
+		}
+		if err := rememberSourceKey(seenKeys, item.SourceKey); err != nil {
+			return fmt.Errorf("task[%d]: %w", taskIndex, err)
+		}
+		parsedType, err := domain.ParseTaskType(item.Type)
+		if err != nil || parsedType != domain.TaskTypeTest || item.AssessmentPurpose != domain.AssessmentPurposeDiagnostic {
+			return fmt.Errorf("task[%d] must be a diagnostic test", taskIndex)
+		}
+		if item.ExecutionMode != "NO_RUN" || item.EvaluationMode != "AUTO" || item.UIMode != "QUIZ" || item.SubmissionMode != "ANSWER_PAYLOAD" || item.RequiresSandbox || item.ExposesPreview || item.ExposesTerminal || item.SupportsLiveValidation {
+			return fmt.Errorf("task[%d] must use the no-run automatic assessment contract", taskIndex)
+		}
+		if strings.TrimSpace(item.EN.Title) == "" || strings.TrimSpace(item.EN.Description) == "" || strings.TrimSpace(item.RU.Title) == "" || strings.TrimSpace(item.RU.Description) == "" {
+			return fmt.Errorf("task[%d] translations are invalid", taskIndex)
+		}
+		if len(item.LearningTargets) == 0 {
+			return fmt.Errorf("task[%d] requires a learning target", taskIndex)
+		}
+		if _, err := normalizeTargets(item.LearningTargets); err != nil {
+			return fmt.Errorf("task[%d] targets: %w", taskIndex, err)
+		}
+		if err := validateQuestions(item.Tests, seenIDs, seenKeys); err != nil {
+			return fmt.Errorf("task[%d]: %w", taskIndex, err)
+		}
+	}
+	return nil
+}
+
+func validateTexts(entity string, texts map[string]Text, languages []string) error {
+	if len(texts) != len(languages) {
+		return fmt.Errorf("invalid %s translations", entity)
+	}
+	for _, language := range languages {
+		text, ok := texts[language]
+		if !ok || strings.TrimSpace(text.Title) == "" || strings.TrimSpace(text.Description) == "" {
+			return fmt.Errorf("invalid %s translation for %s", entity, language)
+		}
+	}
+	return nil
+}
+
+func rememberID(seen map[string]struct{}, name, id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("invalid %s id: %w", name, err)
+	}
+	if _, exists := seen[id]; exists {
+		return fmt.Errorf("duplicate deterministic id: %s", name)
+	}
+	seen[id] = struct{}{}
+	return nil
+}
+
+func rememberSourceKey(seen map[string]struct{}, key string) error {
+	normalized, err := domain.NormalizeContentSourceKey(key)
+	if err != nil || normalized == "" || normalized != key {
+		return domain.ErrValidation
+	}
+	if _, exists := seen[key]; exists {
+		return domain.ErrConflict
+	}
+	seen[key] = struct{}{}
+	return nil
+}
+
+func validateQuestions(questions []Question, seenIDs, seenKeys map[string]struct{}) error {
+	if len(questions) == 0 {
+		return domain.ErrValidation
+	}
+	tests := make([]domain.TaskTest, 0, len(questions))
+	for questionIndex, question := range questions {
+		if err := rememberID(seenIDs, fmt.Sprintf("question[%d]", questionIndex), question.ID); err != nil {
+			return err
+		}
+		if err := rememberSourceKey(seenKeys, question.SourceKey); err != nil {
+			return err
+		}
+		variants := make([]domain.TaskTestVariant, 0, len(question.Variants))
+		for variantIndex, variant := range question.Variants {
+			if err := rememberID(seenIDs, fmt.Sprintf("variant[%d]", variantIndex), variant.ID); err != nil {
+				return err
+			}
+			if err := rememberSourceKey(seenKeys, variant.SourceKey); err != nil {
+				return err
+			}
+			if strings.TrimSpace(variant.EN) == "" || strings.TrimSpace(variant.RU) == "" {
+				return domain.ErrValidation
+			}
+			variants = append(variants, domain.TaskTestVariant{ID: variant.ID, SourceKey: variant.SourceKey, Order: variant.Order, IsCorrect: variant.IsCorrect, Translations: []domain.TaskTestVariantI18n{{I18nID: 1, Language: "en", Text: variant.EN}, {I18nID: 2, Language: "ru", Text: variant.RU}}})
+		}
+		if strings.TrimSpace(question.EN.Title) == "" || strings.TrimSpace(question.RU.Title) == "" {
+			return domain.ErrValidation
+		}
+		tests = append(tests, domain.TaskTest{ID: question.ID, SourceKey: question.SourceKey, Kind: question.Kind, Order: question.Order, Variants: variants, Translations: []domain.TaskTestI18n{{I18nID: 1, Language: "en", Title: question.EN.Title, Description: question.EN.Description}, {I18nID: 2, Language: "ru", Title: question.RU.Title, Description: question.RU.Description}}})
+	}
+	return domain.ValidateTaskAssessments(tests, 0, domain.TaskTestKindSingleChoice)
+}
+
+func normalizeTargets(input []LearningTarget) ([]domain.TaskLearningTarget, error) {
+	targets := make([]domain.TaskLearningTarget, 0, len(input))
+	for _, target := range input {
+		targets = append(targets, domain.TaskLearningTarget{Type: domain.LearningTargetType(target.Type), Key: target.Key, Version: target.Version})
+	}
+	return domain.NormalizeTaskLearningTargets(targets)
+}
+
+// Dependencies are the Course-owned repositories used to provision and read
+// back the exact diagnostic hierarchy through existing use cases.
+type Dependencies struct {
+	Tx              repository.TransactionManager
+	Courses         repository.CourseRepository
+	CourseI18n      repository.CourseI18nRepository
+	I18n            repository.I18nRepository
+	CodeStructures  repository.CodeStructureTypeRepository
+	Modules         repository.ModuleRepository
+	ModuleI18n      repository.ModuleI18nRepository
+	CourseModules   repository.CourseModuleRepository
+	Sections        repository.SectionRepository
+	SectionI18n     repository.SectionI18nRepository
+	ModuleSections  repository.ModuleSectionRepository
+	Lessons         repository.LessonRepository
+	LessonI18n      repository.LessonI18nRepository
+	SectionLessons  repository.SectionLessonRepository
+	Tasks           repository.TaskRepository
+	TaskI18n        repository.TaskI18nRepository
+	TaskTests       repository.TaskTestRepository
+	LearningTargets repository.TaskLearningTargetRepository
+}
+
+type Provisioner struct {
+	Dependencies Dependencies
+	Definition   Definition
+}
+
+// AssessmentMetadata is deliberately answer-key-free and safe for machine
+// readable provisioning evidence.
+type AssessmentMetadata struct {
+	ID                string                               `json:"id"`
+	LessonID          string                               `json:"lesson_id"`
+	Type              int16                                `json:"type"`
+	AssessmentPurpose string                               `json:"assessment_purpose"`
+	EvaluationMode    string                               `json:"evaluation_mode"`
+	Order             int                                  `json:"order"`
+	Version           int                                  `json:"version"`
+	LearningTargets   []task.InternalCourseStructureTarget `json:"learning_targets"`
+}
+
+// Result is the only successful CLI payload. It intentionally has no titles,
+// question text, variants, answer keys, credentials, or run identifier.
+type Result struct {
+	Schema             string               `json:"schema"`
+	Status             string               `json:"status"`
+	FixtureID          string               `json:"fixture_id"`
+	FixtureVersion     int                  `json:"fixture_version"`
+	CourseID           string               `json:"course_id"`
+	CourseSlug         string               `json:"course_slug"`
+	CourseActive       bool                 `json:"course_active"`
+	CatalogVisible     bool                 `json:"catalog_visible"`
+	CurriculumRevision string               `json:"curriculum_revision"`
+	Assessments        []AssessmentMetadata `json:"assessments"`
+}
+
+const resultSchema = "course-diagnostic-assessment-fixture-result.v1"
+
+// Ensure creates an absent fixture in one transaction, verifies an existing
+// fixture without writes, and fails closed when any contract field has drifted.
+func (p Provisioner) Ensure(ctx context.Context) (Result, error) {
+	if err := p.validateDependencies(); err != nil {
+		return Result{}, err
+	}
+	if err := p.Definition.Validate(); err != nil {
+		return Result{}, err
+	}
+	var result Result
+	err := p.Dependencies.Tx.WithTx(ctx, func(txctx repository.Context) error {
+		courseRecord, err := p.Dependencies.Courses.GetBySlug(txctx, p.Definition.Slug)
+		created := false
+		var languageIDs map[string]int
+		var structure domain.CodeStructureType
+		switch {
+		case err == nil:
+			languageIDs, err = resolveLanguages(txctx, p.Dependencies.I18n, p.Definition.Languages, false)
+			if err != nil {
+				return err
+			}
+			structure, err = resolveTestStructure(txctx, p.Dependencies.CodeStructures, false)
+			if err != nil {
+				return err
+			}
+		case errors.Is(err, domain.ErrNotFound):
+			if err := p.ensureRootIDsAvailable(txctx); err != nil {
+				return err
+			}
+			languageIDs, err = resolveLanguages(txctx, p.Dependencies.I18n, p.Definition.Languages, true)
+			if err != nil {
+				return err
+			}
+			structure, err = resolveTestStructure(txctx, p.Dependencies.CodeStructures, true)
+			if err != nil {
+				return err
+			}
+			if err := p.createFixture(txctx, languageIDs); err != nil {
+				if errors.Is(err, domain.ErrConflict) {
+					return drift("identity", "a deterministic fixture identity is already occupied")
+				}
+				return err
+			}
+			courseRecord, err = p.Dependencies.Courses.GetBySlug(txctx, p.Definition.Slug)
+			if err != nil {
+				return fmt.Errorf("read created diagnostic course: %w", err)
+			}
+			created = true
+		default:
+			return fmt.Errorf("read diagnostic course: %w", err)
+		}
+
+		result, err = p.verify(txctx, *courseRecord, languageIDs, structure.ID)
+		if err != nil {
+			return err
+		}
+		if created {
+			result.Status = "created"
+		} else {
+			result.Status = "already_present"
+		}
+		return nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return result, nil
+}
+
+func (p Provisioner) validateDependencies() error {
+	d := p.Dependencies
+	if d.Tx == nil || d.Courses == nil || d.CourseI18n == nil || d.I18n == nil || d.CodeStructures == nil || d.Modules == nil || d.ModuleI18n == nil || d.CourseModules == nil || d.Sections == nil || d.SectionI18n == nil || d.ModuleSections == nil || d.Lessons == nil || d.LessonI18n == nil || d.SectionLessons == nil || d.Tasks == nil || d.TaskI18n == nil || d.TaskTests == nil || d.LearningTargets == nil {
+		return errors.New("diagnostic fixture dependencies are incomplete")
+	}
+	return nil
+}
+
+func (p Provisioner) ensureRootIDsAvailable(ctx repository.Context) error {
+	d := p.Dependencies
+	checks := []struct {
+		name string
+		id   string
+		get  func() error
+	}{
+		{"course", p.Definition.IDs.Course, func() error { _, err := d.Courses.GetByID(ctx, p.Definition.IDs.Course); return err }},
+		{"module", p.Definition.IDs.Module, func() error { _, err := d.Modules.Get(ctx, p.Definition.IDs.Module); return err }},
+		{"section", p.Definition.IDs.Section, func() error { _, err := d.Sections.Get(ctx, p.Definition.IDs.Section); return err }},
+		{"lesson", p.Definition.IDs.Lesson, func() error { _, err := d.Lessons.Get(ctx, p.Definition.IDs.Lesson); return err }},
+	}
+	for _, item := range p.Definition.Tasks {
+		taskID := item.ID
+		checks = append(checks, struct {
+			name string
+			id   string
+			get  func() error
+		}{"task", taskID, func() error { _, err := d.Tasks.Get(ctx, taskID); return err }})
+	}
+	for _, check := range checks {
+		err := check.get()
+		if err == nil {
+			return drift(check.name+".id", "deterministic id is already owned by another record")
+		}
+		if !errors.Is(err, domain.ErrNotFound) {
+			return fmt.Errorf("check diagnostic %s id: %w", check.name, err)
+		}
+	}
+	return nil
+}
+
+func (p Provisioner) createFixture(ctx repository.Context, languageIDs map[string]int) error {
+	d, f := p.Dependencies, p.Definition
+	access := domain.LessonReadAccessGuest
+	visible := false
+	createdCourse, err := (course.CreateCourse{Courses: d.Courses, Publisher: discardEvents{}, Tx: d.Tx}).Handle(ctx, course.CreateCourseInput{ID: f.IDs.Course, Slug: f.Slug, CatalogVisible: &visible, LessonReadAccess: &access})
+	if err != nil {
+		return fmt.Errorf("create diagnostic course: %w", err)
+	}
+	for _, language := range f.Languages {
+		text := f.Course[language]
+		if _, err := (course.UpsertCourseI18n{Courses: d.Courses, CourseI18n: d.CourseI18n, I18n: d.I18n, Tx: d.Tx}).Handle(ctx, course.UpsertCourseI18nInput{CourseID: createdCourse.ID, I18nID: languageIDs[language], Title: text.Title, Description: text.Description}); err != nil {
+			return fmt.Errorf("create diagnostic course translation: %w", err)
+		}
+	}
+
+	moduleStatus, moduleVisibility := domain.ModuleStatusActive, domain.ModuleVisibilityCourseOnly
+	createdModule, err := (moduleuc.CreateModule{Modules: d.Modules, ModuleI18n: d.ModuleI18n, I18n: d.I18n, Tx: d.Tx}).Handle(ctx, moduleuc.CreateModuleInput{ID: f.IDs.Module, Status: &moduleStatus, Visibility: &moduleVisibility, LessonReadAccess: &access, Translations: moduleTranslations(f, languageIDs)})
+	if err != nil {
+		return fmt.Errorf("create diagnostic module: %w", err)
+	}
+	if err := (course.AddCourseModule{Courses: d.Courses, Modules: d.Modules, CourseModules: d.CourseModules, Tx: d.Tx}).Handle(ctx, course.AddCourseModuleInput{CourseID: createdCourse.ID, ModuleID: createdModule.ID, Order: 1}); err != nil {
+		return fmt.Errorf("place diagnostic module: %w", err)
+	}
+
+	sectionStatus := domain.SectionStatusActive
+	createdSection, err := (sectionuc.CreateSection{Sections: d.Sections, SectionI18n: d.SectionI18n, I18n: d.I18n, Tx: d.Tx}).Handle(ctx, sectionuc.CreateSectionInput{ID: f.IDs.Section, Status: &sectionStatus, LessonReadAccess: &access, Translations: sectionTranslations(f, languageIDs)})
+	if err != nil {
+		return fmt.Errorf("create diagnostic section: %w", err)
+	}
+	if err := (moduleuc.AddModuleSection{Modules: d.Modules, Sections: d.Sections, ModuleSections: d.ModuleSections, Tx: d.Tx}).Handle(ctx, moduleuc.AddModuleSectionInput{ModuleID: createdModule.ID, SectionID: createdSection.ID, Order: 1}); err != nil {
+		return fmt.Errorf("place diagnostic section: %w", err)
+	}
+
+	lessonStatus := domain.LessonStatusNoActive
+	createdLesson, err := (lesson.CreateLesson{Lessons: d.Lessons, LessonI18n: d.LessonI18n, Tasks: d.Tasks, Tx: d.Tx}).Handle(ctx, lesson.CreateLessonInput{ID: f.IDs.Lesson, Status: &lessonStatus, LessonReadAccess: &access, Translations: lessonTranslations(f, languageIDs)})
+	if err != nil {
+		return fmt.Errorf("create diagnostic lesson: %w", err)
+	}
+	if err := (sectionuc.AddSectionLesson{Sections: d.Sections, Lessons: d.Lessons, SectionLessons: d.SectionLessons, Tx: d.Tx}).Handle(ctx, sectionuc.AddSectionLessonInput{SectionID: createdSection.ID, LessonID: createdLesson.ID, Order: 1}); err != nil {
+		return fmt.Errorf("place diagnostic lesson: %w", err)
+	}
+
+	createTask := task.CreateTask{Tasks: d.Tasks, Lessons: d.Lessons, TaskI18n: d.TaskI18n, TaskTests: d.TaskTests, LearningTargets: d.LearningTargets, Publisher: discardEvents{}, StructureRes: d.CodeStructures, Tx: d.Tx}
+	for index, fixtureTask := range f.Tasks {
+		if err := createDiagnosticTask(ctx, createTask, createdLesson.ID, fixtureTask, languageIDs, index+1); err != nil {
+			return err
+		}
+	}
+
+	activeLesson := domain.LessonStatusActive
+	if _, err := (lesson.UpdateLesson{Courses: d.Courses, Lessons: d.Lessons, LessonI18n: d.LessonI18n, Tasks: d.Tasks, Tx: d.Tx}).Handle(ctx, lesson.UpdateLessonInput{LessonID: createdLesson.ID, Status: activeLesson, Translations: lessonTranslations(f, languageIDs), LessonReadAccess: &access, LessonReadAccessSet: true}); err != nil {
+		return fmt.Errorf("activate diagnostic lesson: %w", err)
+	}
+	activeCourse, catalogVisible := domain.CourseStatusActive, true
+	if _, err := (course.UpdateCourse{Courses: d.Courses, Lessons: d.Lessons, Publisher: discardEvents{}, Tx: d.Tx}).Handle(ctx, course.UpdateCourseInput{CourseID: createdCourse.ID, Status: &activeCourse, CatalogVisible: &catalogVisible, LessonReadAccess: &access, LessonReadAccessSet: true}); err != nil {
+		return fmt.Errorf("activate diagnostic course: %w", err)
+	}
+	return nil
+}
+
+func createDiagnosticTask(ctx repository.Context, createTask task.CreateTask, lessonID string, fixtureTask FixtureTask, languageIDs map[string]int, order int) error {
+	typeValue, purpose := fixtureTask.Type, fixtureTask.AssessmentPurpose
+	execution, evaluation, ui, submission := fixtureTask.ExecutionMode, fixtureTask.EvaluationMode, fixtureTask.UIMode, fixtureTask.SubmissionMode
+	requiresSandbox, exposesPreview := fixtureTask.RequiresSandbox, fixtureTask.ExposesPreview
+	exposesTerminal, supportsLiveValidation := fixtureTask.ExposesTerminal, fixtureTask.SupportsLiveValidation
+	targets, err := normalizeTargets(fixtureTask.LearningTargets)
+	if err != nil {
+		return fmt.Errorf("normalize diagnostic task targets: %w", err)
+	}
+	if _, err := createTask.Handle(ctx, task.CreateTaskInput{ID: fixtureTask.ID, SourceKey: fixtureTask.SourceKey, LessonID: lessonID, Translations: taskTranslations(fixtureTask, languageIDs), LearningTargets: targets, Type: &typeValue, AssessmentPurpose: &purpose, ExecutionMode: &execution, EvaluationMode: &evaluation, UIMode: &ui, SubmissionMode: &submission, RequiresSandbox: &requiresSandbox, ExposesPreview: &exposesPreview, ExposesTerminal: &exposesTerminal, SupportsLiveValidation: &supportsLiveValidation, Order: order, Tests: taskTests(fixtureTask, languageIDs)}); err != nil {
+		return fmt.Errorf("create diagnostic assessment task %d: %w", order, err)
+	}
+	return nil
+}
+
+func (p Provisioner) verify(ctx repository.Context, courseRecord domain.Course, languageIDs map[string]int, structureID string) (Result, error) {
+	d, f := p.Dependencies, p.Definition
+	if courseRecord.ID != f.IDs.Course || courseRecord.Slug != f.Slug || courseRecord.Status != domain.CourseStatusActive || !courseRecord.CatalogVisible || courseRecord.MainTechID != nil || !hasAccess(courseRecord.LessonReadAccess, domain.LessonReadAccessGuest) {
+		return Result{}, drift("course", "status, catalog visibility, access, or identity differs")
+	}
+	translations, err := d.CourseI18n.ListByCourse(ctx, courseRecord.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic course translations: %w", err)
+	}
+	if !matchesCourseTranslations(translations, f.Course, languageIDs, f.IDs.Course) {
+		return Result{}, drift("course.translations", "translations differ")
+	}
+	modules, err := d.Modules.ListByCourse(ctx, courseRecord.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic modules: %w", err)
+	}
+	if len(modules) != 1 || modules[0].ID != f.IDs.Module || modules[0].Status != domain.ModuleStatusActive || modules[0].Visibility != domain.ModuleVisibilityCourseOnly || modules[0].TechID != nil || !hasAccess(modules[0].LessonReadAccess, domain.LessonReadAccessGuest) {
+		return Result{}, drift("course.modules", "expected one active course-only module")
+	}
+	moduleTexts, err := d.ModuleI18n.ListByModule(ctx, f.IDs.Module)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic module translations: %w", err)
+	}
+	if !matchesModuleTranslations(moduleTexts, f.Module, languageIDs, f.IDs.Module) {
+		return Result{}, drift("module.translations", "translations differ")
+	}
+	sections, err := d.Sections.ListByModule(ctx, f.IDs.Module)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic sections: %w", err)
+	}
+	if len(sections) != 1 || sections[0].ID != f.IDs.Section || sections[0].Status != domain.SectionStatusActive || sections[0].TechID != nil || !hasAccess(sections[0].LessonReadAccess, domain.LessonReadAccessGuest) {
+		return Result{}, drift("module.sections", "expected one active section")
+	}
+	sectionTexts, err := d.SectionI18n.ListBySection(ctx, f.IDs.Section)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic section translations: %w", err)
+	}
+	if !matchesSectionTranslations(sectionTexts, f.Section, languageIDs, f.IDs.Section) {
+		return Result{}, drift("section.translations", "translations differ")
+	}
+	lessons, err := d.Lessons.ListByCourse(ctx, courseRecord.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic lessons: %w", err)
+	}
+	if len(lessons) != 1 || lessons[0].ID != f.IDs.Lesson || lessons[0].CourseID != courseRecord.ID || lessons[0].SectionID != f.IDs.Section || lessons[0].Order != 1 || lessons[0].Status != domain.LessonStatusActive || lessons[0].ComposeConfigID != nil || len(lessons[0].ComposeConfig) != 0 || !hasAccess(lessons[0].LessonReadAccess, domain.LessonReadAccessGuest) {
+		return Result{}, drift("course.lessons", "expected one active lesson without runtime configuration")
+	}
+	lessonTexts, err := d.LessonI18n.ListByLesson(ctx, f.IDs.Lesson)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic lesson translations: %w", err)
+	}
+	if !matchesLessonTranslations(lessonTexts, f.Lesson, languageIDs, f.IDs.Lesson) {
+		return Result{}, drift("lesson.translations", "translations differ")
+	}
+	tasks, err := d.Tasks.ListByLesson(ctx, f.IDs.Lesson)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic tasks: %w", err)
+	}
+	if len(tasks) != len(f.Tasks) {
+		return Result{}, drift("lesson.tasks", "task count differs")
+	}
+	for index, fixtureTask := range f.Tasks {
+		if err := verifyTask(ctx, d, tasks[index], fixtureTask, languageIDs, structureID, index+1); err != nil {
+			return Result{}, err
+		}
+	}
+	return p.safeResult(ctx, courseRecord.ID)
+}
+
+func verifyTask(ctx repository.Context, dependencies Dependencies, actual domain.Task, expected FixtureTask, languageIDs map[string]int, structureID string, order int) error {
+	taskType, _ := domain.ParseTaskType(expected.Type)
+	execution, _ := domain.ParseTaskExecutionMode(expected.ExecutionMode)
+	evaluation, _ := domain.ParseTaskEvaluationMode(expected.EvaluationMode)
+	ui, _ := domain.ParseTaskUIMode(expected.UIMode)
+	submission, _ := domain.ParseTaskSubmissionMode(expected.SubmissionMode)
+	if reason := taskContractMismatch(actual, expected, taskType, execution, evaluation, ui, submission, structureID, order); reason != "" {
+		return drift("lesson.tasks["+fmt.Sprint(order)+"]", reason)
+	}
+	if !matchesTaskTranslations(actual.Translations, expected, languageIDs) {
+		return drift("lesson.tasks["+fmt.Sprint(order)+"].translations", "translations differ")
+	}
+	if !matchesTargets(actual.LearningTargets, expected.LearningTargets) {
+		return drift("lesson.tasks["+fmt.Sprint(order)+"].learning_targets", "targets differ")
+	}
+	actualTests, err := dependencies.TaskTests.ListByTask(ctx, actual.ID)
+	if err != nil {
+		return fmt.Errorf("read diagnostic task assessments: %w", err)
+	}
+	if !matchesTests(actualTests, expected.Tests, languageIDs) {
+		return drift("lesson.tasks["+fmt.Sprint(order)+"].assessment", "question or variant graph differs")
+	}
+	return nil
+}
+
+// taskContractMismatch reports only static contract labels. It is safe for an
+// owner log and makes a real fixture drift actionable without exposing authored
+// question or answer content.
+func taskContractMismatch(actual domain.Task, expected FixtureTask, taskType, execution, evaluation, ui, submission int16, structureID string, order int) string {
+	switch {
+	case actual.ID != expected.ID:
+		return "task id differs"
+	case actual.SourceKey != expected.SourceKey:
+		return "task source key differs"
+	case actual.LessonID == "":
+		return "task lesson is missing"
+	case actual.Status != domain.TaskStatusActive:
+		return "task status differs"
+	case actual.Version != 1:
+		return "task version differs"
+	case actual.Order != order:
+		return "task order differs"
+	case actual.Type != taskType:
+		return "task type differs"
+	case actual.AssessmentPurpose != expected.AssessmentPurpose:
+		return "assessment purpose differs"
+	case actual.CodeStructureTypeID != structureID:
+		return "assessment code structure reference differs"
+	case !jsonEqual(actual.CodeStructure, domain.DefaultTaskAssessmentCodeStructure(domain.TaskTestKindSingleChoice)):
+		return "assessment code structure differs"
+	case actual.ExecutionMode != execution:
+		return "execution mode differs"
+	case actual.EvaluationMode != evaluation:
+		return "evaluation mode differs"
+	case actual.UIMode != ui:
+		return "UI mode differs"
+	case actual.SubmissionMode != submission:
+		return "submission mode differs"
+	case actual.RequiresSandbox != expected.RequiresSandbox || actual.ExposesPreview != expected.ExposesPreview || actual.ExposesTerminal != expected.ExposesTerminal || actual.SupportsLiveValidation != expected.SupportsLiveValidation:
+		return "runtime capability differs"
+	case actual.AllowedErrorsCount != 0:
+		return "allowed errors differs"
+	case actual.MaxAttempts != nil || actual.DeadlineAt != nil:
+		return "attempt policy differs"
+	case actual.ComposeConfigID != nil || len(actual.ComposeConfig) != 0:
+		return "runtime configuration differs"
+	default:
+		return ""
+	}
+}
+
+func (p Provisioner) safeResult(ctx context.Context, courseID string) (Result, error) {
+	structure, err := (task.GetInternalCourseStructure{Lessons: p.Dependencies.Lessons, Tasks: p.Dependencies.Tasks}).Handle(ctx, courseID)
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic course structure: %w", err)
+	}
+	catalog, err := structure.DiagnosticOnly()
+	if err != nil {
+		return Result{}, fmt.Errorf("read diagnostic catalog: %w", err)
+	}
+	if len(catalog.Lessons) != 1 || len(catalog.Lessons[0].Tasks) != len(p.Definition.Tasks) {
+		return Result{}, drift("diagnostic_catalog", "eligible task projection differs")
+	}
+	assessments := make([]AssessmentMetadata, 0, len(catalog.Lessons[0].Tasks))
+	for _, item := range catalog.Lessons[0].Tasks {
+		assessments = append(assessments, AssessmentMetadata{ID: item.ID, LessonID: item.LessonID, Type: item.Type, AssessmentPurpose: item.AssessmentPurpose, EvaluationMode: item.EvaluationMode, Order: item.Order, Version: item.Version, LearningTargets: item.LearningTargets})
+	}
+	sort.SliceStable(assessments, func(left, right int) bool { return assessments[left].Order < assessments[right].Order })
+	return Result{Schema: resultSchema, FixtureID: p.Definition.FixtureID, FixtureVersion: p.Definition.FixtureVersion, CourseID: courseID, CourseSlug: p.Definition.Slug, CourseActive: true, CatalogVisible: true, CurriculumRevision: catalog.CurriculumRevision, Assessments: assessments}, nil
+}
+
+func resolveLanguages(ctx repository.Context, repo repository.I18nRepository, languages []string, create bool) (map[string]int, error) {
+	ids := make(map[string]int, len(languages))
+	for _, language := range languages {
+		entry, err := repo.GetByLanguage(ctx, language)
+		if errors.Is(err, domain.ErrNotFound) && create {
+			if err := repo.Create(ctx, domain.I18n{Language: language}); err != nil {
+				return nil, fmt.Errorf("create %s language reference: %w", language, err)
+			}
+			entry, err = repo.GetByLanguage(ctx, language)
+		}
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return nil, drift("reference.i18n."+language, "required language reference is missing")
+			}
+			return nil, fmt.Errorf("read %s language reference: %w", language, err)
+		}
+		if entry.Language != language || entry.ID <= 0 {
+			return nil, drift("reference.i18n."+language, "language reference differs")
+		}
+		ids[language] = entry.ID
+	}
+	return ids, nil
+}
+
+func resolveTestStructure(ctx repository.Context, repo repository.CodeStructureTypeRepository, create bool) (domain.CodeStructureType, error) {
+	const (
+		id          = "00000000-0000-0000-0000-00000000f900"
+		code        = domain.CodeStructureTypeTestSingleChoiceBasic
+		name        = "Single choice test"
+		description = "Service type for single-choice test tasks."
+		validator   = "ms-go-student"
+	)
+	structure, err := repo.GetByCode(ctx, code)
+	if errors.Is(err, domain.ErrNotFound) && create {
+		if existing, idErr := repo.GetByID(ctx, id); idErr == nil || existing != nil {
+			return domain.CodeStructureType{}, drift("reference.code_structure_type."+code, "canonical reference id is occupied")
+		} else if !errors.Is(idErr, domain.ErrNotFound) {
+			return domain.CodeStructureType{}, fmt.Errorf("check test structure reference id: %w", idErr)
+		}
+		descriptionValue, validatorValue := description, validator
+		if err := repo.Create(ctx, domain.CodeStructureType{ID: id, Code: code, Name: name, Description: &descriptionValue, ValidatorService: &validatorValue, CreatedAt: time.Date(2026, time.March, 11, 0, 0, 0, 0, time.UTC)}); err != nil {
+			return domain.CodeStructureType{}, fmt.Errorf("create test structure reference: %w", err)
+		}
+		structure, err = repo.GetByCode(ctx, code)
+	}
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.CodeStructureType{}, drift("reference.code_structure_type."+code, "required structure reference is missing")
+		}
+		return domain.CodeStructureType{}, fmt.Errorf("read test structure reference: %w", err)
+	}
+	if structure.ID != id || structure.Code != code || structure.Name != name || !sameOptionalString(structure.Description, description) || !sameOptionalString(structure.ValidatorService, validator) {
+		return domain.CodeStructureType{}, drift("reference.code_structure_type."+code, "reference semantics differ")
+	}
+	return *structure, nil
+}
+
+func moduleTranslations(definition Definition, ids map[string]int) []domain.ModuleI18n {
+	result := make([]domain.ModuleI18n, 0, len(definition.Languages))
+	for _, language := range definition.Languages {
+		text := definition.Module[language]
+		result = append(result, domain.ModuleI18n{I18nID: ids[language], Language: language, Title: text.Title, Description: text.Description})
+	}
+	return result
+}
+
+func sectionTranslations(definition Definition, ids map[string]int) []domain.SectionI18n {
+	result := make([]domain.SectionI18n, 0, len(definition.Languages))
+	for _, language := range definition.Languages {
+		text := definition.Section[language]
+		result = append(result, domain.SectionI18n{I18nID: ids[language], Language: language, Title: text.Title, Description: text.Description})
+	}
+	return result
+}
+
+func lessonTranslations(definition Definition, ids map[string]int) []domain.LessonI18n {
+	result := make([]domain.LessonI18n, 0, len(definition.Languages))
+	for _, language := range definition.Languages {
+		text := definition.Lesson[language]
+		result = append(result, domain.LessonI18n{I18nID: ids[language], Language: language, Title: text.Title, Excerpt: text.Excerpt, Description: text.Description})
+	}
+	return result
+}
+
+func taskTranslations(item FixtureTask, ids map[string]int) []domain.TaskI18n {
+	return []domain.TaskI18n{{I18nID: ids["en"], Language: "en", Title: item.EN.Title, Description: item.EN.Description}, {I18nID: ids["ru"], Language: "ru", Title: item.RU.Title, Description: item.RU.Description}}
+}
+
+func taskTests(item FixtureTask, ids map[string]int) []domain.TaskTest {
+	result := make([]domain.TaskTest, 0, len(item.Tests))
+	for _, question := range item.Tests {
+		variants := make([]domain.TaskTestVariant, 0, len(question.Variants))
+		for _, variant := range question.Variants {
+			variants = append(variants, domain.TaskTestVariant{ID: variant.ID, SourceKey: variant.SourceKey, Order: variant.Order, IsCorrect: variant.IsCorrect, Translations: []domain.TaskTestVariantI18n{{I18nID: ids["en"], Language: "en", Text: variant.EN}, {I18nID: ids["ru"], Language: "ru", Text: variant.RU}}})
+		}
+		result = append(result, domain.TaskTest{ID: question.ID, SourceKey: question.SourceKey, Kind: question.Kind, Order: question.Order, Translations: []domain.TaskTestI18n{{I18nID: ids["en"], Language: "en", Title: question.EN.Title, Description: question.EN.Description}, {I18nID: ids["ru"], Language: "ru", Title: question.RU.Title, Description: question.RU.Description}}, Variants: variants})
+	}
+	return result
+}
+
+func matchesCourseTranslations(actual []domain.CourseI18n, expected map[string]Text, ids map[string]int, courseID string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		found := false
+		for _, item := range actual {
+			want := expected[language]
+			if item.CourseID == courseID && item.I18nID == ids[language] && item.Title == want.Title && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesModuleTranslations(actual []domain.ModuleI18n, expected map[string]Text, ids map[string]int, moduleID string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		found := false
+		for _, item := range actual {
+			want := expected[language]
+			if item.ModuleID == moduleID && item.I18nID == ids[language] && item.Title == want.Title && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesSectionTranslations(actual []domain.SectionI18n, expected map[string]Text, ids map[string]int, sectionID string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		found := false
+		for _, item := range actual {
+			want := expected[language]
+			if item.SectionID == sectionID && item.I18nID == ids[language] && item.Title == want.Title && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesLessonTranslations(actual []domain.LessonI18n, expected map[string]LessonText, ids map[string]int, lessonID string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		found := false
+		for _, item := range actual {
+			want := expected[language]
+			if item.LessonID == lessonID && item.I18nID == ids[language] && item.Title == want.Title && item.Excerpt == want.Excerpt && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesTaskTranslations(actual []domain.TaskI18n, expected FixtureTask, ids map[string]int) bool {
+	if len(actual) != 2 {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		want := expected.EN
+		if language == "ru" {
+			want = expected.RU
+		}
+		found := false
+		for _, item := range actual {
+			if item.I18nID == ids[language] && item.Title == want.Title && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesTargets(actual []domain.TaskLearningTarget, expected []LearningTarget) bool {
+	want, err := normalizeTargets(expected)
+	if err != nil || len(actual) != len(want) {
+		return false
+	}
+	for index := range want {
+		if actual[index].Type != want[index].Type || actual[index].Key != want[index].Key || actual[index].Version != want[index].Version || actual[index].Order != want[index].Order {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesTests(actual []domain.TaskTest, expected []Question, ids map[string]int) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index, question := range expected {
+		item := actual[index]
+		if item.ID != question.ID || item.SourceKey != question.SourceKey || item.Kind != question.Kind || item.Order != question.Order || !matchesQuestionTranslations(item.Translations, question, ids) || len(item.Groups) != 0 || len(item.Variants) != len(question.Variants) {
+			return false
+		}
+		for variantIndex, variant := range question.Variants {
+			observed := item.Variants[variantIndex]
+			if observed.ID != variant.ID || observed.SourceKey != variant.SourceKey || observed.Order != variant.Order || observed.IsCorrect != variant.IsCorrect || observed.CorrectOrder != nil || observed.GroupID != "" || observed.GroupSourceKey != "" || !matchesVariantTranslations(observed.Translations, variant, ids) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func matchesQuestionTranslations(actual []domain.TaskTestI18n, expected Question, ids map[string]int) bool {
+	if len(actual) != 2 {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		want := expected.EN
+		if language == "ru" {
+			want = expected.RU
+		}
+		found := false
+		for _, item := range actual {
+			if item.I18nID == ids[language] && item.Title == want.Title && item.Description == want.Description {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesVariantTranslations(actual []domain.TaskTestVariantI18n, expected Variant, ids map[string]int) bool {
+	if len(actual) != 2 {
+		return false
+	}
+	for _, language := range []string{"en", "ru"} {
+		want := expected.EN
+		if language == "ru" {
+			want = expected.RU
+		}
+		found := false
+		for _, item := range actual {
+			if item.I18nID == ids[language] && item.Text == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func hasAccess(actual *domain.LessonReadAccess, expected domain.LessonReadAccess) bool {
+	return actual != nil && *actual == expected
+}
+func jsonEqual(left, right []byte) bool {
+	var leftValue, rightValue any
+	return json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil && bytes.Equal(mustJSON(leftValue), mustJSON(rightValue))
+}
+func mustJSON(value any) []byte { result, _ := json.Marshal(value); return result }
+func sameOptionalString(actual *string, expected string) bool {
+	return actual != nil && *actual == expected
+}
+func drift(path, reason string) error { return fmt.Errorf("%w at %s: %s", ErrDrift, path, reason) }
+
+type discardEvents struct{}
+
+func (discardEvents) Publish(context.Context, string, any) error { return nil }

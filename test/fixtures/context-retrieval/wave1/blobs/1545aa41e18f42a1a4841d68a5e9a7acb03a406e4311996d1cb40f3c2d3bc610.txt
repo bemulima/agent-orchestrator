@@ -1,0 +1,441 @@
+//go:build integration
+
+package postgres_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	privateapi "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type t202Clock struct{}
+
+func (t202Clock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+
+type t202IDs struct{}
+
+func (t202IDs) NewID() string { return uuid.NewString() }
+
+// Root executes this against an already migrated isolated owner database.
+// Named initial paths are fixture inputs; objective evidence always enters the
+// real registered Student HTTP handlers and shared authoritative reducer.
+func TestT202PlanningStateOutboxPostgres(t *testing.T) {
+	dsn := os.Getenv("STUDENT_T202_PLANNING_STATE_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("root must provision isolated Student planning-state proof database")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil || (!t202AcceptanceDatabase(t, cfg, "student") && (cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_student_integration_proof")) {
+		t.Fatal("requires exact isolated T20 root database at 127.0.0.1:58999")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal("SETUP: isolated proof database unavailable")
+	}
+	t202AcceptanceDatabaseIdentity(t, ctx, pool)
+	studentID := uuid.NewString()
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "t202.execution", Version: "v1"}
+	now := t202Clock{}.Now()
+	profile := domain.StudentOnboarding{StudentID: studentID, DirectionCode: "backend", SelfAssessedExperience: "basic", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "en", WeeklyMinutes: 60, PreferredPace: "standard", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if _, err := (&postgres.StudentOnboardingRepoPG{Pool: pool}).Save(ctx, profile, 0); err != nil {
+		t.Fatalf("SETUP: initial owner profile: %v", err)
+	}
+	primary := t202InitialPath(t, ctx, pool, studentID, target)
+	secondary := t202InitialPath(t, ctx, pool, studentID, target)
+	unmatched := target
+	unmatched.Version = ""
+	_ = t202InitialPath(t, ctx, pool, studentID, unmatched)
+	_ = t202InitialPath(t, ctx, pool, uuid.NewString(), target)
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	generalToken, practiceToken := uuid.NewString(), uuid.NewString()
+	handler := &privatehandlers.Handler{
+		PracticeLearningActions:  studentuc.PracticeLearningActions{Actions: actions, Clock: t202Clock{}, IDs: t202IDs{}},
+		PracticeLearningEvidence: studentuc.ApplyPracticeLearningActionEvidence{Actions: actions, Clock: t202Clock{}},
+		PracticeEvidence:         studentuc.ApplyPracticeEvidence{Evidence: &postgres.LearningEvidenceRepoPG{Pool: pool}},
+	}
+	router := chi.NewRouter()
+	router.Mount("/internal", privateapi.NewRouter(handler, generalToken, "", "", practiceToken))
+	instance := uuid.NewString()
+	revision := primary.Items[0].ReferenceID
+	digest := "sha256:" + strings.Repeat("a", 64)
+	base := fmt.Sprintf("/internal/v2/students/%s/practice-learning-actions/%s", studentID, instance)
+	reservation := domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, TaskRevisionID: revision, TaskRevisionDigest: digest, SurfaceClassification: "practice", LearningTargets: []domain.LearningTargetRef{target}, LearningPathID: primary.ID}
+	response := t202HTTP(t, router, http.MethodPut, base, practiceToken, instance, reservation)
+	if response.Code != http.StatusOK {
+		t.Fatalf("reserve status=%d %s", response.Code, response.Body.String())
+	}
+	var binding domain.PracticeLearningActionBinding
+	if err := json.Unmarshal(response.Body.Bytes(), &binding); err != nil {
+		t.Fatal(err)
+	}
+	response = t202HTTP(t, router, http.MethodPost, base+"/open", practiceToken, "", map[string]string{"schema": domain.StudentPracticeLearningActionOpenSchema, "learning_action_id": binding.LearningActionID})
+	if response.Code != http.StatusOK {
+		t.Fatalf("open status=%d %s", response.Code, response.Body.String())
+	}
+	if events := t202Events(t, ctx, pool, studentID); len(events) != 0 {
+		t.Fatal("reservation/open emitted objective planning fact")
+	}
+	evidenceID := uuid.NewString()
+	evidence := domain.PracticeCompetencyEvidenceBundleV2{Schema: domain.PracticeCompetencyEvidenceSchemaV2, PolicyVersion: domain.PracticeCompetencyEvidencePolicyV2, EvidenceID: evidenceID, SubmissionID: evidenceID, LearningActionID: binding.LearningActionID, StudentID: studentID, TaskInstanceID: instance, TaskRevisionID: revision, TaskRevisionDigest: digest, WorkspaceDigest: digest, Outcome: "passed", AssistancePolicyVersion: "teacher-assistance-v1", Evidence: []domain.PracticeCompetencyEvidence{{Target: target, Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{"named-upstream-runtime-step"}}}, OccurredAt: t202Clock{}.Now()}
+	before := t202Counts(t, ctx, pool, studentID)
+	// Failure after receipt/evidence/mastery/path writes proves the event joins
+	// their transaction. The scoped constraint touches only this named fixture.
+	constraint := "t202_outbox_failure_" + strings.ReplaceAll(evidenceID, "-", "")
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE student_outbox ADD CONSTRAINT %s CHECK (causation_id <> '%s') NOT VALID`, constraint, evidenceID)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := pool.Exec(context.Background(), "ALTER TABLE student_outbox DROP CONSTRAINT IF EXISTS "+constraint); err != nil {
+			t.Error(err)
+		}
+	}()
+	response = t202HTTP(t, router, http.MethodPost, base+"/evidence", practiceToken, evidenceID, evidence)
+	if response.Code < 400 {
+		t.Fatal("outbox failure did not fail real evidence ingress")
+	}
+	if t202Counts(t, ctx, pool, studentID) != before {
+		t.Fatal("outbox failure leaked receipt/evidence/mastery/action/path mutation")
+	}
+	if _, err := pool.Exec(ctx, "ALTER TABLE student_outbox DROP CONSTRAINT "+constraint); err != nil {
+		t.Fatal(err)
+	}
+	response = t202HTTP(t, router, http.MethodPost, base+"/evidence", practiceToken, evidenceID, evidence)
+	if response.Code != http.StatusOK {
+		t.Fatalf("retry evidence status=%d %s", response.Code, response.Body.String())
+	}
+	events := t202Events(t, ctx, pool, studentID)
+	if len(events) != 2 {
+		t.Fatalf("fanout must include selected/unselected exact paths only: %d", len(events))
+	}
+	allowed := map[string]bool{primary.ID: true, secondary.ID: true}
+	for _, event := range events {
+		if err := domain.ValidatePlanningStateChangedEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		var envelope domain.EventEnvelope
+		_ = json.Unmarshal(event.Payload, &envelope)
+		var data domain.PlanningStateChangedData
+		_ = json.Unmarshal(envelope.Data, &data)
+		var version int64
+		if err := pool.QueryRow(ctx, `SELECT version FROM student_learning_path WHERE id=$1`, data.LearningPathID).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if !allowed[data.LearningPathID] || data.PathVersion != version || data.TriggerIdentity != evidenceID || data.TriggerKind != domain.TriggerPlanningObjectiveEvidence || len(data.Targets) != 1 || data.Targets[0] != target {
+			t.Fatal("planning fact misbound to committed owner state")
+		}
+		for _, private := range []string{"correctness", "confidence", "workspace_digest", "step_ids", "named-upstream-runtime-step"} {
+			if strings.Contains(string(event.Payload), private) {
+				t.Fatal("raw evidence escaped event")
+			}
+		}
+	}
+	after := t202Counts(t, ctx, pool, studentID)
+	if after.evidence != 1 || after.receipts != 1 || after.audit != 1 || after.mastery != 1 || after.events != 2 || after.closed != 1 {
+		t.Fatalf("official evidence/mastery/trigger commit missing: %+v", after)
+	}
+	for i := 0; i < 3; i++ {
+		response = t202HTTP(t, router, http.MethodPost, base+"/evidence", practiceToken, evidenceID, evidence)
+		if response.Code != http.StatusOK {
+			t.Fatal("lost response replay failed")
+		}
+	}
+	if t202Counts(t, ctx, pool, studentID) != after {
+		t.Fatal("redelivery duplicated objective state/event or path revision")
+	}
+	changed := evidence
+	changed.WorkspaceDigest = "sha256:" + strings.Repeat("b", 64)
+	if response = t202HTTP(t, router, http.MethodPost, base+"/evidence", practiceToken, evidenceID, changed); response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("existing owner contract rejects changed evidence payload with 422: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if t202Counts(t, ctx, pool, studentID) != after {
+		t.Fatal("conflicting replay mutated owner state")
+	}
+	// Legacy compatibility ingress uses the same transactional fanout, without
+	// creating a v2 action or pretending its event is a replan command.
+	legacyID := uuid.NewString()
+	legacy := domain.PracticeCompetencyEvidenceBundle{Schema: domain.PracticeCompetencyEvidenceSchemaV1, PolicyVersion: domain.PracticeCompetencyEvidencePolicyV1, EvidenceID: legacyID, SubmissionID: legacyID, StudentID: studentID, TaskInstanceID: uuid.NewString(), TaskRevisionID: uuid.NewString(), Outcome: "passed", AssistancePolicyVersion: "teacher-assistance-v1", Evidence: evidence.Evidence, OccurredAt: t202Clock{}.Now()}
+	legacyURL := fmt.Sprintf("/internal/students/%s/practice-evidence", studentID)
+	response = t202HTTP(t, router, http.MethodPost, legacyURL, generalToken, legacyID, legacy)
+	if response.Code != http.StatusOK {
+		t.Fatalf("legacy ingress status=%d %s", response.Code, response.Body.String())
+	}
+	legacyAfter := t202Counts(t, ctx, pool, studentID)
+	if legacyAfter.events != 4 || legacyAfter.evidence != 2 || legacyAfter.receipts != 2 || legacyAfter.audit != 2 || legacyAfter.pathVersions != after.pathVersions {
+		t.Fatal("legacy evidence commit/fanout mutated path or missed state")
+	}
+	response = t202HTTP(t, router, http.MethodPost, legacyURL, generalToken, legacyID, legacy)
+	if response.Code != http.StatusOK || t202Counts(t, ctx, pool, studentID) != legacyAfter {
+		t.Fatal("legacy replay duplicated commit/trigger")
+	}
+	if path := os.Getenv("T202_OWNER_EVENT_FILE"); path != "" {
+		var selected json.RawMessage
+		for _, event := range events {
+			if event.CorrelationID == primary.ID {
+				selected = event.Payload
+			}
+		}
+		if len(selected) == 0 {
+			t.Fatal("actual selected-path outbox event missing")
+		}
+		if err := os.WriteFile(path, append(selected, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t202CourseEvidenceOwnerProof(t, ctx, pool)
+	t.Log("PASS actual registered v2+legacy evidence HTTP ingress → real PG objective evidence/mastery/outbox; exact multi-path fanout; forced atomic rollback/retry; lost response replay; event alone leaves path unchanged")
+}
+
+func t202InitialPath(t *testing.T, ctx context.Context, pool *pgxpool.Pool, studentID string, target domain.LearningTargetRef) domain.StudentLearningPath {
+	t.Helper()
+	now := t202Clock{}.Now()
+	path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: studentID, CourseID: uuid.NewString(), GoalCode: "go.backend", CourseFingerprint: "named-t202-upstream-course-fixture-v1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Named initial path fixture; no evidence or final state seeded", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{
+		{ID: uuid.NewString(), ReferenceType: "practice", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap", Targets: []domain.LearningTargetRef{target}},
+		{ID: uuid.NewString(), ReferenceType: "practice", ReferenceID: uuid.NewString(), Position: 1, Status: domain.LearningPathItemPlanned, ReasonCode: "current_gap", Targets: []domain.LearningTargetRef{target}},
+	}}
+	result, replay, err := (&postgres.LearningJourneyRepoPG{Pool: pool}).CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if err != nil || replay {
+		t.Fatalf("SETUP: initial owner path: %v", err)
+	}
+	return result
+}
+func t202HTTP(t *testing.T, router http.Handler, method, url, token, key string, input any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(method, url, strings.NewReader(string(raw)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Internal-Token", token)
+	request.Header.Set("Idempotency-Key", key)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+type t202OwnerCounts struct {
+	receipts, evidence, audit, mastery, events, closed int
+	pathVersions                                       int64
+}
+
+func t202Counts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, studentID string) t202OwnerCounts {
+	t.Helper()
+	var c t202OwnerCounts
+	err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM student_practice_evidence_receipt WHERE student_id=$1),(SELECT count(*) FROM student_practice_target_evidence WHERE student_id=$1),(SELECT count(*) FROM student_practice_target_mastery_audit WHERE student_id=$1),(SELECT COALESCE(sum(evidence_count),0) FROM student_target_mastery WHERE student_id=$1),(SELECT count(*) FROM student_outbox WHERE student_id=$1 AND subject='student.planning-state.changed.v1'),(SELECT count(*) FROM student_learning_action WHERE student_id=$1 AND lifecycle_status='CLOSED'),(SELECT sum(version) FROM student_learning_path WHERE student_id=$1)`, studentID).Scan(&c.receipts, &c.evidence, &c.audit, &c.mastery, &c.events, &c.closed, &c.pathVersions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+func t202Events(t *testing.T, ctx context.Context, pool *pgxpool.Pool, studentID string) []domain.IntegrationEvent {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT event_id::text,subject,schema_version,student_id::text,correlation_id,COALESCE(causation_id,''),occurred_at,payload FROM student_outbox WHERE student_id=$1 AND subject=$2 ORDER BY event_id`, studentID, domain.SubjectPlanningStateChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	events := []domain.IntegrationEvent{}
+	for rows.Next() {
+		var event domain.IntegrationEvent
+		if err := rows.Scan(&event.EventID, &event.Subject, &event.SchemaVersion, &event.StudentID, &event.CorrelationID, &event.CausationID, &event.OccurredAt, &event.Payload); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// Course official outcome and Teacher assistance join are exercised through
+// their real owner repositories/use case. Course/Teacher upstream facts are
+// named fixtures; no final evidence/mastery rows are directly written.
+func t202CourseEvidenceOwnerProof(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	studentID := uuid.NewString()
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "t202.assessment", Version: "v1"}
+	first, quiz := t202InitialCoursePath(t, ctx, pool, studentID, target)
+	second := t202InitialPath(t, ctx, pool, studentID, target)
+	now := t202Clock{}.Now()
+	taskID := quiz.SourceReference.ID
+	frozenTask, err := json.Marshal(map[string]string{"id": taskID, "_completion_fact_type": "quiz_passed", "_completion_source_revision_id": quiz.SourceReference.RevisionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := domain.StudentTaskAnswer{ID: uuid.NewString(), StudentID: studentID, TaskID: taskID, LearningPathItemID: first.Items[0].ID, RequirementID: quiz.ID, StartedAt: now, Status: domain.StudentTaskAnswerStatusInProgress, CreatedAt: now, UpdatedAt: now, AnswerPayload: json.RawMessage(`{}`), FrozenTaskJSON: frozenTask}
+	action, err := domain.NewStudentLearningAction(domain.StudentLearningAction{ID: uuid.NewString(), StudentTaskAnswerID: answer.ID, StudentID: studentID, TaskID: taskID, ContextType: domain.LearningContextLessonTask, ContextID: taskID, LearningTargets: []domain.LearningTargetRef{target}, EvidenceClass: domain.LearningEvidenceKnowledgeCheck, OpenedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	answer, action, err = lifecycle.CreateAnswer(ctx, answer, nil, action)
+	if err != nil {
+		t.Fatalf("named Course owner action creation: %v", err)
+	}
+	closedAt := now.Add(time.Second)
+	closure, err := domain.NewLearningActionClosedEvent(uuid.NewString(), action, closedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistance := domain.TeacherAssistance{EventID: uuid.NewString(), StudentID: studentID, CorrelationID: action.ID, CausationID: closure.EventID, LearningActionID: action.ID, ContextType: action.ContextType, ContextID: action.ContextID, SupportContext: domain.TeacherSupportIndependent, Observations: []domain.TeacherAssistanceObservation{{Target: target, Kind: domain.TeacherObservationIndependentContext}}, PolicyVersion: "teacher-assistance-v1", OccurredAt: closedAt}
+	ingress := studentuc.ApplyTeacherAssistance{Evidence: &postgres.LearningEvidenceRepoPG{Pool: pool}}
+	// Assistance without an official committed closure cannot invent objective
+	// evidence, mastery, an inbox acknowledgment, or a planning-state trigger.
+	before := t202TeacherCounts(t, ctx, pool, studentID)
+	if accepted, err := ingress.Handle(ctx, assistance); err == nil || accepted {
+		t.Fatal("Teacher assistance without official closure became objective evidence")
+	}
+	if t202TeacherCounts(t, ctx, pool, studentID) != before {
+		t.Fatal("rejected assistance leaked durable state")
+	}
+	answer.Status = domain.StudentTaskAnswerStatusPassed
+	answer.EndedAt = &closedAt
+	answer.UpdatedAt = closedAt
+	action.Outcome = domain.LearningActionPassed
+	action.OutcomePolicyVersion = domain.MasteryPolicyVersion
+	if err := lifecycle.CloseAnswer(ctx, answer, action, closure); err != nil {
+		t.Fatalf("real Course official closure commit: %v", err)
+	}
+	if len(t202Events(t, ctx, pool, studentID)) != 0 {
+		t.Fatal("closure without objective assistance join emitted planning-state trigger")
+	}
+	before = t202TeacherCounts(t, ctx, pool, studentID)
+	constraint := "t202_course_outbox_failure_" + strings.ReplaceAll(action.ID, "-", "")
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE student_outbox ADD CONSTRAINT %s CHECK (subject <> 'student.planning-state.changed.v1' OR causation_id <> '%s') NOT VALID`, constraint, action.ID)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := pool.Exec(context.Background(), "ALTER TABLE student_outbox DROP CONSTRAINT IF EXISTS "+constraint); err != nil {
+			t.Error(err)
+		}
+	}()
+	if accepted, err := ingress.Handle(ctx, assistance); err == nil || accepted {
+		t.Fatal("Course planning outbox failure did not roll back objective commit")
+	}
+	if t202TeacherCounts(t, ctx, pool, studentID) != before {
+		t.Fatal("Course failed outbox leaked assistance inbox/evidence/mastery/audit")
+	}
+	if _, err := pool.Exec(ctx, "ALTER TABLE student_outbox DROP CONSTRAINT "+constraint); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := ingress.Handle(ctx, assistance); err != nil || !accepted {
+		t.Fatalf("Course objective join retry: accepted=%v err=%v", accepted, err)
+	}
+	after := t202TeacherCounts(t, ctx, pool, studentID)
+	if after[0] != 1 || after[1] != 1 || after[2] != 1 || after[3] != 1 || after[4] != 1 || after[5] != 1 || after[6] != 2 || after[7] != before[7] {
+		t.Fatalf("Course objective evidence/mastery/outbox commit: %v", after)
+	}
+	projections, err := (&postgres.LearningEvidenceRepoPG{Pool: pool}).ListStudentTargetMastery(ctx, studentID, []domain.LearningTargetRef{target})
+	if err != nil || len(projections) != 1 || projections[0].State != domain.TargetMasteryUnderstood || projections[0].Confidence != .33333 {
+		t.Fatalf("official knowledge-check mastery projection: %#v %v", projections, err)
+	}
+	events := t202Events(t, ctx, pool, studentID)
+	for _, event := range events {
+		if err := domain.ValidatePlanningStateChangedEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		if (event.CorrelationID != first.ID && event.CorrelationID != second.ID) || event.CausationID != action.ID || !event.OccurredAt.Equal(closedAt) {
+			t.Fatal("Course planning fact does not identify official action/outcome time")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if accepted, err := ingress.Handle(ctx, assistance); err != nil || accepted {
+			t.Fatalf("Course assistance replay: %v %v", accepted, err)
+		}
+	}
+	if t202TeacherCounts(t, ctx, pool, studentID) != after {
+		t.Fatal("Course duplicate assistance emitted another planning event or reduction")
+	}
+	t.Log("PASS real Course CreateAnswer/CloseAnswer → curated Teacher ingress → PG evidence/mastery/planning-outbox atomicity, rollback/retry, exact replay; Teacher-alone rejected")
+}
+
+func t202TeacherCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, studentID string) [8]int {
+	t.Helper()
+	var counts [8]int
+	err := pool.QueryRow(ctx, `SELECT
+ (SELECT count(*) FROM student_integration_inbox WHERE student_id=$1),
+ (SELECT count(*) FROM student_learning_action_assistance WHERE student_id=$1),
+ (SELECT count(*) FROM student_learning_evidence WHERE student_id=$1),
+ (SELECT count(*) FROM student_learning_action_target_evidence WHERE student_id=$1),
+ (SELECT count(*) FROM student_target_mastery_audit WHERE student_id=$1),
+ (SELECT COALESCE(sum(evidence_count),0) FROM student_target_mastery WHERE student_id=$1),
+ (SELECT count(*) FROM student_outbox WHERE student_id=$1 AND subject='student.planning-state.changed.v1'),
+ (SELECT sum(version) FROM student_learning_path WHERE student_id=$1)`, studentID).Scan(&counts[0], &counts[1], &counts[2], &counts[3], &counts[4], &counts[5], &counts[6], &counts[7])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return counts
+}
+
+func t202InitialCoursePath(t *testing.T, ctx context.Context, pool *pgxpool.Pool, studentID string, target domain.LearningTargetRef) (domain.StudentLearningPath, domain.LessonRequirement) {
+	t.Helper()
+	now := t202Clock{}.Now()
+	quiz := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "quiz_passed", Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString(), RevisionID: uuid.NewString()}}
+	path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: studentID, CourseID: uuid.NewString(), GoalCode: "go.backend", CourseFingerprint: "named-t202-assessment-course-fixture-v1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Named initial frozen Course/quiz assignment fixture", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{
+		{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), LessonRevisionID: uuid.NewString(), LessonContent: json.RawMessage(`{"title":"Named frozen quiz lesson"}`), FrozenRequirements: []domain.LessonRequirement{quiz}, Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap", Targets: []domain.LearningTargetRef{target}},
+		{ID: uuid.NewString(), ReferenceType: "practice", ReferenceID: uuid.NewString(), Position: 1, Status: domain.LearningPathItemPlanned, ReasonCode: "current_gap", Targets: []domain.LearningTargetRef{target}},
+	}}
+	result, replay, err := (&postgres.LearningJourneyRepoPG{Pool: pool}).CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+	if err != nil || replay {
+		t.Fatalf("SETUP: initial frozen owner Course path: %v", err)
+	}
+	return result, quiz
+}
+
+// t202AcceptanceDatabase permits only the coordinator's explicit isolated fixture.
+// Frozen historical fixture defaults remain available when this gate is absent.
+func t202AcceptanceDatabase(t *testing.T, cfg *pgxpool.Config, owner string) bool {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return false
+	}
+	if !t202AcceptanceDatabaseMatches(cfg, owner) {
+		t.Fatal("SETUP: explicitly attested isolated acceptance database required")
+	}
+	return true
+}
+
+func t202AcceptanceDatabaseMatches(cfg *pgxpool.Config, owner string) bool {
+	port, err := strconv.Atoi(os.Getenv("INFRA_ACCEPTANCE_POSTGRES_PORT"))
+	name := os.Getenv("INFRA_ACCEPTANCE_" + strings.ToUpper(owner) + "_DATABASE_NAME")
+	host := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_HOST")
+	backend := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP")
+	return !(cfg == nil || err != nil || port < 1 || port > 65535 || host != "127.0.0.1" || net.ParseIP(backend) == nil || !regexp.MustCompile("^infra_acceptance_"+owner+"_[a-z0-9_]+_test$").MatchString(name) || cfg.ConnConfig.Host != host || int(cfg.ConnConfig.Port) != port || cfg.ConnConfig.Database != name || cfg.ConnConfig.User == "" || cfg.ConnConfig.TLSConfig != nil || len(cfg.ConnConfig.Fallbacks) != 0)
+}
+
+func t202AcceptanceDatabaseIdentity(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return
+	}
+	var database, backend string
+	if pool.QueryRow(ctx, `SELECT current_database(), host(inet_server_addr())`).Scan(&database, &backend) != nil || database != pool.Config().ConnConfig.Database || backend != os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP") {
+		t.Fatal("SETUP: isolated acceptance PostgreSQL backend attestation failed")
+	}
+}

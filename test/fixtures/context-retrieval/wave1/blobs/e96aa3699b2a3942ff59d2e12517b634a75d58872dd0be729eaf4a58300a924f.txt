@@ -1,0 +1,372 @@
+package postgres
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
+)
+
+type OnboardingPathAdmissionRepoPG struct{ Pool *pgxpool.Pool }
+
+var _ repository.OnboardingPathAdmissionRepository = (*OnboardingPathAdmissionRepoPG)(nil)
+
+func admissionHash(v any) string {
+	b, _ := json.Marshal(v)
+	d := sha256.Sum256(b)
+	return hex.EncodeToString(d[:])
+}
+func lockAdmission(ctx context.Context, tx pgx.Tx, student string) error {
+	return lockStudentAdmissionFence(ctx, tx, student)
+}
+func (r *OnboardingPathAdmissionRepoPG) HasLiveOnboardingPathAdmission(ctx context.Context, student string) (bool, error) {
+	var ok bool
+	e := r.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM student_onboarding_path_admission WHERE student_id=$1 AND status='RESERVED' AND expires_at>now())", student).Scan(&ok)
+	return ok, e
+}
+func (r *OnboardingPathAdmissionRepoPG) Reserve(ctx context.Context, v domain.OnboardingPathAdmissionRequest, student, key string, now time.Time, ttl time.Duration) (domain.OnboardingPathAdmission, bool, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if e = lockAdmission(ctx, tx, student); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	var replayed domain.OnboardingPathAdmission
+	if replay, e := getAdmissionOperation(ctx, tx, key, "RESERVE", student, admissionHash(v), &replayed); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	} else if replay {
+		replayed.Replayed = true
+		_ = tx.Commit(ctx)
+		return replayed, true, nil
+	}
+	var existing domain.OnboardingPathAdmission
+	e = scanAdmission(tx.QueryRow(ctx, admissionSelect+" WHERE handoff_id=$1", v.HandoffID), &existing)
+	if e == nil {
+		// The receipt lookup above is the only lost-ACK replay path. A new key
+		// must never become an alias for a handoff that was already accepted.
+		return domain.OnboardingPathAdmission{}, false, domain.ErrConflict
+	}
+	if !errors.Is(e, pgx.ErrNoRows) {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	if e = validateAdmissionState(ctx, tx, student, v.ExpectedStateRef); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	var active bool
+	if e = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM student_learning_path WHERE student_id=$1 AND status='ACTIVE')", student).Scan(&active); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	if active {
+		return domain.OnboardingPathAdmission{}, false, domain.ErrActivePathExists
+	}
+	var heldID string
+	var heldExpiry time.Time
+	e = tx.QueryRow(ctx, `SELECT admission_id::text,expires_at FROM student_onboarding_path_admission WHERE student_id=$1 AND status='RESERVED' FOR UPDATE`, student).Scan(&heldID, &heldExpiry)
+	if e == nil {
+		if heldExpiry.After(now) {
+			return domain.OnboardingPathAdmission{}, false, domain.ErrReservationConflict
+		}
+		// An expired reservation cannot later materialize. Terminalize its evidence
+		// before a distinct handoff reserves the same no-active-path interval.
+		if _, e = tx.Exec(ctx, `UPDATE student_onboarding_path_admission SET status='ABORTED',abort_hash=$2,abort_reason='CANCELLED',updated_at=$3 WHERE admission_id=$1`, heldID, admissionHash(map[string]string{"reason": "expired"}), now); e != nil {
+			return domain.OnboardingPathAdmission{}, false, e
+		}
+	} else if !errors.Is(e, pgx.ErrNoRows) {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	a := domain.OnboardingPathAdmission{Schema: domain.OnboardingPathAdmissionSchema, AdmissionID: uuid.NewString(), StudentID: student, HandoffID: v.HandoffID, ExecutionID: v.ExecutionID, StateRef: v.ExpectedStateRef, Goal: v.Goal, Status: domain.OnboardingPathAdmissionReserved, Fence: 1, ExpiresAt: now.Add(ttl)}
+	if _, e = tx.Exec(ctx, "INSERT INTO student_onboarding_path_admission(admission_id,student_id,handoff_id,execution_id,state_ref_kind,state_ref_version,goal_code,goal_version,goal_graph_version,request_hash,status,fence,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'RESERVED',1,$11,$12,$12)", a.AdmissionID, student, a.HandoffID, a.ExecutionID, a.StateRef.Kind, a.StateRef.Version, a.Goal.Code, a.Goal.Version, a.Goal.GraphVersion, admissionHash(v), a.ExpiresAt, now); e != nil {
+		return domain.OnboardingPathAdmission{}, false, mapAdmissionError(e)
+	}
+	if e = putAdmissionOperation(ctx, tx, key, a.AdmissionID, "RESERVE", admissionHash(v), a, now); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	return a, false, nil
+}
+func (r *OnboardingPathAdmissionRepoPG) Renew(ctx context.Context, student, id string, fence int64, execution, key string, now time.Time, ttl time.Duration) (domain.OnboardingPathAdmission, bool, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if e = lockAdmission(ctx, tx, student); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	request := domain.OnboardingPathAdmissionRenewal{Schema: domain.OnboardingPathAdmissionRenewalSchema, ExecutionID: execution, Fence: fence}
+	var replayed domain.OnboardingPathAdmission
+	if replay, e := getAdmissionOperation(ctx, tx, key, "RENEW", student, admissionHash(request), &replayed); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	} else if replay {
+		replayed.Replayed = true
+		if e = tx.Commit(ctx); e != nil {
+			return domain.OnboardingPathAdmission{}, false, e
+		}
+		return replayed, true, nil
+	}
+	var a domain.OnboardingPathAdmission
+	if e = scanAdmission(tx.QueryRow(ctx, admissionSelect+" WHERE admission_id=$1 AND student_id=$2 FOR UPDATE", id, student), &a); errors.Is(e, pgx.ErrNoRows) {
+		return a, false, domain.ErrNotFound
+	}
+	if e != nil {
+		return a, false, e
+	}
+	if a.ExecutionID != execution {
+		return a, false, domain.ErrConflict
+	}
+	if a.Status != domain.OnboardingPathAdmissionReserved {
+		return a, false, domain.ErrConflict
+	}
+	if e = validateAdmissionState(ctx, tx, student, a.StateRef); e != nil {
+		return a, false, e
+	}
+	var active bool
+	if e = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM student_learning_path WHERE student_id=$1 AND status='ACTIVE')", student).Scan(&active); e != nil {
+		return a, false, e
+	}
+	if active {
+		return a, false, domain.ErrActivePathExists
+	}
+	if fence != a.Fence {
+		return a, false, domain.ErrReservationExpired
+	}
+	a.Fence++
+	a.ExpiresAt = now.Add(ttl)
+	if _, e = tx.Exec(ctx, "UPDATE student_onboarding_path_admission SET fence=$2,expires_at=$3,updated_at=$4 WHERE admission_id=$1", a.AdmissionID, a.Fence, a.ExpiresAt, now); e != nil {
+		return a, false, e
+	}
+	if e = putAdmissionOperation(ctx, tx, key, a.AdmissionID, "RENEW", admissionHash(request), a, now); e != nil {
+		return a, false, e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return a, false, e
+	}
+	return a, false, nil
+}
+func (r *OnboardingPathAdmissionRepoPG) Materialize(ctx context.Context, student string, v domain.OnboardingPathMaterialization, id, key, assignmentID string, now time.Time) (domain.OnboardingPathMaterializationResult, bool, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if e = lockAdmission(ctx, tx, student); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	var replayed domain.OnboardingPathMaterializationResult
+	if replay, e := getAdmissionOperation(ctx, tx, key, "MATERIALIZE", student, admissionHash(v), &replayed); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	} else if replay {
+		replayed.Replayed = true
+		if e = tx.Commit(ctx); e != nil {
+			return domain.OnboardingPathMaterializationResult{}, false, e
+		}
+		return replayed, true, nil
+	}
+	var a domain.OnboardingPathAdmission
+	if e = scanAdmission(tx.QueryRow(ctx, admissionSelect+" WHERE admission_id=$1 AND student_id=$2 FOR UPDATE", id, student), &a); errors.Is(e, pgx.ErrNoRows) {
+		return domain.OnboardingPathMaterializationResult{}, false, domain.ErrNotFound
+	}
+	if e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	if a.ExecutionID != v.ExecutionID {
+		return domain.OnboardingPathMaterializationResult{}, false, domain.ErrConflict
+	}
+	// getAdmissionOperation is the only exact replay path.  In particular, a
+	// new key cannot append a duplicate MATERIALIZE receipt for terminal evidence.
+	if a.Status == domain.OnboardingPathAdmissionMaterialized {
+		return domain.OnboardingPathMaterializationResult{}, false, domain.ErrConflict
+	}
+	if a.Status != domain.OnboardingPathAdmissionReserved || a.Fence != v.Fence || !a.ExpiresAt.After(now) {
+		return domain.OnboardingPathMaterializationResult{}, false, domain.ErrReservationExpired
+	}
+	if e = validateAdmissionState(ctx, tx, student, a.StateRef); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	var active bool
+	if e = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM student_learning_path WHERE student_id=$1 AND status='ACTIVE')", student).Scan(&active); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	if active {
+		return domain.OnboardingPathMaterializationResult{}, false, domain.ErrActivePathExists
+	}
+	pathID := uuid.NewString()
+	if _, e = tx.Exec(ctx, "INSERT INTO student_course_assignment(id,student_id,course_id,status,assigned_by,initial_planning_request_id,assigned_at) VALUES($1,$2,$3,'ASSIGNED','learning_planner',$4,$5)", assignmentID, student, v.Course.CourseID, a.ExecutionID, now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, mapAdmissionError(e)
+	}
+	if _, e = tx.Exec(ctx, "INSERT INTO student_course_assignment_request(idempotency_key,planning_request_id,request_hash,assignment_id) VALUES($1,$2,$3,$4)", key, a.ExecutionID, admissionHash(v), assignmentID); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, mapAdmissionError(e)
+	}
+	if _, e = tx.Exec(ctx, "INSERT INTO student_learning_path(id,student_id,course_id,goal_code,curriculum_revision,policy_version,planner_policy_version,reason_code,reason_summary,status,is_primary,version,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'student-learning-path-v1',$6,$7,$8,'ACTIVE',TRUE,1,$9,$9)", pathID, student, v.Course.CourseID, a.Goal.Code, v.Course.CourseFingerprint, v.Course.PlannerPolicyVersion, v.Course.ReasonCode, v.Course.ReasonSummary, now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, mapAdmissionError(e)
+	}
+	for i, l := range v.Lessons {
+		b, _ := json.Marshal(l.Targets)
+		status, reason := "PLANNED", "prerequisite_sequence"
+		if i == 0 {
+			status, reason = "READY", "first_current_gap"
+		}
+		if _, e = tx.Exec(ctx, "INSERT INTO student_learning_path_item(student_learning_path_id,reference_type,reference_id,position,status,targets_json,reason_code,id,lesson_revision_id,frozen_requirements,lesson_content_json) VALUES($1,'lesson',$2,$3,$4,$5,$6,$7,NULLIF($8,'')::uuid,$9,$10)", pathID, l.LessonID, i, status, b, reason, persistedItemID(pathID, domain.LearningPathItem{ID: l.Item.ID, ReferenceType: "lesson", ReferenceID: l.LessonID}), l.Item.LessonRevisionID, requirementsJSON(l.Item), nullableContent(l.Item.LessonContent)); e != nil {
+			return domain.OnboardingPathMaterializationResult{}, false, e
+		}
+	}
+	snapshot, _ := json.Marshal(map[string]any{"id": pathID, "student_id": student, "course_id": v.Course.CourseID, "goal_code": a.Goal.Code, "version": 1})
+	if _, e = tx.Exec(ctx, "INSERT INTO student_learning_path_revision(student_learning_path_id,version,snapshot_json,reason_code,reason_summary,created_at) VALUES($1,1,$2,$3,$4,$5)", pathID, snapshot, v.Course.ReasonCode, v.Course.ReasonSummary, now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	if _, e = tx.Exec(ctx, "INSERT INTO student_learning_context(student_id,selected_learning_path_id,selected_path_status,version,updated_at) VALUES($1,$2,'ACTIVE',1,$3) ON CONFLICT(student_id) DO UPDATE SET selected_learning_path_id=EXCLUDED.selected_learning_path_id,selected_path_status='ACTIVE',version=student_learning_context.version+1,updated_at=EXCLUDED.updated_at", student, pathID, now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	var journey int64
+	if e = tx.QueryRow(ctx, "SELECT version FROM student_learning_context WHERE student_id=$1", student).Scan(&journey); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	if _, e = tx.Exec(ctx, "UPDATE student_onboarding_path_admission SET status='MATERIALIZED',course_id=$2,assignment_id=$3,learning_path_id=$4,materialization_hash=$5,updated_at=$6 WHERE admission_id=$1", a.AdmissionID, v.Course.CourseID, assignmentID, pathID, admissionHash(v), now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	result := domain.OnboardingPathMaterializationResult{Schema: domain.OnboardingPathMaterializationResultSchema, AdmissionID: a.AdmissionID, Status: domain.OnboardingPathAdmissionMaterialized, CourseID: v.Course.CourseID, AssignmentID: assignmentID, LearningPathID: pathID, FirstLessonID: v.Lessons[0].LessonID, LearningPathVersion: 1, JourneyVersion: journey}
+	if e = putAdmissionOperation(ctx, tx, key, a.AdmissionID, "MATERIALIZE", admissionHash(v), result, now); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return domain.OnboardingPathMaterializationResult{}, false, e
+	}
+	return result, false, nil
+}
+func (r *OnboardingPathAdmissionRepoPG) Abort(ctx context.Context, student string, v domain.OnboardingPathAbort, id, key string, now time.Time) (domain.OnboardingPathAdmission, bool, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if e = lockAdmission(ctx, tx, student); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	}
+	var replayed domain.OnboardingPathAdmission
+	if replay, e := getAdmissionOperation(ctx, tx, key, "ABORT", student, admissionHash(v), &replayed); e != nil {
+		return domain.OnboardingPathAdmission{}, false, e
+	} else if replay {
+		replayed.Replayed = true
+		if e = tx.Commit(ctx); e != nil {
+			return domain.OnboardingPathAdmission{}, false, e
+		}
+		return replayed, true, nil
+	}
+	var a domain.OnboardingPathAdmission
+	if e = scanAdmission(tx.QueryRow(ctx, admissionSelect+" WHERE admission_id=$1 AND student_id=$2 FOR UPDATE", id, student), &a); errors.Is(e, pgx.ErrNoRows) {
+		return a, false, domain.ErrNotFound
+	}
+	if e != nil {
+		return a, false, e
+	}
+	if a.ExecutionID != v.ExecutionID {
+		return a, false, domain.ErrConflict
+	}
+	if a.Status == domain.OnboardingPathAdmissionAborted || a.Status == domain.OnboardingPathAdmissionMaterialized {
+		return a, false, domain.ErrConflict
+	}
+	if a.Status != domain.OnboardingPathAdmissionReserved || a.Fence != v.Fence || !a.ExpiresAt.After(now) {
+		return a, false, domain.ErrReservationExpired
+	}
+	if _, e = tx.Exec(ctx, "UPDATE student_onboarding_path_admission SET status='ABORTED',abort_hash=$2,abort_reason=$3,updated_at=$4 WHERE admission_id=$1", a.AdmissionID, admissionHash(v), v.Reason, now); e != nil {
+		return a, false, e
+	}
+	a.Status = domain.OnboardingPathAdmissionAborted
+	a.AbortHash = admissionHash(v)
+	if e = putAdmissionOperation(ctx, tx, key, a.AdmissionID, "ABORT", admissionHash(v), a, now); e != nil {
+		return a, false, e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return a, false, e
+	}
+	return a, false, nil
+}
+
+const admissionSelect = `SELECT admission_id,student_id,handoff_id,execution_id,state_ref_kind,state_ref_version,goal_code,goal_version,goal_graph_version,status,fence,expires_at,COALESCE(course_id::text,''),COALESCE(assignment_id::text,''),COALESCE(learning_path_id::text,''),request_hash,COALESCE(materialization_hash,''),COALESCE(abort_hash,'') FROM student_onboarding_path_admission`
+
+func scanAdmission(row pgx.Row, a *domain.OnboardingPathAdmission) error {
+	a.Schema = domain.OnboardingPathAdmissionSchema
+	return row.Scan(&a.AdmissionID, &a.StudentID, &a.HandoffID, &a.ExecutionID, &a.StateRef.Kind, &a.StateRef.Version, &a.Goal.Code, &a.Goal.Version, &a.Goal.GraphVersion, &a.Status, &a.Fence, &a.ExpiresAt, &a.CourseID, &a.AssignmentID, &a.LearningPathID, &a.RequestHash, &a.MaterializeHash, &a.AbortHash)
+}
+func validateAdmissionState(ctx context.Context, tx pgx.Tx, student string, want domain.StudentPlanningReadinessStateRef) error {
+	var version int64
+	var status string
+	e := tx.QueryRow(ctx, "SELECT version,status FROM student_onboarding_draft WHERE student_id=$1 FOR UPDATE", student).Scan(&version, &status)
+	if e == nil && status == "DRAFT" {
+		if want.Kind == "accepted_draft" && want.Version == version {
+			return nil
+		}
+		return domain.ErrStateChanged
+	}
+	if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+		return e
+	}
+	e = tx.QueryRow(ctx, "SELECT version FROM student_onboarding WHERE student_id=$1 FOR UPDATE", student).Scan(&version)
+	if e != nil {
+		return domain.ErrStateChanged
+	}
+	if want.Kind != "finalized_profile" || want.Version != version {
+		return domain.ErrStateChanged
+	}
+	return nil
+}
+func mapAdmissionError(e error) error {
+	if e == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(e, &pgErr) && pgErr.Code == "23505" {
+		return domain.ErrConflict
+	}
+	return e
+}
+
+func getAdmissionOperation(ctx context.Context, tx interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, key, kind, student, hash string, target any) (bool, error) {
+	if key == "" {
+		return false, domain.ErrValidation
+	}
+	var storedHash, storedKind, storedStudent string
+	var body []byte
+	err := tx.QueryRow(ctx, `SELECT o.request_hash,o.operation_kind,a.student_id::text,o.response_json FROM student_onboarding_path_admission_operation o JOIN student_onboarding_path_admission a ON a.admission_id=o.admission_id WHERE o.idempotency_key=$1`, key).Scan(&storedHash, &storedKind, &storedStudent, &body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if storedHash != hash || storedKind != kind || storedStudent != student {
+		return false, domain.ErrConflict
+	}
+	if err = json.Unmarshal(body, target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func putAdmissionOperation(ctx context.Context, tx pgx.Tx, key, admissionID, kind, hash string, response any, now time.Time) error {
+	body, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO student_onboarding_path_admission_operation(idempotency_key,admission_id,operation_kind,request_hash,response_json,created_at) VALUES($1,$2,$3,$4,$5,$6)`, key, admissionID, kind, hash, body, now)
+	return mapAdmissionError(err)
+}
+
+func (repo *OnboardingPathAdmissionRepoPG) ReplayMaterialization(ctx context.Context, student, key string, v domain.OnboardingPathMaterialization) (domain.OnboardingPathMaterializationResult, bool, error) {
+	var result domain.OnboardingPathMaterializationResult
+	replayed, err := getAdmissionOperation(ctx, repo.Pool, key, "MATERIALIZE", student, admissionHash(v), &result)
+	return result, replayed, err
+}

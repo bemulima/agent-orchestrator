@@ -1,0 +1,130 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+func TestTaskTestAnswerVariantRepoStoresStructuredAnswersAtomically(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required for PostgreSQL integration test")
+	}
+
+	ctx := context.Background()
+	pool, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	defer pool.Close()
+
+	const (
+		answerID   = "10000000-0000-0000-0000-000000000001"
+		studentID  = "10000000-0000-0000-0000-000000000002"
+		taskID     = "10000000-0000-0000-0000-000000000003"
+		testID     = "10000000-0000-0000-0000-000000000004"
+		variantAID = "10000000-0000-0000-0000-000000000005"
+		variantBID = "10000000-0000-0000-0000-000000000006"
+		groupAID   = "10000000-0000-0000-0000-000000000007"
+		groupBID   = "10000000-0000-0000-0000-000000000008"
+	)
+
+	_, _ = pool.Exec(ctx, `DELETE FROM student_task_answer WHERE id=$1`, answerID)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO student_task_answer (
+    id, student_id, task_id, started_at, status, attempt, created_at, updated_at
+) VALUES ($1,$2,$3,now(),$4,1,now(),now())
+`, answerID, studentID, taskID, domain.StudentTaskAnswerStatusInProgress); err != nil {
+		t.Fatalf("seed test answer: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM student_task_answer WHERE id=$1`, answerID)
+	})
+
+	repository := TaskTestAnswerVariantRepoPG{Pool: pool}
+	now := time.Now().UTC()
+	positionOne := 1
+	positionTwo := 2
+	singleChoice := []domain.TaskTestAnswerVariant{
+		assessmentSelection("10000000-0000-0000-0000-000000000009", answerID, taskID, testID, variantAID, nil, nil, true, now),
+	}
+	if err := repository.ReplaceForAnswer(ctx, answerID, singleChoice); err != nil {
+		t.Fatalf("store backward-compatible single-choice answer: %v", err)
+	}
+	stored, err := repository.ListForAnswer(ctx, answerID)
+	if err != nil {
+		t.Fatalf("read single-choice answer: %v", err)
+	}
+	if len(stored) != 1 || stored[0].TaskTestVariantID != variantAID || stored[0].SubmittedOrder != nil || stored[0].SubmittedGroupID != nil {
+		t.Fatalf("single-choice readback mismatch: %+v", stored)
+	}
+
+	ordering := []domain.TaskTestAnswerVariant{
+		assessmentSelection("10000000-0000-0000-0000-000000000011", answerID, taskID, testID, variantAID, &positionOne, nil, true, now),
+		assessmentSelection("10000000-0000-0000-0000-000000000012", answerID, taskID, testID, variantBID, &positionTwo, nil, true, now.Add(time.Millisecond)),
+	}
+	if err := repository.ReplaceForAnswer(ctx, answerID, ordering); err != nil {
+		t.Fatalf("store ordering answer: %v", err)
+	}
+	stored, err = repository.ListForAnswer(ctx, answerID)
+	if err != nil {
+		t.Fatalf("read ordering answer: %v", err)
+	}
+	if len(stored) != 2 || stored[0].SubmittedOrder == nil || *stored[0].SubmittedOrder != 1 || stored[1].SubmittedOrder == nil || *stored[1].SubmittedOrder != 2 {
+		t.Fatalf("ordering readback mismatch: %+v", stored)
+	}
+
+	classification := []domain.TaskTestAnswerVariant{
+		assessmentSelection("10000000-0000-0000-0000-000000000021", answerID, taskID, testID, variantAID, nil, stringPointer(groupAID), true, now),
+		assessmentSelection("10000000-0000-0000-0000-000000000022", answerID, taskID, testID, variantBID, nil, stringPointer(groupBID), true, now.Add(time.Millisecond)),
+	}
+	if err := repository.ReplaceForAnswer(ctx, answerID, classification); err != nil {
+		t.Fatalf("store classification answer: %v", err)
+	}
+	stored, err = repository.ListForAnswer(ctx, answerID)
+	if err != nil {
+		t.Fatalf("read classification answer: %v", err)
+	}
+	if len(stored) != 2 || stored[0].SubmittedGroupID == nil || *stored[0].SubmittedGroupID != groupAID || stored[1].SubmittedGroupID == nil || *stored[1].SubmittedGroupID != groupBID {
+		t.Fatalf("classification readback mismatch: %+v", stored)
+	}
+
+	invalidReplacement := []domain.TaskTestAnswerVariant{
+		assessmentSelection("10000000-0000-0000-0000-000000000031", answerID, taskID, testID, variantAID, &positionOne, nil, true, now),
+		assessmentSelection("10000000-0000-0000-0000-000000000032", answerID, taskID, testID, variantBID, &positionOne, nil, true, now.Add(time.Millisecond)),
+	}
+	if err := repository.ReplaceForAnswer(ctx, answerID, invalidReplacement); err == nil {
+		t.Fatal("duplicate submitted order unexpectedly succeeded")
+	}
+	stored, err = repository.ListForAnswer(ctx, answerID)
+	if err != nil {
+		t.Fatalf("read answer after rollback: %v", err)
+	}
+	if len(stored) != 2 || stored[0].SubmittedGroupID == nil || *stored[0].SubmittedGroupID != groupAID {
+		t.Fatalf("failed replacement did not roll back atomically: %+v", stored)
+	}
+}
+
+func assessmentSelection(id, answerID, taskID, testID, variantID string, submittedOrder *int, submittedGroupID *string, correct bool, createdAt time.Time) domain.TaskTestAnswerVariant {
+	return domain.TaskTestAnswerVariant{
+		ID:                  id,
+		StudentTaskAnswerID: answerID,
+		TaskID:              taskID,
+		TaskTestID:          testID,
+		TaskTestVariantID:   variantID,
+		SubmittedOrder:      submittedOrder,
+		SubmittedGroupID:    submittedGroupID,
+		IsCorrect:           correct,
+		CreatedAt:           createdAt,
+	}
+}
+
+func stringPointer(value string) *string {
+	return &value
+}

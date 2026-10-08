@@ -1,0 +1,383 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/middleware"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/parsers"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/example/mc-course-service/internal/usecase/lessonrevision"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+// LessonHandler handles lesson endpoints.
+type LessonHandler struct {
+	RevisionsUC lessonrevision.Definitions
+	Validator   *validator.Validate
+	CreateUC    lesson.CreateLesson
+	UpdateUC    lesson.UpdateLesson
+	DeleteUC    lesson.DeleteLesson
+	GetUC       lesson.GetLesson
+	ListUC      lesson.ListLessonsByCourse
+	MaterialsUC lesson.GetLessonMaterials
+	Access      contentaccess.Service
+}
+
+type lessonTranslationRequest struct {
+	I18nID      int    `json:"i18n_id" validate:"required,min=1"`
+	Title       string `json:"title" validate:"required,max=255"`
+	Excerpt     string `json:"excerpt" validate:"required"`
+	Description string `json:"description" validate:"required"`
+}
+
+type internalLessonResponse struct {
+	ID          string `json:"id"`
+	CourseID    string `json:"course_id,omitempty"`
+	SectionID   string `json:"section_id"`
+	Title       string `json:"title"`
+	Excerpt     string `json:"excerpt"`
+	Description string `json:"description"`
+	Order       int    `json:"order"`
+	Status      int    `json:"status"`
+}
+
+type lessonVersionRequest struct {
+	TechVersionID int  `json:"tech_version_id" validate:"required,min=1"`
+	Status        *int `json:"status" validate:"omitempty,oneof=0 1"`
+}
+
+// CreateLessonRequest body.
+type CreateLessonRequest struct {
+	ID               string                     `json:"id" validate:"omitempty,uuid"`
+	SourceKey        string                     `json:"source_key" validate:"omitempty,max=255"`
+	Title            string                     `json:"title" validate:"required,max=255"`
+	Excerpt          string                     `json:"excerpt" validate:"required"`
+	Description      string                     `json:"description" validate:"required"`
+	Status           *int                       `json:"status" validate:"omitempty,oneof=0 1"`
+	LessonReadAccess *domain.LessonReadAccess   `json:"lesson_read_access" validate:"omitempty,oneof=guest student student_pro disabled"`
+	Versions         []lessonVersionRequest     `json:"versions" validate:"omitempty,dive"`
+	Translations     []lessonTranslationRequest `json:"translations" validate:"omitempty,dive"`
+	ComposeConfig    json.RawMessage            `json:"compose_config"`
+}
+
+// Create handles creation.
+func (h LessonHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var req CreateLessonRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	lesson, err := h.CreateUC.Handle(r.Context(), lesson.CreateLessonInput{
+		ID:               req.ID,
+		SourceKey:        req.SourceKey,
+		Title:            req.Title,
+		Excerpt:          req.Excerpt,
+		Description:      req.Description,
+		Translations:     mapLessonTranslations(req.Translations),
+		Versions:         mapLessonVersions(req.Versions),
+		ComposeConfig:    req.ComposeConfig,
+		Status:           req.Status,
+		LessonReadAccess: req.LessonReadAccess,
+	})
+	if err != nil {
+		if err == domain.ErrConflict {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(lesson)
+}
+
+// List returns lessons for a course id.
+func (h LessonHandler) List(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	fieldsParam := r.URL.Query().Get("fields")
+
+	// Parse and validate fields
+	f := queryfields.Parse(fieldsParam, queryfields.LessonAllowedFields)
+	responseIncludesID := f.Has("id")
+	queryFields := f.Including("id")
+
+	// Parse filters and sort from query parameters
+	filters, err := parsers.ParseLessonFilters(r, h.Validator)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sort := parsers.ParseSortOptions(r)
+
+	if courseID != "" {
+		if filters.CourseID != nil && *filters.CourseID != courseID {
+			http.Error(w, "course_id does not match path", http.StatusBadRequest)
+			return
+		}
+		filters.CourseID = &courseID
+	} else if filters.CourseID != nil {
+		courseID = *filters.CourseID
+	}
+
+	_, role, authenticated := middleware.UserFromContext(r.Context())
+	privileged := authenticated && isPositionPrivilegedRole(role)
+	if !privileged {
+		active := domain.LessonStatusActive
+		filters.Status = &active
+		switch {
+		case filters.CourseID != nil:
+			err = h.Access.RequireCourse(r.Context(), *filters.CourseID)
+		case filters.ModuleID != nil:
+			err = h.Access.RequireModule(r.Context(), *filters.ModuleID)
+		case filters.SectionID != nil:
+			err = h.Access.RequireSection(r.Context(), *filters.SectionID)
+		default:
+			err = domain.ErrNotFound
+		}
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+	}
+
+	lessons, total, err := h.ListUC.HandleWithFields(r.Context(), courseID, queryFields, filters, sort)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure we return empty array instead of null
+	if lessons == nil {
+		lessons = []map[string]any{}
+	}
+	if !privileged && len(lessons) > 0 {
+		lessonIDs := make([]string, 0, len(lessons))
+		for _, item := range lessons {
+			if lessonID, ok := item["id"].(string); ok && lessonID != "" {
+				lessonIDs = append(lessonIDs, lessonID)
+			}
+		}
+		decisions, err := h.Access.ResolveLessons(r.Context(), lessonIDs, false)
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+		for _, item := range lessons {
+			lessonID, _ := item["id"].(string)
+			decision, ok := decisions[lessonID]
+			if !ok {
+				decision.Effective = domain.DefaultLessonReadAccess
+			}
+			item["effective_read_access"] = decision.Effective
+			item["can_read"] = decision.CanRead
+			if decision.SourceType != "" {
+				item["read_access_source_type"] = decision.SourceType
+			}
+			if !decision.CanRead {
+				delete(item, "description")
+				delete(item, "translations")
+				delete(item, "compose_config")
+			}
+			if !responseIncludesID {
+				delete(item, "id")
+			}
+		}
+	} else if !responseIncludesID {
+		for _, item := range lessons {
+			delete(item, "id")
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"lessons": lessons,
+		"meta":    buildPaginationMeta(filters.Page, filters.Limit, total),
+	})
+}
+
+// UpdateLessonRequest body.
+type UpdateLessonRequest struct {
+	Title            string                     `json:"title" validate:"required,max=255"`
+	Excerpt          string                     `json:"excerpt" validate:"required"`
+	Description      string                     `json:"description" validate:"required"`
+	Versions         []lessonVersionRequest     `json:"versions" validate:"omitempty,dive"`
+	Translations     []lessonTranslationRequest `json:"translations" validate:"omitempty,dive"`
+	ComposeConfig    optionalRawMessage         `json:"compose_config"`
+	Status           int                        `json:"status" validate:"oneof=0 1"`
+	LessonReadAccess optionalLessonReadAccess   `json:"lesson_read_access"`
+}
+
+// Update handles PUT /admin/lessons/{lessonID}.
+func (h LessonHandler) Update(w http.ResponseWriter, r *http.Request) {
+	lessonID := chi.URLParam(r, "lessonID")
+	var req UpdateLessonRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	var composeConfig *[]byte
+	if req.ComposeConfig.Set {
+		cfg := []byte(req.ComposeConfig.Value)
+		composeConfig = &cfg
+	}
+	lesson, err := h.UpdateUC.Handle(r.Context(), lesson.UpdateLessonInput{
+		LessonID:            lessonID,
+		Title:               req.Title,
+		Excerpt:             req.Excerpt,
+		Description:         req.Description,
+		Translations:        mapLessonTranslations(req.Translations),
+		Versions:            mapLessonVersions(req.Versions),
+		ComposeConfig:       composeConfig,
+		Status:              req.Status,
+		LessonReadAccess:    req.LessonReadAccess.Value,
+		LessonReadAccessSet: req.LessonReadAccess.Set,
+	})
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err == domain.ErrConflict {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(lesson)
+}
+
+// Get handles GET /lessons/{lessonID}.
+func (h LessonHandler) Get(w http.ResponseWriter, r *http.Request) {
+	lessonID := chi.URLParam(r, "lessonID")
+	var readDecision contentaccess.LessonReadDecision
+	if !isPrivilegedRequest(r) {
+		var err error
+		readDecision, err = h.Access.AuthorizeLesson(r.Context(), lessonID, r.URL.Query().Get(relationAccessQueryParam))
+		if err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+	} else {
+		readDecision = contentaccess.LessonReadDecision{Effective: domain.DefaultLessonReadAccess, CanRead: true}
+	}
+	fieldsParam := r.URL.Query().Get("fields")
+
+	// Parse and validate fields
+	f := queryfields.Parse(fieldsParam, queryfields.LessonAllowedFields)
+
+	result, err := h.GetUC.HandleWithFields(r.Context(), lessonID, f)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result["effective_read_access"] = readDecision.Effective
+	result["can_read"] = readDecision.CanRead
+	if readDecision.SourceType != "" {
+		result["read_access_source_type"] = readDecision.SourceType
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// GetInternalLesson returns lesson metadata for internal consumers.
+func (h LessonHandler) GetInternalLesson(w http.ResponseWriter, r *http.Request) {
+	lessonID := chi.URLParam(r, "lessonID")
+	item, err := h.GetUC.Handle(r.Context(), lessonID)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(internalLessonResponse{
+		ID:          item.ID,
+		CourseID:    item.CourseID,
+		SectionID:   item.SectionID,
+		Title:       item.Title,
+		Excerpt:     item.Excerpt,
+		Description: item.Description,
+		Order:       item.Order,
+		Status:      item.Status,
+	})
+}
+
+// Delete handles DELETE /admin/lessons/{lessonID}.
+func (h LessonHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	lessonID := chi.URLParam(r, "lessonID")
+	if err := h.DeleteUC.Handle(r.Context(), lesson.DeleteLessonInput{LessonID: lessonID}); err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func mapLessonTranslations(translations []lessonTranslationRequest) []domain.LessonI18n {
+	result := make([]domain.LessonI18n, 0, len(translations))
+	for _, translation := range translations {
+		result = append(result, domain.LessonI18n{
+			I18nID:      translation.I18nID,
+			Title:       translation.Title,
+			Excerpt:     translation.Excerpt,
+			Description: translation.Description,
+		})
+	}
+	return result
+}
+
+func mapLessonVersions(versions []lessonVersionRequest) []domain.LessonVersion {
+	result := make([]domain.LessonVersion, 0, len(versions))
+	for _, version := range versions {
+		status := domain.LessonVersionStatusActive
+		if version.Status != nil {
+			status = *version.Status
+		}
+		result = append(result, domain.LessonVersion{
+			TechVersionID: version.TechVersionID,
+			Status:        status,
+		})
+	}
+	return result
+}

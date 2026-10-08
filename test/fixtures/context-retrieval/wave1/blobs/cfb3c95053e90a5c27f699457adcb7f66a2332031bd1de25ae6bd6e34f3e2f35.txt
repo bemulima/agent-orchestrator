@@ -1,0 +1,127 @@
+BEGIN;
+
+LOCK TABLE teacher_onboarding_interaction IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE teacher_onboarding_turn IN SHARE MODE;
+LOCK TABLE teacher_dialog_job IN SHARE MODE;
+LOCK TABLE teacher_onboarding_action_receipt IN SHARE MODE;
+
+-- The mixed-fleet drain is mandatory. NULL is retained only for terminal
+-- historical evidence whose originating session schema cannot be proven.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM teacher_onboarding_interaction
+        WHERE state IN ('active', 'reserved', 'handoff_pending')
+    ) THEN
+        RAISE EXCEPTION 'cannot install migration 023: ambiguous nonterminal onboarding interactions must drain';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM teacher_onboarding_turn
+        WHERE stage IN ('received', 'interaction_reserved', 'ai_staged', 'student_staged', 'response_staged', 'delivery_pending')
+    ) THEN
+        RAISE EXCEPTION 'cannot install migration 023: nonterminal onboarding turns must drain';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM teacher_dialog_job
+        WHERE coordinator_mode IN ('onboarding_action', 'onboarding_text')
+          AND status IN ('queued', 'processing', 'delivery_pending')
+    ) THEN
+        RAISE EXCEPTION 'cannot install migration 023: nonterminal onboarding coordinator jobs must drain';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM teacher_onboarding_action_receipt
+        WHERE status IN ('claimed', 'applied')
+    ) THEN
+        RAISE EXCEPTION 'cannot install migration 023: nonterminal onboarding receipts must drain';
+    END IF;
+END $$;
+
+ALTER TABLE teacher_onboarding_interaction
+    ADD COLUMN session_schema_version SMALLINT,
+    ADD CONSTRAINT teacher_onboarding_interaction_session_schema_version_ck
+        CHECK (session_schema_version IS NULL OR session_schema_version IN (1, 2, 3)),
+    ADD CONSTRAINT teacher_onboarding_interaction_session_admission_ck
+        CHECK (session_schema_version IS NOT NULL OR state IN ('superseded', 'completed', 'closed'));
+
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_session_schema_version()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' AND (NEW.session_schema_version IS NULL OR NEW.session_schema_version NOT IN (1, 2, 3)) THEN
+        RAISE EXCEPTION 'new teacher onboarding interaction requires session schema version 1..3';
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.session_schema_version IS DISTINCT FROM NEW.session_schema_version THEN
+        RAISE EXCEPTION 'teacher onboarding session schema version is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_session_schema_version
+BEFORE INSERT OR UPDATE ON teacher_onboarding_interaction
+FOR EACH ROW EXECUTE FUNCTION protect_teacher_onboarding_session_schema_version();
+
+CREATE TABLE teacher_onboarding_terminal_session (
+    terminal_session_id UUID PRIMARY KEY,
+    student_id TEXT NOT NULL UNIQUE CHECK (student_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+    personal_teacher_id UUID NOT NULL,
+    dialog_id UUID NOT NULL,
+    session_schema_version SMALLINT NOT NULL CHECK (session_schema_version = 3),
+    state_ref_kind VARCHAR(32) NOT NULL CHECK (state_ref_kind IN ('accepted_draft', 'finalized_profile')),
+    state_ref_version BIGINT NOT NULL CHECK (state_ref_version > 0),
+    terminal_kind VARCHAR(32) NOT NULL CHECK (terminal_kind = 'ACTIVE_PATH_EXISTS'),
+    terminal_message_command_id UUID NOT NULL UNIQUE,
+    status VARCHAR(24) NOT NULL CHECK (status IN ('message_pending', 'delivered')),
+    dialog_message_id UUID UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    delivered_at TIMESTAMPTZ,
+    FOREIGN KEY (personal_teacher_id, student_id) REFERENCES personal_teacher(id, student_id) ON DELETE RESTRICT,
+    CHECK ((status = 'message_pending' AND dialog_message_id IS NULL AND delivered_at IS NULL)
+        OR (status = 'delivered' AND dialog_message_id IS NOT NULL AND delivered_at IS NOT NULL)),
+    CHECK (updated_at >= created_at AND (delivered_at IS NULL OR (delivered_at >= created_at AND updated_at >= delivered_at)))
+);
+
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_terminal_session()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF ROW(OLD.terminal_session_id, OLD.student_id, OLD.personal_teacher_id, OLD.dialog_id,
+               OLD.session_schema_version, OLD.state_ref_kind, OLD.state_ref_version,
+               OLD.terminal_kind, OLD.terminal_message_command_id, OLD.created_at)
+           IS DISTINCT FROM
+           ROW(NEW.terminal_session_id, NEW.student_id, NEW.personal_teacher_id, NEW.dialog_id,
+               NEW.session_schema_version, NEW.state_ref_kind, NEW.state_ref_version,
+               NEW.terminal_kind, NEW.terminal_message_command_id, NEW.created_at) THEN
+            RAISE EXCEPTION 'teacher onboarding terminal session identity is immutable';
+        END IF;
+        IF OLD.status = 'delivered' AND ROW(OLD.status, OLD.dialog_message_id, OLD.delivered_at)
+            IS DISTINCT FROM ROW(NEW.status, NEW.dialog_message_id, NEW.delivered_at) THEN
+            RAISE EXCEPTION 'teacher onboarding terminal delivery acknowledgement is immutable';
+        END IF;
+        IF OLD.status = 'message_pending' AND NEW.status = 'delivered'
+           AND (NEW.dialog_message_id IS NULL OR NEW.delivered_at IS NULL) THEN
+            RAISE EXCEPTION 'teacher onboarding terminal delivery acknowledgement must be complete';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_terminal_session
+BEFORE UPDATE ON teacher_onboarding_terminal_session
+FOR EACH ROW EXECUTE FUNCTION protect_teacher_onboarding_terminal_session();
+
+CREATE OR REPLACE FUNCTION protect_teacher_onboarding_terminal_session_delete()
+RETURNS TRIGGER AS $$ BEGIN
+    RAISE EXCEPTION 'teacher onboarding terminal session evidence cannot be deleted';
+END; $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_teacher_onboarding_terminal_session_delete
+BEFORE DELETE ON teacher_onboarding_terminal_session
+FOR EACH ROW EXECUTE FUNCTION protect_teacher_onboarding_terminal_session_delete();
+
+CREATE TRIGGER trg_protect_teacher_onboarding_terminal_session_truncate
+BEFORE TRUNCATE ON teacher_onboarding_terminal_session
+FOR EACH STATEMENT EXECUTE FUNCTION protect_teacher_onboarding_terminal_session_delete();
+
+COMMIT;

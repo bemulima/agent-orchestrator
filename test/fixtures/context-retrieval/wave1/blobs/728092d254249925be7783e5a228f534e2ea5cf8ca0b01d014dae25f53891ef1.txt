@@ -1,0 +1,208 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	privateapi "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type t11ProviderClock struct{}
+
+func (t11ProviderClock) Now() time.Time { return time.Now().UTC() }
+
+type t11ProviderIDs struct{}
+
+func (t11ProviderIDs) NewID() string { return uuid.NewString() }
+
+type t11ProviderFixture struct {
+	StudentID          string `json:"student_id"`
+	LearningPathID     string `json:"learning_path_id"`
+	LearningPathItemID string `json:"learning_path_item_id"`
+}
+
+type t11ProviderCounts struct {
+	t11ProviderFixture
+	Receipts             int   `json:"receipts"`
+	Evidence             int   `json:"evidence"`
+	Audit                int   `json:"audit"`
+	MasteryRows          int   `json:"mastery_rows"`
+	MasteryEvidenceCount int   `json:"mastery_evidence_count"`
+	Actions              int   `json:"actions"`
+	ClosedActions        int   `json:"closed_actions"`
+	CompletedItems       int   `json:"completed_items"`
+	PathVersion          int64 `json:"path_version"`
+}
+
+// TestT11EvidenceHTTPProvider exposes actual registered Student private handlers
+// and the PostgreSQL mastery reducer for serialized cross-service delivery proof.
+// Identities are synthetic; the dedicated trusted service token is direct internal
+// ingress, not JWT authentication or full learner end-to-end verification.
+// This harness never migrates or resets the database and retains its UUID rows.
+// Run this file alone: the historical integration package has stale API references.
+func TestT11EvidenceHTTPProvider(t *testing.T) {
+	dsn := os.Getenv("T11_STUDENT_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set T11_STUDENT_DATABASE_URL for explicitly isolated migrated proof database")
+	}
+	token := os.Getenv("T11_STUDENT_INTERNAL_TOKEN")
+	readyFile, stopFile, assertionFile := os.Getenv("T11_STUDENT_READY_FILE"), os.Getenv("T11_STUDENT_STOP_FILE"), os.Getenv("T11_STUDENT_ASSERTION_FILE")
+	if token == "" || readyFile == "" || stopFile == "" || assertionFile == "" {
+		t.Fatal("provider requires dedicated token, ready, stop, and assertion file envs")
+	}
+	if readyFile == stopFile || readyFile == assertionFile || stopFile == assertionFile {
+		t.Fatal("provider control files must be distinct")
+	}
+	for _, path := range []string{readyFile, stopFile, assertionFile} {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatal("provider requires fresh control files")
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal("invalid proof database configuration")
+	}
+	if (cfg.ConnConfig.Host != "127.0.0.1" && cfg.ConnConfig.Host != "localhost" && cfg.ConnConfig.Host != "::1") || cfg.ConnConfig.Port != 58998 || cfg.ConnConfig.Database != "student_remediation_integration_proof" {
+		t.Fatal("requires owned loopback:58998 student_remediation_integration_proof database")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("cannot connect to isolated Student proof database")
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal("cannot ping isolated Student proof database")
+	}
+	const revisionID = "00000000-0000-4000-8000-000000000003"
+	const stepID = "00000000-0000-4000-8000-000000000005"
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "loops", Version: "v1"}
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	fixtures := make([]t11ProviderFixture, 0, 3)
+	for i := 0; i < 3; i++ {
+		now := time.Now().UTC()
+		fixture := t11ProviderFixture{StudentID: uuid.NewString(), LearningPathID: uuid.NewString(), LearningPathItemID: uuid.NewString()}
+		path := domain.StudentLearningPath{ID: fixture.LearningPathID, StudentID: fixture.StudentID, CourseID: uuid.NewString(), GoalCode: "go.backend", CurriculumRevision: "t11-delivery-proof-v1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Synthetic T11 delivery proof", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ID: fixture.LearningPathItemID, ReferenceType: "practice", ReferenceID: revisionID, Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap", Targets: []domain.LearningTargetRef{target}}}}
+		created, replayed, err := journey.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+		if err != nil || replayed {
+			t.Fatalf("seed isolated path: replayed=%v err=%v", replayed, err)
+		}
+		fixture.LearningPathItemID = created.Items[0].ID
+		fixtures = append(fixtures, fixture)
+	}
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	handler := &privatehandlers.Handler{PracticeLearningActions: studentuc.PracticeLearningActions{Actions: actions, Clock: t11ProviderClock{}, IDs: t11ProviderIDs{}}, PracticeLearningEvidence: studentuc.ApplyPracticeLearningActionEvidence{Actions: actions, Clock: t11ProviderClock{}}}
+	root := chi.NewRouter()
+	root.Mount("/internal", privateapi.NewRouter(handler, uuid.NewString(), "", "", token))
+	readCounts := func(readCtx context.Context) ([]t11ProviderCounts, error) {
+		counts := make([]t11ProviderCounts, 0, len(fixtures))
+		for _, f := range fixtures {
+			c := t11ProviderCounts{t11ProviderFixture: f}
+			err := pool.QueryRow(readCtx, `SELECT
+    (SELECT count(*) FROM student_practice_evidence_receipt WHERE student_id=$1),
+    (SELECT count(*) FROM student_practice_target_evidence WHERE student_id=$1),
+    (SELECT count(*) FROM student_practice_target_mastery_audit WHERE student_id=$1),
+    (SELECT count(*) FROM student_target_mastery WHERE student_id=$1),
+    (SELECT COALESCE(sum(evidence_count),0) FROM student_target_mastery WHERE student_id=$1),
+    (SELECT count(*) FROM student_learning_action WHERE student_id=$1),
+    (SELECT count(*) FROM student_learning_action WHERE student_id=$1 AND lifecycle_status='CLOSED'),
+    (SELECT count(*) FROM student_learning_path_item WHERE student_learning_path_id=$2 AND status='COMPLETED'),
+    (SELECT version FROM student_learning_path WHERE id=$2 AND student_id=$1)`, f.StudentID, f.LearningPathID).Scan(&c.Receipts, &c.Evidence, &c.Audit, &c.MasteryRows, &c.MasteryEvidenceCount, &c.Actions, &c.ClosedActions, &c.CompletedItems, &c.PathVersion)
+			if err != nil {
+				return nil, err
+			}
+			counts = append(counts, c)
+		}
+		return counts, nil
+	}
+	// Read-only proof instrumentation, limited to owned UUIDs; no mutation shortcut.
+	root.Get("/t11/proof/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		counts, err := readCounts(r.Context())
+		if err != nil {
+			http.Error(w, "proof query failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"fixtures": counts})
+	})
+	server := httptest.NewServer(root)
+	defer server.Close()
+	writeJSON := func(path string, value any) {
+		t.Helper()
+		data, err := json.MarshalIndent(value, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(path+".tmp", append(data, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Rename(path+".tmp", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeJSON(readyFile, map[string]any{"base_url": server.URL, "revision_id": revisionID, "target": target, "step_id": stepID, "fixtures": fixtures, "stats_path": "/t11/proof/stats", "retained_rows": true})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("provider stop file not received before deadline")
+		case <-ticker.C:
+			if _, err := os.Stat(stopFile); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			// No deliveries should be in flight after the orchestrator requests stop.
+			server.Close()
+			counts, err := readCounts(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			passed := true
+			for i, c := range counts {
+				want := 1
+				if i == 2 {
+					want = 0
+				}
+				if c.Receipts != want || c.Evidence != want || c.Audit != want || c.MasteryRows != want || c.MasteryEvidenceCount != want || c.Actions != want || c.ClosedActions != want || c.CompletedItems != want {
+					passed = false
+					t.Errorf("fixture %d expected exactly %d completion, got %+v", i, want, c)
+				}
+				version := int64(3)
+				if i == 2 {
+					version = 1
+				}
+				if c.PathVersion != version {
+					passed = false
+					t.Errorf("fixture %d path version=%d want=%d", i, c.PathVersion, version)
+				}
+			}
+			writeJSON(assertionFile, map[string]any{"passed": passed, "fixtures": counts, "real_student_http": true, "real_student_postgres": true, "synthetic_identities": true, "trusted_internal_ingress": true, "jwt_verified": false, "full_e2e": false, "retained_rows": true})
+			return
+		}
+	}
+}

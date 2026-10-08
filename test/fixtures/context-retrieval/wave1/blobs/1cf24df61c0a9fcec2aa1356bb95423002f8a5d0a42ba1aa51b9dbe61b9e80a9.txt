@@ -1,0 +1,99 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/example/ms-go-statistic/internal/domain"
+	"github.com/google/uuid"
+)
+
+type discardLogger struct{}
+
+func (discardLogger) Error(string, error, string) {}
+
+type eventSinkStub struct{ items []domain.Event }
+
+func (stub *eventSinkStub) Publish(_ context.Context, event domain.Event) error {
+	stub.items = append(stub.items, event)
+	return nil
+}
+
+type activityPublisherStub struct{ items []domain.InterestingActivity }
+
+func (stub *activityPublisherStub) PublishInterestingActivity(_ context.Context, activity domain.InterestingActivity) error {
+	stub.items = append(stub.items, activity)
+	return nil
+}
+
+func TestPublishBatchEmitsBoundedRepeatedFailureSignal(t *testing.T) {
+	sink := &eventSinkStub{}
+	publisher := &activityPublisherStub{}
+	service := NewEventService(sink, discardLogger{}, publisher)
+	userID, sessionID, courseID, lessonID, taskID, eventID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	accepted, err := service.PublishBatch(context.Background(), RequestMeta{UserID: userID, Role: "STUDENT"}, EventsBatchRequest{
+		CourseID: courseID, LessonID: lessonID, TaskID: taskID, Platform: "web", EditorMode: "go",
+		Events: []IncomingEvent{{
+			EventID: eventID, SessionID: sessionID, EventType: domain.EventTypeTestFailed,
+			Payload: map[string]any{"consecutive_failures": 3, "same_error_count": 3, "active_seconds": 480, "error_fingerprint": "assertion-x"},
+		}},
+	})
+	if err != nil || accepted != 1 {
+		t.Fatalf("publish batch: accepted=%d err=%v", accepted, err)
+	}
+	if len(publisher.items) != 1 || publisher.items[0].SignalType != "repeated_failure" || publisher.items[0].EventID != eventID {
+		t.Fatalf("unexpected interesting activity: %+v", publisher.items)
+	}
+	if publisher.items[0].StudentID != userID || publisher.items[0].AnalyticsSessionID != sessionID {
+		t.Fatalf("activity identity drift: %+v", publisher.items[0])
+	}
+}
+
+func TestPublishBatchKeepsImprovingFailuresSilent(t *testing.T) {
+	sink := &eventSinkStub{}
+	publisher := &activityPublisherStub{}
+	service := NewEventService(sink, discardLogger{}, publisher)
+	_, err := service.PublishBatch(context.Background(), RequestMeta{UserID: uuid.New(), Role: "STUDENT"}, EventsBatchRequest{
+		CourseID: uuid.New(), LessonID: uuid.New(), TaskID: uuid.New(), Platform: "web", EditorMode: "go",
+		Events: []IncomingEvent{{
+			EventID: uuid.New(), SessionID: uuid.New(), EventType: domain.EventTypeTestFailed,
+			Payload: map[string]any{"same_error_count": 2, "active_seconds": 600, "progressing": true},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+	if len(publisher.items) != 0 {
+		t.Fatalf("improving activity should remain silent: %+v", publisher.items)
+	}
+}
+
+func TestPublishBatchRequiresStableEventIDForInterestingActivity(t *testing.T) {
+	service := NewEventService(&eventSinkStub{}, discardLogger{}, &activityPublisherStub{})
+	_, err := service.PublishBatch(context.Background(), RequestMeta{UserID: uuid.New(), Role: "STUDENT"}, EventsBatchRequest{
+		CourseID: uuid.New(), LessonID: uuid.New(), TaskID: uuid.New(), Platform: "web", EditorMode: "go",
+		Events: []IncomingEvent{{SessionID: uuid.New(), EventType: domain.EventTypeStudentStuck, Payload: map[string]any{}}},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected invalid input, got %v", err)
+	}
+}
+
+func TestPublishBatchRejectsInvalidActivityBeforeAcceptance(t *testing.T) {
+	sink := &eventSinkStub{}
+	service := NewEventService(sink, discardLogger{}, &activityPublisherStub{})
+	accepted, err := service.PublishBatch(context.Background(), RequestMeta{UserID: uuid.New(), Role: "STUDENT"}, EventsBatchRequest{
+		CourseID: uuid.New(), LessonID: uuid.New(), TaskID: uuid.New(), Platform: "web", EditorMode: "go",
+		Events: []IncomingEvent{{
+			EventID: uuid.New(), SessionID: uuid.New(), EventType: domain.EventTypeStudentIdle,
+			Payload: map[string]any{"idle_seconds": 86401},
+		}},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected invalid input, got %v", err)
+	}
+	if accepted != 0 || len(sink.items) != 0 {
+		t.Fatalf("invalid activity was accepted: accepted=%d events=%d", accepted, len(sink.items))
+	}
+}

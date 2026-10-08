@@ -1,0 +1,163 @@
+package nats
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+const (
+	TeacherEventsStream              = "TEACHER_EVENTS"
+	TeacherAssistanceConsumerQueue   = "ms-student-teacher-assistance"
+	TeacherAssistanceConsumerDurable = "ms-student-teacher-assistance-v1"
+)
+
+type teacherEventEnvelope struct {
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	CorrelationID string          `json:"correlation_id"`
+	CausationID   string          `json:"causation_id"`
+	StudentID     string          `json:"student_id"`
+	OccurredAt    time.Time       `json:"occurred_at"`
+	SchemaVersion int             `json:"schema_version"`
+	Data          json.RawMessage `json:"data"`
+}
+
+type teacherAssistanceData struct {
+	LearningActionID string                                `json:"learning_action_id"`
+	ContextType      domain.LearningContextType            `json:"context_type"`
+	ContextID        string                                `json:"context_id"`
+	SupportContext   domain.TeacherSupportContext          `json:"support_context"`
+	HintsUsed        int                                   `json:"hints_used"`
+	MaxHintLevel     *int                                  `json:"max_hint_level"`
+	InterventionUsed bool                                  `json:"intervention_used"`
+	Observations     []domain.TeacherAssistanceObservation `json:"observations"`
+	PolicyVersion    string                                `json:"policy_version"`
+}
+
+// DecodeTeacherAssistanceEvent validates the versioned producer envelope and
+// returns the student-owned projection input.
+func DecodeTeacherAssistanceEvent(payload []byte) (domain.TeacherAssistance, error) {
+	var envelope teacherEventEnvelope
+	if err := decodeTeacherJSON(payload, &envelope); err != nil {
+		return domain.TeacherAssistance{}, fmt.Errorf("decode teacher event envelope: %w", err)
+	}
+	if envelope.EventType != domain.SubjectTeacherAssistanceObserved {
+		return domain.TeacherAssistance{}, errors.New("unsupported teacher event type")
+	}
+	if envelope.SchemaVersion != domain.TeacherAssistanceObservedSchemaVersion {
+		return domain.TeacherAssistance{}, errors.New("unsupported teacher assistance schema version")
+	}
+
+	var data teacherAssistanceData
+	if err := decodeTeacherJSON(envelope.Data, &data); err != nil {
+		return domain.TeacherAssistance{}, fmt.Errorf("decode teacher assistance data: %w", err)
+	}
+	return domain.NewTeacherAssistance(domain.TeacherAssistance{
+		EventID:          envelope.EventID,
+		StudentID:        envelope.StudentID,
+		CorrelationID:    envelope.CorrelationID,
+		CausationID:      envelope.CausationID,
+		LearningActionID: data.LearningActionID,
+		ContextType:      data.ContextType,
+		ContextID:        data.ContextID,
+		SupportContext:   data.SupportContext,
+		HintsUsed:        data.HintsUsed,
+		MaxHintLevel:     data.MaxHintLevel,
+		InterventionUsed: data.InterventionUsed,
+		Observations:     data.Observations,
+		PolicyVersion:    data.PolicyVersion,
+		OccurredAt:       envelope.OccurredAt,
+	})
+}
+
+func decodeTeacherJSON(payload []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+// TeacherAssistanceSubscriber consumes durable teacher assistance summaries.
+// Invalid versioned payloads are terminated; persistence errors are retried.
+type TeacherAssistanceSubscriber struct {
+	Conn       *natsgo.Conn
+	Handler    func(context.Context, domain.TeacherAssistance) (bool, error)
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber TeacherAssistanceSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil {
+		return errors.New("teacher assistance subscriber connection is required")
+	}
+	if subscriber.Handler == nil {
+		return errors.New("teacher assistance subscriber handler is required")
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	js, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = js.QueueSubscribe(
+		domain.SubjectTeacherAssistanceObserved,
+		TeacherAssistanceConsumerQueue,
+		func(message *natsgo.Msg) {
+			assistance, decodeErr := DecodeTeacherAssistanceEvent(message.Data)
+			if decodeErr != nil {
+				log.Printf("terminate invalid teacher assistance event: %v", decodeErr)
+				if termErr := message.Term(); termErr != nil {
+					log.Printf("terminate teacher assistance event: %v", termErr)
+				}
+				return
+			}
+			if _, handleErr := subscriber.Handler(ctx, assistance); handleErr != nil {
+				if errors.Is(handleErr, domain.ErrEvidenceContract) {
+					log.Printf("terminate mismatched teacher assistance event %s: %v", assistance.EventID, handleErr)
+					if termErr := message.Term(); termErr != nil {
+						log.Printf("terminate teacher assistance event %s: %v", assistance.EventID, termErr)
+					}
+					return
+				}
+				log.Printf("retry teacher assistance event %s: %v", assistance.EventID, handleErr)
+				if nakErr := message.NakWithDelay(retryDelay); nakErr != nil {
+					log.Printf("nak teacher assistance event %s: %v", assistance.EventID, nakErr)
+				}
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				log.Printf("ack teacher assistance event %s: %v", assistance.EventID, ackErr)
+			}
+		},
+		natsgo.BindStream(TeacherEventsStream),
+		natsgo.Durable(TeacherAssistanceConsumerDurable),
+		natsgo.ManualAck(),
+		natsgo.AckExplicit(),
+		natsgo.DeliverAll(),
+		natsgo.AckWait(ackWait),
+	)
+	return err
+}

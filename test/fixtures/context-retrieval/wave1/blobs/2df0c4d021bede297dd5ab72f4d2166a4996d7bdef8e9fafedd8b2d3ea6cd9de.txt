@@ -1,0 +1,124 @@
+package curriculum
+
+import (
+	"context"
+	"strings"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+type PersonalTeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+
+type PlanReason string
+
+const (
+	PlanReasonInitial PlanReason = "INITIAL"
+	PlanReasonReplan  PlanReason = "REPLAN"
+)
+
+type PlanConstraints struct {
+	Language       string `json:"language,omitempty"`
+	WeeklyMinutes  int    `json:"weekly_minutes,omitempty"`
+	PreferredPace  string `json:"preferred_pace,omitempty"`
+	Deadline       string `json:"deadline,omitempty"`
+	ProjectContext string `json:"project_context,omitempty"`
+}
+
+type PlanAuditRefs struct {
+	DialogID          string `json:"dialog_id,omitempty"`
+	SourceMessageID   string `json:"source_message_id,omitempty"`
+	TeacherDecisionID string `json:"teacher_decision_id,omitempty"`
+}
+
+type PlanInput struct {
+	DiagnosticPlanID string
+	StudentID        string
+	IdempotencyKey   string
+	GoalCode         string
+	DesiredOutcome   string
+	Targets          []domain.LearningTargetRef
+	Constraints      PlanConstraints
+	AuditRefs        PlanAuditRefs
+	Reason           PlanReason
+}
+
+type PlanResult struct {
+	RequestID  string `json:"request_id"`
+	GoalCode   string `json:"goal_code"`
+	Status     string `json:"status"`
+	ResultCode string `json:"result_code,omitempty"`
+	CourseID   string `json:"course_id,omitempty"`
+	Reused     bool   `json:"reused"`
+}
+
+type LearningPlanner interface {
+	CreateCoursePlan(context.Context, PlanInput) (PlanResult, error)
+}
+
+// Planner is a Teacher-owned delegation facade. It recognizes and audits a
+// learning request, but all target graph, gap, content, and path decisions are
+// delegated to ms-go-learning-planner.
+type Planner struct {
+	Teachers PersonalTeacherEnsurer
+	Overview repository.StudentLearnerOverviewReader
+	Plans    LearningPlanner
+}
+
+func (planner Planner) Execute(ctx context.Context, input PlanInput) (PlanResult, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.GoalCode = strings.ToLower(strings.TrimSpace(input.GoalCode))
+	input.DesiredOutcome = strings.TrimSpace(input.DesiredOutcome)
+	if planner.Teachers == nil || planner.Plans == nil || input.StudentID == "" || input.GoalCode == "" ||
+		input.DesiredOutcome == "" || input.Reason == "" {
+		return PlanResult{}, domain.ErrInvalidCurriculum
+	}
+	if _, err := uuid.Parse(input.StudentID); err != nil {
+		return PlanResult{}, domain.ErrInvalidCurriculum
+	}
+	if _, err := uuid.Parse(input.IdempotencyKey); err != nil {
+		return PlanResult{}, domain.ErrInvalidCurriculum
+	}
+	if _, err := planner.Teachers.Execute(ctx, input.StudentID); err != nil {
+		return PlanResult{}, err
+	}
+	return planner.Plans.CreateCoursePlan(ctx, input)
+}
+
+// ExecuteCurrent requests an asynchronous replan after a completed session.
+// Student remains the source of the current learner goal and mastery.
+func (planner Planner) ExecuteCurrent(
+	ctx context.Context,
+	studentID string,
+	previousCourseID string,
+	triggerID string,
+	audit PlanAuditRefs,
+) (PlanResult, error) {
+	if planner.Overview == nil {
+		return PlanResult{}, domain.ErrInvalidCurriculum
+	}
+	overview, err := planner.Overview.GetLearnerOverview(ctx, studentID)
+	if err != nil {
+		return PlanResult{}, err
+	}
+	studentContext, err := domain.NewGeneralStudentContext(overview)
+	if err != nil || studentContext.Onboarding == nil {
+		return PlanResult{}, domain.ErrInvalidStudentContext
+	}
+	return planner.Execute(ctx, PlanInput{
+		StudentID: studentID, IdempotencyKey: triggerID,
+		GoalCode:       studentContext.Onboarding.GoalCode,
+		DesiredOutcome: "Replan after completed learning session",
+		Constraints: PlanConstraints{
+			Language:       studentContext.Onboarding.PreferredLanguage,
+			WeeklyMinutes:  studentContext.Onboarding.WeeklyMinutes,
+			PreferredPace:  studentContext.Onboarding.PreferredPace,
+			ProjectContext: "continue assigned course " + strings.TrimSpace(previousCourseID),
+		},
+		AuditRefs: audit, Reason: PlanReasonReplan,
+	})
+}

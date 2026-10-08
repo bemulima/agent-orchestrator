@@ -1,0 +1,264 @@
+package handlers
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	answeruc "github.com/example/ms-student-service/internal/usecase/answer"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+const diagnosticAssessmentBodyLimit int64 = 128 << 10
+
+type DiagnosticAssessmentHandler struct {
+	Assessments studentuc.DiagnosticAssessments
+}
+type diagnosticAttemptItemProjection struct {
+	LessonID        string                     `json:"lesson_id"`
+	TaskID          string                     `json:"task_id"`
+	TaskVersion     int64                      `json:"task_version"`
+	UpdatedAt       time.Time                  `json:"updated_at"`
+	LessonOrder     int                        `json:"lesson_order"`
+	TaskOrder       int                        `json:"task_order"`
+	LearningTargets []domain.LearningTargetRef `json:"learning_targets"`
+}
+type diagnosticAttemptProjection struct {
+	Schema         string                             `json:"schema"`
+	ID             string                             `json:"id"`
+	PlanID         string                             `json:"plan_id"`
+	PlanRevision   int                                `json:"plan_revision"`
+	PlanDigest     string                             `json:"plan_digest"`
+	TotalItems     int                                `json:"total_items"`
+	SubmittedItems int                                `json:"submitted_items"`
+	Result         *domain.DiagnosticAssessmentResult `json:"result,omitempty"`
+	Items          []diagnosticAttemptItemProjection  `json:"items"`
+}
+
+// diagnosticTaskProjection is intentionally independent from the ordinary
+// task response. Diagnostics need only authored question material; runtime,
+// starter, compose, grouping source and scorer fields never cross this boundary.
+type diagnosticTaskProjection struct {
+	Schema      string                         `json:"schema"`
+	ID          string                         `json:"id"`
+	LessonID    string                         `json:"lesson_id"`
+	Title       string                         `json:"title"`
+	Description string                         `json:"description,omitempty"`
+	Type        int16                          `json:"type"`
+	Tests       []diagnosticTaskTestProjection `json:"tests"`
+}
+type diagnosticTaskTestProjection struct {
+	ID          string                            `json:"id"`
+	Kind        string                            `json:"kind,omitempty"`
+	Title       string                            `json:"title"`
+	Description string                            `json:"description,omitempty"`
+	Order       int                               `json:"order"`
+	Groups      []diagnosticTaskGroupProjection   `json:"groups,omitempty"`
+	Variants    []diagnosticTaskVariantProjection `json:"variants,omitempty"`
+}
+type diagnosticTaskGroupProjection struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Order int    `json:"order"`
+}
+type diagnosticTaskVariantProjection struct {
+	ID    string `json:"id"`
+	Text  string `json:"text"`
+	Order int    `json:"order"`
+}
+
+func diagnosticTaskResponse(task *answeruc.TaskMetadata) diagnosticTaskProjection {
+	tests := make([]diagnosticTaskTestProjection, 0, len(task.Tests))
+	for _, test := range task.Tests {
+		groups := make([]diagnosticTaskGroupProjection, 0, len(test.Groups))
+		for _, group := range test.Groups {
+			groups = append(groups, diagnosticTaskGroupProjection{ID: group.ID, Title: group.Title, Order: group.Order})
+		}
+		variants := make([]diagnosticTaskVariantProjection, 0, len(test.Variants))
+		for _, variant := range test.Variants {
+			variants = append(variants, diagnosticTaskVariantProjection{ID: variant.ID, Text: variant.Text, Order: variant.Order})
+		}
+		tests = append(tests, diagnosticTaskTestProjection{ID: test.ID, Kind: test.Kind, Title: test.Title, Description: test.Description, Order: test.Order, Groups: groups, Variants: variants})
+	}
+	return diagnosticTaskProjection{Schema: "student-diagnostic-assessment-task.v1", ID: task.ID, LessonID: task.LessonID, Title: task.Title, Description: task.Description, Type: task.Type, Tests: tests}
+}
+
+func diagnosticProjection(attempt domain.DiagnosticAssessmentAttempt) diagnosticAttemptProjection {
+	items := make([]diagnosticAttemptItemProjection, 0, len(attempt.Items))
+	for _, item := range attempt.Items {
+		items = append(items, diagnosticAttemptItemProjection{item.LessonID, item.TaskID, item.TaskVersion, item.UpdatedAt, item.LessonOrder, item.TaskOrder, item.LearningTargets})
+	}
+	return diagnosticAttemptProjection{Schema: "student-diagnostic-assessment-attempt.v1", ID: attempt.ID, PlanID: attempt.PlanID, PlanRevision: attempt.PlanRevision, PlanDigest: attempt.PlanDigest, TotalItems: len(attempt.Items), SubmittedItems: attempt.SubmittedItems, Result: attempt.Result, Items: items}
+}
+
+func (handler DiagnosticAssessmentHandler) Get(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	attemptID := chi.URLParam(r, "attemptID")
+	if !canonicalDiagnosticHTTPID(attemptID) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	attempt, err := handler.Assessments.Get(r.Context(), studentID, attemptID)
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnosticProjection(attempt))
+}
+func (handler DiagnosticAssessmentHandler) GetCurrent(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	attempt, err := handler.Assessments.GetCurrent(r.Context(), studentID)
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnosticProjection(attempt))
+}
+func (handler DiagnosticAssessmentHandler) GetTask(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	attemptID, taskID := chi.URLParam(r, "attemptID"), chi.URLParam(r, "taskID")
+	if !canonicalDiagnosticHTTPID(attemptID) || !canonicalDiagnosticHTTPID(taskID) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	task, err := handler.Assessments.GetTask(r.Context(), studentID, attemptID, taskID)
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnosticTaskResponse(task))
+}
+func (handler DiagnosticAssessmentHandler) Submit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !canonicalDiagnosticHTTPID(chi.URLParam(r, "attemptID")) || !canonicalDiagnosticHTTPID(chi.URLParam(r, "taskID")) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	body, err := decodeDiagnosticJSON(r)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	key, hash, ok := diagnosticRequestKey(r, studentID, body)
+	if !ok {
+		http.Error(w, "invalid idempotency key", http.StatusBadRequest)
+		return
+	}
+	attempt, _, err := handler.Assessments.Submit(r.Context(), studentuc.SubmitDiagnosticAssessmentInput{StudentID: studentID, AttemptID: chi.URLParam(r, "attemptID"), TaskID: chi.URLParam(r, "taskID"), RequestID: key, RequestHash: hash, Response: body})
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnosticProjection(attempt))
+}
+func (handler DiagnosticAssessmentHandler) Complete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	studentID, _, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !canonicalDiagnosticHTTPID(chi.URLParam(r, "attemptID")) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	body, err := decodeDiagnosticJSON(r)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(bytes.TrimSpace(body)) != 2 || string(bytes.TrimSpace(body)) != "{}" {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	key, hash, ok := diagnosticRequestKey(r, studentID, body)
+	if !ok {
+		http.Error(w, "invalid idempotency key", http.StatusBadRequest)
+		return
+	}
+	result, _, err := handler.Assessments.Complete(r.Context(), studentuc.CompleteDiagnosticAssessmentInput{StudentID: studentID, AttemptID: chi.URLParam(r, "attemptID"), RequestID: key, RequestHash: hash})
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+func decodeDiagnosticJSON(r *http.Request) (json.RawMessage, error) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return nil, errors.New("content type")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, diagnosticAssessmentBodyLimit+1))
+	if err != nil || int64(len(body)) > diagnosticAssessmentBodyLimit || !json.Valid(body) {
+		return nil, errors.New("body")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	var raw map[string]json.RawMessage
+	if err = dec.Decode(&raw); err != nil {
+		return nil, err
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("trailing")
+	}
+	return body, nil
+}
+func diagnosticRequestKey(r *http.Request, studentID string, body []byte) (string, string, bool) {
+	// Idempotency keys are UUIDs on the wire; surrounding whitespace is not
+	// canonical and must not silently alias a different request.
+	key := r.Header.Get("Idempotency-Key")
+	parsed, err := uuid.Parse(key)
+	if err != nil || parsed.String() != key || !canonicalDiagnosticHTTPID(studentID) {
+		return "", "", false
+	}
+	sum := sha256.Sum256(append([]byte(r.Method+":"+studentID+":"+r.URL.Path+":"), body...))
+	return key, "sha256:" + hex.EncodeToString(sum[:]), true
+}
+func canonicalDiagnosticHTTPID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+func writeDiagnosticError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, domain.ErrForbidden):
+		http.Error(w, "forbidden", http.StatusForbidden)
+	case errors.Is(err, domain.ErrConflict):
+		http.Error(w, "conflict", http.StatusConflict)
+	case errors.Is(err, domain.ErrValidation):
+		http.Error(w, "invalid request", http.StatusBadRequest)
+	default:
+		http.Error(w, "diagnostic assessments unavailable", http.StatusServiceUnavailable)
+	}
+}

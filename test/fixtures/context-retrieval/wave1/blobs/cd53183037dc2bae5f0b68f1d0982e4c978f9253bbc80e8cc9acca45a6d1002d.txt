@@ -1,0 +1,311 @@
+package http_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	httptransport "github.com/bemulima/ms-go-teacher-agent/internal/transport/http"
+	adminhandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/admin/v1/handlers"
+	apihandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/personalteacher"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+)
+
+type ensureStub struct {
+	teacher domain.PersonalTeacher
+	err     error
+}
+
+type nextActionStub struct {
+	studentID string
+}
+
+func (stub *nextActionStub) Execute(_ context.Context, studentID string) (domain.TeacherNextAction, error) {
+	stub.studentID = studentID
+	return domain.TeacherNextAction{Schema: domain.TeacherNextActionSchemaVersion, PolicyVersion: domain.TeacherNextActionPolicyVersion, Status: "NO_PROGRESSION", ReasonCode: "path_completed", SecondaryActions: []domain.NextActionChoice{}, SourceVersions: domain.TeacherNextActionSourceVersions{StateDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, nil
+}
+
+func (stub ensureStub) Execute(_ context.Context, _ string) (domain.PersonalTeacher, error) {
+	return stub.teacher, stub.err
+}
+
+type updateStub struct {
+	teacher domain.PersonalTeacher
+	err     error
+	input   *personalteacher.UpdateInput
+}
+
+func (stub *updateStub) Execute(_ context.Context, input personalteacher.UpdateInput) (domain.PersonalTeacher, error) {
+	stub.input = &input
+	return stub.teacher, stub.err
+}
+
+type getStub struct {
+	teacher domain.PersonalTeacher
+	err     error
+}
+
+type soulStub struct {
+	soul domain.TeacherSoul
+	err  error
+}
+
+func (stub soulStub) Execute(_ context.Context, _ string) (domain.TeacherSoul, error) {
+	return stub.soul, stub.err
+}
+
+type soulUpdateStub struct {
+	soul  domain.TeacherSoul
+	err   error
+	input *personalteacher.UpdateSoulInput
+}
+
+type provisionDialogStub struct {
+	binding domain.TeacherDialogBinding
+	err     error
+	input   *teacherdialog.ProvisionInput
+}
+
+func (stub *provisionDialogStub) Execute(
+	_ context.Context,
+	input teacherdialog.ProvisionInput,
+) (domain.TeacherDialogBinding, error) {
+	stub.input = &input
+	return stub.binding, stub.err
+}
+
+func (stub *soulUpdateStub) Execute(
+	_ context.Context,
+	input personalteacher.UpdateSoulInput,
+) (domain.TeacherSoul, error) {
+	stub.input = &input
+	return stub.soul, stub.err
+}
+
+func (stub getStub) Execute(_ context.Context, _ string) (domain.PersonalTeacher, error) {
+	return stub.teacher, stub.err
+}
+
+func testTeacher() domain.PersonalTeacher {
+	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+	teacher, _ := domain.NewPersonalTeacher("00000000-0000-0000-0000-000000000001", "student-1", domain.DefaultPersonalTeacherSettings(), now)
+	return teacher
+}
+
+func testSoul() domain.TeacherSoul {
+	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+	soul, _ := domain.NewTeacherSoul(
+		"00000000-0000-0000-0000-000000000001", "student-1", domain.DefaultTeacherSoulSettings(), now,
+	)
+	return soul
+}
+
+func testRouter(update *updateStub, getError error) http.Handler {
+	teacher := testTeacher()
+	soul := testSoul()
+	return httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher: &apihandlers.PersonalTeacherHandler{
+			EnsureUC:     ensureStub{teacher: teacher},
+			UpdateUC:     update,
+			SoulUC:       soulStub{soul: soul},
+			SoulUpdateUC: &soulUpdateStub{soul: soul},
+		},
+		APITeacherDialog: &apihandlers.TeacherDialogHandler{ProvisionUC: &provisionDialogStub{}},
+		AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{
+			GetUC:  getStub{teacher: teacher, err: getError},
+			SoulUC: soulStub{soul: soul, err: getError},
+		},
+		PrivateHealth: &privatehandlers.HealthHandler{
+			Ready: func(context.Context) error { return nil },
+		},
+		InternalToken: "internal-secret",
+	})
+}
+
+func TestTeacherSoulIsScopedToAuthenticatedStudent(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/teacher/me/soul", nil)
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "STUDENT")
+	testRouter(&updateStub{}, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"student_id":"student-1"`)
+	require.Contains(t, recorder.Body.String(), `"persona_code":"patient_mentor"`)
+}
+
+func TestTeacherSoulUpdatePassesActorAndIndependentVersion(t *testing.T) {
+	teacher := testTeacher()
+	soul := testSoul()
+	updateSoul := &soulUpdateStub{soul: soul}
+	router := httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher: &apihandlers.PersonalTeacherHandler{
+			EnsureUC: ensureStub{teacher: teacher}, UpdateUC: &updateStub{teacher: teacher},
+			SoulUC: soulStub{soul: soul}, SoulUpdateUC: updateSoul,
+		},
+		APITeacherDialog: &apihandlers.TeacherDialogHandler{ProvisionUC: &provisionDialogStub{}},
+		AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{
+			GetUC: getStub{teacher: teacher}, SoulUC: soulStub{soul: soul},
+		},
+		PrivateHealth: &privatehandlers.HealthHandler{Ready: func(context.Context) error { return nil }},
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPatch, "/api/v1/teacher/me/soul",
+		strings.NewReader(`{"expected_version":1,"display_name":"Ada"}`),
+	)
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "STUDENT_PRO")
+	router.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, updateSoul.input)
+	require.Equal(t, "student-1", updateSoul.input.StudentID)
+	require.Equal(t, int64(1), updateSoul.input.ExpectedVersion)
+	require.Equal(t, "Ada", *updateSoul.input.DisplayName)
+}
+
+func TestGetMyTeacherRequiresStudentIdentity(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/teacher/me", nil)
+	testRouter(&updateStub{}, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusUnauthorized, recorder.Code)
+}
+
+func TestNextBestActionUsesExactPublicServiceRoute(t *testing.T) {
+	getter := &nextActionStub{}
+	router := httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher:   &apihandlers.PersonalTeacherHandler{},
+		APITeacherDialog:     &apihandlers.TeacherDialogHandler{},
+		APINextBestAction:    &apihandlers.NextBestActionHandler{Getter: getter},
+		AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{},
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/teacher/me/next-action", nil)
+	request.Header.Set("X-User-ID", "11111111-1111-4111-8111-111111111111")
+	request.Header.Set("X-User-Role", "STUDENT")
+	router.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", getter.studentID)
+	require.Contains(t, recorder.Body.String(), `"schema":"student-next-action.v1"`)
+}
+
+func TestGetMyTeacherReturnsLogicalTeacher(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/teacher/me", nil)
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "student")
+	testRouter(&updateStub{}, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"student_id":"student-1"`)
+}
+
+func TestUpdateMyTeacherPassesActorAndVersion(t *testing.T) {
+	update := &updateStub{teacher: testTeacher()}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/teacher/me", strings.NewReader(`{"expected_version":1,"language":"en"}`))
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "STUDENT_PRO")
+	testRouter(update, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, update.input)
+	require.Equal(t, "student-1", update.input.StudentID)
+	require.Equal(t, int64(1), update.input.ExpectedVersion)
+	require.Equal(t, "en", *update.input.Language)
+}
+
+func TestAdminTeacherReadRequiresAdminRole(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin/v1/personal-teachers/student-1", nil)
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "STUDENT")
+	testRouter(&updateStub{}, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+}
+
+func TestAdminTeacherReadMapsMissingTeacher(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin/v1/personal-teachers/missing", nil)
+	request.Header.Set("X-User-ID", "admin-1")
+	request.Header.Set("X-User-Role", "ADMIN")
+	testRouter(&updateStub{}, domain.ErrPersonalTeacherNotFound).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusNotFound, recorder.Code)
+}
+
+func TestPrivateHealthRequiresExactToken(t *testing.T) {
+	router := testRouter(&updateStub{}, nil)
+	for _, testCase := range []struct {
+		name   string
+		token  string
+		status int
+	}{
+		{name: "missing", status: http.StatusForbidden},
+		{name: "wrong", token: "wrong", status: http.StatusForbidden},
+		{name: "valid", token: "internal-secret", status: http.StatusOK},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/internal/healthz", nil)
+			request.Header.Set("X-Internal-Token", testCase.token)
+			router.ServeHTTP(recorder, request)
+			require.Equal(t, testCase.status, recorder.Code)
+		})
+	}
+}
+
+func TestUpdateConflictMapsToHTTPConflict(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/teacher/me", strings.NewReader(`{"expected_version":1,"language":"en"}`))
+	request.Header.Set("X-User-ID", "student-1")
+	request.Header.Set("X-User-Role", "STUDENT")
+	testRouter(&updateStub{err: domain.ErrVersionConflict}, nil).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusConflict, recorder.Code)
+}
+
+func TestEnsureTeacherDialogUsesAuthenticatedStudent(t *testing.T) {
+	binding := domain.TeacherDialogBinding{
+		ID: "11111111-1111-4111-8111-111111111111", StudentID: "44444444-4444-4444-8444-444444444444",
+		PersonalTeacherID: "55555555-5555-4555-8555-555555555555", ContextType: domain.LearningContextLesson,
+		ContextID: "66666666-6666-4666-8666-666666666666", Created: true,
+	}
+	provision := &provisionDialogStub{binding: binding}
+	teacher := testTeacher()
+	router := httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher: &apihandlers.PersonalTeacherHandler{
+			EnsureUC: ensureStub{teacher: teacher}, UpdateUC: &updateStub{teacher: teacher},
+			SoulUC: soulStub{soul: testSoul()}, SoulUpdateUC: &soulUpdateStub{soul: testSoul()},
+		},
+		APITeacherDialog: &apihandlers.TeacherDialogHandler{ProvisionUC: provision},
+		AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{
+			GetUC: getStub{teacher: teacher}, SoulUC: soulStub{soul: testSoul()},
+		},
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPut, "/api/v1/teacher-dialog/ensure",
+		strings.NewReader(`{"context_type":"lesson","context_id":"66666666-6666-4666-8666-666666666666"}`),
+	)
+	request.Header.Set("X-User-ID", binding.StudentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	router.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusCreated, recorder.Code)
+	require.NotNil(t, provision.input)
+	require.Equal(t, binding.StudentID, provision.input.StudentID)
+	require.Contains(t, recorder.Body.String(), `"created":true`)
+}
+
+func TestAdminUnexpectedFailureIsInternalError(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin/v1/personal-teachers/student-1", nil)
+	request.Header.Set("X-User-ID", "admin-1")
+	request.Header.Set("X-User-Role", "ADMIN")
+	testRouter(&updateStub{}, errors.New("database unavailable")).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+}

@@ -1,0 +1,138 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
+)
+
+// TestMigration019EmptySchemaUpDown keeps the rollback proof isolated from the
+// shared public test schema. It applies the authoritative forward chain into
+// an empty disposable schema, then proves that an unused 019 can return to
+// the exact post-018 shape without dropping the dense 017 proof/outcome FKs.
+func TestMigration019EmptySchemaUpDown(t *testing.T) {
+	pool := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	conn, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+
+	schema := "teacher_s5_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err = conn.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if pool != nil && schema != "" {
+			// t.Cleanup runs after this function returns, while the deferred
+			// conn.Release has already returned the acquired connection to the
+			// pool. Clean up through the pool so the migration harness never
+			// dereferences a released connection.
+			_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+		}
+	})
+	_, err = conn.Exec(ctx, "SET search_path TO "+quotedSchema)
+	require.NoError(t, err)
+
+	root := migration019RepositoryRoot(t)
+	upPaths, err := migrationUpPathsThrough(root, 19)
+	require.NoError(t, err)
+	for _, path := range upPaths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := conn.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+
+	down, err := os.ReadFile(filepath.Join(root, "db", "migrations", "019_teacher_onboarding_unified_coordinator.down.sql"))
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, string(down))
+	require.NoError(t, err)
+
+	for _, relation := range []string{"teacher_onboarding_turn", "teacher_onboarding_interaction"} {
+		var exists bool
+		require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, relation).Scan(&exists))
+		require.False(t, exists, relation)
+	}
+	var coordinatorColumn bool
+	require.NoError(t, conn.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns
+  WHERE table_schema=current_schema() AND table_name='teacher_dialog_job' AND column_name='coordinator_mode'
+)`).Scan(&coordinatorColumn))
+	require.False(t, coordinatorColumn)
+	for _, name := range []string{"teacher_dialog_job_proof_fk", "teacher_dialog_job_outcome_fk"} {
+		var exists bool
+		require.NoError(t, conn.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pg_constraint
+  WHERE connamespace=current_schema()::regnamespace AND conname=$1
+)`, name).Scan(&exists))
+		require.True(t, exists, fmt.Sprintf("post-017 FK %s must survive a 019-only rollback", name))
+	}
+}
+
+func TestMigration019DiscoveryIgnoresAppleDoubleSidecars(t *testing.T) {
+	require.False(t, migration019MigrationFileAllowed("._019_teacher_onboarding_unified_coordinator.up.sql"))
+	require.True(t, migration019MigrationFileAllowed("019_teacher_onboarding_unified_coordinator.up.sql"))
+	paths, err := migrationUpPathsThrough(migration019RepositoryRoot(t), 19)
+	require.NoError(t, err)
+	for _, path := range paths {
+		require.LessOrEqual(t, migrationNumber(t, filepath.Base(path)), 19, "historical 019 rollback proof must not apply a later migration")
+	}
+}
+
+func migration019UpPaths(root string) ([]string, error) {
+	return migrationUpPathsThrough(root, int(^uint(0)>>1))
+}
+
+func migrationUpPathsThrough(root string, maximum int) ([]string, error) {
+	paths, err := filepath.Glob(filepath.Join(root, "db", "migrations", "*.up.sql"))
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]string, 0, len(paths))
+	for _, path := range paths {
+		name := filepath.Base(path)
+		if migration019MigrationFileAllowed(name) && migrationNumberValue(name) <= maximum {
+			filtered = append(filtered, path)
+		}
+	}
+	sort.Strings(filtered)
+	return filtered, nil
+}
+
+func migrationNumber(t *testing.T, name string) int {
+	t.Helper()
+	value, err := strconv.Atoi(strings.SplitN(name, "_", 2)[0])
+	require.NoError(t, err, name)
+	return value
+}
+
+func migrationNumberValue(name string) int {
+	value, err := strconv.Atoi(strings.SplitN(name, "_", 2)[0])
+	if err != nil {
+		return int(^uint(0) >> 1)
+	}
+	return value
+}
+
+func migration019MigrationFileAllowed(name string) bool {
+	return strings.HasSuffix(name, ".up.sql") && !strings.HasPrefix(name, "._")
+}
+
+func migration019RepositoryRoot(t *testing.T) string {
+	t.Helper()
+	_, current, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	return filepath.Clean(filepath.Join(filepath.Dir(current), "../../../../"))
+}

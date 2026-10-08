@@ -1,0 +1,265 @@
+package nats
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/google/uuid"
+	natsgo "github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+)
+
+const (
+	LearningPlannerEventsStream = "LEARNING_PLANNER_EVENTS"
+	CoursePlanOutcomeQueue      = "ms-teacher-course-plan-outcome"
+	CoursePlanOutcomeDurable    = "ms-teacher-course-plan-outcome-v1"
+	coursePlanOutcomeSubject    = "course.plan.*"
+	maximumCoursePlanEventBytes = 64 * 1024
+	maximumCoursePlanCodeBytes  = 64
+)
+
+type coursePlanOutcomeEnvelope struct {
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	CorrelationID string          `json:"correlation_id"`
+	CausationID   string          `json:"causation_id"`
+	StudentID     string          `json:"student_id"`
+	OccurredAt    string          `json:"occurred_at"`
+	SchemaVersion int             `json:"schema_version"`
+	Data          json.RawMessage `json:"data"`
+}
+
+type coursePlanOutcomeData struct {
+	RequestID      string                     `json:"request_id"`
+	GoalCode       string                     `json:"goal_code"`
+	Status         string                     `json:"status"`
+	ResultCode     string                     `json:"result_code"`
+	CourseID       string                     `json:"course_id"`
+	Reused         bool                       `json:"reused"`
+	FailureCode    string                     `json:"failure_code"`
+	Source         string                     `json:"source"`
+	Reason         string                     `json:"reason"`
+	AuditRefs      domain.CoursePlanAuditRefs `json:"audit_refs"`
+	LearningPathID *string                    `json:"learning_path_id,omitempty"`
+}
+
+var coursePlanOutcomeDataRequiredFields = []string{
+	"request_id", "goal_code", "status", "result_code", "course_id", "reused",
+	"failure_code", "source", "reason", "audit_refs",
+}
+
+func DecodeCoursePlanOutcome(payload []byte) (domain.CoursePlanOutcome, error) {
+	if len(payload) == 0 || len(payload) > maximumCoursePlanEventBytes {
+		return domain.CoursePlanOutcome{}, errors.New("course plan outcome payload is out of bounds")
+	}
+	var envelope coursePlanOutcomeEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.CoursePlanOutcome{}, fmt.Errorf("decode course plan outcome: %w", err)
+	}
+	if envelope.SchemaVersion != domain.CoursePlanOutcomeSchemaV1 && envelope.SchemaVersion != domain.CoursePlanOutcomeSchemaV2 {
+		return domain.CoursePlanOutcome{}, errors.New("unsupported course plan outcome schema version")
+	}
+	if !canonicalCoursePlanUUID(envelope.EventID) || !canonicalCoursePlanUUID(envelope.CorrelationID) ||
+		!canonicalCoursePlanUUID(envelope.CausationID) || !canonicalCoursePlanUUID(envelope.StudentID) {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome envelope identity")
+	}
+	if envelope.EventType != domain.SubjectCoursePlanCompleted && envelope.EventType != domain.SubjectCoursePlanFailed {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome event type")
+	}
+	occurredAt, err := parseCoursePlanOccurredAt(envelope.OccurredAt)
+	if err != nil {
+		return domain.CoursePlanOutcome{}, err
+	}
+	if len(envelope.Data) == 0 {
+		return domain.CoursePlanOutcome{}, errors.New("course plan outcome data is required")
+	}
+	var fields map[string]json.RawMessage
+	if err := decodeStrictJSON(envelope.Data, &fields); err != nil {
+		return domain.CoursePlanOutcome{}, fmt.Errorf("decode course plan outcome data: %w", err)
+	}
+	for _, field := range coursePlanOutcomeDataRequiredFields {
+		value, exists := fields[field]
+		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return domain.CoursePlanOutcome{}, fmt.Errorf("course plan outcome data field %q is required", field)
+		}
+	}
+	var data coursePlanOutcomeData
+	if err := decodeStrictJSON(envelope.Data, &data); err != nil {
+		return domain.CoursePlanOutcome{}, fmt.Errorf("decode course plan outcome data: %w", err)
+	}
+	if !validCoursePlanGoalCode(data.GoalCode) || !validCoursePlanResultCode(data.ResultCode) {
+		return domain.CoursePlanOutcome{}, errors.New("course plan outcome code is out of bounds")
+	}
+	if data.Status != domain.CoursePlanStatusCompleted && data.Status != domain.CoursePlanStatusFailed {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome status")
+	}
+	if data.Status == domain.CoursePlanStatusCompleted && data.ResultCode == "" {
+		return domain.CoursePlanOutcome{}, errors.New("completed course plan outcome result code is required")
+	}
+	if data.Source != domain.CoursePlanSourceTeacher && data.Source != domain.CoursePlanSourceStudent && data.Source != domain.CoursePlanSourceSystem {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome source")
+	}
+	if data.Reason != "INITIAL" && data.Reason != "REPLAN" {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome reason")
+	}
+	if data.FailureCode != strings.TrimSpace(data.FailureCode) ||
+		(data.Status == domain.CoursePlanStatusFailed && !validCoursePlanFailureCodeWire(data.FailureCode)) ||
+		(data.Status == domain.CoursePlanStatusCompleted && data.FailureCode != "") {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome failure code")
+	}
+	if !canonicalCoursePlanUUID(data.RequestID) || (data.CourseID != "" && !canonicalCoursePlanUUID(data.CourseID)) ||
+		(data.AuditRefs.DialogID != "" && !canonicalCoursePlanUUID(data.AuditRefs.DialogID)) ||
+		(data.AuditRefs.SourceMessageID != "" && !canonicalCoursePlanUUID(data.AuditRefs.SourceMessageID)) ||
+		(data.AuditRefs.TeacherDecisionID != "" && !canonicalCoursePlanUUID(data.AuditRefs.TeacherDecisionID)) {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome data identity")
+	}
+	pathValue, pathPresent := fields["learning_path_id"]
+	if envelope.SchemaVersion == domain.CoursePlanOutcomeSchemaV1 && pathPresent {
+		return domain.CoursePlanOutcome{}, errors.New("learning_path_id is not valid in course plan outcome schema v1")
+	}
+	if pathPresent && (data.LearningPathID == nil || bytes.Equal(bytes.TrimSpace(pathValue), []byte("null")) ||
+		*data.LearningPathID == "" || *data.LearningPathID != strings.TrimSpace(*data.LearningPathID) ||
+		!canonicalCoursePlanUUID(*data.LearningPathID)) {
+		return domain.CoursePlanOutcome{}, errors.New("invalid course plan outcome learning_path_id")
+	}
+	if envelope.CorrelationID != data.RequestID {
+		return domain.CoursePlanOutcome{}, errors.New("inconsistent course plan outcome envelope")
+	}
+	return domain.NormalizeCoursePlanOutcome(domain.CoursePlanOutcome{
+		EventID: envelope.EventID, EventType: envelope.EventType, RequestID: data.RequestID,
+		CausationID: envelope.CausationID, StudentID: envelope.StudentID, OccurredAt: occurredAt,
+		LearningPathID: dereferenceCoursePlanPath(data.LearningPathID), Status: data.Status,
+		ResultCode: data.ResultCode, CourseID: data.CourseID, Reused: data.Reused,
+		FailureCode: data.FailureCode, Source: data.Source, Reason: data.Reason, AuditRefs: data.AuditRefs,
+	})
+}
+
+func canonicalCoursePlanUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func parseCoursePlanOccurredAt(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.Location() != time.UTC || parsed.Format(time.RFC3339Nano) != value {
+		return time.Time{}, errors.New("invalid course plan outcome occurred_at")
+	}
+	return parsed, nil
+}
+
+func validCoursePlanGoalCode(value string) bool {
+	if value == "" || len(value) > maximumCoursePlanCodeBytes || value != strings.TrimSpace(value) || value != strings.ToLower(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validCoursePlanResultCode(value string) bool {
+	return validCoursePlanMachineCode(value, true, true)
+}
+
+func validCoursePlanFailureCodeWire(value string) bool {
+	return validCoursePlanMachineCode(value, false, true)
+}
+
+func validCoursePlanMachineCode(value string, allowEmpty, uppercase bool) bool {
+	if value == "" {
+		return allowEmpty
+	}
+	if len(value) > maximumCoursePlanCodeBytes || value != strings.TrimSpace(value) {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if index == 0 && ((uppercase && (character < 'A' || character > 'Z')) ||
+			(!uppercase && (character < 'a' || character > 'z') && (character < '0' || character > '9'))) {
+			return false
+		}
+		if uppercase {
+			if (character < 'A' || character > 'Z') && (character < '0' || character > '9') && character != '_' {
+				return false
+			}
+		} else if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '_' && character != '-' && character != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func dereferenceCoursePlanPath(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+type CoursePlanOutcomeSubscriber struct {
+	Conn       *natsgo.Conn
+	Handler    func(context.Context, domain.CoursePlanOutcome) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber CoursePlanOutcomeSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil || subscriber.Handler == nil {
+		return errors.New("course plan outcome subscriber connection and handler are required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	jetStream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = jetStream.QueueSubscribe(
+		coursePlanOutcomeSubject,
+		CoursePlanOutcomeQueue,
+		func(message *natsgo.Msg) {
+			outcome, decodeErr := DecodeCoursePlanOutcome(message.Data)
+			if decodeErr != nil {
+				logger.Warn("terminate invalid course plan outcome", zap.Error(decodeErr))
+				_ = message.Term()
+				return
+			}
+			processed, handleErr := subscriber.Handler(ctx, outcome)
+			if handleErr != nil {
+				logger.Warn("retry course plan outcome", zap.String("event_id", outcome.EventID), zap.Error(handleErr))
+				_ = message.NakWithDelay(retryDelay)
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				logger.Warn("ack course plan outcome", zap.String("event_id", outcome.EventID), zap.Error(ackErr))
+				return
+			}
+			logger.Debug("course plan outcome handled", zap.String("event_id", outcome.EventID), zap.Bool("processed", processed))
+		},
+		natsgo.BindStream(LearningPlannerEventsStream), natsgo.Durable(CoursePlanOutcomeDurable),
+		natsgo.ManualAck(), natsgo.AckExplicit(), natsgo.DeliverAll(), natsgo.AckWait(ackWait),
+	)
+	if err != nil {
+		return err
+	}
+	return subscriber.Conn.FlushTimeout(5 * time.Second)
+}

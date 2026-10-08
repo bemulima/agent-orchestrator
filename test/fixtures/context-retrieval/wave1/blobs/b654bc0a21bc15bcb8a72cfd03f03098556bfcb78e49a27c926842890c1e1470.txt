@@ -1,0 +1,158 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	privatehttp "github.com/example/mc-course-service/internal/transport/http/private"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/diagnosticfixture"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root launches this finite provider only against its newly prepared test DB.
+// The three questions are the published, curated Course smoke fixture, with
+// fresh content identities. This proves registered owner HTTP/PG behavior;
+// it makes no AI authoring or content-generation claim. Rows remain for root
+// readback and disposal of the dedicated database; append-only facts are kept.
+func TestT18ServeDiagnosticCourseHTTP(t *testing.T) {
+	if os.Getenv("T18_SERVE_COURSE") != "true" {
+		t.Skip("owned T18 Course provider gate absent")
+	}
+	ready, stop, result := os.Getenv("T18_COURSE_READY_FILE"), os.Getenv("T18_COURSE_STOP_FILE"), os.Getenv("T18_COURSE_RESULT_FILE")
+	token, catalogToken := os.Getenv("T18_COURSE_TOKEN"), os.Getenv("T18_COURSE_CATALOG_TOKEN")
+	cfg, err := pgxpool.ParseConfig(os.Getenv("T18_COURSE_TEST_DATABASE_URL"))
+	host := os.Getenv("T18_ATTESTED_POSTGRES_HOST")
+	if err != nil || cfg.ConnConfig.Database != "remediation_t18_course_test" || host == "" || cfg.ConnConfig.Host != host || net.ParseIP(host) == nil || token == "" || catalogToken == "" || token == catalogToken || ready == "" || stop == "" || result == "" {
+		t.Fatal("SETUP: exact owned Course configuration required")
+	}
+	for _, path := range []string{ready, stop, result} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatal("SETUP: metadata and stop paths must be absent")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: Course pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact Course DB unavailable")
+	}
+	// Root prepares canonical references. The provider does not insert or mutate
+	// shared reference data or an already existing fixture.
+	for _, language := range []string{"en", "ru"} {
+		var n int
+		if pool.QueryRow(ctx, `SELECT count(*) FROM i18n WHERE language=$1`, language).Scan(&n) != nil || n != 1 {
+			t.Fatal("SETUP: Course language reference missing")
+		}
+	}
+	var n int
+	if pool.QueryRow(ctx, `SELECT count(*) FROM code_structure_type WHERE id='00000000-0000-0000-0000-00000000f900' AND code=$1`, domain.CodeStructureTypeTestSingleChoiceBasic).Scan(&n) != nil || n != 1 {
+		t.Fatal("SETUP: canonical Course quiz reference missing")
+	}
+	definition, err := diagnosticfixture.LoadDefinition()
+	if err != nil {
+		t.Fatal("SETUP: curated definition unavailable")
+	}
+	if pool.QueryRow(ctx, `SELECT count(*) FROM course WHERE slug=$1`, definition.Slug).Scan(&n) != nil || n != 0 {
+		t.Fatal("SETUP: fixture slug must be unoccupied")
+	}
+	namespace := "t18." + uuid.NewString()
+	definition.IDs = diagnosticfixture.IDs{Course: uuid.NewString(), Module: uuid.NewString(), Section: uuid.NewString(), Lesson: uuid.NewString()}
+	for i := range definition.Tasks {
+		item := &definition.Tasks[i]
+		item.ID = uuid.NewString()
+		item.SourceKey = namespace + ".task." + item.ID
+		for j := range item.Tests {
+			q := &item.Tests[j]
+			q.ID = uuid.NewString()
+			q.SourceKey = namespace + ".question." + q.ID
+			for k := range q.Variants {
+				v := &q.Variants[k]
+				v.ID = uuid.NewString()
+				v.SourceKey = namespace + ".variant." + v.ID
+			}
+		}
+	}
+	lessons, tasks, targets, tests, structures := LessonRepoPG{Pool: pool}, TaskRepoPG{Pool: pool}, TaskLearningTargetRepoPG{Pool: pool}, TaskTestRepoPG{Pool: pool}, CodeStructureTypeRepoPG{Pool: pool}
+	provisioner := diagnosticfixture.Provisioner{Definition: definition, Dependencies: diagnosticfixture.Dependencies{
+		Tx: TxManagerPG{Pool: pool}, Courses: CourseRepoPG{Pool: pool}, CourseI18n: CourseI18nRepoPG{Pool: pool}, I18n: I18nRepoPG{Pool: pool}, CodeStructures: structures,
+		Modules: ModuleRepoPG{Pool: pool}, ModuleI18n: ModuleI18nRepoPG{Pool: pool}, CourseModules: CourseModuleRepoPG{Pool: pool}, Sections: SectionRepoPG{Pool: pool}, SectionI18n: SectionI18nRepoPG{Pool: pool}, ModuleSections: ModuleSectionRepoPG{Pool: pool}, Lessons: lessons, LessonI18n: LessonI18nRepoPG{Pool: pool}, SectionLessons: SectionLessonRepoPG{Pool: pool}, Tasks: tasks, TaskI18n: TaskI18nRepoPG{Pool: pool}, TaskTests: tests, LearningTargets: targets}}
+	fixture, err := provisioner.Ensure(ctx)
+	if err != nil || fixture.Status != "created" || fixture.CourseID != definition.IDs.Course || len(fixture.Assessments) != 3 {
+		t.Fatal("SETUP: actual curated Course provision failed")
+	}
+	structureUC := task.GetInternalCourseStructure{Lessons: lessons, Tasks: tasks}
+	structure, err := structureUC.Handle(ctx, fixture.CourseID)
+	if err != nil {
+		t.Fatal("SETUP: actual Course structure missing")
+	}
+	catalog, err := structure.DiagnosticOnly()
+	if err != nil || catalog.CurriculumRevision != fixture.CurriculumRevision {
+		t.Fatal("SETUP: actual Course catalog mismatch")
+	}
+	handler := &privatehandlers.TaskHandler{GetDetailsUC: task.GetTaskDetails{Tasks: tasks, TaskTests: tests, TaskFiles: TaskFileStorageRepoPG{Pool: pool}, LearningTargets: targets, Structures: structures}, GetInternalCourseStructureUC: structureUC}
+	registered := chi.NewRouter()
+	lessonHandler := &privatehandlers.LessonHandler{GetUC: lesson.GetLesson{Lessons: lessons}}
+	registered.Mount("/internal", privatehttp.NewRouter(handler, lessonHandler, nil, nil, token, "", catalogToken))
+	server := httptest.NewUnstartedServer(registered)
+	server.Config.ReadHeaderTimeout = 5 * time.Second
+	server.Config.ReadTimeout = 40 * time.Second
+	server.Config.WriteTimeout = 40 * time.Second
+	server.Config.IdleTimeout = 5 * time.Second
+	server.Start()
+	defer server.Close()
+	defer server.CloseClientConnections()
+	metadata := map[string]any{"url": server.URL, "course_id": fixture.CourseID, "curriculum_revision": fixture.CurriculumRevision, "catalog": catalog, "fixture_version": 1, "namespace": namespace, "classification": "actual registered Course diagnostic catalog and trusted task definitions; curated three-question fixture, fresh owned IDs; no AI authoring claim"}
+	t18CourseWriteExclusive(t, ready, metadata)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("owned Course 20-minute deadline exceeded")
+		case <-ticker.C:
+			if _, err := os.Stat(stop); err == nil {
+				t18CourseWriteExclusive(t, result, metadata)
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal("owned Course stop read failed")
+			}
+		}
+	}
+}
+func t18CourseWriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe Course metadata encoding failed")
+	}
+	file, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal("exclusive Course metadata creation failed")
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("safe Course metadata export failed")
+	}
+	if os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic metadata publication failed")
+	}
+}

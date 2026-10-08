@@ -1,0 +1,352 @@
+package internalapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+)
+
+const (
+	teacherOnboardingStudentID  = "11111111-1111-4111-8111-111111111111"
+	teacherOnboardingToken      = "teacher-onboarding-token"
+	teacherOnboardingRequestID  = "22222222-2222-4222-8222-222222222222"
+	teacherOnboardingFinalizeID = "33333333-3333-4333-8333-333333333333"
+)
+
+type teacherOnboardingClock struct{ now time.Time }
+
+func (clock teacherOnboardingClock) Now() time.Time { return clock.now }
+
+type teacherOnboardingRepositoryStub struct {
+	draft             domain.StudentOnboardingDraft
+	profile           domain.StudentOnboarding
+	profileErr        error
+	finalized         domain.StudentOnboardingFinalizeResult
+	replaceErr        error
+	finalizeErr       error
+	draftStudentIDs   []string
+	profileStudentIDs []string
+	replaceCommands   []repository.StudentOnboardingDraftReplaceCommand
+	finalizeCommands  []repository.StudentOnboardingDraftFinalizeCommand
+}
+
+func (stub *teacherOnboardingRepositoryStub) GetDraft(_ context.Context, studentID string) (domain.StudentOnboardingDraft, error) {
+	stub.draftStudentIDs = append(stub.draftStudentIDs, studentID)
+	return stub.draft, nil
+}
+
+func (stub *teacherOnboardingRepositoryStub) ReplaceDraft(
+	_ context.Context,
+	command repository.StudentOnboardingDraftReplaceCommand,
+) (domain.StudentOnboardingDraft, bool, error) {
+	stub.replaceCommands = append(stub.replaceCommands, command)
+	return stub.draft, len(stub.replaceCommands) > 1, stub.replaceErr
+}
+
+func (stub *teacherOnboardingRepositoryStub) FinalizeDraft(
+	_ context.Context,
+	command repository.StudentOnboardingDraftFinalizeCommand,
+) (domain.StudentOnboardingFinalizeResult, bool, error) {
+	stub.finalizeCommands = append(stub.finalizeCommands, command)
+	return stub.finalized, len(stub.finalizeCommands) > 1, stub.finalizeErr
+}
+
+func (stub *teacherOnboardingRepositoryStub) Get(_ context.Context, studentID string) (domain.StudentOnboarding, error) {
+	stub.profileStudentIDs = append(stub.profileStudentIDs, studentID)
+	return stub.profile, stub.profileErr
+}
+
+func (stub *teacherOnboardingRepositoryStub) Save(
+	context.Context,
+	domain.StudentOnboarding,
+	int64,
+) (domain.StudentOnboarding, error) {
+	return domain.StudentOnboarding{}, errors.New("unexpected profile write")
+}
+
+func TestTeacherOnboardingGETUsesExactPathAndReturnsAllowlistedState(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	repo := teacherOnboardingRepository(t, now)
+	handler := teacherOnboardingInternalHandler(repo, now)
+	router := NewRouter(handler, "general-token", "planner-token", teacherOnboardingToken)
+	path := "/v1/teacher/students/" + teacherOnboardingStudentID + "/onboarding/draft"
+
+	response := performTeacherOnboardingRequest(router, http.MethodGet, path, "", "", teacherOnboardingToken)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		len(repo.draftStudentIDs) != 1 || repo.draftStudentIDs[0] != teacherOnboardingStudentID ||
+		len(repo.profileStudentIDs) != 1 || repo.profileStudentIDs[0] != teacherOnboardingStudentID {
+		t.Fatalf("GET was not bound to the exact path student: status=%d draft_ids=%v profile_ids=%v body=%s",
+			response.Code, repo.draftStudentIDs, repo.profileStudentIDs, response.Body.String())
+	}
+	var state domain.TeacherStudentOnboardingState
+	decoder := json.NewDecoder(bytes.NewReader(response.Body.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil || state.Schema != domain.TeacherStudentOnboardingStateSchema ||
+		state.Draft.Schema != domain.StudentOnboardingDraftSchema || state.ProfileVersion != repo.profile.Version {
+		t.Fatalf("unexpected strict state: state=%+v err=%v body=%s", state, err, response.Body.String())
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root) != 3 || root["schema"] == nil || root["draft"] == nil || root["profile_version"] == nil {
+		t.Fatalf("response root is not allowlisted: %v", root)
+	}
+	for _, forbidden := range []string{"request_hash", "receipt", "audit", "mastery", "learning_path", "diagnostic", "raw_evidence"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("Teacher onboarding state leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	repo.profileErr = domain.ErrNotFound
+	absentProfile := performTeacherOnboardingRequest(router, http.MethodGet, path, "", "", teacherOnboardingToken)
+	if absentProfile.Code != http.StatusOK || !strings.Contains(absentProfile.Body.String(), `"profile_version":0`) {
+		t.Fatalf("absent profile did not expose authoritative create precondition: status=%d body=%s",
+			absentProfile.Code, absentProfile.Body.String())
+	}
+
+	invalid := performTeacherOnboardingRequest(router, http.MethodGet,
+		"/v1/teacher/students/not-a-uuid/onboarding/draft", "", "", teacherOnboardingToken)
+	if invalid.Code != http.StatusBadRequest || len(repo.draftStudentIDs) != 2 || len(repo.profileStudentIDs) != 2 {
+		t.Fatalf("invalid path reached repositories: status=%d draft_ids=%v profile_ids=%v",
+			invalid.Code, repo.draftStudentIDs, repo.profileStudentIDs)
+	}
+}
+
+func TestTeacherOnboardingCommandsMatchPublicTransportAndDelegateReplayConflict(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	repo := teacherOnboardingRepository(t, now)
+	internalHandler := teacherOnboardingInternalHandler(repo, now)
+	internalRouter := NewRouter(internalHandler, "general-token", "planner-token", teacherOnboardingToken)
+	publicRouter := publicOnboardingDraftRouter(repo, now)
+	putBody := `{"schema":"student-onboarding-draft.v1","expected_version":1,"goal_text":"","known_stacks":[]}`
+	internalPath := "/v1/teacher/students/" + teacherOnboardingStudentID + "/onboarding/draft"
+
+	internalPut := performTeacherOnboardingRequest(internalRouter, http.MethodPut, internalPath, putBody, teacherOnboardingRequestID, teacherOnboardingToken)
+	publicPut := performPublicOnboardingRequest(publicRouter, http.MethodPut, "/student/onboarding/draft", putBody, teacherOnboardingRequestID)
+	if internalPut.Code != http.StatusOK || publicPut.Code != http.StatusOK || internalPut.Body.String() != publicPut.Body.String() ||
+		len(repo.replaceCommands) != 2 || !reflect.DeepEqual(repo.replaceCommands[0], repo.replaceCommands[1]) ||
+		repo.replaceCommands[0].StudentID != teacherOnboardingStudentID || repo.replaceCommands[0].ExpectedVersion != 1 {
+		t.Fatalf("public/internal PUT diverged: internal=%d %s public=%d %s commands=%+v",
+			internalPut.Code, internalPut.Body.String(), publicPut.Code, publicPut.Body.String(), repo.replaceCommands)
+	}
+
+	finalizeBody := `{"schema":"student-onboarding-finalize.v1","expected_draft_version":1,"expected_profile_version":1}`
+	finalizePath := internalPath + "/finalize"
+	internalFinalize := performTeacherOnboardingRequest(internalRouter, http.MethodPost, finalizePath, finalizeBody, teacherOnboardingFinalizeID, teacherOnboardingToken)
+	publicFinalize := performPublicOnboardingRequest(publicRouter, http.MethodPost, "/student/onboarding/draft/finalize", finalizeBody, teacherOnboardingFinalizeID)
+	if internalFinalize.Code != http.StatusOK || publicFinalize.Code != http.StatusOK ||
+		internalFinalize.Body.String() != publicFinalize.Body.String() || len(repo.finalizeCommands) != 2 ||
+		!reflect.DeepEqual(repo.finalizeCommands[0], repo.finalizeCommands[1]) ||
+		repo.finalizeCommands[0].ExpectedDraftVersion != 1 || repo.finalizeCommands[0].ExpectedProfileVersion != 1 {
+		t.Fatalf("public/internal finalize diverged: internal=%d %s public=%d %s commands=%+v",
+			internalFinalize.Code, internalFinalize.Body.String(), publicFinalize.Code, publicFinalize.Body.String(), repo.finalizeCommands)
+	}
+
+	replay := performTeacherOnboardingRequest(internalRouter, http.MethodPost, finalizePath, finalizeBody, teacherOnboardingFinalizeID, teacherOnboardingToken)
+	if replay.Code != http.StatusOK || replay.Body.String() != internalFinalize.Body.String() ||
+		len(repo.finalizeCommands) != 3 || repo.finalizeCommands[2].RequestHash != repo.finalizeCommands[0].RequestHash {
+		t.Fatalf("finalize replay was not delegated unchanged: status=%d commands=%+v body=%s",
+			replay.Code, repo.finalizeCommands, replay.Body.String())
+	}
+	repo.finalizeErr = domain.ErrConflict
+	conflict := performTeacherOnboardingRequest(internalRouter, http.MethodPost, finalizePath, finalizeBody,
+		"44444444-4444-4444-8444-444444444444", teacherOnboardingToken)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("use-case conflict was not preserved: status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
+func TestTeacherOnboardingRejectsTokensMalformedUnknownTrailingAndOversize(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	repo := teacherOnboardingRepository(t, now)
+	handler := teacherOnboardingInternalHandler(repo, now)
+	router := NewRouter(handler, "general-token", "planner-token", teacherOnboardingToken)
+	path := "/v1/teacher/students/" + teacherOnboardingStudentID + "/onboarding/draft"
+
+	var unauthorizedBodies []string
+	for _, headers := range []struct {
+		name      string
+		token     string
+		browserID string
+	}{
+		{name: "missing"},
+		{name: "wrong", token: "wrong-token"},
+		{name: "general", token: "general-token"},
+		{name: "planner", token: "planner-token"},
+		{name: "browser only", browserID: teacherOnboardingStudentID},
+	} {
+		t.Run(headers.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("X-Internal-Token", headers.token)
+			if headers.browserID != "" {
+				request.Header.Set("X-User-ID", headers.browserID)
+				request.Header.Set("X-User-Role", "TEACHER")
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			unauthorizedBodies = append(unauthorizedBodies, response.Body.String())
+		})
+	}
+	for _, body := range unauthorizedBodies[1:] {
+		if body != unauthorizedBodies[0] {
+			t.Fatalf("missing/wrong token responses differ: %q versus %q", unauthorizedBodies[0], body)
+		}
+	}
+	if len(repo.draftStudentIDs) != 0 {
+		t.Fatalf("unauthorized requests reached use case: %v", repo.draftStudentIDs)
+	}
+
+	validPut := `{"schema":"student-onboarding-draft.v1","expected_version":1}`
+	tests := []struct {
+		name, method, target, body, requestID string
+	}{
+		{name: "malformed", method: http.MethodPut, target: path, body: `{`, requestID: teacherOnboardingRequestID},
+		{name: "unknown", method: http.MethodPut, target: path, body: `{"schema":"student-onboarding-draft.v1","expected_version":1,"student_id":"` + teacherOnboardingStudentID + `"}`, requestID: teacherOnboardingRequestID},
+		{name: "trailing", method: http.MethodPut, target: path, body: validPut + `{}`, requestID: teacherOnboardingRequestID},
+		{name: "oversize put", method: http.MethodPut, target: path, body: `{"schema":"student-onboarding-draft.v1","expected_version":1,"goal_text":"` + strings.Repeat("x", 17<<10) + `"}`, requestID: teacherOnboardingRequestID},
+		{name: "missing idempotency", method: http.MethodPut, target: path, body: validPut},
+		{name: "unknown finalize", method: http.MethodPost, target: path + "/finalize", body: `{"schema":"student-onboarding-finalize.v1","expected_draft_version":1,"expected_profile_version":1,"extra":true}`, requestID: teacherOnboardingRequestID},
+		{name: "oversize finalize", method: http.MethodPost, target: path + "/finalize", body: `{"schema":"student-onboarding-finalize.v1","expected_draft_version":1,"expected_profile_version":1}` + strings.Repeat(" ", 2<<10), requestID: teacherOnboardingRequestID},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := performTeacherOnboardingRequest(router, testCase.method, testCase.target, testCase.body, testCase.requestID, teacherOnboardingToken)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if len(repo.replaceCommands) != 0 || len(repo.finalizeCommands) != 0 {
+		t.Fatalf("invalid requests reached repository: replace=%+v finalize=%+v", repo.replaceCommands, repo.finalizeCommands)
+	}
+
+	disabled := NewRouter(handler, "general-token", "planner-token", "")
+	disabledResponse := performTeacherOnboardingRequest(disabled, http.MethodGet, path, "", "", "general-token")
+	if disabledResponse.Code != http.StatusNotFound {
+		t.Fatalf("unset Teacher token must leave route disabled: status=%d body=%s", disabledResponse.Code, disabledResponse.Body.String())
+	}
+}
+
+func TestTeacherOnboardingCompletedGETRedactsAnswers(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	repo := teacherOnboardingRepository(t, now)
+	completedVersion := repo.profile.Version
+	repo.draft = domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: teacherOnboardingStudentID,
+		Status: domain.StudentOnboardingDraftStatusCompleted, Version: 2,
+		CompletedProfileVersion: &completedVersion, CreatedAt: &now, UpdatedAt: &now, CompletedAt: &now,
+	}
+	router := NewRouter(teacherOnboardingInternalHandler(repo, now), "general-token", "planner-token", teacherOnboardingToken)
+	path := "/v1/teacher/students/" + teacherOnboardingStudentID + "/onboarding/draft"
+	response := performTeacherOnboardingRequest(router, http.MethodGet, path, "", "", teacherOnboardingToken)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"COMPLETED"`) {
+		t.Fatalf("completed state status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, answer := range []string{"direction_code", "self_assessed_experience", "known_stacks", "desired_stacks", "goal_code", "goal_text", "preferred_language", "weekly_minutes", "preferred_pace"} {
+		if strings.Contains(response.Body.String(), answer) {
+			t.Fatalf("completed GET leaked answer %q: %s", answer, response.Body.String())
+		}
+	}
+}
+
+func teacherOnboardingRepository(t *testing.T, now time.Time) *teacherOnboardingRepositoryStub {
+	t.Helper()
+	draft, err := domain.NormalizeStudentOnboardingDraft(domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: teacherOnboardingStudentID,
+		Status: domain.StudentOnboardingDraftStatusDraft, Version: 1, CreatedAt: &now, UpdatedAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := domain.NormalizeStudentOnboarding(domain.StudentOnboarding{
+		StudentID: teacherOnboardingStudentID, DirectionCode: "backend", SelfAssessedExperience: "basic",
+		KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "first-job",
+		PreferredLanguage: "ru", WeeklyMinutes: 300, PreferredPace: "balanced",
+		Version: 1, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedVersion := profile.Version
+	finalized, err := domain.NormalizeStudentOnboardingFinalizeResult(domain.StudentOnboardingFinalizeResult{
+		Schema: domain.StudentOnboardingFinalizeResultSchema,
+		Draft: domain.StudentOnboardingDraft{
+			Schema: domain.StudentOnboardingDraftSchema, StudentID: teacherOnboardingStudentID,
+			Status: domain.StudentOnboardingDraftStatusCompleted, Version: 2,
+			CompletedProfileVersion: &completedVersion, CreatedAt: &now, UpdatedAt: &now, CompletedAt: &now,
+		},
+		Profile: profile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &teacherOnboardingRepositoryStub{draft: draft, profile: profile, finalized: finalized}
+}
+
+func teacherOnboardingInternalHandler(repo *teacherOnboardingRepositoryStub, now time.Time) *Handler {
+	return &Handler{
+		OnboardingDrafts:       studentuc.GetStudentOnboardingDraft{Drafts: repo},
+		OnboardingDraftWrites:  studentuc.PutStudentOnboardingDraft{Drafts: repo, Clock: teacherOnboardingClock{now: now}},
+		OnboardingFinalization: studentuc.FinalizeStudentOnboardingDraft{Drafts: repo, Clock: teacherOnboardingClock{now: now}},
+		OnboardingProfiles:     studentuc.GetStudentOnboarding{Profiles: repo},
+	}
+}
+
+func publicOnboardingDraftRouter(repo *teacherOnboardingRepositoryStub, now time.Time) http.Handler {
+	handler := &handlers.StudentOnboardingHandler{
+		GetDraft:      studentuc.GetStudentOnboardingDraft{Drafts: repo},
+		PutDraft:      studentuc.PutStudentOnboardingDraft{Drafts: repo, Clock: teacherOnboardingClock{now: now}},
+		FinalizeDraft: studentuc.FinalizeStudentOnboardingDraft{Drafts: repo, Clock: teacherOnboardingClock{now: now}},
+	}
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware{}.Middleware)
+	router.Use(middleware.RequireRole("STUDENT", "STUDENT_PRO"))
+	router.Get("/student/onboarding/draft", handler.GetDraftProfile)
+	router.Put("/student/onboarding/draft", handler.PutDraftProfile)
+	router.Post("/student/onboarding/draft/finalize", handler.FinalizeDraftProfile)
+	return router
+}
+
+func performTeacherOnboardingRequest(
+	router http.Handler,
+	method, path, body, requestID, token string,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", token)
+	if requestID != "" {
+		request.Header.Set("Idempotency-Key", requestID)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func performPublicOnboardingRequest(
+	router http.Handler,
+	method, path, body, requestID string,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("X-User-ID", teacherOnboardingStudentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	request.Header.Set("Idempotency-Key", requestID)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}

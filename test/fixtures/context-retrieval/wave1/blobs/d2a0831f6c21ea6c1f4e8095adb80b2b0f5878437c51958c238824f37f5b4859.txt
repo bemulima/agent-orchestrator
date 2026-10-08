@@ -1,0 +1,162 @@
+package domain
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	onboardingStudentID = "11111111-1111-4111-8111-111111111111"
+	onboardingTeacherID = "22222222-2222-4222-8222-222222222222"
+	onboardingDialogID  = "33333333-3333-4333-8333-333333333333"
+	onboardingMessageID = "44444444-4444-4444-8444-444444444444"
+)
+
+func TestTeacherOnboardingStateMachineIsProgressiveAndPreservesAnswers(t *testing.T) {
+	draft := emptyOnboardingDraft()
+	steps := []struct {
+		step   TeacherOnboardingStep
+		action string
+	}{
+		{OnboardingStepDirection, "direction.backend"}, {OnboardingStepExperience, "experience.new"},
+		{OnboardingStepKnownStack, "known.none"}, {OnboardingStepDesiredStack, "desired.go"},
+		{OnboardingStepGoal, "goal.first_job"}, {OnboardingStepLanguage, "language.en"},
+		{OnboardingStepWeeklyMinutes, "weekly.300"}, {OnboardingStepPace, "pace.balanced"},
+	}
+	for _, expected := range steps {
+		step, err := NextTeacherOnboardingStep(draft)
+		if err != nil || step != expected.step {
+			t.Fatalf("step=%s err=%v want=%s", step, err, expected.step)
+		}
+		answers, finalize, err := ApplyTeacherOnboardingAction(draft, step, expected.action)
+		if err != nil || finalize {
+			t.Fatalf("apply %s: finalize=%v err=%v", step, finalize, err)
+		}
+		draft.StudentOnboardingAnswers = answers
+	}
+	step, err := NextTeacherOnboardingStep(draft)
+	if err != nil || step != OnboardingStepConfirmation || draft.GoalCode == nil || *draft.GoalCode != "first-job" || draft.GoalText != nil || draft.KnownStacks == nil || len(*draft.KnownStacks) != 0 || draft.DesiredStacks == nil || len(*draft.DesiredStacks) != 1 || (*draft.DesiredStacks)[0] != "go" {
+		t.Fatalf("unexpected complete draft: step=%s draft=%+v err=%v", step, draft, err)
+	}
+	_, finalize, err := ApplyTeacherOnboardingAction(draft, step, "confirmation.confirm")
+	if err != nil || !finalize {
+		t.Fatalf("confirmation finalize=%v err=%v", finalize, err)
+	}
+}
+
+func TestTeacherOnboardingPreservesExplicitEmptyListAcrossJSONBoundary(t *testing.T) {
+	empty := []string{}
+	draft := emptyOnboardingDraft()
+	draft.KnownStacks = &empty
+	answers, finalize, err := ApplyTeacherOnboardingAction(draft, OnboardingStepDesiredStack, "desired.go")
+	if err != nil || finalize {
+		t.Fatalf("apply desired stack: finalize=%v err=%v", finalize, err)
+	}
+	encoded, err := json.Marshal(answers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"known_stacks":[]`) || strings.Contains(string(encoded), `"known_stacks":null`) {
+		t.Fatalf("explicit empty known stacks were lost: %s", encoded)
+	}
+}
+
+func TestTeacherOnboardingRejectsUnknownOwnerValuesAndClientMeaning(t *testing.T) {
+	draft := emptyOnboardingDraft()
+	unknown := "invented"
+	draft.DirectionCode = &unknown
+	if _, err := NextTeacherOnboardingStep(draft); err == nil {
+		t.Fatal("unknown direction was accepted")
+	}
+	request := AssistantUIActionRequest{Schema: AssistantUIActionSchema, DialogID: onboardingDialogID, MessageID: onboardingMessageID, MessageVersion: 1, BlockID: "onboarding.direction.d0.v1", ActionID: "direction.backend", IdempotencyKey: "55555555-5555-4555-8555-555555555555"}
+	raw, _ := json.Marshal(request)
+	var strict struct {
+		Schema         string `json:"schema"`
+		DialogID       string `json:"dialog_id"`
+		MessageID      string `json:"message_id"`
+		MessageVersion int    `json:"message_version"`
+		BlockID        string `json:"block_id"`
+		ActionID       string `json:"action_id"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if strictJSON(append(raw[:len(raw)-1], []byte(`,"value":"backend"}`)...), &strict) == nil {
+		t.Fatal("client value was accepted")
+	}
+	if strictJSON(append(raw[:len(raw)-1], []byte(`,"label":"Backend"}`)...), &strict) == nil {
+		t.Fatal("client label was accepted")
+	}
+}
+
+func TestOnboardingAssistantUISourceRequiresExactRegisteredBlock(t *testing.T) {
+	body, ui, err := BuildTeacherOnboardingPrompt(OnboardingStepDirection, "ru")
+	if err != nil || body == "" {
+		t.Fatal(err)
+	}
+	binding := TeacherDialogBinding{ID: onboardingDialogID, StudentID: onboardingStudentID, PersonalTeacherID: onboardingTeacherID, ContextType: LearningContextGeneral}
+	source := DialogAssistantUISource{Schema: DialogAssistantUISourceSchema, DialogID: onboardingDialogID, StudentID: onboardingStudentID, PersonalTeacherID: onboardingTeacherID, ContextType: "general_teacher", MessageID: onboardingMessageID, MessageSequence: 1, MessageVersion: 1, AssistantUI: ui}
+	if err := ValidateCurrentOnboardingAssistantUISource(source, binding, onboardingMessageID, 1, OnboardingStepDirection, "ru", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateOnboardingAssistantUISource(source, binding, onboardingMessageID, 1, OnboardingStepDirection, "direction.backend", "ru", 0); err != nil {
+		t.Fatal(err)
+	}
+	var persisted any
+	if err := json.Unmarshal(ui, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persistedUI, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(persistedUI) == string(ui) {
+		t.Fatal("test fixture did not reorder JSON object keys")
+	}
+	source.AssistantUI = persistedUI
+	if err := ValidateOnboardingAssistantUISource(source, binding, onboardingMessageID, 1, OnboardingStepDirection, "direction.backend", "ru", 0); err != nil {
+		t.Fatalf("semantically identical persisted UI rejected: %v", err)
+	}
+	mutations := []json.RawMessage{
+		json.RawMessage(strings.Replace(string(ui), `"direction.backend"`, `"direction.root"`, 1)),
+		json.RawMessage(strings.Replace(string(ui), `"Backend"`, `"Trusted client label"`, 1)),
+		json.RawMessage(strings.Replace(string(ui), `"version":1`, `"version":2`, 1)),
+		json.RawMessage(strings.Replace(string(ui), `"choice"`, `"quiz"`, 1)),
+	}
+	for _, mutation := range mutations {
+		source.AssistantUI = mutation
+		if ValidateOnboardingAssistantUISource(source, binding, onboardingMessageID, 1, OnboardingStepDirection, "direction.backend", "ru", 0) == nil {
+			t.Fatalf("accepted mutated block: %s", mutation)
+		}
+	}
+	source.AssistantUI = ui
+	if ValidateOnboardingAssistantUISource(source, binding, onboardingMessageID, 1, OnboardingStepDirection, "direction.backend", "ru", 1) == nil {
+		t.Fatal("historical draft-version block was accepted")
+	}
+}
+
+func TestOnboardingReceiptContainsNoAnswersAndUsesDistinctStableCommands(t *testing.T) {
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	request := AssistantUIActionRequest{Schema: AssistantUIActionSchema, DialogID: onboardingDialogID, MessageID: onboardingMessageID, MessageVersion: 1, BlockID: "onboarding.direction.d0.v1", ActionID: "direction.backend", IdempotencyKey: "55555555-5555-4555-8555-555555555555"}
+	first, err := NewOnboardingActionReceipt(request, onboardingStudentID, onboardingTeacherID, "66666666-6666-4666-8666-666666666666", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewOnboardingActionReceipt(request, onboardingStudentID, onboardingTeacherID, "77777777-7777-4777-8777-777777777777", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.StudentCommandID != second.StudentCommandID || first.DialogMessageCommandID != second.DialogMessageCommandID || first.StudentCommandID == first.DialogMessageCommandID {
+		t.Fatalf("commands are not stable/distinct: %+v %+v", first, second)
+	}
+	encoded, _ := json.Marshal(first)
+	for _, forbidden := range []string{"direction_code", "desired_stacks", "goal_text", "preferred_language", "weekly_minutes", "Backend"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("receipt leaked %s: %s", forbidden, encoded)
+		}
+	}
+}
+
+func emptyOnboardingDraft() StudentOnboardingDraft {
+	return StudentOnboardingDraft{Schema: StudentOnboardingDraftSchema, StudentID: onboardingStudentID, Status: StudentOnboardingDraftDraft}
+}

@@ -1,0 +1,208 @@
+package answer
+
+import (
+	"context"
+	"sort"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+// SandboxResolver resolves sandbox by user/task/answer tuple.
+type SandboxResolver interface {
+	FindByUserAndTask(ctx context.Context, userID, taskID, answerID string) (string, error)
+}
+
+// ResultTaskSummary contains lightweight task data for result lists.
+type ResultTaskSummary struct {
+	ID          string
+	LessonID    string
+	CourseID    string
+	Title       string
+	Description string
+}
+
+// ResultTaskDetails contains task data for one result page.
+type ResultTaskDetails struct {
+	ID          string
+	LessonID    string
+	CourseID    string
+	Title       string
+	Description string
+	MaxAttempts *int
+}
+
+// StudentResultItem represents one item in student result list.
+type StudentResultItem struct {
+	Answer    domain.StudentTaskAnswer
+	SandboxID string
+	Task      *ResultTaskSummary
+}
+
+// StudentResultsPage represents paginated student results.
+type StudentResultsPage struct {
+	Items  []StudentResultItem
+	Limit  int
+	Offset int
+	Total  int
+}
+
+// ListStudentResultsInput controls result list pagination/filtering.
+type ListStudentResultsInput struct {
+	TaskID string
+	Limit  int
+	Offset int
+}
+
+// ListStudentResults loads attempts across all tasks for one user.
+type ListStudentResults struct {
+	Answers         repository.StudentTaskAnswerRepository
+	TaskProvider    TaskProvider
+	SandboxResolver SandboxResolver
+}
+
+// Handle returns paginated result list for the given student.
+func (uc ListStudentResults) Handle(ctx context.Context, userID string, input ListStudentResultsInput) (*StudentResultsPage, error) {
+	limit := input.Limit
+	offset := input.Offset
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var (
+		answers []domain.StudentTaskAnswer
+		total   int
+		err     error
+	)
+	if input.TaskID != "" {
+		answers, err = uc.Answers.ListForTaskAndStudent(ctx, input.TaskID, userID)
+		if err != nil {
+			return nil, err
+		}
+		sort.Slice(answers, func(i, j int) bool {
+			return answers[i].CreatedAt.After(answers[j].CreatedAt)
+		})
+		total = len(answers)
+		start := offset
+		if start > total {
+			start = total
+		}
+		end := start + limit
+		if end > total {
+			end = total
+		}
+		answers = answers[start:end]
+	} else {
+		answers, err = uc.Answers.ListForStudent(ctx, userID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		total, err = uc.Answers.CountForStudent(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	taskMeta := map[string]*ResultTaskSummary{}
+	for _, item := range answers {
+		if uc.TaskProvider == nil && item.LearningPathItemID == "" {
+			continue
+		}
+		if _, exists := taskMeta[item.ID]; exists {
+			continue
+		}
+		meta, metaErr := taskForAnswer(ctx, uc.TaskProvider, &item)
+		if metaErr == nil && meta != nil {
+			taskMeta[item.ID] = &ResultTaskSummary{
+				ID:          meta.ID,
+				LessonID:    meta.LessonID,
+				CourseID:    meta.CourseID,
+				Title:       meta.Title,
+				Description: meta.Description,
+			}
+		}
+	}
+
+	items := make([]StudentResultItem, 0, len(answers))
+	for _, item := range answers {
+		resultItem := StudentResultItem{Answer: item}
+		if uc.SandboxResolver != nil {
+			if sandboxID, sandboxErr := uc.SandboxResolver.FindByUserAndTask(ctx, userID, item.TaskID, item.ID); sandboxErr == nil {
+				resultItem.SandboxID = sandboxID
+			}
+		}
+		if taskItem, ok := taskMeta[item.ID]; ok {
+			resultItem.Task = taskItem
+		}
+		items = append(items, resultItem)
+	}
+
+	return &StudentResultsPage{
+		Items:  items,
+		Limit:  limit,
+		Offset: offset,
+		Total:  total,
+	}, nil
+}
+
+// StudentResult aggregates full answer result payload.
+type StudentResult struct {
+	Details         *AnswerDetails
+	Task            *ResultTaskDetails
+	AttemptsForTask int
+	SandboxID       string
+}
+
+// GetStudentResult loads detailed result payload for one answer.
+type GetStudentResult struct {
+	GetAnswer       GetStudentAnswer
+	Answers         repository.StudentTaskAnswerRepository
+	TaskProvider    TaskProvider
+	SandboxResolver SandboxResolver
+}
+
+// Handle returns one result payload for the given student and answer.
+func (uc GetStudentResult) Handle(ctx context.Context, userID, answerID string) (*StudentResult, error) {
+	details, err := uc.GetAnswer.Handle(ctx, answerID)
+	if err != nil {
+		return nil, err
+	}
+	if details.Answer.StudentID != userID {
+		return nil, domain.ErrForbidden
+	}
+
+	result := &StudentResult{Details: details}
+
+	if uc.Answers != nil {
+		if attempts, countErr := uc.Answers.CountForTaskAndStudent(ctx, details.Answer.TaskID, userID); countErr == nil {
+			result.AttemptsForTask = attempts
+		}
+	}
+
+	if uc.TaskProvider != nil || details.Answer.LearningPathItemID != "" {
+		if taskMeta, taskErr := taskForAnswer(ctx, uc.TaskProvider, &details.Answer); taskErr == nil && taskMeta != nil {
+			result.Task = &ResultTaskDetails{
+				ID:          taskMeta.ID,
+				LessonID:    taskMeta.LessonID,
+				CourseID:    taskMeta.CourseID,
+				Title:       taskMeta.Title,
+				Description: taskMeta.Description,
+				MaxAttempts: taskMeta.MaxAttempts,
+			}
+		}
+	}
+
+	if uc.SandboxResolver != nil {
+		if sandboxID, sandboxErr := uc.SandboxResolver.FindByUserAndTask(ctx, userID, details.Answer.TaskID, details.Answer.ID); sandboxErr == nil {
+			result.SandboxID = sandboxID
+		}
+	}
+
+	return result, nil
+}

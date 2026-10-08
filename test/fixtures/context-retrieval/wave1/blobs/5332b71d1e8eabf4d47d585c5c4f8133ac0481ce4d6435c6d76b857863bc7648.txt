@@ -1,0 +1,135 @@
+package domain
+
+import (
+	"errors"
+	"strings"
+)
+
+const StudentLearningWorkspaceSchema = "student-learning-workspace.v1"
+
+// StudentLearningWorkspace is the narrow, read-only projection used by Teacher
+// for legacy generic workspace navigation. Authoritative progression decisions
+// come from NextActionResolver, never consumer selection of these items. It deliberately contains no Student identity,
+// planning request, evidence, Course content, or command/receipt identifiers.
+type StudentLearningWorkspace struct {
+	Schema         string                                `json:"schema"`
+	ContextVersion int64                                 `json:"context_version"`
+	SelectedPath   *StudentLearningWorkspaceSelectedPath `json:"selected_path,omitempty"`
+}
+
+// StudentLearningWorkspaceSelectedPath is emitted only for the exact selected
+// ACTIVE path observed with its Student-owned context.
+type StudentLearningWorkspaceSelectedPath struct {
+	LearningPathID string                         `json:"learning_path_id"`
+	CourseID       string                         `json:"course_id"`
+	Status         LearningPathStatus             `json:"status"`
+	PathVersion    int64                          `json:"path_version"`
+	Items          []StudentLearningWorkspaceItem `json:"items"`
+}
+
+// StudentLearningWorkspaceItem omits targets and planner rationale. Position
+// plus the current item status lets a consumer deterministically choose the
+// first IN_PROGRESS item, otherwise the first READY item for generic navigation
+// only. This selection is not an authoritative Next Best Action. Without mutating
+// Student state.
+type StudentLearningWorkspaceItem struct {
+	ReferenceType string                 `json:"reference_type"`
+	ReferenceID   string                 `json:"reference_id"`
+	Position      int                    `json:"position"`
+	Status        LearningPathItemStatus `json:"status"`
+}
+
+// StudentLearningWorkspaceSource is repository-only input. StudentID never
+// crosses the HTTP boundary; it is used to bind the context and path before
+// projection.
+type StudentLearningWorkspaceSource struct {
+	StudentID    string
+	Context      StudentLearningContext
+	SelectedPath *StudentLearningPath
+}
+
+func BuildStudentLearningWorkspace(input StudentLearningWorkspaceSource) (StudentLearningWorkspace, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	if !validJourneyUUID(input.StudentID) {
+		return StudentLearningWorkspace{}, errors.New("invalid learning workspace student")
+	}
+
+	contextValue := input.Context
+	if contextValue.Version == 0 {
+		if contextValue.StudentID != "" || contextValue.SelectedLearningPathID != "" || contextValue.UpdatedAt != nil || input.SelectedPath != nil {
+			return StudentLearningWorkspace{}, errors.New("invalid empty learning workspace context")
+		}
+		return StudentLearningWorkspace{Schema: StudentLearningWorkspaceSchema, ContextVersion: 0}, nil
+	}
+	contextValue, err := NormalizeStudentLearningContext(contextValue)
+	if err != nil || contextValue.StudentID != input.StudentID {
+		return StudentLearningWorkspace{}, errors.New("invalid learning workspace context")
+	}
+	if input.SelectedPath == nil {
+		if contextValue.SelectedLearningPathID != "" {
+			return StudentLearningWorkspace{}, errors.New("missing selected learning workspace path")
+		}
+		return StudentLearningWorkspace{Schema: StudentLearningWorkspaceSchema, ContextVersion: contextValue.Version}, nil
+	}
+	path, err := NormalizeStudentLearningPath(*input.SelectedPath)
+	if err != nil || path.StudentID != input.StudentID || path.ID != contextValue.SelectedLearningPathID ||
+		path.Status != LearningPathStatusActive || path.Version < 1 {
+		return StudentLearningWorkspace{}, errors.New("invalid selected learning workspace path")
+	}
+	items := make([]StudentLearningWorkspaceItem, len(path.Items))
+	for index, item := range path.Items {
+		items[index] = StudentLearningWorkspaceItem{
+			ReferenceType: item.ReferenceType,
+			ReferenceID:   item.ReferenceID,
+			Position:      item.Position,
+			Status:        item.Status,
+		}
+	}
+	return NormalizeStudentLearningWorkspace(StudentLearningWorkspace{
+		Schema:         StudentLearningWorkspaceSchema,
+		ContextVersion: contextValue.Version,
+		SelectedPath: &StudentLearningWorkspaceSelectedPath{
+			LearningPathID: path.ID,
+			CourseID:       path.CourseID,
+			Status:         path.Status,
+			PathVersion:    path.Version,
+			Items:          items,
+		},
+	})
+}
+
+func NormalizeStudentLearningWorkspace(input StudentLearningWorkspace) (StudentLearningWorkspace, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	if input.Schema != StudentLearningWorkspaceSchema || input.ContextVersion < 0 {
+		return StudentLearningWorkspace{}, errors.New("invalid learning workspace")
+	}
+	if input.SelectedPath == nil {
+		return input, nil
+	}
+	path := *input.SelectedPath
+	path.LearningPathID = strings.TrimSpace(path.LearningPathID)
+	path.CourseID = strings.TrimSpace(path.CourseID)
+	if input.ContextVersion < 1 || !validJourneyUUID(path.LearningPathID) || !validJourneyUUID(path.CourseID) ||
+		path.Status != LearningPathStatusActive || path.PathVersion < 1 || len(path.Items) < 1 || len(path.Items) > 500 {
+		return StudentLearningWorkspace{}, errors.New("invalid learning workspace path")
+	}
+	items := make([]StudentLearningWorkspaceItem, len(path.Items))
+	seen := make(map[string]struct{}, len(path.Items))
+	for index, item := range path.Items {
+		item.ReferenceType = normalizeOnboardingCode(item.ReferenceType)
+		item.ReferenceID = strings.TrimSpace(item.ReferenceID)
+		if (item.ReferenceType != "lesson" && item.ReferenceType != "practice") || !validJourneyUUID(item.ReferenceID) ||
+			item.Position != index || !validPathItemStatus(item.Status) {
+			return StudentLearningWorkspace{}, errors.New("invalid learning workspace item")
+		}
+		identity := item.ReferenceType + ":" + item.ReferenceID
+		if _, exists := seen[identity]; exists {
+			return StudentLearningWorkspace{}, errors.New("duplicate learning workspace item")
+		}
+		seen[identity] = struct{}{}
+		items[index] = item
+	}
+	path.Items = items
+	input.SelectedPath = &path
+	return input, nil
+}

@@ -1,0 +1,161 @@
+-- S5 is deliberately additive and dark.  It records the coordinator's
+-- immutable identities and staged response before Dialog delivery, without
+-- changing legacy jobs or enabling the feature.
+ALTER TABLE teacher_dialog_job
+    ADD COLUMN source_message_version BIGINT,
+    ADD COLUMN reply_to_message_id UUID,
+    ADD COLUMN coordinator_mode VARCHAR(32) NOT NULL DEFAULT 'legacy',
+    ADD COLUMN response_assistant_ui JSONB,
+    ADD COLUMN response_assistant_ui_digest CHAR(64);
+
+ALTER TABLE teacher_dialog_job
+    ADD CONSTRAINT teacher_dialog_job_source_message_version_ck
+        CHECK (source_message_version IS NULL OR source_message_version > 0),
+    ADD CONSTRAINT teacher_dialog_job_coordinator_mode_ck
+        CHECK (coordinator_mode IN ('legacy', 'onboarding_action', 'onboarding_text')),
+    ADD CONSTRAINT teacher_dialog_job_response_assistant_ui_ck
+        CHECK ((response_assistant_ui IS NULL AND response_assistant_ui_digest IS NULL)
+            OR (coordinator_mode IN ('onboarding_action', 'onboarding_text')
+                AND response_assistant_ui IS NOT NULL
+                AND response_assistant_ui_digest ~ '^[0-9a-f]{64}$'));
+
+-- 017 predates a coordinator response: it requires a TeacherDecision for all
+-- delivery-pending/delivered jobs.  A unified onboarding turn intentionally
+-- has no fake decision; it has a staged, digest-bound Dialog response instead.
+ALTER TABLE teacher_dialog_job DROP CONSTRAINT teacher_dialog_job_shape_check;
+
+ALTER TABLE teacher_dialog_job
+    ADD CONSTRAINT teacher_dialog_job_shape_check
+        CHECK (
+            (status = 'queued' AND decision_id IS NULL AND response_body IS NULL AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL)
+            OR
+            (status = 'processing' AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL
+                AND ((decision_id IS NULL AND response_body IS NULL)
+                    OR (decision_id IS NOT NULL AND response_body IS NOT NULL)
+                    OR (coordinator_mode <> 'legacy' AND decision_id IS NULL AND response_body IS NOT NULL)))
+            OR
+            (status = 'delivery_pending' AND response_body IS NOT NULL AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL
+                AND ((coordinator_mode = 'legacy' AND decision_id IS NOT NULL)
+                    OR (coordinator_mode <> 'legacy' AND decision_id IS NULL)))
+            OR
+            (status = 'delivered' AND response_body IS NULL AND delivered_message_id IS NOT NULL AND (teacher_turn_schema_version = 1 OR teacher_response_message_id IS NOT NULL) AND delivered_at IS NOT NULL AND error_code IS NULL AND (terminal_outcome IS NULL OR terminal_outcome = 'delivered') AND reconciliation_state IS NULL
+                AND ((coordinator_mode = 'legacy' AND decision_id IS NOT NULL)
+                    OR (coordinator_mode <> 'legacy' AND decision_id IS NULL)))
+            OR
+            (status = 'completed' AND response_body IS NULL AND delivered_message_id IS NULL AND teacher_response_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome = 'failed_no_effect' AND reconciliation_state IS NULL AND no_effect_proof_id IS NOT NULL AND recoverable_outcome_id IS NOT NULL AND error_code IS NOT NULL)
+            OR
+            (status = 'blocked' AND response_body IS NULL AND delivered_at IS NULL AND error_code IS NOT NULL AND terminal_outcome IS NULL
+                AND ((delivered_message_id IS NULL AND teacher_response_message_id IS NULL)
+                    OR (reconciliation_state = 'committed_unreconciled' AND delivered_message_id IS NOT NULL AND teacher_response_message_id = delivered_message_id)))
+        );
+
+-- A normal delivered S5 clarification can still be the result of a durable
+-- Student no-effect proof.  Keep that proof linked to the dense outcome as
+-- well as the cursor; a failed_no_effect outcome uses the same evidence plus
+-- its Teacher-generated recoverable outcome ID.
+ALTER TABLE teacher_dialog_turn_outcome
+    ADD COLUMN no_effect_proof_id UUID,
+    ADD CONSTRAINT teacher_dialog_turn_outcome_proof_fk
+        FOREIGN KEY (no_effect_proof_id) REFERENCES teacher_dialog_turn_proof(no_effect_proof_id) ON DELETE RESTRICT;
+
+CREATE TABLE teacher_onboarding_interaction (
+    interaction_id UUID PRIMARY KEY,
+    dialog_id UUID NOT NULL,
+    student_id UUID NOT NULL,
+    personal_teacher_id UUID NOT NULL,
+    prompt_message_id UUID NOT NULL,
+    prompt_message_version BIGINT NOT NULL CHECK (prompt_message_version > 0),
+    prompt_assistant_ui_digest CHAR(64) NOT NULL CHECK (prompt_assistant_ui_digest ~ '^[0-9a-f]{64}$'),
+    slot_code VARCHAR(64) NOT NULL CHECK (slot_code IN (
+        'direction_code', 'self_assessed_experience', 'known_stacks', 'desired_stacks',
+        'goal_code', 'goal_text', 'preferred_language', 'weekly_minutes', 'preferred_pace'
+    )),
+    expected_draft_version BIGINT NOT NULL CHECK (expected_draft_version >= 0),
+    expected_profile_version BIGINT NOT NULL CHECK (expected_profile_version >= 0),
+    state VARCHAR(16) NOT NULL CHECK (state IN ('active', 'reserved', 'superseded', 'completed')),
+    reserved_teacher_job_id UUID,
+    reserved_action_receipt_id UUID,
+	reservation_mode VARCHAR(32),
+    superseded_by_interaction_id UUID REFERENCES teacher_onboarding_interaction(interaction_id) ON DELETE RESTRICT,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK ((state = 'active' AND reserved_teacher_job_id IS NULL AND reserved_action_receipt_id IS NULL AND reservation_mode IS NULL AND superseded_by_interaction_id IS NULL AND completed_at IS NULL)
+        OR (state = 'reserved' AND reserved_teacher_job_id IS NOT NULL AND reservation_mode IN ('onboarding_action', 'onboarding_text') AND completed_at IS NULL
+            AND ((reservation_mode = 'onboarding_action' AND reserved_action_receipt_id IS NOT NULL) OR (reservation_mode = 'onboarding_text' AND reserved_action_receipt_id IS NULL)))
+        OR (state = 'superseded' AND reserved_teacher_job_id IS NULL AND reserved_action_receipt_id IS NULL AND reservation_mode IS NULL AND superseded_by_interaction_id IS NOT NULL AND completed_at IS NULL)
+        OR (state = 'completed' AND reserved_teacher_job_id IS NOT NULL AND reservation_mode IN ('onboarding_action', 'onboarding_text') AND superseded_by_interaction_id IS NULL AND completed_at IS NOT NULL
+            AND ((reservation_mode = 'onboarding_action' AND reserved_action_receipt_id IS NOT NULL) OR (reservation_mode = 'onboarding_text' AND reserved_action_receipt_id IS NULL))))
+);
+
+ALTER TABLE teacher_onboarding_interaction
+    ADD CONSTRAINT teacher_onboarding_interaction_action_receipt_fk
+        FOREIGN KEY (reserved_action_receipt_id) REFERENCES teacher_onboarding_action_receipt(idempotency_key) ON DELETE RESTRICT,
+    ADD CONSTRAINT teacher_onboarding_interaction_reserved_job_fk
+        FOREIGN KEY (reserved_teacher_job_id) REFERENCES teacher_dialog_job(teacher_job_id) ON DELETE RESTRICT,
+    ADD CONSTRAINT teacher_onboarding_interaction_id_receipt_key UNIQUE (interaction_id, reserved_action_receipt_id);
+
+CREATE UNIQUE INDEX teacher_onboarding_interaction_one_open_dialog
+    ON teacher_onboarding_interaction (dialog_id) WHERE state IN ('active', 'reserved');
+CREATE UNIQUE INDEX teacher_onboarding_interaction_reservation_job
+    ON teacher_onboarding_interaction (reserved_teacher_job_id) WHERE reserved_teacher_job_id IS NOT NULL;
+CREATE UNIQUE INDEX teacher_onboarding_interaction_reservation_receipt
+    ON teacher_onboarding_interaction (reserved_action_receipt_id) WHERE reserved_action_receipt_id IS NOT NULL;
+CREATE UNIQUE INDEX teacher_onboarding_interaction_prompt_version
+    ON teacher_onboarding_interaction (dialog_id, prompt_message_id, prompt_message_version);
+
+CREATE TABLE teacher_onboarding_turn (
+    teacher_job_id UUID PRIMARY KEY,
+    source_event_id UUID NOT NULL UNIQUE,
+    interaction_id UUID REFERENCES teacher_onboarding_interaction(interaction_id) ON DELETE RESTRICT,
+    coordinator_mode VARCHAR(32) NOT NULL CHECK (coordinator_mode IN ('onboarding_action', 'onboarding_text')),
+    stage VARCHAR(32) NOT NULL CHECK (stage IN ('received', 'interaction_reserved', 'ai_staged', 'student_staged', 'response_staged', 'delivery_pending', 'delivered', 'failed_no_effect', 'blocked_unknown')),
+    action_receipt_id UUID,
+    causal_ai_execution_id UUID,
+    fallback_ai_execution_id UUID,
+    student_command_id UUID NOT NULL,
+    response_command_id UUID NOT NULL,
+    student_effect_state VARCHAR(32) NOT NULL DEFAULT 'not_attempted' CHECK (student_effect_state IN ('not_attempted', 'accepted', 'no_effect', 'unknown_effect', 'committed_unreconciled')),
+    no_effect_proof_id UUID,
+    recoverable_outcome_id UUID,
+    response_assistant_ui_digest CHAR(64),
+    semantic_decision JSONB,
+    semantic_decision_digest CHAR(64),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK ((coordinator_mode = 'onboarding_action') = (action_receipt_id IS NOT NULL)
+        AND (coordinator_mode <> 'onboarding_action' OR interaction_id IS NOT NULL)),
+    CHECK (NOT (causal_ai_execution_id IS NOT NULL AND fallback_ai_execution_id IS NOT NULL)),
+    CHECK ((student_effect_state = 'no_effect') = (no_effect_proof_id IS NOT NULL)),
+    CHECK ((stage = 'failed_no_effect') = (student_effect_state = 'no_effect' AND recoverable_outcome_id IS NOT NULL)),
+    CHECK ((stage <> 'failed_no_effect') OR recoverable_outcome_id IS NOT NULL),
+    CHECK ((stage = 'failed_no_effect') OR recoverable_outcome_id IS NULL),
+    -- A turn begins received/not_attempted. Delivered is constrained one-way;
+    -- it must never turn that valid initial state into an impossible row.
+    CHECK ((stage <> 'delivered') OR (student_effect_state IN ('not_attempted', 'accepted', 'no_effect'))),
+    CHECK ((response_assistant_ui_digest IS NULL) OR response_assistant_ui_digest ~ '^[0-9a-f]{64}$'),
+    CHECK ((semantic_decision IS NULL AND semantic_decision_digest IS NULL)
+        OR (coordinator_mode = 'onboarding_text'
+            AND semantic_decision IS NOT NULL
+            AND semantic_decision_digest ~ '^[0-9a-f]{64}$'
+            AND semantic_decision ? 'kind'
+            AND NOT semantic_decision ? 'result')),
+    CONSTRAINT teacher_onboarding_turn_job_event_fk
+        FOREIGN KEY (teacher_job_id, source_event_id) REFERENCES teacher_dialog_job(teacher_job_id, event_id) ON DELETE RESTRICT,
+    CONSTRAINT teacher_onboarding_turn_interaction_receipt_fk
+        FOREIGN KEY (interaction_id, action_receipt_id) REFERENCES teacher_onboarding_interaction(interaction_id, reserved_action_receipt_id) ON DELETE RESTRICT
+);
+
+CREATE UNIQUE INDEX teacher_onboarding_turn_student_command_key
+    ON teacher_onboarding_turn (student_command_id);
+CREATE UNIQUE INDEX teacher_onboarding_turn_response_command_key
+    ON teacher_onboarding_turn (response_command_id);
+CREATE UNIQUE INDEX teacher_onboarding_turn_action_receipt_key
+    ON teacher_onboarding_turn (action_receipt_id) WHERE action_receipt_id IS NOT NULL;
+CREATE UNIQUE INDEX teacher_onboarding_turn_causal_ai_execution_key
+    ON teacher_onboarding_turn (causal_ai_execution_id) WHERE causal_ai_execution_id IS NOT NULL;
+CREATE UNIQUE INDEX teacher_onboarding_turn_fallback_ai_execution_key
+    ON teacher_onboarding_turn (fallback_ai_execution_id) WHERE fallback_ai_execution_id IS NOT NULL;
+
+CREATE INDEX teacher_onboarding_turn_stage_idx
+    ON teacher_onboarding_turn (stage, updated_at);

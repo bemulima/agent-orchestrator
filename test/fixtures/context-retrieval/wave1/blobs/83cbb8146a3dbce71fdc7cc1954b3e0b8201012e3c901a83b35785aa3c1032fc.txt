@@ -1,0 +1,392 @@
+package postgres
+
+import (
+	"context"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ContentAccessRepoPG resolves effective public access through the authored
+// Course hierarchy and semantic relations.
+type ContentAccessRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+const visibleCourseLessonSQL = `
+SELECT 1
+FROM course c
+JOIN course_module cm ON cm.course_id=c.id AND cm.status=1
+JOIN module m ON m.id=cm.module_id AND m.status=1
+JOIN module_section ms ON ms.module_id=m.id AND ms.status=1
+JOIN section s ON s.id=ms.section_id AND s.status=1
+JOIN section_lesson sl ON sl.section_id=s.id AND sl.status=1
+JOIN lesson l ON l.id=sl.lesson_id AND l.status=1
+WHERE c.status=2 AND c.catalog_visible=true`
+
+const activeCourseLessonSQL = `
+SELECT 1
+FROM course c
+JOIN course_module cm ON cm.course_id=c.id AND cm.status=1
+JOIN module m ON m.id=cm.module_id AND m.status=1
+JOIN module_section ms ON ms.module_id=m.id AND ms.status=1
+JOIN section s ON s.id=ms.section_id AND s.status=1
+JOIN section_lesson sl ON sl.section_id=s.id AND sl.status=1
+JOIN lesson l ON l.id=sl.lesson_id AND l.status=1
+WHERE c.status=2`
+
+func (r ContentAccessRepoPG) CanViewCourse(ctx context.Context, courseID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(SELECT 1 FROM course WHERE id=$1 AND status=2 AND catalog_visible=true)`, courseID)
+}
+
+func (r ContentAccessRepoPG) CanViewModule(ctx context.Context, moduleID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1 FROM module m
+WHERE m.id=$1 AND m.status=1 AND (
+    m.visibility IN (2,3) OR EXISTS (
+        SELECT 1 FROM course_module cm
+        JOIN course c ON c.id=cm.course_id
+        WHERE cm.module_id=m.id AND cm.status=1 AND c.status=2 AND c.catalog_visible=true
+    )
+))`, moduleID)
+}
+
+func (r ContentAccessRepoPG) CanViewSection(ctx context.Context, sectionID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1
+FROM section s
+JOIN module_section ms ON ms.section_id=s.id AND ms.status=1
+JOIN module m ON m.id=ms.module_id AND m.status=1
+WHERE s.id=$1 AND s.status=1 AND (
+    m.visibility IN (2,3) OR EXISTS (
+        SELECT 1 FROM course_module cm
+        JOIN course c ON c.id=cm.course_id
+        WHERE cm.module_id=m.id AND cm.status=1 AND c.status=2 AND c.catalog_visible=true
+    )
+))`, sectionID)
+}
+
+func (r ContentAccessRepoPG) CanViewLesson(ctx context.Context, lessonID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS((`+visibleCourseLessonSQL+` AND l.id=$1) UNION ALL (
+SELECT 1
+FROM module m
+JOIN module_section ms ON ms.module_id=m.id AND ms.status=1
+JOIN section s ON s.id=ms.section_id AND s.status=1
+JOIN section_lesson sl ON sl.section_id=s.id AND sl.status=1
+JOIN lesson l ON l.id=sl.lesson_id AND l.status=1
+WHERE m.status=1 AND m.visibility IN (2,3) AND l.id=$1
+))`, lessonID)
+}
+
+func (r ContentAccessRepoPG) CanViewTask(ctx context.Context, taskID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1 FROM task t
+WHERE t.id=$1 AND t.status=1 AND EXISTS((`+visibleCourseLessonSQL+` AND l.id=t.lesson_id) UNION ALL (
+    SELECT 1
+    FROM module m
+    JOIN module_section ms ON ms.module_id=m.id AND ms.status=1
+    JOIN section s ON s.id=ms.section_id AND s.status=1
+    JOIN section_lesson sl ON sl.section_id=s.id AND sl.status=1
+    JOIN lesson l ON l.id=sl.lesson_id AND l.status=1
+    WHERE m.status=1 AND m.visibility IN (2,3) AND l.id=t.lesson_id
+)))`, taskID)
+}
+
+func (r ContentAccessRepoPG) CanViewExample(ctx context.Context, exampleID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1 FROM lesson_example e
+WHERE e.id=$1 AND e.status=1 AND EXISTS((`+visibleCourseLessonSQL+` AND l.id=e.lesson_id) UNION ALL (
+    SELECT 1
+    FROM module m
+    JOIN module_section ms ON ms.module_id=m.id AND ms.status=1
+    JOIN section s ON s.id=ms.section_id AND s.status=1
+    JOIN section_lesson sl ON sl.section_id=s.id AND sl.status=1
+    JOIN lesson l ON l.id=sl.lesson_id AND l.status=1
+    WHERE m.status=1 AND m.visibility IN (2,3) AND l.id=e.lesson_id
+)))`, exampleID)
+}
+
+func (r ContentAccessRepoPG) CanViewLessonViaRelation(ctx context.Context, lessonID string, relationID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1 FROM lesson_relation lr
+WHERE lr.id=$2 AND lr.target_lesson_id=$1
+  AND EXISTS(`+visibleCourseLessonSQL+` AND l.id=lr.source_lesson_id)
+  AND EXISTS(`+activeCourseLessonSQL+` AND l.id=lr.target_lesson_id)
+)`, lessonID, relationID)
+}
+
+func (r ContentAccessRepoPG) CanViewTaskViaRelation(ctx context.Context, taskID string, relationID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS(
+SELECT 1
+FROM task t
+JOIN lesson_relation lr ON lr.target_lesson_id=t.lesson_id
+WHERE t.id=$1 AND t.status=1 AND lr.id=$2
+  AND EXISTS(`+visibleCourseLessonSQL+` AND l.id=lr.source_lesson_id)
+  AND EXISTS(`+activeCourseLessonSQL+` AND l.id=lr.target_lesson_id)
+)`, taskID, relationID)
+}
+
+func (r ContentAccessRepoPG) CanViewExampleViaRelation(ctx context.Context, exampleID string, relationID string) (bool, error) {
+	return r.exists(ctx, `SELECT EXISTS((
+SELECT 1
+FROM lesson_example e
+JOIN lesson_relation lr ON lr.target_lesson_id=e.lesson_id
+WHERE e.id=$1 AND e.status=1 AND lr.id=$2
+  AND EXISTS(`+visibleCourseLessonSQL+` AND l.id=lr.source_lesson_id)
+  AND EXISTS(`+activeCourseLessonSQL+` AND l.id=lr.target_lesson_id)
+) UNION ALL (
+SELECT 1
+FROM lesson_example_relation er
+JOIN lesson_example source_example ON source_example.id=er.source_example_id AND source_example.status=1
+JOIN lesson_example target_example ON target_example.id=er.target_example_id AND target_example.status=1
+WHERE target_example.id=$1 AND er.id=$2
+  AND EXISTS(`+visibleCourseLessonSQL+` AND l.id=source_example.lesson_id)
+  AND EXISTS(`+activeCourseLessonSQL+` AND l.id=target_example.lesson_id)
+))`, exampleID, relationID)
+}
+
+// ResolveLessonReadAccess returns the most permissive effective policy among
+// the active placements through which each reusable lesson can be reached.
+// Within each placement, the nearest explicit hierarchy value wins.
+func (r ContentAccessRepoPG) ResolveLessonReadAccess(ctx context.Context, lessonIDs []string, includeHiddenCourses bool) (map[string]domain.LessonReadAccessResolution, error) {
+	result := make(map[string]domain.LessonReadAccessResolution, len(lessonIDs))
+	if len(lessonIDs) == 0 {
+		return result, nil
+	}
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, lessonReadAccessSQL, lessonIDs, includeHiddenCourses)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var lessonID string
+		var resolution domain.LessonReadAccessResolution
+		if err := rows.Scan(&lessonID, &resolution.Effective, &resolution.SourceType, &resolution.SourceID); err != nil {
+			return nil, err
+		}
+		result[lessonID] = resolution
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ResolveCourseLessonReadAccess returns the most permissive policy among the
+// active catalog placements of one requested visible course.
+func (r ContentAccessRepoPG) ResolveCourseLessonReadAccess(ctx context.Context, courseID string, lessonIDs []string) (map[string]domain.LessonReadAccessResolution, error) {
+	result := make(map[string]domain.LessonReadAccessResolution, len(lessonIDs))
+	if len(lessonIDs) == 0 {
+		return result, nil
+	}
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, courseLessonReadAccessSQL, lessonIDs, courseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var lessonID string
+		var resolution domain.LessonReadAccessResolution
+		if err := rows.Scan(&lessonID, &resolution.Effective, &resolution.SourceType, &resolution.SourceID); err != nil {
+			return nil, err
+		}
+		result[lessonID] = resolution
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+const courseLessonReadAccessSQL = `
+WITH placements AS (
+    SELECT
+        l.id AS lesson_id,
+        COALESCE(
+            l.lesson_read_access,
+            s.lesson_read_access,
+            m.lesson_read_access,
+            c.lesson_read_access,
+            cg.lesson_read_access,
+            cl.lesson_read_access,
+            tr.lesson_read_access,
+            'student'
+        ) AS effective_access,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN 'lesson'
+            WHEN s.lesson_read_access IS NOT NULL THEN 'section'
+            WHEN m.lesson_read_access IS NOT NULL THEN 'module'
+            WHEN c.lesson_read_access IS NOT NULL THEN 'course'
+            WHEN cg.lesson_read_access IS NOT NULL THEN 'course_group'
+            WHEN cl.lesson_read_access IS NOT NULL THEN 'level'
+            WHEN tr.lesson_read_access IS NOT NULL THEN 'track'
+            ELSE 'default'
+        END AS source_type,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN l.id::text
+            WHEN s.lesson_read_access IS NOT NULL THEN s.id::text
+            WHEN m.lesson_read_access IS NOT NULL THEN m.id::text
+            WHEN c.lesson_read_access IS NOT NULL THEN c.id::text
+            WHEN cg.lesson_read_access IS NOT NULL THEN cg.id::text
+            WHEN cl.lesson_read_access IS NOT NULL THEN cl.id::text
+            WHEN tr.lesson_read_access IS NOT NULL THEN tr.id::text
+            ELSE ''
+        END AS source_id
+    FROM lesson l
+    JOIN section_lesson sl ON sl.lesson_id=l.id AND sl.status=1
+    JOIN section s ON s.id=sl.section_id AND s.status=1
+    JOIN module_section ms ON ms.section_id=s.id AND ms.status=1
+    JOIN module m ON m.id=ms.module_id AND m.status=1
+    JOIN course_module cm ON cm.module_id=m.id AND cm.status=1
+    JOIN course c ON c.id=cm.course_id AND c.status=2 AND c.catalog_visible=TRUE
+    LEFT JOIN course_group_course cgc ON cgc.course_id=c.id AND cgc.status=1
+    LEFT JOIN course_group cg ON cg.id=cgc.group_id AND cg.status=1
+    LEFT JOIN level_course_group lcg ON lcg.group_id=cg.id AND lcg.status=1
+    LEFT JOIN course_level cl ON cl.id=lcg.level_id AND cl.status=1
+    LEFT JOIN track_level tl ON tl.level_id=cl.id AND tl.status=1
+    LEFT JOIN track tr ON tr.id=tl.track_id AND tr.status=1
+    WHERE l.id=ANY($1::uuid[])
+      AND l.status=1
+      AND c.id=$2
+), ranked AS (
+    SELECT
+        lesson_id,
+        effective_access,
+        source_type,
+        source_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY lesson_id
+            ORDER BY CASE effective_access
+                WHEN 'guest' THEN 0
+                WHEN 'student' THEN 1
+                WHEN 'student_pro' THEN 2
+                ELSE 3
+            END,
+            source_type,
+            source_id
+        ) AS rank
+    FROM placements
+)
+SELECT lesson_id, effective_access, source_type, source_id
+FROM ranked
+WHERE rank=1
+`
+
+const lessonReadAccessSQL = `
+WITH placements AS (
+    SELECT
+        l.id AS lesson_id,
+        COALESCE(
+            l.lesson_read_access,
+            s.lesson_read_access,
+            m.lesson_read_access,
+            c.lesson_read_access,
+            cg.lesson_read_access,
+            cl.lesson_read_access,
+            tr.lesson_read_access,
+            'student'
+        ) AS effective_access,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN 'lesson'
+            WHEN s.lesson_read_access IS NOT NULL THEN 'section'
+            WHEN m.lesson_read_access IS NOT NULL THEN 'module'
+            WHEN c.lesson_read_access IS NOT NULL THEN 'course'
+            WHEN cg.lesson_read_access IS NOT NULL THEN 'course_group'
+            WHEN cl.lesson_read_access IS NOT NULL THEN 'level'
+            WHEN tr.lesson_read_access IS NOT NULL THEN 'track'
+            ELSE 'default'
+        END AS source_type,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN l.id::text
+            WHEN s.lesson_read_access IS NOT NULL THEN s.id::text
+            WHEN m.lesson_read_access IS NOT NULL THEN m.id::text
+            WHEN c.lesson_read_access IS NOT NULL THEN c.id::text
+            WHEN cg.lesson_read_access IS NOT NULL THEN cg.id::text
+            WHEN cl.lesson_read_access IS NOT NULL THEN cl.id::text
+            WHEN tr.lesson_read_access IS NOT NULL THEN tr.id::text
+            ELSE ''
+        END AS source_id
+    FROM lesson l
+    JOIN section_lesson sl ON sl.lesson_id=l.id AND sl.status=1
+    JOIN section s ON s.id=sl.section_id AND s.status=1
+    JOIN module_section ms ON ms.section_id=s.id AND ms.status=1
+    JOIN module m ON m.id=ms.module_id AND m.status=1
+    JOIN course_module cm ON cm.module_id=m.id AND cm.status=1
+    JOIN course c ON c.id=cm.course_id AND c.status=2
+    LEFT JOIN course_group_course cgc ON cgc.course_id=c.id AND cgc.status=1
+    LEFT JOIN course_group cg ON cg.id=cgc.group_id AND cg.status=1
+    LEFT JOIN level_course_group lcg ON lcg.group_id=cg.id AND lcg.status=1
+    LEFT JOIN course_level cl ON cl.id=lcg.level_id AND cl.status=1
+    LEFT JOIN track_level tl ON tl.level_id=cl.id AND tl.status=1
+    LEFT JOIN track tr ON tr.id=tl.track_id AND tr.status=1
+    WHERE l.id=ANY($1::uuid[])
+      AND l.status=1
+      AND ($2 OR c.catalog_visible=TRUE)
+
+    UNION ALL
+
+    SELECT
+        l.id AS lesson_id,
+        COALESCE(l.lesson_read_access, s.lesson_read_access, m.lesson_read_access, 'student') AS effective_access,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN 'lesson'
+            WHEN s.lesson_read_access IS NOT NULL THEN 'section'
+            WHEN m.lesson_read_access IS NOT NULL THEN 'module'
+            ELSE 'default'
+        END AS source_type,
+        CASE
+            WHEN l.lesson_read_access IS NOT NULL THEN l.id::text
+            WHEN s.lesson_read_access IS NOT NULL THEN s.id::text
+            WHEN m.lesson_read_access IS NOT NULL THEN m.id::text
+            ELSE ''
+        END AS source_id
+    FROM lesson l
+    JOIN section_lesson sl ON sl.lesson_id=l.id AND sl.status=1
+    JOIN section s ON s.id=sl.section_id AND s.status=1
+    JOIN module_section ms ON ms.section_id=s.id AND ms.status=1
+    JOIN module m ON m.id=ms.module_id AND m.status=1 AND m.visibility IN (2,3)
+    WHERE l.id=ANY($1::uuid[])
+      AND l.status=1
+), ranked AS (
+    SELECT
+        lesson_id,
+        effective_access,
+        source_type,
+        source_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY lesson_id
+            ORDER BY CASE effective_access
+                WHEN 'guest' THEN 0
+                WHEN 'student' THEN 1
+                WHEN 'student_pro' THEN 2
+                ELSE 3
+            END,
+            source_type,
+            source_id
+        ) AS rank
+    FROM placements
+)
+SELECT lesson_id, effective_access, source_type, source_id
+FROM ranked
+WHERE rank=1
+`
+
+func (r ContentAccessRepoPG) exists(ctx context.Context, query string, args ...any) (bool, error) {
+	runner := getRunner(ctx, r.Pool)
+	var allowed bool
+	if err := runner.QueryRow(ctx, query, args...).Scan(&allowed); err != nil {
+		return false, err
+	}
+	return allowed, nil
+}
+
+var _ repository.ContentAccessRepository = (*ContentAccessRepoPG)(nil)
+var _ repository.LessonReadAccessRepository = (*ContentAccessRepoPG)(nil)
+var _ repository.CourseLessonReadAccessRepository = (*ContentAccessRepoPG)(nil)

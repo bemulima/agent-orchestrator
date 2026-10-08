@@ -1,0 +1,264 @@
+# HTTP contract
+
+## Trusted actor boundary
+
+The student and admin contours trust `X-User-ID` and `X-User-Role` only from the upstream gateway. Direct exposure permits spoofing and is unsupported.
+
+Allowed roles:
+
+- student API: `STUDENT`, `STUDENT_PRO`;
+- admin API: `ADMIN`, `MODERATOR`.
+
+Route registration follows the `ms-go-course` contour pattern: `api/v1` and `admin/v1` routers register endpoints with explicit per-route role middleware, while the root router composes gateway-header authentication and mounts each contour. Private routes are unversioned under `/internal` and own their shared-token middleware. Contours cannot reuse or convert one another's handlers.
+
+## Student API
+
+### `GET /api/v1/teacher/me`
+
+Creates the logical teacher idempotently when absent and returns it.
+
+### `PATCH /api/v1/teacher/me`
+
+Accepts one JSON object with required `expected_version` and optional settings:
+
+```json
+{
+  "expected_version": 1,
+  "language": "ru",
+  "communication_style": "adaptive",
+  "pedagogy_profile": "adaptive",
+  "hint_policy": "progressive",
+  "intervention_mode": "balanced"
+}
+```
+
+Unknown fields and bodies larger than 16 KiB are rejected. A stale version returns `409 Conflict`.
+
+### `GET /api/v1/teacher/me/soul`
+
+Creates the PersonalTeacher aggregate idempotently when absent and returns the
+separately stored soul bound to the authenticated student. It exposes bounded
+identity and communication fields only, never Student Model or dialog memory.
+
+### `PATCH /api/v1/teacher/me/soul`
+
+Accepts required `expected_version` plus optional `display_name`, `persona_code`,
+`voice_style`, `relationship_style`, and `encouragement_style`. Soul versioning
+is independent from `/teacher/me`; changing one student never changes another
+student's teacher.
+
+### `PUT /api/v1/teacher-dialog/ensure`
+
+Ensures one Dialog-owned teacher conversation for the authenticated student,
+their canonical PersonalTeacher, and an exact educational context. The body is
+strict and limited to 16 KiB:
+
+```json
+{
+  "context_type": "lesson",
+  "context_id": "00000000-0000-4000-8000-000000000001"
+}
+```
+
+`context_type` is one of `general`, `lesson`, `lesson_task`, `practice_task`, or
+`project`. `general` forbids `context_id`; all other types require a UUID. The
+response is `201 Created` only when Dialog created the binding and `200 OK` on
+an idempotent replay. Student and teacher identities are never accepted from
+the request body.
+
+### `POST /api/v1/teacher/me/learning-path/plan`
+
+The diagnostic alternative accepts exactly `{"diagnostic_plan_id":"<UUID>"}`
+and requires `Idempotency-Key` equal to that plan ID. It rejects all additional
+keys, including empty legacy fields. Teacher ensures the persisted Placement,
+reads Planner's durable planning-state, and derives the goal and context from
+owner projections. The stable intent is `INITIAL`, with desired outcome
+`Build my initial learning path after diagnostic` and no mutable preference
+constraints. Only this explicit action submits planning. Existing accepted jobs
+are returned before checking changed profile preferences; exhausted jobs may be
+retried using the same request identity. The response is HTTP 200 with
+`teacher-diagnostic-placement-state.v1`, described below. The legacy request
+and HTTP 202 response remain supported.
+
+### `POST /api/v1/teacher/me/diagnostic-assessments/complete`
+
+Accepts exactly `{"plan_id":"<UUID>"}` (1 KiB limit) from `STUDENT` or
+`STUDENT_PRO`; student identity comes exclusively from gateway actor context.
+Student's assessment completion must have committed first. Teacher calls
+Planner's existing Placement command with `diagnostic-placement-consume.v1`
+and the plan ID as its idempotency key, then reads
+`GET /internal/students/{studentID}/diagnostic-assessment-plans/{planID}/planning-state`.
+This route never submits or retries planning, writes Student state, creates a
+conversation, or calls a model. Repeating it after reload recovers persisted
+Placement and the existing job without browser-local workflow state.
+
+Both diagnostic responses are no-store and contain `schema`, `plan_id`,
+`status`, `goal_code`, bounded `placement` (`band`, `route_code`,
+`route_policy_version`, `decision_digest`), and optional `planner_request_id`,
+`learning_path_id`, `failure_code`, `planning_retryable`. Status is one of
+`READY_FOR_PLANNING`, `PLANNING_PENDING`, `LEARNING_PATH_ACTIVE`,
+`PLANNING_FAILED`, `DIAGNOSTIC_CONTEXT_STALE`, `NO_GAP`.
+`planning_retryable=true` is emitted only for `ATTEMPTS_EXHAUSTED`; the frontend
+must not infer retryability from presentation text. Active-path status requires
+the exact path ID to be confirmed through Student's authoritative learner
+overview with `status=ACTIVE`. Teacher accepts `is_primary` and `is_selected`
+as owner fields, but the overview does not resolve selection context; neither
+field is inferred or mutated. A completed job whose exact path is absent or
+not ACTIVE in the overview fails closed with 503. Historical path selection
+and lifecycle are outside this initial-flow contract.
+Without an accepted job, the current Student goal, onboarding version, and
+direction must match the diagnostic binding or the response is stale without
+submitting planning. Invalid owner context returns 422, idempotency conflict
+409, and unavailable or malformed owner projections 503.
+
+### Legacy learning intent
+
+Recognizes a desired learning outcome and asynchronously delegates planning to
+Learning Planner. `Idempotency-Key` is a required UUID. The strict body contains
+`goal_code`, `desired_outcome`, optional `requested_targets`, bounded
+`constraints`, and optional `reason` (`INITIAL` by
+default or `REPLAN`). Teacher derives `student_id` from trusted gateway headers,
+ensures that student's PersonalTeacher, and forwards no caller-supplied audit,
+mastery, or path state. Dialog/message audit references are added only by
+Teacher-owned internal orchestration.
+The response is `202 Accepted` with `request_id`, `goal_code`, current planning
+`status`, optional `result_code`/`course_id`, and `reused`.
+
+Learning Planner later generates or reuses canonical Course content, assigns it
+through Student, and replaces the Student-owned Learning Path. Teacher receives
+terminal outcomes asynchronously and, when a Dialog audit reference exists,
+posts one idempotent success/failure notification to that Dialog. Invalid intent
+returns `422`; an idempotency conflict returns `409`; an unavailable Learning
+Planner returns `503`.
+
+### `POST /api/v1/teacher/me/learning-sessions/{sessionID}/summarize`
+
+Summarizes one ended Student-owned session linked to Statistic telemetry. The
+response contains bounded analytics counters, a deterministic summary, a
+reason code, a next step, and the committed general-Dialog message identity.
+The route never treats activity counters as mastery evidence. Dialog delivery
+uses the learning-session UUID as its idempotency key; Student metric
+projection uses the session's optimistic version, so a retry repairs partial
+completion without duplicating the teacher message.
+
+For a course-linked session, the same orchestration submits an asynchronous
+`REPLAN` intent using the current Student-owned learner overview. The response
+contains `planning_request_id`; it does not synchronously return or mutate a
+Learning Path.
+
+### `POST /api/v1/teacher/me/channels/telegram/link-code`
+
+Ensures the authenticated student's PersonalTeacher and general Dialog, then
+returns a high-entropy one-time code, `https://t.me/...` deep link, and expiry.
+Only the SHA-256 digest is persisted. The route is present only when all
+Telegram configuration is supplied.
+
+### `GET /api/v1/teacher/me/next-action`
+
+Returns Student's strict `student-next-action.v1` / `student-next-action-policy.v1`
+projection unchanged for the authenticated `STUDENT` or `STUDENT_PRO`. Query
+parameters are forbidden. `TEACHER_NEXT_BEST_ACTION_ENABLED=false` disables the
+HTTP surface with 404 and no owner read. All responses use `Cache-Control: no-store`.
+
+Teacher makes exactly one dedicated-token `GET
+/internal/students/{student_id}/next-action`. JSON is capped at 64 KiB, rejects
+unknown fields and additional values, and must match the published schema/policy.
+Unavailable or malformed owner state returns 503 `nba_state_unavailable` without
+workspace or model fallback. READY has one primary `{kind,target}`; WAITING,
+PLANNING_REQUIRED, and NO_PROGRESSION omit primary. `secondary_actions` is an
+array of permitted choices, never additional primary recommendations. Reason
+and `{context_version,path_version,runtime_version?,state_digest}` are Student
+facts. Targets contain only bounded path, Course, item, lesson, requirement,
+task/answer, practice revision/instance, step/milestone and submission identities;
+no workspace capability, model metadata, or Student identity is exposed.
+
+This paired contract replaces the historical four-kind `teacher-next-action.v1`
+consumer. It is a read only projection; selecting a displayed action requires a
+separate owner command that revalidates current state.
+
+### Conversational onboarding
+
+`POST /api/v1/teacher/me/onboarding/ensure` accepts only
+`{"schema":"teacher-onboarding-ensure.v1"}` (1 KiB cap). It ensures the
+authenticated student's canonical PersonalTeacher and general Dialog, reads
+Student's authoritative draft state, and idempotently appends the current
+deterministic `assistant-ui.v1` prompt with a mandatory body fallback.
+
+After the S11 cutover, a request with no persisted onboarding evidence requires
+the complete dense/canonical/unified/product/handoff capability chain and is
+admitted only as `teacher-onboarding-session.v3`. An incomplete chain returns
+`503` before downstream calls. Exact sessions admitted earlier remain readable
+as v1, v2, or v3 from their immutable interaction/handoff evidence regardless
+of current flags; live flags never reinterpret them. Its v3 statuses are `COLLECTING`,
+`HANDOFF_PENDING`, `PLANNER_HANDOFF_ACCEPTED`, and `ACTIVE_PATH_EXISTS`.
+Pending exposes only the safe display name and `content_status=NOT_CREATED`;
+accepted additionally exposes `execution_status=NOT_STARTED`. The browser
+receives no handoff, graph, course, path, or lesson identity. See
+[Durable onboarding Planner handoff S8](durable-onboarding-handoff.md).
+If retained terminal history is null, partial, or ambiguous and cannot be
+reconstructed from one exact immutable projection, the response is HTTP `409`
+with exactly `{"error":"historical_session_unavailable"}`. It is
+non-retryable, has no `Retry-After`, and causes no downstream mutation.
+When the S9 outcome consumer is enabled, v3 may additionally contain a strict
+`path_outcome` marker only after the outcome's personal-teacher Dialog message
+has been durably acknowledged. The marker is exactly `kind`, `status`, and
+`dialog_message_id`; it contains no handoff, execution, course, path, lesson,
+or graph identity. The frontend must match that message ID against a REST
+Dialog reconciliation before loading Student/Course owner projections.
+
+`POST /api/v1/teacher/me/assistant-ui/actions` accepts one strict 4 KiB
+`assistant-ui-action.v1` containing only Dialog/message/version, block/action,
+and UUID idempotency identities. Labels, values, answers, student identity, and
+caller-supplied meaning are rejected. In canonical mode the actual response is
+the strict `assistant-ui-action-result.v2` object: `schema`, `mode=canonical`,
+`materialized=true`, `replayed`, and `canonical_student_message_id`. An exact
+terminal legacy result may still be replayed from its immutable receipt, but
+S11 never creates a new legacy action receipt.
+The v2 action result proves only canonical Student-message materialization;
+product readiness remains pending on the ordinary dense Teacher turn.
+The frontend must reuse one idempotency key for one intent; stale/concurrent
+actions are `409`, dependency failures are `503`, and responses are no-store.
+
+## Admin API
+
+`GET /admin/v1/personal-teachers/{studentID}` returns an existing teacher and never creates one.
+
+`GET /admin/v1/personal-teachers/{studentID}/soul` returns the existing bounded
+soul and never creates one.
+
+## Private API
+
+`GET /internal/healthz` reports liveness. `GET /internal/readyz` checks
+PostgreSQL and the migration-017 dense-turn schema. When ready it returns the
+bounded `teacher_dialog_v2_reader`, `teacher_dialog_dense_claiming`, and rollout
+sequence capabilities. Both routes require an exact `X-Internal-Token`; the
+contour is disabled when that token is empty.
+
+Readiness also checks whether accepted schema-v2 Teacher dialog work can
+drain under the configured consumer flag. With dense claiming disabled,
+`queued`, `processing`, `delivery_pending`, and unresolved `blocked` V2 jobs
+return HTTP 503 with exactly
+`{"status":"not ready","error_code":"dense_teacher_ordering_disabled_with_pending_v2"}`.
+The check is read-only. Enabled dense claiming or only terminal V2 history
+does not trigger this diagnostic; schema-v1 work remains claimable. Other
+readiness failures retain `{"status":"not ready"}` without raw dependency
+errors or private data. Missing, wrong, or non-exact internal tokens retain
+HTTP 403, and an empty configured token leaves the contour disabled.
+
+Practice task and project context is read from Practice Runtime using
+`PRACTICE_SERVICE_BASE_URL` (`http://localhost:8080` locally and
+`http://ms-go-practice-runtime:8080` in Compose by default). The dedicated
+`PRACTICE_SERVICE_INTERNAL_TOKEN` is used only for the existing Teacher
+context, validation-explanation, and assistance routes. Teacher does not call
+the catalog's private evaluation API or Practice Runtime Submit, retry, review,
+completion, or evidence commands.
+
+## Telegram provider contour
+
+`POST /integrations/telegram/webhook` requires the exact
+`X-Telegram-Bot-Api-Secret-Token`; gateway actor headers have no meaning on this
+contour. `/start <code>` atomically binds one private Telegram account/chat to
+the exact student, PersonalTeacher, and general Dialog. Other private plain-text
+updates are appended through Dialog's internal channel command with a
+deterministic UUID derived from Telegram `update_id`. Unsupported update kinds
+are acknowledged without creating learning state.

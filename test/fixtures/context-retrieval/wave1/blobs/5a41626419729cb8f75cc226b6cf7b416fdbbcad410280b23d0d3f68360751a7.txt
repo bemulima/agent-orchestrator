@@ -1,0 +1,102 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const FreshMigrationResultSchema = "course-migration-result.v1"
+
+var (
+	ErrMigrationTargetNotEmpty = errors.New("migration target is not empty")
+	ErrMigrationFailed         = errors.New("migration failed")
+)
+
+// FreshMigrationResult is safe to persist in verification evidence. It never
+// contains a connection string, database name, SQL text, or driver error.
+type FreshMigrationResult struct {
+	Schema          string `json:"schema"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	MigrationCount  int    `json:"migration_count"`
+	FailedMigration string `json:"failed_migration,omitempty"`
+}
+
+type freshMigrationRunner interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+// RunFreshMigrations applies each forward SQL migration in lexical filename
+// order to an empty public schema. It intentionally does not run seed files,
+// tolerate SQL errors, or infer an already-applied migration set.
+func RunFreshMigrations(ctx context.Context, runner freshMigrationRunner, migrationFS fs.FS) (FreshMigrationResult, error) {
+	result := FreshMigrationResult{Schema: FreshMigrationResultSchema, Status: "failed"}
+	if runner == nil || migrationFS == nil {
+		result.Reason = "invalid_configuration"
+		return result, errors.New("migration dependencies are incomplete")
+	}
+
+	var tables int
+	if err := runner.QueryRow(ctx, `SELECT count(*) FROM pg_tables WHERE schemaname = 'public'`).Scan(&tables); err != nil {
+		result.Reason = "database_unavailable"
+		return result, fmt.Errorf("inspect fresh migration target: %w", err)
+	}
+	if tables != 0 {
+		result.Reason = "target_not_empty"
+		return result, ErrMigrationTargetNotEmpty
+	}
+
+	migrations, err := orderedForwardMigrations(migrationFS)
+	if err != nil {
+		result.Reason = "migration_directory_invalid"
+		return result, err
+	}
+	for _, migration := range migrations {
+		contents, err := fs.ReadFile(migrationFS, migration)
+		if err != nil {
+			result.Reason = "migration_directory_invalid"
+			result.FailedMigration = filepath.Base(migration)
+			return result, fmt.Errorf("read migration %s: %w", filepath.Base(migration), err)
+		}
+		if _, err := runner.Exec(ctx, string(contents)); err != nil {
+			result.Reason = "migration_failed"
+			result.FailedMigration = filepath.Base(migration)
+			return result, fmt.Errorf("%w: %s", ErrMigrationFailed, filepath.Base(migration))
+		}
+		result.MigrationCount++
+	}
+	result.Status = "applied"
+	return result, nil
+}
+
+func orderedForwardMigrations(migrationFS fs.FS) ([]string, error) {
+	entries, err := fs.ReadDir(migrationFS, ".")
+	if err != nil {
+		return nil, fmt.Errorf("read migrations directory: %w", err)
+	}
+	migrations := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".sql") || strings.HasSuffix(name, ".down.sql") {
+			continue
+		}
+		migrations = append(migrations, name)
+	}
+	sort.Strings(migrations)
+	if len(migrations) == 0 {
+		return nil, errors.New("no forward migrations found")
+	}
+	return migrations, nil
+}

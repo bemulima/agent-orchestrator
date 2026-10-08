@@ -1,0 +1,422 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/labstack/echo/v4"
+
+	"github.com/example/ms-go-statistic/internal/usecase"
+	res "github.com/example/ms-go-statistic/pkg/http"
+	pkglog "github.com/example/ms-go-statistic/pkg/log"
+)
+
+type StatHandler struct {
+	service               *usecase.EventService
+	summaryService        *usecase.SummaryService
+	sessionSummaryService *usecase.LearningSessionSummaryService
+	logger                pkglog.Logger
+}
+
+func NewStatHandler(service *usecase.EventService, summaryService *usecase.SummaryService, sessionSummaryService *usecase.LearningSessionSummaryService, logger pkglog.Logger) *StatHandler {
+	return &StatHandler{
+		service:               service,
+		summaryService:        summaryService,
+		sessionSummaryService: sessionSummaryService,
+		logger:                logger,
+	}
+}
+
+func (h *StatHandler) GetLearningSessionSummary(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", err.Error(), requestIDFromCtx(c), nil)
+	}
+	sessionID, err := uuid.Parse(c.Param("session_id"))
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "session_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	result, err := h.sessionSummaryService.Get(c.Request().Context(), meta.UserID, sessionID)
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusInternalServerError, "cannot_get_session_summary", err.Error(), requestIDFromCtx(c), nil)
+	}
+	return res.JSON(c, http.StatusOK, map[string]any{"summary": result})
+}
+
+func (h *StatHandler) StartSession(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	var dto SessionStartRequest
+	if err := c.Bind(&dto); err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "invalid payload", requestIDFromCtx(c), nil)
+	}
+
+	resp, err := h.service.StartSession(c.Request().Context(), meta, usecase.SessionStartRequest{
+		CourseID:   dto.CourseID,
+		LessonID:   dto.LessonID,
+		TaskID:     dto.TaskID,
+		Platform:   dto.Platform,
+		EditorMode: dto.EditorMode,
+		ClientTS:   dto.ClientTS,
+		Payload:    dto.Payload,
+	})
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, usecase.ErrInvalidInput) {
+			status = http.StatusBadRequest
+		}
+		return res.ErrorJSON(c, status, "cannot_start_session", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	return res.JSON(c, http.StatusOK, map[string]any{
+		"session_id": resp.SessionID,
+		"started_at": resp.StartedAt.Format(time.RFC3339Nano),
+	})
+}
+
+func (h *StatHandler) PostEvents(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	var dto EventsBatchRequest
+	if err := c.Bind(&dto); err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "invalid payload", requestIDFromCtx(c), nil)
+	}
+
+	batch := usecase.EventsBatchRequest{
+		CourseID:   dto.CourseID,
+		LessonID:   dto.LessonID,
+		TaskID:     dto.TaskID,
+		Platform:   dto.Platform,
+		EditorMode: dto.EditorMode,
+	}
+	for _, ev := range dto.Events {
+		batch.Events = append(batch.Events, usecase.IncomingEvent{
+			EventID:    ev.EventID,
+			SessionID:  ev.SessionID,
+			EventType:  ev.EventType,
+			EditorMode: ev.EditorMode,
+			Platform:   ev.Platform,
+			ClientTS:   ev.ClientTS,
+			Payload:    ev.Payload,
+			CourseID:   ev.CourseID,
+			LessonID:   ev.LessonID,
+			TaskID:     ev.TaskID,
+		})
+	}
+
+	accepted, err := h.service.PublishBatch(c.Request().Context(), meta, batch)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, usecase.ErrInvalidInput) {
+			status = http.StatusBadRequest
+		}
+		return res.ErrorJSON(c, status, "cannot_publish_events", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	return res.JSON(c, http.StatusAccepted, map[string]any{"accepted": accepted})
+}
+
+func (h *StatHandler) EventsWS(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+
+	conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return nil
+		}
+
+		base := wsBaseMessage{}
+		if err := json.Unmarshal(msg, &base); err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "invalid message"})
+			continue
+		}
+
+		switch base.Type {
+		case "session_start":
+			var start wsSessionStartMessage
+			if err := json.Unmarshal(msg, &start); err != nil {
+				_ = conn.WriteJSON(map[string]string{"error": "invalid session_start message"})
+				continue
+			}
+			resp, err := h.service.StartSession(c.Request().Context(), meta, usecase.SessionStartRequest{
+				CourseID:   start.CourseID,
+				LessonID:   start.LessonID,
+				TaskID:     start.TaskID,
+				Platform:   start.Platform,
+				EditorMode: start.EditorMode,
+				ClientTS:   start.ClientTS,
+				Payload:    start.Payload,
+			})
+			if err != nil {
+				h.logger.Error().Err(err).Msg("failed to start session over ws")
+				_ = conn.WriteJSON(map[string]string{"error": err.Error()})
+				continue
+			}
+			_ = conn.WriteJSON(map[string]any{
+				"type":       "session_started",
+				"session_id": resp.SessionID,
+				"started_at": resp.StartedAt.Format(time.RFC3339Nano),
+			})
+		case "events_batch":
+			var batch wsEventsBatchMessage
+			if err := json.Unmarshal(msg, &batch); err != nil {
+				_ = conn.WriteJSON(map[string]string{"error": "invalid events_batch message"})
+				continue
+			}
+			events := usecase.EventsBatchRequest{
+				CourseID:   batch.CourseID,
+				LessonID:   batch.LessonID,
+				TaskID:     batch.TaskID,
+				Platform:   batch.Platform,
+				EditorMode: batch.EditorMode,
+			}
+			for _, ev := range batch.Events {
+				events.Events = append(events.Events, usecase.IncomingEvent{
+					EventID:    ev.EventID,
+					SessionID:  ev.SessionID,
+					EventType:  ev.EventType,
+					EditorMode: ev.EditorMode,
+					Platform:   ev.Platform,
+					ClientTS:   ev.ClientTS,
+					Payload:    ev.Payload,
+					CourseID:   ev.CourseID,
+					LessonID:   ev.LessonID,
+					TaskID:     ev.TaskID,
+				})
+			}
+			accepted, err := h.service.PublishBatch(c.Request().Context(), meta, events)
+			if err != nil {
+				h.logger.Error().Err(err).Msg("failed to publish events over ws")
+				_ = conn.WriteJSON(map[string]string{"error": err.Error()})
+				continue
+			}
+			_ = conn.WriteJSON(map[string]any{
+				"type":     "events_accepted",
+				"accepted": accepted,
+			})
+		default:
+			_ = conn.WriteJSON(map[string]string{"error": "unsupported message type"})
+		}
+	}
+}
+
+func (h *StatHandler) GetTaskSummary(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", err.Error(), requestIDFromCtx(c), nil)
+	}
+	taskID, err := uuid.Parse(c.Param("task_id"))
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "task_id must be UUID", requestIDFromCtx(c), nil)
+	}
+
+	courseID, err := parseUUIDQuery(c, "course_id")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "course_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	lessonID, err := parseUUIDQuery(c, "lesson_id")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "lesson_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	from, err := parseTimeQuery(c, "from")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "from must be RFC3339 timestamp", requestIDFromCtx(c), nil)
+	}
+	to, err := parseTimeQuery(c, "to")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "to must be RFC3339 timestamp", requestIDFromCtx(c), nil)
+	}
+
+	summary, err := h.summaryService.GetTaskSummary(c.Request().Context(), usecase.SummaryFilter{
+		UserID:   meta.UserID,
+		CourseID: courseID,
+		LessonID: lessonID,
+		TaskID:   &taskID,
+		From:     from,
+		To:       to,
+	})
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusInternalServerError, "cannot_get_summary", err.Error(), requestIDFromCtx(c), nil)
+	}
+	if summary == nil {
+		return res.JSON(c, http.StatusOK, map[string]any{"summary": nil})
+	}
+
+	return res.JSON(c, http.StatusOK, map[string]any{
+		"summary": map[string]any{
+			"task_id":                  summary.TaskID,
+			"started_at":               summary.StartedAt,
+			"ended_at":                 summary.EndedAt,
+			"session_count":            summary.SessionCount,
+			"typing_events":            summary.TypingEvents,
+			"total_duration_seconds":   summary.TotalDurationSeconds,
+			"reading_duration_seconds": summary.ReadingDurationSecond,
+			"solving_duration_seconds": summary.SolvingDurationSecond,
+			"avg_duration_seconds":     summary.AvgDurationSeconds,
+		},
+	})
+}
+
+func (h *StatHandler) ListTaskSummaries(c echo.Context) error {
+	meta, err := readMeta(c.Request())
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	courseID, err := parseUUIDQuery(c, "course_id")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "course_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	lessonID, err := parseUUIDQuery(c, "lesson_id")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "lesson_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	taskID, err := parseUUIDQuery(c, "task_id")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "task_id must be UUID", requestIDFromCtx(c), nil)
+	}
+	from, err := parseTimeQuery(c, "from")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "from must be RFC3339 timestamp", requestIDFromCtx(c), nil)
+	}
+	to, err := parseTimeQuery(c, "to")
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusBadRequest, "bad_request", "to must be RFC3339 timestamp", requestIDFromCtx(c), nil)
+	}
+
+	limit := 20
+	offset := 0
+	if raw := c.QueryParam("limit"); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil {
+			limit = parsed
+		}
+	}
+	if raw := c.QueryParam("offset"); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil {
+			offset = parsed
+		}
+	}
+
+	summaries, err := h.summaryService.ListTaskSummaries(c.Request().Context(), usecase.SummaryFilter{
+		UserID:   meta.UserID,
+		CourseID: courseID,
+		LessonID: lessonID,
+		TaskID:   taskID,
+		From:     from,
+		To:       to,
+	}, limit, offset)
+	if err != nil {
+		return res.ErrorJSON(c, http.StatusInternalServerError, "cannot_list_summaries", err.Error(), requestIDFromCtx(c), nil)
+	}
+
+	items := make([]map[string]any, 0, len(summaries))
+	for _, summary := range summaries {
+		items = append(items, map[string]any{
+			"task_id":                  summary.TaskID,
+			"started_at":               summary.StartedAt,
+			"ended_at":                 summary.EndedAt,
+			"session_count":            summary.SessionCount,
+			"typing_events":            summary.TypingEvents,
+			"total_duration_seconds":   summary.TotalDurationSeconds,
+			"reading_duration_seconds": summary.ReadingDurationSecond,
+			"solving_duration_seconds": summary.SolvingDurationSecond,
+			"avg_duration_seconds":     summary.AvgDurationSeconds,
+		})
+	}
+
+	return res.JSON(c, http.StatusOK, map[string]any{
+		"items":  items,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func readMeta(r *http.Request) (usecase.RequestMeta, error) {
+	userIDStr := r.Header.Get("X-User-Id")
+	role := r.Header.Get("X-User-Role")
+	language := r.Header.Get("X-Language")
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return usecase.RequestMeta{}, errors.New("X-User-Id header is required and must be a UUID")
+	}
+	if role == "" {
+		return usecase.RequestMeta{}, errors.New("X-User-Role header is required")
+	}
+
+	return usecase.RequestMeta{
+		UserID:   userID,
+		Role:     role,
+		Language: language,
+	}, nil
+}
+
+func requestIDFromCtx(c echo.Context) string {
+	if reqID := c.Response().Header().Get(echo.HeaderXRequestID); reqID != "" {
+		return reqID
+	}
+	return c.Request().Header.Get(echo.HeaderXRequestID)
+}
+
+type wsBaseMessage struct {
+	Type string `json:"type"`
+}
+
+type wsSessionStartMessage struct {
+	Type string `json:"type"`
+	SessionStartRequest
+}
+
+type wsEventsBatchMessage struct {
+	Type string `json:"type"`
+	EventsBatchRequest
+}
+
+func parseUUIDQuery(c echo.Context, name string) (*uuid.UUID, error) {
+	raw := c.QueryParam(name)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := uuid.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+func parseTimeQuery(c echo.Context, name string) (*time.Time, error) {
+	raw := c.QueryParam(name)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, err
+	}
+	utc := parsed.UTC()
+	return &utc, nil
+}

@@ -1,0 +1,2712 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/example/mc-course-service/internal/queryfields"
+	httpadapter "github.com/example/mc-course-service/internal/transport/http"
+	adminhandlers "github.com/example/mc-course-service/internal/transport/http/admin/v1/handlers"
+	"github.com/example/mc-course-service/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/codestructuretype"
+	"github.com/example/mc-course-service/internal/usecase/composeconfig"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	"github.com/example/mc-course-service/internal/usecase/course"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	moduleuc "github.com/example/mc-course-service/internal/usecase/module"
+	sectionuc "github.com/example/mc-course-service/internal/usecase/section"
+	"github.com/example/mc-course-service/internal/usecase/tag"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/example/mc-course-service/internal/usecase/tech"
+	"github.com/example/mc-course-service/internal/usecase/techversion"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+const (
+	adminPrefix = ""
+	apiPrefix   = "/api/v1"
+)
+
+func TestAdminCRUDPermissions(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	endpoints := []struct {
+		name           string
+		method         string
+		path           string
+		body           string
+		expectedStatus int
+	}{
+		{
+			name:           "create course",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/course/create",
+			body:           fmt.Sprintf(`{"slug":"course-auth","main_tech_id":%d}`, fixtures.mainTechID),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "create module",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/module/create",
+			body:           fmt.Sprintf(`{"tech_id":%d,"translations":[{"i18n_id":%d,"title":"Module","description":"desc"}]}`, fixtures.mainTechID, fixtures.i18nID),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "add course module",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/course-relations/add-module/" + fixtures.courseID,
+			body:           fmt.Sprintf(`{"module_id":"%s","order":1}`, fixtures.moduleID),
+			expectedStatus: http.StatusNoContent,
+		},
+		{
+			name:           "create section",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/section/create",
+			body:           fmt.Sprintf(`{"tech_id":%d,"translations":[{"i18n_id":%d,"title":"Section","description":"desc"}]}`, fixtures.mainTechID, fixtures.i18nID),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "add module section",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/module-relations/add-section/" + fixtures.moduleID,
+			body:           fmt.Sprintf(`{"section_id":"%s","order":1}`, fixtures.sectionID),
+			expectedStatus: http.StatusNoContent,
+		},
+		{
+			name:           "create lesson",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/lesson/create",
+			body:           fmt.Sprintf(`{"title":"Lesson","excerpt":"excerpt","description":"desc","versions":[{"tech_version_id":%d}],"compose_config":{"version":"3.9","services":{"app":{"image":"auth/lesson:latest"}}}}`, fixtures.techVersionID),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "create task",
+			method:         http.MethodPost,
+			path:           adminPrefix + "/task/create",
+			body:           createTaskBody(fixtures, fixtures.lessonID),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "update task",
+			method:         http.MethodPut,
+			path:           fmt.Sprintf("%s/task/update/%s", adminPrefix, fixtures.taskID),
+			body:           updateTaskBody(fixtures),
+			expectedStatus: http.StatusOK,
+		},
+	}
+
+	allowedRoles := []string{"ADMIN", "MODERATOR"}
+	for _, ep := range endpoints {
+		for _, role := range allowedRoles {
+			t.Run(fmt.Sprintf("%s as %s", ep.name, role), func(t *testing.T) {
+				resp := performRequest(fixtures.router, ep.method, ep.path, ep.body, role, "user-allowed")
+				if resp.Code != ep.expectedStatus {
+					t.Fatalf("expected %d for role %s on %s %s, got %d", ep.expectedStatus, role, ep.method, ep.path, resp.Code)
+				}
+			})
+		}
+	}
+
+	forbiddenRoles := []string{"TEACHER", "STUDENT", "GUEST"}
+	for _, ep := range endpoints {
+		for _, role := range forbiddenRoles {
+			t.Run(fmt.Sprintf("%s forbidden for %s", ep.name, role), func(t *testing.T) {
+				resp := performRequest(fixtures.router, ep.method, ep.path, ep.body, role, "user-forbidden")
+				if resp.Code != http.StatusForbidden {
+					t.Fatalf("expected 403 for role %s on %s %s, got %d", role, ep.method, ep.path, resp.Code)
+				}
+			})
+		}
+	}
+
+	for _, ep := range endpoints {
+		t.Run(fmt.Sprintf("%s guest unauthorized", ep.name), func(t *testing.T) {
+			resp := performRequest(fixtures.router, ep.method, ep.path, ep.body, "", "")
+			if resp.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 for guest on %s %s, got %d", ep.method, ep.path, resp.Code)
+			}
+		})
+	}
+}
+
+func TestAdminKebabCaseEndpoints(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	role := "ADMIN"
+	userID := "admin-user"
+
+	composeBody := fmt.Sprintf(`{"title":"Compose","description":"desc","config":{"version":"3.9","services":{}},"tech_ids":[%d]}`, fixtures.mainTechID)
+	resp := performRequest(fixtures.router, http.MethodPost, adminPrefix+"/compose-config/create", composeBody, role, userID)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for compose-config create, got %d", resp.Code)
+	}
+	var composeCreate struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &composeCreate); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if composeCreate.ID == "" {
+		t.Fatalf("expected compose config id, got empty")
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/compose-config/list", "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for compose-config list, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, adminPrefix+"/compose-config/update/"+composeCreate.ID, `{"title":"Updated title"}`, role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for compose-config update, got %d", resp.Code)
+	}
+
+	moduleBody := fmt.Sprintf(`{"tech_id":%d,"visibility":%d,"translations":[{"i18n_id":%d,"title":"Module","description":"Module desc"}]}`, fixtures.mainTechID, domain.ModuleVisibilityBoth, fixtures.i18nID)
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/module/create", moduleBody, role, userID)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for module create, got %d", resp.Code)
+	}
+	var createdModule domain.Module
+	if err := json.Unmarshal(resp.Body.Bytes(), &createdModule); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if createdModule.ID == "" {
+		t.Fatalf("expected module id, got empty")
+	}
+	if createdModule.Visibility != domain.ModuleVisibilityBoth {
+		t.Fatalf("expected module visibility %d, got %d", domain.ModuleVisibilityBoth, createdModule.Visibility)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/course-relations/add-module/"+fixtures.courseID, fmt.Sprintf(`{"module_id":"%s","order":2}`, createdModule.ID), role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for course module relation add, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/module/get/"+createdModule.ID, "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for module get, got %d", resp.Code)
+	}
+	var moduleGet struct {
+		Module map[string]any `json:"module"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &moduleGet); err != nil {
+		t.Fatalf("invalid module get json: %v", err)
+	}
+	if moduleGet.Module["title"] != "Module" {
+		t.Fatalf("expected normalized module title, got %+v", moduleGet.Module)
+	}
+	if got := int(moduleGet.Module["visibility"].(float64)); got != domain.ModuleVisibilityBoth {
+		t.Fatalf("expected normalized module visibility %d, got %d", domain.ModuleVisibilityBoth, got)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/module/list?course_id="+fixtures.courseID, "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for module list, got %d", resp.Code)
+	}
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/module/list?fields=id,title,visibility", "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for module compact list, got %d", resp.Code)
+	}
+	var moduleList struct {
+		Modules []map[string]any `json:"modules"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &moduleList); err != nil {
+		t.Fatalf("invalid module list json: %v", err)
+	}
+	moduleTitleFound := false
+	for _, item := range moduleList.Modules {
+		if item["title"] == "Module" {
+			moduleTitleFound = true
+			if got := int(item["visibility"].(float64)); got != domain.ModuleVisibilityBoth {
+				t.Fatalf("expected compact module visibility %d, got %d", domain.ModuleVisibilityBoth, got)
+			}
+			break
+		}
+	}
+	if !moduleTitleFound {
+		t.Fatalf("expected module title in compact list, got %+v", moduleList.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, adminPrefix+"/module/update/"+createdModule.ID, fmt.Sprintf(`{"tech_id":%d,"status":1,"translations":[{"i18n_id":%d,"title":"Module 2","description":"Module desc 2"}]}`, fixtures.mainTechID, fixtures.i18nID), role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for module update, got %d", resp.Code)
+	}
+
+	sectionBody := fmt.Sprintf(`{"tech_id":%d,"translations":[{"i18n_id":%d,"title":"Section","description":"Section desc"}]}`, fixtures.mainTechID, fixtures.i18nID)
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/section/create", sectionBody, role, userID)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for section create, got %d", resp.Code)
+	}
+	var createdSection domain.Section
+	if err := json.Unmarshal(resp.Body.Bytes(), &createdSection); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if createdSection.ID == "" {
+		t.Fatalf("expected section id, got empty")
+	}
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/section/list?fields=id,title", "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for section compact list, got %d", resp.Code)
+	}
+	var sectionList struct {
+		Sections []map[string]any `json:"sections"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &sectionList); err != nil {
+		t.Fatalf("invalid section list json: %v", err)
+	}
+	sectionTitleFound := false
+	for _, item := range sectionList.Sections {
+		if item["title"] == "Section" {
+			sectionTitleFound = true
+			break
+		}
+	}
+	if !sectionTitleFound {
+		t.Fatalf("expected section title in compact list, got %+v", sectionList.Sections)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/module-relations/add-section/"+createdModule.ID, fmt.Sprintf(`{"section_id":"%s","order":2}`, createdSection.ID), role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for module section relation add, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/section/get/"+createdSection.ID, "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for section get, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/section/list?module_id="+createdModule.ID, "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for section list, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, adminPrefix+"/section/update/"+createdSection.ID, fmt.Sprintf(`{"tech_id":%d,"status":1,"translations":[{"i18n_id":%d,"title":"Section 2","description":"Section desc 2"}]}`, fixtures.mainTechID, fixtures.i18nID), role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for section update, got %d", resp.Code)
+	}
+
+	i18nBody := fmt.Sprintf(`{"i18n_id":%d,"title":"RU Title","description":"RU Desc"}`, fixtures.i18nID)
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/course-i18n/create/"+fixtures.courseID, i18nBody, role, userID)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for course-i18n create, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/course-i18n/list/"+fixtures.courseID, "", role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for course-i18n list, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, fmt.Sprintf("%s/course-i18n/update/%s/%d", adminPrefix, fixtures.courseID, fixtures.i18nID), fmt.Sprintf(`{"i18n_id":%d,"title":"RU Title 2","description":"RU Desc 2"}`, fixtures.i18nID), role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for course-i18n update, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodDelete, fmt.Sprintf("%s/course-i18n/delete/%s/%d", adminPrefix, fixtures.courseID, fixtures.i18nID), "", role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for course-i18n delete, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, adminPrefix+"/course-relations/update-tags/"+fixtures.courseID, `{"tag_ids":[]}`, role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for course-relations update-tags, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPut, adminPrefix+"/course-relations/update-techs/"+fixtures.courseID, `{"tech_ids":[]}`, role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for course-relations update-techs, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodDelete, adminPrefix+"/section/delete/"+createdSection.ID, "", role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for section delete, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodDelete, adminPrefix+"/module/delete/"+createdModule.ID, "", role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for module delete, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodDelete, adminPrefix+"/compose-config/delete/"+composeCreate.ID, "", role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for compose-config delete, got %d", resp.Code)
+	}
+}
+
+func TestCourseUpdateRequiresActiveLesson(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	role := "ADMIN"
+	userID := "admin-user"
+
+	updateCourseBody := fmt.Sprintf(`{"slug":"existing-course","main_tech_id":%d,"status":%d}`, fixtures.mainTechID, domain.CourseStatusActive)
+	resp := performRequest(fixtures.router, http.MethodPut, adminPrefix+"/course/update/"+fixtures.courseID, updateCourseBody, role, userID)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for course update with active lesson, got %d", resp.Code)
+	}
+}
+
+func TestAdminKebabCaseEndpointsForbidden(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name:   "compose-config create",
+			method: http.MethodPost,
+			path:   adminPrefix + "/compose-config/create",
+			body:   `{"title":"Compose","description":"desc","config":{"version":"3.9","services":{}}}`,
+		},
+		{
+			name:   "module create",
+			method: http.MethodPost,
+			path:   adminPrefix + "/module/create",
+			body:   fmt.Sprintf(`{"tech_id":%d}`, fixtures.mainTechID),
+		},
+		{
+			name:   "section create",
+			method: http.MethodPost,
+			path:   adminPrefix + "/section/create",
+			body:   fmt.Sprintf(`{"tech_id":%d}`, fixtures.mainTechID),
+		},
+		{
+			name:   "course module relation add",
+			method: http.MethodPost,
+			path:   adminPrefix + "/course-relations/add-module/" + fixtures.courseID,
+			body:   fmt.Sprintf(`{"module_id":"%s","order":1}`, fixtures.moduleID),
+		},
+		{
+			name:   "module section relation add",
+			method: http.MethodPost,
+			path:   adminPrefix + "/module-relations/add-section/" + fixtures.moduleID,
+			body:   fmt.Sprintf(`{"section_id":"%s","order":1}`, fixtures.sectionID),
+		},
+		{
+			name:   "course-i18n create",
+			method: http.MethodPost,
+			path:   adminPrefix + "/course-i18n/create/" + fixtures.courseID,
+			body:   fmt.Sprintf(`{"i18n_id":%d,"title":"RU Title","description":"RU Desc"}`, fixtures.i18nID),
+		},
+		{
+			name:   "course-relations update tags",
+			method: http.MethodPut,
+			path:   adminPrefix + "/course-relations/update-tags/" + fixtures.courseID,
+			body:   `{"tag_ids":[]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+" forbidden for student", func(t *testing.T) {
+			resp := performRequest(fixtures.router, tc.method, tc.path, tc.body, "STUDENT", "user-forbidden")
+			if resp.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for student on %s %s, got %d", tc.method, tc.path, resp.Code)
+			}
+		})
+		t.Run(tc.name+" guest unauthorized", func(t *testing.T) {
+			resp := performRequest(fixtures.router, tc.method, tc.path, tc.body, "", "")
+			if resp.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 for guest on %s %s, got %d", tc.method, tc.path, resp.Code)
+			}
+		})
+	}
+}
+
+func TestCourseListPublic(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/course/list", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course list, got %d", resp.Code)
+	}
+
+	var payload struct {
+		Courses []map[string]any `json:"courses"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(payload.Courses) != 1 {
+		t.Fatalf("expected 1 course in list, got %d", len(payload.Courses))
+	}
+	if payload.Courses[0]["title"] != "Existing Title" {
+		t.Fatalf("unexpected title %q", payload.Courses[0]["title"])
+	}
+}
+
+func TestModuleAndSectionListPublic(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public independent module list, got %d", resp.Code)
+	}
+	var independentPayload struct {
+		Modules []domain.Module `json:"modules"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &independentPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(independentPayload.Modules) != 1 || independentPayload.Modules[0].ID != fixtures.independentModuleID {
+		t.Fatalf("expected independent module %s, got %#v", fixtures.independentModuleID, independentPayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, fmt.Sprintf("%s/module/list?tech_id=%d", apiPrefix, fixtures.mainTechID), "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public independent module list by tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &independentPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(independentPayload.Modules) != 1 || independentPayload.Modules[0].ID != fixtures.independentModuleID {
+		t.Fatalf("expected independent module %s by tech, got %#v", fixtures.independentModuleID, independentPayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?tech_id=999", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public independent module list by unmatched tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &independentPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(independentPayload.Modules) != 0 {
+		t.Fatalf("expected no independent modules by unmatched tech, got %#v", independentPayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?course_id="+fixtures.courseID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course module list, got %d", resp.Code)
+	}
+	var coursePayload struct {
+		Modules []domain.Module `json:"modules"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &coursePayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(coursePayload.Modules) != 1 || coursePayload.Modules[0].ID != fixtures.moduleID {
+		t.Fatalf("expected course module %s, got %#v", fixtures.moduleID, coursePayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, fmt.Sprintf("%s/module/list?course_id=%s&tech_id=%d", apiPrefix, fixtures.courseID, fixtures.mainTechID), "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course module list by tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &coursePayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(coursePayload.Modules) != 1 || coursePayload.Modules[0].ID != fixtures.moduleID {
+		t.Fatalf("expected course module %s by tech, got %#v", fixtures.moduleID, coursePayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?course_id="+fixtures.courseID+"&tech_id=999", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course module list by unmatched tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &coursePayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(coursePayload.Modules) != 0 {
+		t.Fatalf("expected no course modules by unmatched tech, got %#v", coursePayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/section/list?module_id="+fixtures.moduleID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public module section list, got %d", resp.Code)
+	}
+	var sectionPayload struct {
+		Sections []domain.Section `json:"sections"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &sectionPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(sectionPayload.Sections) != 1 || sectionPayload.Sections[0].ID != fixtures.sectionID {
+		t.Fatalf("expected section %s, got %#v", fixtures.sectionID, sectionPayload.Sections)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/section/list", "", "", "")
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for section list without module, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?scope=all", "", "", "")
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for public all module scope, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?scope=all&tech_id=999", "", "", "")
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for public all module scope with tech filter, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?tech_id=0", "", "", "")
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid module tech filter, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/module/list?tech_id=abc", "", "", "")
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-numeric module tech filter, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/module/list?scope=all", "", "ADMIN", "admin-user")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin all module scope, got %d", resp.Code)
+	}
+	var allPayload struct {
+		Modules []domain.Module `json:"modules"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &allPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(allPayload.Modules) != 2 {
+		t.Fatalf("expected 2 modules in all scope, got %#v", allPayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, fmt.Sprintf("%s/module/list?scope=content&tech_id=%d", adminPrefix, fixtures.mainTechID), "", "ADMIN", "admin-user")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin content module scope by tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &allPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(allPayload.Modules) != 2 {
+		t.Fatalf("expected 2 content modules by tech, got %#v", allPayload.Modules)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, adminPrefix+"/module/list?scope=content&tech_id=999", "", "ADMIN", "admin-user")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin content module scope by unmatched tech, got %d", resp.Code)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &allPayload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(allPayload.Modules) != 0 {
+		t.Fatalf("expected no content modules by unmatched tech, got %#v", allPayload.Modules)
+	}
+}
+
+func TestCourseLessonsPublic(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/lesson/list?course_id="+fixtures.courseID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course lessons, got %d", resp.Code)
+	}
+
+	var payload struct {
+		Lessons []map[string]any `json:"lessons"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(payload.Lessons) != 1 {
+		t.Fatalf("expected 1 lesson, got %d", len(payload.Lessons))
+	}
+	if payload.Lessons[0]["id"] != fixtures.lessonID {
+		t.Fatalf("unexpected lesson id %s", payload.Lessons[0]["id"])
+	}
+}
+
+func TestModuleLessonsPublic(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/lesson/list?module_id="+fixtures.moduleID+"&fields=id,module_id,section_id,order,title", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public module lessons, got %d", resp.Code)
+	}
+
+	var payload struct {
+		Lessons []map[string]any `json:"lessons"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(payload.Lessons) != 1 {
+		t.Fatalf("expected 1 module lesson, got %#v", payload.Lessons)
+	}
+	if payload.Lessons[0]["id"] != fixtures.lessonID {
+		t.Fatalf("expected lesson id %s, got %v", fixtures.lessonID, payload.Lessons[0]["id"])
+	}
+	if payload.Lessons[0]["module_id"] != fixtures.moduleID {
+		t.Fatalf("expected module context %s, got %v", fixtures.moduleID, payload.Lessons[0]["module_id"])
+	}
+	if payload.Lessons[0]["section_id"] != fixtures.sectionID {
+		t.Fatalf("expected section context %s, got %v", fixtures.sectionID, payload.Lessons[0]["section_id"])
+	}
+}
+
+func TestLessonCanBeReusedAcrossSections(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	role := "ADMIN"
+	userID := "admin-user"
+
+	sectionBody := fmt.Sprintf(`{"tech_id":%d,"translations":[{"i18n_id":%d,"title":"Reusable Section","description":"Reusable section desc"}]}`, fixtures.mainTechID, fixtures.i18nID)
+	resp := performRequest(fixtures.router, http.MethodPost, adminPrefix+"/section/create", sectionBody, role, userID)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for section create, got %d", resp.Code)
+	}
+	var createdSection domain.Section
+	if err := json.Unmarshal(resp.Body.Bytes(), &createdSection); err != nil {
+		t.Fatalf("invalid section json: %v", err)
+	}
+	if createdSection.ID == "" {
+		t.Fatalf("expected section id, got empty")
+	}
+
+	resp = performRequest(fixtures.router, http.MethodPost, adminPrefix+"/section-relations/add-lesson/"+createdSection.ID, fmt.Sprintf(`{"lesson_id":"%s","order":5}`, fixtures.lessonID), role, userID)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for section lesson relation add, got %d", resp.Code)
+	}
+
+	resp = performRequest(fixtures.router, http.MethodGet, apiPrefix+"/lesson/list?section_id="+createdSection.ID+"&fields=id,section_id,order,title", "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public section lessons, got %d", resp.Code)
+	}
+	var payload struct {
+		Lessons []map[string]any `json:"lessons"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid lesson list json: %v", err)
+	}
+	if len(payload.Lessons) != 1 {
+		t.Fatalf("expected 1 section lesson, got %#v", payload.Lessons)
+	}
+	if payload.Lessons[0]["id"] != fixtures.lessonID {
+		t.Fatalf("expected reused lesson id %s, got %v", fixtures.lessonID, payload.Lessons[0]["id"])
+	}
+	if payload.Lessons[0]["section_id"] != createdSection.ID {
+		t.Fatalf("expected section context %s, got %v", createdSection.ID, payload.Lessons[0]["section_id"])
+	}
+	if int(payload.Lessons[0]["order"].(float64)) != 5 {
+		t.Fatalf("expected section lesson order 5, got %v", payload.Lessons[0]["order"])
+	}
+}
+
+func TestCourseGetByIDPublic(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/course/get/"+fixtures.courseID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public course by id, got %d", resp.Code)
+	}
+
+	var payload struct {
+		Course struct {
+			ID    string `json:"ID"`
+			Title string `json:"title"`
+		} `json:"course"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if payload.Course.ID != fixtures.courseID {
+		t.Fatalf("expected course id %s, got %s", fixtures.courseID, payload.Course.ID)
+	}
+	if payload.Course.Title != "Existing Title" {
+		t.Fatalf("expected title Existing Title, got %s", payload.Course.Title)
+	}
+}
+
+func TestTaskComposeConfigFallback(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/task/get/"+fixtures.taskID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for task get, got %d", resp.Code)
+	}
+
+	var payload struct {
+		ComposeConfig json.RawMessage `json:"compose_config"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	expected := `{"version":"3.9","services":{"app":{"image":"fixture/lesson:latest"}}}`
+	if string(payload.ComposeConfig) != expected {
+		t.Fatalf("expected compose_config %s, got %s", expected, string(payload.ComposeConfig))
+	}
+}
+
+func TestTaskComposeConfigOverrideCanBeCleared(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	overrideBody := updateTaskBody(fixtures)
+
+	resp := performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		overrideBody,
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 while setting task compose override, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	assertTaskComposeConfig(t, fixtures, `{"version":"3.9","services":{"app":{"image":"auth/task-updated:latest"}}}`)
+	if got := len(fixtures.composeConfigs.configs); got != 1 {
+		t.Fatalf("expected one compose config after first task override, got %d", got)
+	}
+
+	resp = performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		overrideBody,
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 while repeating task compose override, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if got := len(fixtures.composeConfigs.configs); got != 1 {
+		t.Fatalf("expected repeated override to reuse one compose config, got %d", got)
+	}
+
+	preserveBody := fmt.Sprintf(
+		`{"title":"Task updated","description":"updated","translations":[{"i18n_id":%d,"title":"Task updated","description":"updated"}],"code_structure":%s,"order":2,"status":1}`,
+		fixtures.i18nID,
+		taskCodeStructure(),
+	)
+	resp = performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		preserveBody,
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 while omitting task compose override, got %d: %s", resp.Code, resp.Body.String())
+	}
+	assertTaskComposeConfig(t, fixtures, `{"version":"3.9","services":{"app":{"image":"auth/task-updated:latest"}}}`)
+
+	clearBody := fmt.Sprintf(
+		`{"title":"Task updated","description":"updated","translations":[{"i18n_id":%d,"title":"Task updated","description":"updated"}],"code_structure":%s,"compose_config":null,"order":2,"status":1}`,
+		fixtures.i18nID,
+		taskCodeStructure(),
+	)
+	resp = performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		clearBody,
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 while clearing task compose override, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	assertTaskComposeConfig(t, fixtures, `{"version":"3.9","services":{"app":{"image":"fixture/lesson:latest"}}}`)
+}
+
+func TestTaskComposeConfigOverrideCannotBeClearedWithoutLessonRuntime(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	resp := performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		updateTaskBody(fixtures),
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 while setting task compose override, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	lesson := fixtures.lessons.lessons[fixtures.lessonID]
+	lesson.ComposeConfigID = nil
+	lesson.ComposeConfig = nil
+	fixtures.lessons.lessons[fixtures.lessonID] = lesson
+
+	clearBody := fmt.Sprintf(
+		`{"title":"Task updated","description":"updated","translations":[{"i18n_id":%d,"title":"Task updated","description":"updated"}],"code_structure":%s,"compose_config":null,"order":2,"status":1}`,
+		fixtures.i18nID,
+		taskCodeStructure(),
+	)
+	resp = performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/task/update/"+fixtures.taskID,
+		clearBody,
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 while clearing the only sandbox runtime, got %d: %s", resp.Code, resp.Body.String())
+	}
+	assertTaskComposeConfig(t, fixtures, `{"version":"3.9","services":{"app":{"image":"auth/task-updated:latest"}}}`)
+}
+
+func TestSandboxTaskCannotBeCreatedWithoutTaskOrLessonRuntime(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		composeConfigField string
+	}{
+		{name: "omitted"},
+		{name: "json null", composeConfigField: `,"compose_config":null`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fixtures := newRouterFixtures(t)
+			lesson := fixtures.lessons.lessons[fixtures.lessonID]
+			lesson.ComposeConfigID = nil
+			lesson.ComposeConfig = nil
+			fixtures.lessons.lessons[fixtures.lessonID] = lesson
+
+			body := fmt.Sprintf(
+				`{"title":"Task","description":"desc","translations":[{"i18n_id":%d,"title":"Task","description":"desc"}],"code_structure_type_id":"%s","code_structure":%s%s,"requires_sandbox":true,"order":2,"lesson_id":"%s"}`,
+				fixtures.i18nID,
+				fixtures.codeStructureTypeID,
+				taskCodeStructure(),
+				tt.composeConfigField,
+				fixtures.lessonID,
+			)
+			resp := performRequest(
+				fixtures.router,
+				http.MethodPost,
+				adminPrefix+"/task/create",
+				body,
+				"ADMIN",
+				"runtime-admin",
+			)
+			if resp.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("expected 422 while creating a sandbox task without runtime, got %d: %s", resp.Code, resp.Body.String())
+			}
+			if got := len(fixtures.tasks.tasks); got != 1 {
+				t.Fatalf("expected rejected create not to persist a task, got %d tasks", got)
+			}
+		})
+	}
+}
+
+func TestLessonRuntimeCannotBeClearedWhileSandboxTaskInheritsIt(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	updateBody := func(composeConfigField string) string {
+		return fmt.Sprintf(
+			`{"title":"Lesson","excerpt":"excerpt","description":"desc","versions":[{"tech_version_id":%d}]%s,"status":1}`,
+			fixtures.techVersionID,
+			composeConfigField,
+		)
+	}
+
+	resp := performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/lesson/update/"+fixtures.lessonID,
+		updateBody(""),
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected omitted lesson runtime to be preserved, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if got := string(fixtures.lessons.lessons[fixtures.lessonID].ComposeConfig); got != `{"version":"3.9","services":{"app":{"image":"fixture/lesson:latest"}}}` {
+		t.Fatalf("expected omitted lesson runtime to remain unchanged, got %s", got)
+	}
+
+	resp = performRequest(
+		fixtures.router,
+		http.MethodPut,
+		adminPrefix+"/lesson/update/"+fixtures.lessonID,
+		updateBody(`,"compose_config":null`),
+		"ADMIN",
+		"runtime-admin",
+	)
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 while clearing an inherited lesson runtime, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if got := string(fixtures.lessons.lessons[fixtures.lessonID].ComposeConfig); got != `{"version":"3.9","services":{"app":{"image":"fixture/lesson:latest"}}}` {
+		t.Fatalf("expected rejected lesson clear to preserve runtime, got %s", got)
+	}
+}
+
+func TestManifestReorderAcceptsTemporaryRelationOrders(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "course module",
+			path: adminPrefix + "/course-relations/add-module/" + fixtures.courseID,
+			body: fmt.Sprintf(`{"module_id":"%s","order":-32768}`, fixtures.moduleID),
+		},
+		{
+			name: "module section",
+			path: adminPrefix + "/module-relations/add-section/" + fixtures.moduleID,
+			body: fmt.Sprintf(`{"section_id":"%s","order":-32768}`, fixtures.sectionID),
+		},
+		{
+			name: "section lesson",
+			path: adminPrefix + "/section-relations/add-lesson/" + fixtures.sectionID,
+			body: fmt.Sprintf(`{"lesson_id":"%s","order":-32768}`, fixtures.lessonID),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := performRequest(fixtures.router, http.MethodPost, tt.path, tt.body, "ADMIN", "manifest-importer")
+			if resp.Code != http.StatusNoContent {
+				t.Fatalf("expected 204 for temporary reorder, got %d: %s", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestManifestReplaceHierarchyRelations(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "course modules",
+			path: adminPrefix + "/course-relations/replace-modules/" + fixtures.courseID,
+			body: fmt.Sprintf(`{"items":[{"id":"%s","order":11}]}`, fixtures.moduleID),
+		},
+		{
+			name: "module sections",
+			path: adminPrefix + "/module-relations/replace-sections/" + fixtures.moduleID,
+			body: fmt.Sprintf(`{"items":[{"id":"%s","order":13}]}`, fixtures.sectionID),
+		},
+		{
+			name: "section lessons",
+			path: adminPrefix + "/section-relations/replace-lessons/" + fixtures.sectionID,
+			body: fmt.Sprintf(`{"items":[{"id":"%s","order":17}]}`, fixtures.lessonID),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := performRequest(fixtures.router, http.MethodPut, test.path, test.body, "ADMIN", "manifest-importer")
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("expected 204, got %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if got := fixtures.sectionLessons.placements[fixtures.sectionID][fixtures.lessonID]; got != 17 {
+		t.Fatalf("section lesson order=%d, want 17", got)
+	}
+}
+
+func assertTaskComposeConfig(t *testing.T, fixtures routerFixtures, expected string) {
+	t.Helper()
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/task/get/"+fixtures.taskID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for task get, got %d", resp.Code)
+	}
+	var payload struct {
+		ComposeConfig json.RawMessage `json:"compose_config"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid task json: %v", err)
+	}
+	if string(payload.ComposeConfig) != expected {
+		t.Fatalf("expected compose_config %s, got %s", expected, string(payload.ComposeConfig))
+	}
+}
+
+func TestCourseAccessByRole(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "list courses", method: http.MethodGet, path: apiPrefix + "/course/list"},
+		{name: "get course", method: http.MethodGet, path: apiPrefix + "/course/get-by-slug/existing-course"},
+		{name: "get course by id", method: http.MethodGet, path: apiPrefix + "/course/get/" + fixtures.courseID},
+		{name: "list lessons by course", method: http.MethodGet, path: apiPrefix + "/lesson/list?course_id=" + fixtures.courseID},
+		{name: "get lesson", method: http.MethodGet, path: apiPrefix + "/lesson/get/" + fixtures.lessonID},
+		{name: "list tasks", method: http.MethodGet, path: apiPrefix + "/task/list?lesson_id=" + fixtures.lessonID},
+	}
+	roles := []string{"ADMIN", "MANAGE", "MODERATOR", "TEACHER", "STUDENT", "GUEST", ""}
+	for _, route := range cases {
+		t.Run(route.name, func(t *testing.T) {
+			for _, role := range roles {
+				resp := performRequest(fixtures.router, route.method, route.path, "", role, "user")
+				if resp.Code != http.StatusOK {
+					t.Fatalf("expected 200 for role %q on %s %s, got %d", role, route.method, route.path, resp.Code)
+				}
+			}
+		})
+	}
+}
+
+func TestAdminGetLesson(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	allowedRoles := []string{"ADMIN", "MODERATOR", "TEACHER"}
+	for _, role := range allowedRoles {
+		t.Run(fmt.Sprintf("get lesson as %s", role), func(t *testing.T) {
+			resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/lesson/get/"+fixtures.lessonID, "", role, "user-allowed")
+			if resp.Code != http.StatusOK {
+				t.Fatalf("expected 200 for role %s on GET /lesson/get/%s, got %d", role, fixtures.lessonID, resp.Code)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			id, ok := payload["id"].(string)
+			if !ok || id != fixtures.lessonID {
+				t.Fatalf("expected lesson id %s, got %v", fixtures.lessonID, payload["id"])
+			}
+		})
+	}
+
+	forbiddenRoles := []string{"STUDENT", "GUEST"}
+	for _, role := range forbiddenRoles {
+		t.Run(fmt.Sprintf("get lesson forbidden for %s", role), func(t *testing.T) {
+			resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/lesson/get/"+fixtures.lessonID, "", role, "user-forbidden")
+			if resp.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for role %s on GET /lesson/get/%s, got %d", role, fixtures.lessonID, resp.Code)
+			}
+		})
+	}
+
+	t.Run("get lesson guest unauthorized", func(t *testing.T) {
+		resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/lesson/get/"+fixtures.lessonID, "", "", "")
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for guest on GET /lesson/get/%s, got %d", fixtures.lessonID, resp.Code)
+		}
+	})
+}
+
+func TestAdminGetTask(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	allowedRoles := []string{"ADMIN", "MODERATOR", "TEACHER"}
+	for _, role := range allowedRoles {
+		t.Run(fmt.Sprintf("get task as %s", role), func(t *testing.T) {
+			resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/task/get/"+fixtures.taskID, "", role, "user-allowed")
+			if resp.Code != http.StatusOK {
+				t.Fatalf("expected 200 for role %s on GET /task/get/%s, got %d", role, fixtures.taskID, resp.Code)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			id, ok := payload["id"].(string)
+			if !ok || id != fixtures.taskID {
+				t.Fatalf("expected task id %s, got %v", fixtures.taskID, payload["id"])
+			}
+		})
+	}
+
+	forbiddenRoles := []string{"STUDENT", "GUEST"}
+	for _, role := range forbiddenRoles {
+		t.Run(fmt.Sprintf("get task forbidden for %s", role), func(t *testing.T) {
+			resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/task/get/"+fixtures.taskID, "", role, "user-forbidden")
+			if resp.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for role %s on GET /task/get/%s, got %d", role, fixtures.taskID, resp.Code)
+			}
+		})
+	}
+
+	t.Run("get task guest unauthorized", func(t *testing.T) {
+		resp := performRequest(fixtures.router, http.MethodGet, adminPrefix+"/task/get/"+fixtures.taskID, "", "", "")
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for guest on GET /task/get/%s, got %d", fixtures.taskID, resp.Code)
+		}
+	})
+}
+
+func TestPublicGetLesson(t *testing.T) {
+	fixtures := newRouterFixtures(t)
+
+	resp := performRequest(fixtures.router, http.MethodGet, apiPrefix+"/lesson/get/"+fixtures.lessonID, "", "", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public lesson get, got %d", resp.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	id, ok := payload["id"].(string)
+	if !ok || id != fixtures.lessonID {
+		t.Fatalf("expected lesson id %s, got %v", fixtures.lessonID, payload["id"])
+	}
+}
+
+type routerFixtures struct {
+	router              http.Handler
+	courseID            string
+	moduleID            string
+	independentModuleID string
+	sectionID           string
+	mainTechID          int
+	techVersionID       int
+	i18nID              int
+	lessonID            string
+	taskID              string
+	codeStructureTypeID string
+	composeConfigs      *fakeComposeConfigRepository
+	lessons             *fakeLessonRepository
+	tasks               *fakeTaskRepository
+	sectionLessons      *fakeSectionLessonRepository
+}
+
+func newRouterFixtures(t *testing.T) routerFixtures {
+	t.Helper()
+
+	validator := validator.New()
+	courseRepo := newFakeCourseRepository()
+	courseModuleRepo := newFakeCourseModuleRepository()
+	moduleSectionRepo := newFakeModuleSectionRepository()
+	moduleRepo := newFakeModuleRepository(courseModuleRepo)
+	moduleI18nRepo := newFakeModuleI18nRepository()
+	sectionRepo := newFakeSectionRepository(moduleSectionRepo)
+	sectionI18nRepo := newFakeSectionI18nRepository()
+	techRepo := newFakeTechRepository()
+	techVersionRepo := newFakeTechVersionRepository()
+	tagRepo := newFakeTagRepository()
+	composeConfigRepo := newFakeComposeConfigRepository()
+	courseI18nRepo := newFakeCourseI18nRepository()
+	i18nRepo := newFakeI18nRepository()
+	courseTechRepo := newFakeCourseTechRepository()
+	composeConfigTechRepo := newFakeComposeConfigTechRepository()
+	courseTagRepo := newFakeCourseTagRepository()
+	sectionLessonRepo := newFakeSectionLessonRepository()
+	lessonRepo := newFakeLessonRepository(sectionRepo, moduleSectionRepo, courseModuleRepo, sectionLessonRepo)
+	lessonVersionRepo := newFakeLessonVersionRepository()
+	lessonI18nRepo := newFakeLessonI18nRepository()
+	taskRepo := newFakeTaskRepository(lessonRepo)
+	taskI18nRepo := newFakeTaskI18nRepository()
+	structureRepo := newFakeCodeStructureTypeRepository()
+	txManager := fakeTxManager{}
+
+	now := time.Now().UTC()
+	courseID := uuid.NewString()
+	moduleID := uuid.NewString()
+	independentModuleID := uuid.NewString()
+	sectionID := uuid.NewString()
+	mainTechID := 1
+	techVersionID := 1
+	i18nID := 1
+	lessonID := uuid.NewString()
+	taskID := uuid.NewString()
+	structureID := uuid.NewString()
+
+	lessonCompose := json.RawMessage(`{"version":"3.9","services":{"app":{"image":"fixture/lesson:latest"}}}`)
+
+	mainTechIDCopy := mainTechID
+	courseRepo.courses[courseID] = domain.Course{
+		ID:             courseID,
+		Slug:           "existing-course",
+		MainTechID:     &mainTechIDCopy,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Status:         domain.CourseStatusActive,
+		CatalogVisible: true,
+	}
+	courseRepo.previews = []domain.CoursePreview{
+		{ID: courseID, Slug: "existing-course", Title: "Existing Title", Description: "Existing Description"},
+	}
+
+	moduleRepo.modules[moduleID] = domain.Module{ID: moduleID, TechID: &mainTechIDCopy, Status: domain.ModuleStatusActive, Visibility: domain.ModuleVisibilityCourseOnly, CreatedAt: now, UpdatedAt: now}
+	moduleRepo.modules[independentModuleID] = domain.Module{ID: independentModuleID, TechID: &mainTechIDCopy, Status: domain.ModuleStatusActive, Visibility: domain.ModuleVisibilityStandalone, CreatedAt: now, UpdatedAt: now}
+	sectionRepo.sections[sectionID] = domain.Section{ID: sectionID, TechID: &mainTechIDCopy, Status: domain.SectionStatusActive, CreatedAt: now, UpdatedAt: now}
+	_ = courseModuleRepo.Add(context.Background(), courseID, moduleID, 0)
+	_ = moduleSectionRepo.Add(context.Background(), moduleID, sectionID, 0)
+
+	_ = techRepo.Create(context.Background(), domain.Tech{ID: mainTechID, Label: "go", CreatedAt: now})
+	techVersionRepo.items[techVersionID] = domain.TechVersion{ID: techVersionID, TechID: mainTechID, Version: "1.0.0", CreatedAt: now}
+	_ = i18nRepo.Create(context.Background(), domain.I18n{ID: i18nID, Language: "ru"})
+	_ = courseI18nRepo.Upsert(context.Background(), domain.CourseI18n{CourseID: courseID, I18nID: i18nID, Title: "Existing Title", Description: "Existing Description"})
+	structureRepo.structures[structureID] = domain.CodeStructureType{ID: structureID, Code: "go", Name: "Go", CreatedAt: now}
+
+	lessonRepo.lessons[lessonID] = domain.Lesson{
+		ID:            lessonID,
+		Title:         "Lesson",
+		Excerpt:       "excerpt",
+		Description:   "desc",
+		ComposeConfig: lessonCompose,
+		Versions:      []domain.LessonVersion{{LessonID: lessonID, TechVersionID: techVersionID, Status: domain.LessonVersionStatusActive, CreatedAt: now}},
+		Order:         1,
+		Status:        domain.LessonStatusActive,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	_ = sectionLessonRepo.Add(context.Background(), sectionID, lessonID, 1)
+	_ = lessonVersionRepo.ReplaceByLesson(context.Background(), lessonID, lessonRepo.lessons[lessonID].Versions)
+
+	taskRepo.tasks[taskID] = domain.Task{
+		ID:                  taskID,
+		LessonID:            lessonID,
+		Title:               "Task",
+		Description:         "desc",
+		Translations:        []domain.TaskI18n{{TaskID: taskID, I18nID: i18nID, Language: "ru", Title: "Task", Description: "desc"}},
+		CodeStructureTypeID: structureID,
+		CodeStructure:       json.RawMessage(taskCodeStructure()),
+		ComposeConfig:       nil,
+		RequiresSandbox:     true,
+		Order:               1,
+		Status:              domain.TaskStatusActive,
+		Version:             1,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+
+	deps := httpadapter.RouterDependencies{
+		CourseHandler: &handlers.CourseHandler{
+			Validator: validator,
+			Logger:    zap.NewNop(),
+			GetUC:     course.GetCourse{Courses: courseRepo, CourseI18n: courseI18nRepo},
+			ListUC:    course.ListCourses{Courses: courseRepo},
+		},
+		ModuleHandler: &handlers.ModuleHandler{
+			Validator: validator,
+			GetUC:     moduleuc.GetModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo},
+			ListUC:    moduleuc.ListModules{Modules: moduleRepo, Courses: courseRepo},
+			Access:    contentaccess.Service{Repository: integrationAllowAllContentAccess{}},
+		},
+		AdminModuleRelationsHandler: &adminhandlers.ModuleRelationsHandler{
+			Validator:         validator,
+			AddSectionUC:      moduleuc.AddModuleSection{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager},
+			ReplaceSectionsUC: moduleuc.ReplaceModuleSections{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager},
+			DeleteSectionUC:   moduleuc.DeleteModuleSection{Modules: moduleRepo, Sections: sectionRepo, ModuleSections: moduleSectionRepo, Tx: txManager},
+		},
+		SectionHandler: &handlers.SectionHandler{
+			Validator: validator,
+			GetUC:     sectionuc.GetSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo},
+			ListUC:    sectionuc.ListSectionsByModule{Sections: sectionRepo, Modules: moduleRepo},
+			Access:    contentaccess.Service{Repository: integrationAllowAllContentAccess{}},
+		},
+		AdminSectionRelationsHandler: &adminhandlers.SectionRelationsHandler{
+			Validator:        validator,
+			AddLessonUC:      sectionuc.AddSectionLesson{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager},
+			ReplaceLessonsUC: sectionuc.ReplaceSectionLessons{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager},
+			DeleteLessonUC:   sectionuc.DeleteSectionLesson{Sections: sectionRepo, Lessons: lessonRepo, SectionLessons: sectionLessonRepo, Tx: txManager},
+		},
+		LessonHandler: &handlers.LessonHandler{
+			Validator: validator,
+			GetUC:     lesson.GetLesson{Lessons: lessonRepo},
+			ListUC:    lesson.ListLessonsByCourse{Courses: courseRepo, Modules: moduleRepo, Sections: sectionRepo, Lessons: lessonRepo},
+			Access:    contentaccess.Service{Repository: integrationAllowAllContentAccess{}},
+		},
+		TaskHandler: &handlers.TaskHandler{
+			Validator:    validator,
+			GetUC:        task.GetTask{Tasks: taskRepo},
+			GetDetailsUC: task.GetTaskDetails{Tasks: taskRepo, Structures: structureRepo},
+			ListUC:       task.ListTasksByLesson{Tasks: taskRepo},
+			Access:       contentaccess.Service{Repository: integrationAllowAllContentAccess{}},
+		},
+		AdminTechHandler:          &adminhandlers.TechHandler{Validator: validator, CreateUC: tech.CreateTech{Techs: techRepo}, GetUC: tech.GetTechByLabel{Techs: techRepo}, GetByIDUC: tech.GetTechByID{Techs: techRepo}, UpdateUC: tech.UpdateTech{Techs: techRepo}, DeleteUC: tech.DeleteTech{Techs: techRepo}, ListUC: tech.ListTechs{Techs: techRepo}},
+		AdminTechVersionHandler:   &adminhandlers.TechVersionHandler{Validator: validator, CreateUC: techversion.CreateTechVersion{TechVersions: techVersionRepo, Techs: techRepo}, UpdateUC: techversion.UpdateTechVersion{TechVersions: techVersionRepo}, DeleteUC: techversion.DeleteTechVersion{TechVersions: techVersionRepo}, ListUC: techversion.ListTechVersions{TechVersions: techVersionRepo}},
+		AdminTagHandler:           &adminhandlers.TagHandler{Validator: validator, CreateUC: tag.CreateTag{Tags: tagRepo}, GetByIDUC: tag.GetTagByID{Tags: tagRepo}, UpdateUC: tag.UpdateTag{Tags: tagRepo}, DeleteUC: tag.DeleteTag{Tags: tagRepo}, ListUC: tag.ListTags{Tags: tagRepo}},
+		AdminComposeConfigHandler: &adminhandlers.ComposeConfigHandler{Validator: validator, CreateUC: composeconfig.CreateComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo, Tx: txManager}, GetUC: composeconfig.GetComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo}, UpdateUC: composeconfig.UpdateComposeConfig{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo, Tx: txManager}, ListUC: composeconfig.ListComposeConfigs{ComposeConfigs: composeConfigRepo, ComposeConfigTechs: composeConfigTechRepo}, DeleteUC: composeconfig.DeleteComposeConfig{ComposeConfigs: composeConfigRepo}},
+		AdminCourseI18nHandler:    &adminhandlers.CourseI18nHandler{Validator: validator, UpsertUC: course.UpsertCourseI18n{Courses: courseRepo, CourseI18n: courseI18nRepo, I18n: i18nRepo, Tx: txManager}, DeleteUC: course.DeleteCourseI18n{CourseI18n: courseI18nRepo}, ListUC: course.ListI18n{I18n: i18nRepo}, ListByCourseUC: course.ListCourseI18n{Courses: courseRepo, CourseI18n: courseI18nRepo}},
+		AdminCourseRelationsHandler: &adminhandlers.CourseRelationsHandler{
+			Validator:        validator,
+			UpdateTagsUC:     course.UpdateCourseTags{Courses: courseRepo, Tags: courseTagRepo, Tx: txManager},
+			UpdateTechsUC:    course.UpdateCourseTechs{Courses: courseRepo, Techs: courseTechRepo, Tx: txManager},
+			AddModuleUC:      course.AddCourseModule{Courses: courseRepo, Modules: moduleRepo, CourseModules: courseModuleRepo, Tx: txManager},
+			ReplaceModulesUC: course.ReplaceCourseModules{Courses: courseRepo, Modules: moduleRepo, CourseModules: courseModuleRepo, Tx: txManager},
+			DeleteModuleUC: course.DeleteCourseModule{
+				Courses:       courseRepo,
+				Modules:       moduleRepo,
+				CourseModules: courseModuleRepo,
+				Tx:            txManager,
+			},
+		},
+		PositionHandler:               &handlers.PositionHandler{Validator: validator},
+		AdminPositionRelationsHandler: &adminhandlers.PositionRelationsHandler{Validator: validator},
+		AdminCodeStructureTypeHandler: &adminhandlers.CodeStructureTypeHandler{Validator: validator, ListUC: codestructuretype.ListCodeStructureTypes{Structures: structureRepo}},
+	}
+	deps.AdminCourseHandler = &adminhandlers.CourseHandler{Validator: validator, Logger: zap.NewNop(), CreateUC: course.CreateCourse{Courses: courseRepo, Publisher: nopPublisher{}, Tx: txManager}, UpdateUC: course.UpdateCourse{Courses: courseRepo, Lessons: lessonRepo, Publisher: nopPublisher{}, Tx: txManager}, DeleteUC: course.DeleteCourse{Courses: courseRepo, Publisher: nopPublisher{}}, GetUC: deps.CourseHandler.GetUC, ListUC: deps.CourseHandler.ListUC}
+	deps.AdminModuleHandler = &adminhandlers.ModuleHandler{Validator: validator, CreateUC: moduleuc.CreateModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}, UpdateUC: moduleuc.UpdateModule{Modules: moduleRepo, ModuleI18n: moduleI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}, DeleteUC: moduleuc.DeleteModule{Modules: moduleRepo}, GetUC: deps.ModuleHandler.GetUC, ListUC: deps.ModuleHandler.ListUC, Access: deps.ModuleHandler.Access}
+	deps.AdminSectionHandler = &adminhandlers.SectionHandler{Validator: validator, CreateUC: sectionuc.CreateSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}, UpdateUC: sectionuc.UpdateSection{Sections: sectionRepo, SectionI18n: sectionI18nRepo, Techs: techRepo, I18n: i18nRepo, Tx: txManager}, DeleteUC: sectionuc.DeleteSection{Sections: sectionRepo}, GetUC: deps.SectionHandler.GetUC, ListUC: deps.SectionHandler.ListUC, Access: deps.SectionHandler.Access}
+	deps.AdminLessonHandler = &adminhandlers.LessonHandler{Validator: validator, CreateUC: lesson.CreateLesson{Lessons: lessonRepo, LessonVersions: lessonVersionRepo, LessonI18n: lessonI18nRepo, Tasks: taskRepo, TechVersions: techVersionRepo, ComposeConfigs: composeConfigRepo, Tx: txManager}, UpdateUC: lesson.UpdateLesson{Courses: courseRepo, Lessons: lessonRepo, LessonVersions: lessonVersionRepo, LessonI18n: lessonI18nRepo, Tasks: taskRepo, TechVersions: techVersionRepo, ComposeConfigs: composeConfigRepo, Tx: txManager}, DeleteUC: lesson.DeleteLesson{Lessons: lessonRepo}, GetUC: deps.LessonHandler.GetUC, ListUC: deps.LessonHandler.ListUC, Access: deps.LessonHandler.Access}
+	deps.AdminTaskHandler = &adminhandlers.TaskHandler{Validator: validator, CreateUC: task.CreateTask{Tasks: taskRepo, Lessons: lessonRepo, TaskI18n: taskI18nRepo, Publisher: nopPublisher{}, StructureRes: structureRepo, ComposeConfigs: composeConfigRepo, Tx: txManager}, UpdateUC: task.UpdateTask{Tasks: taskRepo, Lessons: lessonRepo, TaskI18n: taskI18nRepo, Publisher: nopPublisher{}, ComposeConfigs: composeConfigRepo, StructureRes: structureRepo, Tx: txManager}, DeleteUC: task.DeleteTask{Tasks: taskRepo, Publisher: nopPublisher{}}, GetUC: deps.TaskHandler.GetUC, GetDetailsUC: deps.TaskHandler.GetDetailsUC, ListUC: deps.TaskHandler.ListUC, Access: deps.TaskHandler.Access}
+	deps.AdminPositionHandler = &adminhandlers.PositionHandler{Validator: validator}
+	deps.PrivateTaskHandler = &privatehandlers.TaskHandler{GetDetailsUC: task.GetTaskDetails{Tasks: taskRepo, Structures: structureRepo}, GetInternalCourseStructureUC: task.GetInternalCourseStructure{Lessons: lessonRepo, Tasks: taskRepo}}
+	deps.PrivateLessonHandler = &privatehandlers.LessonHandler{GetUC: deps.LessonHandler.GetUC}
+
+	return routerFixtures{
+		router:              httpadapter.NewRouter(deps),
+		courseID:            courseID,
+		moduleID:            moduleID,
+		independentModuleID: independentModuleID,
+		sectionID:           sectionID,
+		mainTechID:          mainTechID,
+		techVersionID:       techVersionID,
+		i18nID:              i18nID,
+		lessonID:            lessonID,
+		taskID:              taskID,
+		codeStructureTypeID: structureID,
+		composeConfigs:      composeConfigRepo,
+		lessons:             lessonRepo,
+		tasks:               taskRepo,
+		sectionLessons:      sectionLessonRepo,
+	}
+}
+
+func createTaskBody(fixtures routerFixtures, lessonID string) string {
+	return fmt.Sprintf(`{"title":"Task","description":"desc","translations":[{"i18n_id":%d,"title":"Task","description":"desc"}],"code_structure_type_id":"%s","code_structure":%s,"compose_config":{"version":"3.9","services":{"app":{"image":"auth/task:latest"}}},"order":1,"lesson_id":"%s"}`,
+		fixtures.i18nID,
+		fixtures.codeStructureTypeID,
+		taskCodeStructure(),
+		lessonID,
+	)
+}
+
+func updateTaskBody(fixtures routerFixtures) string {
+	return fmt.Sprintf(`{"title":"Task updated","description":"updated","translations":[{"i18n_id":%d,"title":"Task updated","description":"updated"}],"code_structure":%s,"compose_config":{"version":"3.9","services":{"app":{"image":"auth/task-updated:latest"}}},"order":2,"status":1}`,
+		fixtures.i18nID,
+		taskCodeStructure(),
+	)
+}
+
+func taskCodeStructure() string {
+	return `{"version":1,"kind":"workspace_contract","workspace":{"required_files":["main.go"]},"stages":[{"id":"source","engine":"ts.ast","targets":{"files":["main.go"]}}],"links":[]}`
+}
+
+func performRequest(router http.Handler, method, path, body, role, userID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set("X-User-ID", userID)
+	}
+	if role != "" {
+		req.Header.Set("X-User-Role", role)
+	}
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	return resp
+}
+
+type fakeCourseRepository struct {
+	courses  map[string]domain.Course
+	previews []domain.CoursePreview
+}
+
+type integrationAllowAllContentAccess struct{}
+
+func (integrationAllowAllContentAccess) CanViewCourse(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewModule(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewSection(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewLesson(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewTask(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewExample(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewLessonViaRelation(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewTaskViaRelation(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (integrationAllowAllContentAccess) CanViewExampleViaRelation(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func newFakeCourseRepository() *fakeCourseRepository {
+	return &fakeCourseRepository{courses: map[string]domain.Course{}, previews: []domain.CoursePreview{}}
+}
+
+func (r *fakeCourseRepository) Create(_ repository.Context, course domain.Course) error {
+	r.courses[course.ID] = course
+	r.previews = append(r.previews, domain.CoursePreview{ID: course.ID, Slug: course.Slug, Title: course.Slug, Description: ""})
+	return nil
+}
+
+func (r *fakeCourseRepository) GetBySlug(_ repository.Context, slug string) (*domain.Course, error) {
+	for _, c := range r.courses {
+		if c.Slug == slug {
+			copy := c
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeCourseRepository) GetByID(_ repository.Context, id string) (*domain.Course, error) {
+	course, ok := r.courses[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := course
+	return &copy, nil
+}
+
+func (r *fakeCourseRepository) GetByIDWithFields(_ repository.Context, id string, _ queryfields.Set) (map[string]any, error) {
+	course, ok := r.courses[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return map[string]any{
+		"id":           course.ID,
+		"slug":         course.Slug,
+		"title":        "Existing Title",
+		"description":  "Existing Description",
+		"tags":         []any{},
+		"lesson_count": 1,
+		"techs":        []any{},
+	}, nil
+}
+
+func (r *fakeCourseRepository) Update(_ repository.Context, course domain.Course) error {
+	if _, ok := r.courses[course.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.courses[course.ID] = course
+	return nil
+}
+
+func (r *fakeCourseRepository) Delete(_ repository.Context, courseID string) error {
+	delete(r.courses, courseID)
+	return nil
+}
+
+func (r *fakeCourseRepository) List(_ repository.Context, _ string, courseFilters filters.CourseFilters, _ *filters.SortOptions) ([]domain.CoursePreview, error) {
+	result := make([]domain.CoursePreview, 0, len(r.previews))
+	for _, preview := range r.previews {
+		if !r.matchesFilters(preview, courseFilters) {
+			continue
+		}
+		result = append(result, preview)
+	}
+	return result, nil
+}
+
+func (r *fakeCourseRepository) ListFields(_ repository.Context, _ string, _ queryfields.Set, courseFilters filters.CourseFilters, _ *filters.SortOptions) ([]map[string]any, int, error) {
+	result := make([]map[string]any, 0, len(r.previews))
+	for _, preview := range r.previews {
+		if !r.matchesFilters(preview, courseFilters) {
+			continue
+		}
+		result = append(result, map[string]any{
+			"id":          preview.ID,
+			"slug":        preview.Slug,
+			"title":       preview.Title,
+			"description": preview.Description,
+		})
+	}
+	return result, len(result), nil
+}
+
+func (r *fakeCourseRepository) matchesFilters(preview domain.CoursePreview, courseFilters filters.CourseFilters) bool {
+	if courseFilters.ID != nil && preview.ID != *courseFilters.ID {
+		return false
+	}
+	if courseFilters.Slug != nil && preview.Slug != *courseFilters.Slug {
+		return false
+	}
+	if courseFilters.Status != nil {
+		course, ok := r.courses[preview.ID]
+		if !ok || course.Status != *courseFilters.Status {
+			return false
+		}
+	}
+	if courseFilters.Title != nil && !containsIgnoreCase(preview.Title, *courseFilters.Title) {
+		return false
+	}
+	return true
+}
+
+func containsIgnoreCase(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+type fakeCourseI18nRepository struct {
+	items []domain.CourseI18n
+}
+
+func newFakeCourseI18nRepository() *fakeCourseI18nRepository {
+	return &fakeCourseI18nRepository{items: []domain.CourseI18n{}}
+}
+
+func (r *fakeCourseI18nRepository) Upsert(_ repository.Context, entry domain.CourseI18n) error {
+	for idx, item := range r.items {
+		if item.CourseID == entry.CourseID && item.I18nID == entry.I18nID {
+			r.items[idx] = entry
+			return nil
+		}
+	}
+	r.items = append(r.items, entry)
+	return nil
+}
+
+func (r *fakeCourseI18nRepository) GetByCourseAndLang(_ repository.Context, courseID string, _ string) (*domain.CourseI18n, error) {
+	for _, item := range r.items {
+		if item.CourseID == courseID {
+			copy := item
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeCourseI18nRepository) ListByCourse(_ repository.Context, courseID string) ([]domain.CourseI18n, error) {
+	result := []domain.CourseI18n{}
+	for _, item := range r.items {
+		if item.CourseID == courseID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeCourseI18nRepository) CountByCourse(_ repository.Context, courseID string) (int, error) {
+	items, _ := r.ListByCourse(context.Background(), courseID)
+	return len(items), nil
+}
+
+func (r *fakeCourseI18nRepository) DeleteByCourse(_ repository.Context, courseID string, i18nID int) error {
+	for idx, item := range r.items {
+		if item.CourseID == courseID && item.I18nID == i18nID {
+			r.items = append(r.items[:idx], r.items[idx+1:]...)
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+type fakeModuleRepository struct {
+	modules map[string]domain.Module
+	links   *fakeCourseModuleRepository
+}
+
+func newFakeModuleRepository(links *fakeCourseModuleRepository) *fakeModuleRepository {
+	return &fakeModuleRepository{modules: map[string]domain.Module{}, links: links}
+}
+
+func (r *fakeModuleRepository) Create(_ repository.Context, module domain.Module) error {
+	r.modules[module.ID] = module
+	return nil
+}
+
+func (r *fakeModuleRepository) Get(_ repository.Context, id string) (*domain.Module, error) {
+	module, ok := r.modules[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := module
+	return &copy, nil
+}
+
+func (r *fakeModuleRepository) Update(_ repository.Context, module domain.Module) error {
+	if _, ok := r.modules[module.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.modules[module.ID] = module
+	return nil
+}
+
+func (r *fakeModuleRepository) Delete(_ repository.Context, id string) error {
+	module, ok := r.modules[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	module.Status = domain.ModuleStatusNoActive
+	r.modules[id] = module
+	return nil
+}
+
+func (r *fakeModuleRepository) List(_ repository.Context, filter filters.ModuleFilters) ([]domain.Module, error) {
+	var result []domain.Module
+	switch {
+	case filter.CourseID != "":
+		result, _ = r.ListByCourse(context.Background(), filter.CourseID)
+	case filter.Scope == "independent" || filter.Scope == "standalone":
+		result, _ = r.ListIndependent(context.Background())
+	case filter.Scope == "" || filter.Scope == "all" || filter.Scope == "content" || filter.Scope == "course_only" || filter.Scope == "both" || filter.Scope == "internal":
+		result, _ = r.ListAll(context.Background())
+		result = filterFakeModulesByScope(result, filter.Scope)
+	default:
+		return nil, domain.ErrValidation
+	}
+	filtered := make([]domain.Module, 0, len(result))
+	for _, module := range result {
+		if filter.TechID != nil && (module.TechID == nil || *module.TechID != *filter.TechID) {
+			continue
+		}
+		if filter.ActiveOnly && module.Status != domain.ModuleStatusActive {
+			continue
+		}
+		filtered = append(filtered, module)
+	}
+	return filtered, nil
+}
+
+func (r *fakeModuleRepository) ListAll(_ repository.Context) ([]domain.Module, error) {
+	result := make([]domain.Module, 0, len(r.modules))
+	for _, module := range r.modules {
+		result = append(result, module)
+	}
+	return result, nil
+}
+
+func (r *fakeModuleRepository) ListIndependent(_ repository.Context) ([]domain.Module, error) {
+	result := make([]domain.Module, 0, len(r.modules))
+	for _, module := range r.modules {
+		if module.Visibility == domain.ModuleVisibilityStandalone || module.Visibility == domain.ModuleVisibilityBoth {
+			result = append(result, module)
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeModuleRepository) ListByCourse(_ repository.Context, courseID string) ([]domain.Module, error) {
+	ids := r.links.moduleIDs(courseID)
+	result := make([]domain.Module, 0, len(ids))
+	for _, id := range ids {
+		if module, ok := r.modules[id]; ok {
+			result = append(result, module)
+		}
+	}
+	return result, nil
+}
+
+func filterFakeModulesByScope(items []domain.Module, scope string) []domain.Module {
+	if scope == "" || scope == "all" {
+		return items
+	}
+	result := make([]domain.Module, 0, len(items))
+	for _, item := range items {
+		switch scope {
+		case "content":
+			if item.Visibility != domain.ModuleVisibilityInternal {
+				result = append(result, item)
+			}
+		case "course_only":
+			if item.Visibility == domain.ModuleVisibilityCourseOnly {
+				result = append(result, item)
+			}
+		case "both":
+			if item.Visibility == domain.ModuleVisibilityBoth {
+				result = append(result, item)
+			}
+		case "internal":
+			if item.Visibility == domain.ModuleVisibilityInternal {
+				result = append(result, item)
+			}
+		}
+	}
+	return result
+}
+
+type fakeModuleI18nRepository struct {
+	items []domain.ModuleI18n
+}
+
+func newFakeModuleI18nRepository() *fakeModuleI18nRepository {
+	return &fakeModuleI18nRepository{items: []domain.ModuleI18n{}}
+}
+
+func (r *fakeModuleI18nRepository) Upsert(_ repository.Context, entry domain.ModuleI18n) error {
+	for idx, item := range r.items {
+		if item.ModuleID == entry.ModuleID && item.I18nID == entry.I18nID {
+			r.items[idx] = entry
+			return nil
+		}
+	}
+	r.items = append(r.items, entry)
+	return nil
+}
+
+func (r *fakeModuleI18nRepository) ListByModule(_ repository.Context, moduleID string) ([]domain.ModuleI18n, error) {
+	result := []domain.ModuleI18n{}
+	for _, item := range r.items {
+		if item.ModuleID == moduleID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeModuleI18nRepository) Delete(_ repository.Context, moduleID string, i18nID int) error {
+	for idx, item := range r.items {
+		if item.ModuleID == moduleID && item.I18nID == i18nID {
+			r.items = append(r.items[:idx], r.items[idx+1:]...)
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+type fakeSectionRepository struct {
+	sections map[string]domain.Section
+	links    *fakeModuleSectionRepository
+}
+
+func newFakeSectionRepository(links *fakeModuleSectionRepository) *fakeSectionRepository {
+	return &fakeSectionRepository{sections: map[string]domain.Section{}, links: links}
+}
+
+func (r *fakeSectionRepository) Create(_ repository.Context, section domain.Section) error {
+	r.sections[section.ID] = section
+	return nil
+}
+
+func (r *fakeSectionRepository) Get(_ repository.Context, id string) (*domain.Section, error) {
+	section, ok := r.sections[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := section
+	return &copy, nil
+}
+
+func (r *fakeSectionRepository) Update(_ repository.Context, section domain.Section) error {
+	if _, ok := r.sections[section.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.sections[section.ID] = section
+	return nil
+}
+
+func (r *fakeSectionRepository) Delete(_ repository.Context, id string) error {
+	section, ok := r.sections[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	section.Status = domain.SectionStatusNoActive
+	r.sections[id] = section
+	return nil
+}
+
+func (r *fakeSectionRepository) ListAll(_ repository.Context) ([]domain.Section, error) {
+	result := make([]domain.Section, 0, len(r.sections))
+	for _, section := range r.sections {
+		result = append(result, section)
+	}
+	return result, nil
+}
+
+func (r *fakeSectionRepository) ListByModule(_ repository.Context, moduleID string) ([]domain.Section, error) {
+	ids := r.links.sectionIDs(moduleID)
+	result := make([]domain.Section, 0, len(ids))
+	for _, id := range ids {
+		if section, ok := r.sections[id]; ok {
+			result = append(result, section)
+		}
+	}
+	return result, nil
+}
+
+type fakeSectionI18nRepository struct {
+	items []domain.SectionI18n
+}
+
+func newFakeSectionI18nRepository() *fakeSectionI18nRepository {
+	return &fakeSectionI18nRepository{items: []domain.SectionI18n{}}
+}
+
+func (r *fakeSectionI18nRepository) Upsert(_ repository.Context, entry domain.SectionI18n) error {
+	for idx, item := range r.items {
+		if item.SectionID == entry.SectionID && item.I18nID == entry.I18nID {
+			r.items[idx] = entry
+			return nil
+		}
+	}
+	r.items = append(r.items, entry)
+	return nil
+}
+
+func (r *fakeSectionI18nRepository) ListBySection(_ repository.Context, sectionID string) ([]domain.SectionI18n, error) {
+	result := []domain.SectionI18n{}
+	for _, item := range r.items {
+		if item.SectionID == sectionID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeSectionI18nRepository) Delete(_ repository.Context, sectionID string, i18nID int) error {
+	for idx, item := range r.items {
+		if item.SectionID == sectionID && item.I18nID == i18nID {
+			r.items = append(r.items[:idx], r.items[idx+1:]...)
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+type fakeCourseModuleRepository struct {
+	links map[string][]string
+}
+
+func newFakeCourseModuleRepository() *fakeCourseModuleRepository {
+	return &fakeCourseModuleRepository{links: map[string][]string{}}
+}
+
+func (r *fakeCourseModuleRepository) ReplaceByCourse(_ repository.Context, courseID string, items []domain.CatalogRelationOrder) error {
+	r.links[courseID] = nil
+	for _, item := range items {
+		r.links[courseID] = append(r.links[courseID], item.ChildID)
+	}
+	return nil
+}
+
+func (r *fakeCourseModuleRepository) Add(_ repository.Context, courseID string, moduleID string, _ int) error {
+	for _, existing := range r.links[courseID] {
+		if existing == moduleID {
+			return nil
+		}
+	}
+	r.links[courseID] = append(r.links[courseID], moduleID)
+	return nil
+}
+
+func (r *fakeCourseModuleRepository) Delete(_ repository.Context, courseID string, moduleID string) error {
+	items := r.links[courseID]
+	for idx, existing := range items {
+		if existing == moduleID {
+			r.links[courseID] = append(items[:idx], items[idx+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (r *fakeCourseModuleRepository) moduleIDs(courseID string) []string {
+	return append([]string(nil), r.links[courseID]...)
+}
+
+func (r *fakeCourseModuleRepository) courseIDForModule(moduleID string) string {
+	for courseID, modules := range r.links {
+		for _, current := range modules {
+			if current == moduleID {
+				return courseID
+			}
+		}
+	}
+	return ""
+}
+
+type fakeModuleSectionRepository struct {
+	links map[string][]string
+}
+
+func newFakeModuleSectionRepository() *fakeModuleSectionRepository {
+	return &fakeModuleSectionRepository{links: map[string][]string{}}
+}
+
+func (r *fakeModuleSectionRepository) ReplaceByModule(_ repository.Context, moduleID string, items []domain.CatalogRelationOrder) error {
+	r.links[moduleID] = nil
+	for _, item := range items {
+		r.links[moduleID] = append(r.links[moduleID], item.ChildID)
+	}
+	return nil
+}
+
+func (r *fakeModuleSectionRepository) Add(_ repository.Context, moduleID string, sectionID string, _ int) error {
+	for _, existing := range r.links[moduleID] {
+		if existing == sectionID {
+			return nil
+		}
+	}
+	r.links[moduleID] = append(r.links[moduleID], sectionID)
+	return nil
+}
+
+func (r *fakeModuleSectionRepository) Delete(_ repository.Context, moduleID string, sectionID string) error {
+	items := r.links[moduleID]
+	for idx, existing := range items {
+		if existing == sectionID {
+			r.links[moduleID] = append(items[:idx], items[idx+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (r *fakeModuleSectionRepository) sectionIDs(moduleID string) []string {
+	return append([]string(nil), r.links[moduleID]...)
+}
+
+func (r *fakeModuleSectionRepository) moduleIDForSection(sectionID string) string {
+	for moduleID, sections := range r.links {
+		for _, current := range sections {
+			if current == sectionID {
+				return moduleID
+			}
+		}
+	}
+	return ""
+}
+
+type fakeTechRepository struct {
+	techs map[int]domain.Tech
+}
+
+func newFakeTechRepository() *fakeTechRepository {
+	return &fakeTechRepository{techs: map[int]domain.Tech{}}
+}
+
+func (r *fakeTechRepository) Create(_ repository.Context, tech domain.Tech) error {
+	r.techs[tech.ID] = tech
+	return nil
+}
+
+func (r *fakeTechRepository) GetByLabel(_ repository.Context, label string) (*domain.Tech, error) {
+	for _, t := range r.techs {
+		if t.Label == label {
+			copy := t
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeTechRepository) GetByID(_ repository.Context, id int) (*domain.Tech, error) {
+	tech, ok := r.techs[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := tech
+	return &copy, nil
+}
+
+func (r *fakeTechRepository) Update(_ repository.Context, tech domain.Tech) error {
+	if _, ok := r.techs[tech.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.techs[tech.ID] = tech
+	return nil
+}
+
+func (r *fakeTechRepository) Delete(_ repository.Context, id int) error {
+	if _, ok := r.techs[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.techs, id)
+	return nil
+}
+
+func (r *fakeTechRepository) List(_ repository.Context, filter filters.TechFilters) ([]domain.Tech, int, error) {
+	items := make([]domain.Tech, 0, len(r.techs))
+	for _, t := range r.techs {
+		if filter.Query != nil && *filter.Query != "" && !strings.Contains(strings.ToLower(t.Label), strings.ToLower(*filter.Query)) {
+			continue
+		}
+		items = append(items, t)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+	return items, len(items), nil
+}
+
+type fakeTechVersionRepository struct {
+	items map[int]domain.TechVersion
+}
+
+func newFakeTechVersionRepository() *fakeTechVersionRepository {
+	return &fakeTechVersionRepository{items: map[int]domain.TechVersion{}}
+}
+
+func (r *fakeTechVersionRepository) Create(_ repository.Context, version domain.TechVersion) error {
+	r.items[version.ID] = version
+	return nil
+}
+
+func (r *fakeTechVersionRepository) GetByID(_ repository.Context, id int) (*domain.TechVersion, error) {
+	item, ok := r.items[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := item
+	return &copy, nil
+}
+
+func (r *fakeTechVersionRepository) GetByTechAndVersion(_ repository.Context, techID int, version string) (*domain.TechVersion, error) {
+	for _, item := range r.items {
+		if item.TechID == techID && item.Version == version {
+			copy := item
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeTechVersionRepository) Update(_ repository.Context, version domain.TechVersion) error {
+	if _, ok := r.items[version.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.items[version.ID] = version
+	return nil
+}
+
+func (r *fakeTechVersionRepository) Delete(_ repository.Context, id int) error {
+	if _, ok := r.items[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.items, id)
+	return nil
+}
+
+func (r *fakeTechVersionRepository) List(_ repository.Context, _ filters.TechVersionFilters) ([]domain.TechVersion, int, error) {
+	list := make([]domain.TechVersion, 0, len(r.items))
+	for _, item := range r.items {
+		list = append(list, item)
+	}
+	return list, len(list), nil
+}
+
+type fakeTagRepository struct {
+	tags map[int]domain.Tag
+}
+
+func newFakeTagRepository() *fakeTagRepository {
+	return &fakeTagRepository{tags: map[int]domain.Tag{}}
+}
+
+func (r *fakeTagRepository) Create(_ repository.Context, tag domain.Tag) error {
+	r.tags[tag.ID] = tag
+	return nil
+}
+
+func (r *fakeTagRepository) GetByID(_ repository.Context, id int) (*domain.Tag, error) {
+	tag, ok := r.tags[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := tag
+	return &copy, nil
+}
+
+func (r *fakeTagRepository) GetBySlug(_ repository.Context, slug string) (*domain.Tag, error) {
+	for _, tag := range r.tags {
+		if tag.Slug == slug {
+			copy := tag
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeTagRepository) Update(_ repository.Context, tag domain.Tag) error {
+	if _, ok := r.tags[tag.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.tags[tag.ID] = tag
+	return nil
+}
+
+func (r *fakeTagRepository) Delete(_ repository.Context, id int) error {
+	if _, ok := r.tags[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.tags, id)
+	return nil
+}
+
+func (r *fakeTagRepository) List(_ repository.Context, _ filters.TagFilters) ([]domain.Tag, int, error) {
+	items := make([]domain.Tag, 0, len(r.tags))
+	for _, tag := range r.tags {
+		items = append(items, tag)
+	}
+	return items, len(items), nil
+}
+
+type fakeComposeConfigRepository struct {
+	configs map[string]domain.ComposeConfig
+}
+
+func newFakeComposeConfigRepository() *fakeComposeConfigRepository {
+	return &fakeComposeConfigRepository{configs: map[string]domain.ComposeConfig{}}
+}
+
+func (r *fakeComposeConfigRepository) Create(_ repository.Context, cfg domain.ComposeConfig) error {
+	r.configs[cfg.ID] = cfg
+	return nil
+}
+
+func (r *fakeComposeConfigRepository) GetByID(_ repository.Context, id string) (*domain.ComposeConfig, error) {
+	cfg, ok := r.configs[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := cfg
+	return &copy, nil
+}
+
+func (r *fakeComposeConfigRepository) GetByConfig(_ repository.Context, config []byte) (*domain.ComposeConfig, error) {
+	for _, cfg := range r.configs {
+		if string(cfg.Config) == string(config) {
+			copy := cfg
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeComposeConfigRepository) Update(_ repository.Context, cfg domain.ComposeConfig) error {
+	if _, ok := r.configs[cfg.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.configs[cfg.ID] = cfg
+	return nil
+}
+
+func (r *fakeComposeConfigRepository) List(_ repository.Context, _ filters.ComposeConfigFilters) ([]domain.ComposeConfig, int, error) {
+	items := make([]domain.ComposeConfig, 0, len(r.configs))
+	for _, cfg := range r.configs {
+		items = append(items, cfg)
+	}
+	return items, len(items), nil
+}
+
+func (r *fakeComposeConfigRepository) Delete(_ repository.Context, id string) error {
+	if _, ok := r.configs[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.configs, id)
+	return nil
+}
+
+type fakeI18nRepository struct {
+	items map[int]domain.I18n
+	langs map[string]domain.I18n
+}
+
+func newFakeI18nRepository() *fakeI18nRepository {
+	return &fakeI18nRepository{items: map[int]domain.I18n{}, langs: map[string]domain.I18n{}}
+}
+
+func (r *fakeI18nRepository) Create(_ repository.Context, entry domain.I18n) error {
+	r.items[entry.ID] = entry
+	r.langs[entry.Language] = entry
+	return nil
+}
+
+func (r *fakeI18nRepository) GetByID(_ repository.Context, id int) (*domain.I18n, error) {
+	entry, ok := r.items[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := entry
+	return &copy, nil
+}
+
+func (r *fakeI18nRepository) GetByLanguage(_ repository.Context, language string) (*domain.I18n, error) {
+	entry, ok := r.langs[language]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := entry
+	return &copy, nil
+}
+
+func (r *fakeI18nRepository) List(_ repository.Context) ([]domain.I18n, error) {
+	result := make([]domain.I18n, 0, len(r.items))
+	for _, entry := range r.items {
+		result = append(result, entry)
+	}
+	return result, nil
+}
+
+type fakeCourseTechRepository struct{}
+
+func newFakeCourseTechRepository() *fakeCourseTechRepository { return &fakeCourseTechRepository{} }
+
+func (r *fakeCourseTechRepository) Add(_ repository.Context, _ string, _ int) error { return nil }
+
+func (r *fakeCourseTechRepository) Replace(_ repository.Context, _ string, _ []int) error {
+	return nil
+}
+
+type fakeComposeConfigTechRepository struct{}
+
+func newFakeComposeConfigTechRepository() *fakeComposeConfigTechRepository {
+	return &fakeComposeConfigTechRepository{}
+}
+
+func (r *fakeComposeConfigTechRepository) Add(_ repository.Context, _ string, _ int) error {
+	return nil
+}
+
+func (r *fakeComposeConfigTechRepository) Replace(_ repository.Context, _ string, _ []int) error {
+	return nil
+}
+
+func (r *fakeComposeConfigTechRepository) ListTechIDs(_ repository.Context, _ string) ([]int, error) {
+	return []int{}, nil
+}
+
+type fakeCourseTagRepository struct{}
+
+func newFakeCourseTagRepository() *fakeCourseTagRepository { return &fakeCourseTagRepository{} }
+
+func (r *fakeCourseTagRepository) Replace(_ repository.Context, _ string, _ []int) error {
+	return nil
+}
+
+type fakeSectionLessonRepository struct {
+	placements map[string]map[string]int
+}
+
+func newFakeSectionLessonRepository() *fakeSectionLessonRepository {
+	return &fakeSectionLessonRepository{placements: map[string]map[string]int{}}
+}
+
+func (r *fakeSectionLessonRepository) ReplaceBySection(_ repository.Context, sectionID string, items []domain.CatalogRelationOrder) error {
+	r.placements[sectionID] = map[string]int{}
+	for _, item := range items {
+		r.placements[sectionID][item.ChildID] = item.Order
+	}
+	return nil
+}
+
+func (r *fakeSectionLessonRepository) Add(_ repository.Context, sectionID string, lessonID string, order int) error {
+	if r.placements[sectionID] == nil {
+		r.placements[sectionID] = map[string]int{}
+	}
+	r.placements[sectionID][lessonID] = order
+	return nil
+}
+
+func (r *fakeSectionLessonRepository) Delete(_ repository.Context, sectionID string, lessonID string) error {
+	if r.placements[sectionID] != nil {
+		delete(r.placements[sectionID], lessonID)
+	}
+	return nil
+}
+
+func (r *fakeSectionLessonRepository) firstPlacement(lessonID string) (string, int) {
+	for sectionID, lessons := range r.placements {
+		if order, ok := lessons[lessonID]; ok {
+			return sectionID, order
+		}
+	}
+	return "", 0
+}
+
+type fakeLessonRepository struct {
+	lessons        map[string]domain.Lesson
+	sections       *fakeSectionRepository
+	moduleSections *fakeModuleSectionRepository
+	courseModules  *fakeCourseModuleRepository
+	sectionLessons *fakeSectionLessonRepository
+}
+
+func newFakeLessonRepository(sections *fakeSectionRepository, moduleSections *fakeModuleSectionRepository, courseModules *fakeCourseModuleRepository, sectionLessons *fakeSectionLessonRepository) *fakeLessonRepository {
+	return &fakeLessonRepository{
+		lessons:        map[string]domain.Lesson{},
+		sections:       sections,
+		moduleSections: moduleSections,
+		courseModules:  courseModules,
+		sectionLessons: sectionLessons,
+	}
+}
+
+func (r *fakeLessonRepository) Create(_ repository.Context, lesson domain.Lesson) error {
+	r.lessons[lesson.ID] = lesson
+	return nil
+}
+
+func (r *fakeLessonRepository) Get(_ repository.Context, id string) (*domain.Lesson, error) {
+	lesson, ok := r.lessons[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := r.withFirstPlacement(lesson)
+	return &copy, nil
+}
+
+func (r *fakeLessonRepository) GetWithFields(_ repository.Context, id string, _ queryfields.Set) (map[string]any, error) {
+	lesson, ok := r.lessons[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	lesson = r.withFirstPlacement(lesson)
+	return map[string]any{
+		"id":          lesson.ID,
+		"section_id":  lesson.SectionID,
+		"module_id":   lesson.ModuleID,
+		"course_id":   lesson.CourseID,
+		"title":       lesson.Title,
+		"excerpt":     lesson.Excerpt,
+		"description": lesson.Description,
+		"order":       lesson.Order,
+		"status":      lesson.Status,
+		"versions":    lesson.Versions,
+	}, nil
+}
+
+func (r *fakeLessonRepository) Update(_ repository.Context, lesson domain.Lesson) error {
+	existing, ok := r.lessons[lesson.ID]
+	if ok && lesson.SectionID == "" {
+		lesson.SectionID = existing.SectionID
+	}
+	if ok && lesson.CourseID == "" {
+		lesson.CourseID = existing.CourseID
+	}
+	if ok && lesson.Order == 0 {
+		lesson.Order = existing.Order
+	}
+	r.lessons[lesson.ID] = lesson
+	return nil
+}
+
+func (r *fakeLessonRepository) Delete(_ repository.Context, lessonID string) error {
+	delete(r.lessons, lessonID)
+	return nil
+}
+
+func (r *fakeLessonRepository) ListByCourse(_ repository.Context, courseID string) ([]domain.Lesson, error) {
+	var list []domain.Lesson
+	for sectionID, lessons := range r.sectionLessons.placements {
+		if r.courseIDForSection(sectionID) != courseID {
+			continue
+		}
+		for lessonID, order := range lessons {
+			lesson, ok := r.lessons[lessonID]
+			if !ok {
+				continue
+			}
+			lesson.SectionID = sectionID
+			lesson.ModuleID = r.moduleIDForSection(sectionID)
+			lesson.CourseID = courseID
+			lesson.Order = order
+			list = append(list, lesson)
+		}
+	}
+	return list, nil
+}
+
+func (r *fakeLessonRepository) ListByCourseFields(_ repository.Context, courseID string, _ queryfields.Set, lessonFilters filters.LessonFilters, _ *filters.SortOptions) ([]map[string]any, int, error) {
+	var lessons []domain.Lesson
+	if courseID != "" {
+		lessons, _ = r.ListByCourse(context.Background(), courseID)
+	} else if lessonFilters.CourseID != nil {
+		lessons, _ = r.ListByCourse(context.Background(), *lessonFilters.CourseID)
+	} else if lessonFilters.ModuleID != nil {
+		for _, sectionID := range r.moduleSections.sectionIDs(*lessonFilters.ModuleID) {
+			sectionLessons, _ := r.ListBySection(context.Background(), sectionID)
+			lessons = append(lessons, sectionLessons...)
+		}
+	} else if lessonFilters.SectionID != nil {
+		lessons, _ = r.ListBySection(context.Background(), *lessonFilters.SectionID)
+	} else {
+		for sectionID := range r.sectionLessons.placements {
+			sectionLessons, _ := r.ListBySection(context.Background(), sectionID)
+			lessons = append(lessons, sectionLessons...)
+		}
+	}
+	var result []map[string]any
+	for _, lesson := range lessons {
+		if lessonFilters.SectionID != nil && lesson.SectionID != *lessonFilters.SectionID {
+			continue
+		}
+		if lessonFilters.ModuleID != nil && lesson.ModuleID != *lessonFilters.ModuleID {
+			continue
+		}
+		if lessonFilters.Status != nil && lesson.Status != *lessonFilters.Status {
+			continue
+		}
+		result = append(result, map[string]any{
+			"id":          lesson.ID,
+			"course_id":   lesson.CourseID,
+			"section_id":  lesson.SectionID,
+			"module_id":   lesson.ModuleID,
+			"title":       lesson.Title,
+			"excerpt":     lesson.Excerpt,
+			"description": lesson.Description,
+			"order":       lesson.Order,
+			"status":      lesson.Status,
+			"versions":    lesson.Versions,
+			"created_at":  lesson.CreatedAt,
+			"updated_at":  lesson.UpdatedAt,
+		})
+	}
+	return result, len(result), nil
+}
+
+func (r *fakeLessonRepository) ListBySection(_ repository.Context, sectionID string) ([]domain.Lesson, error) {
+	var list []domain.Lesson
+	for lessonID, order := range r.sectionLessons.placements[sectionID] {
+		lesson, ok := r.lessons[lessonID]
+		if !ok {
+			continue
+		}
+		lesson.SectionID = sectionID
+		lesson.ModuleID = r.moduleIDForSection(sectionID)
+		lesson.CourseID = r.courseIDForSection(sectionID)
+		lesson.Order = order
+		list = append(list, lesson)
+	}
+	return list, nil
+}
+
+func (r *fakeLessonRepository) withFirstPlacement(lesson domain.Lesson) domain.Lesson {
+	if lesson.SectionID == "" {
+		sectionID, order := r.sectionLessons.firstPlacement(lesson.ID)
+		lesson.SectionID = sectionID
+		lesson.Order = order
+	}
+	if lesson.CourseID == "" {
+		lesson.CourseID = r.courseIDForSection(lesson.SectionID)
+	}
+	if lesson.ModuleID == "" {
+		lesson.ModuleID = r.moduleIDForSection(lesson.SectionID)
+	}
+	return lesson
+}
+
+func (r *fakeLessonRepository) moduleIDForSection(sectionID string) string {
+	return r.moduleSections.moduleIDForSection(sectionID)
+}
+
+func (r *fakeLessonRepository) courseIDForSection(sectionID string) string {
+	moduleID := r.moduleSections.moduleIDForSection(sectionID)
+	if moduleID == "" {
+		return ""
+	}
+	return r.courseModules.courseIDForModule(moduleID)
+}
+
+type fakeLessonVersionRepository struct {
+	items map[string][]domain.LessonVersion
+}
+
+func newFakeLessonVersionRepository() *fakeLessonVersionRepository {
+	return &fakeLessonVersionRepository{items: map[string][]domain.LessonVersion{}}
+}
+
+func (r *fakeLessonVersionRepository) ReplaceByLesson(_ repository.Context, lessonID string, versions []domain.LessonVersion) error {
+	result := make([]domain.LessonVersion, 0, len(versions))
+	for _, version := range versions {
+		version.LessonID = lessonID
+		result = append(result, version)
+	}
+	r.items[lessonID] = result
+	return nil
+}
+
+func (r *fakeLessonVersionRepository) ListByLesson(_ repository.Context, lessonID string) ([]domain.LessonVersion, error) {
+	return append([]domain.LessonVersion(nil), r.items[lessonID]...), nil
+}
+
+type fakeLessonI18nRepository struct {
+	items []domain.LessonI18n
+}
+
+func newFakeLessonI18nRepository() *fakeLessonI18nRepository {
+	return &fakeLessonI18nRepository{items: []domain.LessonI18n{}}
+}
+
+func (r *fakeLessonI18nRepository) Upsert(_ repository.Context, entry domain.LessonI18n) error {
+	r.items = append(r.items, entry)
+	return nil
+}
+
+func (r *fakeLessonI18nRepository) ListByLesson(_ repository.Context, lessonID string) ([]domain.LessonI18n, error) {
+	var result []domain.LessonI18n
+	for _, item := range r.items {
+		if item.LessonID == lessonID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+type fakeTaskRepository struct {
+	tasks   map[string]domain.Task
+	lessons *fakeLessonRepository
+}
+
+func newFakeTaskRepository(lessons *fakeLessonRepository) *fakeTaskRepository {
+	return &fakeTaskRepository{tasks: map[string]domain.Task{}, lessons: lessons}
+}
+
+func (r *fakeTaskRepository) Create(_ repository.Context, task domain.Task) error {
+	r.tasks[task.ID] = task
+	return nil
+}
+
+func (r *fakeTaskRepository) Update(_ repository.Context, task domain.Task) error {
+	r.tasks[task.ID] = task
+	return nil
+}
+
+func (r *fakeTaskRepository) Delete(_ repository.Context, taskID string) error {
+	delete(r.tasks, taskID)
+	return nil
+}
+
+func (r *fakeTaskRepository) Get(_ repository.Context, id string) (*domain.Task, error) {
+	task, ok := r.tasks[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := r.withComposeFallback(task)
+	return &copy, nil
+}
+
+func (r *fakeTaskRepository) GetWithFields(_ repository.Context, id string, _ queryfields.Set) (map[string]any, error) {
+	task, ok := r.tasks[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return map[string]any{"id": task.ID, "title": task.Title}, nil
+}
+
+func (r *fakeTaskRepository) ListByLesson(_ repository.Context, lessonID string) ([]domain.Task, error) {
+	var list []domain.Task
+	for _, task := range r.tasks {
+		if task.LessonID == lessonID {
+			list = append(list, r.withComposeFallback(task))
+		}
+	}
+	return list, nil
+}
+
+func (r *fakeTaskRepository) ListByLessonFields(_ repository.Context, lessonID string, _ queryfields.Set, _ filters.TaskFilters, _ *filters.SortOptions) ([]map[string]any, int, error) {
+	tasks, _ := r.ListByLesson(context.Background(), lessonID)
+	result := make([]map[string]any, 0, len(tasks))
+	for _, task := range tasks {
+		result = append(result, map[string]any{
+			"id":                     task.ID,
+			"lesson_id":              task.LessonID,
+			"title":                  task.Title,
+			"description":            task.Description,
+			"code_structure_type_id": task.CodeStructureTypeID,
+			"code_structure":         task.CodeStructure,
+			"compose_config":         task.ResolvedComposeConfig,
+			"order":                  task.Order,
+			"status":                 task.Status,
+			"version":                task.Version,
+		})
+	}
+	return result, len(result), nil
+}
+
+func (r *fakeTaskRepository) withComposeFallback(task domain.Task) domain.Task {
+	if task.ComposeConfig != nil {
+		task.ResolvedComposeConfig = task.ComposeConfig
+		return task
+	}
+	if r.lessons != nil {
+		if lesson, ok := r.lessons.lessons[task.LessonID]; ok && lesson.ComposeConfig != nil {
+			task.ResolvedComposeConfig = lesson.ComposeConfig
+		}
+	}
+	return task
+}
+
+type fakeTaskI18nRepository struct {
+	items []domain.TaskI18n
+}
+
+func newFakeTaskI18nRepository() *fakeTaskI18nRepository {
+	return &fakeTaskI18nRepository{items: []domain.TaskI18n{}}
+}
+
+func (r *fakeTaskI18nRepository) Upsert(_ repository.Context, entry domain.TaskI18n) error {
+	r.items = append(r.items, entry)
+	return nil
+}
+
+func (r *fakeTaskI18nRepository) ListByTask(_ repository.Context, taskID string) ([]domain.TaskI18n, error) {
+	var result []domain.TaskI18n
+	for _, item := range r.items {
+		if item.TaskID == taskID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+type fakeCodeStructureTypeRepository struct {
+	structures map[string]domain.CodeStructureType
+}
+
+func newFakeCodeStructureTypeRepository() *fakeCodeStructureTypeRepository {
+	return &fakeCodeStructureTypeRepository{structures: map[string]domain.CodeStructureType{}}
+}
+
+func (r *fakeCodeStructureTypeRepository) Create(_ repository.Context, structureType domain.CodeStructureType) error {
+	r.structures[structureType.ID] = structureType
+	return nil
+}
+
+func (r *fakeCodeStructureTypeRepository) Update(_ repository.Context, structureType domain.CodeStructureType) error {
+	if _, ok := r.structures[structureType.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	r.structures[structureType.ID] = structureType
+	return nil
+}
+
+func (r *fakeCodeStructureTypeRepository) Delete(_ repository.Context, id string) error {
+	if _, ok := r.structures[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.structures, id)
+	return nil
+}
+
+func (r *fakeCodeStructureTypeRepository) Get(_ repository.Context, id string) (*domain.CodeStructureType, error) {
+	return r.GetByID(context.Background(), id)
+}
+
+func (r *fakeCodeStructureTypeRepository) GetByID(_ repository.Context, id string) (*domain.CodeStructureType, error) {
+	structure, ok := r.structures[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	copy := structure
+	return &copy, nil
+}
+
+func (r *fakeCodeStructureTypeRepository) GetByCode(_ repository.Context, code string) (*domain.CodeStructureType, error) {
+	for _, structure := range r.structures {
+		if structure.Code == code {
+			copy := structure
+			return &copy, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *fakeCodeStructureTypeRepository) List(_ repository.Context, _ filters.CodeStructureTypeFilters) ([]domain.CodeStructureType, int, error) {
+	result := make([]domain.CodeStructureType, 0, len(r.structures))
+	for _, structure := range r.structures {
+		result = append(result, structure)
+	}
+	return result, len(result), nil
+}
+
+type fakeTxManager struct{}
+
+func (fakeTxManager) WithTx(ctx repository.Context, fn func(ctx repository.Context) error) error {
+	return fn(ctx)
+}
+
+type nopPublisher struct{}
+
+func (nopPublisher) Publish(context.Context, string, any) error { return nil }

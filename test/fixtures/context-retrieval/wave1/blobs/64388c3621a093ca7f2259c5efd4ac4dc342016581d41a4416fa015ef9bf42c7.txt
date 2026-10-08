@@ -1,0 +1,149 @@
+package courseclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+// DiagnosticCatalogClient holds the read-only capability for Course's
+// diagnostic catalog. It is deliberately separate from the general token.
+type DiagnosticCatalogClient struct {
+	BaseURL, InternalToken string
+	HTTPClient             *http.Client
+}
+
+func (client DiagnosticCatalogClient) GetDiagnosticAssessmentCatalog(ctx context.Context, courseID string) (domain.DiagnosticAssessmentCatalog, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" || !canonicalCatalogUUID(courseID) {
+		return domain.DiagnosticAssessmentCatalog{}, fmt.Errorf("diagnostic catalog client is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(client.BaseURL, "/")+"/internal/course/get-internal-diagnostic-assessments/"+courseID, nil)
+	if err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, err
+	}
+	req.Header.Set("X-Internal-Token", client.InternalToken)
+	hc := client.HTTPClient
+	if hc == nil {
+		hc = &http.Client{Timeout: 10 * time.Second}
+	}
+	safeClient := *hc
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrNotFound
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrForbidden
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return domain.DiagnosticAssessmentCatalog{}, fmt.Errorf("course diagnostic catalog: %s", resp.Status)
+	}
+	media, _, contentErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if contentErr != nil || media != "application/json" {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	if err != nil || len(body) > 1<<20 {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	var payload struct {
+		Schema             string `json:"schema"`
+		CourseID           string `json:"course_id"`
+		CurriculumRevision string `json:"curriculum_revision"`
+		Lessons            []struct {
+			ID          string    `json:"id"`
+			SectionID   string    `json:"section_id"`
+			Title       string    `json:"title"`
+			Description string    `json:"description"`
+			UpdatedAt   time.Time `json:"updated_at"`
+			CourseID    string    `json:"course_id"`
+			Order       int       `json:"order"`
+			Status      int       `json:"status"`
+			Tasks       []struct {
+				ID                string                     `json:"id"`
+				Title             string                     `json:"title"`
+				Description       string                     `json:"description"`
+				EvaluationMode    string                     `json:"evaluation_mode"`
+				LessonID          string                     `json:"lesson_id"`
+				Type              int16                      `json:"type"`
+				AssessmentPurpose string                     `json:"assessment_purpose"`
+				Order             int                        `json:"order"`
+				LearningTargets   []domain.LearningTargetRef `json:"learning_targets"`
+				UpdatedAt         time.Time                  `json:"updated_at"`
+				Version           int64                      `json:"version"`
+				Status            int                        `json:"status"`
+			} `json:"tasks"`
+		} `json:"lessons"`
+	}
+	if err = dec.Decode(&payload); err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	result := domain.DiagnosticAssessmentCatalog{Schema: payload.Schema, CourseID: payload.CourseID, CurriculumRevision: payload.CurriculumRevision}
+	if len(payload.Lessons) > 500 || !canonicalCatalogUUID(payload.CourseID) {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	seenLessons := map[string]bool{}
+	seenTasks := map[string]bool{}
+	itemCount := 0
+	for _, lesson := range payload.Lessons {
+		if !canonicalCatalogUUID(lesson.ID) || lesson.CourseID != payload.CourseID || lesson.Status != 1 || lesson.Order < 0 || seenLessons[lesson.ID] {
+			return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+		}
+		seenLessons[lesson.ID] = true
+		for _, task := range lesson.Tasks {
+			itemCount++
+			targets, normalizeErr := domain.NormalizeDiagnosticLearningTargets(task.LearningTargets)
+			if itemCount > 100 || !canonicalCatalogUUID(task.ID) || seenTasks[task.ID] || normalizeErr != nil || len(targets) == 0 || len(targets) > 100 || task.Version < 1 || task.UpdatedAt.IsZero() || task.LessonID != lesson.ID || task.Order < 0 || task.Status != 1 || task.AssessmentPurpose != "diagnostic" || task.EvaluationMode != "AUTO" || !validDiagnosticTaskType(task.Type) {
+				return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+			}
+			seenTasks[task.ID] = true
+			result.Items = append(result.Items, domain.DiagnosticAssessmentCatalogItem{LessonID: task.LessonID, TaskID: task.ID, TaskVersion: task.Version, UpdatedAt: task.UpdatedAt.UTC(), LessonOrder: lesson.Order, TaskOrder: task.Order, Type: task.Type, AssessmentPurpose: strings.TrimSpace(task.AssessmentPurpose), LearningTargets: targets})
+		}
+	}
+	if result.Schema != "course-diagnostic-assessment-catalog.v1" || result.CourseID != courseID || itemCount == 0 || !diagnosticCatalogDigest(result.CurriculumRevision) {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	return result, nil
+}
+func diagnosticCatalogDigest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, r := range value[7:] {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validDiagnosticTaskType(value int16) bool {
+	switch value {
+	case 11, 12, 13:
+		return true
+	default:
+		return false
+	}
+}
+func canonicalCatalogUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}

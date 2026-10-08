@@ -1,0 +1,183 @@
+package lessonrelation
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+var supportedRelations = map[string]struct{}{
+	domain.LessonRelationImplementation: {},
+	domain.LessonRelationPractice:       {},
+	domain.LessonRelationComparison:     {},
+	domain.LessonRelationReference:      {},
+	domain.LessonRelationPrerequisite:   {},
+	domain.LessonRelationContinuation:   {},
+	domain.LessonRelationSeeAlso:        {},
+}
+
+// ReplaceLessonRelations atomically reconciles every outgoing relation owned by one lesson.
+type ReplaceLessonRelations struct {
+	Lessons   repository.LessonRepository
+	Relations repository.LessonRelationRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc ReplaceLessonRelations) Handle(ctx context.Context, sourceLessonID string, relations []domain.LessonRelation) error {
+	sourceLessonID, err := normalizeID(sourceLessonID)
+	if err != nil || uc.Lessons == nil || uc.Relations == nil {
+		return domain.ErrValidation
+	}
+	normalized, err := normalizeRelations(sourceLessonID, relations)
+	if err != nil {
+		return err
+	}
+
+	run := func(fn func(context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	return run(func(ctx context.Context) error {
+		if _, err := uc.Lessons.Get(ctx, sourceLessonID); err != nil {
+			return err
+		}
+		for _, relation := range normalized {
+			if _, err := uc.Lessons.Get(ctx, relation.TargetLessonID); err != nil {
+				return err
+			}
+		}
+		return uc.Relations.ReplaceBySourceLesson(ctx, sourceLessonID, normalized)
+	})
+}
+
+// ListLessonRelations returns outgoing semantic relations for one lesson.
+type ListLessonRelations struct {
+	Lessons   repository.LessonRepository
+	Relations repository.LessonRelationRepository
+}
+
+func (uc ListLessonRelations) Handle(ctx context.Context, sourceLessonID string) ([]domain.LessonRelation, error) {
+	sourceLessonID, err := normalizeID(sourceLessonID)
+	if err != nil || uc.Lessons == nil || uc.Relations == nil {
+		return nil, domain.ErrValidation
+	}
+	if _, err := uc.Lessons.Get(ctx, sourceLessonID); err != nil {
+		return nil, err
+	}
+	return uc.Relations.ListBySourceLesson(ctx, sourceLessonID)
+}
+
+// DeleteLessonRelation removes one semantic relation by ID.
+type DeleteLessonRelation struct {
+	Relations repository.LessonRelationRepository
+}
+
+func (uc DeleteLessonRelation) Handle(ctx context.Context, relationID string) error {
+	relationID, err := normalizeID(relationID)
+	if err != nil || uc.Relations == nil {
+		return domain.ErrValidation
+	}
+	return uc.Relations.Delete(ctx, relationID)
+}
+
+func normalizeRelations(sourceLessonID string, relations []domain.LessonRelation) ([]domain.LessonRelation, error) {
+	result := make([]domain.LessonRelation, 0, len(relations))
+	sourceKeys := make(map[string]struct{}, len(relations))
+	identities := make(map[string]struct{}, len(relations))
+	for _, relation := range relations {
+		if relation.ID == "" {
+			relation.ID = uuid.NewString()
+		} else {
+			var err error
+			relation.ID, err = normalizeID(relation.ID)
+			if err != nil {
+				return nil, domain.ErrValidation
+			}
+		}
+		var err error
+		relation.SourceKey, err = domain.NormalizeContentSourceKey(relation.SourceKey)
+		if err != nil || relation.SourceKey == "" {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := sourceKeys[relation.SourceKey]; exists {
+			return nil, fmt.Errorf("%w: duplicate lesson relation source_key", domain.ErrConflict)
+		}
+		sourceKeys[relation.SourceKey] = struct{}{}
+
+		relation.SourceLessonID = sourceLessonID
+		relation.TargetLessonID, err = normalizeID(relation.TargetLessonID)
+		if err != nil || relation.TargetLessonID == sourceLessonID {
+			return nil, domain.ErrValidation
+		}
+		relation.Relation = strings.TrimSpace(relation.Relation)
+		if _, ok := supportedRelations[relation.Relation]; !ok {
+			return nil, domain.ErrValidation
+		}
+		identity := relation.TargetLessonID + "\x00" + relation.Relation
+		if _, exists := identities[identity]; exists {
+			return nil, fmt.Errorf("%w: duplicate semantic lesson relation", domain.ErrConflict)
+		}
+		identities[identity] = struct{}{}
+
+		relation.Stacks, err = normalizeLabels(relation.Stacks, false)
+		if err != nil {
+			return nil, err
+		}
+		relation.Concepts, err = normalizeLabels(relation.Concepts, true)
+		if err != nil {
+			return nil, err
+		}
+		if relation.PrimaryStack != nil {
+			primary := strings.TrimSpace(*relation.PrimaryStack)
+			if primary == "" || len(primary) > 128 || !contains(relation.Stacks, primary) {
+				return nil, domain.ErrValidation
+			}
+			relation.PrimaryStack = &primary
+		}
+		result = append(result, relation)
+	}
+	return result, nil
+}
+
+func normalizeID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if _, err := uuid.Parse(value); err != nil {
+		return "", domain.ErrValidation
+	}
+	return value, nil
+}
+
+func normalizeLabels(values []string, required bool) ([]string, error) {
+	if required && len(values) == 0 {
+		return nil, domain.ErrValidation
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 128 {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := seen[value]; exists {
+			return nil, domain.ErrValidation
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

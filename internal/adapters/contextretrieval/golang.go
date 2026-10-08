@@ -39,7 +39,7 @@ func (resolver GoResolver) Resolve(ctx context.Context, plan core.RetrievalPlan,
 			continue
 		}
 		if facet.Path != "" && doc.RelativePath != facet.Path && !strings.HasPrefix(doc.RelativePath, facet.Path+"/") {
-			if facet.QueryKind != core.QueryTests || path.Dir(doc.RelativePath) != path.Dir(facet.Path) {
+			if facet.QueryKind != core.QueryTests || strings.HasSuffix(facet.Path, "_test.go") || path.Dir(doc.RelativePath) != path.Dir(facet.Path) {
 				continue
 			}
 		}

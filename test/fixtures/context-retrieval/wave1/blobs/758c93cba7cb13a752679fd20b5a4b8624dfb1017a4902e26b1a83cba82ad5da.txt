@@ -1,0 +1,309 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	httpmw "github.com/example/ms-student-service/internal/transport/http/middleware"
+	"github.com/go-chi/chi/v5"
+)
+
+type LearningPathGetter interface {
+	Handle(context.Context, string) (domain.StudentLearningPath, error)
+}
+
+type LearningPathCollection interface {
+	List(context.Context, string) (domain.StudentLearningPathList, error)
+	Get(context.Context, string, string) (domain.StudentLearningPathMutation, error)
+	GetContext(context.Context, string) (domain.StudentLearningContext, error)
+	Activate(context.Context, string, string, int64, bool) (domain.StudentLearningPathMutation, error)
+	Pause(context.Context, string, string, int64) (domain.StudentLearningPathMutation, error)
+	Resume(context.Context, string, string, int64) (domain.StudentLearningPathMutation, error)
+}
+
+type DiagnosticSnapshotGetter interface {
+	GetLatestDiagnosticSnapshot(context.Context, string) (domain.StudentDiagnosticSnapshot, error)
+}
+
+type LearningSessionService interface {
+	Start(context.Context, string, string, string, string, string, string) (domain.StudentLearningSession, error)
+	End(context.Context, string, string, int64) (domain.StudentLearningSession, error)
+	Get(context.Context, string, string) (domain.StudentLearningSession, error)
+	ListRecent(context.Context, string, int) ([]domain.StudentLearningSession, error)
+}
+
+type StudentLearningJourneyHandler struct {
+	AssignedLessons AssignedLessonContextGetter
+	NextAction      NextActionGetter
+	Completion      LessonCompletionService
+	Paths           LearningPathGetter
+	PathCollection  LearningPathCollection
+	Diagnostics     DiagnosticSnapshotGetter
+	Sessions        LearningSessionService
+}
+
+func (handler StudentLearningJourneyHandler) GetLearningPath(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Paths == nil {
+		http.Error(w, "learning path unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.Paths.Handle(r.Context(), studentID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, legacyLearningPathResponse(result))
+}
+
+// legacyStudentLearningPathResponse intentionally freezes the pre-multi-path
+// representation used by GET /student/learning-path. New lifecycle fields are
+// available only from the plural endpoints.
+type legacyStudentLearningPathResponse struct {
+	ID                   string                    `json:"id"`
+	StudentID            string                    `json:"student_id"`
+	CourseID             string                    `json:"course_id"`
+	GoalCode             string                    `json:"goal_code"`
+	CurriculumRevision   string                    `json:"curriculum_revision"`
+	CourseFingerprint    string                    `json:"course_fingerprint"`
+	PolicyVersion        string                    `json:"policy_version"`
+	PlannerPolicyVersion string                    `json:"planner_policy_version"`
+	ReasonCode           string                    `json:"reason_code"`
+	ReasonSummary        string                    `json:"reason_summary"`
+	Version              int64                     `json:"version"`
+	Items                []domain.LearningPathItem `json:"items"`
+	CreatedAt            time.Time                 `json:"created_at"`
+	UpdatedAt            time.Time                 `json:"updated_at"`
+}
+
+func legacyLearningPathResponse(path domain.StudentLearningPath) legacyStudentLearningPathResponse {
+	return legacyStudentLearningPathResponse{
+		ID: path.ID, StudentID: path.StudentID, CourseID: path.CourseID, GoalCode: path.GoalCode,
+		CurriculumRevision: path.CurriculumRevision, CourseFingerprint: path.CourseFingerprint,
+		PolicyVersion: path.PolicyVersion, PlannerPolicyVersion: path.PlannerPolicyVersion,
+		ReasonCode: path.ReasonCode, ReasonSummary: path.ReasonSummary, Version: path.Version,
+		Items: path.Items, CreatedAt: path.CreatedAt, UpdatedAt: path.UpdatedAt,
+	}
+}
+
+func (handler StudentLearningJourneyHandler) ListLearningPaths(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.PathCollection == nil {
+		http.Error(w, "learning paths unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.PathCollection.List(r.Context(), studentID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) GetLearningPathByID(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.PathCollection == nil {
+		http.Error(w, "learning paths unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.PathCollection.Get(r.Context(), studentID, chi.URLParam(r, "pathID"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result.Path)
+}
+
+func (handler StudentLearningJourneyHandler) GetLearningContext(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.PathCollection == nil {
+		http.Error(w, "learning context unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.PathCollection.GetContext(r.Context(), studentID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) ActivateLearningPath(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ExpectedVersion int64 `json:"expected_version"`
+		MakePrimary     bool  `json:"make_primary"`
+	}
+	handler.mutateLearningPath(w, r, &payload, func(
+		ctx context.Context, collection LearningPathCollection, studentID, pathID string,
+	) (domain.StudentLearningPathMutation, error) {
+		return collection.Activate(ctx, studentID, pathID, payload.ExpectedVersion, payload.MakePrimary)
+	})
+}
+
+func (handler StudentLearningJourneyHandler) PauseLearningPath(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ExpectedVersion int64 `json:"expected_version"`
+	}
+	handler.mutateLearningPath(w, r, &payload, func(
+		ctx context.Context, collection LearningPathCollection, studentID, pathID string,
+	) (domain.StudentLearningPathMutation, error) {
+		return collection.Pause(ctx, studentID, pathID, payload.ExpectedVersion)
+	})
+}
+
+func (handler StudentLearningJourneyHandler) ResumeLearningPath(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ExpectedVersion int64 `json:"expected_version"`
+	}
+	handler.mutateLearningPath(w, r, &payload, func(
+		ctx context.Context, collection LearningPathCollection, studentID, pathID string,
+	) (domain.StudentLearningPathMutation, error) {
+		return collection.Resume(ctx, studentID, pathID, payload.ExpectedVersion)
+	})
+}
+
+func (handler StudentLearningJourneyHandler) mutateLearningPath(
+	w http.ResponseWriter,
+	r *http.Request,
+	payload any,
+	mutation func(context.Context, LearningPathCollection, string, string) (domain.StudentLearningPathMutation, error),
+) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.PathCollection == nil {
+		http.Error(w, "learning paths unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := decodeJourneyJSON(w, r, payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := mutation(r.Context(), handler.PathCollection, studentID, chi.URLParam(r, "pathID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		case errors.Is(err, domain.ErrConflict):
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) GetLatestDiagnostic(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Diagnostics == nil {
+		http.Error(w, "diagnostics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.Diagnostics.GetLatestDiagnosticSnapshot(r.Context(), studentID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) StartLearningSession(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Sessions == nil {
+		http.Error(w, "learning sessions unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var payload struct {
+		Goal               string `json:"goal"`
+		CourseID           string `json:"course_id"`
+		LessonID           string `json:"lesson_id"`
+		TaskID             string `json:"task_id"`
+		AnalyticsSessionID string `json:"analytics_session_id"`
+	}
+	if err := decodeJourneyJSON(w, r, &payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := handler.Sessions.Start(r.Context(), studentID, payload.Goal, payload.CourseID, payload.LessonID, payload.TaskID, payload.AnalyticsSessionID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (handler StudentLearningJourneyHandler) EndLearningSession(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Sessions == nil {
+		http.Error(w, "learning sessions unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var payload struct {
+		ExpectedVersion int64 `json:"expected_version"`
+	}
+	if err := decodeJourneyJSON(w, r, &payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := handler.Sessions.End(r.Context(), studentID, chi.URLParam(r, "sessionID"), payload.ExpectedVersion)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) GetLearningSession(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Sessions == nil {
+		http.Error(w, "learning sessions unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := handler.Sessions.Get(r.Context(), studentID, chi.URLParam(r, "sessionID"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (handler StudentLearningJourneyHandler) ListLearningSessions(w http.ResponseWriter, r *http.Request) {
+	studentID, _, ok := httpmw.UserFromContext(r.Context())
+	if !ok || handler.Sessions == nil {
+		http.Error(w, "learning sessions unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	limit := 5
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = value
+	}
+	result, err := handler.Sessions.ListRecent(r.Context(), studentID, limit)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": result})
+}
+
+func decodeJourneyJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("invalid trailing request data")
+	}
+	return nil
+}

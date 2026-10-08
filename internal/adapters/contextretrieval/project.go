@@ -110,7 +110,7 @@ func AdaptRoute(route domain.RoutingResult, projectSources map[string]core.Sourc
 			query, resolver, claim = core.QueryTests, "tests", core.TestingPolicy
 		}
 		result.SeedFacets = append(result.SeedFacets, core.Facet{ID: facetID("evidence", source, evidence.ID), Kind: evidence.Kind,
-			QueryKind: query, SourceIdentity: source, Path: evidence.Path, Symbol: evidence.Symbol, Resolver: resolver,
+			QueryKind: query, SourceIdentity: source, Path: evidence.Path, Symbol: routingScalarSymbol(evidence.Symbol), Resolver: resolver,
 			ClaimType: claim, ExpectedHash: expectedHash, Required: true})
 	}
 	if contract != nil {
@@ -183,6 +183,9 @@ func AdaptRoutingCoverage(report planning.RoutingCoverageReport, route domain.Ro
 			if status != core.Unknown {
 				inventory.Status = core.Partial
 			}
+		}
+		if project.UnscannedRemainder {
+			inventory.Reasons = append(inventory.Reasons, fmt.Sprintf("unscanned_remainder_count_known=%t", project.RemainderCountKnown))
 		}
 		if project.TerminationReason != "" {
 			inventory.Reasons = append(inventory.Reasons, project.TerminationReason)
@@ -259,7 +262,46 @@ func AdaptRoutingCoverage(report planning.RoutingCoverageReport, route domain.Ro
 	status, complete = routingCoverageStatus(report.Status)
 	result = append(result, core.CoverageResult{Stage: "routing_report", Status: status, Complete: complete,
 		Reasons: []string{"R1 companion " + report.DiagnosticDigest}})
-	return result, nil
+	return compactRoutingCoverage(result), nil
+}
+
+// The bound companion retains per-path acquisition detail. Its in-pack projection
+// sums only additive counters for equal stages and safety states. Required
+// outcomes remain individually addressable by FacetID.
+func compactRoutingCoverage(rows []core.CoverageResult) []core.CoverageResult {
+	result := make([]core.CoverageResult, 0, len(rows))
+	indexes := map[string]int{}
+	for _, row := range rows {
+		aggregate := strings.HasPrefix(row.Stage, "routing_symbols:") || strings.HasPrefix(row.Stage, "routing_omission:")
+		if !aggregate {
+			result = append(result, row)
+			continue
+		}
+		if strings.HasPrefix(row.Stage, "routing_symbols:") {
+			row.Stage = "routing_symbols"
+		}
+		shape := row
+		shape.CandidateCount, shape.SelectedCount, shape.Omitted = 0, 0, 0
+		raw, _ := json.Marshal(shape)
+		key := string(raw)
+		if index, ok := indexes[key]; ok {
+			result[index].CandidateCount += row.CandidateCount
+			result[index].SelectedCount += row.SelectedCount
+			result[index].Omitted += row.Omitted
+		} else {
+			indexes[key] = len(result)
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// Routing Symbols describes a file inventory, not one Go scalar selector.
+func routingScalarSymbol(symbol string) string {
+	if strings.Contains(symbol, ",") {
+		return ""
+	}
+	return symbol
 }
 
 func routingCoverageStatus(value string) (core.Status, bool) {
@@ -288,4 +330,40 @@ func uniqueStrings(values []string) []string {
 		}
 	}
 	return result
+}
+
+// AdaptTaskRoute keeps routing as the search/ownership boundary while explicit
+// caller facets define the evidence question. Generic layer anchors are defaults
+// for unscoped requests, not additional mandatory task facts. ContractPlan
+// obligations remain mandatory even when the caller did not repeat them.
+func AdaptTaskRoute(route domain.RoutingResult, sources map[string]core.SourceAdmission, contract *domain.ContractPlan, coverage []core.CoverageResult, facets []core.Facet) (core.RouteContext, error) {
+	adapted, err := AdaptRoute(route, sources, contract, coverage)
+	if err != nil || len(facets) == 0 {
+		return adapted, err
+	}
+	obligations := map[string]bool{}
+	if contract != nil {
+		for _, boundary := range contract.Boundaries {
+			source := sources[boundary.Owner.ProjectID]
+			obligations[facetID("contract", source.Identity, boundary.Kind, boundary.TargetPath)] = true
+		}
+	}
+	seeds := make([]core.Facet, 0, len(adapted.SeedFacets))
+	for _, seed := range adapted.SeedFacets {
+		keep := obligations[seed.ID]
+		for _, f := range facets {
+			if f.SourceIdentity != seed.SourceIdentity || f.Path == "" {
+				continue
+			}
+			if seed.Path == f.Path || strings.HasPrefix(seed.Path, f.Path+"/") {
+				keep = true
+				break
+			}
+		}
+		if keep {
+			seeds = append(seeds, seed)
+		}
+	}
+	adapted.SeedFacets = seeds
+	return adapted, nil
 }

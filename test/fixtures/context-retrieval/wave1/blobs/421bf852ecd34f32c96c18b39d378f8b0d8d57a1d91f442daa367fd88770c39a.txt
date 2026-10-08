@@ -1,0 +1,285 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+)
+
+const (
+	TeacherOnboardingPlanHandoffRequestSchema = "teacher-onboarding-plan-handoff-request.v1"
+	TeacherOnboardingPlanHandoffSchema        = "teacher-onboarding-plan-handoff.v1"
+	TeacherOnboardingHandoffAccepted          = "ACCEPTED"
+	TeacherOnboardingExecutionNotStarted      = "NOT_STARTED"
+)
+
+var (
+	ErrTeacherOnboardingHandoffUnavailable     = errors.New("teacher onboarding plan handoff unavailable")
+	ErrTeacherOnboardingHandoffConflict        = errors.New("teacher onboarding plan handoff conflict")
+	ErrTeacherOnboardingHandoffStateChanged    = errors.New("teacher onboarding plan handoff state changed")
+	ErrTeacherOnboardingHandoffActivePath      = errors.New("teacher onboarding plan handoff active path exists")
+	ErrTeacherOnboardingHandoffRejected        = errors.New("teacher onboarding plan handoff rejected")
+	ErrTeacherOnboardingHandoffInvalidResponse = errors.New("teacher onboarding plan handoff invalid response")
+)
+
+type TeacherOnboardingHandoffStatus string
+
+const (
+	TeacherOnboardingHandoffQueued         TeacherOnboardingHandoffStatus = "queued"
+	TeacherOnboardingHandoffDispatching    TeacherOnboardingHandoffStatus = "dispatching"
+	TeacherOnboardingHandoffAcceptedStatus TeacherOnboardingHandoffStatus = "accepted"
+	TeacherOnboardingHandoffMessagePending TeacherOnboardingHandoffStatus = "message_pending"
+	TeacherOnboardingHandoffDelivered      TeacherOnboardingHandoffStatus = "delivered"
+	TeacherOnboardingHandoffActivePath     TeacherOnboardingHandoffStatus = "active_path"
+	TeacherOnboardingHandoffBlocked        TeacherOnboardingHandoffStatus = "blocked"
+)
+
+type TeacherOnboardingPlanHandoffRequest struct {
+	Schema           string                          `json:"schema"`
+	ExpectedStateRef TeacherStudentReadinessStateRef `json:"expected_state_ref"`
+	DialogID         string                          `json:"dialog_id"`
+	TeacherJobID     string                          `json:"teacher_job_id"`
+}
+
+type TeacherOnboardingPlanHandoff struct {
+	Schema              string                          `json:"schema"`
+	HandoffID           string                          `json:"handoff_id"`
+	Status              string                          `json:"status"`
+	StateRef            TeacherStudentReadinessStateRef `json:"state_ref"`
+	Goal                TeacherLearningReadinessGoal    `json:"goal"`
+	ExecutionStatus     string                          `json:"execution_status"`
+	ContentStatus       string                          `json:"content_status"`
+	ReadinessObservedAt string                          `json:"readiness_observed_at"`
+	Replayed            bool                            `json:"replayed"`
+}
+
+// TeacherOnboardingHandoffIntent is the bounded Teacher-owned delivery ledger.
+// It stores only exact identities and the server-owned READY goal tuple. It
+// never stores a Student profile, Planner graph payload, prompt, or message body.
+type TeacherOnboardingHandoffIntent struct {
+	ID                    string
+	StudentID             string
+	PersonalTeacherID     string
+	DialogID              string
+	SourceTeacherJobID    string
+	SourceInteractionID   string
+	CommandID             string
+	CommandTeacherJobID   string
+	RequestHash           string
+	StateRef              TeacherStudentReadinessStateRef
+	Goal                  TeacherLearningReadinessGoal
+	Locale                string
+	Status                TeacherOnboardingHandoffStatus
+	ClaimToken            string
+	LockedBy              string
+	LockedUntil           time.Time
+	Attempts              int
+	NextAttemptAt         time.Time
+	PlannerHandoffID      string
+	NotificationCommandID string
+	NotificationMessageID string
+	LastErrorCode         string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	AcceptedAt            time.Time
+	ReadinessObservedAt   time.Time
+	DeliveredAt           time.Time
+	SourceRequest         *DialogTeacherRequest
+}
+
+func BuildTeacherOnboardingHandoffIntent(teacher PersonalTeacher, binding TeacherDialogBinding, readiness TeacherLearningReadiness, locale, sourceTeacherJobID, sourceInteractionID string, now time.Time) (TeacherOnboardingHandoffIntent, error) {
+	binding, err := NewTeacherDialogBinding(binding)
+	readiness, readinessErr := NormalizeTeacherLearningReadiness(readiness, &readiness.StateRef)
+	if err != nil || readinessErr != nil || readiness.Result != TeacherLearningReadinessReady || readiness.Goal == nil ||
+		teacher.ID != binding.PersonalTeacherID || teacher.StudentID != binding.StudentID || now.IsZero() {
+		return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+	}
+	identity := []any{teacher.StudentID, readiness.StateRef.Kind, readiness.StateRef.Version}
+	intent := TeacherOnboardingHandoffIntent{
+		ID: DeterministicOnboardingUUID("planner-handoff-intent", identity...), StudentID: teacher.StudentID,
+		PersonalTeacherID: teacher.ID, DialogID: binding.ID, SourceTeacherJobID: sourceTeacherJobID, SourceInteractionID: sourceInteractionID,
+		CommandID:           DeterministicOnboardingUUID("planner-handoff-command", identity...),
+		CommandTeacherJobID: DeterministicOnboardingUUID("planner-handoff-teacher-job", identity...),
+		StateRef:            readiness.StateRef, Goal: *readiness.Goal, Locale: locale, Status: TeacherOnboardingHandoffQueued,
+		NextAttemptAt: now.UTC(), NotificationCommandID: DeterministicOnboardingUUID("planner-handoff-notification", identity...),
+		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+	}
+	request, err := NewTeacherOnboardingPlanHandoffRequest(intentWithProvisionalHash(intent))
+	if err != nil {
+		return TeacherOnboardingHandoffIntent{}, err
+	}
+	intent.RequestHash, err = TeacherOnboardingPlanHandoffRequestHash(intent.StudentID, request)
+	if err != nil {
+		return TeacherOnboardingHandoffIntent{}, err
+	}
+	return NewTeacherOnboardingHandoffIntent(intent)
+}
+
+func intentWithProvisionalHash(intent TeacherOnboardingHandoffIntent) TeacherOnboardingHandoffIntent {
+	intent.RequestHash = strings.Repeat("0", 64)
+	return intent
+}
+
+func NewTeacherOnboardingHandoffIntent(input TeacherOnboardingHandoffIntent) (TeacherOnboardingHandoffIntent, error) {
+	for field := range map[*string]struct{}{
+		&input.ID: {}, &input.StudentID: {}, &input.PersonalTeacherID: {}, &input.DialogID: {},
+		&input.SourceTeacherJobID: {}, &input.SourceInteractionID: {}, &input.CommandID: {},
+		&input.CommandTeacherJobID: {}, &input.RequestHash: {}, &input.PlannerHandoffID: {},
+		&input.NotificationCommandID: {}, &input.NotificationMessageID: {}, &input.LastErrorCode: {}, &input.LockedBy: {},
+	} {
+		*field = strings.TrimSpace(*field)
+	}
+	input.RequestHash = strings.ToLower(input.RequestHash)
+	input.Locale = strings.TrimSpace(input.Locale)
+	if input.Locale != "en" {
+		input.Locale = "ru"
+	}
+	input.CreatedAt = input.CreatedAt.UTC()
+	input.UpdatedAt = input.UpdatedAt.UTC()
+	input.NextAttemptAt = input.NextAttemptAt.UTC()
+	input.LockedUntil = input.LockedUntil.UTC()
+	input.AcceptedAt = input.AcceptedAt.UTC()
+	input.ReadinessObservedAt = input.ReadinessObservedAt.UTC()
+	input.DeliveredAt = input.DeliveredAt.UTC()
+	stateRef, refErr := NormalizeTeacherStudentReadinessStateRef(input.StateRef)
+	if refErr != nil || stateRef.Kind == TeacherReadinessStateNone || !validReadyGoalForHandoff(input.Goal) ||
+		!validUUID(input.ID) || !validUUID(input.StudentID) || !validUUID(input.PersonalTeacherID) || !validUUID(input.DialogID) ||
+		!validUUID(input.CommandID) || !validUUID(input.CommandTeacherJobID) || !validUUID(input.NotificationCommandID) ||
+		(input.SourceTeacherJobID != "" && !validUUID(input.SourceTeacherJobID)) ||
+		(input.SourceInteractionID != "" && !validUUID(input.SourceInteractionID)) ||
+		(input.SourceTeacherJobID == "") != (input.SourceInteractionID == "") ||
+		(input.PlannerHandoffID != "" && !validUUID(input.PlannerHandoffID)) ||
+		(input.NotificationMessageID != "" && !validUUID(input.NotificationMessageID)) ||
+		len(input.RequestHash) != 64 || !lowerHex(input.RequestHash) || input.Attempts < 0 ||
+		input.CreatedAt.IsZero() || input.UpdatedAt.Before(input.CreatedAt) || input.NextAttemptAt.IsZero() ||
+		len(input.LastErrorCode) > 64 || len(input.LockedBy) > 128 ||
+		(input.PlannerHandoffID == "") != input.AcceptedAt.IsZero() || (input.PlannerHandoffID == "") != input.ReadinessObservedAt.IsZero() {
+		return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+	}
+	input.StateRef = stateRef
+	switch input.Status {
+	case TeacherOnboardingHandoffQueued:
+		if input.ClaimToken != "" || input.LockedBy != "" || !input.LockedUntil.IsZero() || input.PlannerHandoffID != "" || input.NotificationMessageID != "" || !input.AcceptedAt.IsZero() || !input.ReadinessObservedAt.IsZero() || !input.DeliveredAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffDispatching:
+		if !validUUID(input.ClaimToken) || input.LockedBy == "" || input.LockedUntil.IsZero() || input.PlannerHandoffID != "" || input.NotificationMessageID != "" || !input.AcceptedAt.IsZero() || !input.ReadinessObservedAt.IsZero() || !input.DeliveredAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffAcceptedStatus:
+		if input.ClaimToken != "" || input.LockedBy != "" || !input.LockedUntil.IsZero() || !validUUID(input.PlannerHandoffID) || input.NotificationMessageID != "" || input.AcceptedAt.IsZero() || input.ReadinessObservedAt.IsZero() || !input.DeliveredAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffMessagePending:
+		if !validUUID(input.ClaimToken) || input.LockedBy == "" || input.LockedUntil.IsZero() || input.NotificationMessageID != "" || !input.DeliveredAt.IsZero() ||
+			(input.PlannerHandoffID == "") != input.AcceptedAt.IsZero() || (input.PlannerHandoffID == "") != input.ReadinessObservedAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffDelivered:
+		if input.ClaimToken != "" || input.LockedBy != "" || !input.LockedUntil.IsZero() || !validUUID(input.NotificationMessageID) || input.DeliveredAt.IsZero() ||
+			(input.PlannerHandoffID == "") != input.AcceptedAt.IsZero() || (input.PlannerHandoffID == "") != input.ReadinessObservedAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffActivePath:
+		if input.ClaimToken != "" || input.LockedBy != "" || !input.LockedUntil.IsZero() || input.PlannerHandoffID != "" || !input.AcceptedAt.IsZero() || !input.ReadinessObservedAt.IsZero() || input.NotificationMessageID != "" || !input.DeliveredAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingHandoffBlocked:
+		if input.ClaimToken != "" || input.LockedBy != "" || !input.LockedUntil.IsZero() || input.LastErrorCode == "" || !input.DeliveredAt.IsZero() {
+			return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return TeacherOnboardingHandoffIntent{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+
+func NewTeacherOnboardingPlanHandoffRequest(intent TeacherOnboardingHandoffIntent) (TeacherOnboardingPlanHandoffRequest, error) {
+	intent, err := NewTeacherOnboardingHandoffIntent(intent)
+	if err != nil {
+		return TeacherOnboardingPlanHandoffRequest{}, err
+	}
+	return TeacherOnboardingPlanHandoffRequest{
+		Schema: TeacherOnboardingPlanHandoffRequestSchema, ExpectedStateRef: intent.StateRef,
+		DialogID: intent.DialogID, TeacherJobID: intent.CommandTeacherJobID,
+	}, nil
+}
+
+func TeacherOnboardingPlanHandoffRequestHash(studentID string, request TeacherOnboardingPlanHandoffRequest) (string, error) {
+	if !validUUID(studentID) || request.Schema != TeacherOnboardingPlanHandoffRequestSchema || !validUUID(request.DialogID) || !validUUID(request.TeacherJobID) {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	if _, err := NormalizeTeacherStudentReadinessStateRef(request.ExpectedStateRef); err != nil || request.ExpectedStateRef.Kind == TeacherReadinessStateNone {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	encoded, err := json.Marshal(struct {
+		StudentID string                              `json:"student_id"`
+		Request   TeacherOnboardingPlanHandoffRequest `json:"request"`
+	}{StudentID: studentID, Request: request})
+	if err != nil {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func NormalizeTeacherOnboardingPlanHandoff(input TeacherOnboardingPlanHandoff, intent TeacherOnboardingHandoffIntent) (TeacherOnboardingPlanHandoff, error) {
+	intent, intentErr := NewTeacherOnboardingHandoffIntent(intent)
+	stateRef, refErr := NormalizeTeacherStudentReadinessStateRef(input.StateRef)
+	if intentErr != nil || refErr != nil || input.Schema != TeacherOnboardingPlanHandoffSchema || !validUUID(input.HandoffID) ||
+		input.Status != TeacherOnboardingHandoffAccepted || stateRef != intent.StateRef || input.Goal != intent.Goal ||
+		input.ExecutionStatus != TeacherOnboardingExecutionNotStarted || input.ContentStatus != TeacherLearningContentNotCreated || !canonicalHandoffTimestamp(input.ReadinessObservedAt) {
+		return TeacherOnboardingPlanHandoff{}, ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	input.StateRef = stateRef
+	return input, nil
+}
+
+func canonicalHandoffTimestamp(value string) bool {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil && strings.HasSuffix(value, "Z") && parsed.UTC().Format(time.RFC3339Nano) == value
+}
+
+func TeacherOnboardingHandoffDisplayName(goal TeacherLearningReadinessGoal) (string, error) {
+	switch goal {
+	case (TeacherLearningReadinessGoal{Code: TeacherFoundationGoalCode, Version: TeacherFoundationGoalVersion, GraphVersion: TeacherFoundationGraphVersion}):
+		return TeacherFoundationGoalDisplayName, nil
+	case (TeacherLearningReadinessGoal{Code: TeacherGoBackendGoalCode, Version: TeacherGoBackendGoalVersion, GraphVersion: TeacherGoBackendGraphVersion}):
+		return TeacherGoBackendGoalDisplayName, nil
+	default:
+		return "", ErrInvalidTeacherOnboarding
+	}
+}
+
+func TeacherOnboardingHandoffAcceptedBody(locale, displayName string) (string, error) {
+	if displayName != TeacherFoundationGoalDisplayName && displayName != TeacherGoBackendGoalDisplayName {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	if locale == "en" {
+		return "Your “" + displayName + "” learning plan request has been accepted. Preparation has not started yet; no course, path, or lessons have been created.", nil
+	}
+	return "Запрос на подготовку пути «" + displayName + "» принят. Подготовка ещё не началась; курс, путь и уроки не созданы.", nil
+}
+
+func TeacherOnboardingHandoffActivePathBody(locale string) string {
+	if locale == "en" {
+		return "Your existing learning path is preserved unchanged. No new path, course, or lessons have been created."
+	}
+	return "Ваш существующий учебный путь сохранён без изменений. Новый путь, курс или уроки не создавались."
+}
+
+func validReadyGoalForHandoff(goal TeacherLearningReadinessGoal) bool {
+	return validReadyGoal(TeacherReadinessReasonFoundationGraphResolved, goal) || validReadyGoal(TeacherReadinessReasonGoBackendGraphResolved, goal)
+}
+
+func lowerHex(value string) bool {
+	for _, current := range value {
+		if (current < '0' || current > '9') && (current < 'a' || current > 'f') {
+			return false
+		}
+	}
+	return true
+}

@@ -1,0 +1,162 @@
+# Teacher turn S0 contract
+
+This document freezes the safety boundary for one logical Student turn. S1
+adds migration `017_create_teacher_dialog_dense_turns`, durable per-dialog
+cursors, proof/outcome records, fenced claims, lease renewal, and atomic
+terminal completion. Dense v2 claiming remains disabled by default through
+`TEACHER_DIALOG_DENSE_ORDERING_ENABLED=false`; v1 legacy jobs remain readable
+and claimable.
+
+## Identity and ordering
+
+`source_event_id` is the stable `dialog.teacher.requested.event_id` for one
+logical Student turn. A `TeacherJobTurnCorrelation` carries
+`teacher_turn_sequence`, the Dialog-owned dense per-dialog sequence, plus
+`dialog_id`, `canonical_student_message_id`, `student_id`,
+`personal_teacher_id`, `correlation_id`, and `causation_id` at the Teacher-job
+intake boundary. Where applicable it also carries `teacher_job_id`,
+`action_receipt_id`, `student_command_id`, `ai_execution_id`, and
+`learning_action_id`.
+
+`correlation_id` and the Teacher-job `causation_id` are UUIDs. Dialog's v2
+event carries `dialog_causation_id` (the envelope `causation_id`), which
+equals the canonical Student message ID under the current Dialog contract.
+It is preserved separately and is never overwritten with Teacher-job
+causation. For a text turn,
+`correlation_id == canonical_student_message_id`; for an action turn,
+`correlation_id == action_receipt_id`. At Teacher-job intake,
+`teacher_job.causation_id == source_event_id`. This rule is scoped to that
+boundary: AI Prompt execution, Student commands/receipts, and the Dialog
+response each define their own boundary-specific causation ID. These are
+identity bindings, not one shared downstream trace field.
+
+Eligibility is against the expected dense `teacher_turn_sequence`: turn 2 is
+ineligible until turn 1 is safe. `source_message_sequence` is retained as
+evidence only and never acts as the turn cursor; it may gap or differ because
+other Dialog messages share that sequence. Equal source identity is a retry of
+the same turn, never a new turn. Dialog request schema v1 omits dense ordering
+and uses the legacy claim path; schema v2 requires the dense sequence and
+shared correlation fields. A v2 job may be durably accepted out of order, but
+remains unclaimable until the flag is enabled and its sequence equals the
+cursor's next value.
+
+## Cursor advancement
+
+A cursor may advance only from one of these terminal outcomes:
+
+- `delivered`: Dialog has confirmed the canonical idempotent
+  `teacher_response_message_id`;
+- `failed_no_effect`: the turn is proven to have produced no committed Student
+  transition and no Teacher reply, carries a bounded failure code, and links
+  a durable recoverable outcome ID plus a durable `no_effect_proof_id`
+  pointing to Student receipt/absence reconciliation. An attempted
+  `student_command_id` may remain as evidence; it does not prove a committed
+  transition and is allowed only with the no-effect proof. Absence of a
+  failure code alone is never proof.
+
+`unknown`, `partial`, and `committed_unreconciled` are reconciliation states,
+not terminal outcomes. They block advancement and must not be converted to
+success by timeout, process restart, or a best-effort retry. An accepted
+Student command alone never advances the cursor; a confirmed Teacher reply is
+still required.
+
+## Trusted action boundary
+
+The action path is one bounded provenance chain (not one shared causation
+field across every service boundary):
+
+`source prompt message/version + assistant-ui digest` → `action receipt` →
+`canonical Student message` → `source_event_id` → `teacher_job_id` →
+`teacher_response_message_id`.
+
+`TeacherActionReceiptEvidence` validates the receipt ID, source prompt ID and
+version, opaque `block_id`/`action_id` (ASCII, at most 128 bytes), and the
+lowercase 64-character SHA-256 `source_ui_digest` before the action turn is
+accepted. The evidence is only a binding and audit proof; it never grants the
+LLM or Teacher direct Student mutation authority. A text turn has no receipt
+boundary and starts at its canonical Student message.
+
+## Effects and retries
+
+One logical turn can have at most one accepted Student command. Repeating the
+same `student_command_id` is a replay; a different command key is an integrity
+conflict. The Teacher reply uses one deterministic Dialog command key and
+`teacher_job_id`. A retry may replay the same committed message, but may not
+append a second message or replace its message identity.
+
+Student remains the owner of Student state. LLM output is a bounded draft only;
+it cannot contain or execute a Student mutation. All model execution crosses
+the AI Prompt boundary; Teacher does not call a provider directly.
+
+For product-aware onboarding v2, an accepted Student effect is not terminal.
+Teacher proves the receipt, reads state-fenced Planner readiness, and atomically
+stages the deterministic response before Dialog delivery. A stale, invalid, or
+unavailable read cannot become `failed_no_effect` or advance the cursor.
+Recovery from `student_staged` repeats the receipt proof; `no_effect`, tangent,
+and response-staged paths make zero readiness calls. Durable accepted+no-UI
+delivery closes its prompt, while a tangent/no-effect no-UI delivery preserves
+it across crash retry.
+
+## Observability boundary
+
+Reserved low-cardinality metric dimensions are limited to bounded categories
+such as `outcome`, `reconciliation_state`, `boundary`, and `context_type`.
+IDs (`action_receipt_id`, `source_event_id`, `teacher_job_id`,
+`teacher_response_message_id`, `canonical_student_message_id`, and
+`ai_execution_id`) may appear in structured logs for correlation, but must not
+be metric labels. S1 adds no observability subsystem or collector; worker
+concurrency is bounded by `TEACHER_DIALOG_WORKER_CONCURRENCY`.
+
+The domain value objects and executable invariants are in
+`internal/domain/teacher_turn_contract.go` and
+`internal/domain/teacher_dialog_turn.go`; persistence is owned by
+`TeacherDialogJobRepository` and migration 017. Retry and lease expiry never
+advance the cursor. Only delivered or proof-backed failed-no-effect outcomes
+can advance it; unknown, partial, and committed-unreconciled states remain
+blocked.
+
+Legacy schema-v1 completion keeps its original status, response, and
+`delivered_message_id` path and does not create a dense-turn outcome record.
+The additive terminal ledger and `teacher_response_message_id` are written
+only for schema-v2 jobs.
+
+## Rollout order and readiness
+
+Migration 017 and the v2-capable Teacher binary are deployed first with
+`TEACHER_DIALOG_DENSE_ORDERING_ENABLED=false`. Readiness for the next stage is
+the protected Teacher readiness check plus an operator-visible capability
+signal that migration 017 is present and the binary reports v2 dual-read
+support; this signal is a bounded category, never an ID or metric label.
+Only after that check passes is dense claiming enabled in Teacher. Dialog may
+publish schema-v2 requests only after legacy queued work has drained and the
+Teacher consumer is observed claiming v2. These are independent producer and
+consumer switches, not one cross-service atomic flag. Rollback disables the
+Dialog v2 producer first, then disables Teacher dense claiming; the schema and
+v2 reader remain installed until all v2 rows are reconciled.
+
+The protected `GET /internal/readyz` also performs a read-only backlog check.
+If dense claiming is disabled and a schema-v2 job remains `queued`,
+`processing`, `delivery_pending`, or `blocked`, readiness returns HTTP 503
+with `status: not ready` and the static
+`error_code: dense_teacher_ordering_disabled_with_pending_v2`. This includes
+unresolved `unknown`, `partial`, and `committed_unreconciled` work. The check
+does not change jobs, response bodies, proofs, outcomes, or cursors. Terminal
+`delivered` and proof-backed `completed` history does not make readiness fail.
+Dependency or missing-schema failures remain fail-closed and never expose raw
+errors, identities, tokens, counts, or private response text.
+
+| Dialog v2 producer | Teacher dense claiming | Behavior |
+| --- | --- | --- |
+| Disabled | Disabled | Schema-v1 intake and legacy claims continue. |
+| Disabled | Enabled | Schema-v1 intake and legacy claims continue. |
+| Enabled | Disabled | Schema-v2 intake and duplicate ACK remain durable; V2 is not claimed and pending V2 makes protected readiness return the bounded 503 above. |
+| Enabled | Enabled | Schema-v2 claims follow the existing dense cursor. |
+
+After correcting the deployed consumer configuration, reconstructed workers
+resume eligible accepted V2 work under the existing lease, retry, and cursor
+rules. Readiness never auto-enables a flag or terminates valid V2 intake.
+Operators must deploy uniform producer configuration and enforce the existing
+legacy drain barrier across a mixed fleet; these independent switches do not
+provide a distributed configuration lock. An unresolved poisoned turn remains
+blocked. This diagnostic grants no timeout skip, requeue, unblock, or new
+no-effect proof policy.

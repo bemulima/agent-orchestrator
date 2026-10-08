@@ -1,0 +1,328 @@
+package aiprompt
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const (
+	maximumOnboardingSemanticRequestBytes     = domain.TeacherOnboardingSemanticVariablesMaximumBytes + 8<<10
+	maximumOnboardingSemanticResponseBytes    = 256 << 10
+	maximumOnboardingSemanticErrorBytes       = 4 << 10
+	maximumOnboardingSemanticExecutionIDRunes = 128
+)
+
+type onboardingSemanticExecutionRequest struct {
+	IdempotencyKey string                                    `json:"idempotency_key"`
+	TemplateCode   string                                    `json:"template_code"`
+	LanguageCode   string                                    `json:"language_code"`
+	Variables      domain.TeacherOnboardingSemanticVariables `json:"variables"`
+}
+
+type onboardingSemanticExecutionResponse struct {
+	ExecutionID        string          `json:"execution_id"`
+	IdempotencyKey     string          `json:"idempotency_key"`
+	TemplateCode       string          `json:"template_code"`
+	TemplateVersion    int             `json:"template_version"`
+	ProviderCode       string          `json:"provider_code"`
+	ProviderModel      string          `json:"provider_model"`
+	LanguageCode       string          `json:"language_code"`
+	ResponseSchemaCode string          `json:"response_schema_code"`
+	ParsedResponse     json.RawMessage `json:"parsed_response"`
+	Cached             bool            `json:"cached"`
+	CreatedAt          time.Time       `json:"created_at"`
+	ExpiresAt          time.Time       `json:"expires_at"`
+}
+
+func (client Client) InterpretOnboardingSemantic(ctx context.Context, input domain.TeacherOnboardingSemanticRequest) (domain.TeacherOnboardingSemanticExecution, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingSemanticRequest(input)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	variablesPayload, err := json.Marshal(normalized.Variables)
+	if err != nil || len(variablesPayload) > domain.TeacherOnboardingSemanticVariablesMaximumBytes {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	payload, err := json.Marshal(onboardingSemanticExecutionRequest{
+		IdempotencyKey: normalized.AIExecutionID,
+		TemplateCode:   domain.TeacherOnboardingSemanticTemplateCode,
+		LanguageCode:   normalized.LanguageCode,
+		Variables:      normalized.Variables,
+	})
+	if err != nil || len(payload) > maximumOnboardingSemanticRequestBytes {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	endpoint, err := client.endpoint("/api/v1/prompts/execute-confidential")
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingSemanticUnavailable
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingSemanticUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherOnboardingSemanticExecution{}, mapOnboardingSemanticStatus(response)
+	}
+	result, err := decodeOnboardingSemanticExecution(response.Body, false)
+	if err != nil || result.IdempotencyKey != normalized.AIExecutionID ||
+		result.TemplateCode != domain.TeacherOnboardingSemanticTemplateCode ||
+		result.ResponseSchemaCode != domain.TeacherOnboardingSemanticSchemaCode ||
+		result.LanguageCode != normalized.LanguageCode {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	return onboardingSemanticExecution(result), nil
+}
+
+func (client Client) ReplayOnboardingSemantic(ctx context.Context, aiExecutionID string) (domain.TeacherOnboardingSemanticExecution, error) {
+	key, err := normalizeOnboardingSemanticExecutionID(aiExecutionID)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	endpoint, err := client.endpoint("/api/v1/prompts/confidential-executions/" + url.PathEscape(key))
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingSemanticUnavailable
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingSemanticUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherOnboardingSemanticExecution{}, mapOnboardingSemanticStatus(response)
+	}
+	result, err := decodeOnboardingSemanticExecution(response.Body, true)
+	if err != nil || result.IdempotencyKey != key || result.TemplateCode != domain.TeacherOnboardingSemanticTemplateCode ||
+		result.ResponseSchemaCode != domain.TeacherOnboardingSemanticSchemaCode || result.LanguageCode != "ru" && result.LanguageCode != "en" {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	return onboardingSemanticExecution(result), nil
+}
+
+func onboardingSemanticExecution(value onboardingSemanticExecutionResponse) domain.TeacherOnboardingSemanticExecution {
+	result, _ := decodeOnboardingSemanticResult(value.ParsedResponse)
+	return domain.TeacherOnboardingSemanticExecution{
+		Result:          result,
+		LanguageCode:    value.LanguageCode,
+		TemplateVersion: value.TemplateVersion,
+		Cached:          value.Cached,
+	}
+}
+
+func decodeOnboardingSemanticExecution(reader io.Reader, requireCached bool) (onboardingSemanticExecutionResponse, error) {
+	limited := &io.LimitedReader{R: reader, N: maximumOnboardingSemanticResponseBytes + 1}
+	encoded, err := io.ReadAll(limited)
+	if err != nil || limited.N == 0 {
+		return onboardingSemanticExecutionResponse{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	fields, err := exactOnboardingSemanticObject(encoded, []string{
+		"execution_id", "idempotency_key", "template_code", "template_version", "provider_code", "provider_model",
+		"language_code", "response_schema_code", "parsed_response", "cached", "created_at", "expires_at",
+	})
+	if err != nil {
+		return onboardingSemanticExecutionResponse{}, err
+	}
+	var result onboardingSemanticExecutionResponse
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return onboardingSemanticExecutionResponse{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return onboardingSemanticExecutionResponse{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if !validOnboardingSemanticExecutionID(result.ExecutionID) || !validUUIDString(result.IdempotencyKey) ||
+		result.TemplateCode != domain.TeacherOnboardingSemanticTemplateCode || result.ResponseSchemaCode != domain.TeacherOnboardingSemanticSchemaCode ||
+		result.TemplateVersion < 1 || !validOnboardingSemanticOpaque(result.ProviderCode, 64) || !validOnboardingSemanticOpaque(result.ProviderModel, 128) ||
+		(result.LanguageCode != "ru" && result.LanguageCode != "en") || result.CreatedAt.IsZero() || result.ExpiresAt.IsZero() ||
+		!result.ExpiresAt.After(result.CreatedAt) || (requireCached && !result.Cached) {
+		return onboardingSemanticExecutionResponse{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if _, err := decodeOnboardingSemanticResult(fields["parsed_response"]); err != nil {
+		return onboardingSemanticExecutionResponse{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	return result, nil
+}
+
+func decodeOnboardingSemanticResult(encoded []byte) (domain.TeacherOnboardingSemanticResult, error) {
+	root, err := exactOnboardingSemanticObject(encoded, []string{"schema", "response", "slot_candidates", "questions", "uncertainties"})
+	if err != nil {
+		return domain.TeacherOnboardingSemanticResult{}, err
+	}
+	if _, err := exactOnboardingSemanticArray(root["slot_candidates"], []string{"slot", "code_value", "text_value", "string_list_value", "integer_value", "confidence_basis_points"}); err != nil {
+		return domain.TeacherOnboardingSemanticResult{}, err
+	}
+	if _, err := exactOnboardingSemanticArray(root["questions"], []string{"slot", "question"}); err != nil {
+		return domain.TeacherOnboardingSemanticResult{}, err
+	}
+	if _, err := exactOnboardingSemanticArray(root["uncertainties"], []string{"slot", "reason", "detail"}); err != nil {
+		return domain.TeacherOnboardingSemanticResult{}, err
+	}
+	var result domain.TeacherOnboardingSemanticResult
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return domain.TeacherOnboardingSemanticResult{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TeacherOnboardingSemanticResult{}, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	return domain.NormalizeTeacherOnboardingSemanticResult(result)
+}
+
+func exactOnboardingSemanticObject(encoded []byte, required []string) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(encoded)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	var object map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	if err := decoder.Decode(&object); err != nil {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || len(object) != len(required) {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	wanted := make(map[string]struct{}, len(required))
+	for _, key := range required {
+		wanted[key] = struct{}{}
+		value, ok := object[key]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nil, domain.ErrInvalidTeacherOnboardingSemantic
+		}
+	}
+	for key := range object {
+		if _, ok := wanted[key]; !ok {
+			return nil, domain.ErrInvalidTeacherOnboardingSemantic
+		}
+	}
+	return object, nil
+}
+
+func exactOnboardingSemanticArray(encoded json.RawMessage, required []string) ([]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(encoded)
+	if len(trimmed) == 0 || trimmed[0] != '[' || bytes.Equal(trimmed, []byte("null")) {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	var values []json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	if err := decoder.Decode(&values); err != nil {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	for _, value := range values {
+		if _, err := exactOnboardingSemanticObject(value, required); err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+func mapOnboardingSemanticStatus(response *http.Response) error {
+	code := readOnboardingSemanticErrorCode(response.Body)
+	retryAfter := parseOnboardingSemanticRetryAfter(response.Header.Get("Retry-After"))
+	switch response.StatusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return domain.ErrInvalidTeacherOnboardingSemantic
+	case http.StatusNotFound:
+		return domain.ErrTeacherOnboardingSemanticUnknown
+	case http.StatusConflict:
+		// Only the versioned machine code is retryable. A legacy/plain or
+		// unknown 409 must remain a conservative idempotency conflict even if a
+		// proxy happened to preserve Retry-After from an older producer.
+		pending := code == "execution_in_progress"
+		if !pending {
+			retryAfter = 0
+		}
+		return &domain.TeacherOnboardingSemanticConflictError{Pending: pending, RetryAfter: retryAfter}
+	case http.StatusServiceUnavailable:
+		if code == "capability_disabled" {
+			return domain.ErrTeacherOnboardingSemanticCapabilityDisabled
+		}
+		return domain.ErrTeacherOnboardingSemanticUnavailable
+	case http.StatusBadGateway:
+		return domain.ErrTeacherOnboardingSemanticProviderOutput
+	default:
+		return domain.ErrTeacherOnboardingSemanticUnavailable
+	}
+}
+
+func readOnboardingSemanticErrorCode(reader io.Reader) string {
+	if reader == nil {
+		return ""
+	}
+	payload, err := io.ReadAll(io.LimitReader(reader, maximumOnboardingSemanticErrorBytes))
+	if err != nil {
+		return ""
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(envelope.Error.Code)
+}
+
+func parseOnboardingSemanticRetryAfter(value string) int {
+	seconds, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return 0
+	}
+	return seconds
+}
+
+func normalizeOnboardingSemanticExecutionID(value string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return "", domain.ErrInvalidTeacherOnboardingSemantic
+	}
+	return parsed.String(), nil
+}
+
+func validUUIDString(value string) bool {
+	_, err := uuid.Parse(strings.TrimSpace(value))
+	return err == nil
+}
+
+func validOnboardingSemanticExecutionID(value string) bool {
+	return validOnboardingSemanticOpaque(value, maximumOnboardingSemanticExecutionIDRunes)
+}
+
+func validOnboardingSemanticOpaque(value string, maximum int) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= maximum
+}
+
+var _ repository.TeacherOnboardingSemanticInterpreter = Client{}

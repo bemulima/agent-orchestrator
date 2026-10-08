@@ -1,0 +1,326 @@
+package teacherdialog
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const (
+	teacherContextRecentTail             = 12
+	teacherContextMinimumCompactMessages = 8
+)
+
+var teacherContextSummaryNamespace = uuid.MustParse("f39ddf30-e4d2-5bc4-9c4f-514b67c3b8ed")
+
+// ContextBuilder compacts only Dialog-provided public message excerpts. A
+// summary is optional and provisional; the exact current source always stays
+// in the response context and raw history remains owned by Dialog.
+type ContextBuilder struct {
+	Summaries  repository.TeacherContextSummaryRepository
+	Summarizer repository.TeacherContextSummarizer
+}
+
+func (builder ContextBuilder) Build(
+	ctx context.Context,
+	dialog domain.DialogRequestContext,
+	languageCode string,
+	now time.Time,
+) (domain.TeacherPromptDialogContext, error) {
+	normalized, err := domain.NewDialogRequestContext(dialog)
+	if err != nil || now.IsZero() {
+		return domain.TeacherPromptDialogContext{}, domain.ErrInvalidDialogContext
+	}
+	source := normalized.Messages[len(normalized.Messages)-1]
+	if utf8.RuneCountInString(source.Body) > domain.TeacherContextMaximumExcerptRunes {
+		return domain.TeacherPromptDialogContext{}, domain.ErrTeacherContextSourceTooLarge
+	}
+	scope, err := domain.NewTeacherContextScope(domain.TeacherContextScope{
+		StudentID: normalized.StudentID, PersonalTeacherID: normalized.PersonalTeacherID,
+		DialogID: normalized.DialogID, ContextType: normalized.ContextType, ContextID: normalized.ContextID,
+	})
+	if err != nil {
+		return domain.TeacherPromptDialogContext{}, err
+	}
+
+	var latest *domain.TeacherContextSummary
+	if builder.Summaries != nil {
+		if stored, found, latestErr := builder.Summaries.Latest(ctx, scope); latestErr == nil && found {
+			if summary, normalizeErr := domain.NormalizeTeacherContextSummary(stored); normalizeErr == nil &&
+				summary.CoveredThroughSequence < source.MessageSequence {
+				latest = &summary
+			}
+		}
+	}
+	if latest != nil && digestRangeVisible(normalized.Messages, *latest) {
+		visible := messagesInSequenceRange(normalized.Messages, latest.DigestFromSequence, latest.DigestThroughSequence)
+		if digestDialogMessages(visible) != latest.SourceDigest {
+			if builder.Summaries != nil {
+				if _, invalidateErr := builder.Summaries.Invalidate(ctx, scope, latest.CoveredThroughSequence, now.UTC()); invalidateErr != nil {
+					return domain.TeacherPromptDialogContext{}, invalidateErr
+				}
+			}
+			latest = nil
+		}
+	}
+
+	active := activeContextMessages(normalized.Messages)
+	if builder.Summarizer != nil && builder.Summaries != nil {
+		if compacted := builder.compact(ctx, scope, languageCode, active, normalized.Messages, latest, now.UTC()); compacted != nil {
+			latest = compacted
+		}
+	}
+
+	through := int64(0)
+	if latest != nil {
+		through = latest.CoveredThroughSequence
+	}
+	window := boundedRecentMessages(activeAfter(active, through))
+	result := domain.TeacherPromptDialogContext{Messages: window}
+	if latest != nil {
+		result.ProvisionalSummary = summaryProjection(*latest)
+	}
+	result = fitPromptContext(result)
+	return domain.NormalizeTeacherPromptDialogContext(result, normalized.SourceMessageID, normalized)
+}
+
+func (builder ContextBuilder) compact(
+	ctx context.Context,
+	scope domain.TeacherContextScope,
+	languageCode string,
+	active []domain.DialogMessage,
+	visible []domain.DialogMessage,
+	latest *domain.TeacherContextSummary,
+	now time.Time,
+) *domain.TeacherContextSummary {
+	previousThrough := int64(0)
+	if latest != nil {
+		previousThrough = latest.CoveredThroughSequence
+	}
+	unsummarized := activeAfter(active, previousThrough)
+	if len(unsummarized) < teacherContextRecentTail+teacherContextMinimumCompactMessages {
+		return nil
+	}
+	maximumPrefix := len(unsummarized) - teacherContextRecentTail
+	prefix := make([]domain.DialogMessage, 0, maximumPrefix)
+	var excerptBytes int
+	for _, message := range unsummarized[:maximumPrefix] {
+		excerpt := excerptMessage(message)
+		if excerptBytes+len(excerpt.Body) > domain.TeacherContextMaximumExcerptBytes {
+			break
+		}
+		excerptBytes += len(excerpt.Body)
+		prefix = append(prefix, message)
+	}
+	if len(prefix) < teacherContextMinimumCompactMessages {
+		return nil
+	}
+	requestMessages := make([]domain.TeacherContextMessage, 0, len(prefix))
+	for _, message := range prefix {
+		requestMessages = append(requestMessages, excerptMessage(message))
+	}
+	through := prefix[len(prefix)-1].MessageSequence
+	request := domain.TeacherContextSummarizationRequest{
+		IdempotencyKey: summaryIdempotencyKey(scope, through), LanguageCode: languageCode,
+		Scope: scope, Messages: requestMessages,
+	}
+	if latest != nil {
+		prior := latest.Payload
+		request.PriorSummary = &prior
+	}
+	request, err := domain.NormalizeTeacherContextSummarizationRequest(request)
+	if err != nil {
+		return nil
+	}
+	payload, err := builder.Summarizer.Summarize(ctx, request)
+	if err != nil {
+		return nil
+	}
+	payload, err = domain.NormalizeTeacherContextSummaryPayload(payload)
+	if err != nil {
+		return nil
+	}
+	coveredFrom := prefix[0].MessageSequence
+	createdAt := now
+	if latest != nil {
+		coveredFrom = latest.CoveredFromSequence
+		createdAt = latest.CreatedAt
+	}
+	digestFrom := prefix[0].MessageSequence
+	digestMessages := prefix
+	if rangeEndpointsVisible(visible, coveredFrom, through) {
+		digestFrom = coveredFrom
+		digestMessages = messagesInSequenceRange(visible, coveredFrom, through)
+	}
+	candidate := domain.TeacherContextSummary{
+		Scope: scope, CoveredFromSequence: coveredFrom, CoveredThroughSequence: through,
+		DigestFromSequence: digestFrom, DigestThroughSequence: through,
+		DigestEventSequence: maximumDialogEventSequence(digestMessages),
+		SourceDigest:        digestDialogMessages(digestMessages), Payload: payload,
+		SchemaCode: domain.TeacherContextSummarySchemaCode, PolicyVersion: domain.TeacherContextSummaryPolicyVersion,
+		CreatedAt: createdAt, UpdatedAt: now,
+	}
+	stored, _, err := builder.Summaries.Store(ctx, domain.TeacherContextSummaryUpdate{
+		Summary: candidate, ExpectedThroughSequence: previousThrough, NewFromSequence: prefix[0].MessageSequence,
+	})
+	if err == nil {
+		return &stored
+	}
+	// A concurrent worker may have advanced the same scope. Use only a result
+	// that won durable CAS; never substitute the unpersisted model output.
+	if current, found, latestErr := builder.Summaries.Latest(ctx, scope); latestErr == nil && found {
+		if normalized, normalizeErr := domain.NormalizeTeacherContextSummary(current); normalizeErr == nil &&
+			normalized.CoveredThroughSequence < active[len(active)-1].MessageSequence {
+			return &normalized
+		}
+	}
+	return nil
+}
+
+func activeContextMessages(messages []domain.DialogMessage) []domain.DialogMessage {
+	result := make([]domain.DialogMessage, 0, len(messages))
+	for _, message := range messages {
+		if message.Status == 1 && strings.TrimSpace(message.Body) != "" {
+			result = append(result, message)
+		}
+	}
+	return result
+}
+
+func activeAfter(messages []domain.DialogMessage, through int64) []domain.DialogMessage {
+	result := make([]domain.DialogMessage, 0, len(messages))
+	for _, message := range messages {
+		if message.MessageSequence > through {
+			result = append(result, message)
+		}
+	}
+	return result
+}
+
+func excerptMessage(message domain.DialogMessage) domain.TeacherContextMessage {
+	body := message.Body
+	runes := []rune(body)
+	if len(runes) > domain.TeacherContextMaximumExcerptRunes {
+		body = string(runes[:domain.TeacherContextMaximumExcerptRunes])
+	}
+	return domain.TeacherContextMessage{
+		AuthorType: message.AuthorType, Body: body, MessageSequence: message.MessageSequence,
+	}
+}
+
+func boundedRecentMessages(messages []domain.DialogMessage) []domain.TeacherContextMessage {
+	start := 0
+	if len(messages) > domain.TeacherContextMaximumMessages {
+		start = len(messages) - domain.TeacherContextMaximumMessages
+	}
+	result := make([]domain.TeacherContextMessage, 0, len(messages)-start)
+	totalBytes := 0
+	for index := start; index < len(messages); index++ {
+		excerpt := excerptMessage(messages[index])
+		totalBytes += len(excerpt.Body)
+		result = append(result, excerpt)
+	}
+	for totalBytes > domain.TeacherContextMaximumExcerptBytes && len(result) > 1 {
+		totalBytes -= len(result[0].Body)
+		result = result[1:]
+	}
+	if len(result) > 0 {
+		result[len(result)-1].IsSource = true
+	}
+	return result
+}
+
+func fitPromptContext(input domain.TeacherPromptDialogContext) domain.TeacherPromptDialogContext {
+	for len(input.Messages) > 1 {
+		encoded, err := json.Marshal(input)
+		if err == nil && len(encoded) <= domain.TeacherContextMaximumBytes && utf8.RuneCount(encoded) <= domain.TeacherContextMaximumRunes {
+			return input
+		}
+		input.Messages = input.Messages[1:]
+	}
+	return input
+}
+
+func summaryProjection(summary domain.TeacherContextSummary) *domain.TeacherContextSummaryProjection {
+	return &domain.TeacherContextSummaryProjection{
+		Schema: domain.TeacherContextSummarySchemaCode, PolicyVersion: summary.PolicyVersion,
+		CoveredFromSequence: summary.CoveredFromSequence, CoveredThroughSequence: summary.CoveredThroughSequence,
+		Observations: summary.Payload,
+	}
+}
+
+func summaryIdempotencyKey(scope domain.TeacherContextScope, through int64) string {
+	identity := strings.Join([]string{
+		scope.StudentID, scope.PersonalTeacherID, scope.DialogID, string(scope.ContextType), scope.ContextID,
+		jsonNumber(through),
+	}, "\x1f")
+	return uuid.NewSHA1(teacherContextSummaryNamespace, []byte(identity)).String()
+}
+
+func digestRangeVisible(messages []domain.DialogMessage, summary domain.TeacherContextSummary) bool {
+	return rangeEndpointsVisible(messages, summary.DigestFromSequence, summary.DigestThroughSequence)
+}
+
+func rangeEndpointsVisible(messages []domain.DialogMessage, from, through int64) bool {
+	foundFrom, foundThrough := false, false
+	for _, message := range messages {
+		foundFrom = foundFrom || message.MessageSequence == from
+		foundThrough = foundThrough || message.MessageSequence == through
+	}
+	return foundFrom && foundThrough
+}
+
+func messagesInSequenceRange(messages []domain.DialogMessage, from, through int64) []domain.DialogMessage {
+	result := make([]domain.DialogMessage, 0)
+	for _, message := range messages {
+		if message.MessageSequence >= from && message.MessageSequence <= through {
+			result = append(result, message)
+		}
+	}
+	return result
+}
+
+func digestDialogMessages(messages []domain.DialogMessage) string {
+	type digestMessage struct {
+		ID                string                         `json:"id"`
+		AuthorType        domain.DialogMessageAuthorType `json:"author_type"`
+		Body              string                         `json:"body"`
+		Status            int                            `json:"status"`
+		MessageSequence   int64                          `json:"message_sequence"`
+		LastEventSequence int64                          `json:"last_event_sequence"`
+	}
+	values := make([]digestMessage, 0, len(messages))
+	for _, message := range messages {
+		values = append(values, digestMessage{
+			ID: message.ID, AuthorType: message.AuthorType, Body: message.Body, Status: message.Status,
+			MessageSequence: message.MessageSequence, LastEventSequence: message.LastEventSequence,
+		})
+	}
+	encoded, _ := json.Marshal(values)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func maximumDialogEventSequence(messages []domain.DialogMessage) int64 {
+	maximum := int64(0)
+	for _, message := range messages {
+		if message.LastEventSequence > maximum {
+			maximum = message.LastEventSequence
+		}
+	}
+	return maximum
+}
+
+func jsonNumber(value int64) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}

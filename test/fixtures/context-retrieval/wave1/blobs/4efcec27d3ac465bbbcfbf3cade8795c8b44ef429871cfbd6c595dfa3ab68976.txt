@@ -1,0 +1,422 @@
+package answer
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+func TestValidateTaskTestAnswerPayloadStillUsesTrustedCorrectness(t *testing.T) {
+	task := &TaskMetadata{
+		ID:                 "task-id",
+		AllowedErrorsCount: 0,
+		Tests: []TaskTestMetadata{
+			{
+				ID: "question-id", Kind: "single_choice", Title: "Choose", Order: 1,
+				Variants: []TaskTestVariantMetadata{
+					{ID: "correct-id", Text: "Correct", IsCorrect: true, Order: 1},
+					{ID: "wrong-id", Text: "Wrong", Order: 2},
+				},
+			},
+		},
+	}
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","variant_id":"correct-id"}]}`)
+
+	result, _, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate answer payload: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("trusted correct answer was not accepted: %+v", result.Errors)
+	}
+	if len(selected) != 1 || !selected[0].IsCorrect || selected[0].TaskTestVariantID != "correct-id" {
+		t.Fatalf("selected answer persistence changed: %+v", selected)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadScoresCorrectOrdering(t *testing.T) {
+	task := orderingAssessmentTask(0, orderingQuestion("question-id", "variant"))
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","ordered_variant_ids":["variant-b","variant-a"]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate ordering payload: %v", err)
+	}
+	if !result.Valid || len(result.Errors) != 0 {
+		t.Fatalf("correct ordering was not accepted: %+v", result)
+	}
+	if rawResult["mode"] != assessmentKindOrdering || rawResult["correct_answers"] != 1 || rawResult["incorrect_answers"] != 0 {
+		t.Fatalf("unexpected ordering summary: %+v", rawResult)
+	}
+	if len(selected) != 2 || selected[0].TaskTestVariantID != "variant-b" || selected[1].TaskTestVariantID != "variant-a" {
+		t.Fatalf("submitted sequence was not preserved: %+v", selected)
+	}
+	for index, item := range selected {
+		wantOrder := index + 1
+		if item.SubmittedOrder == nil || *item.SubmittedOrder != wantOrder || !item.IsCorrect || item.SubmittedGroupID != nil {
+			t.Fatalf("persisted ordering position %d is invalid: %+v", index, item)
+		}
+	}
+
+	encoded, err := json.Marshal(rawResult)
+	if err != nil {
+		t.Fatalf("marshal raw result: %v", err)
+	}
+	if strings.Contains(string(encoded), "correct_order") || strings.Contains(string(encoded), "correct_variant") {
+		t.Fatalf("ordering result exposes the answer key: %s", encoded)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadScoresIncorrectOrderingAsOneQuestionError(t *testing.T) {
+	task := orderingAssessmentTask(0, orderingQuestion("question-id", "variant"))
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","ordered_variant_ids":["variant-a","variant-b"]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate ordering payload: %v", err)
+	}
+	if result.Valid || !hasValidationErrorCode(result.Errors, "TEST_ORDER_INCORRECT") || !hasValidationErrorCode(result.Errors, "TEST_ALLOWED_ERRORS_EXCEEDED") {
+		t.Fatalf("incorrect ordering result mismatch: %+v", result)
+	}
+	if rawResult["correct_answers"] != 0 || rawResult["incorrect_answers"] != 1 {
+		t.Fatalf("ordering must count errors per question: %+v", rawResult)
+	}
+	if len(selected) != 2 || selected[0].IsCorrect || selected[1].IsCorrect {
+		t.Fatalf("incorrect positions were not recorded: %+v", selected)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadAppliesAllowedErrorsPerOrderingQuestion(t *testing.T) {
+	task := orderingAssessmentTask(
+		1,
+		orderingQuestion("question-a", "a"),
+		orderingQuestion("question-b", "b"),
+	)
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-a","ordered_variant_ids":["a-b","a-a"]},{"test_id":"question-b","ordered_variant_ids":["b-a","b-b"]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate ordering payload: %v", err)
+	}
+	if !result.Valid || !hasValidationErrorCode(result.Errors, "TEST_ORDER_INCORRECT") || hasValidationErrorCode(result.Errors, "TEST_ALLOWED_ERRORS_EXCEEDED") {
+		t.Fatalf("one allowed ordering error should pass: %+v", result)
+	}
+	if rawResult["correct_answers"] != 1 || rawResult["incorrect_answers"] != 1 || len(selected) != 4 {
+		t.Fatalf("question-level ordering totals mismatch: raw=%+v selected=%+v", rawResult, selected)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadRejectsInvalidOrderingDefinition(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*TaskMetadata)
+	}{
+		{
+			name: "missing correct order",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].CorrectOrder = nil
+			},
+		},
+		{
+			name: "duplicate correct order",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].CorrectOrder = intPointer(1)
+				task.Tests[0].Variants[1].CorrectOrder = intPointer(1)
+			},
+		},
+		{
+			name: "correct order out of range",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].CorrectOrder = intPointer(3)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task := orderingAssessmentTask(0, orderingQuestion("question-id", "variant"))
+			test.mutate(task)
+			payload := json.RawMessage(`{"answers":[{"test_id":"question-id","ordered_variant_ids":["variant-b","variant-a"]}]}`)
+
+			result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+			if !errors.Is(err, domain.ErrValidation) || result != nil || rawResult != nil || selected != nil {
+				t.Fatalf("invalid definition result = (%+v, %+v, %+v, %v), want validation error", result, rawResult, selected, err)
+			}
+		})
+	}
+}
+
+func TestFinalValidationPersistsOrderingPositions(t *testing.T) {
+	task := orderingAssessmentTask(0, orderingQuestion("question-id", "variant"))
+	task.Status = domain.TaskStatusActive
+	task.Type = 12
+	task.SubmissionMode = taskSubmissionAnswerPayload
+	task.EvaluationMode = taskEvaluationAuto
+	repo := &taskAnswerGuardRepoStub{
+		answers: map[string]*domain.StudentTaskAnswer{
+			"answer-id": {
+				ID: "answer-id", StudentID: "student-id", TaskID: task.ID,
+				Status: domain.StudentTaskAnswerStatusInProgress,
+			},
+		},
+		progress: map[string]domain.StudentTaskProgress{},
+	}
+	selections := &assessmentVariantRepoStub{}
+	provider := progressionTaskProviderStub{tasks: map[string]*TaskMetadata{task.ID: task}}
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","ordered_variant_ids":["variant-b","variant-a"]}]}`)
+
+	err := (FinalValidation{
+		Answers:         repo,
+		TaskTestAnswers: selections,
+		TaskProvider:    provider,
+	}).Handle(context.Background(), "answer-id", payload)
+	if err != nil {
+		t.Fatalf("finalize ordering answer: %v", err)
+	}
+	if repo.answers["answer-id"].Status != domain.StudentTaskAnswerStatusPassed {
+		t.Fatalf("answer status = %d, want passed", repo.answers["answer-id"].Status)
+	}
+	if selections.calls != 1 || selections.answerID != "answer-id" || len(selections.variants) != 2 {
+		t.Fatalf("ordering selections were not replaced once: %+v", selections)
+	}
+	if selections.variants[0].SubmittedOrder == nil || *selections.variants[0].SubmittedOrder != 1 || selections.variants[1].SubmittedOrder == nil || *selections.variants[1].SubmittedOrder != 2 {
+		t.Fatalf("ordering positions were not persisted: %+v", selections.variants)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadScoresCorrectClassification(t *testing.T) {
+	task := classificationAssessmentTask(0, classificationQuestion("question-id", "item"))
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","group_assignments":[{"variant_id":"item-a","group_id":"item-group-a"},{"variant_id":"item-b","group_id":"item-group-b"}]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate classification payload: %v", err)
+	}
+	if !result.Valid || len(result.Errors) != 0 {
+		t.Fatalf("correct classification was not accepted: %+v", result)
+	}
+	if rawResult["mode"] != assessmentKindClassification || rawResult["correct_answers"] != 1 || rawResult["incorrect_answers"] != 0 {
+		t.Fatalf("unexpected classification summary: %+v", rawResult)
+	}
+	if len(selected) != 2 || selected[0].TaskTestVariantID != "item-a" || selected[1].TaskTestVariantID != "item-b" {
+		t.Fatalf("submitted assignments were not preserved: %+v", selected)
+	}
+	wantGroups := []string{"item-group-a", "item-group-b"}
+	for index, item := range selected {
+		if item.SubmittedGroupID == nil || *item.SubmittedGroupID != wantGroups[index] || !item.IsCorrect || item.SubmittedOrder != nil {
+			t.Fatalf("persisted classification assignment %d is invalid: %+v", index, item)
+		}
+	}
+
+	encoded, err := json.Marshal(rawResult)
+	if err != nil {
+		t.Fatalf("marshal raw result: %v", err)
+	}
+	for _, forbidden := range []string{"correct_group", "expected_group", "group_source_key", "trusted_group"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("classification result exposes trusted assignments through %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadScoresIncorrectClassificationAsOneQuestionError(t *testing.T) {
+	task := classificationAssessmentTask(0, classificationQuestion("question-id", "item"))
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","group_assignments":[{"variant_id":"item-a","group_id":"item-group-b"},{"variant_id":"item-b","group_id":"item-group-b"}]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate classification payload: %v", err)
+	}
+	if result.Valid || !hasValidationErrorCode(result.Errors, "TEST_CLASSIFICATION_INCORRECT") || !hasValidationErrorCode(result.Errors, "TEST_ALLOWED_ERRORS_EXCEEDED") {
+		t.Fatalf("incorrect classification result mismatch: %+v", result)
+	}
+	if rawResult["correct_answers"] != 0 || rawResult["incorrect_answers"] != 1 {
+		t.Fatalf("classification must count errors per question: %+v", rawResult)
+	}
+	if len(selected) != 2 || selected[0].IsCorrect || !selected[1].IsCorrect {
+		t.Fatalf("per-assignment correctness was not recorded: %+v", selected)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadAppliesAllowedErrorsPerClassificationQuestion(t *testing.T) {
+	task := classificationAssessmentTask(
+		1,
+		classificationQuestion("question-a", "a"),
+		classificationQuestion("question-b", "b"),
+	)
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-a","group_assignments":[{"variant_id":"a-a","group_id":"a-group-a"},{"variant_id":"a-b","group_id":"a-group-b"}]},{"test_id":"question-b","group_assignments":[{"variant_id":"b-a","group_id":"b-group-b"},{"variant_id":"b-b","group_id":"b-group-a"}]}]}`)
+
+	result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+	if err != nil {
+		t.Fatalf("validate classification payload: %v", err)
+	}
+	if !result.Valid || !hasValidationErrorCode(result.Errors, "TEST_CLASSIFICATION_INCORRECT") || hasValidationErrorCode(result.Errors, "TEST_ALLOWED_ERRORS_EXCEEDED") {
+		t.Fatalf("one allowed classification error should pass: %+v", result)
+	}
+	if rawResult["correct_answers"] != 1 || rawResult["incorrect_answers"] != 1 || len(selected) != 4 {
+		t.Fatalf("question-level classification totals mismatch: raw=%+v selected=%+v", rawResult, selected)
+	}
+}
+
+func TestValidateTaskTestAnswerPayloadRejectsInvalidClassificationDefinition(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*TaskMetadata)
+	}{
+		{
+			name: "variant group is missing",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].GroupID = ""
+			},
+		},
+		{
+			name: "variant references unknown group",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].GroupID = "other-group"
+			},
+		},
+		{
+			name: "group id is duplicated",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Groups[1].ID = task.Tests[0].Groups[0].ID
+			},
+		},
+		{
+			name: "declared group is unused",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Groups = append(task.Tests[0].Groups, TaskTestGroupMetadata{ID: "unused-group"})
+			},
+		},
+		{
+			name: "ordering key is present",
+			mutate: func(task *TaskMetadata) {
+				task.Tests[0].Variants[0].CorrectOrder = intPointer(1)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task := classificationAssessmentTask(0, classificationQuestion("question-id", "item"))
+			test.mutate(task)
+			payload := json.RawMessage(`{"answers":[{"test_id":"question-id","group_assignments":[{"variant_id":"item-a","group_id":"item-group-a"},{"variant_id":"item-b","group_id":"item-group-b"}]}]}`)
+
+			result, rawResult, selected, err := validateTaskTestAnswerPayload("answer-id", task.ID, task, payload)
+			if !errors.Is(err, domain.ErrValidation) || result != nil || rawResult != nil || selected != nil {
+				t.Fatalf("invalid definition result = (%+v, %+v, %+v, %v), want validation error", result, rawResult, selected, err)
+			}
+		})
+	}
+}
+
+func TestFinalValidationPersistsClassificationAssignments(t *testing.T) {
+	task := classificationAssessmentTask(0, classificationQuestion("question-id", "item"))
+	task.Status = domain.TaskStatusActive
+	task.Type = 13
+	task.SubmissionMode = taskSubmissionAnswerPayload
+	task.EvaluationMode = taskEvaluationAuto
+	repo := &taskAnswerGuardRepoStub{
+		answers: map[string]*domain.StudentTaskAnswer{
+			"answer-id": {
+				ID: "answer-id", StudentID: "student-id", TaskID: task.ID,
+				Status: domain.StudentTaskAnswerStatusInProgress,
+			},
+		},
+		progress: map[string]domain.StudentTaskProgress{},
+	}
+	selections := &assessmentVariantRepoStub{}
+	provider := progressionTaskProviderStub{tasks: map[string]*TaskMetadata{task.ID: task}}
+	payload := json.RawMessage(`{"answers":[{"test_id":"question-id","group_assignments":[{"variant_id":"item-a","group_id":"item-group-a"},{"variant_id":"item-b","group_id":"item-group-b"}]}]}`)
+
+	err := (FinalValidation{
+		Answers:         repo,
+		TaskTestAnswers: selections,
+		TaskProvider:    provider,
+	}).Handle(context.Background(), "answer-id", payload)
+	if err != nil {
+		t.Fatalf("finalize classification answer: %v", err)
+	}
+	if repo.answers["answer-id"].Status != domain.StudentTaskAnswerStatusPassed {
+		t.Fatalf("answer status = %d, want passed", repo.answers["answer-id"].Status)
+	}
+	if selections.calls != 1 || selections.answerID != "answer-id" || len(selections.variants) != 2 {
+		t.Fatalf("classification selections were not replaced once: %+v", selections)
+	}
+	if selections.variants[0].SubmittedGroupID == nil || *selections.variants[0].SubmittedGroupID != "item-group-a" || selections.variants[1].SubmittedGroupID == nil || *selections.variants[1].SubmittedGroupID != "item-group-b" {
+		t.Fatalf("classification groups were not persisted: %+v", selections.variants)
+	}
+}
+
+type assessmentVariantRepoStub struct {
+	calls    int
+	answerID string
+	variants []domain.TaskTestAnswerVariant
+}
+
+func (s *assessmentVariantRepoStub) ReplaceForAnswer(_ context.Context, answerID string, variants []domain.TaskTestAnswerVariant) error {
+	s.calls++
+	s.answerID = answerID
+	s.variants = append([]domain.TaskTestAnswerVariant(nil), variants...)
+	return nil
+}
+
+func orderingAssessmentTask(allowedErrors int, questions ...TaskTestMetadata) *TaskMetadata {
+	return &TaskMetadata{
+		ID:                 "task-id",
+		TaskKind:           assessmentKindOrdering,
+		AllowedErrorsCount: allowedErrors,
+		Tests:              questions,
+	}
+}
+
+func orderingQuestion(id, variantPrefix string) TaskTestMetadata {
+	return TaskTestMetadata{
+		ID: id, Kind: assessmentKindOrdering, Title: "Arrange", Order: 1,
+		Variants: []TaskTestVariantMetadata{
+			{ID: variantPrefix + "-a", Text: "A", CorrectOrder: intPointer(2), Order: 1},
+			{ID: variantPrefix + "-b", Text: "B", CorrectOrder: intPointer(1), Order: 2},
+		},
+	}
+}
+
+func classificationAssessmentTask(allowedErrors int, questions ...TaskTestMetadata) *TaskMetadata {
+	return &TaskMetadata{
+		ID:                 "task-id",
+		TaskKind:           assessmentKindClassification,
+		AllowedErrorsCount: allowedErrors,
+		Tests:              questions,
+	}
+}
+
+func classificationQuestion(id, prefix string) TaskTestMetadata {
+	groupAID := prefix + "-group-a"
+	groupBID := prefix + "-group-b"
+	return TaskTestMetadata{
+		ID: id, Kind: assessmentKindClassification, Title: "Classify", Order: 1,
+		Groups: []TaskTestGroupMetadata{
+			{ID: groupAID, Title: "A", Order: 1},
+			{ID: groupBID, Title: "B", Order: 2},
+		},
+		Variants: []TaskTestVariantMetadata{
+			{ID: prefix + "-a", Text: "A", GroupID: groupAID, Order: 1},
+			{ID: prefix + "-b", Text: "B", GroupID: groupBID, Order: 2},
+		},
+	}
+}
+
+func intPointer(value int) *int {
+	return &value
+}
+
+func hasValidationErrorCode(errors []ValidationError, code string) bool {
+	for _, item := range errors {
+		if item.Code == code {
+			return true
+		}
+	}
+	return false
+}

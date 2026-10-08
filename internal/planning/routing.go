@@ -5,12 +5,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"gopkg.in/yaml.v3"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
@@ -174,7 +179,7 @@ func buildRoutingMetadata(requestText string, baseline domain.PlannerOutput, pro
 		primary := primaryRoute(result.Routes, result.Classification)
 		result.PrimaryRoute = &primary
 	}
-	contractPlan, err := buildContractPlan(result.Status, result.Routes, result.SharedBoundaryCandidates, inventories, resolvedProfiles)
+	contractPlan, err := buildContractPlan(result.Status, result.Routes, result.SharedBoundaryCandidates, inventories, resolvedProfiles, requestText)
 	if err != nil {
 		return domain.RoutingResult{}, domain.ContractPlan{}, nil, err
 	}
@@ -226,7 +231,10 @@ func resolveArchitectureProfile(requestText, projectID string, inventory reposit
 	if goMod != nil && goSources > 0 {
 		goProfile := catalog.Profiles["go.canonical"]
 		if !matchesRepositoryShape(inventory, goProfile.RepoShape) {
-			profileReason = "Go source was found, but required canonical layered directories are not present"
+			profileReason = "Go source was found, but required canonical layered source was not found"
+			if inventory.coverage.UnscannedRemainder || inventory.coverage.ReadErrors > 0 {
+				profileReason = "Required canonical layered source NOT_VERIFIED_BY_ACQUISITION_LIMIT_OR_READ_ERROR"
+			}
 		}
 		if matchesRepositoryShape(inventory, goProfile.RepoShape) {
 			profileID = "go.canonical"
@@ -325,7 +333,7 @@ func selectEvidenceBackedRoutes(
 	for _, route := range profile.Routes {
 		candidate := evidenceBackedRouteCandidate{route: route}
 		for _, evidence := range inventory.evidence {
-			if evidenceMatchesRoute(evidence.value.Path, route.Targets) {
+			if evidenceMatchesRoute(evidence.value.Path, route.Targets) && verifiedOutboundRoot(route.ID, evidence, inventory) {
 				candidate.files = append(candidate.files, evidence)
 			}
 		}
@@ -333,6 +341,14 @@ func selectEvidenceBackedRoutes(
 			candidate.localScore = localRouteScore(route, inventory)
 		}
 		candidate.diagnostic = analyzeRouteCandidateWithCoverage(route.ID, requestText, projectID, architectureEvidence, candidate.files, inventory.coverage)
+		if candidate.diagnostic.Polarity == domain.RoutePolarityNeutral && routeActionPattern.MatchString(requestText) && namedSourceSyntax(requestText, candidate.files) {
+			candidate.diagnostic.Polarity = domain.RoutePolarityPositive
+			candidate.diagnostic.CandidateSignal = "named source syntax anchors requested inspection or work; no type-aware relationship claimed"
+		}
+		if route.ID == "backend.transport.message" && strings.EqualFold(candidate.diagnostic.MatchedPhrase, "consumer") && !regexp.MustCompile(`(?i)\b(?:nats|queue|message|messaging|jetstream|broker)\b`).MatchString(requestText) {
+			candidate.diagnostic.Polarity = domain.RoutePolarityNeutral
+			candidate.diagnostic.CandidateSignal = "consumer without an incoming message protocol does not establish queue transport ownership"
+		}
 		candidates = append(candidates, candidate)
 	}
 	var selected []evidenceBackedRouteCandidate
@@ -369,7 +385,7 @@ func selectEvidenceBackedRoutes(
 			}
 			continue
 		}
-		if maxLocal > 0 && candidate.localScore != maxLocal {
+		if maxLocal > 0 && candidate.localScore != maxLocal && !requestedRoutingActionPattern.MatchString(requestText) && !strings.Contains(candidate.diagnostic.CandidateSignal, "named source syntax") {
 			candidate.diagnostic.Decision = domain.RouteDecisionNotSelected
 			candidate.diagnostic.CandidateSignal = joinReason(candidate.diagnostic.CandidateSignal,
 				"local ownership evidence selected a more specific positive route")
@@ -440,7 +456,7 @@ func indexRepository(root, projectID string) (repositoryInventory, error) {
 	}
 	inventory := repositoryInventory{root: canonical, byPath: map[string]indexedEvidence{}, coverage: newRoutingRepositoryCoverage(projectID)}
 	visited, totalBytes := 0, 0
-	err = filepath.WalkDir(canonical, func(current string, entry fs.DirEntry, walkErr error) error {
+	err = walkRoutingInventory(canonical, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			inventory.coverage.ReadErrors++
 			inventory.coverage.UnscannedRemainder = true
@@ -490,6 +506,7 @@ func indexRepository(root, projectID string) (repositoryInventory, error) {
 			}
 			inventory.coverage.TerminationReason = reason
 			inventory.coverage.UnscannedRemainder = true
+			inventory.coverage.RemainderCountKnown = false
 			inventory.coverage.omit("inventory", relative, reason, 1)
 			return filepath.SkipAll
 		}
@@ -673,7 +690,9 @@ type evidenceBackedRouteCandidate struct {
 
 var routingClauseSeparator = regexp.MustCompile(`(?i)\b(?:but|however|while)\b|[,.!?;\n]+`)
 
-var routeActionPattern = regexp.MustCompile(`(?i)\b(?:implement(?:s|ed|ing)?|add(?:s|ed|ing)?|chang(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|fix(?:es|ed|ing)?|creat(?:e|es|ed|ing)|build(?:s|ing)?|writ(?:e|es|ten|ing)|introduc(?:e|es|ed|ing)|extend(?:s|ed|ing)?|refactor(?:s|ed|ing)?|replac(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|support(?:s|ed|ing)?|реализ\p{L}*|добав\p{L}*|измен\p{L}*|обнов\p{L}*|исправ\p{L}*|созда\p{L}*|поддерж\p{L}*)\b`)
+var routeActionPattern = regexp.MustCompile(`(?i)\b(?:inspect(?:s|ed|ing)?|implement(?:s|ed|ing)?|add(?:s|ed|ing)?|chang(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|fix(?:es|ed|ing)?|creat(?:e|es|ed|ing)|build(?:s|ing)?|writ(?:e|es|ten|ing)|introduc(?:e|es|ed|ing)|extend(?:s|ed|ing)?|refactor(?:s|ed|ing)?|replac(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|support(?:s|ed|ing)?|реализ\p{L}*|добав\p{L}*|измен\p{L}*|обнов\p{L}*|исправ\p{L}*|созда\p{L}*|поддерж\p{L}*)\b`)
+
+var requestedRoutingActionPattern = regexp.MustCompile(`(?i)(?:^|[.!?;,]\s*)(?:only\s+)?(?:inspect|implement|add|change|modify|update|fix|create|build|write|introduce|extend|refactor|replace|remove|support)\b`)
 
 var compositionActionPattern = regexp.MustCompile(`(?i)\b(?:register(?:s|ed|ing)?|wire(?:s|d|ing)?|connect(?:s|ed|ing)?|bootstrap(?:s|ped|ping)?|bind(?:s|bound|ing)?|configur(?:e|es|ed|ing)|add(?:s|ed|ing)?|change(?:s|d|ing)?|modify(?:s|ied|ying)?|update(?:s|d|ing)?)\b`)
 
@@ -692,11 +711,11 @@ var routeNegativePrefixPattern = regexp.MustCompile(`(?i)\b(?:do\s+not|don't|doe
 var routeNegativeSuffixPattern = regexp.MustCompile(`(?i)\b(?:out\s+of\s+scope|out-of-scope|unchanged|excluded|not\s+in\s+scope)\b`)
 
 var routeSignalKeywords = map[string][]string{
-	"backend.domain":                     {"invariant", "domain invariant", "domain", "business rule", "правил", "инвариант", "модель предмет"},
+	"backend.domain":                     {"invariant", "domain invariant", "domain", "business rule", "repository interface", "repository port", "правил", "инвариант", "модель предмет"},
 	"backend.usecase":                    {"business process", "application workflow", "usecase", "use case", "application", "workflow", "процесс", "сценар", "бизнес-логик", "бизнес логик"},
 	"backend.transport.http":             {"http", "endpoint", "handler", "rest api", "http boundary", "эндпоинт", "обработчик"},
 	"backend.transport.message":          {"consumer", "message handler", "queue consumer", "потребител сообщ", "обработчик сообщ"},
-	"backend.infrastructure.persistence": {"sql", "postgres", "postgresql", "database", "query", "persistence", "repository adapter", "storage adapter", "repository", "migration", "storage", "баз данных", "запрос", "миграц", "хранилищ"},
+	"backend.infrastructure.persistence": {"sql", "postgres", "postgresql", "database", "query", "persistence", "repository adapter", "storage adapter", "repository", "write invariant", "migration", "storage", "баз данных", "запрос", "миграц", "хранилищ"},
 	"backend.infrastructure.client":      {"external client", "http client", "rpc client", "external api", "внешн клиент", "внешн api"},
 	"backend.infrastructure.messaging":   {"publisher", "message publish", "event publish", "messaging", "broker", "публикатор", "публикац событ", "брокер"},
 	"backend.migration":                  {"migration", "schema change", "database schema", "миграц", "схем базы"},
@@ -753,10 +772,21 @@ func analyzeRouteCandidateWithCoverage(routeID, requestText, projectID string, a
 		lower := strings.ToLower(clause.text)
 		conditional := routingConditionalPattern.MatchString(lower)
 		explanatory := routingExplanatoryPattern.MatchString(lower)
+		if action, context := routeActionPattern.FindStringIndex(lower), routingExplanatoryPattern.FindStringIndex(lower); action != nil && (context == nil || action[0] < context[0]) {
+			explanatory = false
+		}
 		positiveAction := routeActionPattern.MatchString(lower) || routeIssuePattern.MatchString(lower)
 		strongCompositionAction := routeID == "backend.composition" && compositionOwnershipActionPattern.MatchString(lower)
 		fragmentAction := routeID != "backend.composition" && isNominalTaskFragment(lower)
 		for _, match := range matches {
+			if context := routingExplanatoryPattern.FindStringIndex(lower); context != nil && context[0] < match.start && regexp.MustCompile(`(?i)\b(?:using|with|depends on)\s+(?:(?:a|an|the)\s+)?$`).MatchString(lower[:context[0]]) {
+				signals = append(signals, signal{domain.RoutePolarityNeutral, match.phrase, clippedTaskSpan(clause.text), "existing dependency is contextual evidence, not this action's target"})
+				continue
+			}
+			if future := regexp.MustCompile(`(?i)\bbefore\s+(?:changing|modifying|implementing|adding)\b`).FindStringIndex(lower); future != nil && match.start >= future[1] {
+				signals = append(signals, signal{domain.RoutePolarityNeutral, match.phrase, clippedTaskSpan(clause.text), "future implementation depends on a prior owner decision; not current requested work"})
+				continue
+			}
 			if routeMentionIsNegated(lower, match) {
 				signals = append(signals, signal{domain.RoutePolarityNegative, match.phrase, clippedTaskSpan(clause.text), "explicit exclusion phrase applies to this route responsibility"})
 				continue
@@ -875,7 +905,26 @@ func routePhraseMatches(routeID, clause string) []routePhraseMatch {
 		patternText = strings.ReplaceAll(patternText, ` `, `\s+`)
 		pattern := regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(` + patternText + `)(?:$|[^\p{L}\p{N}_])`)
 		for _, indexes := range pattern.FindAllStringSubmatchIndex(clause, -1) {
-			matches = append(matches, routePhraseMatch{phrase: clause[indexes[2]:indexes[3]], start: indexes[2], end: indexes[3]})
+			shadowed := false
+			for other, phrases := range routeSignalKeywords {
+				if other == routeID {
+					continue
+				}
+				for _, phrase := range phrases {
+					if len(phrase) <= len(keyword) {
+						continue
+					}
+					re := regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(` + strings.ReplaceAll(regexp.QuoteMeta(phrase), " ", `\s+`) + `)(?:$|[^\p{L}\p{N}_])`)
+					for _, span := range re.FindAllStringSubmatchIndex(clause, -1) {
+						if span[2] <= indexes[2] && span[3] >= indexes[3] {
+							shadowed = true
+						}
+					}
+				}
+			}
+			if !shadowed {
+				matches = append(matches, routePhraseMatch{phrase: clause[indexes[2]:indexes[3]], start: indexes[2], end: indexes[3]})
+			}
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool {
@@ -900,6 +949,9 @@ func routePhraseMatches(routeID, clause string) []routePhraseMatch {
 func routeMentionIsNegated(text string, match routePhraseMatch) bool {
 	prefix := text[:match.start]
 	for _, marker := range routeNegativePrefixPattern.FindAllStringIndex(prefix, -1) {
+		if regexp.MustCompile(`(?i)^\s*(?:executing|running|applying)\b`).MatchString(prefix[marker[1]:]) {
+			continue
+		}
 		if wordCount(prefix[marker[1]:]) <= 10 {
 			return true
 		}
@@ -1128,7 +1180,9 @@ func sharedBoundaryCandidates(routes []domain.RoutedTarget, profiles map[string]
 			// interface shared by transport and composition. Keep its routing
 			// evidence, but do not infer a reverse transport dependency or
 			// materialize a synthetic registration contract for freeze.
-			if boundary == "http-route-registration" || boundary == "message-consumer-registration" {
+			// Database schema is likewise an inspected DDL artifact, not a Go
+			// interface or a reverse import from persistence to migration.
+			if boundary == "http-route-registration" || boundary == "message-consumer-registration" || boundary == "database-schema" {
 				continue
 			}
 			byKind[boundary] = append(byKind[boundary], routeReference(route))
@@ -1145,7 +1199,7 @@ func sharedBoundaryCandidates(routes []domain.RoutedTarget, profiles map[string]
 	return result
 }
 
-func buildContractPlan(status domain.RoutingStatus, routes []domain.RoutedTarget, candidates []domain.SharedBoundaryCandidate, inventories map[string]repositoryInventory, profiles map[string]agentcontrol.Profile) (domain.ContractPlan, error) {
+func buildContractPlan(status domain.RoutingStatus, routes []domain.RoutedTarget, candidates []domain.SharedBoundaryCandidate, inventories map[string]repositoryInventory, profiles map[string]agentcontrol.Profile, requestText string) (domain.ContractPlan, error) {
 	var refs []domain.RouteReference
 	for _, route := range routes {
 		refs = append(refs, routeReference(route))
@@ -1187,6 +1241,12 @@ func buildContractPlan(status domain.RoutingStatus, routes []domain.RoutedTarget
 				}
 				boundary.Existing, boundary.SourceEvidenceID = true, item.value.ID
 				break
+			}
+			if !boundary.Existing && candidate.Kind == "application-command-result" {
+				if item, ok := taskTypedApplicationBoundary(requestText, ownerRoute, candidate.Routes, inventories[owner.ProjectID], profiles[owner.ProjectID]); ok {
+					boundary.Existing, boundary.SourceEvidenceID = true, item.value.ID
+					boundary.Rationale = "task-named typed owner signature and consumer selector syntax; freeze and type compatibility remain unverified"
+				}
 			}
 			references, err := contractbaseline.PlannedContractReferences(owner.ProjectID,
 				profiles[owner.ProjectID], []domain.PlannedContractBoundary{boundary}, evidenceValues(inventories[owner.ProjectID].evidence))
@@ -1647,4 +1707,509 @@ func contractImplementers(profile agentcontrol.Profile, kind string, consumers [
 
 func isCompositionRoute(routeID string) bool {
 	return routeID == "backend.composition" || routeID == "frontend.app-runtime" || routeID == "frontend.shared.bff"
+}
+
+// Ambiguous infrastructure/http roots need both an owner declaration and
+// outbound source syntax. Legacy unambiguous client roots retain their contract.
+func verifiedOutboundRoot(route string, evidence indexedEvidence, inventory repositoryInventory) bool {
+	if route != "backend.infrastructure.client" || !strings.HasPrefix(evidence.value.Path, "internal/infrastructure/http/") {
+		return true
+	}
+	directory := path.Dir(evidence.value.Path)
+	declared := false
+	for _, item := range inventory.evidence {
+		if item.value.Kind != "architecture_metadata" && item.value.Kind != "service_metadata" {
+			continue
+		}
+		var declaration yaml.Node
+		if yaml.Unmarshal(item.content, &declaration) == nil {
+			declared = declared || declaresOutboundDirectory(&declaration, directory, false)
+		}
+	}
+	if !declared {
+		return false
+	}
+	for _, item := range inventory.evidence {
+		if path.Dir(item.value.Path) == directory && item.value.Kind == "source" && outboundHTTPSyntax(item.content) {
+			return true
+		}
+	}
+	return false
+}
+
+func declaresOutboundDirectory(node *yaml.Node, directory string, outbound bool) bool {
+	if node.Kind == yaml.AliasNode {
+		return false
+	}
+	if node.Kind == yaml.ScalarNode {
+		return outbound && (node.Value == directory || strings.HasPrefix(directory, strings.TrimSuffix(node.Value, "/")+"/"))
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := strings.ToLower(node.Content[i].Value)
+			direction := outbound || strings.Contains(key, "outbound") || strings.Contains(key, "outgoing") || strings.Contains(key, "client")
+			if strings.Contains(key, "inbound") {
+				direction = false
+			}
+			if declaresOutboundDirectory(node.Content[i+1], directory, direction) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, child := range node.Content {
+		if declaresOutboundDirectory(child, directory, outbound) {
+			return true
+		}
+	}
+	return false
+}
+
+// Bounded AST syntax establishes a concrete HTTP call, never execution or
+// type-aware ownership. Comments, strings and unrelated Do methods are ignored.
+func outboundHTTPSyntax(content []byte) bool {
+	file, err := parser.ParseFile(token.NewFileSet(), "client.go", content, 0)
+	if err != nil {
+		return false
+	}
+	alias := ""
+	for _, imp := range file.Imports {
+		value, _ := strconv.Unquote(imp.Path.Value)
+		if value == "net/http" {
+			alias = "http"
+			if imp.Name != nil {
+				alias = imp.Name.Name
+			}
+		}
+	}
+	if alias == "" || alias == "_" || alias == "." {
+		return false
+	}
+	clients := map[string]bool{}
+	isClient := func(expr ast.Expr) bool {
+		if star, ok := expr.(*ast.StarExpr); ok {
+			expr = star.X
+		}
+		selector, ok := expr.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "Client" {
+			return false
+		}
+		ident, ok := selector.X.(*ast.Ident)
+		return ok && ident.Name == alias
+	}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.Field:
+			if isClient(v.Type) {
+				for _, name := range v.Names {
+					clients[name.Name] = true
+				}
+			}
+		case *ast.ValueSpec:
+			if isClient(v.Type) {
+				for _, name := range v.Names {
+					clients[name.Name] = true
+				}
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range v.Rhs {
+				if i >= len(v.Lhs) {
+					break
+				}
+				if unary, ok := rhs.(*ast.UnaryExpr); ok {
+					rhs = unary.X
+				}
+				if literal, ok := rhs.(*ast.CompositeLit); ok && isClient(literal.Type) {
+					if name, ok := v.Lhs[i].(*ast.Ident); ok {
+						clients[name.Name] = true
+					}
+				}
+			}
+		}
+		return true
+	})
+	// Copies of an already established HTTP client retain the same syntax identity.
+	ast.Inspect(file, func(n ast.Node) bool {
+		if assignment, ok := n.(*ast.AssignStmt); ok {
+			for i, rhs := range assignment.Rhs {
+				if star, ok := rhs.(*ast.StarExpr); ok {
+					rhs = star.X
+				}
+				if i >= len(assignment.Lhs) {
+					break
+				}
+				if name, ok := rhs.(*ast.Ident); ok && clients[name.Name] {
+					if target, ok := assignment.Lhs[i].(*ast.Ident); ok {
+						clients[target.Name] = true
+					}
+				}
+			}
+		}
+		return true
+	})
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		method := selector.Sel.Name
+		if receiver, ok := selector.X.(*ast.Ident); ok {
+			if receiver.Name == alias && (method == "Get" || method == "Post" || method == "PostForm") {
+				found = true
+			}
+			if clients[receiver.Name] && (method == "Do" || method == "Get" || method == "Post" || method == "PostForm") {
+				found = true
+			}
+		}
+		if receiver, ok := selector.X.(*ast.SelectorExpr); ok && clients[receiver.Sel.Name] && method == "Do" {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// Fair acquisition visits root files first, then yields one file per subtree
+// in deterministic rounds. The canonical internal layers get separate lanes,
+// so early metadata or persistence cannot starve a later usecase directory.
+// The visitor still owns all policy exclusions and global acquisition limits.
+func walkRoutingInventory(root string, visit fs.WalkDirFunc) error {
+	type node struct {
+		name  string
+		entry fs.DirEntry
+		err   error
+	}
+	type lane struct{ pending []node }
+	children := func(name string) []node {
+		entries, err := os.ReadDir(name)
+		if err != nil {
+			return []node{{name: name, err: err}}
+		}
+		nodes := make([]node, 0, len(entries))
+		for _, entry := range entries {
+			nodes = append(nodes, node{filepath.Join(name, entry.Name()), entry, nil})
+		}
+		return nodes
+	}
+	var lanes []*lane
+	var files []node
+	for _, n := range children(root) {
+		if n.err != nil {
+			if err := visit(n.name, nil, n.err); err != nil {
+				return err
+			}
+			continue
+		}
+		if !n.entry.IsDir() {
+			files = append(files, n)
+			continue
+		}
+		err := visit(n.name, n.entry, nil)
+		if err == filepath.SkipAll {
+			return nil
+		}
+		if err == filepath.SkipDir {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n.entry.Name() == "internal" {
+			var internalFiles []node
+			for _, child := range children(n.name) {
+				if child.entry != nil && child.entry.IsDir() {
+					lanes = append(lanes, &lane{pending: []node{child}})
+				} else {
+					internalFiles = append(internalFiles, child)
+				}
+			}
+			if len(internalFiles) > 0 {
+				lanes = append(lanes, &lane{pending: internalFiles})
+			}
+		} else {
+			lanes = append(lanes, &lane{pending: children(n.name)})
+		}
+	}
+	// Keep exact-cap behavior for flat inventories and stack/owner root files.
+	for _, n := range files {
+		err := visit(n.name, n.entry, n.err)
+		if err == filepath.SkipAll {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for len(lanes) > 0 {
+		active := lanes[:0]
+		for _, l := range lanes {
+			for len(l.pending) > 0 {
+				n := l.pending[0]
+				l.pending = l.pending[1:]
+				err := visit(n.name, n.entry, n.err)
+				if err == filepath.SkipAll {
+					return nil
+				}
+				if err == filepath.SkipDir {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				if n.err == nil && n.entry.IsDir() {
+					l.pending = append(children(n.name), l.pending...)
+					continue
+				}
+				break
+			}
+			if len(l.pending) > 0 {
+				active = append(active, l)
+			}
+		}
+		lanes = active
+	}
+	return nil
+}
+
+// namedSourceSyntax associates explicit task identifiers with bounded admitted
+// declarations or literal qualified selector syntax. This is file/layer evidence,
+// not a caller graph, receiver type proof, or permission to edit dependencies.
+func namedSourceSyntax(task string, files []indexedEvidence) bool {
+	inspection := regexp.MustCompile(`(?i)^\s*inspect\b`).MatchString(task)
+	separator := regexp.MustCompile(`(?i)\b(?:but|however|while)\b|[,!?;\n]+|\.\s+|\.$`)
+	for _, clause := range separator.Split(task, -1) {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		action := requestedRoutingActionPattern.MatchString(clause)
+		if !action && (!inspection || routingExplanatoryPattern.MatchString(clause)) {
+			continue
+		}
+		if regexp.MustCompile(`(?i)\b(?:dependency|unchanged|out.of.scope|do not|must not|before changing)\b`).MatchString(clause) {
+			continue
+		}
+		if regexp.MustCompile(`(?i)\b(?:using|with|depends on)\s+(?:(?:a|an|the)\s+)?(?:existing|current)\b`).MatchString(clause) {
+			continue
+		}
+		if namedSourceClauseSyntax(clause, files) {
+			return true
+		}
+	}
+	return false
+}
+
+func namedSourceClauseSyntax(task string, files []indexedEvidence) bool {
+	mentioned := func(name string) bool {
+		return len(name) >= 4 && regexp.MustCompile(`(?:^|[^\p{L}\p{N}_])`+regexp.QuoteMeta(name)+`(?:$|[^\p{L}\p{N}_])`).MatchString(task)
+	}
+	qualified := regexp.MustCompile(`\b[A-Z][A-Za-z0-9_]*\.[A-Z][A-Za-z0-9_]*\b`).FindAllString(task, -1)
+	for _, evidence := range files {
+		if mentioned(evidence.value.Path) {
+			return true
+		}
+		if !strings.HasSuffix(evidence.value.Path, ".go") || strings.HasSuffix(evidence.value.Path, "_test.go") {
+			continue
+		}
+		tree, err := parser.ParseFile(token.NewFileSet(), "source.go", evidence.content, 0)
+		if err != nil {
+			continue
+		}
+		for _, decl := range tree.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv != nil && len(d.Recv.List) > 0 {
+					recv := d.Recv.List[0].Type
+					if star, ok := recv.(*ast.StarExpr); ok {
+						recv = star.X
+					}
+					if ident, ok := recv.(*ast.Ident); ok && mentioned(ident.Name+"."+d.Name.Name) {
+						return true
+					}
+				}
+			}
+		}
+		for _, name := range qualified {
+			found := false
+			ast.Inspect(tree, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok {
+					if recv, ok := sel.X.(*ast.SelectorExpr); ok && recv.Sel.Name+"."+sel.Sel.Name == name {
+						found = true
+					}
+				}
+				return !found
+			})
+			if found {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// taskTypedApplicationBoundary recognizes actual task-named owner signatures
+// without requiring conventional Command/Result names or creating a new file.
+// Consumer selector syntax is corroboration only, not receiver-type resolution.
+func taskTypedApplicationBoundary(task string, owner *agentcontrol.ProfileRoute, refs []domain.RouteReference, inventory repositoryInventory, profile agentcontrol.Profile) (indexedEvidence, bool) {
+	if owner == nil {
+		return indexedEvidence{}, false
+	}
+	mentions := func(name string) bool {
+		return len(name) >= 4 && regexp.MustCompile(`(?:^|[^\p{L}\p{N}_])`+regexp.QuoteMeta(name)+`(?:$|[^\p{L}\p{N}_])`).MatchString(task)
+	}
+	custom := func(expr ast.Expr) bool {
+		if star, ok := expr.(*ast.StarExpr); ok {
+			expr = star.X
+		}
+		switch e := expr.(type) {
+		case *ast.Ident:
+			return e.Name != "error" && ast.IsExported(e.Name)
+		case *ast.SelectorExpr:
+			if x, ok := e.X.(*ast.Ident); ok {
+				return x.Name != "context" && ast.IsExported(e.Sel.Name)
+			}
+		}
+		return false
+	}
+	for _, item := range inventory.evidence {
+		if item.value.Kind != "source" || !strings.HasSuffix(item.value.Path, ".go") || !agentcontrol.ContractPathOwnedByRoute(profile, owner.ID, item.value.Path) {
+			continue
+		}
+		tree, err := parser.ParseFile(token.NewFileSet(), "owner.go", item.content, 0)
+		if err != nil {
+			continue
+		}
+		for _, decl := range tree.Decls {
+			f, ok := decl.(*ast.FuncDecl)
+			if !ok || f.Recv == nil || len(f.Recv.List) == 0 || f.Type.Params == nil || f.Type.Results == nil {
+				continue
+			}
+			recv := f.Recv.List[0].Type
+			if star, ok := recv.(*ast.StarExpr); ok {
+				recv = star.X
+			}
+			typ, ok := recv.(*ast.Ident)
+			if !ok || !mentions(typ.Name) && !mentions(typ.Name+"."+f.Name.Name) {
+				continue
+			}
+			input, output := false, false
+			for _, p := range f.Type.Params.List {
+				isContext := false
+				if sel, ok := p.Type.(*ast.SelectorExpr); ok {
+					if pkg, ok := sel.X.(*ast.Ident); ok {
+						isContext = pkg.Name == "context" && sel.Sel.Name == "Context"
+					}
+				}
+				input = input || !isContext
+			}
+			for _, p := range f.Type.Results.List {
+				output = output || custom(p.Type)
+			}
+			if !input || !output {
+				continue
+			}
+			signature := typ.Name + "." + f.Name.Name
+			for _, consumer := range refs {
+				if consumer.RouteID == owner.ID {
+					continue
+				}
+				route := findProfileRoute(profile, consumer.RouteID)
+				if route == nil {
+					continue
+				}
+				for _, e := range inventory.evidence {
+					if evidenceMatchesRoute(e.value.Path, route.Targets) && (namedSourceClauseSyntax(signature, []indexedEvidence{e}) || declaredOwnerFieldCall(item, typ.Name, f.Name.Name, e, inventory)) {
+						return item, true
+					}
+				}
+			}
+		}
+	}
+	return indexedEvidence{}, false
+}
+
+// declaredOwnerFieldCall follows an explicit imported struct-field type alias
+// and selector expression inside one admitted consumer file. It records syntax
+// corroboration, not a type-checked provider/consumer compatibility certificate.
+func declaredOwnerFieldCall(owner indexedEvidence, typ, method string, consumer indexedEvidence, inventory repositoryInventory) bool {
+	if !strings.HasSuffix(consumer.value.Path, ".go") {
+		return false
+	}
+	mod, ok := inventory.byPath["go.mod"]
+	if !ok {
+		return false
+	}
+	module := ""
+	for _, line := range strings.Split(string(mod.content), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "module" {
+			module = strings.Trim(fields[1], `"`)
+			break
+		}
+	}
+	if module == "" {
+		return false
+	}
+	ownerImport := module + "/" + path.Dir(owner.value.Path)
+	tree, err := parser.ParseFile(token.NewFileSet(), "consumer.go", consumer.content, 0)
+	if err != nil {
+		return false
+	}
+	imports := map[string]bool{}
+	for _, imp := range tree.Imports {
+		p, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || p != ownerImport {
+			continue
+		}
+		alias := path.Base(p)
+		if imp.Name != nil {
+			alias = imp.Name.Name
+		}
+		imports[alias] = true
+	}
+	aliases := map[string]bool{}
+	ast.Inspect(tree, func(n ast.Node) bool {
+		field, ok := n.(*ast.Field)
+		if !ok {
+			return true
+		}
+		expr := field.Type
+		if star, ok := expr.(*ast.StarExpr); ok {
+			expr = star.X
+		}
+		sel, ok := expr.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != typ {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || !imports[pkg.Name] {
+			return true
+		}
+		for _, name := range field.Names {
+			aliases[name.Name] = true
+		}
+		return true
+	})
+	found := false
+	ast.Inspect(tree, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != method {
+			return true
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		if ok && aliases[recv.Sel.Name] {
+			found = true
+		}
+		return !found
+	})
+	return found
 }

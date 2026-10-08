@@ -1,0 +1,133 @@
+package internalapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type onboardingTurnApplyStub struct {
+	command domain.StudentOnboardingTurnCommand
+	result  domain.StudentOnboardingTurnResult
+	err     error
+}
+
+func (stub *onboardingTurnApplyStub) Handle(_ context.Context, command domain.StudentOnboardingTurnCommand) (domain.StudentOnboardingTurnResult, error) {
+	stub.command = command
+	return stub.result, stub.err
+}
+
+type onboardingTurnGetStub struct {
+	studentID, commandID string
+	result               domain.StudentOnboardingTurnResult
+	err                  error
+}
+
+func (stub *onboardingTurnGetStub) Handle(_ context.Context, studentID, commandID string) (domain.StudentOnboardingTurnResult, error) {
+	stub.studentID, stub.commandID = studentID, commandID
+	return stub.result, stub.err
+}
+
+type onboardingTurnProofStub struct {
+	proof  domain.StudentOnboardingTurnNoEffectProof
+	result domain.StudentOnboardingTurnResult
+	err    error
+}
+
+func (stub *onboardingTurnProofStub) Handle(_ context.Context, proof domain.StudentOnboardingTurnNoEffectProof) (domain.StudentOnboardingTurnResult, error) {
+	stub.proof = proof
+	return stub.result, stub.err
+}
+
+func TestTeacherOnboardingTurnTransportIsPrivateStrictAndRouteBound(t *testing.T) {
+	command := testTeacherOnboardingTurnCommand()
+	result := domain.StudentOnboardingTurnResult{Schema: domain.StudentOnboardingTurnResultSchema, StudentCommandID: command.StudentCommandID, CanonicalStudentMessageID: command.CanonicalStudentMessageID, StudentEffectState: domain.StudentOnboardingTurnEffectAccepted}
+	apply := &onboardingTurnApplyStub{result: result}
+	get := &onboardingTurnGetStub{result: result}
+	proof := &onboardingTurnProofStub{result: result}
+	router := NewRouter(&Handler{OnboardingTurnApply: apply, OnboardingTurns: get, OnboardingTurnProofs: proof}, "general-token", "planner-token", "teacher-token")
+	path := "/v1/teacher/students/11111111-1111-4111-8111-111111111111/onboarding/turns"
+	body, err := json.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := performOnboardingTurnHTTP(router, http.MethodPost, path, body, command.StudentCommandID, "teacher-token")
+	if response.Code != http.StatusOK || apply.command.StudentID != "11111111-1111-4111-8111-111111111111" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("apply status=%d command=%+v body=%s", response.Code, apply.command, response.Body.String())
+	}
+	for _, forbidden := range []string{"slots", "code_value", "ai_execution", "profile", "body"} {
+		if bytes.Contains(response.Body.Bytes(), []byte(forbidden)) {
+			t.Fatalf("result leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	unknown := performOnboardingTurnHTTP(router, http.MethodPost, path, append(body[:len(body)-1], []byte(`,"unexpected":true}`)...), command.StudentCommandID, "teacher-token")
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown property status=%d body=%s", unknown.Code, unknown.Body.String())
+	}
+	wrongHeader := performOnboardingTurnHTTP(router, http.MethodPost, path, body, "22222222-2222-4222-8222-222222222223", "teacher-token")
+	if wrongHeader.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched header status=%d", wrongHeader.Code)
+	}
+	missingToken := performOnboardingTurnHTTP(router, http.MethodPost, path, body, command.StudentCommandID, "")
+	if missingToken.Code != http.StatusForbidden {
+		t.Fatalf("missing token status=%d", missingToken.Code)
+	}
+
+	getResponse := performOnboardingTurnHTTP(router, http.MethodGet, path+"/"+command.StudentCommandID, nil, "", "teacher-token")
+	if getResponse.Code != http.StatusOK || get.studentID != apply.command.StudentID || get.commandID != command.StudentCommandID {
+		t.Fatalf("GET status=%d ids=%s/%s", getResponse.Code, get.studentID, get.commandID)
+	}
+	proofBody, err := json.Marshal(domain.StudentOnboardingTurnNoEffectProof{Schema: domain.StudentOnboardingTurnNoEffectProofSchema, Command: command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofResponse := performOnboardingTurnHTTP(router, http.MethodPost, path+"/"+command.StudentCommandID+"/prove-no-effect", proofBody, command.StudentCommandID, "teacher-token")
+	if proofResponse.Code != http.StatusOK || proof.proof.Command.StudentID != apply.command.StudentID {
+		t.Fatalf("proof status=%d proof=%+v", proofResponse.Code, proof.proof)
+	}
+}
+
+func TestTeacherOnboardingTurnCapabilityDisabledIsDistinctFromConflict(t *testing.T) {
+	command := testTeacherOnboardingTurnCommand()
+	body, err := json.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply := &onboardingTurnApplyStub{err: domain.ErrForbidden}
+	router := NewRouter(&Handler{OnboardingTurnApply: apply, OnboardingTurns: &onboardingTurnGetStub{}, OnboardingTurnProofs: &onboardingTurnProofStub{}}, "general-token", "planner-token", "teacher-token")
+	response := performOnboardingTurnHTTP(router, http.MethodPost, "/v1/teacher/students/11111111-1111-4111-8111-111111111111/onboarding/turns", body, command.StudentCommandID, "teacher-token")
+	if response.Code != http.StatusServiceUnavailable || !bytes.Contains(response.Body.Bytes(), []byte("capability disabled")) {
+		t.Fatalf("disabled capability status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func performOnboardingTurnHTTP(router http.Handler, method, path string, body []byte, idempotencyKey, token string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, bytes.NewReader(body))
+	request.Header.Set("X-Internal-Token", token)
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func testTeacherOnboardingTurnCommand() domain.StudentOnboardingTurnCommand {
+	confidence := 5000
+	direction := "backend"
+	return domain.StudentOnboardingTurnCommand{
+		Schema: domain.StudentOnboardingTurnSchema, StudentCommandID: "22222222-2222-4222-8222-222222222222",
+		DialogID: "33333333-3333-4333-8333-333333333333", PersonalTeacherID: "44444444-4444-4444-8444-444444444444", TeacherTurnSequence: 1,
+		CanonicalStudentMessageID: "55555555-5555-4555-8555-555555555555", SourceEventID: "66666666-6666-4666-8666-666666666666", DialogCausationID: "55555555-5555-4555-8555-555555555555",
+		TeacherJobID: "77777777-7777-4777-8777-777777777777", AIExecutionID: testOnboardingTurnStringPointer("88888888-8888-4888-8888-888888888888"), CorrelationID: "55555555-5555-4555-8555-555555555555", CausationID: "88888888-8888-4888-8888-888888888888",
+		ExpectedDraftVersion: 0, Slots: []domain.StudentOnboardingTurnSlot{{SlotCode: domain.StudentOnboardingSlotDirectionCode, CodeValue: &direction, Origin: domain.StudentOnboardingTurnOriginExplicitText, ConfidenceBasisPoints: &confidence}},
+	}
+}
+
+func testOnboardingTurnStringPointer(value string) *string { return &value }

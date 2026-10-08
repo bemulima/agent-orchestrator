@@ -1,0 +1,711 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// CatalogScopeRepoPG implements CatalogScopeRepository.
+type CatalogScopeRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CatalogScopeRepoPG) ListPublic(ctx context.Context, lang string) ([]domain.CatalogScope, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+WITH requested_i18n AS (
+    SELECT id FROM i18n WHERE language = $1
+)
+SELECT
+    t.id,
+    t.slug,
+    COALESCE(t.source_key, ''),
+    COALESCE(ti.title, ti_fallback.title, t.slug),
+    t."order",
+    cl.id,
+    cl.slug,
+    COALESCE(cl.source_key, ''),
+    COALESCE(cli.title, cli_fallback.title, cl.slug),
+    tl."order",
+    COUNT(DISTINCT c.id)::int
+FROM track t
+JOIN track_level tl ON tl.track_id = t.id AND tl.status = $2
+JOIN course_level cl ON cl.id = tl.level_id AND cl.status = $2
+JOIN level_course_group lcg ON lcg.level_id = cl.id AND lcg.status = $2
+JOIN course_group cg ON cg.id = lcg.group_id AND cg.status = $2
+JOIN course_group_course cgc ON cgc.group_id = cg.id AND cgc.status = $2
+JOIN course c ON c.id = cgc.course_id AND c.status = $3 AND c.catalog_visible = TRUE
+LEFT JOIN requested_i18n ri ON TRUE
+LEFT JOIN track_i18n ti ON ti.track_id = t.id AND ti.i18n_id = ri.id
+LEFT JOIN course_level_i18n cli ON cli.level_id = cl.id AND cli.i18n_id = ri.id
+LEFT JOIN LATERAL (
+    SELECT title FROM track_i18n WHERE track_id = t.id ORDER BY i18n_id LIMIT 1
+) ti_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT title FROM course_level_i18n WHERE level_id = cl.id ORDER BY i18n_id LIMIT 1
+) cli_fallback ON TRUE
+WHERE t.status = $2
+GROUP BY
+    t.id, t.slug, t.source_key, ti.title, ti_fallback.title, t."order",
+    cl.id, cl.slug, cl.source_key, cli.title, cli_fallback.title, tl."order"
+ORDER BY
+    t."order" ASC NULLS LAST,
+    COALESCE(t.source_key, t.id::text) ASC,
+    tl."order" ASC,
+    COALESCE(cl.source_key, cl.id::text) ASC,
+    t.id ASC,
+    cl.id ASC`, lang, domain.CatalogStatusActive, domain.CourseStatusActive)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []domain.CatalogScope{}
+	for rows.Next() {
+		var item domain.CatalogScope
+		if err := rows.Scan(
+			&item.TrackID,
+			&item.TrackSlug,
+			&item.TrackSourceKey,
+			&item.TrackTitle,
+			&item.TrackOrder,
+			&item.LevelID,
+			&item.LevelSlug,
+			&item.LevelSourceKey,
+			&item.LevelTitle,
+			&item.LevelOrder,
+			&item.CourseCount,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+// TrackRepoPG implements TrackRepository.
+type TrackRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r TrackRepoPG) Create(ctx context.Context, track domain.Track) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO track (id, slug, source_key, "order", status, lesson_read_access, created_at, updated_at) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7,$8)`,
+		track.ID, track.Slug, track.SourceKey, track.Order, track.Status, track.LessonReadAccess, track.CreatedAt, track.UpdatedAt)
+	return mapPgError(err)
+}
+
+func (r TrackRepoPG) Get(ctx context.Context, id string) (*domain.Track, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), "order", status, lesson_read_access, created_at, updated_at FROM track WHERE id=$1`, id)
+	var item domain.Track
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Order, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r TrackRepoPG) GetBySourceKey(ctx context.Context, sourceKey string) (*domain.Track, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), "order", status, lesson_read_access, created_at, updated_at FROM track WHERE source_key=$1`, sourceKey)
+	var item domain.Track
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Order, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r TrackRepoPG) Update(ctx context.Context, track domain.Track) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE track SET slug=$1, "order"=$2, status=$3, lesson_read_access=$4, updated_at=now() WHERE id=$5`,
+		track.Slug, track.Order, track.Status, track.LessonReadAccess, track.ID)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r TrackRepoPG) Delete(ctx context.Context, id string) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE track SET status=$1, updated_at=now() WHERE id=$2`, domain.CatalogStatusNoActive, id)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r TrackRepoPG) List(ctx context.Context, filter filters.TrackFilters) ([]domain.Track, error) {
+	runner := getRunner(ctx, r.Pool)
+	args := []any{}
+	where := []string{}
+
+	if filter.Title != nil {
+		args = append(args, "%"+*filter.Title+"%")
+		where = append(where, fmt.Sprintf("EXISTS (SELECT 1 FROM track_i18n ti WHERE ti.track_id = t.id AND ti.title ILIKE $%d)", len(args)))
+	}
+	if filter.ID != nil {
+		args = append(args, *filter.ID)
+		where = append(where, fmt.Sprintf("t.id = $%d", len(args)))
+	}
+	if filter.Slug != nil {
+		args = append(args, *filter.Slug)
+		where = append(where, fmt.Sprintf("t.slug = $%d", len(args)))
+	}
+	if filter.Status != nil {
+		args = append(args, *filter.Status)
+		where = append(where, fmt.Sprintf("t.status = $%d", len(args)))
+	}
+	if filter.ActiveOnly {
+		args = append(args, domain.CatalogStatusActive)
+		where = append(where, fmt.Sprintf("t.status = $%d", len(args)))
+	}
+
+	query := `SELECT t.id, t.slug, COALESCE(t.source_key,''), t."order", t.status, t.lesson_read_access, t.created_at, t.updated_at FROM track t`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += ` ORDER BY t."order" ASC NULLS LAST, t.source_key ASC NULLS LAST, t.created_at ASC, t.id ASC`
+
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []domain.Track{}
+	for rows.Next() {
+		var item domain.Track
+		if err := rows.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Order, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+// TrackI18nRepoPG implements TrackI18nRepository.
+type TrackI18nRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r TrackI18nRepoPG) Upsert(ctx context.Context, entry domain.TrackI18n) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO track_i18n (track_id, i18n_id, title, description)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (track_id, i18n_id) DO UPDATE SET title=EXCLUDED.title, description=EXCLUDED.description`,
+		entry.TrackID, entry.I18nID, entry.Title, entry.Description)
+	return err
+}
+
+func (r TrackI18nRepoPG) ListByTrack(ctx context.Context, trackID string) ([]domain.TrackI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT ti.track_id, ti.i18n_id, i.language, ti.title, ti.description
+FROM track_i18n ti
+JOIN i18n i ON i.id = ti.i18n_id
+WHERE ti.track_id=$1
+ORDER BY i.language`, trackID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.TrackI18n{}
+	for rows.Next() {
+		var entry domain.TrackI18n
+		if err := rows.Scan(&entry.TrackID, &entry.I18nID, &entry.Language, &entry.Title, &entry.Description); err != nil {
+			return nil, err
+		}
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
+func (r TrackI18nRepoPG) Delete(ctx context.Context, trackID string, i18nID int) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `DELETE FROM track_i18n WHERE track_id=$1 AND i18n_id=$2`, trackID, i18nID)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// CourseLevelRepoPG implements CourseLevelRepository.
+type CourseLevelRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseLevelRepoPG) Create(ctx context.Context, level domain.CourseLevel) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course_level (id, slug, source_key, status, lesson_read_access, created_at, updated_at) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7)`,
+		level.ID, level.Slug, level.SourceKey, level.Status, level.LessonReadAccess, level.CreatedAt, level.UpdatedAt)
+	return mapPgError(err)
+}
+
+func (r CourseLevelRepoPG) Get(ctx context.Context, id string) (*domain.CourseLevel, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), status, lesson_read_access, created_at, updated_at FROM course_level WHERE id=$1`, id)
+	var item domain.CourseLevel
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r CourseLevelRepoPG) GetBySourceKey(ctx context.Context, sourceKey string) (*domain.CourseLevel, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), status, lesson_read_access, created_at, updated_at FROM course_level WHERE source_key=$1`, sourceKey)
+	var item domain.CourseLevel
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r CourseLevelRepoPG) Update(ctx context.Context, level domain.CourseLevel) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE course_level SET slug=$1, status=$2, lesson_read_access=$3, updated_at=now() WHERE id=$4`,
+		level.Slug, level.Status, level.LessonReadAccess, level.ID)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r CourseLevelRepoPG) Delete(ctx context.Context, id string) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE course_level SET status=$1, updated_at=now() WHERE id=$2`, domain.CatalogStatusNoActive, id)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r CourseLevelRepoPG) List(ctx context.Context, filter filters.CourseLevelFilters) ([]domain.CourseLevel, error) {
+	runner := getRunner(ctx, r.Pool)
+	args := []any{}
+	where := []string{}
+	joins := []string{}
+
+	if filter.TrackID != nil {
+		joins = append(joins, "JOIN track_level tl ON tl.level_id = l.id")
+		args = append(args, *filter.TrackID)
+		where = append(where, fmt.Sprintf("tl.track_id = $%d", len(args)))
+		where = append(where, "tl.status = 1")
+		if filter.ActiveOnly {
+			joins = append(joins, "JOIN track t ON t.id = tl.track_id")
+			where = append(where, "t.status = 1")
+		}
+	}
+	if filter.Title != nil {
+		args = append(args, "%"+*filter.Title+"%")
+		where = append(where, fmt.Sprintf("EXISTS (SELECT 1 FROM course_level_i18n li WHERE li.level_id = l.id AND li.title ILIKE $%d)", len(args)))
+	}
+	if filter.ID != nil {
+		args = append(args, *filter.ID)
+		where = append(where, fmt.Sprintf("l.id = $%d", len(args)))
+	}
+	if filter.Slug != nil {
+		args = append(args, *filter.Slug)
+		where = append(where, fmt.Sprintf("l.slug = $%d", len(args)))
+	}
+	if filter.Status != nil {
+		args = append(args, *filter.Status)
+		where = append(where, fmt.Sprintf("l.status = $%d", len(args)))
+	}
+	if filter.ActiveOnly {
+		args = append(args, domain.CatalogStatusActive)
+		where = append(where, fmt.Sprintf("l.status = $%d", len(args)))
+	}
+
+	orderBy := "l.created_at DESC"
+	if filter.TrackID != nil {
+		orderBy = `tl."order", l.created_at`
+	}
+	query := `SELECT l.id, l.slug, COALESCE(l.source_key,''), l.status, l.lesson_read_access, l.created_at, l.updated_at FROM course_level l ` + strings.Join(joins, " ")
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY " + orderBy
+
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []domain.CourseLevel{}
+	for rows.Next() {
+		var item domain.CourseLevel
+		if err := rows.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+// CourseLevelI18nRepoPG implements CourseLevelI18nRepository.
+type CourseLevelI18nRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseLevelI18nRepoPG) Upsert(ctx context.Context, entry domain.CourseLevelI18n) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course_level_i18n (level_id, i18n_id, title, description)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (level_id, i18n_id) DO UPDATE SET title=EXCLUDED.title, description=EXCLUDED.description`,
+		entry.LevelID, entry.I18nID, entry.Title, entry.Description)
+	return err
+}
+
+func (r CourseLevelI18nRepoPG) ListByLevel(ctx context.Context, levelID string) ([]domain.CourseLevelI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT li.level_id, li.i18n_id, i.language, li.title, li.description
+FROM course_level_i18n li
+JOIN i18n i ON i.id = li.i18n_id
+WHERE li.level_id=$1
+ORDER BY i.language`, levelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.CourseLevelI18n{}
+	for rows.Next() {
+		var entry domain.CourseLevelI18n
+		if err := rows.Scan(&entry.LevelID, &entry.I18nID, &entry.Language, &entry.Title, &entry.Description); err != nil {
+			return nil, err
+		}
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
+func (r CourseLevelI18nRepoPG) Delete(ctx context.Context, levelID string, i18nID int) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `DELETE FROM course_level_i18n WHERE level_id=$1 AND i18n_id=$2`, levelID, i18nID)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// CourseGroupRepoPG implements CourseGroupRepository.
+type CourseGroupRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseGroupRepoPG) Create(ctx context.Context, group domain.CourseGroup) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course_group (id, slug, source_key, status, lesson_read_access, created_at, updated_at) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7)`,
+		group.ID, group.Slug, group.SourceKey, group.Status, group.LessonReadAccess, group.CreatedAt, group.UpdatedAt)
+	return mapPgError(err)
+}
+
+func (r CourseGroupRepoPG) Get(ctx context.Context, id string) (*domain.CourseGroup, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), status, lesson_read_access, created_at, updated_at FROM course_group WHERE id=$1`, id)
+	var item domain.CourseGroup
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r CourseGroupRepoPG) GetBySourceKey(ctx context.Context, sourceKey string) (*domain.CourseGroup, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, COALESCE(source_key,''), status, lesson_read_access, created_at, updated_at FROM course_group WHERE source_key=$1`, sourceKey)
+	var item domain.CourseGroup
+	if err := row.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r CourseGroupRepoPG) Update(ctx context.Context, group domain.CourseGroup) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE course_group SET slug=$1, status=$2, lesson_read_access=$3, updated_at=now() WHERE id=$4`,
+		group.Slug, group.Status, group.LessonReadAccess, group.ID)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r CourseGroupRepoPG) Delete(ctx context.Context, id string) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE course_group SET status=$1, updated_at=now() WHERE id=$2`, domain.CatalogStatusNoActive, id)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r CourseGroupRepoPG) List(ctx context.Context, filter filters.CourseGroupFilters) ([]domain.CourseGroup, error) {
+	runner := getRunner(ctx, r.Pool)
+	args := []any{}
+	where := []string{}
+	joins := []string{}
+
+	if filter.LevelID != nil {
+		joins = append(joins, "JOIN level_course_group lcg ON lcg.group_id = g.id")
+		args = append(args, *filter.LevelID)
+		where = append(where, fmt.Sprintf("lcg.level_id = $%d", len(args)))
+		where = append(where, "lcg.status = 1")
+		if filter.ActiveOnly {
+			joins = append(joins, "JOIN course_level l ON l.id = lcg.level_id")
+			where = append(where, "l.status = 1")
+		}
+	}
+	if filter.Title != nil {
+		args = append(args, "%"+*filter.Title+"%")
+		where = append(where, fmt.Sprintf("EXISTS (SELECT 1 FROM course_group_i18n gi WHERE gi.group_id = g.id AND gi.title ILIKE $%d)", len(args)))
+	}
+	if filter.ID != nil {
+		args = append(args, *filter.ID)
+		where = append(where, fmt.Sprintf("g.id = $%d", len(args)))
+	}
+	if filter.Slug != nil {
+		args = append(args, *filter.Slug)
+		where = append(where, fmt.Sprintf("g.slug = $%d", len(args)))
+	}
+	if filter.Status != nil {
+		args = append(args, *filter.Status)
+		where = append(where, fmt.Sprintf("g.status = $%d", len(args)))
+	}
+	if filter.ActiveOnly {
+		args = append(args, domain.CatalogStatusActive)
+		where = append(where, fmt.Sprintf("g.status = $%d", len(args)))
+	}
+
+	orderBy := "g.created_at DESC"
+	if filter.LevelID != nil {
+		orderBy = `lcg."order", g.created_at`
+	}
+	query := `SELECT g.id, g.slug, COALESCE(g.source_key,''), g.status, g.lesson_read_access, g.created_at, g.updated_at FROM course_group g ` + strings.Join(joins, " ")
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY " + orderBy
+
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []domain.CourseGroup{}
+	for rows.Next() {
+		var item domain.CourseGroup
+		if err := rows.Scan(&item.ID, &item.Slug, &item.SourceKey, &item.Status, &item.LessonReadAccess, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+// CourseGroupI18nRepoPG implements CourseGroupI18nRepository.
+type CourseGroupI18nRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseGroupI18nRepoPG) Upsert(ctx context.Context, entry domain.CourseGroupI18n) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course_group_i18n (group_id, i18n_id, title, description)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (group_id, i18n_id) DO UPDATE SET title=EXCLUDED.title, description=EXCLUDED.description`,
+		entry.GroupID, entry.I18nID, entry.Title, entry.Description)
+	return err
+}
+
+func (r CourseGroupI18nRepoPG) ListByGroup(ctx context.Context, groupID string) ([]domain.CourseGroupI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT gi.group_id, gi.i18n_id, i.language, gi.title, gi.description
+FROM course_group_i18n gi
+JOIN i18n i ON i.id = gi.i18n_id
+WHERE gi.group_id=$1
+ORDER BY i.language`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.CourseGroupI18n{}
+	for rows.Next() {
+		var entry domain.CourseGroupI18n
+		if err := rows.Scan(&entry.GroupID, &entry.I18nID, &entry.Language, &entry.Title, &entry.Description); err != nil {
+			return nil, err
+		}
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
+func (r CourseGroupI18nRepoPG) Delete(ctx context.Context, groupID string, i18nID int) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `DELETE FROM course_group_i18n WHERE group_id=$1 AND i18n_id=$2`, groupID, i18nID)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// TrackLevelRepoPG implements TrackLevelRepository.
+type TrackLevelRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r TrackLevelRepoPG) Add(ctx context.Context, trackID string, levelID string, order int) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO track_level (track_id, level_id, "order", status) VALUES ($1,$2,$3,1)
+ON CONFLICT (track_id, level_id) DO UPDATE SET "order"=EXCLUDED."order", status=EXCLUDED.status, updated_at=now()`,
+		trackID, levelID, order)
+	return mapPgError(err)
+}
+
+func (r TrackLevelRepoPG) Delete(ctx context.Context, trackID string, levelID string) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `DELETE FROM track_level WHERE track_id=$1 AND level_id=$2`, trackID, levelID)
+	return err
+}
+
+func (r TrackLevelRepoPG) Replace(ctx context.Context, trackID string, items []domain.CatalogRelationOrder) error {
+	runner := getRunner(ctx, r.Pool)
+	if _, err := runner.Exec(ctx, `DELETE FROM track_level WHERE track_id=$1`, trackID); err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := runner.Exec(ctx, `INSERT INTO track_level (track_id, level_id, "order", status) VALUES ($1,$2,$3,1)`, trackID, item.ChildID, item.Order); err != nil {
+			return mapPgError(err)
+		}
+	}
+	return nil
+}
+
+// LevelCourseGroupRepoPG implements LevelCourseGroupRepository.
+type LevelCourseGroupRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r LevelCourseGroupRepoPG) Add(ctx context.Context, levelID string, groupID string, order int) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO level_course_group (level_id, group_id, "order", status) VALUES ($1,$2,$3,1)
+ON CONFLICT (level_id, group_id) DO UPDATE SET "order"=EXCLUDED."order", status=EXCLUDED.status, updated_at=now()`,
+		levelID, groupID, order)
+	return mapPgError(err)
+}
+
+func (r LevelCourseGroupRepoPG) Delete(ctx context.Context, levelID string, groupID string) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `DELETE FROM level_course_group WHERE level_id=$1 AND group_id=$2`, levelID, groupID)
+	return err
+}
+
+func (r LevelCourseGroupRepoPG) Replace(ctx context.Context, levelID string, items []domain.CatalogRelationOrder) error {
+	runner := getRunner(ctx, r.Pool)
+	if _, err := runner.Exec(ctx, `DELETE FROM level_course_group WHERE level_id=$1`, levelID); err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := runner.Exec(ctx, `INSERT INTO level_course_group (level_id, group_id, "order", status) VALUES ($1,$2,$3,1)`, levelID, item.ChildID, item.Order); err != nil {
+			return mapPgError(err)
+		}
+	}
+	return nil
+}
+
+// CourseGroupCourseRepoPG implements CourseGroupCourseRepository.
+type CourseGroupCourseRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r CourseGroupCourseRepoPG) Add(ctx context.Context, groupID string, courseID string, order int) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course_group_course (group_id, course_id, "order", status) VALUES ($1,$2,$3,1)
+ON CONFLICT (group_id, course_id) DO UPDATE SET "order"=EXCLUDED."order", status=EXCLUDED.status, updated_at=now()`,
+		groupID, courseID, order)
+	return mapPgError(err)
+}
+
+func (r CourseGroupCourseRepoPG) Delete(ctx context.Context, groupID string, courseID string) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `DELETE FROM course_group_course WHERE group_id=$1 AND course_id=$2`, groupID, courseID)
+	return err
+}
+
+func (r CourseGroupCourseRepoPG) Replace(ctx context.Context, groupID string, items []domain.CatalogRelationOrder) error {
+	runner := getRunner(ctx, r.Pool)
+	if _, err := runner.Exec(ctx, `DELETE FROM course_group_course WHERE group_id=$1`, groupID); err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := runner.Exec(ctx, `INSERT INTO course_group_course (group_id, course_id, "order", status) VALUES ($1,$2,$3,1)`, groupID, item.ChildID, item.Order); err != nil {
+			return mapPgError(err)
+		}
+	}
+	return nil
+}
+
+var _ repository.TrackRepository = (*TrackRepoPG)(nil)
+var _ repository.CatalogScopeRepository = (*CatalogScopeRepoPG)(nil)
+var _ repository.TrackI18nRepository = (*TrackI18nRepoPG)(nil)
+var _ repository.CourseLevelRepository = (*CourseLevelRepoPG)(nil)
+var _ repository.CourseLevelI18nRepository = (*CourseLevelI18nRepoPG)(nil)
+var _ repository.CourseGroupRepository = (*CourseGroupRepoPG)(nil)
+var _ repository.CourseGroupI18nRepository = (*CourseGroupI18nRepoPG)(nil)
+var _ repository.TrackLevelRepository = (*TrackLevelRepoPG)(nil)
+var _ repository.LevelCourseGroupRepository = (*LevelCourseGroupRepoPG)(nil)
+var _ repository.CourseGroupCourseRepository = (*CourseGroupCourseRepoPG)(nil)

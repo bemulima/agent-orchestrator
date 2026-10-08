@@ -1,0 +1,719 @@
+package internalapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+)
+
+// Handler handles internal endpoints.
+type Handler struct {
+	AssignedLessons          AssignedLessonContextGetter
+	NextAction               NextActionGetter
+	Answers                  repository.StudentTaskAnswerRepository
+	Students                 repository.StudentPracticeTaskRepository
+	Mastery                  TargetMasteryGetter
+	LearningActions          LearningActionContextGetter
+	LearningCode             LearningActionCodeContextGetter
+	LearnerOverview          LearnerOverviewGetter
+	PlanningReadiness        StudentPlanningReadinessGetter
+	PlanningSnapshot         PlanningSnapshotGetter
+	HybridApplication        HybridApplicationService
+	LearningWorkspace        StudentLearningWorkspaceGetter
+	LearningPaths            LearningPathReplacer
+	LearningPathCompletion   LearningPathCompleter
+	LearningPathPlanning     LearningPathPlanningService
+	Diagnostics              DiagnosticSnapshotCapturer
+	LearningSessions         LearningSessionMetricsApplier
+	CourseAssignments        CourseAssigner
+	PracticeEvidence         PracticeEvidenceApplier
+	PracticeLearningActions  PracticeLearningActionService
+	PracticeLearningEvidence PracticeLearningEvidenceApplier
+	DiagnosticAssessments    *studentuc.DiagnosticAssessments
+	OnboardingDrafts         StudentOnboardingDraftGetter
+	OnboardingDraftWrites    StudentOnboardingDraftPutter
+	OnboardingFinalization   StudentOnboardingDraftFinalizer
+	OnboardingProfiles       StudentOnboardingProfileGetter
+	OnboardingTurnApply      StudentOnboardingTurnApplier
+	OnboardingTurns          StudentOnboardingTurnGetter
+	OnboardingTurnProofs     StudentOnboardingTurnNoEffectProver
+	OnboardingPathAdmissions OnboardingPathAdmissionService
+}
+type OnboardingPathAdmissionService interface {
+	Reserve(context.Context, string, string, domain.OnboardingPathAdmissionRequest) (domain.OnboardingPathAdmission, bool, error)
+	Renew(context.Context, string, string, string, string, int64) (domain.OnboardingPathAdmission, bool, error)
+	Materialize(context.Context, string, string, string, domain.OnboardingPathMaterialization) (domain.OnboardingPathMaterializationResult, bool, error)
+	Abort(context.Context, string, string, string, domain.OnboardingPathAbort) (domain.OnboardingPathAdmission, bool, error)
+}
+
+type TargetMasteryGetter interface {
+	Handle(ctx context.Context, studentID string, targets []domain.LearningTargetRef) ([]domain.StudentTargetMastery, error)
+}
+
+type LearningActionContextGetter interface {
+	Handle(ctx context.Context, studentID, learningActionID string) (domain.LearningActionContext, error)
+}
+
+type LearningActionCodeContextGetter interface {
+	Handle(ctx context.Context, studentID, learningActionID string) (domain.LearningActionCodeContext, error)
+}
+
+type LearnerOverviewGetter interface {
+	Handle(ctx context.Context, studentID string) (domain.LearnerOverview, error)
+}
+
+type StudentPlanningReadinessGetter interface {
+	Handle(ctx context.Context, studentID string) (domain.StudentPlanningReadinessSnapshot, error)
+}
+
+type StudentLearningWorkspaceGetter interface {
+	Handle(ctx context.Context, studentID string) (domain.StudentLearningWorkspace, error)
+}
+
+type LearningPathReplacer interface {
+	Handle(context.Context, studentuc.ReplaceLearningPathInput) (domain.StudentLearningPath, error)
+}
+
+type LearningPathCompleter interface {
+	Handle(context.Context, studentuc.CompleteLearningPathInput) (domain.StudentLearningPath, error)
+}
+
+type LearningPathPlanningService interface {
+	Get(context.Context, string, string) (domain.LearningPathPlanningState, error)
+	Replan(context.Context, studentuc.LearningPathReplanInput) (domain.LearningPathPlanningCommandResult, error)
+	CompleteNoGap(context.Context, studentuc.LearningPathNoGapInput) (domain.LearningPathPlanningCommandResult, error)
+}
+
+type DiagnosticSnapshotCapturer interface {
+	Handle(context.Context, studentuc.CaptureDiagnosticInput) (domain.StudentDiagnosticSnapshot, error)
+}
+
+type LearningSessionMetricsApplier interface {
+	ApplyMetrics(context.Context, string, string, int64, studentuc.LearningSessionMetrics) (domain.StudentLearningSession, error)
+	Get(context.Context, string, string) (domain.StudentLearningSession, error)
+}
+
+type CourseAssigner interface {
+	Handle(context.Context, studentuc.AssignCourseInput) (domain.StudentCourseAssignment, bool, error)
+}
+
+type PracticeEvidenceApplier interface {
+	Handle(context.Context, string, string, domain.PracticeCompetencyEvidenceBundle) (domain.PracticeEvidenceReceipt, error)
+}
+
+type PracticeLearningActionService interface {
+	Reserve(context.Context, domain.PracticeLearningActionReserve) (domain.PracticeLearningActionBinding, error)
+	Get(context.Context, string, string) (domain.PracticeLearningActionBinding, error)
+	Open(context.Context, string, string, string) (domain.PracticeLearningActionBinding, error)
+	Cancel(context.Context, string, string, string, string) (domain.PracticeLearningActionBinding, error)
+}
+
+type PracticeLearningEvidenceApplier interface {
+	Handle(context.Context, string, string, string, domain.PracticeCompetencyEvidenceBundleV2) (domain.PracticeEvidenceReceiptV2, error)
+}
+
+// NewHandler creates a new internal handler.
+func NewHandler(
+	answers repository.StudentTaskAnswerRepository,
+	students repository.StudentPracticeTaskRepository,
+	mastery TargetMasteryGetter,
+	learningActions LearningActionContextGetter,
+	learnerOverview ...LearnerOverviewGetter,
+) *Handler {
+	handler := &Handler{
+		Answers:         answers,
+		Students:        students,
+		Mastery:         mastery,
+		LearningActions: learningActions,
+	}
+	if len(learnerOverview) > 0 {
+		handler.LearnerOverview = learnerOverview[0]
+	}
+	return handler
+}
+
+func (h *Handler) AssignCourse(w http.ResponseWriter, r *http.Request) {
+	if h.CourseAssignments == nil {
+		http.Error(w, "Course assignments are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		PlanningRequestID string `json:"planning_request_id"`
+		AssignedBy        string `json:"assigned_by"`
+	}
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	_, _, err := h.CourseAssignments.Handle(r.Context(), studentuc.AssignCourseInput{
+		StudentID: chi.URLParam(r, "studentID"), CourseID: chi.URLParam(r, "courseID"),
+		PlanningRequestID: request.PlanningRequestID, AssignedBy: request.AssignedBy,
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			http.Error(w, "invalid Course assignment", http.StatusUnprocessableEntity)
+		case errors.Is(err, domain.ErrConflict):
+			http.Error(w, "Course assignment conflict", http.StatusConflict)
+		default:
+			http.Error(w, "Course assignment failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ApplyPracticeEvidence accepts only the bounded public result produced by
+// Practice. Validator diagnostics and hidden evaluation assets are never part
+// of this Student-owned contract.
+func (h *Handler) ApplyPracticeEvidence(w http.ResponseWriter, r *http.Request) {
+	if h.PracticeEvidence == nil {
+		http.Error(w, "practice evidence is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request domain.PracticeCompetencyEvidenceBundle
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	receipt, err := h.PracticeEvidence.Handle(r.Context(), chi.URLParam(r, "studentID"), r.Header.Get("Idempotency-Key"), request)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrEvidenceContract), errors.Is(err, domain.ErrValidation):
+			http.Error(w, "invalid practice evidence", http.StatusUnprocessableEntity)
+		case errors.Is(err, domain.ErrConflict):
+			http.Error(w, "practice evidence conflict", http.StatusConflict)
+		default:
+			http.Error(w, "practice evidence ingest failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(receipt)
+}
+
+func (h *Handler) ReplaceLearningPath(w http.ResponseWriter, r *http.Request) {
+	if h.LearningPaths == nil {
+		http.Error(w, "learning path is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		ExpectedOnboardingVersion int64                     `json:"expected_onboarding_version"`
+		ExpectedDirectionCode     string                    `json:"expected_direction_code"`
+		PlanningRequestID         string                    `json:"planning_request_id"`
+		CourseID                  string                    `json:"course_id"`
+		GoalCode                  string                    `json:"goal_code"`
+		CurriculumRevision        string                    `json:"curriculum_revision"`
+		CourseFingerprint         string                    `json:"course_fingerprint"`
+		PlannerPolicyVersion      string                    `json:"planner_policy_version"`
+		ReasonCode                string                    `json:"reason_code"`
+		ReasonSummary             string                    `json:"reason_summary"`
+		ExpectedVersion           int64                     `json:"expected_version"`
+		Items                     []domain.LearningPathItem `json:"items"`
+	}
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if request.CurriculumRevision != "" && request.CourseFingerprint != "" &&
+		request.CurriculumRevision != request.CourseFingerprint {
+		http.Error(w, "conflicting course fingerprint", http.StatusUnprocessableEntity)
+		return
+	}
+	if (request.ExpectedOnboardingVersion != 0 || request.ExpectedDirectionCode != "") &&
+		(request.ExpectedOnboardingVersion < 1 || strings.TrimSpace(request.ExpectedDirectionCode) == "" || request.ExpectedVersion != 0 || request.PlanningRequestID == "") {
+		http.Error(w, "invalid diagnostic context fence", http.StatusBadRequest)
+		return
+	}
+	if request.CurriculumRevision == "" {
+		request.CurriculumRevision = request.CourseFingerprint
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		idempotencyKey = request.PlanningRequestID
+	}
+	result, err := h.LearningPaths.Handle(r.Context(), studentuc.ReplaceLearningPathInput{
+		ExpectedOnboardingVersion: request.ExpectedOnboardingVersion, ExpectedDirectionCode: request.ExpectedDirectionCode,
+		StudentID: chi.URLParam(r, "studentID"), PlanningRequestID: request.PlanningRequestID,
+		IdempotencyKey: idempotencyKey, CourseID: request.CourseID, GoalCode: request.GoalCode,
+		CurriculumRevision: request.CurriculumRevision, ReasonCode: request.ReasonCode,
+		PlannerPolicyVersion: request.PlannerPolicyVersion,
+		ReasonSummary:        request.ReasonSummary, ExpectedVersion: request.ExpectedVersion, Items: request.Items,
+	})
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) CompleteLearningPath(w http.ResponseWriter, r *http.Request) {
+	if h.LearningPathCompletion == nil {
+		http.Error(w, "learning path completion is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		GoalCode             string `json:"goal_code"`
+		CourseFingerprint    string `json:"course_fingerprint"`
+		PlannerPolicyVersion string `json:"planner_policy_version"`
+		ReasonCode           string `json:"reason_code"`
+		ReasonSummary        string `json:"reason_summary"`
+		ExpectedVersion      int64  `json:"expected_version"`
+	}
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := h.LearningPathCompletion.Handle(r.Context(), studentuc.CompleteLearningPathInput{
+		StudentID: chi.URLParam(r, "studentID"), GoalCode: request.GoalCode,
+		CourseFingerprint: request.CourseFingerprint, PlannerPolicyVersion: request.PlannerPolicyVersion,
+		ReasonCode: request.ReasonCode, ReasonSummary: request.ReasonSummary,
+		ExpectedVersion: request.ExpectedVersion,
+	})
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) CaptureDiagnosticSnapshot(w http.ResponseWriter, r *http.Request) {
+	if h.Diagnostics == nil {
+		http.Error(w, "diagnostics are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		AssessmentID       string                     `json:"assessment_id"`
+		CurriculumRevision string                     `json:"curriculum_revision"`
+		Targets            []domain.LearningTargetRef `json:"targets"`
+	}
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := h.Diagnostics.Handle(r.Context(), studentuc.CaptureDiagnosticInput{
+		StudentID: chi.URLParam(r, "studentID"), AssessmentID: request.AssessmentID,
+		CurriculumRevision: request.CurriculumRevision, Targets: request.Targets,
+	})
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) ApplyLearningSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.LearningSessions == nil {
+		http.Error(w, "learning sessions are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		ExpectedVersion          int64  `json:"expected_version"`
+		AnalyticsSessionID       string `json:"analytics_session_id"`
+		ActiveLearningSeconds    int    `json:"active_learning_seconds"`
+		LessonCount              int    `json:"lesson_count"`
+		TaskCount                int    `json:"task_count"`
+		QuestionCount            int    `json:"question_count"`
+		SelectedExplanationCount int    `json:"selected_explanation_count"`
+		CodeRunCount             int    `json:"code_run_count"`
+		FailureCount             int    `json:"failure_count"`
+		PassedTestCount          int    `json:"passed_test_count"`
+		HintCount                int    `json:"hint_count"`
+		TeacherInterventionCount int    `json:"teacher_intervention_count"`
+		StuckSignalCount         int    `json:"stuck_signal_count"`
+	}
+	if err := decodeInternalJSON(w, r, &request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	result, err := h.LearningSessions.ApplyMetrics(r.Context(), chi.URLParam(r, "studentID"), chi.URLParam(r, "sessionID"), request.ExpectedVersion, studentuc.LearningSessionMetrics{
+		AnalyticsSessionID: request.AnalyticsSessionID, ActiveLearningSeconds: request.ActiveLearningSeconds,
+		LessonCount: request.LessonCount, TaskCount: request.TaskCount, QuestionCount: request.QuestionCount,
+		SelectedExplanationCount: request.SelectedExplanationCount, CodeRunCount: request.CodeRunCount,
+		FailureCount: request.FailureCount, PassedTestCount: request.PassedTestCount,
+		HintCount: request.HintCount, TeacherInterventionCount: request.TeacherInterventionCount,
+		StuckSignalCount: request.StuckSignalCount,
+	})
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) GetLearningSession(w http.ResponseWriter, r *http.Request) {
+	if h.LearningSessions == nil {
+		http.Error(w, "learning sessions are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := h.LearningSessions.Get(r.Context(), chi.URLParam(r, "studentID"), chi.URLParam(r, "sessionID"))
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// GetLearningActionCodeContext returns a bounded text-only workspace snapshot
+// without answer, Sandbox, secret, binary, or validator-owned data.
+func (h *Handler) GetLearningActionCodeContext(w http.ResponseWriter, r *http.Request) {
+	if h.LearningCode == nil {
+		http.Error(w, "learning action code context is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := h.LearningCode.Handle(r.Context(), chi.URLParam(r, "studentID"), chi.URLParam(r, "learningActionID"))
+	if err != nil {
+		writeInternalJourneyError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func decodeInternalJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("invalid trailing request data")
+	}
+	return nil
+}
+
+func writeInternalJourneyError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrDiagnosticContextStale):
+		http.Error(w, "diagnostic_context_stale", http.StatusConflict)
+	case errors.Is(err, domain.ErrValidation):
+		http.Error(w, "invalid learning journey request", http.StatusBadRequest)
+	case errors.Is(err, domain.ErrConflict):
+		http.Error(w, "learning journey version conflict", http.StatusConflict)
+	case errors.Is(err, domain.ErrNotFound):
+		http.Error(w, "learning journey not found", http.StatusNotFound)
+	default:
+		http.Error(w, "learning journey operation failed", http.StatusInternalServerError)
+	}
+}
+
+// GetLearnerOverview returns a bounded Student-owned projection for general teacher dialogs.
+func (h *Handler) GetLearnerOverview(w http.ResponseWriter, r *http.Request) {
+	if h.LearnerOverview == nil {
+		http.Error(w, "learner overview is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := h.LearnerOverview.Handle(r.Context(), chi.URLParam(r, "studentID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			http.Error(w, "invalid learner overview query", http.StatusBadRequest)
+		default:
+			http.Error(w, "learner overview query failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// GetStudentPlanningReadiness returns the strict, bounded planning input. It
+// intentionally does not reuse the broader learner-overview response.
+func (h *Handler) GetStudentPlanningReadiness(w http.ResponseWriter, r *http.Request) {
+	if h.PlanningReadiness == nil {
+		http.Error(w, "student planning readiness is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := h.PlanningReadiness.Handle(r.Context(), chi.URLParam(r, "studentID"))
+	if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, "invalid planning readiness query", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "planning readiness query failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+type progressItemResponse struct {
+	TaskID         string `json:"task_id"`
+	HasPassed      bool   `json:"has_passed"`
+	HasUnderReview bool   `json:"has_under_review"`
+	LatestStatus   int    `json:"latest_status"`
+	LatestAnswerID string `json:"latest_answer_id,omitempty"`
+}
+
+type usageCountResponse struct {
+	PracticeTaskID          string `json:"practice_task_id,omitempty"`
+	PracticeTaskPartID      string `json:"practice_task_part_id,omitempty"`
+	PracticeTaskMilestoneID string `json:"practice_task_milestone_id,omitempty"`
+	StudentUsageCount       int    `json:"student_usage_count"`
+}
+
+type targetMasteryQueryRequest struct {
+	Targets []domain.LearningTargetRef `json:"targets"`
+}
+
+type targetMasteryResponse struct {
+	Target                  domain.LearningTargetRef  `json:"target"`
+	State                   domain.TargetMasteryState `json:"state"`
+	MasteryScore            float64                   `json:"mastery_score"`
+	Confidence              float64                   `json:"confidence"`
+	IndependentSuccessCount int                       `json:"independent_success_count"`
+	AssistedSuccessCount    int                       `json:"assisted_success_count"`
+	FailureCount            int                       `json:"failure_count"`
+	EvidenceCount           int                       `json:"evidence_count"`
+	LastSeenAt              *time.Time                `json:"last_seen_at,omitempty"`
+	LastPracticedAt         *time.Time                `json:"last_practiced_at,omitempty"`
+	LastFailedAt            *time.Time                `json:"last_failed_at,omitempty"`
+	PolicyVersion           string                    `json:"policy_version"`
+}
+
+// QueryStudentTargetMastery returns bounded relevant mastery without exposing raw evidence.
+func (h *Handler) QueryStudentTargetMastery(w http.ResponseWriter, r *http.Request) {
+	if h.Mastery == nil {
+		http.Error(w, "mastery projection is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var request targetMasteryQueryRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	items, err := h.Mastery.Handle(r.Context(), chi.URLParam(r, "studentID"), request.Targets)
+	if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			http.Error(w, "invalid mastery query", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "mastery query failed", http.StatusInternalServerError)
+		return
+	}
+	response := make([]targetMasteryResponse, 0, len(items))
+	for _, item := range items {
+		var lastSeenAt *time.Time
+		if !item.LastSeenAt.IsZero() {
+			value := item.LastSeenAt.UTC()
+			lastSeenAt = &value
+		}
+		response = append(response, targetMasteryResponse{
+			Target:                  item.Target,
+			State:                   item.State,
+			MasteryScore:            item.MasteryScore,
+			Confidence:              item.Confidence,
+			IndependentSuccessCount: item.IndependentSuccessCount,
+			AssistedSuccessCount:    item.AssistedSuccessCount,
+			FailureCount:            item.FailureCount,
+			EvidenceCount:           item.EvidenceCount,
+			LastSeenAt:              lastSeenAt,
+			LastPracticedAt:         item.LastPracticedAt,
+			LastFailedAt:            item.LastFailedAt,
+			PolicyVersion:           item.PolicyVersion,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"items": response})
+}
+
+// GetLearningActionContext returns a safe action snapshot without objective outcome.
+func (h *Handler) GetLearningActionContext(w http.ResponseWriter, r *http.Request) {
+	if h.LearningActions == nil {
+		http.Error(w, "learning action context is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := h.LearningActions.Handle(
+		r.Context(),
+		chi.URLParam(r, "studentID"),
+		chi.URLParam(r, "learningActionID"),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			http.Error(w, "invalid learning action context query", http.StatusBadRequest)
+		case errors.Is(err, domain.ErrNotFound):
+			http.Error(w, "learning action not found", http.StatusNotFound)
+		default:
+			http.Error(w, "learning action context query failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// GetAnswerStatus returns answer status.
+func (h *Handler) GetAnswerStatus(w http.ResponseWriter, r *http.Request) {
+	answerID := chi.URLParam(r, "answerID")
+	answer, err := h.Answers.GetByID(r.Context(), answerID)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]int{"status": answer.Status})
+}
+
+// GetTaskProgress returns aggregated progress for selected tasks and one user.
+func (h *Handler) GetTaskProgress(w http.ResponseWriter, r *http.Request) {
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+
+	taskIDs := splitCSV(r.URL.Query().Get("task_ids"))
+	if len(taskIDs) == 0 {
+		http.Error(w, "task_ids is required", http.StatusBadRequest)
+		return
+	}
+
+	progressMap, err := h.Answers.GetProgressByTaskIDs(r.Context(), userID, taskIDs)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	items := make([]progressItemResponse, 0, len(progressMap))
+	for _, taskID := range taskIDs {
+		progress, ok := progressMap[taskID]
+		if !ok {
+			continue
+		}
+		items = append(items, progressItemResponse{
+			TaskID:         progress.TaskID,
+			HasPassed:      progress.HasPassed,
+			HasUnderReview: progress.HasUnderReview,
+			LatestStatus:   progress.LatestStatus,
+			LatestAnswerID: progress.LatestAnswerID,
+		})
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].TaskID < items[j].TaskID
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"items": items,
+	})
+}
+
+func (h *Handler) GetPracticeTaskUsage(w http.ResponseWriter, r *http.Request) {
+	if h.Students == nil {
+		http.Error(w, "student repository is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	practiceTaskID := chi.URLParam(r, "id")
+	count, err := h.Students.CountStudentPracticeTasksByPracticeTaskID(r.Context(), practiceTaskID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(usageCountResponse{
+		PracticeTaskID:    practiceTaskID,
+		StudentUsageCount: count,
+	})
+}
+
+func (h *Handler) GetPracticeTaskPartUsage(w http.ResponseWriter, r *http.Request) {
+	if h.Students == nil {
+		http.Error(w, "student repository is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	partID := chi.URLParam(r, "id")
+	count, err := h.Students.CountStudentPracticeTasksByPartID(r.Context(), partID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(usageCountResponse{
+		PracticeTaskPartID: partID,
+		StudentUsageCount:  count,
+	})
+}
+
+func (h *Handler) GetPracticeTaskMilestoneUsage(w http.ResponseWriter, r *http.Request) {
+	if h.Students == nil {
+		http.Error(w, "student repository is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	milestoneID := chi.URLParam(r, "id")
+	count, err := h.Students.CountStudentPracticeTasksByMilestoneID(r.Context(), milestoneID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(usageCountResponse{
+		PracticeTaskMilestoneID: milestoneID,
+		StudentUsageCount:       count,
+	})
+}
+
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Exercise importer readback, scoped deletion, reapply, and DB rollback."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+IMPORTER_PATH = ROOT / "scripts" / "import_knowledge_task_manifest.py"
+MANIFEST_PATH = ROOT / "db" / "manifests" / "knowledge-task-manifest.neutral.example.json"
+
+
+def load_importer():
+    spec = importlib.util.spec_from_file_location("knowledge_task_manifest", IMPORTER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load importer from {IMPORTER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def main() -> None:
+    module = load_importer()
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    api = module.CourseAPI()
+
+    # Append keeps unrelated catalog siblings intact when this scenario runs
+    # after a larger multi-manifest integration batch.
+    module.apply_manifest_batch([manifest], api, ownership="append")
+    append_checks = module.verify_manifest_batch([manifest], api, ownership="append")
+    module.apply_manifest_batch([manifest], api, ownership="append")
+    repeat_checks = module.verify_manifest_batch([manifest], api, ownership="append")
+    assert repeat_checks == append_checks
+
+    partial_source = copy.deepcopy(manifest)
+    lesson = partial_source["modules"][0]["sections"][0]["lessons"][0]
+    stale_task = lesson["tasks"].pop()
+    selected, scope = module.scoped_manifest_batch(
+        [partial_source],
+        module.ScopeSelector("lesson", lesson["source_key"]),
+    )
+    module.apply_manifest_batch(selected, api, scope, "partial")
+    partial_checks = module.verify_manifest_batch(selected, api, scope, "partial")
+    assert api.request(
+        "GET",
+        f"/task/get/{module.source_uuid(stale_task['source_key'])}",
+        allow_not_found=True,
+    ) is None
+    module.apply_manifest_batch(selected, api, scope, "partial")
+    assert module.verify_manifest_batch(selected, api, scope, "partial") == partial_checks
+
+    kept_task = selected[0]["modules"][0]["sections"][0]["lessons"][0]["tasks"][0]
+    kept_task_id = module.source_uuid(kept_task["source_key"])
+    try:
+        api.request(
+            "POST",
+            "/knowledge-import/batch",
+            {
+                "operations": [
+                    {"method": "DELETE", "path": f"/task/delete/{kept_task_id}", "body": {}},
+                    {
+                        "method": "PUT",
+                        "path": "/task/update/ffffffff-ffff-ffff-ffff-ffffffffffff",
+                        "body": {},
+                    },
+                ]
+            },
+        )
+    except module.ManifestError as error:
+        assert "operation_index" in str(error), error
+    else:
+        raise AssertionError("forced batch failure unexpectedly committed")
+    assert api.request("GET", f"/task/get/{kept_task_id}")["id"] == kept_task_id
+
+    module.apply_manifest_batch([manifest], api, ownership="append")
+    assert module.verify_manifest_batch([manifest], api, ownership="append") == append_checks
+    print(
+        "Knowledge import readback integration passed: "
+        f"append={append_checks}, partial={partial_checks}, deletion/reapply/rollback verified"
+    )
+
+
+if __name__ == "__main__":
+    main()

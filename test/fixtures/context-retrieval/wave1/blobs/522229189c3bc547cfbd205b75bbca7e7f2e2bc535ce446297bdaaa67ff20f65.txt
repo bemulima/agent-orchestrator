@@ -1,0 +1,646 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	pgadapter "github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	httpadapter "github.com/example/ms-student-service/internal/transport/http"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+)
+
+func TestStructuredAssessmentRegularCourseHTTPFlows(t *testing.T) {
+	for _, scenario := range structuredAssessmentScenarios() {
+		t.Run(scenario.kind, func(t *testing.T) {
+			runStructuredAssessmentHTTPFlow(t, scenario, false)
+		})
+	}
+}
+
+func TestStructuredAssessmentPracticeTaskScopedHTTPFlows(t *testing.T) {
+	for _, scenario := range structuredAssessmentScenarios() {
+		t.Run(scenario.kind, func(t *testing.T) {
+			runStructuredAssessmentHTTPFlow(t, scenario, true)
+		})
+	}
+}
+
+func TestStructuredAssessmentPostgresScoringReadback(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+
+	answerRepo := pgadapter.StudentTaskAnswerRepoPG{Pool: pool}
+	autoReviewRepo := pgadapter.AutoReviewRepoPG{Pool: pool}
+	selectionRepo := pgadapter.TaskTestAnswerVariantRepoPG{Pool: pool}
+	for _, scenario := range structuredAssessmentScenarios() {
+		t.Run(scenario.kind, func(t *testing.T) {
+			transport := &structuredCourseTransport{task: scenario.task, token: "internal-token"}
+			courseClient := courseclient.Client{
+				BaseURL:       "http://course.test",
+				InternalToken: transport.token,
+				HTTPClient:    &http.Client{Transport: transport},
+			}
+			studentID := uuid.NewString()
+			publisher := newRecordPublisher()
+			started, err := (answer.StartTaskAnswer{
+				TaskProvider: courseClient,
+				Answers:      answerRepo,
+				Publisher:    publisher,
+			}).Handle(context.Background(), answer.StartTaskAnswerInput{
+				StudentID: studentID,
+				TaskID:    scenario.task.ID,
+			})
+			if err != nil {
+				t.Fatalf("start database-backed assessment: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = pool.Exec(context.Background(), `DELETE FROM task_test_answer_variant WHERE student_task_answer_id=$1`, started.AnswerID)
+				cleanupTestDB(t, pool, started.AnswerID)
+			})
+
+			err = (answer.FinalValidation{
+				Answers:         answerRepo,
+				TaskTestAnswers: selectionRepo,
+				TaskProvider:    courseClient,
+				Publisher:       publisher,
+				AutoReviews:     autoReviewRepo,
+			}).Handle(context.Background(), started.AnswerID, scenario.correctPayload)
+			if err != nil {
+				t.Fatalf("finalize database-backed assessment: %v", err)
+			}
+
+			storedAnswer, err := answerRepo.GetByID(context.Background(), started.AnswerID)
+			if err != nil || storedAnswer.Status != domain.StudentTaskAnswerStatusPassed {
+				t.Fatalf("stored answer mismatch: answer=%+v err=%v", storedAnswer, err)
+			}
+			storedSelections, err := selectionRepo.ListForAnswer(context.Background(), started.AnswerID)
+			if err != nil {
+				t.Fatalf("read stored selections: %v", err)
+			}
+			assertPersistedAssessmentSelections(t, scenario.kind, storedSelections, true)
+			storedReview, err := autoReviewRepo.GetByAnswerID(context.Background(), started.AnswerID)
+			if err != nil || !storedReview.Passed || storedReview.RawResult["source"] != "task_test" {
+				t.Fatalf("stored review mismatch: review=%+v err=%v", storedReview, err)
+			}
+		})
+	}
+}
+
+type structuredAssessmentScenario struct {
+	kind             string
+	task             *answer.TaskMetadata
+	incorrectPayload json.RawMessage
+	correctPayload   json.RawMessage
+}
+
+type structuredFlowFixture struct {
+	integrationFixtures
+	selections     *memoryAssessmentSelectionRepo
+	practiceAccess *recordingPracticeAccess
+}
+
+func runStructuredAssessmentHTTPFlow(t *testing.T, scenario structuredAssessmentScenario, practiceScoped bool) {
+	t.Helper()
+	fixture := newStructuredFlowFixture(t, scenario.task, practiceScoped)
+	studentID := uuid.NewString()
+	headers := authHeaders(studentID, "STUDENT")
+
+	taskURL, startURL, submitURL := structuredAssessmentURLs(scenario.task.ID, practiceScoped)
+	getTask := fixture.doJSONRequest(t, http.MethodGet, taskURL, nil, headers)
+	if getTask.StatusCode != http.StatusOK {
+		body := readResponseBody(t, getTask)
+		t.Fatalf("GET task returned %d: %s", getTask.StatusCode, body)
+	}
+	publicTask := readResponseBody(t, getTask)
+	assertPublicAssessmentHasNoAnswerKey(t, publicTask)
+
+	firstAnswerID := startStructuredAttempt(t, fixture.integrationFixtures, startURL, headers)
+	firstSubmit := submitStructuredAttempt(t, fixture.integrationFixtures, submitURL(firstAnswerID), scenario.incorrectPayload, headers)
+	if firstSubmit.Status != "FAILED" || firstSubmit.Review.Passed {
+		t.Fatalf("incorrect %s submission result: %+v", scenario.kind, firstSubmit)
+	}
+	assertSafeStudentAssessmentPayload(t, firstSubmit.raw)
+	if !bytes.Contains(firstSubmit.raw, []byte("ASSESSMENT_INCORRECT")) {
+		t.Fatalf("failed assessment response has no generic error: %s", firstSubmit.raw)
+	}
+
+	assertPersistedAssessmentSelections(t, scenario.kind, fixture.selections.forAnswer(firstAnswerID), false)
+	trustedReview, err := fixture.AutoReviews.GetByAnswerID(context.Background(), firstAnswerID)
+	if err != nil || trustedReview.RawResult["items"] == nil {
+		t.Fatalf("trusted diagnostics were not retained: review=%+v err=%v", trustedReview, err)
+	}
+
+	studentResultURLs := []string{
+		fmt.Sprintf("%s/student/tasks/%s/answers/%s", apiPrefix, scenario.task.ID, firstAnswerID),
+		fmt.Sprintf("%s/student/answers/%s", apiPrefix, firstAnswerID),
+		fmt.Sprintf("%s/student/results/%s", apiPrefix, firstAnswerID),
+	}
+	for _, resultURL := range studentResultURLs {
+		response := fixture.doJSONRequest(t, http.MethodGet, resultURL, nil, headers)
+		if response.StatusCode != http.StatusOK {
+			body := readResponseBody(t, response)
+			t.Fatalf("GET %s returned %d: %s", resultURL, response.StatusCode, body)
+		}
+		assertSafeStudentAssessmentPayload(t, readResponseBody(t, response))
+	}
+
+	secondAnswerID := startStructuredAttempt(t, fixture.integrationFixtures, startURL, headers)
+	if secondAnswerID == firstAnswerID {
+		t.Fatal("retry reused a finalized failed answer")
+	}
+	secondSubmit := submitStructuredAttempt(t, fixture.integrationFixtures, submitURL(secondAnswerID), scenario.correctPayload, headers)
+	if secondSubmit.Status != "PASSED" || !secondSubmit.Review.Passed {
+		t.Fatalf("correct %s submission result: %+v", scenario.kind, secondSubmit)
+	}
+	assertSafeStudentAssessmentPayload(t, secondSubmit.raw)
+	assertPersistedAssessmentSelections(t, scenario.kind, fixture.selections.forAnswer(secondAnswerID), true)
+
+	passedResult := fixture.doJSONRequest(t, http.MethodGet, fmt.Sprintf("%s/student/results/%s", apiPrefix, secondAnswerID), nil, headers)
+	if passedResult.StatusCode != http.StatusOK {
+		body := readResponseBody(t, passedResult)
+		t.Fatalf("GET passed result returned %d: %s", passedResult.StatusCode, body)
+	}
+	assertSafeStudentAssessmentPayload(t, readResponseBody(t, passedResult))
+
+	if practiceScoped && (fixture.practiceAccess == nil || !fixture.practiceAccess.sawScope()) {
+		t.Fatal("practice-task flow did not preserve scoped access context")
+	}
+}
+
+type structuredSubmitResult struct {
+	wikiSubmitResponse
+	raw []byte
+}
+
+func startStructuredAttempt(t *testing.T, fixture integrationFixtures, url string, headers map[string]string) string {
+	t.Helper()
+	response := fixture.doJSONRequest(t, http.MethodPost, url, nil, headers)
+	if response.StatusCode != http.StatusOK {
+		body := readResponseBody(t, response)
+		t.Fatalf("start returned %d: %s", response.StatusCode, body)
+	}
+	var started startTaskDTO
+	decodeBody(t, response, &started)
+	if started.AnswerID == "" || started.Status != "IN_PROCESS" || started.SandboxID != "" {
+		t.Fatalf("unexpected structured assessment start: %+v", started)
+	}
+	return started.AnswerID
+}
+
+func submitStructuredAttempt(t *testing.T, fixture integrationFixtures, url string, payload json.RawMessage, headers map[string]string) structuredSubmitResult {
+	t.Helper()
+	body, err := json.Marshal(map[string]json.RawMessage{"answer_payload": payload})
+	if err != nil {
+		t.Fatalf("marshal submit payload: %v", err)
+	}
+	response := fixture.doJSONRequest(t, http.MethodPost, url, bytes.NewReader(body), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		headers,
+	))
+	if response.StatusCode != http.StatusOK {
+		responseBody := readResponseBody(t, response)
+		t.Fatalf("submit returned %d: %s", response.StatusCode, responseBody)
+	}
+	responseBody := readResponseBody(t, response)
+	var result wikiSubmitResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		t.Fatalf("decode submit response: %v body=%s", err, responseBody)
+	}
+	return structuredSubmitResult{wikiSubmitResponse: result, raw: responseBody}
+}
+
+func structuredAssessmentURLs(taskID string, practiceScoped bool) (string, string, func(string) string) {
+	if !practiceScoped {
+		taskURL := fmt.Sprintf("%s/student/tasks/%s", apiPrefix, taskID)
+		return taskURL, taskURL + "/start", func(answerID string) string {
+			return fmt.Sprintf("%s/answers/%s/submit", taskURL, answerID)
+		}
+	}
+	base := fmt.Sprintf(
+		"%s/student/student-practice-tasks/%s/parts/%s/milestones/%s/lessons/%s/tasks/%s",
+		apiPrefix,
+		uuid.NewString(),
+		uuid.NewString(),
+		uuid.NewString(),
+		uuid.NewString(),
+		taskID,
+	)
+	return base, base + "/start", func(answerID string) string {
+		return fmt.Sprintf("%s/answers/%s/submit", base, answerID)
+	}
+}
+
+func newStructuredFlowFixture(t *testing.T, task *answer.TaskMetadata, practiceScoped bool) structuredFlowFixture {
+	t.Helper()
+	transport := &structuredCourseTransport{task: task, token: "internal-token"}
+	courseClient := courseclient.Client{
+		BaseURL:       "http://course.test",
+		InternalToken: transport.token,
+		HTTPClient:    &http.Client{Transport: transport},
+	}
+	answers := newMemoryAnswerRepo()
+	autoReviews := newMemoryAutoReviewRepo()
+	manualReviews := newMemoryManualReviewRepo()
+	selections := newMemoryAssessmentSelectionRepo()
+	publisher := newRecordPublisher()
+	progression := &answer.ProgressionService{TaskProvider: courseClient, Answers: answers}
+	var practiceAccess *recordingPracticeAccess
+	if practiceScoped {
+		practiceAccess = &recordingPracticeAccess{}
+		progression.PracticeTaskAccess = practiceAccess
+	}
+
+	getAnswer := answer.GetStudentAnswer{Answers: answers, AutoReviews: autoReviews, ManualReviews: manualReviews}
+	start := answer.StartTaskAnswer{
+		TaskProvider: courseClient,
+		Answers:      answers,
+		Publisher:    publisher,
+		Progression:  progression,
+	}
+	finalValidation := answer.FinalValidation{
+		Answers:         answers,
+		TaskTestAnswers: selections,
+		TaskProvider:    courseClient,
+		Progression:     progression,
+		Publisher:       publisher,
+		AutoReviews:     autoReviews,
+	}
+	answerHandler := &handlers.AnswerHandler{
+		Validator:  validator.New(),
+		Start:      start,
+		Progress:   progression,
+		SubmitById: finalValidation,
+		List:       answer.ListStudentAnswers{Answers: answers},
+		Get:        getAnswer,
+		ListResults: answer.ListStudentResults{
+			Answers:      answers,
+			TaskProvider: courseClient,
+		},
+		GetResult: answer.GetStudentResult{
+			GetAnswer:    getAnswer,
+			Answers:      answers,
+			TaskProvider: courseClient,
+		},
+	}
+	practiceHandler := &handlers.StudentPracticeTaskHandler{
+		Validator:  validator.New(),
+		Progress:   progression,
+		Start:      start,
+		SubmitById: finalValidation,
+		Get:        getAnswer,
+	}
+	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
+		AnswerHandler:              answerHandler,
+		StudentPracticeTaskHandler: practiceHandler,
+		// This suite explicitly exercises the emergency compatibility flow; production defaults remain retired (410).
+		LegacyPracticeWritesEnabled: true,
+	})
+	return structuredFlowFixture{
+		integrationFixtures: integrationFixtures{
+			Router:        router,
+			Answers:       answers,
+			AutoReviews:   autoReviews,
+			ManualReviews: manualReviews,
+			Publisher:     publisher,
+		},
+		selections:     selections,
+		practiceAccess: practiceAccess,
+	}
+}
+
+type memoryAssessmentSelectionRepo struct {
+	mu      sync.Mutex
+	records map[string][]domain.TaskTestAnswerVariant
+}
+
+func newMemoryAssessmentSelectionRepo() *memoryAssessmentSelectionRepo {
+	return &memoryAssessmentSelectionRepo{records: make(map[string][]domain.TaskTestAnswerVariant)}
+}
+
+func (repo *memoryAssessmentSelectionRepo) ReplaceForAnswer(_ context.Context, answerID string, variants []domain.TaskTestAnswerVariant) error {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	repo.records[answerID] = append([]domain.TaskTestAnswerVariant(nil), variants...)
+	return nil
+}
+
+func (repo *memoryAssessmentSelectionRepo) forAnswer(answerID string) []domain.TaskTestAnswerVariant {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	return append([]domain.TaskTestAnswerVariant(nil), repo.records[answerID]...)
+}
+
+type recordingPracticeAccess struct {
+	mu          sync.Mutex
+	scopeWasSet bool
+}
+
+func (resolver *recordingPracticeAccess) ResolvePracticeTaskTaskAccess(ctx context.Context, _ string, taskID string) (*answer.TaskAccess, error) {
+	resolver.recordScope(ctx)
+	return &answer.TaskAccess{TaskID: taskID, Current: true}, nil
+}
+
+func (resolver *recordingPracticeAccess) ResolvePracticeTaskLessonAccess(ctx context.Context, _ string, lessonID string) (*answer.LessonAccess, error) {
+	resolver.recordScope(ctx)
+	return &answer.LessonAccess{LessonID: lessonID, Current: true}, nil
+}
+
+func (resolver *recordingPracticeAccess) recordScope(ctx context.Context) {
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	_, resolver.scopeWasSet = answer.PracticeTaskScopeFromContext(ctx)
+}
+
+func (resolver *recordingPracticeAccess) sawScope() bool {
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	return resolver.scopeWasSet
+}
+
+type structuredCourseTransport struct {
+	task  *answer.TaskMetadata
+	token string
+}
+
+func (transport *structuredCourseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	publicTaskPath := fmt.Sprintf("/api/v1/task/get/%s", transport.task.ID)
+	publicCoursePath := fmt.Sprintf("/api/v1/course/get/%s", transport.task.CourseID)
+	taskPath := fmt.Sprintf("/internal/task/get-internal-task/%s", transport.task.ID)
+	structurePath := fmt.Sprintf("/internal/course/get-internal-course-structure/%s", transport.task.CourseID)
+	switch request.URL.Path {
+	case publicTaskPath, publicCoursePath:
+		if request.Header.Get("X-Internal-Token") != "" {
+			return structuredHTTPResponse(http.StatusInternalServerError, map[string]string{"error": "public request used internal token"}), nil
+		}
+		return structuredHTTPResponse(http.StatusOK, map[string]any{"id": transport.task.ID}), nil
+	case taskPath:
+		if request.Header.Get("X-Internal-Token") != transport.token {
+			return structuredHTTPResponse(http.StatusForbidden, map[string]string{"error": "forbidden"}), nil
+		}
+		return structuredHTTPResponse(http.StatusOK, structuredTaskContractPayload(transport.task)), nil
+	case structurePath:
+		if request.Header.Get("X-Internal-Token") != transport.token {
+			return structuredHTTPResponse(http.StatusForbidden, map[string]string{"error": "forbidden"}), nil
+		}
+		return structuredHTTPResponse(http.StatusOK, map[string]any{
+			"course_id": transport.task.CourseID,
+			"lessons": []any{map[string]any{
+				"id":        transport.task.LessonID,
+				"course_id": transport.task.CourseID,
+				"title":     "Lesson",
+				"order":     1,
+				"status":    domain.TaskStatusActive,
+				"tasks": []any{map[string]any{
+					"id":              transport.task.ID,
+					"lesson_id":       transport.task.LessonID,
+					"course_id":       transport.task.CourseID,
+					"title":           transport.task.Title,
+					"type":            transport.task.Type,
+					"evaluation_mode": "AUTO",
+					"order":           1,
+					"status":          domain.TaskStatusActive,
+				}},
+			}},
+		}), nil
+	default:
+		return structuredHTTPResponse(http.StatusNotFound, map[string]string{"error": "not found"}), nil
+	}
+}
+
+func structuredTaskContractPayload(task *answer.TaskMetadata) map[string]any {
+	tests := make([]any, 0, len(task.Tests))
+	for _, question := range task.Tests {
+		groups := make([]any, 0, len(question.Groups))
+		for _, group := range question.Groups {
+			groups = append(groups, map[string]any{
+				"id": group.ID, "title": group.Title, "order": group.Order,
+			})
+		}
+		variants := make([]any, 0, len(question.Variants))
+		for _, variant := range question.Variants {
+			variants = append(variants, map[string]any{
+				"id":               variant.ID,
+				"text":             variant.Text,
+				"is_correct":       variant.IsCorrect,
+				"correct_order":    variant.CorrectOrder,
+				"group_id":         variant.GroupID,
+				"group_source_key": variant.GroupSourceKey,
+				"order":            variant.Order,
+			})
+		}
+		tests = append(tests, map[string]any{
+			"id":          question.ID,
+			"kind":        question.Kind,
+			"title":       question.Title,
+			"description": question.Description,
+			"order":       question.Order,
+			"groups":      groups,
+			"variants":    variants,
+		})
+	}
+	return map[string]any{
+		"id":                       task.ID,
+		"lesson_id":                task.LessonID,
+		"course_id":                task.CourseID,
+		"title":                    task.Title,
+		"description":              task.Description,
+		"status":                   task.Status,
+		"type":                     task.Type,
+		"task_kind":                task.TaskKind,
+		"code_structure_type_code": task.CodeStructureType,
+		"allowed_errors_count":     task.AllowedErrorsCount,
+		"tests":                    tests,
+		"execution_mode":           "NO_RUN",
+		"evaluation_mode":          "AUTO",
+		"ui_mode":                  "QUIZ",
+		"submission_mode":          "ANSWER_PAYLOAD",
+		"requires_sandbox":         false,
+		"max_attempts":             task.MaxAttempts,
+	}
+}
+
+func structuredHTTPResponse(status int, payload any) *http.Response {
+	body, _ := json.Marshal(payload)
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+func structuredAssessmentScenarios() []structuredAssessmentScenario {
+	maxAttempts := 2
+	newTask := func(taskType int16, taskKind, code string, question answer.TaskTestMetadata) *answer.TaskMetadata {
+		return &answer.TaskMetadata{
+			ID: uuid.NewString(), LessonID: uuid.NewString(), CourseID: uuid.NewString(),
+			Title: "Assessment", Description: "Structured assessment",
+			Status: domain.TaskStatusActive, Type: taskType, TaskKind: taskKind,
+			CodeStructureType: code, AllowedErrorsCount: 0, Tests: []answer.TaskTestMetadata{question},
+			ExecutionMode: "NO_RUN", EvaluationMode: "AUTO", UIMode: "QUIZ", SubmissionMode: "ANSWER_PAYLOAD",
+			MaxAttempts: &maxAttempts,
+		}
+	}
+
+	singleQuestionID := uuid.NewString()
+	singleCorrectID := uuid.NewString()
+	singleWrongID := uuid.NewString()
+	singleTask := newTask(11, "test", "TEST_SINGLE_CHOICE_BASIC", answer.TaskTestMetadata{
+		ID: singleQuestionID, Kind: "single_choice", Title: "Choose", Order: 1,
+		Variants: []answer.TaskTestVariantMetadata{
+			{ID: singleCorrectID, Text: "Correct", IsCorrect: true, Order: 1},
+			{ID: singleWrongID, Text: "Wrong", Order: 2},
+		},
+	})
+
+	orderingQuestionID := uuid.NewString()
+	orderingAID := uuid.NewString()
+	orderingBID := uuid.NewString()
+	one, two := 1, 2
+	orderingTask := newTask(12, "ordering", "TEST_ORDERING_BASIC", answer.TaskTestMetadata{
+		ID: orderingQuestionID, Kind: "ordering", Title: "Arrange", Order: 1,
+		Variants: []answer.TaskTestVariantMetadata{
+			{ID: orderingAID, Text: "A", CorrectOrder: &two, Order: 1},
+			{ID: orderingBID, Text: "B", CorrectOrder: &one, Order: 2},
+		},
+	})
+
+	classificationQuestionID := uuid.NewString()
+	classificationAID := uuid.NewString()
+	classificationBID := uuid.NewString()
+	groupAID := uuid.NewString()
+	groupBID := uuid.NewString()
+	classificationTask := newTask(13, "classification", "TEST_CLASSIFICATION_BASIC", answer.TaskTestMetadata{
+		ID: classificationQuestionID, Kind: "classification", Title: "Classify", Order: 1,
+		Groups: []answer.TaskTestGroupMetadata{
+			{ID: groupAID, Title: "Group A", Order: 1},
+			{ID: groupBID, Title: "Group B", Order: 2},
+		},
+		Variants: []answer.TaskTestVariantMetadata{
+			{ID: classificationAID, Text: "A", GroupID: groupAID, GroupSourceKey: "group-a", Order: 1},
+			{ID: classificationBID, Text: "B", GroupID: groupBID, GroupSourceKey: "group-b", Order: 2},
+		},
+	})
+
+	return []structuredAssessmentScenario{
+		{
+			kind:             "single_choice",
+			task:             singleTask,
+			incorrectPayload: assessmentPayload(singleQuestionID, "variant_id", singleWrongID),
+			correctPayload:   assessmentPayload(singleQuestionID, "variant_id", singleCorrectID),
+		},
+		{
+			kind:             "ordering",
+			task:             orderingTask,
+			incorrectPayload: assessmentPayload(orderingQuestionID, "ordered_variant_ids", []string{orderingAID, orderingBID}),
+			correctPayload:   assessmentPayload(orderingQuestionID, "ordered_variant_ids", []string{orderingBID, orderingAID}),
+		},
+		{
+			kind: "classification",
+			task: classificationTask,
+			incorrectPayload: assessmentPayload(classificationQuestionID, "group_assignments", []map[string]string{
+				{"variant_id": classificationAID, "group_id": groupBID},
+				{"variant_id": classificationBID, "group_id": groupBID},
+			}),
+			correctPayload: assessmentPayload(classificationQuestionID, "group_assignments", []map[string]string{
+				{"variant_id": classificationAID, "group_id": groupAID},
+				{"variant_id": classificationBID, "group_id": groupBID},
+			}),
+		},
+	}
+}
+
+func assessmentPayload(questionID, field string, value any) json.RawMessage {
+	payload, _ := json.Marshal(map[string]any{
+		"answers": []any{map[string]any{"test_id": questionID, field: value}},
+	})
+	return payload
+}
+
+func assertPersistedAssessmentSelections(t *testing.T, kind string, selections []domain.TaskTestAnswerVariant, allCorrect bool) {
+	t.Helper()
+	wantCount := 2
+	if kind == "single_choice" {
+		wantCount = 1
+	}
+	if len(selections) != wantCount {
+		t.Fatalf("persisted %s selections = %d, want %d: %+v", kind, len(selections), wantCount, selections)
+	}
+	for index, selection := range selections {
+		switch kind {
+		case "single_choice":
+			if selection.SubmittedOrder != nil || selection.SubmittedGroupID != nil {
+				t.Fatalf("single-choice persistence contains structured fields: %+v", selection)
+			}
+		case "ordering":
+			if selection.SubmittedOrder == nil || *selection.SubmittedOrder != index+1 || selection.SubmittedGroupID != nil {
+				t.Fatalf("ordering persistence mismatch: %+v", selections)
+			}
+		case "classification":
+			if selection.SubmittedGroupID == nil || selection.SubmittedOrder != nil {
+				t.Fatalf("classification persistence mismatch: %+v", selections)
+			}
+		}
+		if allCorrect && !selection.IsCorrect {
+			t.Fatalf("correct %s answer persisted an incorrect row: %+v", kind, selections)
+		}
+	}
+}
+
+func assertPublicAssessmentHasNoAnswerKey(t *testing.T, payload []byte) {
+	t.Helper()
+	for _, forbidden := range []string{`"is_correct"`, `"correct_order"`, `"group_id"`, `"group_source_key"`} {
+		if bytes.Contains(payload, []byte(forbidden)) {
+			t.Fatalf("public task exposes %s: %s", forbidden, payload)
+		}
+	}
+}
+
+func assertSafeStudentAssessmentPayload(t *testing.T, payload []byte) {
+	t.Helper()
+	for _, forbidden := range []string{
+		`"items"`,
+		`"correct":`,
+		"correct_answers",
+		"incorrect_answers",
+		"correct_variant_id",
+		"correct_variant_text",
+		"correct_order",
+		"correct_group",
+		"expected_group",
+		"group_source_key",
+		"submitted_variant_ids",
+		"submitted_group_assignments",
+		"selected_variant_id",
+		"TEST_VARIANT_INCORRECT",
+		"TEST_ORDER_INCORRECT",
+		"TEST_CLASSIFICATION_INCORRECT",
+	} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("student result exposes %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func readResponseBody(t *testing.T, response *http.Response) []byte {
+	t.Helper()
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return body
+}

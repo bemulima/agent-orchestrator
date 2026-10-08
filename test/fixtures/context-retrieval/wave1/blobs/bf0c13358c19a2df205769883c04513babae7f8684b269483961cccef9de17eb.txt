@@ -1,0 +1,417 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	SubjectDialogTeacherRequested         = "dialog.teacher.requested"
+	DialogTeacherRequestedSchemaVersionV1 = 1
+	DialogTeacherRequestedSchemaVersionV2 = 2
+	DialogTeacherRequestedSchemaVersion   = DialogTeacherRequestedSchemaVersionV2
+)
+
+var (
+	ErrInvalidDialogContext   = errors.New("invalid dialog context")
+	ErrDialogRequestNotFound  = errors.New("dialog request not found")
+	ErrDialogStateUnavailable = errors.New("dialog state unavailable")
+)
+
+// TeacherDialogBinding is the canonical Dialog-owned conversation binding
+// returned to the authenticated student. Teacher-agent owns neither messages
+// nor the dialog lifecycle; it only provisions the binding through Dialog.
+type TeacherDialogBinding struct {
+	ID                string              `json:"id"`
+	StudentID         string              `json:"student_id"`
+	PersonalTeacherID string              `json:"personal_teacher_id"`
+	ContextType       LearningContextType `json:"context_type"`
+	ContextID         string              `json:"context_id,omitempty"`
+	Created           bool                `json:"created"`
+}
+
+func NewTeacherDialogBinding(input TeacherDialogBinding) (TeacherDialogBinding, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PersonalTeacherID = strings.TrimSpace(input.PersonalTeacherID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	if !validUUID(input.ID) || !validUUID(input.StudentID) || !validUUID(input.PersonalTeacherID) ||
+		!validTeacherDialogBindingContext(input.ContextType, input.ContextID) {
+		return TeacherDialogBinding{}, ErrInvalidDialogContext
+	}
+	return input, nil
+}
+
+func validTeacherDialogBindingContext(contextType LearningContextType, contextID string) bool {
+	if !validContextType(contextType) {
+		return false
+	}
+	if contextType == LearningContextGeneral {
+		return contextID == ""
+	}
+	return validUUID(contextID)
+}
+
+type DialogTeacherRequest struct {
+	SchemaVersion       int
+	EventID             string
+	DialogID            string
+	EventSequence       int64
+	TeacherTurnSequence int64
+	SourceMessageID     string
+	SourceSequence      int64
+	// SourceMessageVersion and ReplyToMessageID are emitted by Dialog v2. They
+	// remain optional while old v2 events drain; the S5 coordinator requires
+	// both values before it considers a user turn eligible for onboarding.
+	SourceMessageVersion      int64
+	ReplyToMessageID          string
+	CanonicalStudentMessageID string
+	CorrelationID             string
+	// DialogCausationID is the causation identity emitted by Dialog. It is
+	// intentionally distinct from CausationID, which is derived for the
+	// Teacher-job boundary and equals EventID.
+	DialogCausationID string
+	CausationID       string
+	ActionReceiptID   string
+	StudentCommandID  string
+	SourceChannel     DialogMessageChannel
+	StudentID         string
+	PersonalTeacherID string
+	ContextType       LearningContextType
+	ContextID         string
+	LearningActionID  string
+	OccurredAt        time.Time
+}
+
+func NewDialogTeacherRequest(input DialogTeacherRequest) (DialogTeacherRequest, error) {
+	if input.SchemaVersion == 0 {
+		input.SchemaVersion = DialogTeacherRequestedSchemaVersionV1
+	}
+	input.EventID = strings.TrimSpace(input.EventID)
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	input.SourceMessageID = strings.TrimSpace(input.SourceMessageID)
+	input.ReplyToMessageID = strings.TrimSpace(input.ReplyToMessageID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PersonalTeacherID = strings.TrimSpace(input.PersonalTeacherID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	input.CanonicalStudentMessageID = strings.TrimSpace(input.CanonicalStudentMessageID)
+	input.CorrelationID = strings.TrimSpace(input.CorrelationID)
+	input.DialogCausationID = strings.TrimSpace(input.DialogCausationID)
+	input.CausationID = strings.TrimSpace(input.CausationID)
+	input.ActionReceiptID = strings.TrimSpace(input.ActionReceiptID)
+	input.StudentCommandID = strings.TrimSpace(input.StudentCommandID)
+	input.SourceChannel = normalizeDialogMessageChannel(input.SourceChannel)
+	// PostgreSQL stores timestamptz at microsecond precision. Normalize before
+	// durable intake so an identical JetStream redelivery cannot look different
+	// after the first value has made a database round trip.
+	input.OccurredAt = input.OccurredAt.UTC().Truncate(time.Microsecond)
+	if (input.SchemaVersion != DialogTeacherRequestedSchemaVersionV1 && input.SchemaVersion != DialogTeacherRequestedSchemaVersionV2) ||
+		!validUUID(input.EventID) || !validUUID(input.DialogID) || !validUUID(input.SourceMessageID) ||
+		!validUUID(input.StudentID) || !validUUID(input.PersonalTeacherID) || input.EventSequence < 1 ||
+		input.SourceSequence < 1 || !input.SourceChannel.valid() || input.OccurredAt.IsZero() || !validContextType(input.ContextType) {
+		return DialogTeacherRequest{}, ErrInvalidDialogContext
+	}
+	if !validDialogContextShape(input.ContextType, input.ContextID, input.LearningActionID) {
+		return DialogTeacherRequest{}, ErrInvalidDialogContext
+	}
+	if input.SourceMessageVersion < 0 || (input.ReplyToMessageID != "" && !validUUID(input.ReplyToMessageID)) {
+		return DialogTeacherRequest{}, ErrInvalidDialogContext
+	}
+	if input.SchemaVersion == DialogTeacherRequestedSchemaVersionV2 {
+		// Dialog v2 carries only canonical message/action evidence.  The
+		// Student command is Teacher-owned: S5 obtains the frozen deterministic
+		// command ID from the local action receipt (or allocates/persists it for
+		// text) after durable job admission.  Accepting it from the public Dialog
+		// event would make that identity forgeable and would break action replay.
+		if input.StudentCommandID != "" {
+			return DialogTeacherRequest{}, ErrInvalidDialogContext
+		}
+		// Dialog's event causation is the canonical Student message. The
+		// Teacher-job causation is a separate boundary field derived from the
+		// stable source event ID; Dialog must not be made to emit that value.
+		if !validUUID(input.DialogCausationID) || input.DialogCausationID != input.CanonicalStudentMessageID {
+			return DialogTeacherRequest{}, ErrInvalidDialogContext
+		}
+		correlation, correlationErr := NormalizeTeacherJobTurnCorrelation(TeacherJobTurnCorrelation{
+			SourceEventID: input.EventID, TeacherTurnSequence: input.TeacherTurnSequence,
+			DialogID: input.DialogID, CanonicalStudentMessageID: input.CanonicalStudentMessageID,
+			SourceMessageSequence: input.SourceSequence, StudentID: input.StudentID,
+			PersonalTeacherID: input.PersonalTeacherID, ActionReceiptID: input.ActionReceiptID,
+			CorrelationID: input.CorrelationID,
+			CausationID:   input.EventID,
+		})
+		if correlationErr != nil {
+			return DialogTeacherRequest{}, ErrInvalidDialogContext
+		}
+		input.CanonicalStudentMessageID = correlation.CanonicalStudentMessageID
+		input.CorrelationID = correlation.CorrelationID
+		input.CausationID = correlation.CausationID
+		input.ActionReceiptID = correlation.ActionReceiptID
+		input.StudentCommandID = ""
+	}
+	return input, nil
+}
+
+// HasFrozenOnboardingReplyMetadata distinguishes new Dialog v2 events from
+// accepted legacy events.  It is intentionally an eligibility predicate, not
+// a decoder requirement: an old v2 delivery must remain a legacy chat turn.
+func (request DialogTeacherRequest) HasFrozenOnboardingReplyMetadata() bool {
+	return request.SourceMessageVersion > 0 && validUUID(request.ReplyToMessageID)
+}
+
+func (request DialogTeacherRequest) UsesDenseTeacherOrdering() bool {
+	return request.SchemaVersion == DialogTeacherRequestedSchemaVersionV2
+}
+
+func validDialogContextShape(contextType LearningContextType, contextID, learningActionID string) bool {
+	if !validContextType(contextType) {
+		return false
+	}
+	if contextType == LearningContextGeneral {
+		return contextID == "" && learningActionID == ""
+	}
+	if !validUUID(contextID) {
+		return false
+	}
+	if requiresLearningAction(contextType) {
+		return validUUID(learningActionID)
+	}
+	return learningActionID == ""
+}
+
+type DialogMessageAuthorType string
+
+const (
+	DialogMessageAuthorUser            DialogMessageAuthorType = "user"
+	DialogMessageAuthorPersonalTeacher DialogMessageAuthorType = "personal_teacher"
+)
+
+type DialogMessageChannel string
+
+const (
+	DialogMessageChannelWeb      DialogMessageChannel = "web"
+	DialogMessageChannelTelegram DialogMessageChannel = "telegram"
+)
+
+func (channel DialogMessageChannel) valid() bool {
+	return channel == DialogMessageChannelWeb || channel == DialogMessageChannelTelegram
+}
+
+func normalizeDialogMessageChannel(channel DialogMessageChannel) DialogMessageChannel {
+	channel = DialogMessageChannel(strings.ToLower(strings.TrimSpace(string(channel))))
+	if channel == "" {
+		return DialogMessageChannelWeb
+	}
+	return channel
+}
+
+type DialogMessage struct {
+	ID                string
+	DialogID          string
+	AuthorType        DialogMessageAuthorType
+	Channel           DialogMessageChannel
+	SenderID          string
+	PersonalTeacherID string
+	LearningActionID  string
+	LessonContext     *LessonMessageContext
+	AssistantUI       json.RawMessage
+	ReplyToMessageID  string
+	Body              string
+	Status            int
+	Version           int
+	MessageSequence   int64
+	LastEventSequence int64
+	CreatedAt         time.Time
+}
+
+func NewDialogTeacherStructuredProactive(binding TeacherDialogBinding, message DialogMessage, body string, assistantUI json.RawMessage) (DialogMessage, error) {
+	normalized, err := NewDialogTeacherProactive(binding, message)
+	if err != nil || normalized.Version < 1 || !ValidOnboardingFallback(body) || normalized.Body != body {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	if !equivalentStrictAssistantUI(assistantUI, normalized.AssistantUI) {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	return normalized, nil
+}
+
+type DialogRequestContext struct {
+	DialogID          string
+	StudentID         string
+	PersonalTeacherID string
+	ContextType       LearningContextType
+	ContextID         string
+	SourceMessageID   string
+	LearningActionID  string
+	Messages          []DialogMessage
+}
+
+func NewDialogRequestContext(input DialogRequestContext) (DialogRequestContext, error) {
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PersonalTeacherID = strings.TrimSpace(input.PersonalTeacherID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	input.SourceMessageID = strings.TrimSpace(input.SourceMessageID)
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	if !validUUID(input.DialogID) || !validUUID(input.StudentID) || !validUUID(input.PersonalTeacherID) ||
+		!validUUID(input.SourceMessageID) || len(input.Messages) < 1 || len(input.Messages) > 50 {
+		return DialogRequestContext{}, ErrInvalidDialogContext
+	}
+	if !validDialogContextShape(input.ContextType, input.ContextID, input.LearningActionID) {
+		return DialogRequestContext{}, ErrInvalidDialogContext
+	}
+	previousSequence := int64(0)
+	normalized := make([]DialogMessage, len(input.Messages))
+	for index, message := range input.Messages {
+		message.ID = strings.TrimSpace(message.ID)
+		message.DialogID = strings.TrimSpace(message.DialogID)
+		message.SenderID = strings.TrimSpace(message.SenderID)
+		message.PersonalTeacherID = strings.TrimSpace(message.PersonalTeacherID)
+		message.LearningActionID = strings.TrimSpace(message.LearningActionID)
+		message.ReplyToMessageID = strings.TrimSpace(message.ReplyToMessageID)
+		message.Channel = normalizeDialogMessageChannel(message.Channel)
+		message.CreatedAt = message.CreatedAt.UTC()
+		if !validUUID(message.ID) || message.DialogID != input.DialogID || message.MessageSequence <= previousSequence ||
+			!message.Channel.valid() || message.LastEventSequence < message.MessageSequence || message.CreatedAt.IsZero() || (message.Status != 1 && message.Status != 2) {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		switch message.AuthorType {
+		case DialogMessageAuthorUser:
+			if message.SenderID != input.StudentID || message.PersonalTeacherID != "" {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+		case DialogMessageAuthorPersonalTeacher:
+			if message.SenderID != "" || message.PersonalTeacherID != input.PersonalTeacherID {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+		default:
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		if requiresLearningAction(input.ContextType) && !validUUID(message.LearningActionID) {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		if !requiresLearningAction(input.ContextType) && message.LearningActionID != "" {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		lessonContext, lessonErr := NormalizeLessonMessageContext(message.LessonContext)
+		if input.ContextType == LearningContextLesson {
+			if message.LessonContext != nil && lessonErr != nil {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+			if lessonContext != nil && lessonContext.Schema == LessonMessageContextSchemaVersion &&
+				lessonContext.LessonID != input.ContextID {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+			if message.AuthorType == DialogMessageAuthorUser && message.Status == 2 && message.LessonContext != nil {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+			if message.AuthorType == DialogMessageAuthorPersonalTeacher && message.LessonContext != nil {
+				return DialogRequestContext{}, ErrInvalidDialogContext
+			}
+		} else if message.LessonContext != nil {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		message.LessonContext = lessonContext
+		if message.ReplyToMessageID != "" && !validUUID(message.ReplyToMessageID) {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		previousSequence = message.MessageSequence
+		normalized[index] = message
+	}
+	source := normalized[len(normalized)-1]
+	if source.ID != input.SourceMessageID || source.AuthorType != DialogMessageAuthorUser ||
+		source.SenderID != input.StudentID || source.Status != 1 || source.LearningActionID != input.LearningActionID ||
+		strings.TrimSpace(source.Body) == "" || (input.ContextType == LearningContextLesson && source.LessonContext == nil) {
+		return DialogRequestContext{}, ErrInvalidDialogContext
+	}
+	if input.ContextType == LearningContextLesson {
+		currentLessonContext, err := NormalizeCurrentLessonMessageContext(source.LessonContext)
+		if err != nil || currentLessonContext.LessonID != input.ContextID {
+			return DialogRequestContext{}, ErrInvalidDialogContext
+		}
+		normalized[len(normalized)-1].LessonContext = currentLessonContext
+	}
+	input.Messages = normalized
+	return input, nil
+}
+
+func NewDialogTeacherResponse(request DialogTeacherRequest, message DialogMessage) (DialogMessage, error) {
+	normalizedRequest, err := NewDialogTeacherRequest(request)
+	if err != nil {
+		return DialogMessage{}, err
+	}
+	message.ID = strings.TrimSpace(message.ID)
+	message.DialogID = strings.TrimSpace(message.DialogID)
+	message.SenderID = strings.TrimSpace(message.SenderID)
+	message.PersonalTeacherID = strings.TrimSpace(message.PersonalTeacherID)
+	message.LearningActionID = strings.TrimSpace(message.LearningActionID)
+	message.ReplyToMessageID = strings.TrimSpace(message.ReplyToMessageID)
+	message.Channel = normalizeDialogMessageChannel(message.Channel)
+	message.CreatedAt = message.CreatedAt.UTC()
+	if !validUUID(message.ID) || message.DialogID != normalizedRequest.DialogID ||
+		message.AuthorType != DialogMessageAuthorPersonalTeacher || message.Channel != normalizedRequest.SourceChannel || message.SenderID != "" ||
+		message.PersonalTeacherID != normalizedRequest.PersonalTeacherID ||
+		message.LessonContext != nil ||
+		message.LearningActionID != normalizedRequest.LearningActionID ||
+		message.ReplyToMessageID != normalizedRequest.SourceMessageID || message.Status != 1 ||
+		message.MessageSequence < 1 || message.LastEventSequence < message.MessageSequence ||
+		message.CreatedAt.IsZero() || strings.TrimSpace(message.Body) == "" ||
+		!utf8.ValidString(message.Body) || utf8.RuneCountInString(message.Body) > 100000 {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	return message, nil
+}
+
+func NewDialogTeacherProactive(binding TeacherDialogBinding, message DialogMessage) (DialogMessage, error) {
+	normalizedBinding, err := NewTeacherDialogBinding(binding)
+	if err != nil || normalizedBinding.ContextType != LearningContextGeneral {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	message.ID = strings.TrimSpace(message.ID)
+	message.DialogID = strings.TrimSpace(message.DialogID)
+	message.SenderID = strings.TrimSpace(message.SenderID)
+	message.PersonalTeacherID = strings.TrimSpace(message.PersonalTeacherID)
+	message.LearningActionID = strings.TrimSpace(message.LearningActionID)
+	message.ReplyToMessageID = strings.TrimSpace(message.ReplyToMessageID)
+	message.Channel = normalizeDialogMessageChannel(message.Channel)
+	message.CreatedAt = message.CreatedAt.UTC()
+	if !validUUID(message.ID) || message.DialogID != normalizedBinding.ID ||
+		message.AuthorType != DialogMessageAuthorPersonalTeacher || message.Channel != DialogMessageChannelWeb || message.SenderID != "" ||
+		message.PersonalTeacherID != normalizedBinding.PersonalTeacherID || message.LearningActionID != "" ||
+		message.LessonContext != nil || message.ReplyToMessageID != "" || message.Status != 1 ||
+		message.MessageSequence < 1 || message.LastEventSequence < message.MessageSequence ||
+		message.CreatedAt.IsZero() || strings.TrimSpace(message.Body) == "" ||
+		!utf8.ValidString(message.Body) || utf8.RuneCountInString(message.Body) > 100000 {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	return message, nil
+}
+
+func NewDialogStudentChannelMessage(binding TeacherDialogBinding, message DialogMessage) (DialogMessage, error) {
+	normalizedBinding, err := NewTeacherDialogBinding(binding)
+	if err != nil || normalizedBinding.ContextType != LearningContextGeneral {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	message.ID = strings.TrimSpace(message.ID)
+	message.DialogID = strings.TrimSpace(message.DialogID)
+	message.SenderID = strings.TrimSpace(message.SenderID)
+	message.PersonalTeacherID = strings.TrimSpace(message.PersonalTeacherID)
+	message.LearningActionID = strings.TrimSpace(message.LearningActionID)
+	message.ReplyToMessageID = strings.TrimSpace(message.ReplyToMessageID)
+	message.Channel = normalizeDialogMessageChannel(message.Channel)
+	message.CreatedAt = message.CreatedAt.UTC()
+	if !validUUID(message.ID) || message.DialogID != normalizedBinding.ID ||
+		message.AuthorType != DialogMessageAuthorUser || message.Channel != DialogMessageChannelTelegram ||
+		message.SenderID != normalizedBinding.StudentID || message.PersonalTeacherID != "" ||
+		message.LearningActionID != "" || message.LessonContext != nil || message.ReplyToMessageID != "" ||
+		message.Status != 1 || message.MessageSequence < 1 || message.LastEventSequence < message.MessageSequence ||
+		message.CreatedAt.IsZero() || strings.TrimSpace(message.Body) == "" ||
+		!utf8.ValidString(message.Body) || utf8.RuneCountInString(message.Body) > 100000 {
+		return DialogMessage{}, ErrInvalidDialogContext
+	}
+	return message, nil
+}

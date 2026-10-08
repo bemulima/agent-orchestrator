@@ -1,0 +1,427 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"go.uber.org/zap"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/middleware"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/parsers"
+	"github.com/example/mc-course-service/internal/usecase/catalog"
+	"github.com/example/mc-course-service/internal/usecase/course"
+)
+
+// CourseHandler exposes course endpoints.
+type CourseHandler struct {
+	Validator   *validator.Validate
+	Logger      *zap.Logger
+	CreateUC    course.CreateCourse
+	UpdateUC    course.UpdateCourse
+	DeleteUC    course.DeleteCourse
+	GetUC       course.GetCourse
+	ListUC      course.ListCourses
+	ScopeListUC catalog.ListPublicScopes
+	OutlineUC   course.GetCourseOutline
+}
+
+// Outline handles GET /course/{courseID}/outline.
+func (h CourseHandler) Outline(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	lang := resolveLang(r.Header.Get("Accept-Language"))
+	outline, err := h.OutlineUC.Handle(r.Context(), courseID, lang)
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err == domain.ErrValidation {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"outline": outline})
+}
+
+type courseResponse struct {
+	domain.Course
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	Tags        any    `json:"tags"`
+	LessonCount int    `json:"lesson_count"`
+	Techs       any    `json:"techs"`
+}
+
+// CreateCourseRequest represents request body.
+type CreateCourseRequest struct {
+	ID               string                   `json:"id" validate:"omitempty,uuid"`
+	Slug             string                   `json:"slug" validate:"required,ascii,max=255"`
+	SourceKey        string                   `json:"source_key" validate:"omitempty,max=255"`
+	MainTechID       int                      `json:"main_tech_id" validate:"required,min=1"`
+	CatalogVisible   *bool                    `json:"catalog_visible"`
+	LessonReadAccess *domain.LessonReadAccess `json:"lesson_read_access" validate:"omitempty,oneof=guest student student_pro disabled"`
+}
+
+// Create handles POST /course/create.
+func (h CourseHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var req CreateCourseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	courseEntity, err := h.CreateUC.Handle(r.Context(), course.CreateCourseInput{
+		ID:               req.ID,
+		Slug:             req.Slug,
+		SourceKey:        req.SourceKey,
+		MainTechID:       req.MainTechID,
+		CatalogVisible:   req.CatalogVisible,
+		LessonReadAccess: req.LessonReadAccess,
+	})
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err == domain.ErrValidation {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{"course": courseEntity})
+}
+
+// GetBySlug handles GET /course/get-by-slug/{slug}.
+func (h CourseHandler) GetBySlug(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	lang := resolveLang(r.Header.Get("Accept-Language"))
+	course, err := h.GetUC.Handle(r.Context(), slug, lang)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if _, role, ok := middleware.UserFromContext(r.Context()); !ok || !isPositionPrivilegedRole(role) {
+		if course.Status != domain.CourseStatusActive || !course.CatalogVisible {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+	}
+	title, description, tags, lessonCount, techs, err := h.loadCourseMeta(r, course.ID)
+	if err != nil {
+		h.handleCourseMetaError(w, err)
+		return
+	}
+	resp := courseResponse{Course: *course, Title: title, Description: description, Tags: tags, LessonCount: lessonCount, Techs: techs}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"course": resp})
+}
+
+// Get handles GET /course/get/{courseID}.
+func (h CourseHandler) Get(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	fieldsParam := r.URL.Query().Get("fields")
+	lang := resolveLang(r.Header.Get("Accept-Language"))
+	_, role, ok := middleware.UserFromContext(r.Context())
+	privileged := ok && isPositionPrivilegedRole(role)
+
+	// If fields parameter is provided, use dynamic field selection
+	if fieldsParam != "" {
+		if !privileged {
+			course, err := h.GetUC.HandleByID(r.Context(), courseID, lang)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			if course.Status != domain.CourseStatusActive || !course.CatalogVisible {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+		}
+		f := queryfields.Parse(fieldsParam, queryfields.CourseAllowedFields)
+		result, err := h.GetUC.HandleByIDWithFields(r.Context(), courseID, f)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"course": result})
+		return
+	}
+
+	course, err := h.GetUC.HandleByID(r.Context(), courseID, lang)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if !privileged && (course.Status != domain.CourseStatusActive || !course.CatalogVisible) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	title, description, tags, lessonCount, techs, err := h.loadCourseMeta(r, course.ID)
+	if err != nil {
+		h.handleCourseMetaError(w, err)
+		return
+	}
+	resp := courseResponse{Course: *course, Title: title, Description: description, Tags: tags, LessonCount: lessonCount, Techs: techs}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"course": resp})
+}
+
+// List handles GET /course/list with filters and sort in query parameters.
+func (h CourseHandler) List(w http.ResponseWriter, r *http.Request) {
+	lang := resolveLang(r.Header.Get("Accept-Language"))
+	fieldsParam := r.URL.Query().Get("fields")
+
+	// Parse and validate fields
+	f := queryfields.Parse(fieldsParam, queryfields.CoursePreviewAllowedFields)
+
+	// Parse filters and sort from query parameters
+	filters, err := parsers.ParseCourseFilters(r, h.Validator)
+	if err != nil {
+		h.Logger.Warn("Failed to parse course filters", zap.Error(err), zap.String("query", r.URL.RawQuery))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sort := parsers.ParseSortOptions(r)
+	_, role, ok := middleware.UserFromContext(r.Context())
+	if !ok || !isPositionPrivilegedRole(role) {
+		active := domain.CourseStatusActive
+		filters.Status = &active
+		visible := true
+		filters.CatalogVisible = &visible
+		filters.CatalogActiveOnly = true
+	}
+
+	courses, total, err := h.ListUC.HandleWithFields(r.Context(), lang, f, filters, sort)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure we return empty array instead of null
+	if courses == nil {
+		courses = []map[string]any{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"courses": courses,
+		"meta":    buildPaginationMeta(filters.Page, filters.Limit, total),
+	})
+}
+
+// ListCatalog handles GET /catalog/course/list using the authored catalog hierarchy order.
+func (h CourseHandler) ListCatalog(w http.ResponseWriter, r *http.Request) {
+	lang := resolveLang(r.Header.Get("Accept-Language"))
+	fieldsParam := r.URL.Query().Get("fields")
+	f := queryfields.Parse(fieldsParam, queryfields.CoursePreviewAllowedFields)
+
+	filters, err := parsers.ParseCourseFilters(r, h.Validator)
+	if err != nil {
+		h.Logger.Warn("Failed to parse catalog course filters", zap.Error(err), zap.String("query", r.URL.RawQuery))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	active := domain.CourseStatusActive
+	visible := true
+	filters.Status = &active
+	filters.CatalogVisible = &visible
+	filters.CatalogActiveOnly = true
+	filters.CatalogOrdered = true
+
+	courses, total, err := h.ListUC.HandleWithFields(r.Context(), lang, f, filters, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if courses == nil {
+		courses = []map[string]any{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"courses": courses,
+		"meta":    buildPaginationMeta(filters.Page, filters.Limit, total),
+	})
+}
+
+// ListCatalogScopes handles GET /catalog/scope/list.
+func (h CourseHandler) ListCatalogScopes(w http.ResponseWriter, r *http.Request) {
+	scopes, err := h.ScopeListUC.Handle(r.Context(), resolveLang(r.Header.Get("Accept-Language")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if scopes == nil {
+		scopes = []domain.CatalogScope{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"scopes": scopes})
+}
+
+func (h CourseHandler) loadCourseMeta(r *http.Request, courseID string) (string, string, any, int, any, error) {
+	f := queryfields.Parse("title,description,tags,lesson_count,techs", queryfields.CourseAllowedFields)
+	result, err := h.GetUC.HandleByIDWithFields(r.Context(), courseID, f)
+	if err != nil {
+		return "", "", nil, 0, nil, err
+	}
+
+	title, _ := result["title"].(string)
+	description, _ := result["description"].(string)
+
+	tags := any([]any{})
+	if raw, ok := result["tags"]; ok && raw != nil {
+		switch v := raw.(type) {
+		case json.RawMessage:
+			tags = v
+		case []byte:
+			if json.Valid(v) {
+				tags = json.RawMessage(v)
+			}
+		case string:
+			if json.Valid([]byte(v)) {
+				tags = json.RawMessage(v)
+			}
+		default:
+			tags = v
+		}
+	}
+
+	lessonCount := 0
+	if raw, ok := result["lesson_count"]; ok && raw != nil {
+		switch v := raw.(type) {
+		case int:
+			lessonCount = v
+		case int32:
+			lessonCount = int(v)
+		case int64:
+			lessonCount = int(v)
+		case float64:
+			lessonCount = int(v)
+		}
+	}
+
+	techs := any([]any{})
+	if raw, ok := result["techs"]; ok && raw != nil {
+		switch v := raw.(type) {
+		case json.RawMessage:
+			techs = v
+		case []byte:
+			if json.Valid(v) {
+				techs = json.RawMessage(v)
+			}
+		case string:
+			if json.Valid([]byte(v)) {
+				techs = json.RawMessage(v)
+			}
+		default:
+			techs = v
+		}
+	}
+
+	return title, description, tags, lessonCount, techs, nil
+}
+
+func (h CourseHandler) handleCourseMetaError(w http.ResponseWriter, err error) {
+	if err == domain.ErrNotFound {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// UpdateCourseRequest represents request body for update.
+type UpdateCourseRequest struct {
+	Slug             string                   `json:"slug" validate:"required,ascii,max=255"`
+	MainTechID       int                      `json:"main_tech_id" validate:"required,min=1"`
+	Status           *int                     `json:"status" validate:"omitempty,oneof=0 1 2"`
+	CatalogVisible   *bool                    `json:"catalog_visible"`
+	LessonReadAccess optionalLessonReadAccess `json:"lesson_read_access"`
+}
+
+// Update handles PUT /course/update/{courseID}.
+func (h CourseHandler) Update(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	var req UpdateCourseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	courseEntity, err := h.UpdateUC.Handle(r.Context(), course.UpdateCourseInput{
+		CourseID:            courseID,
+		Slug:                req.Slug,
+		MainTechID:          &req.MainTechID,
+		Status:              req.Status,
+		CatalogVisible:      req.CatalogVisible,
+		LessonReadAccess:    req.LessonReadAccess.Value,
+		LessonReadAccessSet: req.LessonReadAccess.Set,
+	})
+	if err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err == domain.ErrValidation {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		if err == domain.ErrInvalidStatus {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"course": courseEntity})
+}
+
+// Delete handles DELETE /course/delete/{courseID}.
+func (h CourseHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	courseID := chi.URLParam(r, "courseID")
+	if err := h.DeleteUC.Handle(r.Context(), course.DeleteCourseInput{CourseID: courseID}); err != nil {
+		if err == domain.ErrNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func resolveLang(header string) string {
+	if header == "" {
+		return ""
+	}
+	parts := strings.Split(header, ",")
+	if len(parts) == 0 {
+		return ""
+	}
+	lang := strings.TrimSpace(parts[0])
+	if len(lang) >= 2 {
+		return strings.ToLower(lang[:2])
+	}
+	return ""
+}

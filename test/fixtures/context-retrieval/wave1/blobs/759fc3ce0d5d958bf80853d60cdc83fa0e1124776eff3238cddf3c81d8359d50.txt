@@ -1,0 +1,231 @@
+package postgres
+
+import (
+	"context"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LessonExampleRepoPG stores first-class lesson examples in Postgres.
+type LessonExampleRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+func (r LessonExampleRepoPG) ReplaceByLesson(ctx context.Context, lessonID string, examples []domain.LessonExample) error {
+	runner := getRunner(ctx, r.Pool)
+	keys := make([]string, 0, len(examples))
+	for _, example := range examples {
+		keys = append(keys, example.SourceKey)
+	}
+	if len(keys) == 0 {
+		_, err := runner.Exec(ctx, `DELETE FROM lesson_example WHERE lesson_id=$1`, lessonID)
+		return err
+	}
+	if _, err := runner.Exec(ctx, `DELETE FROM lesson_example WHERE lesson_id=$1 AND NOT (source_key = ANY($2::text[]))`, lessonID, keys); err != nil {
+		return err
+	}
+
+	for _, example := range examples {
+		var persistedID string
+		err := runner.QueryRow(ctx, `
+INSERT INTO lesson_example (
+    id, source_key, lesson_id, "order", status, mode, primary_stack, stacks, target_concepts
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+ON CONFLICT (source_key) DO UPDATE SET
+    "order"=EXCLUDED."order",
+    status=EXCLUDED.status,
+    mode=EXCLUDED.mode,
+    primary_stack=EXCLUDED.primary_stack,
+    stacks=EXCLUDED.stacks,
+    target_concepts=EXCLUDED.target_concepts,
+    updated_at=now()
+WHERE lesson_example.lesson_id=EXCLUDED.lesson_id
+RETURNING id`,
+			example.ID,
+			example.SourceKey,
+			lessonID,
+			example.Order,
+			example.Status,
+			example.Mode,
+			example.PrimaryStack,
+			example.Stacks,
+			example.TargetConcepts,
+		).Scan(&persistedID)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return domain.ErrConflict
+			}
+			return mapPgError(err)
+		}
+
+		translationIDs := make([]int, 0, len(example.Translations))
+		for _, translation := range example.Translations {
+			translationIDs = append(translationIDs, translation.I18nID)
+		}
+		if _, err := runner.Exec(ctx, `DELETE FROM lesson_example_i18n WHERE example_id=$1 AND NOT (i18n_id = ANY($2::int[]))`, persistedID, translationIDs); err != nil {
+			return err
+		}
+		for _, translation := range example.Translations {
+			_, err := runner.Exec(ctx, `
+INSERT INTO lesson_example_i18n (example_id, i18n_id, title, description)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (example_id, i18n_id) DO UPDATE SET
+    title=EXCLUDED.title,
+    description=EXCLUDED.description`,
+				persistedID,
+				translation.I18nID,
+				translation.Title,
+				translation.Description,
+			)
+			if err != nil {
+				return mapPgError(err)
+			}
+		}
+	}
+	return nil
+}
+
+func (r LessonExampleRepoPG) Get(ctx context.Context, exampleID string) (*domain.LessonExample, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `
+SELECT
+    e.id, e.source_key, e.lesson_id, COALESCE(l.source_key, ''), e."order", e.status,
+    e.mode, e.primary_stack, e.stacks, e.target_concepts, e.created_at, e.updated_at
+FROM lesson_example e
+JOIN lesson l ON l.id=e.lesson_id
+WHERE e.id=$1`, exampleID)
+	var example domain.LessonExample
+	if err := row.Scan(
+		&example.ID,
+		&example.SourceKey,
+		&example.LessonID,
+		&example.LessonSourceKey,
+		&example.Order,
+		&example.Status,
+		&example.Mode,
+		&example.PrimaryStack,
+		&example.Stacks,
+		&example.TargetConcepts,
+		&example.CreatedAt,
+		&example.UpdatedAt,
+	); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	translations, err := r.listTranslationsByExample(ctx, exampleID)
+	if err != nil {
+		return nil, err
+	}
+	example.Translations = translations
+	return &example, nil
+}
+
+func (r LessonExampleRepoPG) ListByLesson(ctx context.Context, lessonID string, activeOnly bool) ([]domain.LessonExample, error) {
+	runner := getRunner(ctx, r.Pool)
+	query := `
+SELECT
+    e.id, e.source_key, e.lesson_id, COALESCE(l.source_key, ''), e."order", e.status,
+    e.mode, e.primary_stack, e.stacks, e.target_concepts, e.created_at, e.updated_at
+FROM lesson_example e
+JOIN lesson l ON l.id=e.lesson_id
+WHERE e.lesson_id=$1`
+	if activeOnly {
+		query += ` AND e.status=1`
+	}
+	query += ` ORDER BY e."order", e.source_key`
+	rows, err := runner.Query(ctx, query, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]domain.LessonExample, 0)
+	byID := make(map[string]int)
+	for rows.Next() {
+		var example domain.LessonExample
+		if err := rows.Scan(
+			&example.ID,
+			&example.SourceKey,
+			&example.LessonID,
+			&example.LessonSourceKey,
+			&example.Order,
+			&example.Status,
+			&example.Mode,
+			&example.PrimaryStack,
+			&example.Stacks,
+			&example.TargetConcepts,
+			&example.CreatedAt,
+			&example.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		example.Translations = make([]domain.LessonExampleI18n, 0)
+		byID[example.ID] = len(result)
+		result = append(result, example)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	translations, err := r.listTranslationsByLesson(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	for _, translation := range translations {
+		if index, ok := byID[translation.ExampleID]; ok {
+			result[index].Translations = append(result[index].Translations, translation)
+		}
+	}
+	return result, nil
+}
+
+func (r LessonExampleRepoPG) Delete(ctx context.Context, exampleID string) error {
+	runner := getRunner(ctx, r.Pool)
+	command, err := runner.Exec(ctx, `DELETE FROM lesson_example WHERE id=$1`, exampleID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r LessonExampleRepoPG) listTranslationsByExample(ctx context.Context, exampleID string) ([]domain.LessonExampleI18n, error) {
+	return r.listTranslations(ctx, `WHERE ei.example_id=$1`, exampleID)
+}
+
+func (r LessonExampleRepoPG) listTranslationsByLesson(ctx context.Context, lessonID string) ([]domain.LessonExampleI18n, error) {
+	return r.listTranslations(ctx, `JOIN lesson_example e ON e.id=ei.example_id WHERE e.lesson_id=$1`, lessonID)
+}
+
+func (r LessonExampleRepoPG) listTranslations(ctx context.Context, scope string, value string) ([]domain.LessonExampleI18n, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT ei.example_id, ei.i18n_id, i.language, ei.title, ei.description
+FROM lesson_example_i18n ei
+JOIN i18n i ON i.id=ei.i18n_id
+`+strings.TrimSpace(scope)+`
+ORDER BY ei.example_id, i.language`, value)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.LessonExampleI18n, 0)
+	for rows.Next() {
+		var translation domain.LessonExampleI18n
+		if err := rows.Scan(&translation.ExampleID, &translation.I18nID, &translation.Language, &translation.Title, &translation.Description); err != nil {
+			return nil, err
+		}
+		result = append(result, translation)
+	}
+	return result, rows.Err()
+}
+
+var _ repository.LessonExampleRepository = (*LessonExampleRepoPG)(nil)

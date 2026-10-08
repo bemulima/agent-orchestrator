@@ -1,0 +1,983 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	httpadapter "github.com/example/ms-student-service/internal/transport/http"
+	adminhandlers "github.com/example/ms-student-service/internal/transport/http/admin/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+)
+
+const (
+	apiPrefix   = "/api/v1"
+	adminPrefix = "/admin/v1"
+)
+
+func TestStudentFlowUsesCourseAndUserServices(t *testing.T) {
+	taskID := uuid.NewString()
+	userID := uuid.NewString()
+	courseID := uuid.NewString()
+	internalToken := "internal-token"
+	codeStructure := json.RawMessage(`{"files":["main.go"]}`)
+
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          courseID,
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     codeStructure,
+		MaxAttempts:       nil,
+	})
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: internalToken,
+	})
+
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	startResp := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders(userID, "STUDENT"))
+	if startResp.StatusCode != http.StatusOK {
+		t.Fatalf("start returned %d, want 200", startResp.StatusCode)
+	}
+	var started startTaskDTO
+	decodeBody(t, startResp, &started)
+	if started.Status != "IN_PROCESS" {
+		t.Fatalf("start status = %q, want %q", started.Status, "IN_PROCESS")
+	}
+	if started.AnswerID == "" || started.SandboxID == "" || started.PreviewURL == "" {
+		t.Fatalf("start payload missing fields: %#v", started)
+	}
+	if got := fixtures.Answers.get(started.AnswerID); got == nil {
+		t.Fatalf("answer not persisted")
+	}
+
+	if events := fixtures.Publisher.Events(); len(events) != 1 || events[0].Subject != domain.SubjectTaskAnswerStarted {
+		t.Fatalf("expected start event, got %#v", events)
+	}
+
+	submitURL := fmt.Sprintf("%s/student/tasks/%s/submit", apiPrefix, taskID)
+	payload := map[string]string{
+		"student_task_answer_id": started.AnswerID,
+		"filestorage_id":         uuid.NewString(),
+	}
+	body, _ := json.Marshal(payload)
+	submitResp := fixtures.doJSONRequest(t, http.MethodPost, submitURL, bytes.NewReader(body), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders(userID, "STUDENT"),
+	))
+	if submitResp.StatusCode != http.StatusOK {
+		t.Fatalf("submit returned %d, want 200", submitResp.StatusCode)
+	}
+	var submitAnswer answerDTO
+	decodeBody(t, submitResp, &submitAnswer)
+	if submitAnswer.Status != domain.StudentTaskAnswerStatusUnderReview {
+		t.Fatalf("submit status = %d, want %d", submitAnswer.Status, domain.StudentTaskAnswerStatusUnderReview)
+	}
+	if submitAnswer.FilestorageID == nil {
+		t.Fatalf("filestorage_id expected")
+	}
+	if submitAnswer.EndedAt == nil {
+		t.Fatalf("ended_at expected")
+	}
+
+	if got := fixtures.Answers.get(submitAnswer.ID); got == nil || got.Status != domain.StudentTaskAnswerStatusUnderReview {
+		t.Fatalf("stored answer not updated to under review")
+	}
+
+	events := fixtures.Publisher.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	if course.Calls() != 2 {
+		t.Fatalf("course service called %d times, want 2 (start + submit)", course.Calls())
+	}
+	if header := course.LastToken(); header != internalToken {
+		t.Fatalf("internal token = %s, want %s", header, internalToken)
+	}
+}
+
+func TestHiddenCourseTaskRequiresRelationForStartAndSubmit(t *testing.T) {
+	taskID := uuid.NewString()
+	userID := uuid.NewString()
+	relationID := uuid.NewString()
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          uuid.NewString(),
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+	})
+	course.requiredRelationID = relationID
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{Course: course, InternalToken: "internal-token"})
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	directStart := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders(userID, "STUDENT"))
+	if directStart.StatusCode != http.StatusNotFound {
+		t.Fatalf("hidden direct start returned %d, want 404", directStart.StatusCode)
+	}
+	directStart.Body.Close()
+
+	relatedStart := fixtures.doJSONRequest(
+		t,
+		http.MethodPost,
+		startURL+"?via_relation_id="+relationID,
+		nil,
+		authHeaders(userID, "STUDENT"),
+	)
+	if relatedStart.StatusCode != http.StatusOK {
+		t.Fatalf("related start returned %d, want 200", relatedStart.StatusCode)
+	}
+	var started startTaskDTO
+	decodeBody(t, relatedStart, &started)
+
+	submitURL := fmt.Sprintf("%s/student/tasks/%s/submit", apiPrefix, taskID)
+	payload, _ := json.Marshal(map[string]string{
+		"student_task_answer_id": started.AnswerID,
+		"filestorage_id":         uuid.NewString(),
+	})
+	directSubmit := fixtures.doJSONRequest(t, http.MethodPost, submitURL, bytes.NewReader(payload), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders(userID, "STUDENT"),
+	))
+	if directSubmit.StatusCode != http.StatusNotFound {
+		t.Fatalf("hidden direct submit returned %d, want 404", directSubmit.StatusCode)
+	}
+	directSubmit.Body.Close()
+
+	relatedSubmit := fixtures.doJSONRequest(
+		t,
+		http.MethodPost,
+		submitURL+"?via_relation_id="+relationID,
+		bytes.NewReader(payload),
+		mergeHeaders(map[string]string{"Content-Type": "application/json"}, authHeaders(userID, "STUDENT")),
+	)
+	if relatedSubmit.StatusCode != http.StatusOK {
+		t.Fatalf("related submit returned %d, want 200", relatedSubmit.StatusCode)
+	}
+	relatedSubmit.Body.Close()
+}
+
+func TestStartRequiresStudentRoleFromUserService(t *testing.T) {
+	taskID := uuid.NewString()
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          uuid.NewString(),
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+	})
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: "token",
+	})
+
+	url := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+
+	resp := fixtures.doJSONRequest(t, http.MethodPost, url, nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("guest status = %d, want 401", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	resp = fixtures.doJSONRequest(t, http.MethodPost, url, nil, map[string]string{
+		"X-User-ID":   uuid.NewString(),
+		"X-User-Role": "TEACHER",
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("teacher status = %d, want 403", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	if course.Calls() != 0 {
+		t.Fatalf("course service should not be called for unauthorized requests, got %d", course.Calls())
+	}
+}
+
+func TestAutoReviewUpdatesStatusAndPublishesEvent(t *testing.T) {
+	taskID := uuid.NewString()
+	courseID := uuid.NewString()
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          courseID,
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+	})
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: "token",
+	})
+
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	startResp := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders("student-1", "STUDENT"))
+	var started startTaskDTO
+	decodeBody(t, startResp, &started)
+	answerID := started.AnswerID
+
+	submitURL := fmt.Sprintf("%s/student/tasks/%s/submit", apiPrefix, taskID)
+	body, _ := json.Marshal(map[string]string{
+		"student_task_answer_id": answerID,
+		"filestorage_id":         uuid.NewString(),
+	})
+	submitResp := fixtures.doJSONRequest(t, http.MethodPost, submitURL, bytes.NewReader(body), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders("student-1", "STUDENT"),
+	))
+	var startAns answerDTO
+	decodeBody(t, submitResp, &startAns)
+
+	autoUC := answer.ApplyAutoReview{
+		Answers:       fixtures.Answers,
+		AutoReviews:   fixtures.AutoReviews,
+		ManualReviews: fixtures.ManualReviews,
+		Publisher:     fixtures.Publisher,
+	}
+	checkedAt := time.Now().UTC()
+	_, err := autoUC.Handle(context.Background(), answer.ApplyAutoReviewInput{
+		StudentTaskAnswerID: answerID,
+		ValidatorName:       "ms-ts-validator",
+		AutoScore:           floatPtr(95.0),
+		Passed:              true,
+		Feedback:            strPtr("looks ok"),
+		RawResult:           map[string]any{"details": []any{}},
+		CheckedAt:           &checkedAt,
+	})
+	if err != nil {
+		t.Fatalf("auto review handle: %v", err)
+	}
+
+	stored := fixtures.Answers.get(answerID)
+	if stored == nil || stored.Status != domain.StudentTaskAnswerStatusPassed {
+		t.Fatalf("answer status = %v, want %d", stored, domain.StudentTaskAnswerStatusPassed)
+	}
+
+	review, err := fixtures.AutoReviews.GetByAnswerID(context.Background(), startAns.ID)
+	if err != nil {
+		t.Fatalf("auto review not saved: %v", err)
+	}
+	if !review.Passed || review.ValidatorName != "ms-ts-validator" {
+		t.Fatalf("review content mismatch: %#v", review)
+	}
+
+	events := fixtures.Publisher.Events()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (start, auto), got %d", len(events))
+	}
+	last := events[1]
+	if last.Subject != domain.SubjectTaskAnswerAutoApplied {
+		t.Fatalf("last subject = %s, want %s", last.Subject, domain.SubjectTaskAnswerAutoApplied)
+	}
+}
+
+func TestManualReviewUpdatesStatusAndPublishesEvent(t *testing.T) {
+	taskID := uuid.NewString()
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          uuid.NewString(),
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+	})
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: "token",
+	})
+
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	startResp := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders("student-2", "STUDENT"))
+	var started startTaskDTO
+	decodeBody(t, startResp, &started)
+	answerID := started.AnswerID
+
+	submitURL := fmt.Sprintf("%s/student/tasks/%s/submit", apiPrefix, taskID)
+	body, _ := json.Marshal(map[string]string{
+		"student_task_answer_id": answerID,
+		"filestorage_id":         uuid.NewString(),
+	})
+	submitResp := fixtures.doJSONRequest(t, http.MethodPost, submitURL, bytes.NewReader(body), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders("student-2", "STUDENT"),
+	))
+	var ans answerDTO
+	decodeBody(t, submitResp, &ans)
+
+	reviewURL := fmt.Sprintf("%s/student/task/answers/%s/review", adminPrefix, ans.ID)
+	reviewPayload, _ := json.Marshal(map[string]any{
+		"status":      domain.StudentTaskAnswerStatusPassed,
+		"final_score": 88.5,
+		"feedback":    "nice",
+	})
+	resp := fixtures.doJSONRequest(t, http.MethodPost, reviewURL, bytes.NewReader(reviewPayload), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders("reviewer-1", "REVIEWER"),
+	))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("manual review status = %d, want 200", resp.StatusCode)
+	}
+	var reviewed answerDTO
+	decodeBody(t, resp, &reviewed)
+
+	stored := fixtures.Answers.get(ans.ID)
+	if stored == nil || stored.Status != domain.StudentTaskAnswerStatusPassed {
+		t.Fatalf("manual review status not applied, got %#v", stored)
+	}
+	mr, err := fixtures.ManualReviews.GetByAnswerID(context.Background(), ans.ID)
+	if err != nil {
+		t.Fatalf("manual review not persisted: %v", err)
+	}
+	if mr.FinalScore == nil || *mr.FinalScore != 88.5 || mr.ReviewerID != "reviewer-1" {
+		t.Fatalf("manual review content mismatch: %#v", mr)
+	}
+
+	ev := fixtures.Publisher.Events()
+	if len(ev) != 2 || ev[1].Subject != domain.SubjectTaskAnswerReviewed {
+		t.Fatalf("expected second event reviewed, got %#v", ev)
+	}
+}
+
+func TestAutoReviewFailureMarksFailed(t *testing.T) {
+	taskID := uuid.NewString()
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          uuid.NewString(),
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+	})
+	defer course.Close()
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: "token",
+	})
+
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	startResp := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders("student-3", "STUDENT"))
+	var started startTaskDTO
+	decodeBody(t, startResp, &started)
+	answerID := started.AnswerID
+
+	submitURL := fmt.Sprintf("%s/student/tasks/%s/submit", apiPrefix, taskID)
+	body, _ := json.Marshal(map[string]string{
+		"student_task_answer_id": answerID,
+		"filestorage_id":         uuid.NewString(),
+	})
+	submitResp := fixtures.doJSONRequest(t, http.MethodPost, submitURL, bytes.NewReader(body), mergeHeaders(
+		map[string]string{"Content-Type": "application/json"},
+		authHeaders("student-3", "STUDENT"),
+	))
+	var ans answerDTO
+	decodeBody(t, submitResp, &ans)
+
+	autoUC := answer.ApplyAutoReview{
+		Answers:       fixtures.Answers,
+		AutoReviews:   fixtures.AutoReviews,
+		ManualReviews: fixtures.ManualReviews,
+		Publisher:     fixtures.Publisher,
+	}
+	_, err := autoUC.Handle(context.Background(), answer.ApplyAutoReviewInput{
+		StudentTaskAnswerID: ans.ID,
+		ValidatorName:       "ms-css-validator",
+		Passed:              false,
+		Feedback:            strPtr("fail"),
+		RawResult:           map[string]any{"details": []any{}},
+	})
+	if err != nil {
+		t.Fatalf("auto review handle: %v", err)
+	}
+	stored := fixtures.Answers.get(ans.ID)
+	if stored == nil || stored.Status != domain.StudentTaskAnswerStatusFailed {
+		t.Fatalf("status = %#v, want failed", stored)
+	}
+	ev := fixtures.Publisher.Events()
+	if len(ev) != 2 || ev[1].Subject != domain.SubjectTaskAnswerAutoApplied {
+		t.Fatalf("expected auto applied event, got %#v", ev)
+	}
+}
+
+func TestStartHonorsMaxAttempts(t *testing.T) {
+	taskID := uuid.NewString()
+	maxAttempts := 1
+	course := newCourseServiceStub(t, courseTaskResponse{
+		ID:                taskID,
+		CourseID:          uuid.NewString(),
+		Status:            domain.TaskStatusActive,
+		CodeStructureType: "go",
+		CodeStructure:     json.RawMessage(`{}`),
+		MaxAttempts:       &maxAttempts,
+	})
+	defer course.Close()
+
+	fixtures := newIntegrationFixtures(t, integrationConfig{
+		Course:        course,
+		InternalToken: "token",
+	})
+	startURL := fmt.Sprintf("%s/student/tasks/%s/start", apiPrefix, taskID)
+	first := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders("student-4", "STUDENT"))
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first attempt status = %d, want 200", first.StatusCode)
+	}
+	_ = first.Body.Close()
+
+	second := fixtures.doJSONRequest(t, http.MethodPost, startURL, nil, authHeaders("student-4", "STUDENT"))
+	if second.StatusCode != http.StatusBadRequest {
+		t.Fatalf("second attempt status = %d, want 400", second.StatusCode)
+	}
+}
+
+// integrationFixtures wires the HTTP server with in-memory deps.
+type integrationFixtures struct {
+	Router        http.Handler
+	Answers       *memoryAnswerRepo
+	AutoReviews   *memoryAutoReviewRepo
+	ManualReviews *memoryManualReviewRepo
+	Publisher     *recordPublisher
+}
+
+type integrationConfig struct {
+	Course        *courseServiceStub
+	InternalToken string
+}
+
+type fakeSandboxCreator struct{}
+
+func (fakeSandboxCreator) CreateSandbox(ctx context.Context, userID, taskID, answerID string, composeConfig []byte, codeStructureTypeCode string, codeStructure []byte, starterFileStorageID string) (string, string, error) {
+	return "00000000-0000-0000-0000-00000000sb01", "https://stub.sandbox.localhost", nil
+}
+
+func newIntegrationFixtures(t *testing.T, cfg integrationConfig) integrationFixtures {
+	t.Helper()
+
+	if cfg.InternalToken != "" {
+		cfg.Course.token = cfg.InternalToken
+	}
+
+	answers := newMemoryAnswerRepo()
+	autoReviews := newMemoryAutoReviewRepo()
+	manualReviews := newMemoryManualReviewRepo()
+	publisher := newRecordPublisher()
+	validator := validator.New()
+
+	courseClient := courseclient.Client{
+		BaseURL:       cfg.Course.URL(),
+		InternalToken: cfg.InternalToken,
+		HTTPClient:    cfg.Course.Client(),
+	}
+
+	answerHandler := &handlers.AnswerHandler{
+		Validator: validator,
+		Start: answer.StartTaskAnswer{
+			TaskProvider:   courseClient,
+			Answers:        answers,
+			Publisher:      publisher,
+			SandboxCreator: fakeSandboxCreator{},
+		},
+		Submit: answer.SubmitTaskAnswer{
+			Answers:      answers,
+			TaskProvider: courseClient,
+		},
+		List: answer.ListStudentAnswers{Answers: answers},
+		Get: answer.GetStudentAnswer{
+			Answers:       answers,
+			AutoReviews:   autoReviews,
+			ManualReviews: manualReviews,
+		},
+		Manual: answer.ApplyManualReview{
+			Answers:       answers,
+			ManualReviews: manualReviews,
+			Publisher:     publisher,
+		},
+	}
+
+	router := httpadapter.NewRouter(httpadapter.RouterDependencies{
+		AnswerHandler: answerHandler,
+		AdminReviewHandlers: adminhandlers.ReviewHandlers{
+			ManualReview: answerHandler.ManualReview,
+		},
+	})
+
+	return integrationFixtures{
+		Router:        router,
+		Answers:       answers,
+		AutoReviews:   autoReviews,
+		ManualReviews: manualReviews,
+		Publisher:     publisher,
+	}
+}
+
+func (f integrationFixtures) doJSONRequest(t *testing.T, method, url string, body *bytes.Reader, headers map[string]string) *http.Response {
+	t.Helper()
+	var reader *bytes.Reader
+	if body == nil {
+		reader = bytes.NewReader(nil)
+	} else {
+		reader = body
+	}
+	req := httptest.NewRequest(method, url, reader)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp := httptest.NewRecorder()
+	f.Router.ServeHTTP(resp, req)
+	return resp.Result()
+}
+
+// in-memory repositories and publisher
+
+type memoryAnswerRepo struct {
+	mu      sync.Mutex
+	records map[string]domain.StudentTaskAnswer
+}
+
+func newMemoryAnswerRepo() *memoryAnswerRepo {
+	return &memoryAnswerRepo{records: map[string]domain.StudentTaskAnswer{}}
+}
+
+func (r *memoryAnswerRepo) Create(_ context.Context, answer domain.StudentTaskAnswer, maxAttempts *int) (domain.StudentTaskAnswer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cnt := 0
+	for _, a := range r.records {
+		if a.TaskID == answer.TaskID && a.StudentID == answer.StudentID {
+			cnt++
+		}
+	}
+	if maxAttempts != nil && cnt >= *maxAttempts {
+		return domain.StudentTaskAnswer{}, domain.ErrMaxAttempts
+	}
+	answer.Attempt = cnt + 1
+	r.records[answer.ID] = answer
+	return answer, nil
+}
+
+func (r *memoryAnswerRepo) Update(_ context.Context, answer domain.StudentTaskAnswer) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records[answer.ID] = answer
+	return nil
+}
+
+func (r *memoryAnswerRepo) GetByID(_ context.Context, id string) (*domain.StudentTaskAnswer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	answer, ok := r.records[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	cp := answer
+	return &cp, nil
+}
+
+func (r *memoryAnswerRepo) GetActiveForTaskAndStudent(_ context.Context, taskID string, userID string) (*domain.StudentTaskAnswer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, a := range r.records {
+		if a.TaskID == taskID && a.StudentID == userID && a.Status == domain.StudentTaskAnswerStatusInProgress {
+			cp := a
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (r *memoryAnswerRepo) ListForTaskAndStudent(_ context.Context, taskID string, userID string) ([]domain.StudentTaskAnswer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var res []domain.StudentTaskAnswer
+	for _, a := range r.records {
+		if a.TaskID == taskID && a.StudentID == userID {
+			res = append(res, a)
+		}
+	}
+	return res, nil
+}
+
+func (r *memoryAnswerRepo) CountForTaskAndStudent(_ context.Context, taskID string, userID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cnt := 0
+	for _, a := range r.records {
+		if a.TaskID == taskID && a.StudentID == userID {
+			cnt++
+		}
+	}
+	return cnt, nil
+}
+
+func (r *memoryAnswerRepo) CountForStudent(_ context.Context, userID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cnt := 0
+	for _, a := range r.records {
+		if a.StudentID == userID {
+			cnt++
+		}
+	}
+	return cnt, nil
+}
+
+func (r *memoryAnswerRepo) ListForStudent(_ context.Context, userID string, limit, offset int) ([]domain.StudentTaskAnswer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]domain.StudentTaskAnswer, 0)
+	skipped := 0
+	for _, a := range r.records {
+		if a.StudentID != userID {
+			continue
+		}
+		if skipped < offset {
+			skipped++
+			continue
+		}
+		result = append(result, a)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (r *memoryAnswerRepo) GetProgressByTaskIDs(_ context.Context, userID string, taskIDs []string) (map[string]domain.StudentTaskProgress, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	allowed := make(map[string]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		allowed[taskID] = struct{}{}
+	}
+
+	result := make(map[string]domain.StudentTaskProgress, len(taskIDs))
+	latestAttempt := make(map[string]int, len(taskIDs))
+	for _, item := range r.records {
+		if item.StudentID != userID {
+			continue
+		}
+		if _, ok := allowed[item.TaskID]; !ok {
+			continue
+		}
+		progress := result[item.TaskID]
+		progress.TaskID = item.TaskID
+		if item.Status == domain.StudentTaskAnswerStatusPassed {
+			progress.HasPassed = true
+		}
+		if item.Status == domain.StudentTaskAnswerStatusUnderReview {
+			progress.HasUnderReview = true
+		}
+		if progress.LatestAnswerID == "" || item.Attempt >= latestAttempt[item.TaskID] {
+			progress.LatestStatus = item.Status
+			progress.LatestAnswerID = item.ID
+			latestAttempt[item.TaskID] = item.Attempt
+		}
+		result[item.TaskID] = progress
+	}
+
+	return result, nil
+}
+
+func (r *memoryAnswerRepo) get(id string) *domain.StudentTaskAnswer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if a, ok := r.records[id]; ok {
+		cp := a
+		return &cp
+	}
+	return nil
+}
+
+type memoryAutoReviewRepo struct {
+	mu      sync.Mutex
+	records map[string]domain.StudentTaskAnswerAutoReview
+}
+
+func newMemoryAutoReviewRepo() *memoryAutoReviewRepo {
+	return &memoryAutoReviewRepo{records: map[string]domain.StudentTaskAnswerAutoReview{}}
+}
+
+func (r *memoryAutoReviewRepo) Save(_ context.Context, review domain.StudentTaskAnswerAutoReview) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records[review.StudentTaskAnswerID] = review
+	return nil
+}
+
+func (r *memoryAutoReviewRepo) GetByAnswerID(_ context.Context, answerID string) (*domain.StudentTaskAnswerAutoReview, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	review, ok := r.records[answerID]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	cp := review
+	return &cp, nil
+}
+
+type memoryManualReviewRepo struct {
+	mu      sync.Mutex
+	records map[string]domain.StudentTaskAnswerReview
+}
+
+func newMemoryManualReviewRepo() *memoryManualReviewRepo {
+	return &memoryManualReviewRepo{records: map[string]domain.StudentTaskAnswerReview{}}
+}
+
+func (r *memoryManualReviewRepo) Save(_ context.Context, review domain.StudentTaskAnswerReview) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records[review.StudentTaskAnswerID] = review
+	return nil
+}
+
+func (r *memoryManualReviewRepo) GetByAnswerID(_ context.Context, answerID string) (*domain.StudentTaskAnswerReview, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	review, ok := r.records[answerID]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	cp := review
+	return &cp, nil
+}
+
+var (
+	_ repository.StudentTaskAnswerRepository = (*memoryAnswerRepo)(nil)
+	_ repository.AutoReviewRepository        = (*memoryAutoReviewRepo)(nil)
+	_ repository.ManualReviewRepository      = (*memoryManualReviewRepo)(nil)
+)
+
+type publishedEvent struct {
+	Subject string
+	Payload map[string]any
+}
+
+type recordPublisher struct {
+	mu     sync.Mutex
+	events []publishedEvent
+}
+
+func newRecordPublisher() *recordPublisher {
+	return &recordPublisher{events: []publishedEvent{}}
+}
+
+func (p *recordPublisher) Publish(subject string, payload any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	payloadMap := map[string]any{}
+	if m, ok := payload.(map[string]any); ok {
+		for k, v := range m {
+			payloadMap[k] = v
+		}
+	}
+	p.events = append(p.events, publishedEvent{Subject: subject, Payload: payloadMap})
+	return nil
+}
+
+func (p *recordPublisher) Events() []publishedEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]publishedEvent, len(p.events))
+	copy(out, p.events)
+	return out
+}
+
+var _ domain.EventPublisher = (*recordPublisher)(nil)
+
+type courseServiceStub struct {
+	baseURL            string
+	token              string
+	resp               courseTaskResponse
+	requiredRelationID string
+	callCount          int
+	publicCalls        int
+	lastTokenSeen      string
+}
+
+type courseTaskResponse struct {
+	ID                string
+	CourseID          string
+	Status            int
+	CodeStructureType string
+	CodeStructure     json.RawMessage
+	ComposeConfig     json.RawMessage
+	MaxAttempts       *int
+}
+
+func newCourseServiceStub(t *testing.T, resp courseTaskResponse) *courseServiceStub {
+	t.Helper()
+	if len(resp.ComposeConfig) == 0 {
+		resp.ComposeConfig = json.RawMessage(`{"version":"3.9","services":{"app":{"image":"alpine:3.20","command":["sh","-c","while true; do sleep 3600; done"]}}}`)
+	}
+	stub := &courseServiceStub{
+		baseURL: "http://course.test",
+		token:   "internal-token",
+		resp:    resp,
+	}
+	return stub
+}
+
+func (s *courseServiceStub) URL() string {
+	return s.baseURL
+}
+
+func (s *courseServiceStub) Client() *http.Client {
+	return &http.Client{Transport: s}
+}
+
+func (s *courseServiceStub) Calls() int {
+	return s.callCount
+}
+
+func (s *courseServiceStub) LastToken() string {
+	return s.lastTokenSeen
+}
+
+func (s *courseServiceStub) Close() {
+}
+
+func (s *courseServiceStub) RoundTrip(req *http.Request) (*http.Response, error) {
+	publicPath := fmt.Sprintf("/api/v1/task/get/%s", s.resp.ID)
+	if req.URL.Path == publicPath {
+		s.publicCalls++
+		if req.Header.Get("X-Internal-Token") != "" {
+			return nil, fmt.Errorf("public course access check used internal token")
+		}
+		if s.requiredRelationID != "" && req.URL.Query().Get("via_relation_id") != s.requiredRelationID {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader([]byte(`{"id":"` + s.resp.ID + `"}`))),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	}
+
+	expectedPath := fmt.Sprintf("/internal/task/get-internal-task/%s", s.resp.ID)
+	if req.URL.Path != expectedPath {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+			Header:     make(http.Header),
+		}, nil
+	}
+	s.callCount++
+	s.lastTokenSeen = req.Header.Get("X-Internal-Token")
+	if s.token != "" && s.lastTokenSeen != s.token {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(bytes.NewReader([]byte("forbidden"))),
+			Header:     make(http.Header),
+		}, nil
+	}
+	body, _ := json.Marshal(map[string]any{
+		"id":                       s.resp.ID,
+		"course_id":                s.resp.CourseID,
+		"status":                   s.resp.Status,
+		"code_structure_type_code": s.resp.CodeStructureType,
+		"code_structure":           s.resp.CodeStructure,
+		"compose_config":           s.resp.ComposeConfig,
+		"max_attempts":             s.resp.MaxAttempts,
+	})
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}, nil
+}
+
+func decodeBody(t *testing.T, resp *http.Response, dest any) {
+	t.Helper()
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(dest); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+}
+
+func authHeaders(userID, role string) map[string]string {
+	return map[string]string{
+		"X-User-ID":   userID,
+		"X-User-Role": strings.ToUpper(role),
+	}
+}
+
+func mergeHeaders(groups ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, g := range groups {
+		for k, v := range g {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func floatPtr(v float64) *float64 { return &v }
+func strPtr(v string) *string     { return &v }
+
+type answerDTO struct {
+	ID            string     `json:"id"`
+	StudentID     string     `json:"student_id"`
+	TaskID        string     `json:"task_id"`
+	FilestorageID *string    `json:"filestorage_id"`
+	StartedAt     time.Time  `json:"started_at"`
+	EndedAt       *time.Time `json:"ended_at"`
+	Status        int        `json:"status"`
+	Attempt       int        `json:"attempt"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+type startTaskDTO struct {
+	AnswerID   string `json:"answer_id"`
+	SandboxID  string `json:"sandbox_id"`
+	Status     string `json:"status"`
+	PreviewURL string `json:"preview_url"`
+}
+
+type wikiReviewResponse struct {
+	Passed  bool  `json:"passed"`
+	Errors  []any `json:"errors"`
+	Score   int   `json:"score"`
+	Details any   `json:"details,omitempty"`
+}
+
+type wikiSubmitResponse struct {
+	AnswerID string             `json:"answer_id"`
+	Status   string             `json:"status"`
+	Review   wikiReviewResponse `json:"review"`
+}
+
+func stringFromPayload(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}

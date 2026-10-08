@@ -1,0 +1,559 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// DiagnosticAssessmentRepoPG persists placement-only diagnostic aggregates. It
+// never calls ordinary answer, action, evidence, mastery, progression or NATS
+// adapters. Completion persists a reference-only trigger in the same transaction.
+type DiagnosticAssessmentRepoPG struct{ Pool *pgxpool.Pool }
+
+var _ repository.DiagnosticAssessmentRepository = (*DiagnosticAssessmentRepoPG)(nil)
+var diagnosticHash = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// ReplayDiagnosticReservation and ReplayDiagnosticSubmission are read-only
+// idempotency preflights. They let usecases recover a committed receipt
+// without contacting Course after a lost response.
+func (repo *DiagnosticAssessmentRepoPG) ReplayDiagnosticReservation(ctx context.Context, studentID, planID, requestID, requestHash string) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	if !validDiagnosticID(studentID) || !validDiagnosticID(planID) || requestID != planID || !validDiagnosticCommand(requestID, requestHash, time.Now()) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	tx, err := repo.diagnosticTx(ctx)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	attempt, replay, found, err := diagnosticReceiptAttempt(ctx, tx, requestID, requestHash, "RESERVE", studentID, requestID, "")
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	return attempt, found && replay, nil
+}
+
+func (repo *DiagnosticAssessmentRepoPG) ReplayDiagnosticSubmission(ctx context.Context, studentID, attemptID, taskID, requestID, requestHash string) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	if !validDiagnosticID(studentID) || !validDiagnosticID(attemptID) || !validDiagnosticID(taskID) || !validDiagnosticCommand(requestID, requestHash, time.Now()) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	tx, err := repo.diagnosticTx(ctx)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	attempt, replay, found, err := diagnosticReceiptAttempt(ctx, tx, requestID, requestHash, "SUBMIT", studentID, attemptID, taskID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	return attempt, found && replay, nil
+}
+
+func (repo *DiagnosticAssessmentRepoPG) ReserveDiagnosticAssessment(ctx context.Context, command repository.DiagnosticAssessmentReserveCommand) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	plan, err := domain.NormalizeDiagnosticAssessmentPlan(command.Plan)
+	if err != nil || command.RequestID != plan.ID || !validDiagnosticCommand(command.RequestID, command.RequestHash, command.OccurredAt) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	tx, err := repo.diagnosticTx(ctx)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := diagnosticLock(ctx, tx, command.RequestID); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if attempt, replay, found, err := diagnosticReceiptAttempt(ctx, tx, command.RequestID, command.RequestHash, "RESERVE", plan.StudentID, command.RequestID, ""); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	} else if found {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.DiagnosticAssessmentAttempt{}, false, err
+		}
+		return attempt, replay, nil
+	}
+	// Lock the authoritative onboarding row until this reservation commits. This
+	// binds a plan to the exact version atomically, without allowing an
+	// onboarding update to race the insert after Course has been consulted.
+	var onboardingVersion int64
+	if err := tx.QueryRow(ctx, `SELECT version FROM student_onboarding WHERE student_id=$1 FOR SHARE`, plan.StudentID).Scan(&onboardingVersion); errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	} else if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	} else if onboardingVersion != plan.OnboardingVersion {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	var existing string
+	err = tx.QueryRow(ctx, `SELECT id::text FROM student_diagnostic_assessment_attempt WHERE student_id=$1 AND plan_id=$2 AND plan_revision=$3`, plan.StudentID, plan.ID, plan.PlanRevision).Scan(&existing)
+	if err == nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO student_diagnostic_assessment_attempt (id,student_id,plan_id,course_id,plan_revision,policy_version,onboarding_version,bootstrap_policy_version,bootstrap_context_digest,course_content_revision,plan_digest,plan_json,plan_created_at,reserved_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, command.RequestID, plan.StudentID, plan.ID, plan.CourseID, plan.PlanRevision, plan.PolicyVersion, plan.OnboardingVersion, plan.BootstrapPolicyVersion, plan.BootstrapContextDigest, plan.CourseContentRevision, plan.PlanDigest, planJSON, diagnosticTime(plan.CreatedAt), diagnosticTime(command.OccurredAt)); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, mapDiagnosticError(err)
+	}
+	for position, item := range plan.Assessments {
+		targets, marshalErr := json.Marshal(item.LearningTargets)
+		if marshalErr != nil {
+			return domain.DiagnosticAssessmentAttempt{}, false, marshalErr
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO student_diagnostic_assessment_item (attempt_id,task_id,lesson_id,task_version,task_updated_at,lesson_order,task_order,item_position,learning_targets) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, command.RequestID, item.TaskID, item.LessonID, item.TaskVersion, diagnosticTime(item.UpdatedAt), item.LessonOrder, item.TaskOrder, position+1, targets); err != nil {
+			return domain.DiagnosticAssessmentAttempt{}, false, mapDiagnosticError(err)
+		}
+	}
+	attempt := diagnosticAttemptFromPlan(command.RequestID, plan, command.OccurredAt)
+	if err = insertDiagnosticReceipt(ctx, tx, command.RequestID, command.RequestHash, command.RequestID, "RESERVE", "", attempt, command.OccurredAt); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, mapDiagnosticError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	return attempt, false, nil
+}
+
+func (repo *DiagnosticAssessmentRepoPG) GetDiagnosticAssessment(ctx context.Context, studentID, attemptID string) (domain.DiagnosticAssessmentAttempt, error) {
+	if !validDiagnosticID(studentID) || !validDiagnosticID(attemptID) {
+		return domain.DiagnosticAssessmentAttempt{}, domain.ErrValidation
+	}
+	if repo == nil || repo.Pool == nil {
+		return domain.DiagnosticAssessmentAttempt{}, errors.New("diagnostic assessment repository pool is required")
+	}
+	return getDiagnosticAttempt(ctx, repo.Pool, studentID, attemptID)
+}
+
+func (repo *DiagnosticAssessmentRepoPG) GetCurrentDiagnosticAssessment(ctx context.Context, studentID string) (domain.DiagnosticAssessmentAttempt, error) {
+	if !validDiagnosticID(studentID) {
+		return domain.DiagnosticAssessmentAttempt{}, domain.ErrValidation
+	}
+	if repo == nil || repo.Pool == nil {
+		return domain.DiagnosticAssessmentAttempt{}, errors.New("diagnostic assessment repository pool is required")
+	}
+	var attemptID string
+	err := repo.Pool.QueryRow(ctx, `SELECT attempt.id::text
+FROM student_diagnostic_assessment_attempt attempt
+JOIN student_onboarding onboarding ON onboarding.student_id=attempt.student_id
+WHERE attempt.student_id=$1 AND attempt.onboarding_version=onboarding.version
+ORDER BY attempt.plan_revision DESC, attempt.reserved_at DESC, attempt.id DESC
+LIMIT 1`, studentID).Scan(&attemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, err
+	}
+	return getDiagnosticAttempt(ctx, repo.Pool, studentID, attemptID)
+}
+
+func (repo *DiagnosticAssessmentRepoPG) SubmitDiagnosticAssessment(ctx context.Context, command repository.DiagnosticAssessmentSubmitCommand) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	if !validDiagnosticCommand(command.RequestID, command.RequestHash, command.OccurredAt) || !validDiagnosticID(command.StudentID) || !validDiagnosticID(command.AttemptID) || !validDiagnosticID(command.TaskID) || !json.Valid(command.Response) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	tx, err := repo.diagnosticTx(ctx)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err = diagnosticLock(ctx, tx, command.RequestID); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if attempt, replay, found, err := diagnosticReceiptAttempt(ctx, tx, command.RequestID, command.RequestHash, "SUBMIT", command.StudentID, command.AttemptID, command.TaskID); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	} else if found {
+		if err = tx.Commit(ctx); err != nil {
+			return domain.DiagnosticAssessmentAttempt{}, false, err
+		}
+		return attempt, replay, nil
+	}
+	attempt, err := getDiagnosticAttempt(ctx, tx, command.StudentID, command.AttemptID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if attempt.Result != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	var exists bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM student_diagnostic_assessment_item WHERE attempt_id=$1 AND task_id=$2)`, command.AttemptID, command.TaskID).Scan(&exists); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if !exists {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrNotFound
+	}
+	var priorID string
+	err = tx.QueryRow(ctx, `SELECT request_id::text FROM student_diagnostic_assessment_submission WHERE attempt_id=$1 AND task_id=$2`, command.AttemptID, command.TaskID).Scan(&priorID)
+	if err == nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO student_diagnostic_assessment_submission(attempt_id,task_id,request_id,request_hash,response_json,correct,submitted_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, command.AttemptID, command.TaskID, command.RequestID, command.RequestHash, command.Response, command.Correct, diagnosticTime(command.OccurredAt)); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, mapDiagnosticError(err)
+	}
+	attempt.SubmittedItems++
+	if err = insertDiagnosticReceipt(ctx, tx, command.RequestID, command.RequestHash, command.AttemptID, "SUBMIT", command.TaskID, attempt, command.OccurredAt); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, mapDiagnosticError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	return attempt, false, nil
+}
+
+func (repo *DiagnosticAssessmentRepoPG) CompleteDiagnosticAssessment(ctx context.Context, command repository.DiagnosticAssessmentCompleteCommand) (domain.DiagnosticAssessmentResult, bool, error) {
+	if !validDiagnosticCommand(command.RequestID, command.RequestHash, command.OccurredAt) || !validDiagnosticID(command.StudentID) || !validDiagnosticID(command.AttemptID) {
+		return domain.DiagnosticAssessmentResult{}, false, domain.ErrValidation
+	}
+	tx, err := repo.diagnosticTx(ctx)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err = diagnosticLock(ctx, tx, command.RequestID); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	if result, replay, found, err := diagnosticReceiptResult(ctx, tx, command.RequestID, command.RequestHash, command.StudentID, command.AttemptID); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	} else if found {
+		if err = tx.Commit(ctx); err != nil {
+			return domain.DiagnosticAssessmentResult{}, false, err
+		}
+		return result, replay, nil
+	}
+	attempt, err := getDiagnosticAttempt(ctx, tx, command.StudentID, command.AttemptID)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	if attempt.Result != nil {
+		return domain.DiagnosticAssessmentResult{}, false, domain.ErrConflict
+	}
+	if attempt.SubmittedItems != len(attempt.Items) {
+		return domain.DiagnosticAssessmentResult{}, false, domain.ErrConflict
+	}
+	var correct, total int
+	if err = tx.QueryRow(ctx, `SELECT COALESCE(count(*) FILTER (WHERE correct),0),count(*) FROM student_diagnostic_assessment_submission WHERE attempt_id=$1`, command.AttemptID).Scan(&correct, &total); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	if total != len(attempt.Items) {
+		return domain.DiagnosticAssessmentResult{}, false, domain.ErrConflict
+	}
+	band, err := domain.DiagnosticPlacementBand(correct, total)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	result := domain.DiagnosticAssessmentResult{Schema: "student-diagnostic-assessment-result.v1", StudentID: attempt.StudentID, CourseID: attempt.CourseID, CourseContentRevision: attempt.CourseContentRevision, PolicyVersion: attempt.PolicyVersion, AttemptID: attempt.ID, PlanID: attempt.PlanID, PlanRevision: attempt.PlanRevision, Correct: correct, Total: total, Percent: correct * 100 / total, Band: band, BandPolicyVersion: domain.DiagnosticAssessmentBandPolicy, PlanDigest: attempt.PlanDigest, CompletedAt: diagnosticTime(command.OccurredAt)}
+	result.ResultDigest, err = domain.DiagnosticAssessmentResultDigest(result)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO student_diagnostic_assessment_result(attempt_id,student_id,course_id,course_content_revision,policy_version,correct,total,percent,band,band_policy_version,completed_at,result_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, result.AttemptID, result.StudentID, result.CourseID, result.CourseContentRevision, result.PolicyVersion, result.Correct, result.Total, result.Percent, result.Band, result.BandPolicyVersion, result.CompletedAt, result.ResultDigest); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, mapDiagnosticError(err)
+	}
+	if err = insertDiagnosticReceipt(ctx, tx, command.RequestID, command.RequestHash, command.AttemptID, "COMPLETE", "", result, command.OccurredAt); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, mapDiagnosticError(err)
+	}
+	event, err := domain.NewDiagnosticResultCommittedEvent(result, command.RequestID)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO student_outbox(event_id,subject,schema_version,student_id,correlation_id,causation_id,occurred_at,payload,next_attempt_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$7,$7)`, event.EventID, event.Subject, event.SchemaVersion, event.StudentID, event.CorrelationID, event.CausationID, event.OccurredAt, string(event.Payload)); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, mapDiagnosticError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, err
+	}
+	return result, false, nil
+}
+
+// pgx Rows and Pool both provide QueryRow; the small interface keeps reads usable in transactions.
+type diagnosticQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func getDiagnosticAttempt(ctx context.Context, q diagnosticQuerier, studentID, attemptID string) (domain.DiagnosticAssessmentAttempt, error) {
+	var planJSON []byte
+	var id, planID, courseID, policy, bootstrapPolicy, bootstrapDigest, courseRevision, digest string
+	var revision int
+	var onboardingVersion int64
+	var createdAt, reservedAt time.Time
+	err := q.QueryRow(ctx, `SELECT id::text,plan_id::text,course_id::text,plan_revision,policy_version,onboarding_version,bootstrap_policy_version,bootstrap_context_digest,course_content_revision,plan_digest,plan_json,plan_created_at,reserved_at FROM student_diagnostic_assessment_attempt WHERE id=$1 AND student_id=$2`, attemptID, studentID).Scan(&id, &planID, &courseID, &revision, &policy, &onboardingVersion, &bootstrapPolicy, &bootstrapDigest, &courseRevision, &digest, &planJSON, &createdAt, &reservedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, err
+	}
+	var plan domain.DiagnosticAssessmentPlan
+	if err = decodeStoredDiagnosticJSON(planJSON, &plan); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, fmt.Errorf("invalid stored diagnostic plan: %w", err)
+	}
+	plan, err = domain.NormalizeDiagnosticAssessmentPlan(plan)
+	if err != nil || plan.ID != planID || plan.CourseID != courseID || plan.PlanRevision != revision || plan.PolicyVersion != policy || plan.OnboardingVersion != onboardingVersion || plan.BootstrapPolicyVersion != bootstrapPolicy || plan.BootstrapContextDigest != bootstrapDigest || plan.CourseContentRevision != courseRevision || plan.PlanDigest != digest || !plan.CreatedAt.UTC().Equal(createdAt.UTC()) {
+		return domain.DiagnosticAssessmentAttempt{}, fmt.Errorf("invalid stored diagnostic plan: %w", err)
+	}
+	attempt := diagnosticAttemptFromPlan(id, plan, reservedAt)
+	rows, rowErr := q.Query(ctx, `SELECT task_id::text,lesson_id::text,task_version,task_updated_at,lesson_order,task_order,item_position,learning_targets FROM student_diagnostic_assessment_item WHERE attempt_id=$1 ORDER BY item_position`, id)
+	if rowErr != nil {
+		return domain.DiagnosticAssessmentAttempt{}, rowErr
+	}
+	defer rows.Close()
+	position := 0
+	for rows.Next() {
+		var taskID, lessonID string
+		var version int64
+		var updated time.Time
+		var lessonOrder, taskOrder, itemPosition int
+		var targetsRaw []byte
+		if rowErr = rows.Scan(&taskID, &lessonID, &version, &updated, &lessonOrder, &taskOrder, &itemPosition, &targetsRaw); rowErr != nil {
+			return domain.DiagnosticAssessmentAttempt{}, rowErr
+		}
+		if position >= len(plan.Assessments) {
+			return domain.DiagnosticAssessmentAttempt{}, errors.New("extra stored diagnostic item")
+		}
+		item := plan.Assessments[position]
+		var targets []domain.LearningTargetRef
+		dec := json.NewDecoder(bytes.NewReader(targetsRaw))
+		dec.DisallowUnknownFields()
+		if rowErr = dec.Decode(&targets); rowErr != nil {
+			return domain.DiagnosticAssessmentAttempt{}, rowErr
+		}
+		if rowErr = dec.Decode(&struct{}{}); rowErr != io.EOF {
+			return domain.DiagnosticAssessmentAttempt{}, errors.New("invalid stored diagnostic targets")
+		}
+		normalized, normErr := domain.NormalizeDiagnosticLearningTargets(targets)
+		if normErr != nil || taskID != item.TaskID || lessonID != item.LessonID || version != item.TaskVersion || !updated.UTC().Equal(item.UpdatedAt.UTC()) || lessonOrder != item.LessonOrder || taskOrder != item.TaskOrder || itemPosition != position+1 || !diagnosticTargetsEqualJSON(normalized, item.LearningTargets) {
+			return domain.DiagnosticAssessmentAttempt{}, errors.New("invalid stored diagnostic item")
+		}
+		position++
+	}
+	if rows.Err() != nil {
+		return domain.DiagnosticAssessmentAttempt{}, rows.Err()
+	}
+	if position != len(plan.Assessments) {
+		return domain.DiagnosticAssessmentAttempt{}, errors.New("missing stored diagnostic item")
+	}
+	var count int
+	if err = q.QueryRow(ctx, `SELECT count(*) FROM student_diagnostic_assessment_submission WHERE attempt_id=$1`, id).Scan(&count); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, err
+	}
+	attempt.SubmittedItems = count
+	var result domain.DiagnosticAssessmentResult
+	err = q.QueryRow(ctx, `SELECT student_id::text,course_id::text,course_content_revision,policy_version,correct,total,percent,band,band_policy_version,completed_at,result_digest FROM student_diagnostic_assessment_result WHERE attempt_id=$1`, id).Scan(&result.StudentID, &result.CourseID, &result.CourseContentRevision, &result.PolicyVersion, &result.Correct, &result.Total, &result.Percent, &result.Band, &result.BandPolicyVersion, &result.CompletedAt, &result.ResultDigest)
+	if err == nil {
+		result.Schema = "student-diagnostic-assessment-result.v1"
+		result.AttemptID = id
+		result.PlanID = plan.ID
+		result.PlanRevision = plan.PlanRevision
+		result.PlanDigest = plan.PlanDigest
+		if result.StudentID != plan.StudentID || result.CourseID != plan.CourseID || result.CourseContentRevision != plan.CourseContentRevision || result.PolicyVersion != plan.PolicyVersion {
+			return domain.DiagnosticAssessmentAttempt{}, errors.New("invalid stored diagnostic result binding")
+		}
+		var normalizeErr error
+		result, normalizeErr = normalizeStoredDiagnosticResult(result)
+		if normalizeErr != nil {
+			return domain.DiagnosticAssessmentAttempt{}, errors.New("invalid stored diagnostic result")
+		}
+		attempt.Result = &result
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, err
+	}
+	return attempt, nil
+}
+func diagnosticAttemptFromPlan(id string, p domain.DiagnosticAssessmentPlan, created time.Time) domain.DiagnosticAssessmentAttempt {
+	createdAt := diagnosticTime(created)
+	return domain.DiagnosticAssessmentAttempt{Schema: "student-diagnostic-assessment-attempt.v1", ID: id, StudentID: p.StudentID, PlanID: p.ID, CourseID: p.CourseID, PlanRevision: p.PlanRevision, PolicyVersion: p.PolicyVersion, OnboardingVersion: p.OnboardingVersion, BootstrapPolicyVersion: p.BootstrapPolicyVersion, BootstrapContextDigest: p.BootstrapContextDigest, CourseContentRevision: p.CourseContentRevision, PlanDigest: p.PlanDigest, Items: p.Assessments, CreatedAt: createdAt}
+}
+func diagnosticTime(value time.Time) time.Time { return value.UTC().Truncate(time.Microsecond) }
+
+// PostgreSQL timestamptz is an absolute instant, but pgx may attach a zero-offset
+// location other than time.UTC while scanning it. Canonicalize this trusted
+// persistence value before applying the strict wire/digest validator.
+func normalizeStoredDiagnosticResult(result domain.DiagnosticAssessmentResult) (domain.DiagnosticAssessmentResult, error) {
+	result.CompletedAt = diagnosticTime(result.CompletedAt)
+	return domain.NormalizeDiagnosticAssessmentResult(result)
+}
+
+func diagnosticTargetsEqualJSON(left, right []domain.LearningTargetRef) bool {
+	a, _ := json.Marshal(left)
+	b, _ := json.Marshal(right)
+	return bytes.Equal(a, b)
+}
+
+func (repo *DiagnosticAssessmentRepoPG) diagnosticTx(ctx context.Context) (pgx.Tx, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("diagnostic assessment repository pool is required")
+	}
+	return repo.Pool.Begin(ctx)
+}
+func diagnosticLock(ctx context.Context, tx pgx.Tx, requestID string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "diagnostic-assessment:"+requestID)
+	return err
+}
+func validDiagnosticID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+func validDiagnosticCommand(id, hash string, occurred time.Time) bool {
+	return validDiagnosticID(id) && diagnosticHash.MatchString(hash) && !occurred.IsZero()
+}
+func decodeStoredDiagnosticJSON(raw []byte, target any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return domain.ErrValidation
+	}
+	return nil
+}
+func insertDiagnosticReceipt(ctx context.Context, tx pgx.Tx, requestID, requestHash, attemptID, kind, taskID string, response any, occurred time.Time) error {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	var task any
+	if strings.TrimSpace(taskID) != "" {
+		task = taskID
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO student_diagnostic_assessment_receipt(request_id,attempt_id,command_kind,request_hash,task_id,response_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, requestID, attemptID, kind, requestHash, task, encoded, diagnosticTime(occurred))
+	return err
+}
+func diagnosticReceiptAttempt(ctx context.Context, tx pgx.Tx, requestID, hash, kind, studentID, expectedAttemptID, taskID string) (domain.DiagnosticAssessmentAttempt, bool, bool, error) {
+	var attemptID, storedHash, storedKind string
+	var storedTask *string
+	var raw []byte
+	err := tx.QueryRow(ctx, `SELECT attempt_id::text,request_hash,command_kind,task_id::text,response_json FROM student_diagnostic_assessment_receipt WHERE request_id=$1`, requestID).Scan(&attemptID, &storedHash, &storedKind, &storedTask, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, nil
+	}
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, err
+	}
+	if storedHash != hash || storedKind != kind || attemptID != expectedAttemptID || ((storedTask == nil) != (taskID == "")) || (storedTask != nil && *storedTask != taskID) {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, domain.ErrConflict
+	}
+	authoritative, err := getDiagnosticAttempt(ctx, tx, studentID, attemptID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var attempt domain.DiagnosticAssessmentAttempt
+	if err = dec.Decode(&attempt); err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, err
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, domain.ErrConflict
+	}
+	if !validHistoricalDiagnosticAttempt(attempt, authoritative, kind) {
+		return domain.DiagnosticAssessmentAttempt{}, false, false, domain.ErrConflict
+	}
+	return attempt, true, true, nil
+}
+func diagnosticReceiptResult(ctx context.Context, tx pgx.Tx, requestID, hash, studentID, expectedAttemptID string) (domain.DiagnosticAssessmentResult, bool, bool, error) {
+	var storedHash, kind string
+	var attemptID string
+	var raw []byte
+	err := tx.QueryRow(ctx, `SELECT attempt_id::text,request_hash,command_kind,response_json FROM student_diagnostic_assessment_receipt WHERE request_id=$1`, requestID).Scan(&attemptID, &storedHash, &kind, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticAssessmentResult{}, false, false, nil
+	}
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, false, err
+	}
+	if storedHash != hash || kind != "COMPLETE" || attemptID != expectedAttemptID {
+		return domain.DiagnosticAssessmentResult{}, false, false, domain.ErrConflict
+	}
+	authoritative, err := getDiagnosticAttempt(ctx, tx, studentID, attemptID)
+	if err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, false, err
+	}
+	var result domain.DiagnosticAssessmentResult
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&result); err != nil {
+		return domain.DiagnosticAssessmentResult{}, false, false, err
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		return domain.DiagnosticAssessmentResult{}, false, false, domain.ErrConflict
+	}
+	normalized, normalizeErr := domain.NormalizeDiagnosticAssessmentResult(result)
+	if normalizeErr != nil || authoritative.Result == nil || normalized.AttemptID != attemptID || normalized.StudentID != authoritative.StudentID || normalized.CourseID != authoritative.CourseID || normalized.PlanID != authoritative.PlanID || normalized.PlanRevision != authoritative.PlanRevision || normalized.PlanDigest != authoritative.PlanDigest || normalized.CourseContentRevision != authoritative.CourseContentRevision || normalized.PolicyVersion != authoritative.PolicyVersion || !diagnosticResultsEqual(normalized, *authoritative.Result) {
+		return domain.DiagnosticAssessmentResult{}, false, false, domain.ErrConflict
+	}
+	return normalized, true, true, nil
+}
+
+func diagnosticResultsEqual(left, right domain.DiagnosticAssessmentResult) bool {
+	left.CompletedAt = left.CompletedAt.UTC().Truncate(time.Microsecond)
+	right.CompletedAt = right.CompletedAt.UTC().Truncate(time.Microsecond)
+	a, _ := json.Marshal(left)
+	b, _ := json.Marshal(right)
+	return bytes.Equal(a, b)
+}
+func validHistoricalDiagnosticAttempt(snapshot, current domain.DiagnosticAssessmentAttempt, kind string) bool {
+	if snapshot.Schema != "student-diagnostic-assessment-attempt.v1" || snapshot.ID != current.ID || snapshot.StudentID != current.StudentID || snapshot.PlanID != current.PlanID || snapshot.CourseID != current.CourseID || snapshot.PlanRevision != current.PlanRevision || snapshot.PolicyVersion != current.PolicyVersion || snapshot.OnboardingVersion != current.OnboardingVersion || snapshot.BootstrapPolicyVersion != current.BootstrapPolicyVersion || snapshot.BootstrapContextDigest != current.BootstrapContextDigest || snapshot.CourseContentRevision != current.CourseContentRevision || snapshot.PlanDigest != current.PlanDigest || !canonicalStoredDiagnosticTimestamp(snapshot.CreatedAt) || !snapshot.CreatedAt.Equal(current.CreatedAt) || snapshot.SubmittedItems < 0 || snapshot.SubmittedItems > current.SubmittedItems || snapshot.Result != nil {
+		return false
+	}
+	switch kind {
+	case "RESERVE":
+		if snapshot.SubmittedItems != 0 {
+			return false
+		}
+	case "SUBMIT":
+		if snapshot.SubmittedItems < 1 || snapshot.SubmittedItems > len(snapshot.Items) {
+			return false
+		}
+	default:
+		return false
+	}
+	left, _ := json.Marshal(snapshot.Items)
+	right, _ := json.Marshal(current.Items)
+	if !bytes.Equal(left, right) {
+		return false
+	}
+	if snapshot.Result != nil {
+		if current.Result == nil {
+			return false
+		}
+		a, _ := json.Marshal(snapshot.Result)
+		b, _ := json.Marshal(current.Result)
+		return bytes.Equal(a, b)
+	}
+	return true
+}
+
+func canonicalStoredDiagnosticTimestamp(value time.Time) bool {
+	return !value.IsZero() && value.Location() == time.UTC && value.Nanosecond()%1000 == 0
+}
+func mapDiagnosticError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "23514" || pgErr.Code == "23503") {
+		return domain.ErrConflict
+	}
+	return err
+}

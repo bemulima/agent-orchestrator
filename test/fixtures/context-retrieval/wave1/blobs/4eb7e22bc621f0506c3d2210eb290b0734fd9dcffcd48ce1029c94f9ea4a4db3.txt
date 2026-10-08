@@ -1,0 +1,220 @@
+package internalapi_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	"github.com/go-chi/chi/v5"
+)
+
+const snapshotStudentID = "11111111-1111-4111-8111-111111111111"
+const snapshotPathID = "22222222-2222-4222-8222-222222222222"
+const snapshotHTTPPath = "/v1/students/" + snapshotStudentID + "/learning-paths/" + snapshotPathID + "/planning-snapshot"
+const snapshotBody = `{"targets":[{"type":"concept","key":"go.syntax","version":"v1"}],"trigger_context":{"kind":"manual_request","reason":"inspect current owner state"}}`
+
+// This is an API unit model. It proves strict transport and whitelisting, never
+// PostgreSQL consistency, registered production composition, or live E2E.
+type planningSnapshotUnitGetter struct {
+	calls     int
+	request   domain.PlanningSnapshotRequest
+	studentID string
+	pathID    string
+	err       error
+	mutate    func(*domain.StudentPlanningSnapshot)
+}
+
+func (getter *planningSnapshotUnitGetter) Handle(_ context.Context, sid, pid string, request domain.PlanningSnapshotRequest) (domain.StudentPlanningSnapshot, error) {
+	getter.calls++
+	getter.request, getter.studentID, getter.pathID = request, sid, pid
+	if getter.err != nil {
+		return domain.StudentPlanningSnapshot{}, getter.err
+	}
+	result, err := domain.BuildStudentPlanningSnapshot(planningSnapshotHTTPSource(request.Targets), request)
+	if err == nil && getter.mutate != nil {
+		getter.mutate(&result)
+	}
+	return result, err
+}
+
+func planningSnapshotHTTPSource(targets []domain.LearningTargetRef) domain.PlanningSnapshotSource {
+	now := time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC)
+	mastery := make([]domain.StudentTargetMastery, len(targets))
+	for i, target := range targets {
+		mastery[i] = domain.StudentTargetMastery{StudentID: snapshotStudentID, Target: target, State: domain.TargetMasteryUnknown, PolicyVersion: domain.MasteryPolicyVersion}
+	}
+	return domain.PlanningSnapshotSource{
+		StudentID: snapshotStudentID, RequestedTargets: targets, CapturedAt: now, Mastery: mastery,
+		Profile: domain.StudentOnboarding{StudentID: snapshotStudentID, DirectionCode: "backend", SelfAssessedExperience: "beginner", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "go.backend", GoalText: "PRIVATE_GOAL_CANARY", PreferredLanguage: "ru", WeeklyMinutes: 120, PreferredPace: "steady", ProfileVersion: domain.StudentOnboardingProfileVersion, Version: 3, CreatedAt: now, UpdatedAt: now},
+		Context: domain.StudentLearningContext{StudentID: snapshotStudentID, SelectedLearningPathID: snapshotPathID, Version: 4, UpdatedAt: &now},
+		Path:    domain.StudentLearningPath{ID: snapshotPathID, StudentID: snapshotStudentID, CourseID: "33333333-3333-4333-8333-333333333333", GoalCode: "go.backend", CourseFingerprint: strings.Repeat("a", 64), PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "PRIVATE_REASON_CANARY", Status: domain.LearningPathStatusActive, IsPrimary: true, IsSelected: true, Version: 2, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ID: "44444444-4444-4444-8444-444444444444", ReferenceType: "lesson", ReferenceID: "55555555-5555-4555-8555-555555555555", Position: 0, Status: domain.LearningPathItemReady, Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.syntax", Version: "v1"}}, ReasonCode: "first_gap", LessonContent: json.RawMessage(`{"description":"PRIVATE_LESSON_CANARY"}`)}}},
+	}
+}
+
+func planningSnapshotDirectRouter(getter privatehandlers.PlanningSnapshotGetter) http.Handler {
+	handler := &privatehandlers.Handler{PlanningSnapshot: getter}
+	router := chi.NewRouter()
+	router.Post("/v1/students/{studentID}/learning-paths/{pathID}/planning-snapshot", handler.GetPlanningSnapshot)
+	return router
+}
+
+func planningSnapshotRequest(router http.Handler, path, body, contentType string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func TestPlanningSnapshotHandlerWhitelistAndExactInputs(t *testing.T) {
+	getter := &planningSnapshotUnitGetter{}
+	response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, snapshotBody, "application/json")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if getter.calls != 1 || getter.studentID != snapshotStudentID || getter.pathID != snapshotPathID || len(getter.request.Targets) != 1 {
+		t.Fatal("wrong getter identity or requested targets")
+	}
+	if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Content-Type") != "application/json" {
+		t.Fatal("snapshot cache/type headers missing")
+	}
+	for _, forbidden := range []string{"PRIVATE_GOAL_CANARY", "PRIVATE_REASON_CANARY", "PRIVATE_LESSON_CANARY", "lesson_content", "goal_text", "reason_summary", "expected_answers", "solution", "workspace", "secret"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("private field %q exposed", forbidden)
+		}
+	}
+	var snapshot domain.StudentPlanningSnapshot
+	if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Schema != domain.StudentPlanningSnapshotSchema || snapshot.References.SnapshotRef == "" || len(snapshot.Mastery) != 1 || snapshot.Mastery[0].State != domain.TargetMasteryUnknown {
+		t.Fatal("missing safe snapshot refs/mastery")
+	}
+	for _, signal := range []domain.PlanningSnapshotUnavailable{snapshot.Availability.EvidenceQuality, snapshot.Availability.Stability} {
+		if signal.Status != "DERIVED_BY_PLANNER" || signal.Value != nil || signal.ReasonCode != "PLANNER_POLICY_HYBRID_V1" {
+			t.Fatal("quality/stability must remain Planner-owned")
+		}
+	}
+	for _, unavailable := range []domain.PlanningSnapshotUnavailable{snapshot.Availability.RuntimeHold, snapshot.Availability.AutomaticAdaptation, snapshot.Availability.StudentPinning} {
+		if unavailable.Status != "UNAVAILABLE" || unavailable.Value != nil || unavailable.ReasonCode == "" {
+			t.Fatal("unavailable semantics were defaulted")
+		}
+	}
+}
+
+func TestPlanningSnapshotHandlerRejectsMalformedBeforeRead(t *testing.T) {
+	cases := map[string]string{
+		"unknown root":               strings.TrimSuffix(snapshotBody, "}") + `,"extra":true}`,
+		"case alias":                 strings.Replace(snapshotBody, `"targets"`, `"Targets"`, 1),
+		"unknown target":             strings.Replace(snapshotBody, `"version":"v1"`, `"version":"v1","outcome":"passed"`, 1),
+		"unknown trace":              strings.Replace(snapshotBody, `"kind":"manual_request"`, `"kind":"manual_request","consent":true`, 1),
+		"duplicate root":             `{"targets":[{"type":"concept","key":"go.syntax"}],"targets":[],"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"duplicate target":           strings.Replace(snapshotBody, `"key":"go.syntax"`, `"key":"go.syntax","key":"go.http"`, 1),
+		"duplicate escaped target":   strings.Replace(snapshotBody, `"key":"go.syntax"`, `"key":"go.syntax","k\u0065y":"go.http"`, 1),
+		"duplicate trace":            strings.Replace(snapshotBody, `"kind":"manual_request"`, `"kind":"manual_request","kind":"activity_completed"`, 1),
+		"null document":              `null`,
+		"null targets":               `{"targets":null,"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"null target":                `{"targets":[null],"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"null version":               strings.Replace(snapshotBody, `"version":"v1"`, `"version":null`, 1),
+		"null trace":                 `{"targets":[{"type":"concept","key":"go.syntax"}],"trigger_context":null}`,
+		"null optional correlation":  strings.Replace(snapshotBody, `"kind":"manual_request"`, `"kind":"manual_request","correlation_id":null`, 1),
+		"empty optional correlation": strings.Replace(snapshotBody, `"kind":"manual_request"`, `"kind":"manual_request","correlation_id":""`, 1),
+		"foreign target shape":       `{"targets":[["concept"]],"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"duplicate exact targets":    `{"targets":[{"type":"concept","key":"go.syntax"},{"type":"concept","key":"go.syntax","version":""}],"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"empty targets":              `{"targets":[],"trigger_context":{"kind":"manual_request","reason":"read"}}`,
+		"missing trace":              `{"targets":[{"type":"concept","key":"go.syntax"}]}`,
+		"empty trace reason":         strings.Replace(snapshotBody, `"inspect current owner state"`, `" "`, 1),
+		"trailing value":             snapshotBody + ` {}`,
+		"invalid UTF8":               strings.Replace(snapshotBody, "go.syntax", string([]byte{0xff}), 1),
+		"oversize document":          `{"targets":[{"type":"concept","key":"go.syntax"}],"trigger_context":{"kind":"manual_request","reason":"` + strings.Repeat("a", domain.MaximumPlanningSnapshotRequestBytes) + `"}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			getter := &planningSnapshotUnitGetter{}
+			response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, body, "application/json")
+			if response.Code != http.StatusBadRequest || getter.calls != 0 {
+				t.Fatalf("status=%d reads=%d", response.Code, getter.calls)
+			}
+		})
+	}
+	for _, contentType := range []string{"", "text/plain", "application/jsonx"} {
+		getter := &planningSnapshotUnitGetter{}
+		response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, snapshotBody, contentType)
+		if response.Code != http.StatusBadRequest || getter.calls != 0 {
+			t.Fatal("wrong content type caused read")
+		}
+	}
+}
+
+func TestPlanningSnapshotHandlerPreservesFullAllowedTargetEnvelope(t *testing.T) {
+	targets := make([]domain.LearningTargetRef, 500)
+	for i := range targets {
+		targets[i] = domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: fmt.Sprintf("%03d", i) + strings.Repeat("k", 252), Version: strings.Repeat("v", 128)}
+	}
+	// Exact empty legacy version stays empty; no graph version is invented.
+	targets[0].Version = ""
+	body, err := json.Marshal(domain.PlanningSnapshotRequest{Targets: targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "caller-defined-trace", Reason: "bounded caller trace", CorrelationID: "66666666-6666-4666-8666-666666666666"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	getter := &planningSnapshotUnitGetter{}
+	response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, string(body), "application/json; charset=utf-8")
+	if response.Code != http.StatusOK || getter.calls != 1 || len(getter.request.Targets) != 500 {
+		t.Fatalf("full existing target envelope rejected: status=%d reads=%d body=%s", response.Code, getter.calls, response.Body.String())
+	}
+	if getter.request.Targets[0].Version != "" {
+		t.Fatal("legacy target version was invented")
+	}
+	targets = append(targets, domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "over-limit"})
+	body, _ = json.Marshal(domain.PlanningSnapshotRequest{Targets: targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "trace", Reason: "read"}})
+	getter = &planningSnapshotUnitGetter{}
+	response = planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, string(body), "application/json")
+	if response.Code != http.StatusBadRequest || getter.calls != 0 {
+		t.Fatal("501 target request caused read")
+	}
+}
+
+func TestPlanningSnapshotHandlerIdentityAndSafeFailures(t *testing.T) {
+	for name, err := range map[string]error{"missing": domain.ErrNotFound, "conflict": domain.ErrConflict, "invalid": domain.ErrValidation, "storage": errors.New("PRIVATE_STORAGE_SECRET")} {
+		want := map[string]int{"missing": 404, "conflict": 409, "invalid": 422, "storage": 500}[name]
+		getter := &planningSnapshotUnitGetter{err: err}
+		response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, snapshotBody, "application/json")
+		if response.Code != want || strings.Contains(response.Body.String(), "PRIVATE_STORAGE_SECRET") {
+			t.Fatalf("wrong safe error: %d %s", response.Code, response.Body.String())
+		}
+	}
+	response := planningSnapshotRequest(planningSnapshotDirectRouter(nil), snapshotHTTPPath, snapshotBody, "application/json")
+	if response.Code != 503 {
+		t.Fatal("missing owner port must fail closed")
+	}
+	for _, path := range []string{strings.Replace(snapshotHTTPPath, snapshotStudentID, "invalid", 1), strings.Replace(snapshotHTTPPath, snapshotPathID, "00000000-0000-0000-0000-000000000000", 1)} {
+		getter := &planningSnapshotUnitGetter{}
+		response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), path, snapshotBody, "application/json")
+		if response.Code != 400 || getter.calls != 0 {
+			t.Fatal("invalid URL identity caused read")
+		}
+	}
+	for name, mutate := range map[string]func(*domain.StudentPlanningSnapshot){
+		"foreign learner":         func(s *domain.StudentPlanningSnapshot) { s.StudentID = "77777777-7777-4777-8777-777777777777" },
+		"foreign path":            func(s *domain.StudentPlanningSnapshot) { s.LearningPathID = "88888888-8888-4888-8888-888888888888" },
+		"tampered ref":            func(s *domain.StudentPlanningSnapshot) { s.References.SnapshotRef = strings.Repeat("b", 64) },
+		"different requested set": func(s *domain.StudentPlanningSnapshot) { s.RequestedTargets[0].Key = "go.http" },
+		"different trace":         func(s *domain.StudentPlanningSnapshot) { s.TriggerContext.Reason = "different caller" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			getter := &planningSnapshotUnitGetter{mutate: mutate}
+			response := planningSnapshotRequest(planningSnapshotDirectRouter(getter), snapshotHTTPPath, snapshotBody, "application/json")
+			if response.Code != 500 {
+				t.Fatalf("malformed owner result emitted: %d", response.Code)
+			}
+		})
+	}
+}

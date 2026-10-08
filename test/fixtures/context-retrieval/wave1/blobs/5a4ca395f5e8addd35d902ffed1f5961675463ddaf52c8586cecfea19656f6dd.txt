@@ -1,0 +1,203 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/middleware"
+	"github.com/example/mc-course-service/internal/transport/http/admin/v1/parsers"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	moduleuc "github.com/example/mc-course-service/internal/usecase/module"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+// ModuleHandler handles module endpoints.
+type ModuleHandler struct {
+	Validator *validator.Validate
+	CreateUC  moduleuc.CreateModule
+	UpdateUC  moduleuc.UpdateModule
+	DeleteUC  moduleuc.DeleteModule
+	GetUC     moduleuc.GetModule
+	ListUC    moduleuc.ListModules
+	Access    contentaccess.Service
+}
+
+type moduleTranslationRequest struct {
+	I18nID      int    `json:"i18n_id" validate:"required,min=1"`
+	Title       string `json:"title" validate:"required,max=255"`
+	Description string `json:"description" validate:"required"`
+}
+
+type moduleCreateRequest struct {
+	ID               string                     `json:"id" validate:"omitempty,uuid"`
+	SourceKey        string                     `json:"source_key" validate:"omitempty,max=255"`
+	TechID           *int                       `json:"tech_id" validate:"omitempty,min=1"`
+	Status           *int                       `json:"status" validate:"omitempty,oneof=0 1"`
+	Visibility       *int                       `json:"visibility" validate:"omitempty,oneof=1 2 3 4"`
+	LessonReadAccess *domain.LessonReadAccess   `json:"lesson_read_access" validate:"omitempty,oneof=guest student student_pro disabled"`
+	Translations     []moduleTranslationRequest `json:"translations" validate:"omitempty,dive"`
+}
+
+type moduleUpdateRequest struct {
+	TechID           *int                       `json:"tech_id" validate:"omitempty,min=1"`
+	Status           int                        `json:"status" validate:"oneof=0 1"`
+	Visibility       *int                       `json:"visibility" validate:"omitempty,oneof=1 2 3 4"`
+	LessonReadAccess optionalLessonReadAccess   `json:"lesson_read_access"`
+	Translations     []moduleTranslationRequest `json:"translations" validate:"omitempty,dive"`
+}
+
+func (h ModuleHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var req moduleCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	item, err := h.CreateUC.Handle(r.Context(), moduleuc.CreateModuleInput{
+		ID:               req.ID,
+		SourceKey:        req.SourceKey,
+		TechID:           req.TechID,
+		Status:           req.Status,
+		Visibility:       req.Visibility,
+		LessonReadAccess: req.LessonReadAccess,
+		Translations:     mapModuleTranslations(req.Translations),
+	})
+	if err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(item)
+}
+
+func (h ModuleHandler) Update(w http.ResponseWriter, r *http.Request) {
+	moduleID := chi.URLParam(r, "moduleID")
+	var req moduleUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.Validator.Struct(req); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	item, err := h.UpdateUC.Handle(r.Context(), moduleuc.UpdateModuleInput{
+		ID:                  moduleID,
+		TechID:              req.TechID,
+		Status:              req.Status,
+		Visibility:          req.Visibility,
+		LessonReadAccess:    req.LessonReadAccess.Value,
+		LessonReadAccessSet: req.LessonReadAccess.Set,
+		Translations:        mapModuleTranslations(req.Translations),
+	})
+	if err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(item)
+}
+
+func (h ModuleHandler) Get(w http.ResponseWriter, r *http.Request) {
+	moduleID := chi.URLParam(r, "moduleID")
+	item, translations, err := h.GetUC.Handle(r.Context(), moduleID)
+	if err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fields := queryfields.Parse("", queryfields.ModuleAllowedFields)
+	moduleResponse := buildModuleFields(*item, translations, fields, resolveLang(r.Header.Get("Accept-Language")))
+	_ = json.NewEncoder(w).Encode(map[string]any{"module": moduleResponse, "translations": moduleResponse["translations"]})
+}
+
+func (h ModuleHandler) List(w http.ResponseWriter, r *http.Request) {
+	filters, err := parsers.ParseModuleFilters(r, h.Validator)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	fields := queryfields.Parse(r.URL.Query().Get("fields"), queryfields.ModuleAllowedFields)
+	_, role, ok := middleware.UserFromContext(r.Context())
+	privileged := ok && isPositionPrivilegedRole(role)
+	if !privileged && filters.CourseID != "" {
+		if err := h.Access.RequireCourse(r.Context(), filters.CourseID); err != nil {
+			writeContentAccessError(w, err)
+			return
+		}
+	}
+	if filters.Scope == "all" && !privileged {
+		writeModuleError(w, domain.ErrValidation)
+		return
+	}
+	if (filters.Scope == "content" || filters.Scope == "course_only" || filters.Scope == "internal") && !privileged {
+		writeModuleError(w, domain.ErrValidation)
+		return
+	}
+	if filters.CourseID == "" && filters.Scope == "" && !privileged {
+		filters.Scope = "independent"
+	}
+	filters.ActiveOnly = !privileged
+	items, err := h.ListUC.Handle(r.Context(), moduleuc.ListModulesInput{
+		CourseID:   filters.CourseID,
+		Scope:      filters.Scope,
+		TechID:     filters.TechID,
+		ActiveOnly: filters.ActiveOnly,
+	})
+	if err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	response, err := h.mapModuleListResponse(r, items, fields)
+	if err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"modules": response})
+}
+
+func (h ModuleHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	moduleID := chi.URLParam(r, "moduleID")
+	if err := h.DeleteUC.Handle(r.Context(), moduleID); err != nil {
+		writeModuleError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func mapModuleTranslations(translations []moduleTranslationRequest) []domain.ModuleI18n {
+	result := make([]domain.ModuleI18n, 0, len(translations))
+	for _, translation := range translations {
+		result = append(result, domain.ModuleI18n{
+			I18nID:      translation.I18nID,
+			Title:       translation.Title,
+			Description: translation.Description,
+		})
+	}
+	return result
+}
+
+func writeModuleError(w http.ResponseWriter, err error) {
+	if err == domain.ErrNotFound {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, domain.ErrValidation) {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if err == domain.ErrConflict {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}

@@ -1,0 +1,396 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TaskRepoPG implements TaskRepository.
+type TaskRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+const taskDynamicJoins = `
+JOIN lesson l ON l.id = t.lesson_id
+LEFT JOIN compose_config tc ON tc.id = t.compose_config_id
+LEFT JOIN compose_config lc ON lc.id = l.compose_config_id
+LEFT JOIN LATERAL (
+    SELECT
+        ti.title,
+        ti.description
+    FROM task_i18n ti
+    JOIN i18n i ON i.id = ti.i18n_id
+    WHERE ti.task_id = t.id
+    ORDER BY CASE i.language
+        WHEN 'ru' THEN 0
+        WHEN 'en' THEN 1
+        ELSE 2
+    END, i.language
+    LIMIT 1
+) task_i18n_primary ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'task_id', ti.task_id,
+                'i18n_id', ti.i18n_id,
+                'lang', i.language,
+                'title', ti.title,
+                'description', ti.description
+            )
+            ORDER BY CASE i.language
+                WHEN 'ru' THEN 0
+                WHEN 'en' THEN 1
+                ELSE 2
+            END, i.language
+        ),
+        '[]'::jsonb
+    ) AS translations
+    FROM task_i18n ti
+    JOIN i18n i ON i.id = ti.i18n_id
+    WHERE ti.task_id = t.id
+) task_i18n ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'task_id', tlt.task_id,
+                'type', tlt.target_type,
+                'key', tlt.target_key,
+                'version', tlt.target_version,
+                'order', tlt."order"
+            )
+            ORDER BY tlt."order", tlt.target_type, tlt.target_key, tlt.target_version
+        ),
+        '[]'::jsonb
+    ) AS targets
+    FROM task_learning_target tlt
+    WHERE tlt.task_id = t.id
+) task_learning_targets ON TRUE
+`
+
+// Create inserts task.
+func (r TaskRepoPG) Create(ctx context.Context, task domain.Task) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO task (id, source_key, lesson_id, code_structure_type_id, code_structure, compose_config_id, "type", assessment_purpose, execution_mode, evaluation_mode, ui_mode, submission_mode, requires_sandbox, exposes_preview, exposes_terminal, supports_live_validation, allowed_errors_count, "order", status, version, created_at, updated_at, max_attempts) VALUES ($1,NULLIF($2,''),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		task.ID, task.SourceKey, task.LessonID, task.CodeStructureTypeID, task.CodeStructure, task.ComposeConfigID, task.Type, domain.AssessmentPurposeValue(task.AssessmentPurpose), task.ExecutionMode, task.EvaluationMode, task.UIMode, task.SubmissionMode, task.RequiresSandbox, task.ExposesPreview, task.ExposesTerminal, task.SupportsLiveValidation, task.AllowedErrorsCount, task.Order, task.Status, task.Version, task.CreatedAt, task.UpdatedAt, task.MaxAttempts)
+	return mapPgError(err)
+}
+
+// Update modifies task.
+func (r TaskRepoPG) Update(ctx context.Context, task domain.Task) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `UPDATE task SET code_structure_type_id=$1, code_structure=$2, compose_config_id=$3, "type"=$4, assessment_purpose=$5, execution_mode=$6, evaluation_mode=$7, ui_mode=$8, submission_mode=$9, requires_sandbox=$10, exposes_preview=$11, exposes_terminal=$12, supports_live_validation=$13, allowed_errors_count=$14, "order"=$15, status=$16, updated_at=$17, max_attempts=$18 WHERE id=$19`,
+		task.CodeStructureTypeID, task.CodeStructure, task.ComposeConfigID, task.Type, domain.AssessmentPurposeValue(task.AssessmentPurpose), task.ExecutionMode, task.EvaluationMode, task.UIMode, task.SubmissionMode, task.RequiresSandbox, task.ExposesPreview, task.ExposesTerminal, task.SupportsLiveValidation, task.AllowedErrorsCount, task.Order, task.Status, task.UpdatedAt, task.MaxAttempts, task.ID)
+	return mapPgError(err)
+}
+
+// Get finds task by id.
+func (r TaskRepoPG) Get(ctx context.Context, id string) (*domain.Task, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `
+SELECT
+    t.id,
+    COALESCE(t.source_key, ''),
+    t.lesson_id,
+    COALESCE(task_i18n_primary.title, '') AS title,
+    COALESCE(task_i18n_primary.description, '') AS description,
+    t.code_structure_type_id,
+    t.code_structure,
+    t.compose_config_id,
+    tc.config AS compose_config,
+    COALESCE(tc.config, lc.config) AS resolved_compose_config,
+    t."type",
+    t.execution_mode,
+    t.evaluation_mode,
+    t.ui_mode,
+    t.submission_mode,
+    t.requires_sandbox,
+    t.exposes_preview,
+    t.exposes_terminal,
+    t.supports_live_validation,
+    t.allowed_errors_count,
+    COALESCE(task_i18n.translations, '[]'::jsonb) AS translations,
+    COALESCE(task_learning_targets.targets, '[]'::jsonb) AS learning_targets,
+    t."order",
+    t.status,
+    t.version,
+    t.created_at,
+    t.updated_at,
+    t.max_attempts,
+	 t.deadline_at,
+	 COALESCE(t.assessment_purpose, 'knowledge_check')
+FROM task t
+`+taskDynamicJoins+`
+WHERE t.id=$1
+`, id)
+	var t domain.Task
+	var translationsRaw, learningTargetsRaw []byte
+	if err := row.Scan(&t.ID, &t.SourceKey, &t.LessonID, &t.Title, &t.Description, &t.CodeStructureTypeID, &t.CodeStructure, &t.ComposeConfigID, &t.ComposeConfig, &t.ResolvedComposeConfig, &t.Type, &t.ExecutionMode, &t.EvaluationMode, &t.UIMode, &t.SubmissionMode, &t.RequiresSandbox, &t.ExposesPreview, &t.ExposesTerminal, &t.SupportsLiveValidation, &t.AllowedErrorsCount, &translationsRaw, &learningTargetsRaw, &t.Order, &t.Status, &t.Version, &t.CreatedAt, &t.UpdatedAt, &t.MaxAttempts, &t.DeadlineAt, &t.AssessmentPurpose); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	t.Translations = parseTaskTranslations(translationsRaw)
+	learningTargets, parseErr := parseTaskLearningTargets(learningTargetsRaw)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	t.LearningTargets = learningTargets
+	return &t, nil
+}
+
+// ListByLesson returns tasks.
+func (r TaskRepoPG) ListByLesson(ctx context.Context, lessonID string) ([]domain.Task, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT
+    t.id,
+    COALESCE(t.source_key, ''),
+    t.lesson_id,
+    COALESCE(task_i18n_primary.title, '') AS title,
+    COALESCE(task_i18n_primary.description, '') AS description,
+    t.code_structure_type_id,
+    t.code_structure,
+    t.compose_config_id,
+    tc.config AS compose_config,
+    COALESCE(tc.config, lc.config) AS resolved_compose_config,
+    t."type",
+    t.execution_mode,
+    t.evaluation_mode,
+    t.ui_mode,
+    t.submission_mode,
+    t.requires_sandbox,
+    t.exposes_preview,
+    t.exposes_terminal,
+    t.supports_live_validation,
+    t.allowed_errors_count,
+    COALESCE(task_i18n.translations, '[]'::jsonb) AS translations,
+    COALESCE(task_learning_targets.targets, '[]'::jsonb) AS learning_targets,
+    t."order",
+    t.status,
+    t.version,
+    t.created_at,
+    t.updated_at,
+    t.max_attempts,
+	 t.deadline_at,
+	 COALESCE(t.assessment_purpose, 'knowledge_check')
+FROM task t
+`+taskDynamicJoins+`
+WHERE t.lesson_id=$1
+ORDER BY t."order" ASC, t.id ASC
+`, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []domain.Task
+	for rows.Next() {
+		var t domain.Task
+		var translationsRaw, learningTargetsRaw []byte
+		if err := rows.Scan(&t.ID, &t.SourceKey, &t.LessonID, &t.Title, &t.Description, &t.CodeStructureTypeID, &t.CodeStructure, &t.ComposeConfigID, &t.ComposeConfig, &t.ResolvedComposeConfig, &t.Type, &t.ExecutionMode, &t.EvaluationMode, &t.UIMode, &t.SubmissionMode, &t.RequiresSandbox, &t.ExposesPreview, &t.ExposesTerminal, &t.SupportsLiveValidation, &t.AllowedErrorsCount, &translationsRaw, &learningTargetsRaw, &t.Order, &t.Status, &t.Version, &t.CreatedAt, &t.UpdatedAt, &t.MaxAttempts, &t.DeadlineAt, &t.AssessmentPurpose); err != nil {
+			return nil, err
+		}
+		t.Translations = parseTaskTranslations(translationsRaw)
+		learningTargets, parseErr := parseTaskLearningTargets(learningTargetsRaw)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		t.LearningTargets = learningTargets
+		res = append(res, t)
+	}
+	// The fixture reads every task's assessment graph on this transaction after
+	// the list returns, so release this cursor before the next repository call.
+	rows.Close()
+	return res, rows.Err()
+}
+
+// Delete removes task by id.
+func (r TaskRepoPG) Delete(ctx context.Context, taskID string) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `DELETE FROM task WHERE id=$1`, taskID)
+	return err
+}
+
+// GetWithFields returns task with selected fields.
+func (r TaskRepoPG) GetWithFields(ctx context.Context, id string, f queryfields.Set) (map[string]any, error) {
+	selectCols := selectColumns(f, taskFieldSQL)
+	if selectCols == "" {
+		selectCols = r.defaultTaskColumns()
+	}
+
+	query := fmt.Sprintf(`
+SELECT %s
+FROM task t
+%s
+WHERE t.id=$1
+`, selectCols, taskDynamicJoins)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, domain.ErrNotFound
+	}
+
+	return ScanRowToMap(rows)
+}
+
+// ListByLessonFields returns tasks with selected fields.
+func (r TaskRepoPG) ListByLessonFields(ctx context.Context, lessonID string, f queryfields.Set, taskFilters filters.TaskFilters, sort *filters.SortOptions) ([]map[string]any, int, error) {
+	query, args := r.buildListQuery(lessonID, f, taskFilters, sort)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var res []map[string]any
+	for rows.Next() {
+		row, err := ScanRowToMap(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		res = append(res, row)
+	}
+
+	total, err := r.countListTotal(ctx, lessonID, taskFilters)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return res, total, nil
+}
+
+func (r TaskRepoPG) countListTotal(ctx context.Context, lessonID string, taskFilters filters.TaskFilters) (int, error) {
+	query, args, _ := r.buildListBaseQuery(lessonID, "COUNT(*)", taskFilters)
+	var total int
+	runner := getRunner(ctx, r.Pool)
+	if err := runner.QueryRow(ctx, query, args...).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (r TaskRepoPG) buildListQuery(lessonID string, f queryfields.Set, taskFilters filters.TaskFilters, sort *filters.SortOptions) (string, []interface{}) {
+	selectCols := r.selectTaskColumns(f)
+	query, args, argIdx := r.buildListBaseQuery(lessonID, selectCols, taskFilters)
+
+	orderBy := `t."order" ASC`
+	if sort != nil {
+		switch sort.Field {
+		case filters.SortFieldCreatedAt:
+			orderBy = fmt.Sprintf("t.created_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldUpdatedAt:
+			orderBy = fmt.Sprintf("t.updated_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldTitle:
+			orderBy = fmt.Sprintf("COALESCE(task_i18n_primary.title, '') %s", strings.ToUpper(string(sort.Order)))
+		}
+	}
+	query += " ORDER BY " + orderBy
+
+	_, limit, offset := filters.NormalizePagination(taskFilters.Page, taskFilters.Limit)
+	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	return query, args
+}
+
+func (r TaskRepoPG) buildListBaseQuery(lessonID string, selectCols string, taskFilters filters.TaskFilters) (string, []interface{}, int) {
+	var args []interface{}
+	argIdx := 1
+
+	if selectCols == "" {
+		selectCols = r.selectTaskColumns(queryfields.Set{})
+	}
+
+	query := fmt.Sprintf(`
+SELECT %s
+FROM task t
+%s
+WHERE t.lesson_id = $%d`, selectCols, taskDynamicJoins, argIdx)
+	args = append(args, lessonID)
+	argIdx++
+
+	var whereConditions []string
+	if taskFilters.ID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("t.id = $%d", argIdx))
+		args = append(args, *taskFilters.ID)
+		argIdx++
+	}
+	if taskFilters.LessonID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("t.lesson_id = $%d", argIdx))
+		args = append(args, *taskFilters.LessonID)
+		argIdx++
+	}
+	if taskFilters.Title != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("EXISTS (SELECT 1 FROM task_i18n ti WHERE ti.task_id = t.id AND ti.title ILIKE $%d)", argIdx))
+		args = append(args, "%"+*taskFilters.Title+"%")
+		argIdx++
+	}
+	if taskFilters.Status != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("t.status = $%d", argIdx))
+		args = append(args, *taskFilters.Status)
+		argIdx++
+	}
+
+	if len(whereConditions) > 0 {
+		query += " AND " + strings.Join(whereConditions, " AND ")
+	}
+
+	return query, args, argIdx
+}
+
+func (r TaskRepoPG) selectTaskColumns(f queryfields.Set) string {
+	selectCols := selectColumns(f, taskFieldSQL)
+	if selectCols == "" {
+		selectCols = r.defaultTaskColumns()
+	}
+	return selectCols
+}
+
+func (r TaskRepoPG) defaultTaskColumns() string {
+	return `t.id, t.lesson_id, COALESCE(task_i18n_primary.title, '') AS title, COALESCE(task_i18n_primary.description, '') AS description, COALESCE(task_i18n.translations, '[]'::jsonb) AS translations, t.code_structure_type_id, t.code_structure, COALESCE(tc.config, lc.config) AS compose_config, t."type" AS type, COALESCE(t.assessment_purpose, 'knowledge_check') AS assessment_purpose, t.execution_mode, t.evaluation_mode, t.ui_mode, t.submission_mode, t.requires_sandbox, t.exposes_preview, t.exposes_terminal, t.supports_live_validation, t.allowed_errors_count, t."order", t.status, t.version, t.created_at, t.updated_at, t.max_attempts, t.deadline_at`
+}
+
+func parseTaskTranslations(raw []byte) []domain.TaskI18n {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var translations []domain.TaskI18n
+	if err := json.Unmarshal(raw, &translations); err != nil {
+		return nil
+	}
+	return translations
+}
+
+func parseTaskLearningTargets(raw []byte) ([]domain.TaskLearningTarget, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	var targets []domain.TaskLearningTarget
+	if err := json.Unmarshal(raw, &targets); err != nil {
+		return nil, err
+	}
+	return domain.NormalizeTaskLearningTargets(targets)
+}
+
+var _ repository.TaskRepository = (*TaskRepoPG)(nil)

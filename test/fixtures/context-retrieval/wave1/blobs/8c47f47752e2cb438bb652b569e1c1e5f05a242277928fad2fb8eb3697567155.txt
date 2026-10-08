@@ -1,0 +1,1355 @@
+package domain
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+const (
+	TeacherOnboardingEnsureSchema       = "teacher-onboarding-ensure.v1"
+	TeacherOnboardingSessionSchema      = "teacher-onboarding-session.v1"
+	TeacherOnboardingSessionV2Schema    = "teacher-onboarding-session.v2"
+	TeacherOnboardingSessionV3Schema    = "teacher-onboarding-session.v3"
+	TeacherOnboardingPromptPolicyV1     = 1
+	TeacherOnboardingPromptPolicyV2     = 2
+	AssistantUIActionSchema             = "assistant-ui-action.v1"
+	AssistantUIActionResultSchema       = "assistant-ui-action-result.v1"
+	AssistantUIActionResultV2Schema     = "assistant-ui-action-result.v2"
+	AssistantUIEnvelopeSchema           = "assistant-ui.v1"
+	DialogAssistantUISourceSchema       = "dialog-assistant-ui-source.v1"
+	StudentOnboardingDraftSchema        = "student-onboarding-draft.v1"
+	StudentOnboardingFinalizeSchema     = "student-onboarding-finalize.v1"
+	StudentOnboardingFinalizeResult     = "student-onboarding-finalize-result.v1"
+	TeacherStudentOnboardingStateSchema = "teacher-student-onboarding-state.v1"
+)
+
+var (
+	ErrInvalidTeacherOnboarding                      = errors.New("invalid teacher onboarding")
+	ErrTeacherOnboardingConflict                     = errors.New("teacher onboarding conflict")
+	ErrTeacherOnboardingBusy                         = errors.New("teacher onboarding action is in progress")
+	ErrTeacherOnboardingUnavailable                  = errors.New("teacher onboarding unavailable")
+	ErrTeacherOnboardingHistoricalSessionUnavailable = errors.New("historical_session_unavailable")
+	ErrTeacherOnboardingTurnUnknown                  = errors.New("teacher onboarding turn unknown")
+)
+
+type StudentOnboardingDraftStatus string
+
+const (
+	StudentOnboardingDraftDraft     StudentOnboardingDraftStatus = "DRAFT"
+	StudentOnboardingDraftCompleted StudentOnboardingDraftStatus = "COMPLETED"
+)
+
+type StudentOnboardingAnswers struct {
+	DirectionCode          *string   `json:"direction_code"`
+	SelfAssessedExperience *string   `json:"self_assessed_experience"`
+	KnownStacks            *[]string `json:"known_stacks"`
+	DesiredStacks          *[]string `json:"desired_stacks"`
+	GoalCode               *string   `json:"goal_code"`
+	GoalText               *string   `json:"goal_text"`
+	PreferredLanguage      *string   `json:"preferred_language"`
+	WeeklyMinutes          *int      `json:"weekly_minutes"`
+	PreferredPace          *string   `json:"preferred_pace"`
+}
+
+type StudentOnboardingDraft struct {
+	Schema    string                       `json:"schema"`
+	StudentID string                       `json:"student_id"`
+	Status    StudentOnboardingDraftStatus `json:"status"`
+	StudentOnboardingAnswers
+	Version                 int64      `json:"version"`
+	CompletedProfileVersion *int64     `json:"completed_profile_version,omitempty"`
+	CreatedAt               *time.Time `json:"created_at,omitempty"`
+	UpdatedAt               *time.Time `json:"updated_at,omitempty"`
+	CompletedAt             *time.Time `json:"completed_at,omitempty"`
+}
+
+type TeacherStudentOnboardingState struct {
+	Schema         string                 `json:"schema"`
+	Draft          StudentOnboardingDraft `json:"draft"`
+	ProfileVersion int64                  `json:"profile_version"`
+}
+
+type StudentOnboardingProfile struct {
+	StudentID              string    `json:"student_id"`
+	DirectionCode          string    `json:"direction_code"`
+	SelfAssessedExperience string    `json:"self_assessed_experience"`
+	KnownStacks            []string  `json:"known_stacks"`
+	DesiredStacks          []string  `json:"desired_stacks"`
+	GoalCode               string    `json:"goal_code"`
+	GoalText               string    `json:"goal_text,omitempty"`
+	PreferredLanguage      string    `json:"preferred_language"`
+	WeeklyMinutes          int       `json:"weekly_minutes"`
+	PreferredPace          string    `json:"preferred_pace"`
+	ProfileVersion         string    `json:"profile_version"`
+	Version                int64     `json:"version"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+type StudentOnboardingFinalizeResponse struct {
+	Schema  string                   `json:"schema"`
+	Draft   StudentOnboardingDraft   `json:"draft"`
+	Profile StudentOnboardingProfile `json:"profile"`
+}
+
+func NormalizeTeacherStudentOnboardingState(input TeacherStudentOnboardingState, studentID string) (TeacherStudentOnboardingState, error) {
+	studentID = strings.TrimSpace(studentID)
+	if input.Schema != TeacherStudentOnboardingStateSchema || !validUUID(studentID) || input.ProfileVersion < 0 {
+		return TeacherStudentOnboardingState{}, ErrInvalidTeacherOnboarding
+	}
+	draft, err := normalizeStudentOnboardingDraft(input.Draft, studentID)
+	if err != nil || (draft.Status == StudentOnboardingDraftCompleted &&
+		(draft.CompletedProfileVersion == nil || input.ProfileVersion < *draft.CompletedProfileVersion)) {
+		return TeacherStudentOnboardingState{}, ErrInvalidTeacherOnboarding
+	}
+	input.Draft = draft
+	return input, nil
+}
+
+func normalizeStudentOnboardingDraft(input StudentOnboardingDraft, studentID string) (StudentOnboardingDraft, error) {
+	if input.Schema != StudentOnboardingDraftSchema || input.StudentID != studentID || input.Version < 0 {
+		return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+	}
+	input.CreatedAt = onboardingUTC(input.CreatedAt)
+	input.UpdatedAt = onboardingUTC(input.UpdatedAt)
+	input.CompletedAt = onboardingUTC(input.CompletedAt)
+	if input.Version == 0 {
+		if input.Status != StudentOnboardingDraftDraft || hasOnboardingAnswers(input.StudentOnboardingAnswers) ||
+			input.CreatedAt != nil || input.UpdatedAt != nil || input.CompletedAt != nil || input.CompletedProfileVersion != nil {
+			return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+		}
+		return input, nil
+	}
+	if input.CreatedAt == nil || input.UpdatedAt == nil || input.CreatedAt.IsZero() || input.UpdatedAt.Before(*input.CreatedAt) {
+		return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+	}
+	switch input.Status {
+	case StudentOnboardingDraftDraft:
+		if input.CompletedAt != nil || input.CompletedProfileVersion != nil {
+			return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+		}
+	case StudentOnboardingDraftCompleted:
+		if hasOnboardingAnswers(input.StudentOnboardingAnswers) || input.CompletedAt == nil ||
+			input.CompletedProfileVersion == nil || *input.CompletedProfileVersion < 1 || input.CompletedAt.Before(*input.CreatedAt) || input.CompletedAt.After(*input.UpdatedAt) {
+			return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return StudentOnboardingDraft{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+
+func onboardingUTC(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	result := value.UTC()
+	return &result
+}
+
+func hasOnboardingAnswers(input StudentOnboardingAnswers) bool {
+	return input.DirectionCode != nil || input.SelfAssessedExperience != nil || input.KnownStacks != nil ||
+		input.DesiredStacks != nil || input.GoalCode != nil || input.GoalText != nil ||
+		input.PreferredLanguage != nil || input.WeeklyMinutes != nil || input.PreferredPace != nil
+}
+
+type TeacherOnboardingStep string
+
+const (
+	OnboardingStepDirection     TeacherOnboardingStep = "direction"
+	OnboardingStepExperience    TeacherOnboardingStep = "experience"
+	OnboardingStepKnownStack    TeacherOnboardingStep = "known_stack"
+	OnboardingStepDesiredStack  TeacherOnboardingStep = "desired_stack"
+	OnboardingStepGoal          TeacherOnboardingStep = "goal"
+	OnboardingStepLanguage      TeacherOnboardingStep = "language"
+	OnboardingStepWeeklyMinutes TeacherOnboardingStep = "weekly_minutes"
+	OnboardingStepPace          TeacherOnboardingStep = "pace"
+	OnboardingStepConfirmation  TeacherOnboardingStep = "confirmation"
+	OnboardingStepComplete      TeacherOnboardingStep = "complete"
+)
+
+type onboardingChoice struct {
+	ActionID, Value, LabelRU, LabelEN string
+	Minutes                           int
+}
+
+var onboardingChoices = map[TeacherOnboardingStep][]onboardingChoice{
+	OnboardingStepDirection: {
+		{"direction.backend", "backend", "Backend", "Backend", 0}, {"direction.frontend", "frontend", "Frontend", "Frontend", 0},
+		{"direction.fullstack", "fullstack", "Fullstack", "Full stack", 0}, {"direction.data", "data", "Данные", "Data", 0},
+	},
+	OnboardingStepExperience: {
+		{"experience.new", "new", "Начинаю с нуля", "Starting from scratch", 0}, {"experience.basic", "basic", "Знаю основы", "Know the basics", 0},
+		{"experience.intermediate", "intermediate", "Есть практика", "Have practical experience", 0}, {"experience.advanced", "advanced", "Опытный", "Advanced", 0},
+	},
+	OnboardingStepKnownStack: {
+		{"known.none", "", "Пока нет", "None yet", 0}, {"known.go", "go", "Go", "Go", 0},
+		{"known.javascript", "javascript", "JavaScript", "JavaScript", 0}, {"known.typescript", "typescript", "TypeScript", "TypeScript", 0},
+		{"known.python", "python", "Python", "Python", 0}, {"known.java", "java", "Java", "Java", 0},
+	},
+	OnboardingStepDesiredStack: {
+		{"desired.go", "go", "Go", "Go", 0}, {"desired.javascript", "javascript", "JavaScript", "JavaScript", 0},
+		{"desired.typescript", "typescript", "TypeScript", "TypeScript", 0}, {"desired.python", "python", "Python", "Python", 0},
+		{"desired.java", "java", "Java", "Java", 0},
+	},
+	OnboardingStepGoal: {
+		{"goal.get_started", "get-started", "Освоить основы", "Learn the fundamentals", 0}, {"goal.first_job", "first-job", "Подготовиться к первой работе", "Prepare for a first job", 0},
+		{"goal.switch_career", "switch-career", "Сменить профессию", "Switch careers", 0}, {"goal.build_project", "build-project", "Создать проект", "Build a project", 0},
+	},
+	OnboardingStepLanguage: {
+		{"language.ru", "ru", "Русский", "Russian", 0}, {"language.en", "en", "Английский", "English", 0},
+	},
+	OnboardingStepWeeklyMinutes: {
+		{"weekly.120", "", "2 часа в неделю", "2 hours per week", 120}, {"weekly.300", "", "5 часов в неделю", "5 hours per week", 300},
+		{"weekly.600", "", "10 часов в неделю", "10 hours per week", 600},
+	},
+	OnboardingStepPace: {
+		{"pace.gentle", "gentle", "Спокойный", "Gentle", 0}, {"pace.balanced", "balanced", "Сбалансированный", "Balanced", 0},
+		{"pace.intensive", "intensive", "Интенсивный", "Intensive", 0},
+	},
+	OnboardingStepConfirmation: {{"confirmation.confirm", "confirm", "Подтвердить", "Confirm", 0}},
+}
+
+// productAwareOnboardingChoices is immutable prompt policy v2. It does not
+// modify v1 replay values. Optional planning inputs (known stacks, weekly
+// minutes, pace and interests) are intentionally absent; desired stack is
+// exposed only for the currently supported Go backend specialization.
+var productAwareOnboardingChoices = map[TeacherOnboardingStep][]onboardingChoice{
+	OnboardingStepGoal: {
+		{"goal.learn_programming", "learn_programming", "Научиться программировать", "Learn programming", 0},
+	},
+	OnboardingStepExperience: {
+		{"experience.beginner", "beginner", "Начинаю с нуля", "Starting from scratch", 0},
+		{"experience.basic", "basic", "Знаю основы", "Know the basics", 0},
+		{"experience.intermediate", "intermediate", "Есть практика", "Have practical experience", 0},
+		{"experience.advanced", "advanced", "Опытный", "Advanced", 0},
+	},
+	OnboardingStepDirection: {
+		{"direction.undecided", "undecided", "Не знаю", "Not sure yet", 0},
+		{"direction.backend", "backend", "Backend", "Backend", 0},
+		{"direction.frontend", "frontend", "Frontend", "Frontend", 0},
+		{"direction.fullstack", "fullstack", "Fullstack", "Full stack", 0},
+		{"direction.data", "data", "Данные", "Data", 0},
+	},
+	OnboardingStepDesiredStack: {
+		{"desired.go", "go", "Go для backend", "Go for backend", 0},
+	},
+	OnboardingStepLanguage: {
+		{"language.ru", "ru", "Русский", "Russian", 0},
+		{"language.en", "en", "Английский", "English", 0},
+	},
+	OnboardingStepConfirmation: onboardingChoices[OnboardingStepConfirmation],
+}
+
+func NextTeacherOnboardingStep(draft StudentOnboardingDraft) (TeacherOnboardingStep, error) {
+	if draft.Status == StudentOnboardingDraftCompleted {
+		return OnboardingStepComplete, nil
+	}
+	if draft.Status != StudentOnboardingDraftDraft {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	for _, step := range []TeacherOnboardingStep{OnboardingStepDirection, OnboardingStepExperience, OnboardingStepKnownStack, OnboardingStepDesiredStack, OnboardingStepGoal, OnboardingStepLanguage, OnboardingStepWeeklyMinutes, OnboardingStepPace} {
+		if draftAnswerPresent(draft, step) && !draftAnswerAllowed(draft, step) {
+			return "", ErrInvalidTeacherOnboarding
+		}
+	}
+	checks := []struct {
+		step     TeacherOnboardingStep
+		answered bool
+	}{
+		{OnboardingStepDirection, draft.DirectionCode != nil}, {OnboardingStepExperience, draft.SelfAssessedExperience != nil},
+		{OnboardingStepKnownStack, draft.KnownStacks != nil}, {OnboardingStepDesiredStack, draft.DesiredStacks != nil},
+		{OnboardingStepGoal, draft.GoalCode != nil}, {OnboardingStepLanguage, draft.PreferredLanguage != nil},
+		{OnboardingStepWeeklyMinutes, draft.WeeklyMinutes != nil}, {OnboardingStepPace, draft.PreferredPace != nil},
+	}
+	for _, check := range checks {
+		if !check.answered {
+			return check.step, validateAnsweredOnboarding(draft, check.step)
+		}
+	}
+	if err := validateAnsweredOnboarding(draft, OnboardingStepConfirmation); err != nil {
+		return "", err
+	}
+	return OnboardingStepConfirmation, nil
+}
+
+func draftAnswerPresent(draft StudentOnboardingDraft, step TeacherOnboardingStep) bool {
+	switch step {
+	case OnboardingStepDirection:
+		return draft.DirectionCode != nil
+	case OnboardingStepExperience:
+		return draft.SelfAssessedExperience != nil
+	case OnboardingStepKnownStack:
+		return draft.KnownStacks != nil
+	case OnboardingStepDesiredStack:
+		return draft.DesiredStacks != nil
+	case OnboardingStepGoal:
+		return draft.GoalCode != nil
+	case OnboardingStepLanguage:
+		return draft.PreferredLanguage != nil
+	case OnboardingStepWeeklyMinutes:
+		return draft.WeeklyMinutes != nil
+	case OnboardingStepPace:
+		return draft.PreferredPace != nil
+	default:
+		return false
+	}
+}
+
+func validateAnsweredOnboarding(draft StudentOnboardingDraft, until TeacherOnboardingStep) error {
+	order := []TeacherOnboardingStep{OnboardingStepDirection, OnboardingStepExperience, OnboardingStepKnownStack, OnboardingStepDesiredStack, OnboardingStepGoal, OnboardingStepLanguage, OnboardingStepWeeklyMinutes, OnboardingStepPace}
+	for _, step := range order {
+		if step == until {
+			return nil
+		}
+		if !draftAnswerAllowed(draft, step) {
+			return ErrInvalidTeacherOnboarding
+		}
+	}
+	return nil
+}
+
+func draftAnswerAllowed(draft StudentOnboardingDraft, step TeacherOnboardingStep) bool {
+	var value string
+	switch step {
+	case OnboardingStepDirection:
+		if draft.DirectionCode == nil {
+			return false
+		}
+		value = *draft.DirectionCode
+	case OnboardingStepExperience:
+		if draft.SelfAssessedExperience == nil {
+			return false
+		}
+		value = *draft.SelfAssessedExperience
+	case OnboardingStepKnownStack:
+		if draft.KnownStacks == nil || len(*draft.KnownStacks) > 1 {
+			return false
+		}
+		if len(*draft.KnownStacks) == 0 {
+			value = ""
+		} else {
+			value = (*draft.KnownStacks)[0]
+		}
+	case OnboardingStepDesiredStack:
+		if draft.DesiredStacks == nil || len(*draft.DesiredStacks) != 1 {
+			return false
+		}
+		value = (*draft.DesiredStacks)[0]
+	case OnboardingStepGoal:
+		if draft.GoalCode == nil {
+			return false
+		}
+		value = *draft.GoalCode
+	case OnboardingStepLanguage:
+		if draft.PreferredLanguage == nil {
+			return false
+		}
+		value = *draft.PreferredLanguage
+	case OnboardingStepWeeklyMinutes:
+		if draft.WeeklyMinutes == nil {
+			return false
+		}
+		for _, choice := range onboardingChoices[step] {
+			if choice.Minutes == *draft.WeeklyMinutes {
+				return true
+			}
+		}
+		return false
+	case OnboardingStepPace:
+		if draft.PreferredPace == nil {
+			return false
+		}
+		value = *draft.PreferredPace
+	}
+	for _, choice := range onboardingChoices[step] {
+		if choice.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+type AssistantUIOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+type AssistantUIChoiceData struct {
+	Prompt  string              `json:"prompt"`
+	Options []AssistantUIOption `json:"options"`
+}
+type AssistantUIConfirmationData struct {
+	Title       string            `json:"title"`
+	Description string            `json:"description,omitempty"`
+	Confirm     AssistantUIOption `json:"confirm"`
+}
+type AssistantUIBlock struct {
+	ID           string                       `json:"id"`
+	Version      int                          `json:"version"`
+	Type         string                       `json:"type"`
+	Choice       *AssistantUIChoiceData       `json:"-"`
+	Confirmation *AssistantUIConfirmationData `json:"-"`
+}
+
+func (block AssistantUIBlock) MarshalJSON() ([]byte, error) {
+	data := any(block.Choice)
+	if block.Type == "confirmation" {
+		data = block.Confirmation
+	}
+	return json.Marshal(struct {
+		ID      string `json:"id"`
+		Version int    `json:"version"`
+		Type    string `json:"type"`
+		Data    any    `json:"data"`
+	}{block.ID, block.Version, block.Type, data})
+}
+
+type AssistantUIEnvelope struct {
+	Schema string             `json:"schema"`
+	Blocks []AssistantUIBlock `json:"blocks"`
+}
+
+func OnboardingLocale(draft StudentOnboardingDraft) string {
+	if draft.PreferredLanguage != nil && *draft.PreferredLanguage == "en" {
+		return "en"
+	}
+	return "ru"
+}
+
+func BuildTeacherOnboardingPrompt(step TeacherOnboardingStep, locale string, draftVersions ...int64) (string, json.RawMessage, error) {
+	return buildTeacherOnboardingPrompt(step, locale, TeacherOnboardingPromptPolicyV1, draftVersions...)
+}
+
+func BuildProductAwareTeacherOnboardingPrompt(step TeacherOnboardingStep, locale string, draftVersions ...int64) (string, json.RawMessage, error) {
+	return buildTeacherOnboardingPrompt(step, locale, TeacherOnboardingPromptPolicyV2, draftVersions...)
+}
+
+func buildTeacherOnboardingPrompt(step TeacherOnboardingStep, locale string, policyVersion int, draftVersions ...int64) (string, json.RawMessage, error) {
+	if step == OnboardingStepComplete {
+		if policyVersion != TeacherOnboardingPromptPolicyV1 {
+			return "", nil, ErrInvalidTeacherOnboarding
+		}
+		return completionBody(locale), nil, nil
+	}
+	draftVersion := int64(0)
+	if len(draftVersions) > 1 || (len(draftVersions) == 1 && draftVersions[0] < 0) {
+		return "", nil, ErrInvalidTeacherOnboarding
+	}
+	if len(draftVersions) == 1 {
+		draftVersion = draftVersions[0]
+	}
+	choices, ok := onboardingChoicesForPolicy(step, policyVersion)
+	if !ok || len(choices) == 0 {
+		return "", nil, ErrInvalidTeacherOnboarding
+	}
+	promptRU := map[TeacherOnboardingStep]string{OnboardingStepDirection: "Какое направление вам интереснее?", OnboardingStepExperience: "Как вы оцениваете свой текущий опыт?", OnboardingStepKnownStack: "Какой основной стек вы уже знаете?", OnboardingStepDesiredStack: "Хотите изучать Go для backend?", OnboardingStepGoal: "Какова ваша главная цель?", OnboardingStepLanguage: "На каком языке вести обучение?", OnboardingStepWeeklyMinutes: "Сколько времени в неделю вы готовы заниматься?", OnboardingStepPace: "Какой темп вам подходит?", OnboardingStepConfirmation: "Подтвердите ответы"}
+	promptEN := map[TeacherOnboardingStep]string{OnboardingStepDirection: "Which direction interests you most?", OnboardingStepExperience: "How would you describe your current experience?", OnboardingStepKnownStack: "Which main stack do you already know?", OnboardingStepDesiredStack: "Would you like to learn Go for backend development?", OnboardingStepGoal: "What is your main goal?", OnboardingStepLanguage: "Which language should I use for the learning content?", OnboardingStepWeeklyMinutes: "How much time can you study each week?", OnboardingStepPace: "Which pace suits you?", OnboardingStepConfirmation: "Confirm your answers"}
+	prompt := promptRU[step]
+	if policyVersion == TeacherOnboardingPromptPolicyV2 && step == OnboardingStepLanguage {
+		prompt = "На каком языке показывать учебные материалы?"
+	}
+	if locale == "en" {
+		prompt = promptEN[step]
+	}
+	options := make([]AssistantUIOption, len(choices))
+	for index, choice := range choices {
+		label := choice.LabelRU
+		if locale == "en" {
+			label = choice.LabelEN
+		}
+		options[index] = AssistantUIOption{choice.ActionID, label}
+	}
+	block := AssistantUIBlock{ID: "onboarding." + string(step) + ".d" + strconv.FormatInt(draftVersion, 10) + ".v" + strconv.Itoa(policyVersion), Version: 1, Type: "choice", Choice: &AssistantUIChoiceData{Prompt: prompt, Options: options}}
+	if step == OnboardingStepConfirmation {
+		block.Type = "confirmation"
+		block.Choice = nil
+		block.Confirmation = &AssistantUIConfirmationData{Title: prompt, Description: confirmationDescription(locale), Confirm: options[0]}
+	}
+	payload, err := json.Marshal(AssistantUIEnvelope{Schema: AssistantUIEnvelopeSchema, Blocks: []AssistantUIBlock{block}})
+	if err != nil || len(payload) > 64<<10 {
+		return "", nil, ErrInvalidTeacherOnboarding
+	}
+	return prompt, payload, nil
+}
+
+func completionBody(locale string) string {
+	if locale == "en" {
+		return "Onboarding is complete. I’ll use these preferences to guide our work."
+	}
+	return "Онбординг завершён. Я буду учитывать эти предпочтения в нашей работе."
+}
+func confirmationDescription(locale string) string {
+	if locale == "en" {
+		return "Confirm and save this answer."
+	}
+	return "Подтвердить и сохранить этот ответ."
+}
+
+func ApplyTeacherOnboardingAction(draft StudentOnboardingDraft, step TeacherOnboardingStep, actionID string) (StudentOnboardingAnswers, bool, error) {
+	choice, ok := onboardingChoiceFor(step, actionID)
+	if !ok {
+		return StudentOnboardingAnswers{}, false, ErrTeacherOnboardingConflict
+	}
+	answers := cloneOnboardingAnswers(draft.StudentOnboardingAnswers)
+	switch step {
+	case OnboardingStepDirection:
+		answers.DirectionCode = stringPointer(choice.Value)
+	case OnboardingStepExperience:
+		answers.SelfAssessedExperience = stringPointer(choice.Value)
+	case OnboardingStepKnownStack:
+		values := []string{}
+		if choice.Value != "" {
+			values = []string{choice.Value}
+		}
+		answers.KnownStacks = &values
+	case OnboardingStepDesiredStack:
+		values := []string{choice.Value}
+		answers.DesiredStacks = &values
+	case OnboardingStepGoal:
+		answers.GoalCode = stringPointer(choice.Value)
+	case OnboardingStepLanguage:
+		answers.PreferredLanguage = stringPointer(choice.Value)
+	case OnboardingStepWeeklyMinutes:
+		value := choice.Minutes
+		answers.WeeklyMinutes = &value
+	case OnboardingStepPace:
+		answers.PreferredPace = stringPointer(choice.Value)
+	case OnboardingStepConfirmation:
+		return answers, true, nil
+	default:
+		return StudentOnboardingAnswers{}, false, ErrTeacherOnboardingConflict
+	}
+	return answers, false, nil
+}
+
+func onboardingChoiceFor(step TeacherOnboardingStep, actionID string) (onboardingChoice, bool) {
+	for _, choice := range onboardingChoices[step] {
+		if choice.ActionID == actionID {
+			return choice, true
+		}
+	}
+	return onboardingChoice{}, false
+}
+
+func onboardingChoicesForPolicy(step TeacherOnboardingStep, policyVersion int) ([]onboardingChoice, bool) {
+	var source map[TeacherOnboardingStep][]onboardingChoice
+	switch policyVersion {
+	case TeacherOnboardingPromptPolicyV1:
+		source = onboardingChoices
+	case TeacherOnboardingPromptPolicyV2:
+		source = productAwareOnboardingChoices
+	default:
+		return nil, false
+	}
+	choices, ok := source[step]
+	return choices, ok
+}
+
+func onboardingChoiceForPolicy(step TeacherOnboardingStep, actionID string, policyVersion int) (onboardingChoice, bool) {
+	choices, ok := onboardingChoicesForPolicy(step, policyVersion)
+	if !ok {
+		return onboardingChoice{}, false
+	}
+	for _, choice := range choices {
+		if choice.ActionID == actionID {
+			return choice, true
+		}
+	}
+	return onboardingChoice{}, false
+}
+
+func cloneOnboardingAnswers(input StudentOnboardingAnswers) StudentOnboardingAnswers {
+	result := input
+	if input.KnownStacks != nil {
+		values := append([]string{}, (*input.KnownStacks)...)
+		result.KnownStacks = &values
+	}
+	if input.DesiredStacks != nil {
+		values := append([]string{}, (*input.DesiredStacks)...)
+		result.DesiredStacks = &values
+	}
+	return result
+}
+func stringPointer(value string) *string { return &value }
+
+type DialogAssistantUISource struct {
+	Schema            string          `json:"schema"`
+	DialogID          string          `json:"dialog_id"`
+	StudentID         string          `json:"student_id"`
+	PersonalTeacherID string          `json:"personal_teacher_id"`
+	ContextType       string          `json:"context_type"`
+	ContextID         *string         `json:"context_id,omitempty"`
+	MessageID         string          `json:"message_id"`
+	MessageSequence   int64           `json:"message_sequence"`
+	MessageVersion    int             `json:"message_version"`
+	AssistantUI       json.RawMessage `json:"assistant_ui"`
+}
+
+func ValidateOnboardingAssistantUISource(source DialogAssistantUISource, binding TeacherDialogBinding, expectedMessageID string, expectedVersion int, step TeacherOnboardingStep, actionID, locale string, draftVersion int64) error {
+	policyVersion, err := TeacherOnboardingPromptPolicyVersion(source.AssistantUI)
+	if err != nil {
+		return ErrTeacherOnboardingConflict
+	}
+	if err := ValidateCurrentOnboardingAssistantUISource(source, binding, expectedMessageID, expectedVersion, step, locale, draftVersion); err != nil {
+		return err
+	}
+	if _, ok := onboardingChoiceForPolicy(step, actionID, policyVersion); !ok {
+		return ErrTeacherOnboardingConflict
+	}
+	return nil
+}
+
+// ValidateCurrentOnboardingAssistantUISource verifies that a persisted Dialog
+// message is the exact current deterministic prompt. Unlike action validation,
+// it deliberately does not require a selected option: Ensure only needs to
+// recover the current prompt identity, never resolve a browser action.
+func ValidateCurrentOnboardingAssistantUISource(source DialogAssistantUISource, binding TeacherDialogBinding, expectedMessageID string, expectedVersion int, step TeacherOnboardingStep, locale string, draftVersion int64) error {
+	if source.Schema != DialogAssistantUISourceSchema || source.DialogID != binding.ID || source.StudentID != binding.StudentID || source.PersonalTeacherID != binding.PersonalTeacherID ||
+		source.ContextType != "general_teacher" || source.ContextID != nil || source.MessageID != expectedMessageID || expectedVersion < 1 || source.MessageVersion != expectedVersion || source.MessageSequence < 1 {
+		return ErrTeacherOnboardingConflict
+	}
+	policyVersion, err := TeacherOnboardingPromptPolicyVersion(source.AssistantUI)
+	if err != nil {
+		return ErrTeacherOnboardingConflict
+	}
+	_, expected, err := buildTeacherOnboardingPrompt(step, locale, policyVersion, draftVersion)
+	if err != nil || len(expected) == 0 {
+		return ErrTeacherOnboardingConflict
+	}
+	if !equivalentStrictAssistantUI(expected, source.AssistantUI) {
+		return ErrTeacherOnboardingConflict
+	}
+	return nil
+}
+
+// CurrentOnboardingPromptCommandID is shared by Ensure and delivery after an
+// action. The identity is scoped to the exact Dialog and Student-owned state,
+// so a concurrent Ensure and action delivery resolve to the same Dialog append
+// rather than content-deduplicating unrelated messages.
+func CurrentOnboardingPromptCommandID(binding TeacherDialogBinding, draftVersion, profileVersion int64, step TeacherOnboardingStep, promptPolicyVersions ...int) (string, error) {
+	normalized, err := NewTeacherDialogBinding(binding)
+	policyVersion := TeacherOnboardingPromptPolicyV1
+	if len(promptPolicyVersions) > 1 || (len(promptPolicyVersions) == 1 && promptPolicyVersions[0] != TeacherOnboardingPromptPolicyV1 && promptPolicyVersions[0] != TeacherOnboardingPromptPolicyV2) {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	if len(promptPolicyVersions) == 1 {
+		policyVersion = promptPolicyVersions[0]
+	}
+	if err != nil || normalized.ContextType != LearningContextGeneral || draftVersion < 0 || profileVersion < 0 {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	if _, ok := onboardingChoicesForPolicy(step, policyVersion); !ok || step == OnboardingStepComplete {
+		return "", ErrInvalidTeacherOnboarding
+	}
+	if policyVersion == TeacherOnboardingPromptPolicyV2 {
+		return DeterministicOnboardingUUID("ensure-v2", normalized.ID, draftVersion, profileVersion, step), nil
+	}
+	return DeterministicOnboardingUUID("ensure", normalized.ID, draftVersion, profileVersion, step), nil
+}
+
+// TeacherOnboardingPromptPolicyVersion reads the immutable policy suffix from
+// one exact assistant-ui block. Assistant UI's own block version remains v1;
+// the onboarding policy version is carried only by the server-owned block ID.
+func TeacherOnboardingPromptPolicyVersion(raw json.RawMessage) (int, error) {
+	envelope, err := strictAssistantUI(raw)
+	if err != nil || len(envelope.Blocks) != 1 {
+		return 0, ErrInvalidTeacherOnboarding
+	}
+	_, policyVersion, _, ok := onboardingBlockIdentity(envelope.Blocks[0].ID)
+	if !ok {
+		return 0, ErrInvalidTeacherOnboarding
+	}
+	return policyVersion, nil
+}
+
+func TeacherOnboardingPromptStep(raw json.RawMessage) (TeacherOnboardingStep, int, error) {
+	envelope, err := strictAssistantUI(raw)
+	if err != nil || len(envelope.Blocks) != 1 {
+		return "", 0, ErrInvalidTeacherOnboarding
+	}
+	step, policyVersion, _, ok := onboardingBlockIdentity(envelope.Blocks[0].ID)
+	if !ok {
+		return "", 0, ErrInvalidTeacherOnboarding
+	}
+	return step, policyVersion, nil
+}
+
+func ResolveOnboardingAssistantUISourceLocale(source DialogAssistantUISource, binding TeacherDialogBinding, expectedMessageID string, expectedVersion int, step TeacherOnboardingStep, actionID string, draftVersion int64) (string, error) {
+	for _, locale := range []string{"ru", "en"} {
+		if ValidateOnboardingAssistantUISource(source, binding, expectedMessageID, expectedVersion, step, actionID, locale, draftVersion) == nil {
+			return locale, nil
+		}
+	}
+	return "", ErrTeacherOnboardingConflict
+}
+
+type strictAssistantUIEnvelope struct {
+	Schema string                   `json:"schema"`
+	Blocks []strictAssistantUIBlock `json:"blocks"`
+}
+type strictAssistantUIBlock struct {
+	ID      string          `json:"id"`
+	Version int             `json:"version"`
+	Type    string          `json:"type"`
+	Data    json.RawMessage `json:"data"`
+}
+type strictChoiceData struct {
+	Prompt  string              `json:"prompt"`
+	Options []AssistantUIOption `json:"options"`
+}
+type strictConfirmationData struct {
+	Title       string            `json:"title"`
+	Description string            `json:"description,omitempty"`
+	Confirm     AssistantUIOption `json:"confirm"`
+}
+
+func strictAssistantUI(raw json.RawMessage) (strictAssistantUIEnvelope, error) {
+	var envelope strictAssistantUIEnvelope
+	if len(raw) == 0 || len(raw) > 64<<10 || strictJSON(raw, &envelope) != nil || envelope.Schema != AssistantUIEnvelopeSchema || len(envelope.Blocks) != 1 {
+		return strictAssistantUIEnvelope{}, ErrInvalidTeacherOnboarding
+	}
+	block := envelope.Blocks[0]
+	if block.Version != 1 || block.ID == "" {
+		return strictAssistantUIEnvelope{}, ErrInvalidTeacherOnboarding
+	}
+	switch block.Type {
+	case "choice":
+		var data strictChoiceData
+		if strictJSON(block.Data, &data) != nil || data.Prompt == "" || len(data.Options) == 0 || len(data.Options) > 20 || !validAssistantOptions(data.Options) {
+			return strictAssistantUIEnvelope{}, ErrInvalidTeacherOnboarding
+		}
+	case "confirmation":
+		var data strictConfirmationData
+		if strictJSON(block.Data, &data) != nil || data.Title == "" || data.Confirm.ID == "" || data.Confirm.Label == "" {
+			return strictAssistantUIEnvelope{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return strictAssistantUIEnvelope{}, ErrInvalidTeacherOnboarding
+	}
+	return envelope, nil
+}
+
+func equivalentStrictAssistantUI(wantRaw, gotRaw json.RawMessage) bool {
+	if _, err := strictAssistantUI(wantRaw); err != nil {
+		return false
+	}
+	if _, err := strictAssistantUI(gotRaw); err != nil {
+		return false
+	}
+	var want, got any
+	if json.Unmarshal(wantRaw, &want) != nil || json.Unmarshal(gotRaw, &got) != nil {
+		return false
+	}
+	return reflect.DeepEqual(want, got)
+}
+
+func validAssistantOptions(options []AssistantUIOption) bool {
+	seen := map[string]struct{}{}
+	for _, option := range options {
+		if option.ID == "" || option.Label == "" {
+			return false
+		}
+		if _, ok := seen[option.ID]; ok {
+			return false
+		}
+		seen[option.ID] = struct{}{}
+	}
+	return true
+}
+func strictJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+type AssistantUIActionRequest struct {
+	Schema         string `json:"schema"`
+	DialogID       string `json:"dialog_id"`
+	MessageID      string `json:"message_id"`
+	MessageVersion int    `json:"message_version"`
+	BlockID        string `json:"block_id"`
+	ActionID       string `json:"action_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+func NormalizeAssistantUIActionRequest(input AssistantUIActionRequest) (AssistantUIActionRequest, error) {
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	input.MessageID = strings.TrimSpace(input.MessageID)
+	input.BlockID = strings.TrimSpace(input.BlockID)
+	input.ActionID = strings.TrimSpace(input.ActionID)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	if input.Schema != AssistantUIActionSchema || !validUUID(input.DialogID) || !validUUID(input.MessageID) || !validUUID(input.IdempotencyKey) || input.MessageVersion < 1 || !validOnboardingOpaqueID(input.BlockID) || !validOnboardingOpaqueID(input.ActionID) {
+		return AssistantUIActionRequest{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+func validOnboardingOpaqueID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' && r != ':' {
+			return false
+		}
+	}
+	return true
+}
+
+type TeacherOnboardingSession struct {
+	Schema         string                       `json:"schema"`
+	DialogID       string                       `json:"dialog_id"`
+	MessageID      *string                      `json:"message_id"`
+	MessageVersion *int                         `json:"message_version"`
+	Status         StudentOnboardingDraftStatus `json:"status"`
+	DraftVersion   int64                        `json:"draft_version"`
+	ProfileVersion int64                        `json:"profile_version"`
+	V2             *TeacherOnboardingSessionV2  `json:"-"`
+	V3             *TeacherOnboardingSessionV3  `json:"-"`
+}
+
+type TeacherOnboardingSessionV2Status string
+type TeacherOnboardingSessionV2Phase string
+
+type TeacherOnboardingSessionV3Status string
+
+type TeacherOnboardingPathOutcomeMarkerStatus string
+
+const (
+	TeacherOnboardingSessionV3Collecting       TeacherOnboardingSessionV3Status = "COLLECTING"
+	TeacherOnboardingSessionHandoffPending     TeacherOnboardingSessionV3Status = "HANDOFF_PENDING"
+	TeacherOnboardingSessionHandoffAccepted    TeacherOnboardingSessionV3Status = "PLANNER_HANDOFF_ACCEPTED"
+	TeacherOnboardingSessionV3ActivePathExists TeacherOnboardingSessionV3Status = "ACTIVE_PATH_EXISTS"
+)
+
+const (
+	TeacherOnboardingPathOutcomeMarkerKind = "ONBOARDING_PATH_OUTCOME"
+
+	TeacherOnboardingPathOutcomeMarkerReady        TeacherOnboardingPathOutcomeMarkerStatus = "PATH_READY"
+	TeacherOnboardingPathOutcomeMarkerActiveExists TeacherOnboardingPathOutcomeMarkerStatus = "ACTIVE_PATH_EXISTS"
+)
+
+const (
+	TeacherOnboardingSessionCollecting       TeacherOnboardingSessionV2Status = "COLLECTING"
+	TeacherOnboardingSessionPlanningReady    TeacherOnboardingSessionV2Status = "PLANNING_READY"
+	TeacherOnboardingSessionActivePathExists TeacherOnboardingSessionV2Status = "ACTIVE_PATH_EXISTS"
+
+	TeacherOnboardingPhaseGettingAcquainted TeacherOnboardingSessionV2Phase = "GETTING_ACQUAINTED"
+	TeacherOnboardingPhaseDeterminingStart  TeacherOnboardingSessionV2Phase = "DETERMINING_START"
+	TeacherOnboardingPhasePreparingPath     TeacherOnboardingSessionV2Phase = "PREPARING_PATH"
+	TeacherOnboardingPhaseReadyToStart      TeacherOnboardingSessionV2Phase = "READY_TO_START"
+)
+
+type TeacherOnboardingCurrentPrompt struct {
+	MessageID      string `json:"message_id"`
+	MessageVersion int    `json:"message_version"`
+}
+
+type TeacherOnboardingTerminal struct {
+	Kind        TeacherOnboardingSessionV2Status `json:"kind"`
+	DisplayName string                           `json:"display_name,omitempty"`
+}
+
+type TeacherOnboardingSessionV2 struct {
+	Schema        string                           `json:"schema"`
+	DialogID      string                           `json:"dialog_id"`
+	Status        TeacherOnboardingSessionV2Status `json:"status"`
+	Phase         TeacherOnboardingSessionV2Phase  `json:"phase"`
+	StateRef      TeacherStudentReadinessStateRef  `json:"state_ref"`
+	CurrentPrompt *TeacherOnboardingCurrentPrompt  `json:"current_prompt,omitempty"`
+	Terminal      *TeacherOnboardingTerminal       `json:"terminal,omitempty"`
+}
+
+type TeacherOnboardingTerminalV3 struct {
+	Kind            TeacherOnboardingSessionV3Status `json:"kind"`
+	DisplayName     string                           `json:"display_name,omitempty"`
+	ExecutionStatus string                           `json:"execution_status,omitempty"`
+	ContentStatus   string                           `json:"content_status,omitempty"`
+}
+
+type TeacherOnboardingSessionV3 struct {
+	Schema        string                              `json:"schema"`
+	DialogID      string                              `json:"dialog_id"`
+	Status        TeacherOnboardingSessionV3Status    `json:"status"`
+	Phase         TeacherOnboardingSessionV2Phase     `json:"phase"`
+	StateRef      TeacherStudentReadinessStateRef     `json:"state_ref"`
+	CurrentPrompt *TeacherOnboardingCurrentPrompt     `json:"current_prompt,omitempty"`
+	Terminal      *TeacherOnboardingTerminalV3        `json:"terminal,omitempty"`
+	PathOutcome   *TeacherOnboardingPathOutcomeMarker `json:"path_outcome,omitempty"`
+}
+
+// TeacherOnboardingPathOutcomeMarker is the only S9 delivery fact exposed to
+// the browser. It deliberately omits Planner, handoff, execution, course,
+// path, and lesson identities; Dialog message identity is the REST
+// reconciliation fence used by the frontend before any owner hydration.
+type TeacherOnboardingPathOutcomeMarker struct {
+	Kind            string                                   `json:"kind"`
+	Status          TeacherOnboardingPathOutcomeMarkerStatus `json:"status"`
+	DialogMessageID string                                   `json:"dialog_message_id"`
+}
+
+func NormalizeTeacherOnboardingPathOutcomeMarker(input TeacherOnboardingPathOutcomeMarker) (TeacherOnboardingPathOutcomeMarker, error) {
+	input.Kind = strings.TrimSpace(input.Kind)
+	input.DialogMessageID = strings.TrimSpace(input.DialogMessageID)
+	if input.Kind != TeacherOnboardingPathOutcomeMarkerKind || !validUUID(input.DialogMessageID) {
+		return TeacherOnboardingPathOutcomeMarker{}, ErrInvalidTeacherOnboarding
+	}
+	switch input.Status {
+	case TeacherOnboardingPathOutcomeMarkerReady, TeacherOnboardingPathOutcomeMarkerActiveExists:
+		return input, nil
+	default:
+		return TeacherOnboardingPathOutcomeMarker{}, ErrInvalidTeacherOnboarding
+	}
+}
+
+func DurableHandoffTeacherOnboardingSession(payload TeacherOnboardingSessionV3) (TeacherOnboardingSession, error) {
+	normalized, err := NormalizeTeacherOnboardingSessionV3(payload)
+	if err != nil {
+		return TeacherOnboardingSession{}, err
+	}
+	return TeacherOnboardingSession{V3: &normalized}, nil
+}
+
+func NormalizeTeacherOnboardingSessionV3(input TeacherOnboardingSessionV3) (TeacherOnboardingSessionV3, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	stateRef, err := NormalizeTeacherStudentReadinessStateRef(input.StateRef)
+	if err != nil || input.Schema != TeacherOnboardingSessionV3Schema || !validUUID(input.DialogID) {
+		return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+	}
+	input.StateRef = stateRef
+	if input.PathOutcome != nil {
+		marker, markerErr := NormalizeTeacherOnboardingPathOutcomeMarker(*input.PathOutcome)
+		if markerErr != nil {
+			return TeacherOnboardingSessionV3{}, markerErr
+		}
+		input.PathOutcome = &marker
+	}
+	switch input.Status {
+	case TeacherOnboardingSessionV3Collecting:
+		if input.Phase != TeacherOnboardingPhaseGettingAcquainted && input.Phase != TeacherOnboardingPhaseDeterminingStart && input.Phase != TeacherOnboardingPhasePreparingPath {
+			return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+		}
+		if input.CurrentPrompt == nil || input.Terminal != nil || input.PathOutcome != nil || !validUUID(input.CurrentPrompt.MessageID) || input.CurrentPrompt.MessageVersion < 1 {
+			return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingSessionHandoffPending:
+		if input.Phase != TeacherOnboardingPhasePreparingPath || input.CurrentPrompt != nil || input.PathOutcome != nil || input.Terminal == nil || input.Terminal.Kind != input.Status ||
+			(input.Terminal.DisplayName != TeacherFoundationGoalDisplayName && input.Terminal.DisplayName != TeacherGoBackendGoalDisplayName) ||
+			input.Terminal.ExecutionStatus != "" || input.Terminal.ContentStatus != TeacherLearningContentNotCreated {
+			return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingSessionHandoffAccepted:
+		if input.Phase != TeacherOnboardingPhaseReadyToStart || input.CurrentPrompt != nil || input.Terminal == nil || input.Terminal.Kind != input.Status ||
+			(input.Terminal.DisplayName != TeacherFoundationGoalDisplayName && input.Terminal.DisplayName != TeacherGoBackendGoalDisplayName) ||
+			input.Terminal.ExecutionStatus != TeacherOnboardingExecutionNotStarted || input.Terminal.ContentStatus != TeacherLearningContentNotCreated {
+			return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingSessionV3ActivePathExists:
+		if input.Phase != TeacherOnboardingPhaseReadyToStart || input.CurrentPrompt != nil || input.Terminal == nil || input.Terminal.Kind != input.Status ||
+			input.Terminal.DisplayName != "" || input.Terminal.ExecutionStatus != "" || input.Terminal.ContentStatus != "" {
+			return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return TeacherOnboardingSessionV3{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+
+func ProductAwareTeacherOnboardingSession(payload TeacherOnboardingSessionV2) (TeacherOnboardingSession, error) {
+	normalized, err := NormalizeTeacherOnboardingSessionV2(payload)
+	if err != nil {
+		return TeacherOnboardingSession{}, err
+	}
+	return TeacherOnboardingSession{V2: &normalized}, nil
+}
+
+func NormalizeTeacherOnboardingSessionV2(input TeacherOnboardingSessionV2) (TeacherOnboardingSessionV2, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	stateRef, err := NormalizeTeacherStudentReadinessStateRef(input.StateRef)
+	if err != nil || input.Schema != TeacherOnboardingSessionV2Schema || !validUUID(input.DialogID) {
+		return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+	}
+	input.StateRef = stateRef
+	switch input.Status {
+	case TeacherOnboardingSessionCollecting:
+		if input.Phase != TeacherOnboardingPhaseGettingAcquainted && input.Phase != TeacherOnboardingPhaseDeterminingStart && input.Phase != TeacherOnboardingPhasePreparingPath {
+			return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+		}
+		if input.CurrentPrompt == nil || input.Terminal != nil || !validUUID(input.CurrentPrompt.MessageID) || input.CurrentPrompt.MessageVersion < 1 {
+			return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingSessionPlanningReady:
+		if input.Phase != TeacherOnboardingPhaseReadyToStart || input.CurrentPrompt != nil || input.Terminal == nil || input.Terminal.Kind != input.Status ||
+			(input.Terminal.DisplayName != TeacherFoundationGoalDisplayName && input.Terminal.DisplayName != TeacherGoBackendGoalDisplayName) {
+			return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+		}
+	case TeacherOnboardingSessionActivePathExists:
+		if input.Phase != TeacherOnboardingPhaseReadyToStart || input.CurrentPrompt != nil || input.Terminal == nil || input.Terminal.Kind != input.Status || input.Terminal.DisplayName != "" {
+			return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return TeacherOnboardingSessionV2{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+
+func (session TeacherOnboardingSession) MarshalJSON() ([]byte, error) {
+	if session.V3 != nil {
+		normalized, err := NormalizeTeacherOnboardingSessionV3(*session.V3)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(normalized)
+	}
+	if session.V2 != nil {
+		normalized, err := NormalizeTeacherOnboardingSessionV2(*session.V2)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(normalized)
+	}
+	type legacyTeacherOnboardingSession TeacherOnboardingSession
+	legacy := legacyTeacherOnboardingSession(session)
+	legacy.V2 = nil
+	legacy.V3 = nil
+	return json.Marshal(legacy)
+}
+
+type AssistantUIActionResultPayload struct {
+	Schema         string                       `json:"schema"`
+	Applied        bool                         `json:"applied"`
+	Replayed       bool                         `json:"replayed"`
+	Status         StudentOnboardingDraftStatus `json:"status"`
+	DraftVersion   int64                        `json:"draft_version"`
+	ProfileVersion int64                        `json:"profile_version"`
+	NextMessageID  *string                      `json:"next_message_id"`
+}
+
+// AssistantUIActionResult preserves v1 for legacy callers and serializes the
+// dark canonical branch as its separate strict v2 contract.
+type AssistantUIActionResult struct {
+	AssistantUIActionResultPayload
+	V2 *AssistantUIActionResultV2Payload
+}
+
+type AssistantUIActionResultV2Payload struct {
+	Schema                    string `json:"schema"`
+	Mode                      string `json:"mode"`
+	Materialized              bool   `json:"materialized"`
+	Replayed                  bool   `json:"replayed"`
+	CanonicalStudentMessageID string `json:"canonical_student_message_id"`
+}
+
+func LegacyAssistantUIActionResult(payload AssistantUIActionResultPayload) AssistantUIActionResult {
+	return AssistantUIActionResult{AssistantUIActionResultPayload: payload}
+}
+
+func (result AssistantUIActionResult) MarshalJSON() ([]byte, error) {
+	if result.V2 != nil {
+		return json.Marshal(result.V2)
+	}
+	return json.Marshal(result.AssistantUIActionResultPayload)
+}
+
+type OnboardingActionReceiptStatus string
+
+const (
+	OnboardingReceiptClaimed      OnboardingActionReceiptStatus = "claimed"
+	OnboardingReceiptApplied      OnboardingActionReceiptStatus = "applied"
+	OnboardingReceiptCompleted    OnboardingActionReceiptStatus = "completed"
+	OnboardingReceiptRejected     OnboardingActionReceiptStatus = "rejected"
+	OnboardingReceiptMaterialized OnboardingActionReceiptStatus = "materialized"
+)
+
+type OnboardingActionExecutionMode string
+
+const (
+	OnboardingActionExecutionLegacy    OnboardingActionExecutionMode = "legacy"
+	OnboardingActionExecutionCanonical OnboardingActionExecutionMode = "canonical"
+)
+
+type OnboardingActionReceipt struct {
+	IdempotencyKey            string
+	RequestHash               string
+	StudentID                 string
+	PersonalTeacherID         string
+	DialogID                  string
+	SourceMessageID           string
+	SourceMessageVersion      int
+	BlockID                   string
+	ActionID                  string
+	Step                      TeacherOnboardingStep
+	Status                    OnboardingActionReceiptStatus
+	ExecutionMode             OnboardingActionExecutionMode
+	ClaimToken                string
+	LockedUntil               *time.Time
+	ExpectedDraftVersion      *int64
+	ExpectedProfileVersion    *int64
+	ResultDraftVersion        *int64
+	ResultProfileVersion      *int64
+	ResultStatus              StudentOnboardingDraftStatus
+	StudentCommandID          string
+	DialogMessageCommandID    string
+	CanonicalMessageCommandID string
+	CanonicalStudentMessageID string
+	NextMessageID             string
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+	CompletedAt               *time.Time
+}
+
+func NewOnboardingActionReceipt(request AssistantUIActionRequest, studentID, teacherID, claimToken string, now, lockedUntil time.Time) (OnboardingActionReceipt, error) {
+	return NewOnboardingActionReceiptForMode(request, studentID, teacherID, claimToken, now, lockedUntil, OnboardingActionExecutionLegacy)
+}
+
+func NewOnboardingActionReceiptForMode(request AssistantUIActionRequest, studentID, teacherID, claimToken string, now, lockedUntil time.Time, mode OnboardingActionExecutionMode) (OnboardingActionReceipt, error) {
+	request, err := NormalizeAssistantUIActionRequest(request)
+	if err != nil || !validUUID(studentID) || !validUUID(teacherID) || !validUUID(claimToken) || now.IsZero() || !lockedUntil.After(now) {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	hash, err := onboardingActionHash(request)
+	if err != nil {
+		return OnboardingActionReceipt{}, err
+	}
+	step := stepFromBlockID(request.BlockID)
+	if step == "" {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	now = now.UTC()
+	lockedUntil = lockedUntil.UTC()
+	if mode != OnboardingActionExecutionLegacy && mode != OnboardingActionExecutionCanonical {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	receipt := OnboardingActionReceipt{IdempotencyKey: request.IdempotencyKey, RequestHash: hash, StudentID: studentID, PersonalTeacherID: teacherID, DialogID: request.DialogID, SourceMessageID: request.MessageID, SourceMessageVersion: request.MessageVersion, BlockID: request.BlockID, ActionID: request.ActionID, Step: step, Status: OnboardingReceiptClaimed, ExecutionMode: mode, ClaimToken: claimToken, LockedUntil: &lockedUntil, StudentCommandID: DeterministicOnboardingUUID("student", request.IdempotencyKey), DialogMessageCommandID: DeterministicOnboardingUUID("dialog", request.IdempotencyKey), CreatedAt: now, UpdatedAt: now}
+	if mode == OnboardingActionExecutionCanonical {
+		receipt.CanonicalMessageCommandID = DeterministicOnboardingUUID("canonical-student", request.IdempotencyKey)
+	}
+	return receipt, nil
+}
+
+func stepFromBlockID(blockID string) TeacherOnboardingStep {
+	step, _, _, ok := onboardingBlockIdentity(blockID)
+	if !ok {
+		return ""
+	}
+	return step
+}
+
+func onboardingBlockIdentity(blockID string) (TeacherOnboardingStep, int, int64, bool) {
+	for _, policyVersion := range []int{TeacherOnboardingPromptPolicyV1, TeacherOnboardingPromptPolicyV2} {
+		for step := range map[TeacherOnboardingStep]struct{}{
+			OnboardingStepDirection: {}, OnboardingStepExperience: {}, OnboardingStepKnownStack: {}, OnboardingStepDesiredStack: {},
+			OnboardingStepGoal: {}, OnboardingStepLanguage: {}, OnboardingStepWeeklyMinutes: {}, OnboardingStepPace: {}, OnboardingStepConfirmation: {},
+		} {
+			if _, known := onboardingChoicesForPolicy(step, policyVersion); !known {
+				continue
+			}
+			prefix := "onboarding." + string(step) + ".d"
+			suffix := ".v" + strconv.Itoa(policyVersion)
+			if !strings.HasPrefix(blockID, prefix) || !strings.HasSuffix(blockID, suffix) {
+				continue
+			}
+			version := strings.TrimSuffix(strings.TrimPrefix(blockID, prefix), suffix)
+			parsed, err := strconv.ParseInt(version, 10, 64)
+			if err == nil && parsed >= 0 && strconv.FormatInt(parsed, 10) == version {
+				return step, policyVersion, parsed, true
+			}
+		}
+	}
+	return "", 0, 0, false
+}
+func onboardingActionHash(input AssistantUIActionRequest) (string, error) {
+	value := map[string]any{"schema": input.Schema, "dialog_id": input.DialogID, "message_id": input.MessageID, "message_version": input.MessageVersion, "block_id": input.BlockID, "action_id": input.ActionID, "idempotency_key": input.IdempotencyKey}
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var builder strings.Builder
+	for _, key := range keys {
+		builder.WriteString(key)
+		builder.WriteByte('=')
+		_, _ = fmt.Fprint(&builder, value[key])
+		builder.WriteByte('\n')
+	}
+	sum := sha256.Sum256([]byte(builder.String()))
+	return hex.EncodeToString(sum[:]), nil
+}
+func DeterministicOnboardingUUID(kind string, parts ...any) string {
+	values := []string{"teacher-onboarding-v1", kind}
+	for _, part := range parts {
+		values = append(values, fmt.Sprint(part))
+	}
+	return uuid.NewSHA1(uuid.MustParse("8d2595f9-1459-4f94-903c-5e94a903f196"), []byte(strings.Join(values, "\x1f"))).String()
+}
+func (receipt OnboardingActionReceipt) Result(replayed bool) (AssistantUIActionResultPayload, error) {
+	if receipt.Status != OnboardingReceiptCompleted || receipt.ResultDraftVersion == nil || receipt.ResultProfileVersion == nil || receipt.NextMessageID == "" || !validUUID(receipt.NextMessageID) {
+		return AssistantUIActionResultPayload{}, ErrTeacherOnboardingUnavailable
+	}
+	next := receipt.NextMessageID
+	return AssistantUIActionResultPayload{Schema: AssistantUIActionResultSchema, Applied: true, Replayed: replayed, Status: receipt.ResultStatus, DraftVersion: *receipt.ResultDraftVersion, ProfileVersion: *receipt.ResultProfileVersion, NextMessageID: &next}, nil
+}
+func (receipt OnboardingActionReceipt) CanonicalResult(replayed bool) (AssistantUIActionResult, error) {
+	if receipt.Status != OnboardingReceiptMaterialized || !validUUID(receipt.CanonicalStudentMessageID) {
+		return AssistantUIActionResult{}, ErrTeacherOnboardingUnavailable
+	}
+	return AssistantUIActionResult{V2: &AssistantUIActionResultV2Payload{Schema: AssistantUIActionResultV2Schema, Mode: string(OnboardingActionExecutionCanonical), Materialized: true, Replayed: replayed, CanonicalStudentMessageID: receipt.CanonicalStudentMessageID}}, nil
+}
+func ReceiptMatches(left, right OnboardingActionReceipt) bool {
+	return left.IdempotencyKey == right.IdempotencyKey && left.RequestHash == right.RequestHash && left.StudentID == right.StudentID && left.PersonalTeacherID == right.PersonalTeacherID && left.DialogID == right.DialogID && left.SourceMessageID == right.SourceMessageID && left.SourceMessageVersion == right.SourceMessageVersion && left.BlockID == right.BlockID && left.ActionID == right.ActionID && left.Step == right.Step && left.StudentCommandID == right.StudentCommandID && left.DialogMessageCommandID == right.DialogMessageCommandID && left.ExecutionMode == right.ExecutionMode && left.CanonicalMessageCommandID == right.CanonicalMessageCommandID
+}
+
+// ReceiptReplayMatches permits an existing idempotency key to recover its
+// frozen execution mode after a feature-flag change. It is never used to
+// claim a different key; source/action uniqueness remains database-enforced.
+func ReceiptReplayMatches(left, right OnboardingActionReceipt) bool {
+	return left.IdempotencyKey == right.IdempotencyKey && left.RequestHash == right.RequestHash && left.StudentID == right.StudentID && left.PersonalTeacherID == right.PersonalTeacherID && left.DialogID == right.DialogID && left.SourceMessageID == right.SourceMessageID && left.SourceMessageVersion == right.SourceMessageVersion && left.BlockID == right.BlockID && left.ActionID == right.ActionID && left.Step == right.Step && left.StudentCommandID == right.StudentCommandID && (left.ExecutionMode == OnboardingActionExecutionLegacy || left.ExecutionMode == OnboardingActionExecutionCanonical)
+}
+
+// ReplayTerminalOnboardingAction returns only an exact, already terminal
+// result. It lets the HTTP action endpoint preserve historical v1/v2 replay
+// while the S11 cutover rejects every new or incomplete legacy execution.
+func ReplayTerminalOnboardingAction(receipt OnboardingActionReceipt, request AssistantUIActionRequest, studentID string) (AssistantUIActionResult, bool, error) {
+	request, err := NormalizeAssistantUIActionRequest(request)
+	if err != nil {
+		return AssistantUIActionResult{}, false, err
+	}
+	receipt, err = NormalizeOnboardingActionReceipt(receipt)
+	if err != nil {
+		return AssistantUIActionResult{}, false, ErrTeacherOnboardingUnavailable
+	}
+	hash, err := onboardingActionHash(request)
+	if err != nil {
+		return AssistantUIActionResult{}, false, err
+	}
+	if receipt.IdempotencyKey != request.IdempotencyKey || receipt.RequestHash != hash || receipt.StudentID != studentID ||
+		receipt.DialogID != request.DialogID || receipt.SourceMessageID != request.MessageID || receipt.SourceMessageVersion != request.MessageVersion ||
+		receipt.BlockID != request.BlockID || receipt.ActionID != request.ActionID || receipt.Step != stepFromBlockID(request.BlockID) {
+		return AssistantUIActionResult{}, false, ErrTeacherOnboardingConflict
+	}
+	switch receipt.Status {
+	case OnboardingReceiptCompleted:
+		if receipt.ExecutionMode != OnboardingActionExecutionLegacy {
+			return AssistantUIActionResult{}, false, ErrTeacherOnboardingUnavailable
+		}
+		legacy, resultErr := receipt.Result(true)
+		return LegacyAssistantUIActionResult(legacy), true, resultErr
+	case OnboardingReceiptMaterialized:
+		if receipt.ExecutionMode != OnboardingActionExecutionCanonical {
+			return AssistantUIActionResult{}, false, ErrTeacherOnboardingUnavailable
+		}
+		result, resultErr := receipt.CanonicalResult(true)
+		return result, true, resultErr
+	case OnboardingReceiptRejected:
+		return AssistantUIActionResult{}, false, ErrTeacherOnboardingConflict
+	default:
+		return AssistantUIActionResult{}, false, nil
+	}
+}
+
+func NormalizeOnboardingActionReceipt(input OnboardingActionReceipt) (OnboardingActionReceipt, error) {
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.RequestHash = strings.TrimSpace(input.RequestHash)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PersonalTeacherID = strings.TrimSpace(input.PersonalTeacherID)
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	input.SourceMessageID = strings.TrimSpace(input.SourceMessageID)
+	input.BlockID = strings.TrimSpace(input.BlockID)
+	input.ActionID = strings.TrimSpace(input.ActionID)
+	input.ClaimToken = strings.TrimSpace(input.ClaimToken)
+	input.StudentCommandID = strings.TrimSpace(input.StudentCommandID)
+	input.DialogMessageCommandID = strings.TrimSpace(input.DialogMessageCommandID)
+	input.CanonicalMessageCommandID = strings.TrimSpace(input.CanonicalMessageCommandID)
+	input.CanonicalStudentMessageID = strings.TrimSpace(input.CanonicalStudentMessageID)
+	input.NextMessageID = strings.TrimSpace(input.NextMessageID)
+	if !validUUID(input.IdempotencyKey) || len(input.RequestHash) != 64 || !validUUID(input.StudentID) ||
+		!validUUID(input.PersonalTeacherID) || !validUUID(input.DialogID) || !validUUID(input.SourceMessageID) ||
+		input.SourceMessageVersion < 1 || !validOnboardingOpaqueID(input.BlockID) || !validOnboardingOpaqueID(input.ActionID) ||
+		stepFromBlockID(input.BlockID) != input.Step || !validUUID(input.StudentCommandID) || !validUUID(input.DialogMessageCommandID) ||
+		input.CreatedAt.IsZero() || input.UpdatedAt.IsZero() || input.UpdatedAt.Before(input.CreatedAt) {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	if _, err := hex.DecodeString(input.RequestHash); err != nil {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	if input.ExecutionMode == "" {
+		input.ExecutionMode = OnboardingActionExecutionLegacy
+	}
+	if input.ExecutionMode != OnboardingActionExecutionLegacy && input.ExecutionMode != OnboardingActionExecutionCanonical {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	if input.ExecutionMode == OnboardingActionExecutionLegacy && (input.CanonicalMessageCommandID != "" || input.CanonicalStudentMessageID != "") {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	if input.ExecutionMode == OnboardingActionExecutionCanonical && !validUUID(input.CanonicalMessageCommandID) {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	active := input.Status == OnboardingReceiptClaimed || input.Status == OnboardingReceiptApplied
+	locked := input.ClaimToken != "" && input.LockedUntil != nil
+	if (input.ClaimToken == "") != (input.LockedUntil == nil) || (!active && locked) || (locked && !validUUID(input.ClaimToken)) {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	if (input.ExpectedDraftVersion == nil) != (input.ExpectedProfileVersion == nil) ||
+		(input.ExpectedDraftVersion != nil && (*input.ExpectedDraftVersion < 0 || *input.ExpectedProfileVersion < 0)) {
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	switch input.Status {
+	case OnboardingReceiptClaimed:
+		if input.ResultDraftVersion != nil || input.ResultProfileVersion != nil || input.ResultStatus != "" || input.NextMessageID != "" || input.CompletedAt != nil {
+			return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+		}
+	case OnboardingReceiptApplied:
+		if input.ExpectedDraftVersion == nil || input.ResultDraftVersion == nil || input.ResultProfileVersion == nil || input.NextMessageID != "" || input.CompletedAt != nil ||
+			*input.ResultDraftVersion < 1 || *input.ResultProfileVersion < 0 || (input.ResultStatus != StudentOnboardingDraftDraft && input.ResultStatus != StudentOnboardingDraftCompleted) {
+			return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+		}
+	case OnboardingReceiptCompleted:
+		if input.ExpectedDraftVersion == nil || input.ResultDraftVersion == nil || input.ResultProfileVersion == nil || !validUUID(input.NextMessageID) || input.CompletedAt == nil ||
+			(input.ResultStatus != StudentOnboardingDraftDraft && input.ResultStatus != StudentOnboardingDraftCompleted) {
+			return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+		}
+	case OnboardingReceiptRejected:
+		if input.ResultDraftVersion != nil || input.ResultProfileVersion != nil || input.ResultStatus != "" || input.NextMessageID != "" || input.CompletedAt != nil {
+			return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+		}
+	case OnboardingReceiptMaterialized:
+		if input.ExecutionMode != OnboardingActionExecutionCanonical || !validUUID(input.CanonicalStudentMessageID) || input.ClaimToken != "" || input.LockedUntil != nil || input.ResultDraftVersion != nil || input.ResultProfileVersion != nil || input.ResultStatus != "" || input.NextMessageID != "" || input.CompletedAt == nil {
+			return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+		}
+	default:
+		return OnboardingActionReceipt{}, ErrInvalidTeacherOnboarding
+	}
+	return input, nil
+}
+
+func ValidOnboardingStepForState(draft StudentOnboardingDraft, step TeacherOnboardingStep) error {
+	next, err := NextTeacherOnboardingStep(draft)
+	if err != nil || next != step {
+		return ErrTeacherOnboardingConflict
+	}
+	return nil
+}
+func FormatOnboardingVersion(value int64) string { return strconv.FormatInt(value, 10) }
+func ValidOnboardingFallback(body string) bool {
+	return strings.TrimSpace(body) != "" && utf8.ValidString(body) && utf8.RuneCountInString(body) <= 2000
+}

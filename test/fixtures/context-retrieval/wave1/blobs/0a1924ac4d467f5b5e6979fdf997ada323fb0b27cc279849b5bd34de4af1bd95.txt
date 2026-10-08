@@ -1,0 +1,208 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const (
+	DialogEventsStream           = "DIALOG_EVENTS"
+	DialogRequestConsumerQueue   = "ms-teacher-dialog-requested"
+	DialogRequestConsumerDurable = "ms-teacher-dialog-requested-v1"
+)
+
+type dialogTeacherRequestedEnvelope struct {
+	SchemaVersion        int       `json:"schema_version"`
+	EventID              string    `json:"event_id"`
+	OccurredAt           time.Time `json:"occurred_at"`
+	DialogID             string    `json:"dialog_id"`
+	EventSequence        int64     `json:"event_sequence"`
+	TeacherTurnSequence  *int64    `json:"teacher_turn_sequence"`
+	SourceMessageID      string    `json:"source_message_id"`
+	SourceSequence       int64     `json:"source_message_sequence"`
+	SourceMessageVersion *int      `json:"source_message_version,omitempty"`
+	// New producers emit this field explicitly (including null).  It cannot be
+	// required by the decoder until previously durable v2 events have drained.
+	ReplyToMessageID          *string `json:"reply_to_message_id"`
+	CanonicalStudentMessageID *string `json:"canonical_student_message_id"`
+	CorrelationID             *string `json:"correlation_id"`
+	CausationID               *string `json:"causation_id"`
+	ActionReceiptID           *string `json:"action_receipt_id"`
+	StudentCommandID          *string `json:"student_command_id"`
+	Channel                   string  `json:"channel"`
+	StudentID                 string  `json:"student_id"`
+	PersonalTeacherID         string  `json:"personal_teacher_id"`
+	ContextType               string  `json:"context_type"`
+	ContextID                 *string `json:"context_id"`
+	LearningActionID          *string `json:"learning_action_id"`
+}
+
+func DecodeDialogTeacherRequested(payload []byte) (domain.DialogTeacherRequest, error) {
+	var envelope dialogTeacherRequestedEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.DialogTeacherRequest{}, fmt.Errorf("decode dialog teacher request: %w", err)
+	}
+	// A missing source_message_version is a tolerated old-v2 event. A newly
+	// emitted field is a positive integer; JSON null must not silently become a
+	// missing value through Go's *int decoding.
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &rawFields); err != nil {
+		return domain.DialogTeacherRequest{}, fmt.Errorf("decode dialog teacher request fields: %w", err)
+	}
+	if raw, present := rawFields["source_message_version"]; present &&
+		(envelope.SourceMessageVersion == nil || string(raw) == "null" || *envelope.SourceMessageVersion < 1) {
+		return domain.DialogTeacherRequest{}, errors.New("source_message_version must be a positive integer when present")
+	}
+	if envelope.SchemaVersion != domain.DialogTeacherRequestedSchemaVersionV1 && envelope.SchemaVersion != domain.DialogTeacherRequestedSchemaVersionV2 {
+		return domain.DialogTeacherRequest{}, errors.New("unsupported dialog teacher request schema version")
+	}
+	if envelope.SchemaVersion == domain.DialogTeacherRequestedSchemaVersionV2 {
+		// This is an internal Teacher identity, not Dialog event data. Retain the
+		// field in the shared legacy envelope only for V1 compatibility, but make
+		// its appearance in V2 a terminal schema violation (including JSON null).
+		if _, present := rawFields["student_command_id"]; present {
+			return domain.DialogTeacherRequest{}, errors.New("student_command_id is not part of dialog teacher request v2")
+		}
+	}
+	contextType, err := normalizeDialogContextType(envelope.ContextType)
+	if err != nil {
+		return domain.DialogTeacherRequest{}, err
+	}
+	return domain.NewDialogTeacherRequest(domain.DialogTeacherRequest{
+		SchemaVersion: envelope.SchemaVersion,
+		EventID:       envelope.EventID, DialogID: envelope.DialogID, EventSequence: envelope.EventSequence,
+		TeacherTurnSequence: optionalInt64(envelope.TeacherTurnSequence),
+		SourceMessageID:     envelope.SourceMessageID, SourceSequence: envelope.SourceSequence,
+		SourceMessageVersion: optionalInt(envelope.SourceMessageVersion), ReplyToMessageID: optionalString(envelope.ReplyToMessageID),
+		CanonicalStudentMessageID: optionalString(envelope.CanonicalStudentMessageID),
+		CorrelationID:             optionalString(envelope.CorrelationID), DialogCausationID: optionalString(envelope.CausationID),
+		ActionReceiptID: optionalString(envelope.ActionReceiptID), StudentCommandID: optionalString(envelope.StudentCommandID),
+		SourceChannel: domain.DialogMessageChannel(envelope.Channel),
+		StudentID:     envelope.StudentID, PersonalTeacherID: envelope.PersonalTeacherID,
+		ContextType: contextType, ContextID: optionalString(envelope.ContextID),
+		LearningActionID: optionalString(envelope.LearningActionID), OccurredAt: envelope.OccurredAt,
+	})
+}
+
+func optionalInt(value *int) int64 {
+	if value == nil {
+		return 0
+	}
+	return int64(*value)
+}
+
+func normalizeDialogContextType(value string) (domain.LearningContextType, error) {
+	switch value {
+	case "general_teacher":
+		return domain.LearningContextGeneral, nil
+	case string(domain.LearningContextLesson):
+		return domain.LearningContextLesson, nil
+	case string(domain.LearningContextLessonTask):
+		return domain.LearningContextLessonTask, nil
+	case string(domain.LearningContextPracticeTask):
+		return domain.LearningContextPracticeTask, nil
+	case string(domain.LearningContextProject):
+		return domain.LearningContextProject, nil
+	default:
+		return "", domain.ErrInvalidDialogContext
+	}
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func optionalInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+type DialogTeacherRequestedSubscriber struct {
+	Conn       *nats.Conn
+	Handler    func(context.Context, domain.DialogTeacherRequest) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber DialogTeacherRequestedSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil {
+		return errors.New("dialog teacher subscriber connection is required")
+	}
+	if subscriber.Handler == nil {
+		return errors.New("dialog teacher subscriber handler is required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 60 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	jetStream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = jetStream.QueueSubscribe(
+		domain.SubjectDialogTeacherRequested,
+		DialogRequestConsumerQueue,
+		func(message *nats.Msg) {
+			request, decodeErr := DecodeDialogTeacherRequested(message.Data)
+			if decodeErr != nil {
+				logger.Warn("terminate invalid dialog teacher request", zap.Error(decodeErr))
+				if termErr := message.Term(); termErr != nil {
+					logger.Warn("terminate dialog teacher request", zap.Error(termErr))
+				}
+				return
+			}
+			processed, handleErr := subscriber.Handler(ctx, request)
+			if handleErr != nil {
+				if errors.Is(handleErr, domain.ErrTeacherDialogRequestConflict) {
+					logger.Warn("terminate conflicting dialog teacher request", zap.String("event_id", request.EventID))
+					if termErr := message.Term(); termErr != nil {
+						logger.Warn("terminate dialog teacher request", zap.String("event_id", request.EventID), zap.Error(termErr))
+					}
+					return
+				}
+				logger.Warn("retry dialog teacher request", zap.String("event_id", request.EventID), zap.Error(handleErr))
+				if nakErr := message.NakWithDelay(retryDelay); nakErr != nil {
+					logger.Warn("nak dialog teacher request", zap.String("event_id", request.EventID), zap.Error(nakErr))
+				}
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				logger.Warn("ack dialog teacher request", zap.String("event_id", request.EventID), zap.Error(ackErr))
+				return
+			}
+			logger.Debug("dialog teacher request handled", zap.String("event_id", request.EventID), zap.Bool("processed", processed))
+		},
+		nats.BindStream(DialogEventsStream),
+		nats.Durable(DialogRequestConsumerDurable),
+		nats.ManualAck(),
+		nats.AckExplicit(),
+		nats.DeliverAll(),
+		nats.AckWait(ackWait),
+	)
+	if err != nil {
+		return err
+	}
+	return subscriber.Conn.FlushTimeout(5 * time.Second)
+}

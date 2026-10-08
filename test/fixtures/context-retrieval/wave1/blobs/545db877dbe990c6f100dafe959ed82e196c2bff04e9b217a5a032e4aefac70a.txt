@@ -1,0 +1,248 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+// These tests are opt-in because they exercise a real disposable PostgreSQL
+// database. The database name must end in _test so a developer cannot point
+// them at the live review database by accident.
+func teacherDecisionIntegrationPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	databaseURL := strings.TrimSpace(os.Getenv("TEACHER_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("TEACHER_TEST_DATABASE_URL is not configured")
+	}
+	config, err := pgxpool.ParseConfig(databaseURL)
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(config.ConnConfig.Database, "_test"), "TEACHER_TEST_DATABASE_URL must target a database ending in _test")
+	pool, err := NewPool(context.Background(), databaseURL)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+type teacherDecisionIntegrationFixture struct {
+	pool      *pgxpool.Pool
+	teacherID string
+	studentID string
+}
+
+func newTeacherDecisionIntegrationFixture(t *testing.T) *teacherDecisionIntegrationFixture {
+	t.Helper()
+	pool := teacherDecisionIntegrationPool(t)
+	fixture := &teacherDecisionIntegrationFixture{
+		pool:      pool,
+		teacherID: uuid.NewString(),
+		studentID: uuid.NewString(),
+	}
+	now := time.Now().UTC()
+	_, err := pool.Exec(context.Background(), `
+INSERT INTO personal_teacher (
+    id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,
+    hint_policy,intervention_mode,version,created_at,updated_at
+) VALUES ($1,$2,'integration-profile','ru','integration','integration',
+    'scaffold','manual',1,$3,$3)
+`, fixture.teacherID, fixture.studentID, now)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = pool.Exec(ctx, `UPDATE teacher_dialog_job SET status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,response_body=NULL,delivered_message_id=NULL,teacher_response_message_id=NULL,terminal_outcome=NULL,reconciliation_state=CASE WHEN teacher_turn_schema_version=2 THEN 'unknown' ELSE NULL END,no_effect_proof_id=NULL,recoverable_outcome_id=NULL,error_code='integration_cleanup' WHERE personal_teacher_id=$1`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_dialog_turn_outcome WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_dialog_turn_proof WHERE teacher_job_id IN (SELECT teacher_job_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_dialog_turn_cursor WHERE dialog_id IN (SELECT dialog_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_dialog_job WHERE personal_teacher_id=$1`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_outbox WHERE student_id=$1`, fixture.studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM teacher_decision WHERE personal_teacher_id=$1`, fixture.teacherID)
+		_, _ = pool.Exec(ctx, `DELETE FROM personal_teacher WHERE id=$1`, fixture.teacherID)
+	})
+	return fixture
+}
+
+func (fixture *teacherDecisionIntegrationFixture) decision(
+	decisionID, eventID string,
+	contextType domain.LearningContextType,
+	contextID, learningActionID, correlationID string,
+) (domain.TeacherDecision, domain.IntegrationEvent) {
+	if correlationID == "" {
+		correlationID = fixture.teacherID
+	}
+	if learningActionID != "" {
+		correlationID = learningActionID
+	}
+	decision := domain.TeacherDecision{
+		ID:                decisionID,
+		PersonalTeacherID: fixture.teacherID,
+		StudentID:         fixture.studentID,
+		CorrelationID:     correlationID,
+		CausationID:       eventID,
+		LearningActionID:  learningActionID,
+		TeachingMode:      domain.TeachingModeLesson,
+		ContextType:       contextType,
+		ContextID:         contextID,
+		PracticeStepID:    practiceStepIDFor(contextType),
+		PedagogyMethod:    "adaptive",
+		PedagogyVersion:   "adaptive-v1",
+		PedagogyStage:     domain.PedagogyStage("orient"),
+		Strategy:          "scaffolding",
+		Action:            domain.TeacherActionRespond,
+		ReasonCode:        "integration",
+		ReasonSummary:     "integration decision",
+		PolicyVersion:     "teacher-policy.v1",
+		CreatedAt:         time.Now().UTC(),
+	}
+	event, err := domain.NewIntegrationEvent(
+		eventID, domain.SubjectTeacherDecisionRecorded, decision.CorrelationID,
+		decision.CausationID, decision.StudentID, decision.CreatedAt,
+		domain.TeacherDecisionRecordedSchemaVersion, decision,
+	)
+	if err != nil {
+		panic(fmt.Sprintf("build integration event: %v", err))
+	}
+	return decision, event
+}
+
+func practiceStepIDFor(contextType domain.LearningContextType) string {
+	if contextType == domain.LearningContextPracticeTask || contextType == domain.LearningContextProject {
+		return "implement"
+	}
+	return ""
+}
+
+func TestTeacherDecisionRepositoryStoresNullableAndUUIDLearningActionIDs(t *testing.T) {
+	t.Parallel()
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDecisionRepository{Pool: fixture.pool}
+
+	t.Run("empty learning action is stored as null", func(t *testing.T) {
+		decisionID, eventID := uuid.NewString(), uuid.NewString()
+		decision, event := fixture.decision(decisionID, eventID, domain.LearningContextGeneral, "", "", "")
+		require.NoError(t, repository.Record(context.Background(), decision, event))
+
+		var stored string
+		var isNull bool
+		require.NoError(t, fixture.pool.QueryRow(context.Background(), `
+SELECT COALESCE(learning_action_id::text,''), learning_action_id IS NULL
+FROM teacher_decision WHERE id=$1
+`, decisionID).Scan(&stored, &isNull))
+		require.Empty(t, stored)
+		require.True(t, isNull)
+	})
+
+	t.Run("valid learning action is stored as uuid", func(t *testing.T) {
+		decisionID, eventID, learningActionID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		decision, event := fixture.decision(decisionID, eventID, domain.LearningContextPracticeTask, uuid.NewString(), learningActionID, "")
+		require.NoError(t, repository.Record(context.Background(), decision, event))
+
+		var stored string
+		require.NoError(t, fixture.pool.QueryRow(context.Background(), `
+SELECT learning_action_id::text FROM teacher_decision WHERE id=$1
+`, decisionID).Scan(&stored))
+		require.Equal(t, learningActionID, stored)
+		var stepID string
+		require.NoError(t, fixture.pool.QueryRow(context.Background(), `
+SELECT practice_step_id FROM teacher_decision WHERE id=$1
+`, decisionID).Scan(&stepID))
+		require.Equal(t, "implement", stepID)
+		decisions, err := repository.ListByLearningAction(context.Background(), fixture.studentID, learningActionID)
+		require.NoError(t, err)
+		require.Len(t, decisions, 1)
+		require.Equal(t, "implement", decisions[0].PracticeStepID)
+	})
+
+	t.Run("invalid learning action rolls back decision and outbox", func(t *testing.T) {
+		decisionID, eventID := uuid.NewString(), uuid.NewString()
+		decision, event := fixture.decision(decisionID, eventID, domain.LearningContextPracticeTask, uuid.NewString(), "not-a-uuid", "")
+		err := repository.Record(context.Background(), decision, event)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "invalid input syntax for type uuid")
+
+		var decisionCount, outboxCount int
+		require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT count(*) FROM teacher_decision WHERE id=$1`, decisionID).Scan(&decisionCount))
+		require.NoError(t, fixture.pool.QueryRow(context.Background(), `SELECT count(*) FROM teacher_outbox WHERE event_id=$1`, eventID).Scan(&outboxCount))
+		require.Zero(t, decisionCount)
+		require.Zero(t, outboxCount)
+	})
+}
+
+func TestTeacherDialogSaveGeneratedCommitsDecisionAndOutboxAtomically(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	eventID, dialogID, sourceMessageID, claimToken := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, err := fixture.pool.Exec(ctx, `
+INSERT INTO teacher_dialog_job (
+    event_id,teacher_job_id,dialog_id,event_sequence,source_message_id,source_message_sequence,student_id,
+    personal_teacher_id,context_type,occurred_at,status,claim_token,locked_by,locked_until,
+    attempts,next_attempt_at,accepted_at,updated_at
+) VALUES ($1,$1,$2,1,$3,1,$4,$5,'general',$6,'processing',$7,'integration-worker',$8,1,$6,$6,$6)
+`, eventID, dialogID, sourceMessageID, fixture.studentID, fixture.teacherID, now, claimToken, now.Add(time.Minute))
+	require.NoError(t, err)
+
+	decision, event := fixture.decision(uuid.NewString(), eventID, domain.LearningContextGeneral, "", "", dialogID)
+	require.NoError(t, repository.SaveGenerated(ctx, eventID, claimToken, decision, event, "cached response", uuid.NewString(), now))
+
+	var status, responseBody string
+	var storedDecisionID string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+SELECT status,response_body,decision_id::text FROM teacher_dialog_job WHERE event_id=$1
+`, eventID).Scan(&status, &responseBody, &storedDecisionID))
+	require.Equal(t, "processing", status)
+	require.Equal(t, "cached response", responseBody)
+	require.Equal(t, decision.ID, storedDecisionID)
+
+	var decisionCount, outboxCount int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT count(*) FROM teacher_decision WHERE id=$1`, decision.ID).Scan(&decisionCount))
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT count(*) FROM teacher_outbox WHERE event_id=$1`, event.EventID).Scan(&outboxCount))
+	require.Equal(t, 1, decisionCount)
+	require.Equal(t, 1, outboxCount)
+}
+
+func TestTeacherDialogSaveGeneratedRollsBackDecisionAndOutboxTogether(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	eventID, dialogID, sourceMessageID, claimToken := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, err := fixture.pool.Exec(ctx, `
+INSERT INTO teacher_dialog_job (
+    event_id,teacher_job_id,dialog_id,event_sequence,source_message_id,source_message_sequence,student_id,
+    personal_teacher_id,context_type,occurred_at,status,claim_token,locked_by,locked_until,
+    attempts,next_attempt_at,accepted_at,updated_at
+) VALUES ($1,$1,$2,1,$3,1,$4,$5,'general',$6,'processing',$7,'integration-worker',$8,1,$6,$6,$6)
+`, eventID, dialogID, sourceMessageID, fixture.studentID, fixture.teacherID, now, claimToken, now.Add(time.Minute))
+	require.NoError(t, err)
+
+	decision, event := fixture.decision(uuid.NewString(), eventID, domain.LearningContextGeneral, "", "", dialogID)
+	decision.Strategy = ""
+	err = repository.SaveGenerated(ctx, eventID, claimToken, decision, event, "cached response", uuid.NewString(), now)
+	require.Error(t, err)
+
+	var decisionCount, outboxCount int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT count(*) FROM teacher_decision WHERE id=$1`, decision.ID).Scan(&decisionCount))
+	require.NoError(t, fixture.pool.QueryRow(ctx, `SELECT count(*) FROM teacher_outbox WHERE event_id=$1`, event.EventID).Scan(&outboxCount))
+	require.Zero(t, decisionCount)
+	require.Zero(t, outboxCount)
+
+	var status string
+	var responseBody *string
+	var storedDecisionID *string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+SELECT status,response_body,decision_id::text FROM teacher_dialog_job WHERE event_id=$1
+`, eventID).Scan(&status, &responseBody, &storedDecisionID))
+	require.Equal(t, "processing", status)
+	require.Nil(t, responseBody)
+	require.Nil(t, storedDecisionID)
+}

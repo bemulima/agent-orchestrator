@@ -1,0 +1,487 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumResponseBytes = 2 << 20
+
+// Client reads bounded Student-owned action and mastery projections.
+type Client struct {
+	BaseURL                string
+	InternalToken          string
+	LearningWorkspaceToken string
+	HTTPClient             *http.Client
+}
+
+type learningActionContextResponse struct {
+	LearningActionID string                      `json:"learning_action_id"`
+	StudentID        string                      `json:"student_id"`
+	TaskID           string                      `json:"task_id"`
+	ContextType      domain.LearningContextType  `json:"context_type"`
+	ContextID        string                      `json:"context_id"`
+	LearningTargets  []domain.LearningTargetRef  `json:"learning_targets"`
+	Status           domain.LearningActionStatus `json:"status"`
+	OpenedAt         time.Time                   `json:"opened_at"`
+}
+
+type targetMasteryResponse struct {
+	Target                  domain.LearningTargetRef  `json:"target"`
+	State                   domain.TargetMasteryState `json:"state"`
+	MasteryScore            float64                   `json:"mastery_score"`
+	Confidence              float64                   `json:"confidence"`
+	IndependentSuccessCount int                       `json:"independent_success_count"`
+	AssistedSuccessCount    int                       `json:"assisted_success_count"`
+	FailureCount            int                       `json:"failure_count"`
+	EvidenceCount           int                       `json:"evidence_count"`
+	LastSeenAt              *time.Time                `json:"last_seen_at,omitempty"`
+	LastPracticedAt         *time.Time                `json:"last_practiced_at,omitempty"`
+	LastFailedAt            *time.Time                `json:"last_failed_at,omitempty"`
+	PolicyVersion           string                    `json:"policy_version"`
+}
+
+type learnerOverviewOnboardingResponse struct {
+	StudentID              string    `json:"student_id"`
+	DirectionCode          string    `json:"direction_code"`
+	SelfAssessedExperience string    `json:"self_assessed_experience"`
+	KnownStacks            []string  `json:"known_stacks"`
+	DesiredStacks          []string  `json:"desired_stacks"`
+	GoalCode               string    `json:"goal_code"`
+	GoalText               string    `json:"goal_text"`
+	PreferredLanguage      string    `json:"preferred_language"`
+	WeeklyMinutes          int       `json:"weekly_minutes"`
+	PreferredPace          string    `json:"preferred_pace"`
+	ProfileVersion         string    `json:"profile_version"`
+	Version                int64     `json:"version"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+type learnerOverviewMasteryResponse struct {
+	StudentID string `json:"student_id"`
+	targetMasteryResponse
+}
+
+func (client Client) GetLearnerOverview(ctx context.Context, studentID string) (domain.StudentLearnerOverview, error) {
+	endpoint, err := client.endpoint("/internal/students/" + url.PathEscape(studentID) + "/learner-overview")
+	if err != nil {
+		return domain.StudentLearnerOverview{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.StudentLearnerOverview{}, unavailable(err)
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.StudentLearnerOverview{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusNotFound {
+			return domain.StudentLearnerOverview{}, domain.ErrStudentContextNotFound
+		}
+		if response.StatusCode == http.StatusBadRequest {
+			return domain.StudentLearnerOverview{}, domain.ErrInvalidStudentContext
+		}
+		return domain.StudentLearnerOverview{}, unavailableStatus(response.Status)
+	}
+	if !studentJSONMediaType(response.Header.Get("Content-Type")) {
+		return domain.StudentLearnerOverview{}, invalidStudentResponse(domain.ErrInvalidStudentContext)
+	}
+	var payload struct {
+		StudentID      string                             `json:"student_id"`
+		Version        string                             `json:"version"`
+		Onboarding     *learnerOverviewOnboardingResponse `json:"onboarding"`
+		RecentMastery  []learnerOverviewMasteryResponse   `json:"recent_mastery"`
+		LearningPath   *domain.StudentLearningPath        `json:"learning_path"`
+		Diagnostic     *domain.StudentDiagnosticSnapshot  `json:"diagnostic"`
+		RecentSessions []domain.StudentLearningSession    `json:"recent_sessions"`
+	}
+	if err := decodeStrict(response.Body, &payload); err != nil {
+		return domain.StudentLearnerOverview{}, invalidStudentResponse(domain.ErrInvalidStudentContext)
+	}
+	overview := domain.StudentLearnerOverview{
+		StudentID: payload.StudentID, Version: payload.Version, LearningPath: payload.LearningPath,
+		Diagnostic: payload.Diagnostic, RecentSessions: payload.RecentSessions,
+	}
+	if payload.Onboarding != nil {
+		if payload.Onboarding.StudentID != payload.StudentID {
+			return domain.StudentLearnerOverview{}, domain.ErrInvalidStudentContext
+		}
+		overview.Onboarding = &domain.StudentOnboardingSnapshot{
+			DirectionCode:          payload.Onboarding.DirectionCode,
+			SelfAssessedExperience: payload.Onboarding.SelfAssessedExperience,
+			KnownStacks:            payload.Onboarding.KnownStacks, DesiredStacks: payload.Onboarding.DesiredStacks,
+			GoalCode: payload.Onboarding.GoalCode, GoalText: payload.Onboarding.GoalText,
+			PreferredLanguage: payload.Onboarding.PreferredLanguage,
+			WeeklyMinutes:     payload.Onboarding.WeeklyMinutes, PreferredPace: payload.Onboarding.PreferredPace,
+			ProfileVersion: payload.Onboarding.ProfileVersion, Version: payload.Onboarding.Version,
+		}
+	}
+	overview.RecentMastery = make([]domain.StudentTargetMastery, 0, len(payload.RecentMastery))
+	for _, item := range payload.RecentMastery {
+		if item.StudentID != payload.StudentID {
+			return domain.StudentLearnerOverview{}, domain.ErrInvalidStudentContext
+		}
+		overview.RecentMastery = append(overview.RecentMastery, domain.StudentTargetMastery{
+			Target: item.Target, State: item.State, MasteryScore: item.MasteryScore,
+			Confidence: item.Confidence, IndependentSuccessCount: item.IndependentSuccessCount,
+			AssistedSuccessCount: item.AssistedSuccessCount, FailureCount: item.FailureCount,
+			EvidenceCount: item.EvidenceCount, LastSeenAt: item.LastSeenAt,
+			LastPracticedAt: item.LastPracticedAt, LastFailedAt: item.LastFailedAt,
+			PolicyVersion: item.PolicyVersion,
+		})
+	}
+	return overview, nil
+}
+
+func (client Client) GetLearningSession(ctx context.Context, studentID, sessionID string) (domain.StudentLearningSession, error) {
+	endpoint, err := client.endpoint("/internal/students/" + url.PathEscape(studentID) + "/learning-sessions/" + url.PathEscape(sessionID))
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.StudentLearningSession{}, unavailable(err)
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusNotFound {
+			return domain.StudentLearningSession{}, domain.ErrStudentContextNotFound
+		}
+		if response.StatusCode == http.StatusBadRequest {
+			return domain.StudentLearningSession{}, domain.ErrInvalidStudentContext
+		}
+		return domain.StudentLearningSession{}, unavailableStatus(response.Status)
+	}
+	var session domain.StudentLearningSession
+	if err := decodeStrict(response.Body, &session); err != nil {
+		return domain.StudentLearningSession{}, unavailable(err)
+	}
+	normalized, err := domain.NormalizeStudentLearningSessions([]domain.StudentLearningSession{session}, studentID)
+	if err != nil || normalized[0].ID != strings.TrimSpace(sessionID) {
+		return domain.StudentLearningSession{}, domain.ErrInvalidStudentContext
+	}
+	return normalized[0], nil
+}
+
+func (client Client) ApplyLearningSessionMetrics(
+	ctx context.Context,
+	studentID, sessionID string,
+	expectedVersion int64,
+	analytics domain.LearningAnalyticsSummary,
+) (domain.StudentLearningSession, error) {
+	body, err := json.Marshal(struct {
+		ExpectedVersion          int64  `json:"expected_version"`
+		AnalyticsSessionID       string `json:"analytics_session_id"`
+		ActiveLearningSeconds    int    `json:"active_learning_seconds"`
+		LessonCount              int    `json:"lesson_count"`
+		TaskCount                int    `json:"task_count"`
+		QuestionCount            int    `json:"question_count"`
+		SelectedExplanationCount int    `json:"selected_explanation_count"`
+		CodeRunCount             int    `json:"code_run_count"`
+		FailureCount             int    `json:"failure_count"`
+		PassedTestCount          int    `json:"passed_test_count"`
+		HintCount                int    `json:"hint_count"`
+		TeacherInterventionCount int    `json:"teacher_intervention_count"`
+		StuckSignalCount         int    `json:"stuck_signal_count"`
+	}{
+		ExpectedVersion: expectedVersion, AnalyticsSessionID: analytics.AnalyticsSessionID,
+		ActiveLearningSeconds: analytics.ActiveLearningSeconds, LessonCount: analytics.LessonCount,
+		TaskCount: analytics.TaskCount, QuestionCount: analytics.QuestionCount,
+		SelectedExplanationCount: analytics.SelectedExplanationCount, CodeRunCount: analytics.CodeRunCount,
+		FailureCount: analytics.FailureCount, PassedTestCount: analytics.PassedTestCount,
+		HintCount: analytics.HintCount, TeacherInterventionCount: analytics.TeacherInterventionCount,
+		StuckSignalCount: analytics.StuckSignalCount,
+	})
+	if err != nil {
+		return domain.StudentLearningSession{}, domain.ErrInvalidStudentContext
+	}
+	endpoint, err := client.endpoint("/internal/students/" + url.PathEscape(studentID) + "/learning-sessions/" + url.PathEscape(sessionID) + "/metrics")
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return domain.StudentLearningSession{}, unavailable(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			return domain.StudentLearningSession{}, domain.ErrStudentContextNotFound
+		case http.StatusBadRequest:
+			return domain.StudentLearningSession{}, domain.ErrInvalidStudentContext
+		case http.StatusConflict:
+			return domain.StudentLearningSession{}, domain.ErrTeacherGenerationConflict
+		default:
+			return domain.StudentLearningSession{}, unavailableStatus(response.Status)
+		}
+	}
+	var session domain.StudentLearningSession
+	if err := decodeStrict(response.Body, &session); err != nil {
+		return domain.StudentLearningSession{}, unavailable(err)
+	}
+	normalized, err := domain.NormalizeStudentLearningSessions([]domain.StudentLearningSession{session}, studentID)
+	if err != nil || normalized[0].ID != strings.TrimSpace(sessionID) || normalized[0].Version != expectedVersion+1 ||
+		normalized[0].AnalyticsSessionID != analytics.AnalyticsSessionID {
+		return domain.StudentLearningSession{}, domain.ErrInvalidStudentContext
+	}
+	return normalized[0], nil
+}
+
+func (client Client) GetLearningActionContext(
+	ctx context.Context,
+	studentID string,
+	learningActionID string,
+) (domain.StudentLearningActionSnapshot, error) {
+	endpoint, err := client.endpoint(
+		"/internal/students/" + url.PathEscape(studentID) +
+			"/learning-actions/" + url.PathEscape(learningActionID) + "/context",
+	)
+	if err != nil {
+		return domain.StudentLearningActionSnapshot{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.StudentLearningActionSnapshot{}, unavailable(err)
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.StudentLearningActionSnapshot{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusNotFound {
+			return domain.StudentLearningActionSnapshot{}, domain.ErrStudentContextNotFound
+		}
+		if response.StatusCode == http.StatusBadRequest {
+			return domain.StudentLearningActionSnapshot{}, domain.ErrInvalidStudentContext
+		}
+		return domain.StudentLearningActionSnapshot{}, unavailableStatus(response.Status)
+	}
+	var payload learningActionContextResponse
+	if err := decodeStrict(response.Body, &payload); err != nil {
+		return domain.StudentLearningActionSnapshot{}, unavailable(err)
+	}
+	return domain.StudentLearningActionSnapshot{
+		LearningActionID: payload.LearningActionID,
+		StudentID:        payload.StudentID,
+		TaskID:           payload.TaskID,
+		ContextType:      payload.ContextType,
+		ContextID:        payload.ContextID,
+		LearningTargets:  payload.LearningTargets,
+		Status:           payload.Status,
+		OpenedAt:         payload.OpenedAt,
+	}, nil
+}
+
+func (client Client) GetLearningActionCodeContext(
+	ctx context.Context,
+	studentID string,
+	learningActionID string,
+) (domain.StudentLearningActionCodeContext, error) {
+	endpoint, err := client.endpoint(
+		"/internal/students/" + url.PathEscape(studentID) +
+			"/learning-actions/" + url.PathEscape(learningActionID) + "/code-context",
+	)
+	if err != nil {
+		return domain.StudentLearningActionCodeContext{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.StudentLearningActionCodeContext{}, unavailable(err)
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.StudentLearningActionCodeContext{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			return domain.StudentLearningActionCodeContext{}, domain.ErrStudentContextNotFound
+		case http.StatusConflict:
+			return domain.StudentLearningActionCodeContext{}, domain.ErrLearningActionClosed
+		case http.StatusBadRequest:
+			return domain.StudentLearningActionCodeContext{}, domain.ErrInvalidStudentContext
+		default:
+			return domain.StudentLearningActionCodeContext{}, unavailableStatus(response.Status)
+		}
+	}
+	var result domain.StudentLearningActionCodeContext
+	if err := decodeStrict(response.Body, &result); err != nil {
+		return domain.StudentLearningActionCodeContext{}, unavailable(err)
+	}
+	result, err = domain.NormalizeStudentLearningActionCodeContext(result, studentID, learningActionID, result.TaskID)
+	if err != nil {
+		return domain.StudentLearningActionCodeContext{}, unavailable(err)
+	}
+	return result, nil
+}
+
+func (client Client) GetTargetMastery(
+	ctx context.Context,
+	studentID string,
+	targets []domain.LearningTargetRef,
+) ([]domain.StudentTargetMastery, error) {
+	if len(targets) == 0 || len(targets) > 100 {
+		return nil, domain.ErrInvalidStudentContext
+	}
+	requestBody, err := json.Marshal(struct {
+		Targets []domain.LearningTargetRef `json:"targets"`
+	}{Targets: targets})
+	if err != nil {
+		return nil, domain.ErrInvalidStudentContext
+	}
+	endpoint, err := client.endpoint("/internal/students/" + url.PathEscape(studentID) + "/mastery/query")
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusBadRequest {
+			return nil, domain.ErrInvalidStudentContext
+		}
+		return nil, unavailableStatus(response.Status)
+	}
+	var payload struct {
+		Items []targetMasteryResponse `json:"items"`
+	}
+	if err := decodeStrict(response.Body, &payload); err != nil {
+		return nil, unavailable(err)
+	}
+	result := make([]domain.StudentTargetMastery, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		result = append(result, domain.StudentTargetMastery{
+			Target:                  item.Target,
+			State:                   item.State,
+			MasteryScore:            item.MasteryScore,
+			Confidence:              item.Confidence,
+			IndependentSuccessCount: item.IndependentSuccessCount,
+			AssistedSuccessCount:    item.AssistedSuccessCount,
+			FailureCount:            item.FailureCount,
+			EvidenceCount:           item.EvidenceCount,
+			LastSeenAt:              item.LastSeenAt,
+			LastPracticedAt:         item.LastPracticedAt,
+			LastFailedAt:            item.LastFailedAt,
+			PolicyVersion:           item.PolicyVersion,
+		})
+	}
+	return result, nil
+}
+
+func (client Client) endpoint(path string) (string, error) {
+	return client.endpointWithToken(path, client.InternalToken)
+}
+
+func (client Client) endpointWithToken(path, token string) (string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(client.BaseURL), "/")
+	if baseURL == "" || strings.TrimSpace(token) == "" {
+		return "", unavailable(errors.New("student service URL and internal token are required"))
+	}
+	parsed, err := url.ParseRequestURI(baseURL + path)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", unavailable(errors.New("invalid student service URL"))
+	}
+	return parsed.String(), nil
+}
+
+func (client Client) authorize(request *http.Request) {
+	client.authorizeWithToken(request, client.InternalToken)
+}
+
+func (client Client) authorizeWithToken(request *http.Request, token string) {
+	request.Header.Set("X-Internal-Token", token)
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 3 * time.Second}
+	}
+	noRedirect := *httpClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := noRedirect.Do(request)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	return response, nil
+}
+
+func decodeStrict(reader io.Reader, target any) error {
+	limited := &io.LimitedReader{R: reader, N: maximumResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("student response must contain one JSON value")
+	}
+	if limited.N == 0 {
+		return errors.New("student response exceeds size limit")
+	}
+	return nil
+}
+
+func unavailable(cause error) error {
+	return fmt.Errorf("%w: %v", domain.ErrStudentStateUnavailable, cause)
+}
+
+func invalidStudentResponse(cause error) error {
+	return fmt.Errorf("%w: %w", domain.ErrStudentStateUnavailable, cause)
+}
+
+func studentJSONMediaType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && mediaType == "application/json"
+}
+
+func unavailableStatus(status string) error {
+	return fmt.Errorf("%w: unexpected student response %s", domain.ErrStudentStateUnavailable, status)
+}
+
+var _ repository.StudentLearningActionContextReader = Client{}
+var _ repository.StudentLearningActionCodeContextReader = Client{}
+var _ repository.StudentTargetMasteryReader = Client{}
+var _ repository.StudentLearnerOverviewReader = Client{}
+var _ repository.StudentLearningSessionGateway = Client{}
+var _ repository.StudentLearningWorkspaceReader = Client{}

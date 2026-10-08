@@ -1,0 +1,146 @@
+# Messaging contract
+
+The service owns two emitted subjects:
+
+- `teacher.decision.recorded`, schema version `2`.
+- `teacher.assistance.observed`, schema version `1`.
+
+The approved target is a dedicated `TEACHER_EVENTS` JetStream stream, PostgreSQL transactional outbox, versioned event envelopes, and idempotent consumers. The existing `ms-go-course` best-effort publisher must not be copied.
+
+The common envelope contains `event_id`, `event_type`, `correlation_id`, `causation_id`, `student_id`, `occurred_at`, `schema_version`, and `data`.
+
+It consumes `course.plan.completed` and `course.plan.failed`, schema version
+`1`, from `LEARNING_PLANNER_EVENTS` with durable
+`ms-teacher-course-plan-outcome-v1` and queue
+`ms-teacher-course-plan-outcome`. Only `source=TEACHER` outcomes have Teacher
+side effects; Student/System planning is acknowledged without local state. A
+Teacher outcome is accepted into `teacher_course_plan_notification_inbox`
+before a bounded localized business notification is appended to the originating
+Dialog, when `audit_refs.dialog_id` is present. The event ID is the Dialog
+idempotency key, so a crash after Dialog commit is repaired by replay. Provider
+errors, generated content, mastery, prompts, and chain-of-thought are excluded.
+
+When `TEACHER_ONBOARDING_PATH_OUTCOME_ENABLED` is enabled and migration 022 is
+installed, the service also consumes the exact
+`planner.onboarding-path.outcome.v1` subject from `LEARNING_PLANNER_EVENTS`
+with durable `ms-teacher-planner-onboarding-path-outcome-v1`. The strict v1
+envelope uses `correlation_id=execution_id` and `causation_id=handoff_id`; the
+data contains only the execution, exact S8 handoff, Student/Dialog/Teacher
+identities, and `PATH_READY`, `ACTIVE_PATH_EXISTS`, or `STATE_CHANGED`. The
+first status requires course/path/first-lesson IDs and the conflict statuses
+forbid them. Teacher resolves `handoff_id` through its immutable S8 ledger,
+rejects identity drift, persists the event/execution inbox, and appends one
+localized personal-teacher message using `event_id` as the Dialog idempotency
+key. No Planner graph, profile, provider, raw error, or browser identifier is
+accepted. Invalid contracts and identity drift terminate; transient database,
+readiness, or Dialog failures retry.
+
+It also consumes `learning_action.closed`, schema version `1`, from the `TASKANSWER_EVENTS` stream with durable `ms-teacher-learning-action-closed-v1`. This student-owned trigger contains `learning_action_id`, an action context, and zero to 100 frozen ordered targets. It deliberately contains no outcome, score, confidence, or mastery. Invalid/unknown/version-mismatched payloads are terminated; transient finalization failures are negatively acknowledged with delay.
+
+The service consumes bounded `learning.activity.interesting`, schema version
+`1`, from `LEARNING_ANALYTICS_EVENTS` with durable
+`ms-teacher-learning-activity-v1`. The envelope correlates by analytics session
+and contains only stable identities plus bounded counters. Student code,
+compiler/test output, raw errors, mastery, and dialog history are excluded.
+Invalid events terminate; transient persistence or Dialog failures are retried.
+The inbox, explainable decision, and decision outbox commit atomically. When the
+replaceable deterministic policy chooses an offer, it is appended to the same
+general PersonalTeacher Dialog with the source event ID as idempotency key.
+Only one offer may be delivered per student and analytics session; progress
+signals stay silent.
+
+The mounted consumer for `dialog.teacher.requested`, schema versions `1` and `2`, binds to
+`DIALOG_EVENTS` with durable `ms-teacher-dialog-requested-v1` and queue
+`ms-teacher-dialog-requested`. The Dialog-owned envelope contains only event,
+source, dialog, student, PersonalTeacher, educational-context, and optional
+LearningAction identities. Version 2 adds the positive dense
+`teacher_turn_sequence`, canonical student message, correlation and Dialog
+causation identities, with optional action-receipt and frozen reply metadata.
+`student_command_id` is not part of version 2 and is rejected even when null;
+Teacher derives or restores that private command identity after durable intake.
+The envelope contains no body, mastery, or history; Teacher
+loads a bounded window through the internal Dialog HTTP contract. Invalid JSON,
+unknown fields, unsupported versions, and invalid context shapes terminate;
+transient handler failures are negatively acknowledged with delay.
+
+The subscriber acknowledges only after `teacher_dialog_job` durably inserts the
+request or confirms that a redelivery is identical. Reuse of an event or source
+message identity with different metadata is terminated as a conflict. General,
+selected-text lesson, and action contexts are then processed asynchronously.
+
+Generation and delivery are separately recoverable. The source event ID is the
+stable confidential-execution and Dialog-append key. Decision, decision outbox,
+and pending response body commit together; the body survives append retries and
+is cleared after Dialog returns the verified committed message. Delivery remains
+independent from asynchronous assistance evidence and mastery recalculation.
+
+`teacher-turn-s0.v1` binds the source event, dense Teacher turn, Dialog,
+canonical student message, source message sequence, student and PersonalTeacher,
+correlation, and causation identities. Source message sequence is evidence only;
+eligibility uses the dense per-Dialog Teacher sequence. The cursor advances only
+after a confirmed delivered Teacher response or a durable `failed_no_effect`
+proof and recoverable outcome. `unknown`, `partial`, and
+`committed_unreconciled` remain blocking. AI Prompt is the only LLM boundary and
+has no Student mutation authority.
+
+The `data` payload for `teacher.decision.recorded` is the immutable `TeacherDecision` audit record. Version 2 adds `pedagogy_method`, `pedagogy_method_version`, and method-neutral `pedagogy_stage`, allowing methods to be replaced without losing audit identity. Task-scoped decisions include `learning_action_id` and use it as `correlation_id`. It contains context references and a bounded business reason, never chain-of-thought, prompts, raw student code, or dialog history.
+
+The `data` payload for `teacher.assistance.observed` is one immutable assistance summary for one `learning_action_id`:
+
+```json
+{
+  "learning_action_id": "action-cycle-uuid",
+  "context_type": "lesson_task",
+  "context_id": "task-id",
+  "support_context": "guided",
+  "hints_used": 2,
+  "max_hint_level": 3,
+  "intervention_used": false,
+  "observations": [
+    {
+      "target": {
+        "type": "concept",
+        "key": "go.error-wrapping",
+        "version": "optional-curriculum-version"
+      },
+      "kind": "hint_used"
+    }
+  ],
+  "policy_version": "teacher-assistance-v1"
+}
+```
+
+Allowed observation kinds are `independent_context`, `guided_context`, `hint_used`, and `intervention`. The target key is opaque and provider-neutral; `version` is optional until a canonical curriculum version is available. Success, failure, score, confidence, and mastery are forbidden teacher claims. `ms-go-student` combines these facts with its own objective outcomes later.
+
+Policy `teacher-assistance-v1` emits one independent/guided context observation per target, plus hint and intervention observations when those actions occurred. With at most 100 targets, the event therefore contains at most 300 observations. A closure with no targets is committed to the teacher inbox only and produces no assistance event.
+
+Delivery rules:
+
+- decision and outbox envelope commit in one PostgreSQL transaction;
+- relay delivery is at least once;
+- `event_id` is sent as `Nats-Msg-Id`;
+- relay claims use a lease long enough to cover the configured sequential batch timeout;
+- each publication waits for a JetStream acknowledgement;
+- retries use exponential delay from 1 second to 5 minutes and continue until acknowledged;
+- there is no destructive dead-letter move in this increment; `last_error` and `attempts` remain queryable in the outbox;
+- consumers must deduplicate by `event_id`;
+- consumed closure inbox, optional assistance row, and optional emitted envelope commit atomically;
+- consumed Dialog request is acknowledged only after durable job ownership or identical-duplicate verification;
+- generated decision, decision outbox envelope, and pending Dialog response commit atomically;
+- Dialog delivery retries use the source event ID and do not regenerate a staged response;
+- interesting-activity inbox, intervention decision, and decision outbox commit atomically;
+- proactive Dialog append uses the analytics event ID and is capped at one delivered offer per student/session;
+- Learning Planner outcome acceptance is durable before Dialog delivery, and
+  the plan event ID is the append idempotency key;
+- `learning_action.closed.correlation_id` equals `learning_action_id`, and `teacher.assistance.observed.causation_id` equals the closure `event_id`.
+
+Before adding another concrete producer or consumer, define:
+
+- event owner and semantic version;
+- stable event and causation identifiers;
+- idempotent consumer behavior;
+- payload and subject for each event;
+- retry and dead-letter behavior;
+- payload privacy and retention rules.
+
+`ms-go-student` applies `teacher.assistance.observed` asynchronously through a durable inbox transaction. A response to the student does not wait for evidence projection or future mastery recalculation.

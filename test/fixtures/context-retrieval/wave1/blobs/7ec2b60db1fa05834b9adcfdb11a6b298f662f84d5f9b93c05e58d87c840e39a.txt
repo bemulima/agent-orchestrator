@@ -1,0 +1,282 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	TeacherContextSummarySchemaCode    = "teacher.context-summary.v1"
+	TeacherContextSummaryPolicyVersion = "teacher-context-summary-policy-v1"
+
+	TeacherContextMaximumMessages        = 50
+	TeacherContextMaximumExcerptRunes    = 2000
+	TeacherContextMaximumExcerptBytes    = 64 << 10
+	TeacherContextMaximumBytes           = 160 << 10
+	TeacherContextMaximumRunes           = 50000
+	TeacherResponseVariablesMaximumBytes = 1 << 20
+	TeacherResponseVariablesMaximumRunes = 262144
+)
+
+var (
+	ErrInvalidTeacherContextSummary  = errors.New("invalid teacher context summary")
+	ErrTeacherContextSummaryConflict = errors.New("teacher context summary conflict")
+	ErrTeacherContextSourceTooLarge  = errors.New("teacher context source too large")
+)
+
+// TeacherContextScope identifies one Teacher-owned provisional memory. It is
+// intentionally narrower than a student: summaries never cross a Dialog or
+// educational context boundary.
+type TeacherContextScope struct {
+	StudentID         string
+	PersonalTeacherID string
+	DialogID          string
+	ContextType       LearningContextType
+	ContextID         string
+}
+
+func NewTeacherContextScope(input TeacherContextScope) (TeacherContextScope, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PersonalTeacherID = strings.TrimSpace(input.PersonalTeacherID)
+	input.DialogID = strings.TrimSpace(input.DialogID)
+	input.ContextID = strings.TrimSpace(input.ContextID)
+	if !validUUID(input.StudentID) || !validUUID(input.PersonalTeacherID) || !validUUID(input.DialogID) ||
+		!validTeacherDialogBindingContext(input.ContextType, input.ContextID) {
+		return TeacherContextScope{}, ErrInvalidTeacherContextSummary
+	}
+	return input, nil
+}
+
+type TeacherContextSummaryPayload struct {
+	Schema                 string   `json:"schema"`
+	Summary                string   `json:"summary"`
+	UnderstoodObservations []string `json:"understood_observations"`
+	OpenDifficulties       []string `json:"open_difficulties"`
+	AssistanceObservations []string `json:"assistance_observations"`
+	NextFocus              []string `json:"next_focus"`
+}
+
+func NormalizeTeacherContextSummaryPayload(input TeacherContextSummaryPayload) (TeacherContextSummaryPayload, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.Summary = strings.TrimSpace(input.Summary)
+	if input.Schema != TeacherContextSummarySchemaCode || !validBoundedSummaryText(input.Summary, 4000) ||
+		input.UnderstoodObservations == nil || input.OpenDifficulties == nil ||
+		input.AssistanceObservations == nil || input.NextFocus == nil {
+		return TeacherContextSummaryPayload{}, ErrInvalidTeacherContextSummary
+	}
+	var err error
+	if input.UnderstoodObservations, err = normalizeSummaryList(input.UnderstoodObservations); err != nil {
+		return TeacherContextSummaryPayload{}, err
+	}
+	if input.OpenDifficulties, err = normalizeSummaryList(input.OpenDifficulties); err != nil {
+		return TeacherContextSummaryPayload{}, err
+	}
+	if input.AssistanceObservations, err = normalizeSummaryList(input.AssistanceObservations); err != nil {
+		return TeacherContextSummaryPayload{}, err
+	}
+	if input.NextFocus, err = normalizeSummaryList(input.NextFocus); err != nil {
+		return TeacherContextSummaryPayload{}, err
+	}
+	return input, nil
+}
+
+type TeacherContextSummary struct {
+	Scope                  TeacherContextScope
+	CoveredFromSequence    int64
+	CoveredThroughSequence int64
+	DigestFromSequence     int64
+	DigestThroughSequence  int64
+	DigestEventSequence    int64
+	SourceDigest           string
+	Payload                TeacherContextSummaryPayload
+	SchemaCode             string
+	PolicyVersion          string
+	Revision               int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+func NormalizeTeacherContextSummary(input TeacherContextSummary) (TeacherContextSummary, error) {
+	scope, err := NewTeacherContextScope(input.Scope)
+	if err != nil {
+		return TeacherContextSummary{}, err
+	}
+	payload, err := NormalizeTeacherContextSummaryPayload(input.Payload)
+	if err != nil {
+		return TeacherContextSummary{}, err
+	}
+	input.SchemaCode = strings.TrimSpace(input.SchemaCode)
+	input.PolicyVersion = strings.TrimSpace(input.PolicyVersion)
+	input.SourceDigest = strings.ToLower(strings.TrimSpace(input.SourceDigest))
+	input.CreatedAt = input.CreatedAt.UTC()
+	input.UpdatedAt = input.UpdatedAt.UTC()
+	if input.CoveredFromSequence < 1 || input.CoveredThroughSequence < input.CoveredFromSequence ||
+		input.DigestFromSequence < input.CoveredFromSequence || input.DigestThroughSequence < input.DigestFromSequence ||
+		input.DigestThroughSequence > input.CoveredThroughSequence || input.DigestEventSequence < input.DigestThroughSequence ||
+		len(input.SourceDigest) != 64 || !isLowerHex(input.SourceDigest) ||
+		input.SchemaCode != TeacherContextSummarySchemaCode || input.PolicyVersion != TeacherContextSummaryPolicyVersion ||
+		input.Revision < 0 || input.CreatedAt.IsZero() || input.UpdatedAt.IsZero() || input.UpdatedAt.Before(input.CreatedAt) {
+		return TeacherContextSummary{}, ErrInvalidTeacherContextSummary
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil || len(encoded) > 128<<10 {
+		return TeacherContextSummary{}, ErrInvalidTeacherContextSummary
+	}
+	input.Scope = scope
+	input.Payload = payload
+	return input, nil
+}
+
+type TeacherContextSummaryUpdate struct {
+	Summary                 TeacherContextSummary
+	ExpectedThroughSequence int64
+	NewFromSequence         int64
+}
+
+func NormalizeTeacherContextSummaryUpdate(input TeacherContextSummaryUpdate) (TeacherContextSummaryUpdate, error) {
+	summary, err := NormalizeTeacherContextSummary(input.Summary)
+	if err != nil || input.ExpectedThroughSequence < 0 || input.NewFromSequence < 1 ||
+		(input.ExpectedThroughSequence == 0 && summary.CoveredFromSequence != input.NewFromSequence) ||
+		(input.ExpectedThroughSequence > 0 && (summary.CoveredFromSequence > input.ExpectedThroughSequence || input.NewFromSequence <= input.ExpectedThroughSequence)) ||
+		input.NewFromSequence > summary.CoveredThroughSequence {
+		return TeacherContextSummaryUpdate{}, ErrInvalidTeacherContextSummary
+	}
+	input.Summary = summary
+	return input, nil
+}
+
+type TeacherContextMessage struct {
+	AuthorType      DialogMessageAuthorType `json:"author_type"`
+	Body            string                  `json:"body"`
+	MessageSequence int64                   `json:"message_sequence"`
+	IsSource        bool                    `json:"is_source"`
+}
+
+type TeacherContextSummarizationRequest struct {
+	IdempotencyKey string
+	LanguageCode   string
+	Scope          TeacherContextScope
+	PriorSummary   *TeacherContextSummaryPayload
+	Messages       []TeacherContextMessage
+}
+
+func NormalizeTeacherContextSummarizationRequest(input TeacherContextSummarizationRequest) (TeacherContextSummarizationRequest, error) {
+	scope, err := NewTeacherContextScope(input.Scope)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.LanguageCode = strings.ToLower(strings.TrimSpace(input.LanguageCode))
+	if err != nil || !validUUID(input.IdempotencyKey) || (input.LanguageCode != "ru" && input.LanguageCode != "en") ||
+		len(input.Messages) < 1 || len(input.Messages) > TeacherContextMaximumMessages {
+		return TeacherContextSummarizationRequest{}, ErrInvalidTeacherContextSummary
+	}
+	var totalBytes int
+	previous := int64(0)
+	for index := range input.Messages {
+		message := &input.Messages[index]
+		if message.IsSource || (message.AuthorType != DialogMessageAuthorUser && message.AuthorType != DialogMessageAuthorPersonalTeacher) ||
+			message.MessageSequence <= previous || strings.TrimSpace(message.Body) == "" || !utf8.ValidString(message.Body) ||
+			utf8.RuneCountInString(message.Body) > TeacherContextMaximumExcerptRunes {
+			return TeacherContextSummarizationRequest{}, ErrInvalidTeacherContextSummary
+		}
+		totalBytes += len(message.Body)
+		previous = message.MessageSequence
+	}
+	if totalBytes > TeacherContextMaximumExcerptBytes {
+		return TeacherContextSummarizationRequest{}, ErrInvalidTeacherContextSummary
+	}
+	if input.PriorSummary != nil {
+		prior, priorErr := NormalizeTeacherContextSummaryPayload(*input.PriorSummary)
+		if priorErr != nil {
+			return TeacherContextSummarizationRequest{}, priorErr
+		}
+		input.PriorSummary = &prior
+	}
+	input.Scope = scope
+	return input, nil
+}
+
+type TeacherContextSummaryProjection struct {
+	Schema                 string                       `json:"schema"`
+	PolicyVersion          string                       `json:"policy_version"`
+	CoveredFromSequence    int64                        `json:"covered_from_sequence"`
+	CoveredThroughSequence int64                        `json:"covered_through_sequence"`
+	Observations           TeacherContextSummaryPayload `json:"observations"`
+}
+
+type TeacherPromptDialogContext struct {
+	Messages           []TeacherContextMessage          `json:"messages"`
+	ProvisionalSummary *TeacherContextSummaryProjection `json:"provisional_summary,omitempty"`
+}
+
+func NormalizeTeacherPromptDialogContext(input TeacherPromptDialogContext, sourceID string, dialog DialogRequestContext) (TeacherPromptDialogContext, error) {
+	if len(input.Messages) < 1 || len(input.Messages) > TeacherContextMaximumMessages {
+		return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+	}
+	var excerptBytes int
+	previous := int64(0)
+	sourceSequence := dialog.Messages[len(dialog.Messages)-1].MessageSequence
+	for index := range input.Messages {
+		message := &input.Messages[index]
+		if (message.AuthorType != DialogMessageAuthorUser && message.AuthorType != DialogMessageAuthorPersonalTeacher) ||
+			message.MessageSequence <= previous || strings.TrimSpace(message.Body) == "" || !utf8.ValidString(message.Body) ||
+			utf8.RuneCountInString(message.Body) > TeacherContextMaximumExcerptRunes {
+			return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+		}
+		excerptBytes += len(message.Body)
+		if message.IsSource {
+			if message.MessageSequence != sourceSequence || message.Body != dialog.Messages[len(dialog.Messages)-1].Body {
+				return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+			}
+		}
+		previous = message.MessageSequence
+	}
+	last := input.Messages[len(input.Messages)-1]
+	if !last.IsSource || last.MessageSequence != sourceSequence || excerptBytes > TeacherContextMaximumExcerptBytes || !validUUID(sourceID) {
+		return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+	}
+	if input.ProvisionalSummary != nil {
+		projection := input.ProvisionalSummary
+		payload, err := NormalizeTeacherContextSummaryPayload(projection.Observations)
+		if err != nil || projection.Schema != TeacherContextSummarySchemaCode ||
+			projection.PolicyVersion != TeacherContextSummaryPolicyVersion || projection.CoveredFromSequence < 1 ||
+			projection.CoveredThroughSequence < projection.CoveredFromSequence || projection.CoveredThroughSequence >= sourceSequence {
+			return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+		}
+		projection.Observations = payload
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil || len(encoded) > TeacherContextMaximumBytes || utf8.RuneCount(encoded) > TeacherContextMaximumRunes {
+		return TeacherPromptDialogContext{}, ErrInvalidTeacherGeneration
+	}
+	return input, nil
+}
+
+func normalizeSummaryList(values []string) ([]string, error) {
+	if len(values) > 8 {
+		return nil, ErrInvalidTeacherContextSummary
+	}
+	result := make([]string, len(values))
+	for index, value := range values {
+		value = strings.TrimSpace(value)
+		if !validBoundedSummaryText(value, 500) {
+			return nil, ErrInvalidTeacherContextSummary
+		}
+		result[index] = value
+	}
+	return result, nil
+}
+
+func validBoundedSummaryText(value string, maximum int) bool {
+	return value != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= maximum
+}
+
+func isLowerHex(value string) bool {
+	for _, symbol := range value {
+		if (symbol < '0' || symbol > '9') && (symbol < 'a' || symbol > 'f') {
+			return false
+		}
+	}
+	return true
+}

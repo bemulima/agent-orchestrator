@@ -1,0 +1,713 @@
+package domain
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/google/uuid"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
+)
+
+const HybridConsequenceSchema = "planner-hybrid-consequence.v1"
+const HybridOutcomeNoChange = "NO_CHANGE"
+const HybridOutcomeReplanNeeded = "REPLAN_NEEDED"
+const HybridApplicationAuto = "AUTO"
+const HybridApplicationRequiresIntent = "REQUIRES_INTENT"
+
+type HybridScopeIdentity struct {
+	GoalCode      string   `json:"goal_code"`
+	DirectionCode string   `json:"direction_code"`
+	DesiredStacks []string `json:"desired_stacks"`
+}
+
+type HybridFutureMutation struct {
+	Kind           string `json:"kind"`
+	ItemID         string `json:"learning_path_item_id"`
+	TargetPosition *int   `json:"target_position,omitempty"`
+	TemplateItemID string `json:"template_learning_path_item_id,omitempty"`
+	NewItemID      string `json:"new_learning_path_item_id,omitempty"`
+}
+
+type HybridRequestedChange struct {
+	Scope     HybridScopeIdentity    `json:"scope"`
+	Mutations []HybridFutureMutation `json:"mutations"`
+}
+
+type HybridLearningIntentProjection struct {
+	IntentID             string                `json:"intent_id"`
+	StudentID            string                `json:"student_id"`
+	LearningPathID       string                `json:"learning_path_id"`
+	ExpectedPathRevision int64                 `json:"expected_path_revision"`
+	Kind                 string                `json:"kind"`
+	RequestedChange      HybridRequestedChange `json:"requested_change"`
+	CreatedAt            time.Time             `json:"created_at"`
+}
+
+type HybridConsequence struct {
+	Schema               string                 `json:"schema"`
+	ConsequenceID        string                 `json:"consequence_id"`
+	StudentID            string                 `json:"student_id"`
+	LearningPathID       string                 `json:"learning_path_id"`
+	ExpectedPathRevision int64                  `json:"expected_path_revision"`
+	SnapshotRef          string                 `json:"snapshot_ref"`
+	SnapshotTargets      []LearningTargetRef    `json:"snapshot_targets"`
+	PolicyVersion        string                 `json:"policy_version"`
+	PolicyInputHash      string                 `json:"policy_input_hash"`
+	Outcome              string                 `json:"outcome"`
+	ApplicationMode      string                 `json:"application_mode,omitempty"`
+	ReasonCodes          []string               `json:"reason_codes"`
+	BaselineScope        HybridScopeIdentity    `json:"baseline_scope"`
+	DesiredScope         HybridScopeIdentity    `json:"desired_scope"`
+	Mutations            []HybridFutureMutation `json:"mutations"`
+	IntentID             string                 `json:"intent_id,omitempty"`
+	RequiredIntentKind   string                 `json:"required_intent_kind,omitempty"`
+}
+
+const HybridReplanPolicyVersion = "hybrid-replan-v1"
+const HybridApplicationApplied = "APPLIED"
+const HybridApplicationNoChange = "NO_CHANGE"
+const HybridApplicationWaitingSafeBoundary = "WAITING_SAFE_BOUNDARY"
+
+var (
+	ErrHybridStale          = errors.New("hybrid snapshot stale")
+	ErrHybridIntentRequired = errors.New("hybrid learner intent required")
+	ErrHybridConflict       = errors.New("hybrid semantic conflict")
+	ErrHybridUnsafe         = errors.New("hybrid unsafe mutation")
+	ErrHybridUnsupported    = errors.New("hybrid unsupported mutation")
+)
+
+type HybridLearningIntentReceipt struct {
+	Intent                  HybridLearningIntentProjection `json:"intent"`
+	PayloadHash             string                         `json:"payload_hash"`
+	Status                  string                         `json:"status"`
+	CommittedAt             time.Time                      `json:"committed_at"`
+	ConsumedAt              *time.Time                     `json:"consumed_at,omitempty"`
+	ConsumedByConsequenceID string                         `json:"consumed_by_consequence_id,omitempty"`
+}
+type HybridApplicationReceipt struct {
+	ConsequenceID     string    `json:"consequence_id"`
+	PayloadHash       string    `json:"payload_hash"`
+	LearningPathID    string    `json:"learning_path_id"`
+	PreviousRevision  int64     `json:"previous_revision"`
+	ResultingRevision int64     `json:"resulting_revision"`
+	Status            string    `json:"status"`
+	CommittedAt       time.Time `json:"committed_at"`
+}
+
+func hybridApplicationUUID(s string) bool { return IsCanonicalPracticeLearningActionUUID(s) }
+func hybridApplicationDigest(s string) bool {
+	if len(s) != 71 || !strings.HasPrefix(s, "sha256:") || s != strings.ToLower(s) {
+		return false
+	}
+	b, e := hex.DecodeString(s[7:])
+	return e == nil && len(b) == 32
+}
+func HybridConsequenceID(sid, pid, ref, policy string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("planner-hybrid-consequence.v1\x00"+sid+"\x00"+pid+"\x00"+ref+"\x00"+policy)).String()
+}
+func validateHybridScope(s HybridScopeIdentity) error {
+	code := func(v string) bool { return len(v) > 0 && len(v) <= 128 && v == strings.ToLower(strings.TrimSpace(v)) }
+	if !code(s.GoalCode) || !code(s.DirectionCode) || s.DesiredStacks == nil || len(s.DesiredStacks) > 100 {
+		return ErrValidation
+	}
+	for i, v := range s.DesiredStacks {
+		if !code(v) || (i > 0 && v <= s.DesiredStacks[i-1]) {
+			return ErrValidation
+		}
+	}
+	return nil
+}
+
+var hybridApplicationReasons = map[string]bool{"NO_SIGNIFICANT_CHANGE": true, "INSUFFICIENT_EVIDENCE_QUALITY": true, "UNSTABLE_MASTERY": true, "CONFIDENCE_INSUFFICIENT": true, "TARGET_MASTERED_STABLE": true, "NO_RELEVANT_FUTURE_ITEMS": true, "EXISTING_PREREQUISITE_GAP": true, "EXPLICIT_LEARNER_INTENT": true, "REQUIRES_LEARNER_INTENT": true}
+var hybridApplicationIntentKinds = map[string]bool{"CHANGE_GOAL": true, "CHANGE_DIRECTION": true, "CHANGE_TRACK": true, "CHANGE_TECH_STACK": true, "SUBSTANTIAL_SCOPE_CHANGE": true, "REPLACE_ACTIVE_ACTIVITY": true, "CANCEL_ACTIVE_ACTIVITY": true, "REMOVE_ACTIVE_PROJECT": true}
+
+func validateHybridApplicationMutation(m HybridFutureMutation) error {
+	if !hybridApplicationUUID(m.ItemID) {
+		return ErrValidation
+	}
+	switch m.Kind {
+	case "SKIP_REDUNDANT_PENDING_ITEM", "CANCEL_ACTIVE_ACTIVITY", "REMOVE_ACTIVE_PROJECT":
+		if m.TargetPosition != nil || m.TemplateItemID != "" || m.NewItemID != "" {
+			return ErrValidation
+		}
+	case "REORDER_PENDING_ITEMS":
+		if m.TargetPosition == nil || *m.TargetPosition < 0 || *m.TargetPosition > 499 || m.TemplateItemID != "" || m.NewItemID != "" {
+			return ErrValidation
+		}
+	case "REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM", "REPLACE_ACTIVE_ACTIVITY":
+		if !hybridApplicationUUID(m.TemplateItemID) || m.ItemID == m.TemplateItemID || m.TargetPosition != nil || m.NewItemID != "" {
+			return ErrValidation
+		}
+	case "INSERT_FUTURE_REMEDIATION":
+		if !hybridApplicationUUID(m.TemplateItemID) || !hybridApplicationUUID(m.NewItemID) || m.TargetPosition == nil || *m.TargetPosition < 0 || *m.TargetPosition > 499 {
+			return ErrValidation
+		}
+	default:
+		return ErrHybridUnsupported
+	}
+	return nil
+}
+func ValidateHybridConsequence(c HybridConsequence) error {
+	if c.Schema != HybridConsequenceSchema || !hybridApplicationUUID(c.StudentID) || !hybridApplicationUUID(c.LearningPathID) || c.ExpectedPathRevision < 1 || !hybridApplicationDigest(c.SnapshotRef) || !hybridApplicationDigest(c.PolicyInputHash) || c.PolicyVersion != HybridReplanPolicyVersion || c.ConsequenceID != HybridConsequenceID(c.StudentID, c.LearningPathID, c.SnapshotRef, c.PolicyVersion) || c.Mutations == nil || len(c.Mutations) > 500 || len(c.ReasonCodes) == 0 || validateHybridScope(c.BaselineScope) != nil || validateHybridScope(c.DesiredScope) != nil {
+		return ErrValidation
+	}
+	targets, e := NormalizePlanningSnapshotTargets(c.SnapshotTargets)
+	if e != nil || !reflect.DeepEqual(targets, c.SnapshotTargets) {
+		return ErrValidation
+	}
+	for i, r := range c.ReasonCodes {
+		if !hybridApplicationReasons[r] || (i > 0 && r <= c.ReasonCodes[i-1]) {
+			return ErrValidation
+		}
+	}
+	ids := map[string]bool{}
+	newids := map[string]bool{}
+	for i, m := range c.Mutations {
+		if validateHybridApplicationMutation(m) != nil || (i > 0 && m.ItemID <= c.Mutations[i-1].ItemID) {
+			return ErrValidation
+		}
+		ids[m.ItemID] = true
+	}
+	for _, m := range c.Mutations {
+		if m.NewItemID != "" {
+			if ids[m.NewItemID] || newids[m.NewItemID] {
+				return ErrValidation
+			}
+			newids[m.NewItemID] = true
+		}
+	}
+	switch c.Outcome {
+	case HybridOutcomeNoChange:
+		if c.ApplicationMode != "" || len(c.Mutations) != 0 || c.IntentID != "" || c.RequiredIntentKind != "" || !reflect.DeepEqual(c.BaselineScope, c.DesiredScope) {
+			return ErrValidation
+		}
+	case HybridOutcomeReplanNeeded:
+		switch c.ApplicationMode {
+		case HybridApplicationAuto:
+			if len(c.Mutations) == 0 || c.IntentID != "" || c.RequiredIntentKind != "" || !reflect.DeepEqual(c.BaselineScope, c.DesiredScope) {
+				return ErrValidation
+			}
+			for _, m := range c.Mutations {
+				if m.Kind == "REPLACE_ACTIVE_ACTIVITY" || m.Kind == "CANCEL_ACTIVE_ACTIVITY" || m.Kind == "REMOVE_ACTIVE_PROJECT" {
+					return ErrValidation
+				}
+			}
+		case HybridApplicationRequiresIntent:
+			if !hybridApplicationUUID(c.IntentID) || !hybridApplicationIntentKinds[c.RequiredIntentKind] || (len(c.Mutations) == 0 && reflect.DeepEqual(c.BaselineScope, c.DesiredScope)) {
+				return ErrValidation
+			}
+		default:
+			return ErrValidation
+		}
+	default:
+		return ErrValidation
+	}
+	return nil
+}
+func HybridConsequencePayloadHash(c HybridConsequence) (string, error) {
+	if e := ValidateHybridConsequence(c); e != nil {
+		return "", e
+	}
+	return planningSnapshotDigest(c)
+}
+func ValidateHybridLearningIntent(p HybridLearningIntentProjection) error {
+	if !hybridApplicationUUID(p.IntentID) || !hybridApplicationUUID(p.StudentID) || !hybridApplicationUUID(p.LearningPathID) || p.ExpectedPathRevision < 1 || p.CreatedAt.IsZero() || !hybridApplicationIntentKinds[p.Kind] || validateHybridScope(p.RequestedChange.Scope) != nil || p.RequestedChange.Mutations == nil || len(p.RequestedChange.Mutations) > 500 {
+		return ErrValidation
+	}
+	if p.Kind == "CHANGE_TRACK" {
+		return ErrHybridUnsupported
+	}
+	seen := map[string]bool{}
+	newids := map[string]bool{}
+	for _, m := range p.RequestedChange.Mutations {
+		if e := validateHybridApplicationMutation(m); e != nil {
+			return e
+		}
+		if seen[m.ItemID] {
+			return ErrHybridConflict
+		}
+		seen[m.ItemID] = true
+	}
+	for _, m := range p.RequestedChange.Mutations {
+		if m.NewItemID != "" {
+			if seen[m.NewItemID] || newids[m.NewItemID] {
+				return ErrHybridConflict
+			}
+			newids[m.NewItemID] = true
+		}
+	}
+	return nil
+}
+func ValidateHybridLearningIntentProjection(p HybridLearningIntentProjection, s StudentPlanningSnapshot) error {
+	if e := ValidateHybridLearningIntent(p); e != nil {
+		return e
+	}
+	if p.StudentID != s.StudentID || p.LearningPathID != s.LearningPathID || p.ExpectedPathRevision != s.Path.Version {
+		return ErrHybridStale
+	}
+	return nil
+}
+func HybridLearningIntentPayloadHash(p HybridLearningIntentProjection) (string, error) {
+	if e := ValidateHybridLearningIntent(p); e != nil {
+		return "", e
+	}
+	p.CreatedAt = time.Time{}
+	p.RequestedChange.Mutations = cloneHybridApplicationMutations(p.RequestedChange.Mutations)
+	sort.Slice(p.RequestedChange.Mutations, func(i, j int) bool {
+		return p.RequestedChange.Mutations[i].ItemID < p.RequestedChange.Mutations[j].ItemID
+	})
+	return planningSnapshotDigest(p)
+}
+func cloneHybridApplicationMutations(in []HybridFutureMutation) []HybridFutureMutation {
+	out := append([]HybridFutureMutation{}, in...)
+	for i := range out {
+		if out[i].TargetPosition != nil {
+			v := *out[i].TargetPosition
+			out[i].TargetPosition = &v
+		}
+	}
+	return out
+}
+func hybridApplicationScope(s StudentPlanningSnapshot) HybridScopeIdentity {
+	return HybridScopeIdentity{GoalCode: s.Path.GoalCode, DirectionCode: s.Profile.DirectionCode, DesiredStacks: append([]string{}, s.Profile.DesiredStacks...)}
+}
+func cloneHybridPath(p StudentLearningPath) StudentLearningPath {
+	p.Items = cloneHybridSlice(p.Items)
+	for i := range p.Items {
+		p.Items[i] = cloneHybridItem(p.Items[i])
+	}
+	return p
+}
+func cloneHybridItem(i LearningPathItem) LearningPathItem {
+	i.Targets = cloneHybridSlice(i.Targets)
+	i.FrozenRequirements = cloneHybridSlice(i.FrozenRequirements)
+	i.LessonContent = cloneHybridSlice(i.LessonContent)
+	return i
+}
+func cloneHybridSlice[T any](input []T) []T {
+	if input == nil {
+		return nil
+	}
+	output := make([]T, len(input))
+	copy(output, input)
+	return output
+}
+func hybridPathMatchesSnapshot(s StudentPlanningSnapshot, p StudentLearningPath) bool {
+	if s.StudentID != p.StudentID || s.LearningPathID != p.ID || s.Path.CourseID != p.CourseID || s.Path.GoalCode != p.GoalCode || s.Path.CourseFingerprint != p.CourseFingerprint || s.Path.PolicyVersion != p.PolicyVersion || s.Path.PlannerPolicyVersion != p.PlannerPolicyVersion || s.Path.Status != p.Status || s.Path.Version != p.Version || len(s.Path.Items) != len(p.Items) {
+		return false
+	}
+	for n, i := range p.Items {
+		w := s.Path.Items[n]
+		targets := append([]LearningTargetRef{}, i.Targets...)
+		sortPlanningTargets(targets)
+		if w.ID != i.ID || w.Position != i.Position || w.Status != i.Status || w.ReferenceType != i.ReferenceType || w.ReferenceID != i.ReferenceID || w.LessonRevisionID != i.LessonRevisionID || !reflect.DeepEqual(w.Targets, targets) || !PlanningSnapshotCanonicalEqual(w.FrozenRequirements, append([]LessonRequirement{}, i.FrozenRequirements...)) {
+			return false
+		}
+	}
+	return true
+}
+func hybridProtectedApplicationItems(s StudentPlanningSnapshot, p StudentLearningPath) (map[string]bool, int) {
+	protected := map[string]bool{}
+	boundary := -1
+	for _, i := range p.Items {
+		if i.Status != LearningPathItemPlanned {
+			protected[i.ID] = true
+			if i.Position > boundary {
+				boundary = i.Position
+			}
+		}
+		for _, r := range i.FrozenRequirements {
+			if r.Satisfied {
+				protected[i.ID] = true
+			}
+		}
+	}
+	for _, f := range s.ActivityFacts {
+		protected[f.ItemID] = true
+	}
+	for _, b := range s.CourseBindings {
+		if b.LifecycleStatus == "OPEN" {
+			protected[b.LearningPathItemID] = true
+		}
+	}
+	for _, b := range s.PracticeBindings {
+		if b.LifecycleStatus == PracticeLearningActionOpen || b.LifecycleStatus == PracticeLearningActionReserved {
+			for _, i := range p.Items {
+				if i.ID == b.LearningPathItemID || (b.LearningPathItemID == "" && i.ReferenceType == "practice" && i.ReferenceID == b.TaskRevisionID) {
+					protected[i.ID] = true
+				}
+			}
+		}
+	}
+	for _, i := range p.Items {
+		if i.Position <= boundary {
+			protected[i.ID] = true
+		}
+	}
+	return protected, boundary
+}
+func hybridHasOpenApplicationBinding(s StudentPlanningSnapshot) bool {
+	for _, item := range s.Path.Items {
+		if item.Status == LearningPathItemInProgress {
+			return true
+		}
+	}
+	for _, b := range s.CourseBindings {
+		if b.LifecycleStatus == "OPEN" {
+			return true
+		}
+	}
+	for _, b := range s.PracticeBindings {
+		if b.LifecycleStatus == PracticeLearningActionOpen || b.LifecycleStatus == PracticeLearningActionReserved {
+			return true
+		}
+	}
+	return false
+}
+func hybridIntentScopeKind(p HybridLearningIntentProjection, baseline HybridScopeIdentity) error {
+	desired := p.RequestedChange.Scope
+	switch p.Kind {
+	case "CHANGE_GOAL":
+		if desired.GoalCode == baseline.GoalCode || desired.DirectionCode != baseline.DirectionCode || !reflect.DeepEqual(desired.DesiredStacks, baseline.DesiredStacks) {
+			return ErrHybridConflict
+		}
+	case "CHANGE_DIRECTION":
+		if desired.DirectionCode == baseline.DirectionCode || desired.GoalCode != baseline.GoalCode || !reflect.DeepEqual(desired.DesiredStacks, baseline.DesiredStacks) {
+			return ErrHybridConflict
+		}
+	case "CHANGE_TECH_STACK":
+		if reflect.DeepEqual(desired.DesiredStacks, baseline.DesiredStacks) || desired.GoalCode != baseline.GoalCode || desired.DirectionCode != baseline.DirectionCode {
+			return ErrHybridConflict
+		}
+	case "CHANGE_TRACK":
+		return ErrHybridUnsupported
+	case "REPLACE_ACTIVE_ACTIVITY", "CANCEL_ACTIVE_ACTIVITY", "REMOVE_ACTIVE_PROJECT":
+		if !reflect.DeepEqual(desired, baseline) || len(p.RequestedChange.Mutations) != 1 || p.RequestedChange.Mutations[0].Kind != p.Kind {
+			return ErrHybridConflict
+		}
+	}
+	if reflect.DeepEqual(desired, baseline) && len(p.RequestedChange.Mutations) == 0 {
+		return ErrHybridConflict
+	}
+	return nil
+}
+func ValidateHybridLearningIntentForCreation(s StudentPlanningSnapshot, p StudentLearningPath, intent HybridLearningIntentProjection) error {
+	if _, err := NormalizeStudentPlanningSnapshot(s); err != nil {
+		return ErrHybridStale
+	}
+	if e := ValidateHybridLearningIntentProjection(intent, s); e != nil {
+		return e
+	}
+	if !hybridPathMatchesSnapshot(s, p) || p.Status != LearningPathStatusActive {
+		return ErrHybridStale
+	}
+	if e := hybridIntentScopeKind(intent, hybridApplicationScope(s)); e != nil {
+		return e
+	}
+	// Recording an exact learner request is distinct from accepting its state
+	// transition. Cancellation has no supported Student terminal state yet, but
+	// the meaningful request still belongs in durable owner intent history.
+	if intent.Kind == "CANCEL_ACTIVE_ACTIVITY" {
+		operation := intent.RequestedChange.Mutations[0]
+		for _, item := range p.Items {
+			if item.ID == operation.ItemID {
+				if item.Status == LearningPathItemReady || item.Status == LearningPathItemInProgress {
+					return nil
+				}
+				return ErrHybridUnsafe
+			}
+		}
+		return ErrHybridConflict
+	}
+	_, _, e := planHybridMutations(s, p, intent.RequestedChange.Mutations, true)
+	return e
+}
+func ValidateAndPlanHybridApplication(s StudentPlanningSnapshot, p StudentLearningPath, c HybridConsequence, intent *HybridLearningIntentProjection) (StudentLearningPath, string, error) {
+	unchanged := cloneHybridPath(p)
+	if e := ValidateHybridConsequence(c); e != nil {
+		return unchanged, "", e
+	}
+	if _, e := NormalizeStudentPlanningSnapshot(s); e != nil {
+		return unchanged, "", ErrHybridStale
+	}
+	if !hybridPathMatchesSnapshot(s, p) || c.StudentID != p.StudentID || c.LearningPathID != p.ID || c.ExpectedPathRevision != p.Version || c.SnapshotRef != s.References.SnapshotRef || !reflect.DeepEqual(c.SnapshotTargets, s.RequestedTargets) || !reflect.DeepEqual(c.BaselineScope, hybridApplicationScope(s)) {
+		return unchanged, "", ErrHybridStale
+	}
+	// All owner target facets influencing this path must be in the coherent
+	// requested set. The repository fences precisely this set with mastery locks;
+	// an otherwise valid subset snapshot cannot authorize a partial fence.
+	covered := map[string]bool{}
+	for _, target := range c.SnapshotTargets {
+		covered[targetIdentity(target)] = true
+	}
+	require := func(targets []LearningTargetRef) bool {
+		for _, target := range targets {
+			if !covered[targetIdentity(target)] {
+				return false
+			}
+		}
+		return true
+	}
+	for _, item := range p.Items {
+		if !require(item.Targets) {
+			return unchanged, "", ErrHybridStale
+		}
+	}
+	for _, binding := range s.CourseBindings {
+		if !require(binding.LearningTargets) {
+			return unchanged, "", ErrHybridStale
+		}
+	}
+	for _, binding := range s.PracticeBindings {
+		if !require(binding.LearningTargets) {
+			return unchanged, "", ErrHybridStale
+		}
+	}
+	if c.Outcome == HybridOutcomeNoChange {
+		return unchanged, HybridApplicationNoChange, nil
+	}
+	if p.Status != LearningPathStatusActive {
+		return unchanged, "", ErrHybridUnsafe
+	}
+	major := c.ApplicationMode == HybridApplicationRequiresIntent
+	if major {
+		if intent == nil {
+			return unchanged, "", ErrHybridIntentRequired
+		}
+		if s.PendingIntent == nil || !PlanningSnapshotCanonicalEqual(*s.PendingIntent, *intent) {
+			return unchanged, "", ErrHybridIntentRequired
+		}
+		if e := ValidateHybridLearningIntentForCreation(s, p, *intent); e != nil {
+			return unchanged, "", e
+		}
+		ops := cloneHybridApplicationMutations(intent.RequestedChange.Mutations)
+		sort.Slice(ops, func(i, j int) bool { return ops[i].ItemID < ops[j].ItemID })
+		if intent.IntentID != c.IntentID || intent.Kind != c.RequiredIntentKind || !reflect.DeepEqual(intent.RequestedChange.Scope, c.DesiredScope) || !reflect.DeepEqual(ops, c.Mutations) {
+			return unchanged, "", ErrHybridIntentRequired
+		}
+		if hybridHasOpenApplicationBinding(s) {
+			return unchanged, HybridApplicationWaitingSafeBoundary, nil
+		}
+		if !reflect.DeepEqual(c.DesiredScope, c.BaselineScope) {
+			return unchanged, "", ErrHybridUnsupported
+		}
+	}
+	for _, m := range c.Mutations {
+		if m.Kind == "INSERT_FUTURE_REMEDIATION" {
+			found := false
+			for _, r := range c.ReasonCodes {
+				found = found || r == "EXISTING_PREREQUISITE_GAP"
+			}
+			if !found {
+				return unchanged, "", ErrHybridUnsupported
+			}
+		}
+	}
+	planned, waiting, e := planHybridMutations(s, p, c.Mutations, major)
+	if e != nil {
+		return unchanged, "", e
+	}
+	if waiting {
+		return unchanged, HybridApplicationWaitingSafeBoundary, nil
+	}
+	if reflect.DeepEqual(planned.Items, p.Items) {
+		return unchanged, "", ErrHybridConflict
+	}
+	planned.Version = p.Version + 1
+	return planned, HybridApplicationApplied, nil
+}
+func planHybridMutations(s StudentPlanningSnapshot, p StudentLearningPath, ops []HybridFutureMutation, major bool) (StudentLearningPath, bool, error) {
+	result := cloneHybridPath(p)
+	protected, boundary := hybridProtectedApplicationItems(s, p)
+	indexes := map[string]int{}
+	reserved := map[string]bool{}
+	for n, i := range p.Items {
+		if !hybridApplicationUUID(i.ID) || reserved[i.ID] {
+			return result, false, ErrHybridConflict
+		}
+		indexes[i.ID] = n
+		reserved[i.ID] = true
+	}
+	waiting := false
+	authorizedReady := map[string]bool{}
+	for _, m := range ops {
+		n, ok := indexes[m.ItemID]
+		if !ok {
+			return result, false, ErrHybridConflict
+		}
+		i := p.Items[n]
+		active := m.Kind == "REPLACE_ACTIVE_ACTIVITY" || m.Kind == "CANCEL_ACTIVE_ACTIVITY" || m.Kind == "REMOVE_ACTIVE_PROJECT"
+		if active {
+			if !major {
+				return result, false, ErrHybridUnsafe
+			}
+			if i.Status != LearningPathItemReady && i.Status != LearningPathItemInProgress {
+				return result, false, ErrHybridUnsafe
+			}
+			if m.Kind == "REMOVE_ACTIVE_PROJECT" {
+				known := false
+				for _, b := range s.PracticeBindings {
+					known = known || (b.SurfaceClassification == "project" && (b.LifecycleStatus == PracticeLearningActionOpen || b.LifecycleStatus == PracticeLearningActionReserved) && (b.LearningPathItemID == i.ID || (b.LearningPathItemID == "" && i.ReferenceType == "practice" && b.TaskRevisionID == i.ReferenceID)))
+				}
+				if !known {
+					return result, false, ErrHybridUnsupported
+				}
+			}
+			if m.Kind == "REPLACE_ACTIVE_ACTIVITY" {
+				tn, ok := indexes[m.TemplateItemID]
+				if !ok || !hybridApplicationFrozenTemplate(s, p.Items[tn]) {
+					return result, false, ErrHybridUnsupported
+				}
+				started := hybridHasOpenApplicationBinding(s) || i.Status != LearningPathItemReady
+				for _, r := range i.FrozenRequirements {
+					started = started || r.Satisfied
+				}
+				for _, fact := range s.ActivityFacts {
+					started = started || fact.ItemID == i.ID
+				}
+				if !started {
+					authorizedReady[i.ID] = true
+					continue
+				}
+			} else if !hybridHasOpenApplicationBinding(s) && i.Status == LearningPathItemReady {
+				return result, false, ErrHybridUnsupported
+			}
+			waiting = true
+			continue
+		}
+		if protected[i.ID] || i.Status != LearningPathItemPlanned {
+			return result, false, ErrHybridUnsafe
+		}
+	}
+	if waiting {
+		future := []HybridFutureMutation{}
+		for _, op := range ops {
+			if op.Kind != "REPLACE_ACTIVE_ACTIVITY" && op.Kind != "CANCEL_ACTIVE_ACTIVITY" && op.Kind != "REMOVE_ACTIVE_PROJECT" {
+				future = append(future, op)
+			}
+		}
+		if _, _, err := planHybridMutations(s, p, future, false); err != nil {
+			return result, false, err
+		}
+		return result, true, nil
+	}
+	type insertion struct {
+		position int
+		item     LearningPathItem
+	}
+	insertions := []insertion{}
+	moves := map[int]LearningPathItem{}
+	sources := map[int]bool{}
+	for _, m := range ops {
+		n := indexes[m.ItemID]
+		old := result.Items[n]
+		switch m.Kind {
+		case "SKIP_REDUNDANT_PENDING_ITEM":
+			result.Items[n].Status = LearningPathItemSkippedMastered
+		case "REORDER_PENDING_ITEMS":
+			destination := *m.TargetPosition
+			if destination >= len(p.Items) || destination == old.Position || protected[p.Items[destination].ID] || p.Items[destination].Status != LearningPathItemPlanned {
+				return result, false, ErrHybridUnsafe
+			}
+			if _, ok := moves[destination]; ok {
+				return result, false, ErrHybridConflict
+			}
+			moves[destination] = old
+			sources[old.Position] = true
+		case "REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM", "INSERT_FUTURE_REMEDIATION", "REPLACE_ACTIVE_ACTIVITY":
+			tn, ok := indexes[m.TemplateItemID]
+			if !ok {
+				return result, false, ErrHybridConflict
+			}
+			template := p.Items[tn]
+			if !hybridApplicationFrozenTemplate(s, template) {
+				return result, false, ErrHybridUnsupported
+			}
+			replacement := cloneHybridItem(template)
+			replacement.Status = LearningPathItemPlanned
+			for k := range replacement.FrozenRequirements {
+				replacement.FrozenRequirements[k].Satisfied = false
+			}
+			if m.Kind == "REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM" || m.Kind == "REPLACE_ACTIVE_ACTIVITY" {
+				a := append([]LearningTargetRef{}, old.Targets...)
+				b := append([]LearningTargetRef{}, template.Targets...)
+				sortPlanningTargets(a)
+				sortPlanningTargets(b)
+				if m.Kind == "REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM" && !reflect.DeepEqual(a, b) {
+					return result, false, ErrHybridUnsupported
+				}
+				replacement.ID = old.ID
+				replacement.Position = old.Position
+				replacement.Status = old.Status
+				replacement.ReasonCode = old.ReasonCode
+				result.Items[n] = replacement
+			} else {
+				if reserved[m.NewItemID] || *m.TargetPosition <= boundary || *m.TargetPosition < old.Position || *m.TargetPosition > len(p.Items) || len(p.Items)+len(insertions) >= 500 {
+					return result, false, ErrHybridConflict
+				}
+				reserved[m.NewItemID] = true
+				replacement.ID = m.NewItemID
+				insertions = append(insertions, insertion{*m.TargetPosition, replacement})
+			}
+		default:
+			return result, false, ErrHybridUnsupported
+		}
+	}
+	if len(moves) != len(sources) {
+		return result, false, ErrHybridConflict
+	}
+	for position := range moves {
+		if !sources[position] {
+			return result, false, ErrHybridConflict
+		}
+	}
+	for position, item := range moves {
+		item.Position = position
+		result.Items[position] = item
+	}
+	sort.Slice(insertions, func(i, j int) bool {
+		if insertions[i].position != insertions[j].position {
+			return insertions[i].position < insertions[j].position
+		}
+		return insertions[i].item.ID < insertions[j].item.ID
+	})
+	if len(insertions) > 0 {
+		out := []LearningPathItem{}
+		k := 0
+		for n := 0; n <= len(result.Items); n++ {
+			for k < len(insertions) && insertions[k].position == n {
+				out = append(out, insertions[k].item)
+				k++
+			}
+			if n < len(result.Items) {
+				out = append(out, result.Items[n])
+			}
+		}
+		result.Items = out
+		for n := range result.Items {
+			result.Items[n].Position = n
+		}
+	}
+	for n, i := range p.Items {
+		if protected[i.ID] && !authorizedReady[i.ID] && !reflect.DeepEqual(i, result.Items[n]) {
+			return result, false, ErrHybridUnsafe
+		}
+	}
+	return result, false, nil
+}
+func hybridApplicationFrozenTemplate(s StudentPlanningSnapshot, i LearningPathItem) bool {
+	if i.ReferenceType == "lesson" {
+		return i.LessonRevisionID != "" && len(i.FrozenRequirements) > 0 && ValidateLessonAssignment(i) == nil && len(i.LessonContent) > 0 && json.Valid(i.LessonContent)
+	}
+	if i.ReferenceType == "practice" {
+		for _, b := range s.PracticeBindings {
+			if b.TaskRevisionID == i.ReferenceID && hybridApplicationDigest(b.TaskRevisionDigest) {
+				return true
+			}
+		}
+	}
+	return false
+}

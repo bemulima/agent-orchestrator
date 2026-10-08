@@ -1,0 +1,458 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// CourseRepoPG implements CourseRepository.
+type CourseRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+const coursePreviewSelectColumns = "c.id AS id, c.slug AS slug, COALESCE(ci.title, ci_fallback.title) AS title, COALESCE(ci.description, ci_fallback.description) AS description"
+
+// Create inserts course.
+func (r CourseRepoPG) Create(ctx context.Context, course domain.Course) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO course (id, slug, source_key, created_at, updated_at, main_tech_id, status, catalog_visible, lesson_read_access) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7,$8,$9)`,
+		course.ID, course.Slug, course.SourceKey, course.CreatedAt, course.UpdatedAt, course.MainTechID, course.Status, course.CatalogVisible, course.LessonReadAccess)
+	return err
+}
+
+// GetBySlug finds course by slug.
+func (r CourseRepoPG) GetBySlug(ctx context.Context, slug string) (*domain.Course, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, created_at, updated_at, main_tech_id, status, catalog_visible, lesson_read_access FROM course WHERE slug=$1`, slug)
+	var c domain.Course
+	if err := row.Scan(&c.ID, &c.Slug, &c.CreatedAt, &c.UpdatedAt, &c.MainTechID, &c.Status, &c.CatalogVisible, &c.LessonReadAccess); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
+// GetByID fetches course by id.
+func (r CourseRepoPG) GetByID(ctx context.Context, id string) (*domain.Course, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `SELECT id, slug, created_at, updated_at, main_tech_id, status, catalog_visible, lesson_read_access FROM course WHERE id=$1`, id)
+	var c domain.Course
+	if err := row.Scan(&c.ID, &c.Slug, &c.CreatedAt, &c.UpdatedAt, &c.MainTechID, &c.Status, &c.CatalogVisible, &c.LessonReadAccess); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
+// Update updates course slug and main tech.
+func (r CourseRepoPG) Update(ctx context.Context, course domain.Course) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `UPDATE course SET slug=$1, main_tech_id=$2, status=$3, catalog_visible=$4, lesson_read_access=$5, updated_at=now() WHERE id=$6`,
+		course.Slug, course.MainTechID, course.Status, course.CatalogVisible, course.LessonReadAccess, course.ID)
+	return err
+}
+
+// Delete marks course as inactive.
+func (r CourseRepoPG) Delete(ctx context.Context, courseID string) error {
+	runner := getRunner(ctx, r.Pool)
+	cmd, err := runner.Exec(ctx, `UPDATE course SET status=$1, updated_at=now() WHERE id=$2`, domain.CourseStatusNoActive, courseID)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return err
+}
+
+// List returns localized course previews.
+func (r CourseRepoPG) List(ctx context.Context, lang string, courseFilters filters.CourseFilters, sort *filters.SortOptions) ([]domain.CoursePreview, error) {
+	query, args := r.buildListQuery(lang, coursePreviewSelectColumns, courseFilters, sort)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var res []domain.CoursePreview
+	for rows.Next() {
+		var c domain.CoursePreview
+		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.Description); err != nil {
+			return nil, err
+		}
+		res = append(res, c)
+	}
+	return res, nil
+}
+
+// ListFields returns localized course previews with selected fields.
+func (r CourseRepoPG) ListFields(ctx context.Context, lang string, f queryfields.Set, courseFilters filters.CourseFilters, sort *filters.SortOptions) ([]map[string]any, int, error) {
+	selectCols := selectColumns(f, coursePreviewFieldSQL)
+	if selectCols == "" {
+		selectCols = coursePreviewSelectColumns
+	}
+	query, args := r.buildListQuery(lang, selectCols, courseFilters, sort)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var res []map[string]any
+	for rows.Next() {
+		row, err := ScanRowToMap(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		res = append(res, row)
+	}
+
+	total, err := r.countListTotal(ctx, lang, courseFilters)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return res, total, nil
+}
+
+func (r CourseRepoPG) countListTotal(ctx context.Context, lang string, courseFilters filters.CourseFilters) (int, error) {
+	query, args := r.buildListCountQuery(lang, courseFilters)
+	var total int
+	runner := getRunner(ctx, r.Pool)
+	if err := runner.QueryRow(ctx, query, args...).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// buildListQuery builds SQL query with filters, sorting, and pagination.
+func (r CourseRepoPG) buildListQuery(lang string, selectCols string, courseFilters filters.CourseFilters, sort *filters.SortOptions) (string, []interface{}) {
+	query, args, argIdx := r.buildListBaseQuery(lang, selectCols, courseFilters)
+
+	// Build ORDER BY
+	orderBy := "c.created_at DESC" // default
+	if courseFilters.CatalogOrdered {
+		orderBy = `catalog_path.track_order ASC NULLS LAST,
+			catalog_path.track_key ASC,
+			catalog_path.level_order ASC,
+			catalog_path.level_key ASC,
+			catalog_path.group_order ASC,
+			catalog_path.group_key ASC,
+			catalog_path.course_order ASC,
+			c.id ASC`
+	} else if sort != nil {
+		switch sort.Field {
+		case filters.SortFieldCreatedAt:
+			orderBy = fmt.Sprintf("c.created_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldUpdatedAt:
+			orderBy = fmt.Sprintf("c.updated_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldTitle:
+			orderBy = fmt.Sprintf("COALESCE(ci.title, ci_fallback.title) %s", strings.ToUpper(string(sort.Order)))
+		}
+	}
+	query += " ORDER BY " + orderBy
+
+	_, limit, offset := filters.NormalizePagination(courseFilters.Page, courseFilters.Limit)
+	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	return query, args
+}
+
+func (r CourseRepoPG) buildListCountQuery(lang string, courseFilters filters.CourseFilters) (string, []interface{}) {
+	query, args, _ := r.buildListBaseQuery(lang, "COUNT(*)", courseFilters)
+	return query, args
+}
+
+// buildListBaseQuery builds SQL query with joins and filters, without ordering or pagination.
+func (r CourseRepoPG) buildListBaseQuery(lang string, selectCols string, courseFilters filters.CourseFilters) (string, []interface{}, int) {
+	var args []interface{}
+	argIdx := 1
+
+	if selectCols == "" {
+		selectCols = coursePreviewSelectColumns
+	}
+
+	query := fmt.Sprintf(`
+WITH lang AS (
+    SELECT id FROM i18n WHERE language = $%d
+)
+SELECT %s
+FROM course c
+LEFT JOIN lang l ON TRUE
+LEFT JOIN course_i18n ci ON ci.course_id = c.id AND l.id = ci.i18n_id
+LEFT JOIN LATERAL (
+    SELECT ci2.title, ci2.description
+    FROM course_i18n ci2
+    WHERE ci2.course_id = c.id
+    ORDER BY ci2.i18n_id
+    LIMIT 1
+) ci_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT jsonb_agg(jsonb_build_object('id', t.id, 'slug', t.slug, 'name', t.name) ORDER BY t.name) AS tags
+    FROM course_tag ct
+    JOIN tag t ON t.id = ct.tag_id
+    WHERE ct.course_id = c.id
+) course_tags ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        jsonb_agg(ct.tech_id ORDER BY ct.tech_id) AS tech_ids,
+        jsonb_agg(jsonb_build_object('id', t.id, 'label', t.label) ORDER BY t.label) AS techs
+    FROM course_tech ct
+    JOIN tech t ON t.id = ct.tech_id
+    WHERE ct.course_id = c.id
+) course_techs ON TRUE
+	LEFT JOIN LATERAL (
+	    SELECT COUNT(DISTINCT lsn.id)::int AS lesson_count
+	    FROM course_module cm
+	    JOIN module_section ms ON ms.module_id = cm.module_id
+	    JOIN section_lesson sl ON sl.section_id = ms.section_id
+	    JOIN lesson lsn ON lsn.id = sl.lesson_id
+	    WHERE cm.course_id = c.id
+	) course_lessons ON TRUE
+`, argIdx, selectCols)
+	args = append(args, lang)
+	argIdx++
+
+	if courseFilters.CatalogOrdered {
+		catalogPathConditions := []string{"cgc.course_id = c.id", "cgc.status = 1"}
+		if courseFilters.TrackSlug != nil {
+			catalogPathConditions = append(catalogPathConditions, fmt.Sprintf("t.slug = $%d", argIdx))
+			args = append(args, *courseFilters.TrackSlug)
+			argIdx++
+		}
+		if courseFilters.LevelSlug != nil {
+			catalogPathConditions = append(catalogPathConditions, fmt.Sprintf("cl.slug = $%d", argIdx))
+			args = append(args, *courseFilters.LevelSlug)
+			argIdx++
+		}
+		query += fmt.Sprintf(`
+JOIN LATERAL (
+    SELECT
+        t."order" AS track_order,
+        COALESCE(t.source_key, t.id::text) AS track_key,
+        tl."order" AS level_order,
+        COALESCE(cl.source_key, cl.id::text) AS level_key,
+        lcg."order" AS group_order,
+        COALESCE(cg.source_key, cg.id::text) AS group_key,
+        cgc."order" AS course_order
+    FROM course_group_course cgc
+    JOIN course_group cg ON cg.id = cgc.group_id AND cg.status = 1
+    JOIN level_course_group lcg ON lcg.group_id = cg.id AND lcg.status = 1
+    JOIN course_level cl ON cl.id = lcg.level_id AND cl.status = 1
+    JOIN track_level tl ON tl.level_id = cl.id AND tl.status = 1
+    JOIN track t ON t.id = tl.track_id AND t.status = 1
+    WHERE %s
+    ORDER BY
+        t."order" ASC NULLS LAST,
+        COALESCE(t.source_key, t.id::text) ASC,
+        tl."order" ASC,
+        COALESCE(cl.source_key, cl.id::text) ASC,
+        lcg."order" ASC,
+        COALESCE(cg.source_key, cg.id::text) ASC,
+        cgc."order" ASC,
+        cgc.group_id ASC
+    LIMIT 1
+) catalog_path ON TRUE
+`, strings.Join(catalogPathConditions, " AND "))
+	}
+
+	// Build WHERE conditions
+	var whereConditions []string
+	if courseFilters.ID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("c.id = $%d", argIdx))
+		args = append(args, *courseFilters.ID)
+		argIdx++
+	}
+	if courseFilters.Slug != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("c.slug = $%d", argIdx))
+		args = append(args, *courseFilters.Slug)
+		argIdx++
+	}
+	if courseFilters.Status != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("c.status = $%d", argIdx))
+		args = append(args, *courseFilters.Status)
+		argIdx++
+	}
+	if courseFilters.CatalogVisible != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("c.catalog_visible = $%d", argIdx))
+		args = append(args, *courseFilters.CatalogVisible)
+		argIdx++
+	}
+	if courseFilters.Title != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("(COALESCE(ci.title, ci_fallback.title) ILIKE $%d)", argIdx))
+		args = append(args, "%"+*courseFilters.Title+"%")
+		argIdx++
+	}
+	if courseFilters.TagID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("EXISTS (SELECT 1 FROM course_tag ct WHERE ct.course_id = c.id AND ct.tag_id = $%d)", argIdx))
+		args = append(args, *courseFilters.TagID)
+		argIdx++
+	}
+	if courseFilters.TagSlug != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("EXISTS (SELECT 1 FROM course_tag ct JOIN tag t ON t.id = ct.tag_id WHERE ct.course_id = c.id AND t.slug = $%d)", argIdx))
+		args = append(args, *courseFilters.TagSlug)
+		argIdx++
+	}
+	if courseFilters.CourseGroupID != nil {
+		activeClause := ""
+		groupJoin := ""
+		if courseFilters.CatalogActiveOnly {
+			groupJoin = " JOIN course_group cg ON cg.id = cgc.group_id"
+			activeClause = " AND cgc.status = 1 AND cg.status = 1"
+		}
+		whereConditions = append(whereConditions, fmt.Sprintf("EXISTS (SELECT 1 FROM course_group_course cgc%s WHERE cgc.course_id = c.id AND cgc.group_id = $%d%s)", groupJoin, argIdx, activeClause))
+		args = append(args, *courseFilters.CourseGroupID)
+		argIdx++
+	}
+	if courseFilters.LevelID != nil {
+		activeJoins := ""
+		activeClause := ""
+		if courseFilters.CatalogActiveOnly {
+			activeJoins = `
+			JOIN course_group cg ON cg.id = cgc.group_id
+			JOIN course_level cl ON cl.id = lcg.level_id`
+			activeClause = " AND cgc.status = 1 AND lcg.status = 1 AND cg.status = 1 AND cl.status = 1"
+		}
+		whereConditions = append(whereConditions, fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM course_group_course cgc
+			JOIN level_course_group lcg ON lcg.group_id = cgc.group_id
+			%s
+			WHERE cgc.course_id = c.id AND lcg.level_id = $%d%s
+		)`, activeJoins, argIdx, activeClause))
+		args = append(args, *courseFilters.LevelID)
+		argIdx++
+	}
+	if courseFilters.TrackID != nil {
+		activeJoins := ""
+		activeClause := ""
+		if courseFilters.CatalogActiveOnly {
+			activeJoins = `
+			JOIN course_group cg ON cg.id = cgc.group_id
+			JOIN course_level cl ON cl.id = lcg.level_id
+			JOIN track t ON t.id = tl.track_id`
+			activeClause = " AND cgc.status = 1 AND lcg.status = 1 AND tl.status = 1 AND cg.status = 1 AND cl.status = 1 AND t.status = 1"
+		}
+		whereConditions = append(whereConditions, fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM course_group_course cgc
+			JOIN level_course_group lcg ON lcg.group_id = cgc.group_id
+			JOIN track_level tl ON tl.level_id = lcg.level_id
+			%s
+			WHERE cgc.course_id = c.id AND tl.track_id = $%d%s
+		)`, activeJoins, argIdx, activeClause))
+		args = append(args, *courseFilters.TrackID)
+		argIdx++
+	}
+	if !courseFilters.CatalogOrdered && courseFilters.TrackSlug != nil && courseFilters.LevelSlug != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM course_group_course cgc
+			JOIN course_group cg ON cg.id = cgc.group_id
+			JOIN level_course_group lcg ON lcg.group_id = cg.id
+			JOIN course_level cl ON cl.id = lcg.level_id
+			JOIN track_level tl ON tl.level_id = cl.id
+			JOIN track t ON t.id = tl.track_id
+			WHERE cgc.course_id = c.id
+				AND t.slug = $%d
+				AND cl.slug = $%d
+				AND cgc.status = 1
+				AND cg.status = 1
+				AND lcg.status = 1
+				AND cl.status = 1
+				AND tl.status = 1
+				AND t.status = 1
+		)`, argIdx, argIdx+1))
+		args = append(args, *courseFilters.TrackSlug, *courseFilters.LevelSlug)
+		argIdx += 2
+	}
+
+	if len(whereConditions) > 0 {
+		query += " WHERE " + strings.Join(whereConditions, " AND ")
+	}
+
+	return query, args, argIdx
+}
+
+// GetByIDWithFields returns course with selected fields.
+func (r CourseRepoPG) GetByIDWithFields(ctx context.Context, id string, f queryfields.Set) (map[string]any, error) {
+	cols := columnsWithAliases(f, courseFieldSQL)
+	if len(cols) == 0 {
+		cols = []string{
+			"c.id AS id",
+			"c.slug AS slug",
+			"c.created_at AS created_at",
+			"c.updated_at AS updated_at",
+			"c.main_tech_id AS main_tech_id",
+			"c.status AS status",
+			"c.catalog_visible AS catalog_visible",
+		}
+	}
+	selectCols := strings.Join(cols, ", ")
+
+	query := fmt.Sprintf(`SELECT %s
+FROM course c
+LEFT JOIN LATERAL (
+    SELECT ci2.title, ci2.description
+    FROM course_i18n ci2
+    WHERE ci2.course_id = c.id
+    ORDER BY ci2.i18n_id
+    LIMIT 1
+) ci_fallback ON TRUE
+LEFT JOIN LATERAL (
+    SELECT jsonb_agg(jsonb_build_object('id', t.id, 'slug', t.slug, 'name', t.name) ORDER BY t.name) AS tags
+    FROM course_tag ct
+    JOIN tag t ON t.id = ct.tag_id
+    WHERE ct.course_id = c.id
+) course_tags ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        jsonb_agg(ct.tech_id ORDER BY ct.tech_id) AS tech_ids,
+        jsonb_agg(jsonb_build_object('id', t.id, 'label', t.label) ORDER BY t.label) AS techs
+    FROM course_tech ct
+    JOIN tech t ON t.id = ct.tech_id
+    WHERE ct.course_id = c.id
+) course_techs ON TRUE
+	LEFT JOIN LATERAL (
+	    SELECT COUNT(DISTINCT lsn.id)::int AS lesson_count
+	    FROM course_module cm
+	    JOIN module_section ms ON ms.module_id = cm.module_id
+	    JOIN section_lesson sl ON sl.section_id = ms.section_id
+	    JOIN lesson lsn ON lsn.id = sl.lesson_id
+	    WHERE cm.course_id = c.id
+	) course_lessons ON TRUE
+WHERE c.id=$1`, selectCols)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, domain.ErrNotFound
+	}
+
+	return ScanRowToMap(rows)
+}
+
+// Ensure interfaces.
+var _ repository.CourseRepository = (*CourseRepoPG)(nil)

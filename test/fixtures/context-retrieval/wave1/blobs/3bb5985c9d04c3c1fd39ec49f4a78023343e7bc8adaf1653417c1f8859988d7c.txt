@@ -1,0 +1,99 @@
+package onboarding
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// PathOutcomeHandler consumes Planner's durable S9 terminal fact. Correlation
+// is performed only through the immutable S8 handoff ledger; Student/Dialog
+// IDs from the event are never used as a lookup shortcut.
+type PathOutcomeHandler struct {
+	Handoffs  repository.TeacherOnboardingPathOutcomeCorrelator
+	Outcomes  repository.TeacherOnboardingPathOutcomeStore
+	Readiness repository.TeacherLearningReadinessResolver
+	Dialogs   repository.DialogTeacherProactiveAppender
+	Clock     Clock
+}
+
+func (handler PathOutcomeHandler) Handle(ctx context.Context, raw domain.TeacherOnboardingPathOutcome) (bool, error) {
+	outcome, err := domain.NormalizeTeacherOnboardingPathOutcome(raw)
+	if err != nil {
+		return false, err
+	}
+	if handler.Handoffs == nil || handler.Outcomes == nil || handler.Readiness == nil || handler.Dialogs == nil || handler.Clock == nil {
+		return false, errors.New("teacher onboarding path outcome dependencies are required")
+	}
+	handoff, found, err := handler.Handoffs.GetByPlannerHandoffID(ctx, outcome.HandoffID)
+	if err != nil {
+		return false, err
+	}
+	if !found || handoff.StudentID != outcome.StudentID || handoff.DialogID != outcome.DialogID || handoff.CommandTeacherJobID != outcome.TeacherJobID || handoff.PlannerHandoffID != outcome.HandoffID {
+		return false, domain.ErrInvalidTeacherOnboardingPathOutcome
+	}
+	if err := handler.validateAuthoritativeStatus(ctx, outcome, handoff); err != nil {
+		return false, err
+	}
+	record, created, err := handler.Outcomes.Accept(ctx, domain.TeacherOnboardingPathOutcomeRecord{
+		Outcome: outcome, PersonalTeacherID: handoff.PersonalTeacherID,
+		Body: domain.TeacherOnboardingPathOutcomeBody(handoff.Locale, outcome.Status), AcceptedAt: handler.Clock.Now().UTC(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if record.DeliveredAt != nil {
+		return created, nil
+	}
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: outcome.DialogID, StudentID: outcome.StudentID, PersonalTeacherID: handoff.PersonalTeacherID,
+		ContextType: domain.LearningContextGeneral,
+	})
+	if err != nil {
+		return false, err
+	}
+	message, err := handler.Dialogs.AppendTeacherProactive(ctx, binding, outcome.EventID, record.Body)
+	if err != nil {
+		return false, err
+	}
+	if message.DialogID != outcome.DialogID || message.PersonalTeacherID != handoff.PersonalTeacherID || message.Body != record.Body || message.Version < 1 {
+		return false, domain.ErrInvalidTeacherOnboardingPathOutcome
+	}
+	if err := handler.Outcomes.MarkDelivered(ctx, outcome.EventID, message.ID, handler.Clock.Now().UTC()); err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
+func (handler PathOutcomeHandler) validateAuthoritativeStatus(ctx context.Context, outcome domain.TeacherOnboardingPathOutcome, handoff domain.TeacherOnboardingHandoffIntent) error {
+	switch outcome.Status {
+	case domain.TeacherOnboardingPathReady:
+		// Planner's PATH_READY payload is the durable commit fact. Ensure will
+		// re-read the authoritative Student/Planner readiness before presenting
+		// ACTIVE_PATH_EXISTS to the browser.
+		return nil
+	case domain.TeacherOnboardingPathActiveExists:
+		readiness, err := handler.Readiness.ResolveLearningReadiness(ctx, handoff.StudentID, handoff.StateRef)
+		if err != nil {
+			return err
+		}
+		readiness, err = domain.NormalizeTeacherLearningReadiness(readiness, &handoff.StateRef)
+		if err != nil || readiness.Result != domain.TeacherLearningReadinessNotReady || len(readiness.ReasonCodes) != 1 || readiness.ReasonCodes[0] != domain.TeacherReadinessReasonActivePathExists || readiness.ActivePath == nil {
+			return domain.ErrInvalidTeacherOnboardingPathOutcome
+		}
+		return nil
+	case domain.TeacherOnboardingPathStateChanged:
+		_, err := handler.Readiness.ResolveLearningReadiness(ctx, handoff.StudentID, handoff.StateRef)
+		if !errors.Is(err, domain.ErrTeacherLearningReadinessStale) {
+			if err == nil {
+				return domain.ErrInvalidTeacherOnboardingPathOutcome
+			}
+			return err
+		}
+		return nil
+	default:
+		return domain.ErrInvalidTeacherOnboardingPathOutcome
+	}
+}

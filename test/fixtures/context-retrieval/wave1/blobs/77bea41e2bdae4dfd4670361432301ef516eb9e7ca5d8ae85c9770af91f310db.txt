@@ -1,0 +1,198 @@
+package lessonrevision
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"sort"
+	"time"
+)
+
+type Definitions struct {
+	Revisions    repository.LessonRevisionRepository
+	Lessons      repository.LessonRepository
+	Translations repository.LessonI18nRepository
+	Tasks        repository.TaskRepository
+	Tests        repository.TaskTestRepository
+	Files        repository.TaskFileStorageRepository
+	Examples     repository.LessonExampleRepository
+	Tx           repository.TransactionManager
+}
+
+func (u Definitions) Get(ctx context.Context, id string) (*domain.LessonRevision, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, domain.ErrValidation
+	}
+	return u.Revisions.GetRevision(ctx, id)
+}
+func (u Definitions) SetPolicy(ctx context.Context, id string, a []domain.LessonActivity) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return domain.ErrValidation
+	}
+	if err := domain.ValidateLessonActivities(a); err != nil {
+		return err
+	}
+	lesson, err := u.Lessons.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	tasks, err := u.Tasks.ListByLesson(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err = validateSources(lesson.ID, a, tasks); err != nil {
+		return err
+	}
+	return u.Revisions.SetPolicy(ctx, id, a)
+}
+func validateSources(id string, a []domain.LessonActivity, tasks []domain.Task) error {
+	for _, activity := range a {
+		switch activity.Type {
+		case domain.ActivityTheoryAcknowledged:
+			if activity.SourceReference.ID != id {
+				return domain.ErrValidation
+			}
+		case domain.ActivityQuizPassed, domain.ActivityTaskPassed:
+			found := false
+			for _, task := range tasks {
+				if task.ID == activity.SourceReference.ID && task.Status == domain.TaskStatusActive {
+					found = true
+					if activity.Type == domain.ActivityQuizPassed && !domain.IsAssessmentTaskType(task.Type) && task.Type != domain.TaskTypeQuizTheory {
+						return domain.ErrValidation
+					}
+				}
+			}
+			if !found {
+				return domain.ErrValidation
+			}
+		}
+	}
+	return nil
+}
+func (u Definitions) Resolve(ctx context.Context, id string) (*domain.LessonRevision, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, domain.ErrValidation
+	}
+	var result *domain.LessonRevision
+	run := func(ctx context.Context) error {
+		lesson, err := u.Lessons.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if lesson.Status != domain.LessonStatusActive {
+			return domain.ErrNotFound
+		}
+		tasks, err := u.Tasks.ListByLesson(ctx, id)
+		if err != nil {
+			return err
+		}
+		sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+		revision := domain.LessonRevision{Schema: domain.LessonRevisionSchema, LessonID: id, Content: domain.LessonRevisionContent{Title: lesson.Title, Excerpt: lesson.Excerpt, Description: lesson.Description, Tasks: []domain.LessonRevisionTask{}}}
+		if u.Translations != nil {
+			revision.Content.Translations, err = u.Translations.ListByLesson(ctx, id)
+			if err != nil {
+				return err
+			}
+		}
+		if u.Examples != nil {
+			revision.Content.Examples, err = u.Examples.ListByLesson(ctx, id, true)
+			if err != nil {
+				return err
+			}
+		}
+		for _, task := range tasks {
+			if task.Status != domain.TaskStatusActive {
+				continue
+			}
+			snapshot := domain.LessonRevisionTask{Task: task}
+			if u.Tests != nil {
+				snapshot.Tests, err = u.Tests.ListByTask(ctx, task.ID)
+				if err != nil {
+					return err
+				}
+			}
+			if u.Files != nil {
+				snapshot.StarterFiles, err = u.Files.ListByTask(ctx, task.ID)
+				if err != nil {
+					return err
+				}
+			}
+			revision.Content.Tasks = append(revision.Content.Tasks, snapshot)
+		}
+		revision.Activities, err = u.Revisions.GetPolicy(ctx, id)
+		if err != nil {
+			return err
+		}
+		if len(revision.Activities) == 0 {
+			for _, task := range revision.Content.Tasks {
+				activityType := domain.ActivityTaskPassed
+				if domain.IsAssessmentTaskType(task.Task.Type) || task.Task.Type == domain.TaskTypeQuizTheory {
+					activityType = domain.ActivityQuizPassed
+				}
+				revision.Activities = append(revision.Activities, domain.LessonActivity{ActivityID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(id+":"+activityType+":"+task.Task.ID)).String(), Type: activityType, Required: true, SourceReference: domain.ActivitySourceReference{ID: task.Task.ID}})
+			}
+			if len(revision.Activities) == 0 {
+				revision.Activities = []domain.LessonActivity{{ActivityID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(id+":theory")).String(), Type: domain.ActivityTheoryAcknowledged, Required: true, SourceReference: domain.ActivitySourceReference{ID: id}}}
+			}
+		}
+		if err = domain.ValidateLessonActivities(revision.Activities); err != nil {
+			return err
+		}
+		if err = validateSources(id, revision.Activities, tasks); err != nil {
+			return err
+		}
+		// Authored task references are bound to this snapshot, never to mutable task.version.
+		for i := range revision.Activities {
+			if revision.Activities[i].Type != domain.ActivityPracticeCompleted {
+				revision.Activities[i].SourceReference.RevisionID = ""
+			}
+		}
+		sort.Slice(revision.Activities, func(i, j int) bool { return revision.Activities[i].ActivityID < revision.Activities[j].ActivityID })
+		raw, err := json.Marshal(revision)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(raw)
+		hash := hex.EncodeToString(sum[:])
+		revision.LessonRevisionID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(id+":"+hash)).String()
+		revision.CreatedAt = time.Now().UTC()
+		for i := range revision.Activities {
+			if revision.Activities[i].Type != domain.ActivityPracticeCompleted {
+				revision.Activities[i].SourceReference.RevisionID = revision.LessonRevisionID
+			}
+		}
+		result, err = u.Revisions.StoreRevision(ctx, hash, revision)
+		return err
+	}
+	if u.Tx == nil {
+		return nil, domain.ErrValidation
+	}
+	if err := u.Tx.WithTx(ctx, run); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// FreezeGeneratedReceipt makes request replay return the originally chosen revisions.
+func (u Definitions) FreezeGeneratedReceipt(ctx context.Context, key string, bindings []domain.GeneratedLessonBinding) ([]domain.GeneratedLessonBinding, error) {
+	existing, err := u.Revisions.GetGeneratedReceipt(ctx, key)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return nil, err
+	}
+	for i := range bindings {
+		revision, resolveErr := u.Resolve(ctx, bindings[i].LessonID)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		bindings[i].LessonRevisionID = revision.LessonRevisionID
+	}
+	return u.Revisions.StoreGeneratedReceipt(ctx, key, bindings)
+}

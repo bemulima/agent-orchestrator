@@ -1,0 +1,146 @@
+ALTER TABLE teacher_dialog_job
+    ADD COLUMN teacher_job_id UUID,
+    ADD COLUMN teacher_turn_schema_version SMALLINT NOT NULL DEFAULT 1,
+    ADD COLUMN teacher_turn_sequence BIGINT,
+    ADD COLUMN canonical_student_message_id UUID,
+    ADD COLUMN correlation_id UUID,
+    ADD COLUMN dialog_causation_id UUID,
+    ADD COLUMN causation_id UUID,
+    ADD COLUMN action_receipt_id UUID,
+    ADD COLUMN student_command_id UUID,
+    ADD COLUMN ai_execution_id UUID,
+    ADD COLUMN terminal_outcome VARCHAR(32),
+    ADD COLUMN reconciliation_state VARCHAR(32),
+    ADD COLUMN no_effect_proof_id UUID,
+    ADD COLUMN recoverable_outcome_id UUID,
+    ADD COLUMN teacher_response_message_id UUID;
+
+UPDATE teacher_dialog_job
+SET teacher_job_id = event_id,
+    teacher_response_message_id = delivered_message_id;
+
+ALTER TABLE teacher_dialog_job
+    ALTER COLUMN teacher_job_id SET NOT NULL,
+    ADD CONSTRAINT teacher_dialog_job_teacher_job_id_key UNIQUE (teacher_job_id),
+    ADD CONSTRAINT teacher_dialog_job_teacher_job_event_key UNIQUE (teacher_job_id, event_id),
+    ADD CONSTRAINT teacher_dialog_job_turn_schema_check
+        CHECK (teacher_turn_schema_version IN (1, 2)),
+    ADD CONSTRAINT teacher_dialog_job_turn_sequence_check
+        CHECK ((teacher_turn_schema_version = 1 AND teacher_turn_sequence IS NULL AND canonical_student_message_id IS NULL AND correlation_id IS NULL AND dialog_causation_id IS NULL AND causation_id IS NULL)
+            OR (teacher_turn_schema_version = 2 AND teacher_turn_sequence > 0 AND canonical_student_message_id IS NOT NULL AND correlation_id IS NOT NULL AND dialog_causation_id = canonical_student_message_id AND causation_id = event_id)),
+    ADD CONSTRAINT teacher_dialog_job_dense_sequence_key
+        UNIQUE (dialog_id, teacher_turn_sequence),
+    ADD CONSTRAINT teacher_dialog_job_terminal_outcome_check
+        CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('delivered', 'failed_no_effect')),
+    ADD CONSTRAINT teacher_dialog_job_reconciliation_state_check
+        CHECK (reconciliation_state IS NULL OR reconciliation_state IN ('unknown', 'partial', 'committed_unreconciled'));
+
+DO $$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    FOR constraint_name IN
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'teacher_dialog_job'::regclass
+          AND contype = 'c'
+          AND (
+              pg_get_constraintdef(oid) LIKE '%status%'
+              OR pg_get_constraintdef(oid) LIKE '%claim_token%'
+              OR pg_get_constraintdef(oid) LIKE '%locked_until%'
+              OR pg_get_constraintdef(oid) LIKE '%response_body%'
+              OR pg_get_constraintdef(oid) LIKE '%delivered_message_id%'
+              OR pg_get_constraintdef(oid) LIKE '%decision_id%'
+          )
+    LOOP
+        EXECUTE format('ALTER TABLE teacher_dialog_job DROP CONSTRAINT %I', constraint_name);
+    END LOOP;
+END $$;
+
+ALTER TABLE teacher_dialog_job
+    ADD CONSTRAINT teacher_dialog_job_status_check
+        CHECK (status IN ('queued', 'processing', 'delivery_pending', 'delivered', 'completed', 'blocked')),
+    ADD CONSTRAINT teacher_dialog_job_status_lease_check
+        CHECK ((status = 'processing') = (claim_token IS NOT NULL AND locked_by IS NOT NULL AND locked_until IS NOT NULL)),
+    ADD CONSTRAINT teacher_dialog_job_inactive_lease_check
+        CHECK (status = 'processing' OR (claim_token IS NULL AND locked_by IS NULL AND locked_until IS NULL)),
+    ADD CONSTRAINT teacher_dialog_job_response_body_check
+        CHECK (response_body IS NULL OR (btrim(response_body) <> '' AND octet_length(response_body) <= 48000)),
+    ADD CONSTRAINT teacher_dialog_job_shape_check
+        CHECK (
+            (status = 'queued' AND decision_id IS NULL AND response_body IS NULL AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL)
+            OR
+            (status = 'processing' AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL
+                AND ((decision_id IS NULL AND response_body IS NULL) OR (decision_id IS NOT NULL AND response_body IS NOT NULL)))
+            OR
+            (status = 'delivery_pending' AND decision_id IS NOT NULL AND response_body IS NOT NULL AND delivered_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome IS NULL AND reconciliation_state IS NULL)
+            OR
+            (status = 'delivered' AND decision_id IS NOT NULL AND response_body IS NULL AND delivered_message_id IS NOT NULL AND (teacher_turn_schema_version = 1 OR teacher_response_message_id IS NOT NULL) AND delivered_at IS NOT NULL AND error_code IS NULL AND (terminal_outcome IS NULL OR terminal_outcome = 'delivered') AND reconciliation_state IS NULL)
+            OR
+            (status = 'completed' AND response_body IS NULL AND delivered_message_id IS NULL AND teacher_response_message_id IS NULL AND delivered_at IS NULL AND terminal_outcome = 'failed_no_effect' AND reconciliation_state IS NULL AND no_effect_proof_id IS NOT NULL AND recoverable_outcome_id IS NOT NULL AND error_code IS NOT NULL)
+            OR
+            (status = 'blocked' AND response_body IS NULL AND delivered_at IS NULL AND error_code IS NOT NULL AND terminal_outcome IS NULL
+                AND ((delivered_message_id IS NULL AND teacher_response_message_id IS NULL)
+                    OR (reconciliation_state = 'committed_unreconciled' AND delivered_message_id IS NOT NULL AND teacher_response_message_id = delivered_message_id)))
+        ),
+    ADD CONSTRAINT teacher_dialog_job_failed_no_effect_fields_check
+        CHECK ((terminal_outcome = 'failed_no_effect') = (no_effect_proof_id IS NOT NULL AND recoverable_outcome_id IS NOT NULL AND error_code IS NOT NULL)),
+    ADD CONSTRAINT teacher_dialog_job_delivered_alias_check
+        CHECK (teacher_response_message_id IS NULL OR delivered_message_id = teacher_response_message_id);
+
+CREATE TABLE teacher_dialog_turn_cursor (
+    dialog_id UUID PRIMARY KEY,
+    ordering_mode VARCHAR(16) NOT NULL DEFAULT 'dense' CHECK (ordering_mode = 'dense'),
+    next_teacher_turn_sequence BIGINT NOT NULL DEFAULT 1 CHECK (next_teacher_turn_sequence > 0),
+    last_source_event_id UUID,
+    last_teacher_job_id UUID,
+    last_terminal_outcome VARCHAR(32),
+    last_teacher_response_message_id UUID,
+    last_no_effect_proof_id UUID,
+    last_recoverable_outcome_id UUID,
+    last_failure_code VARCHAR(64),
+    revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK (last_terminal_outcome IS NULL OR last_terminal_outcome IN ('delivered', 'failed_no_effect'))
+);
+
+CREATE TABLE teacher_dialog_turn_proof (
+    no_effect_proof_id UUID PRIMARY KEY,
+    teacher_job_id UUID NOT NULL REFERENCES teacher_dialog_job(teacher_job_id) ON DELETE RESTRICT,
+    source_event_id UUID NOT NULL REFERENCES teacher_dialog_job(event_id) ON DELETE RESTRICT,
+    student_command_id UUID,
+    proof_kind VARCHAR(64) NOT NULL DEFAULT 'student_effect_absence',
+    recorded_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (source_event_id),
+    FOREIGN KEY (teacher_job_id, source_event_id) REFERENCES teacher_dialog_job(teacher_job_id, event_id) ON DELETE RESTRICT,
+    CHECK (proof_kind = 'student_effect_absence')
+);
+
+CREATE TABLE teacher_dialog_turn_outcome (
+    recoverable_outcome_id UUID PRIMARY KEY,
+    teacher_job_id UUID NOT NULL REFERENCES teacher_dialog_job(teacher_job_id) ON DELETE RESTRICT,
+    source_event_id UUID NOT NULL REFERENCES teacher_dialog_job(event_id) ON DELETE RESTRICT,
+    dialog_id UUID NOT NULL,
+    teacher_turn_sequence BIGINT,
+    turn_correlation_id UUID,
+    outcome VARCHAR(32) NOT NULL CHECK (outcome IN ('delivered', 'failed_no_effect')),
+    student_command_id UUID,
+    teacher_response_message_id UUID,
+    failure_code VARCHAR(64),
+    created_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (source_event_id),
+    FOREIGN KEY (teacher_job_id, source_event_id) REFERENCES teacher_dialog_job(teacher_job_id, event_id) ON DELETE RESTRICT,
+    CHECK (teacher_turn_sequence IS NULL OR teacher_turn_sequence > 0),
+    CHECK ((outcome = 'failed_no_effect' AND failure_code IS NOT NULL AND teacher_response_message_id IS NULL)
+        OR (outcome = 'delivered' AND failure_code IS NULL AND teacher_response_message_id IS NOT NULL))
+);
+
+ALTER TABLE teacher_dialog_job
+    ADD CONSTRAINT teacher_dialog_job_proof_fk
+        FOREIGN KEY (no_effect_proof_id) REFERENCES teacher_dialog_turn_proof(no_effect_proof_id) ON DELETE RESTRICT,
+    ADD CONSTRAINT teacher_dialog_job_outcome_fk
+        FOREIGN KEY (recoverable_outcome_id) REFERENCES teacher_dialog_turn_outcome(recoverable_outcome_id) ON DELETE RESTRICT;
+
+CREATE INDEX teacher_dialog_job_dense_pending_idx
+    ON teacher_dialog_job (dialog_id, teacher_turn_sequence, next_attempt_at, occurred_at, event_id)
+    WHERE teacher_turn_schema_version = 2 AND status IN ('queued', 'processing', 'delivery_pending');

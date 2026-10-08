@@ -243,3 +243,97 @@ The isolated candidate starts at upstream `ef4c34e7b21481fa151dadd9a0464a0b630c0
 Both prerequisite-only and complete retrieval trees passed secret-free full verification. The prerequisite tree also passed the pre-R1 serialized planner output and approval fingerprint golden. Final retrieval checks passed formatting, Go vet/all tests, focused routing/catalog/contracts/retrieval tests, CLI build, 71 Gold fixtures (12 adversarial), offline Prepare/Expand and byte-identical repeated Prepare/digest. Recall and precision are 1.00; forbidden scope, silent missing required contracts, stale leaks, silent authority conflicts and false COMPLETE are zero. The expected explicit missing-contract case retains raw rate 0.25. Independent reviews report P0=0 and P1=0.
 
 Full verification uses the current upstream Makefile with only its automatic `.env` include omitted, repository caches, offline Go modules, and Compose `--env-file /dev/null`. Git fixture subprocesses receive no global Git environment overrides. Build VCS stamping is disabled for the plain isolated filesystem candidate; source and logical Git trees are compared directly. Fixture/provider-dependent DB, live model and production certification gates are outside this publication. Verification evidence and the final commit/push/remote proof are retained under ignored `.cache/agent-context/publication-v2`; publication succeeds only after normal push and verified local/remote SHA equality.
+
+## First Go wave remediation snapshot (before closure v2)
+
+The project adapter treats a routing file's comma-separated symbol inventory as
+one checksum-bound whole-file selector. An actual single-symbol selector keeps
+its semantics. `AdaptTaskRoute` uses explicit caller facets to choose evidence
+within the admitted routing boundary, retaining all ContractPlan obligations,
+source checksums, ownership, constraints and R1 outcomes. Unscoped requests keep
+routing seeds as defaults. The offline CLI consumes this projection; the
+RoutingResult, Prepare/Expand and ContextPack v1 contracts remain unchanged.
+
+R1 acquisition extraction and omission rows are grouped only when source,
+stage and safety state agree; additive counts are summed. Individual required
+outcomes, limit reasons, unknown remainder and the full companion digest remain
+visible. COMPLETE named-path policy exclusions are a separately count- and
+hash-bound ledger in the pack. Facet-specific exclusions and all incomplete,
+secret-content, stale and authority outcomes remain individual. The full R1 and
+loader ledgers must be kept as external verification artifacts; a compact
+projection does not certify Git history or authorize a write.
+
+The bounded routing inventory acquires root stack/owner files and interleaves
+repository subtrees, giving canonical internal layers separate lanes. Existing
+visited/file/byte bounds and unknown remainder accounting still apply. A missing
+layer after incomplete acquisition is unverified, not established absence.
+The Go canonical catalog 1.3.1 supports owner-declared outbound
+`internal/infrastructure/http/**` packages only when directional YAML and actual
+Go AST HTTP client calls agree. This is syntax evidence, not type-aware or
+runtime certification. Exact `*_test.go` selectors exclude sibling files;
+implementation-file association remains a bounded syntax heuristic.
+
+The unchanged 71 serialized Gold cases are complemented by integration Gold
+regressions for these five blockers, including short/overlong inventories,
+large R1 and named-policy envelopes, exact/missing test paths, metadata
+saturation, and outbound/inbound negatives. `TestWave1Replay` materializes the
+safe six-owner corpus in `test/fixtures/context-retrieval/wave1`, validates all
+content hashes, and executes real routing → bound R1 → task adaptation →
+Prepare/Expand for 39 original tasks. It asserts supported mandatory recall,
+independent file-level precision, explicit unsupported/missing/excluded
+outcomes, read admission, forbidden writes, freshness and canonical accounting.
+Raw acceptance results are saved to `.cache/wave1-results.json`; a passing
+regression test does not turn a known diagnostic or original layer mismatch into
+a passing readiness gate. Captured exclusion ledgers contain no excluded bytes.
+
+Original labels are preserved. Proposed canonical layer-name corrections and
+lexical SQL fallbacks are separate, unapplied proposals. Semantic SQL, callers
+and official `average_grade` remain unsupported or owner-contract gaps. Auth's
+mandatory secret-excluded signin test remains a visible recall failure. No
+service business/runtime code, instruction trust or content policy is changed.
+
+## Go Wave 1 capability acceptance v2
+
+`wave1-capability-acceptance/v2` is a separate, independently audited overlay.
+Original 39 task definitions, required labels and their 166/205 denominators stay
+immutable. Requested route responsibilities are distinguished from unchanged
+implementation, contract and test dependencies that must still be retrieved.
+Each applied `EXPECTED_LABEL_WAS_WRONG` correction cites source, architecture,
+profile, repository policy, contracts and tests in the versioned audit corpus.
+Owner identity is exact; route layer comparison also rejects unexpected extras.
+
+The evaluator partitions every original evidence occurrence and separately
+checks every required facet of the resulting plan, including generated route,
+contract and policy obligations. `SUPPORTED_REQUIRED` requires selected current
+facet-bound evidence. Unsupported semantics require explicit unsupported
+coverage/diagnostics; selected lexical bytes cannot satisfy that facet. Security
+exclusion requires `REQUIRED_EVIDENCE_EXCLUDED_BY_SECURITY` and policy-excluded
+coverage. Secret policy is unchanged, and excluded Auth assertion bytes are never
+part of the corpus. The Auth owner must supply a safe assertion source.
+
+A missing business contract requires independent contract-absence evidence.
+An incomplete broad inventory remains NOT_VERIFIED. A separate complete scoped
+resolver search may establish the narrower absence; its snapshot and coverage
+are reported separately without upgrading the original ContextPack. No official
+`average_grade` producer, dataset, payload, scale, null or aggregation contract
+was found in the frozen admitted corpus. This yields `MISSING_METRIC_CONTRACT`,
+not a new DTO or metric calculation. Retained User identity compatibility versus
+Auth login identity authority remains `BUSINESS_OWNERSHIP_DECISION_REQUIRED`.
+Auth, User and RBAC owners remain distinct.
+
+`lexical-sql-capability/v1` formalizes the existing `exact.v1` + `QueryExact`
+equivalent: exact admitted migration files and case-sensitive literal table,
+column, DDL, query and repository-reference strings. Semantic SQL remains
+UNSUPPORTED; an explicit lexical follow-up does not reinterpret the original
+semantic request. ContextPack ABI and original Gold v1 semantics are unchanged.
+
+Routing now scopes an existing-dependency qualifier to its context, preserves
+explicitly requested responsibilities despite metadata frequency, and prefers
+specific responsibility phrases over their generic substrings. Named qualified
+Go declaration/selector syntax can locate an admitted containing-file layer;
+it does not certify receiver types, dynamic dispatch or a caller graph. DDL is
+an inspection artifact, not a reverse Go import from persistence to migration.
+
+Acceptance PASS certifies these bounded retrieval obligations, not execution
+approval, full unbounded acquisition, or COMPLETE pack status. Valid unsupported,
+security, business and owner results retain their diagnostic and pack status.

@@ -1,0 +1,174 @@
+package teacherdialog_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+	"github.com/stretchr/testify/require"
+	"testing"
+	"time"
+)
+
+func TestT14WorkerNeverReadsMutableCourseForFrozenSource(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	request := jobs.job.Request
+	request.ContextType = domain.LearningContextLesson
+	request.LearningActionID = ""
+	jobs.job.Request = request
+	builder.value = domain.StudentContext{StudentID: request.StudentID, ContextType: domain.LearningContextLesson, ContextID: request.ContextID}
+	dialog.context.ContextType = domain.LearningContextLesson
+	dialog.context.LearningActionID = ""
+	dialog.context.Messages[0].LearningActionID = ""
+	var source domain.LessonMessageContext
+	raw := map[string]string{"schema": "lesson-message-context.v2", "mode": "lesson_overview", "course_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "lesson_id": request.ContextID, "content_revision": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "learning_path_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "learning_path_item_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	data, err := json.Marshal(raw)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, &source))
+	dialog.context.Messages[0].LessonContext = &source
+	course := &courseLessonReader{content: domain.CourseLessonContent{LessonID: request.ContextID, CourseID: raw["course_id"], Language: "ru", Title: "Published R2", ContentRevision: "2026-10-04T00:00:00Z"}}
+	worker.CourseLessons = course
+	worker.PromptContext = t14UncheckedPrompt{}
+	claimed, err := worker.ProcessNext(context.Background())
+	require.True(t, claimed)
+	require.Error(t, err)
+	require.Zero(t, course.calls, "a frozen request must never consult current Course content")
+	require.Zero(t, generator.generated)
+}
+
+// Isolate the Worker provider dispatch from the earlier timestamp-only decoder.
+// A zero prompt snapshot is sufficient: the wrong Course read happens before
+// generation validation and must be absent for every frozen source.
+type t14UncheckedPrompt struct{}
+
+func (t14UncheckedPrompt) Build(context.Context, domain.DialogRequestContext, string, time.Time) (domain.TeacherPromptDialogContext, error) {
+	return domain.TeacherPromptDialogContext{}, nil
+}
+
+type assignedLessonReader struct {
+	content                   domain.AssignedLessonContext
+	err                       error
+	calls                     int
+	studentID, pathID, itemID string
+}
+
+func (reader *assignedLessonReader) GetAssignedLessonContext(_ context.Context, studentID, pathID, itemID string) (domain.AssignedLessonContext, error) {
+	reader.calls++
+	reader.studentID, reader.pathID, reader.itemID = studentID, pathID, itemID
+	return reader.content, reader.err
+}
+func t14FrozenWorker(t *testing.T, mode domain.LessonMessageMode) (teacherdialog.Worker, *workerJobs, *dialogBoundary, *responseGenerator, *assignedLessonReader, *courseLessonReader) {
+	t.Helper()
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	request := jobs.job.Request
+	request.ContextType = domain.LearningContextLesson
+	request.LearningActionID = ""
+	jobs.job.Request = request
+	builder.value = domain.StudentContext{StudentID: request.StudentID, ContextType: request.ContextType, ContextID: request.ContextID}
+	dialog.context.ContextType = request.ContextType
+	dialog.context.LearningActionID = ""
+	dialog.context.Messages[0].LearningActionID = ""
+	content := domain.AssignedLessonContext{Schema: domain.AssignedLessonContextSchemaVersion, StudentID: request.StudentID, LearningPathID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", LearningPathItemID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", LessonID: request.ContextID, LessonRevisionID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", Content: domain.AssignedLessonContent{Title: "  Frozen R1  ", Excerpt: "  Frozen public overview  ", Description: "Frozen R1 uses errors.Is(err, target), never published R2."}}
+	encoded, err := json.Marshal([3]string{content.Content.Title, content.Content.Excerpt, content.Content.Description})
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	content.ContentDigest = "sha256:" + hex.EncodeToString(digest[:])
+	source := &domain.LessonMessageContext{Schema: domain.LessonMessageContextSchemaVersionV2, Mode: mode, CourseID: content.CourseID, LessonID: content.LessonID, ContentRevision: content.LessonRevisionID, LearningPathID: content.LearningPathID, LearningPathItemID: content.LearningPathItemID, ContentDigest: content.ContentDigest}
+	if mode == domain.LessonMessageModeSelection {
+		source.SelectedText = "errors.Is(err, target)"
+	}
+	dialog.context.Messages[0].LessonContext = source
+	assigned := &assignedLessonReader{content: content}
+	current := &courseLessonReader{err: domain.ErrLessonContextUnavailable}
+	worker.AssignedLessons = assigned
+	worker.CourseLessons = current
+	return worker, jobs, dialog, generator, assigned, current
+}
+func TestT14WorkerUsesStudentFrozenProjectionAfterMutablePublication(t *testing.T) {
+	for _, mode := range []domain.LessonMessageMode{domain.LessonMessageModeOverview, domain.LessonMessageModeSelection} {
+		t.Run(string(mode), func(t *testing.T) {
+			worker, jobs, _, generator, assigned, current := t14FrozenWorker(t, mode)
+			claimed, err := worker.ProcessNext(context.Background())
+			require.True(t, claimed)
+			require.NoError(t, err)
+			require.Equal(t, 1, assigned.calls)
+			require.Zero(t, current.calls)
+			require.Equal(t, jobs.job.Request.StudentID, assigned.studentID)
+			require.Equal(t, assigned.content.LearningPathID, assigned.pathID)
+			require.Equal(t, assigned.content.LearningPathItemID, assigned.itemID)
+			require.Equal(t, 1, generator.generated)
+			require.NotEmpty(t, jobs.completedMessage)
+			require.Equal(t, assigned.content.ContentDigest, generator.request.Lesson.ContentDigest)
+			require.Equal(t, assigned.content.LessonRevisionID, generator.request.Lesson.ContentRevision)
+			if mode == domain.LessonMessageModeOverview {
+				require.Equal(t, assigned.content.Content.Title, generator.request.Lesson.Title)
+			} else {
+				require.Equal(t, "errors.Is(err, target)", generator.request.Lesson.SelectedText)
+				require.Empty(t, generator.request.Lesson.Title)
+			}
+			encoded, err := json.Marshal(generator.request.Lesson)
+			require.NoError(t, err)
+			require.NotContains(t, string(encoded), assigned.content.Content.Description)
+		})
+	}
+}
+func TestT14WorkerBlocksForeignMissingAndUnavailableAssignedContextWithoutFallback(t *testing.T) {
+	for _, name := range []string{"owner", "path", "item", "course", "lesson", "revision", "digest", "fragment", "missing", "outage", "nil reader"} {
+		t.Run(name, func(t *testing.T) {
+			worker, jobs, dialog, generator, assigned, current := t14FrozenWorker(t, domain.LessonMessageModeSelection)
+			foreign := "99999999-9999-4999-8999-999999999999"
+			switch name {
+			case "owner":
+				assigned.content.StudentID = foreign
+			case "path":
+				assigned.content.LearningPathID = foreign
+			case "item":
+				assigned.content.LearningPathItemID = foreign
+			case "course":
+				assigned.content.CourseID = foreign
+			case "lesson":
+				assigned.content.LessonID = foreign
+			case "revision":
+				assigned.content.LessonRevisionID = foreign
+			case "digest":
+				assigned.content.ContentDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			case "fragment":
+				dialog.context.Messages[0].LessonContext.SelectedText = "not frozen"
+			case "missing":
+				assigned.err = domain.ErrLessonContextNotFound
+			case "outage":
+				assigned.err = domain.ErrLessonContextUnavailable
+			case "nil reader":
+				worker.AssignedLessons = nil
+			}
+			claimed, err := worker.ProcessNext(context.Background())
+			require.True(t, claimed)
+			require.Error(t, err)
+			require.Zero(t, current.calls)
+			require.Zero(t, generator.generated)
+			require.Zero(t, dialog.appendCalls)
+			require.Empty(t, jobs.savedBody)
+			if name == "outage" || name == "nil reader" {
+				require.Equal(t, domain.TeacherDialogErrorDialogContext, jobs.retriedCode)
+			} else {
+				require.Equal(t, domain.TeacherDialogErrorDialogContext, jobs.blockedCode)
+			}
+		})
+	}
+}
+func TestT14FrozenPendingDeliveryReplayDoesNotReloadStudentOrCourse(t *testing.T) {
+	worker, jobs, dialog, generator, assigned, current := t14FrozenWorker(t, domain.LessonMessageModeOverview)
+	jobs.job.ResponseBody = "already generated"
+	jobs.job.DecisionID = "99999999-9999-4999-8999-999999999999"
+	assigned.err = domain.ErrLessonContextUnavailable
+	claimed, err := worker.ProcessNext(context.Background())
+	require.True(t, claimed)
+	require.NoError(t, err)
+	require.Zero(t, assigned.calls)
+	require.Zero(t, current.calls)
+	require.Zero(t, generator.generated)
+	require.Zero(t, dialog.readCalls)
+	require.Equal(t, 1, dialog.appendCalls)
+}

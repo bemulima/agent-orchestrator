@@ -1,0 +1,369 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/example/ms-student-service/internal/migrations"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// This suite requires an explicitly supplied, isolated proof database. It never
+// drops a schema and uses the production migration runner, including checksums.
+func TestLessonCompletionCutoverPostgres(t *testing.T) {
+	databaseURL := os.Getenv("LESSON_COMPLETION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set LESSON_COMPLETION_TEST_DATABASE_URL to an isolated loopback *_integration_proof database")
+	}
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !(config.ConnConfig.Host == "127.0.0.1" || config.ConnConfig.Host == "localhost" || config.ConnConfig.Host == "::1") || !strings.HasSuffix(config.ConnConfig.Database, "_integration_proof") {
+		t.Fatal("lesson completion proof requires isolated loopback *_integration_proof database")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var migrated bool
+	if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='student_learning_path_item' AND column_name='lesson_revision_id')`).Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	legacyStudent, legacyPath, legacyLesson := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	if !migrated {
+		prefix := t.TempDir()
+		files, err := migrations.Discover(completionProofMigrationDirectory(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range files {
+			if file.Filename >= "030_" {
+				continue
+			}
+			if err = os.WriteFile(filepath.Join(prefix, file.Filename), []byte(file.SQL), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		completionProofMigrate(t, ctx, databaseURL, prefix)
+		if _, err = pool.Exec(ctx, `INSERT INTO student_learning_path(id,student_id,course_id,goal_code,curriculum_revision,policy_version,planner_policy_version,reason_code,reason_summary,version,created_at,updated_at) VALUES($1,$2,$3,'go.backend','r10',$4,'course-planner-v1','initial_plan','legacy cutover fixture',1,now(),now())`, legacyPath, legacyStudent, uuid.NewString(), domain.LearningPathPolicyVersion); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(ctx, `INSERT INTO student_learning_path_item(student_learning_path_id,reference_type,reference_id,position,status,reason_code) VALUES($1,'lesson',$2,0,'READY','first_current_gap')`, legacyPath, legacyLesson); err != nil {
+			t.Fatal(err)
+		}
+	}
+	completionProofMigrate(t, ctx, databaseURL, completionProofMigrationDirectory(t))
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	if !migrated {
+		t.Run("legacy_rows_keep_no_historical_revision", func(t *testing.T) {
+			path, err := repo.GetLearningPathByID(ctx, legacyStudent, legacyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(path.Items) != 1 || path.Items[0].ID == "" || path.Items[0].LessonRevisionID != "" || len(path.Items[0].FrozenRequirements) != 0 || path.Items[0].Status != domain.LearningPathItemReady {
+				t.Fatalf("fabricated legacy history: %+v", path.Items)
+			}
+		})
+	} else {
+		t.Log("database already migrated: pre-cutover seed assertion verified only on first fresh run")
+	}
+
+	newPath := func(t *testing.T, types ...string) domain.StudentLearningPath {
+		t.Helper()
+		now := time.Now().UTC()
+		path := completionProofLearningPath(uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), now)
+		item := &path.Items[0]
+		item.ID = uuid.NewString()
+		item.LessonRevisionID = uuid.NewString()
+		item.LessonContent = json.RawMessage(`{"title":"R10"}`)
+		item.Targets = []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "loops", Version: "v1"}}
+		for _, kind := range types {
+			r := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: kind, Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString()}}
+			if kind != "theory_acknowledged" {
+				r.SourceReference.RevisionID = uuid.NewString()
+			}
+			if kind == "practice_completed" {
+				r.SourceReference.ID = r.SourceReference.RevisionID
+			}
+			item.FrozenRequirements = append(item.FrozenRequirements, r)
+		}
+		created, replayed, err := repo.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+		if err != nil || replayed {
+			t.Fatalf("create frozen path: replay=%v err=%v", replayed, err)
+		}
+		return created
+	}
+	factFor := func(path domain.StudentLearningPath, index int) domain.LessonActivityFact {
+		item := path.Items[0]
+		r := item.FrozenRequirements[index]
+		return domain.LessonActivityFact{StudentID: path.StudentID, ItemID: item.ID, RequirementID: r.ID, Type: r.Type, SourceID: r.SourceReference.ID, SourceRevisionID: r.SourceReference.RevisionID, FactID: uuid.NewString(), OccurredAt: time.Now().UTC()}
+	}
+	load := func(t *testing.T, path domain.StudentLearningPath) domain.StudentLearningPath {
+		t.Helper()
+		v, e := repo.GetLearningPathByID(ctx, path.StudentID, path.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return v
+	}
+	apply := func(t *testing.T, fact domain.LessonActivityFact) {
+		t.Helper()
+		if _, _, e := repo.ApplyLessonFact(ctx, fact); e != nil {
+			t.Fatal(e)
+		}
+	}
+
+	t.Run("A_theory_only", func(t *testing.T) {
+		path := newPath(t, "theory_acknowledged")
+		apply(t, factFor(path, 0))
+		if load(t, path).Items[0].Status != domain.LearningPathItemCompleted {
+			t.Fatal("theory acknowledgment did not complete item")
+		}
+	})
+	t.Run("B_theory_and_quiz", func(t *testing.T) {
+		path := newPath(t, "theory_acknowledged", "quiz_passed")
+		apply(t, factFor(path, 0))
+		if load(t, path).Items[0].Status == domain.LearningPathItemCompleted {
+			t.Fatal("quiz requirement was ignored")
+		}
+		apply(t, factFor(path, 1))
+		if load(t, path).Items[0].Status != domain.LearningPathItemCompleted {
+			t.Fatal("passed quiz did not complete item")
+		}
+	})
+	t.Run("C_practice_exact_correlation", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		fact := factFor(path, 0)
+		wrong := fact
+		wrong.SourceRevisionID = uuid.NewString()
+		if _, _, err := repo.ApplyLessonFact(ctx, wrong); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("mismatched revision error: %v", err)
+		}
+		if load(t, path).Items[0].FrozenRequirements[0].Satisfied {
+			t.Fatal("mismatch mutated requirement")
+		}
+		apply(t, fact)
+		if load(t, path).Items[0].Status != domain.LearningPathItemCompleted {
+			t.Fatal("practice did not complete item")
+		}
+	})
+	t.Run("D_all_required_activities", func(t *testing.T) {
+		path := newPath(t, "theory_acknowledged", "quiz_passed", "task_passed", "practice_completed")
+		for i := range path.Items[0].FrozenRequirements {
+			apply(t, factFor(path, i))
+			completed := load(t, path).Items[0].Status == domain.LearningPathItemCompleted
+			if completed != (i == 3) {
+				t.Fatalf("completion after %d activities: %v", i+1, completed)
+			}
+		}
+	})
+	t.Run("E_failed_attempt_is_not_success", func(t *testing.T) {
+		path := newPath(t, "quiz_passed")
+		wrong := factFor(path, 0)
+		wrong.Type = "quiz_failed"
+		if _, _, err := repo.ApplyLessonFact(ctx, wrong); err == nil {
+			t.Fatal("failure accepted as successful fact")
+		}
+		if load(t, path).Items[0].Status == domain.LearningPathItemCompleted {
+			t.Fatal("failure completed lesson")
+		}
+	})
+	t.Run("F_duplicate_fact_is_replay_stable", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		fact := factFor(path, 0)
+		apply(t, fact)
+		before := load(t, path)
+		apply(t, fact)
+		after := load(t, path)
+		if before.Version != after.Version {
+			t.Fatalf("duplicate advanced version: %d -> %d", before.Version, after.Version)
+		}
+		fact.SourceID = uuid.NewString()
+		if _, _, err := repo.ApplyLessonFact(ctx, fact); err == nil {
+			t.Fatal("same fact identity accepted different payload")
+		}
+	})
+	t.Run("G_out_of_order_facts", func(t *testing.T) {
+		for _, order := range [][]int{{0, 1, 2}, {2, 0, 1}, {1, 2, 0}} {
+			path := newPath(t, "theory_acknowledged", "quiz_passed", "practice_completed")
+			lastUpdate := path.UpdatedAt
+			for _, i := range order {
+				fact := factFor(path, i)
+				fact.OccurredAt = path.CreatedAt.Add(time.Duration(i+1) * time.Microsecond)
+				apply(t, fact)
+				current := load(t, path)
+				if current.UpdatedAt.Before(lastUpdate) {
+					t.Fatal("late fact regressed processing timestamp")
+				}
+				lastUpdate = current.UpdatedAt
+			}
+			item := load(t, path).Items[0]
+			if item.Status != domain.LearningPathItemCompleted {
+				t.Fatalf("order %v did not complete", order)
+			}
+			for _, r := range item.FrozenRequirements {
+				if !r.Satisfied {
+					t.Fatalf("order %v lost fact", order)
+				}
+			}
+		}
+	})
+	t.Run("H_frozen_assignment_readback", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		snapshot := load(t, path)
+		if snapshot.Items[0].LessonRevisionID != path.Items[0].LessonRevisionID || snapshot.Items[0].FrozenRequirements[0].ID != path.Items[0].FrozenRequirements[0].ID {
+			t.Fatal("revision/requirement identity changed on persistence")
+		}
+	})
+	t.Run("authoritative_Practice_ingest_mastery_closure_and_replay", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		item := path.Items[0]
+		requirement := item.FrozenRequirements[0]
+		now := time.Now().UTC()
+		instanceID, evidenceID := uuid.NewString(), uuid.NewString()
+		actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+		reserve, err := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{
+			Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: path.StudentID,
+			TaskInstanceID: instanceID, TaskRevisionID: requirement.SourceReference.RevisionID,
+			TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), SurfaceClassification: "practice",
+			LearningPathID: path.ID, LearningPathItemID: item.ID, RequirementID: requirement.ID,
+			IdempotencyKey: instanceID, LearningActionID: uuid.NewString(), LearningTargets: item.Targets, OccurredAt: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, replayed, err := actions.ReservePracticeLearningAction(ctx, reserve)
+		if err != nil || replayed || binding.LearningPathItemID != item.ID || binding.RequirementID != requirement.ID {
+			t.Fatalf("reserve binding=%+v replayed=%v err=%v", binding, replayed, err)
+		}
+		binding, replayed, err = actions.OpenPracticeLearningAction(ctx, path.StudentID, instanceID, binding.LearningActionID, now.Add(time.Second))
+		if err != nil || replayed || binding.LifecycleStatus != domain.PracticeLearningActionOpen {
+			t.Fatalf("open binding=%+v replayed=%v err=%v", binding, replayed, err)
+		}
+		evidence, err := domain.NormalizePracticeCompetencyEvidenceBundleV2(path.StudentID, instanceID, evidenceID, domain.PracticeCompetencyEvidenceBundleV2{
+			Schema: domain.PracticeCompetencyEvidenceSchemaV2, EvidenceID: evidenceID, LearningActionID: binding.LearningActionID,
+			StudentID: path.StudentID, TaskInstanceID: instanceID, TaskRevisionID: reserve.TaskRevisionID,
+			TaskRevisionDigest: reserve.TaskRevisionDigest, WorkspaceDigest: "sha256:" + strings.Repeat("c", 64),
+			SubmissionID: evidenceID, Outcome: "passed", AssistancePolicyVersion: "practice-assistance-v1",
+			LearningPathItemID: item.ID, RequirementID: requirement.ID,
+			Evidence:   []domain.PracticeCompetencyEvidence{{Target: item.Targets[0], Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{"implementation"}}},
+			OccurredAt: now.Add(2 * time.Second), PolicyVersion: domain.PracticeCompetencyEvidencePolicyV2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wrong := evidence
+		wrong.RequirementID = uuid.NewString()
+		if _, err = actions.ApplyPracticeLearningActionEvidence(ctx, wrong, now.Add(3*time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("mismatched evidence err=%v", err)
+		}
+		var receipts int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM student_practice_evidence_receipt WHERE evidence_id=$1`, evidenceID).Scan(&receipts); err != nil || receipts != 0 {
+			t.Fatalf("rejected evidence receipt count=%d err=%v", receipts, err)
+		}
+		open, err := actions.GetPracticeLearningAction(ctx, path.StudentID, instanceID)
+		if err != nil || open.LifecycleStatus != domain.PracticeLearningActionOpen || load(t, path).Items[0].FrozenRequirements[0].Satisfied {
+			t.Fatalf("rejected evidence had side effects: binding=%+v err=%v", open, err)
+		}
+		inserted, err := actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now.Add(3*time.Second))
+		if err != nil || !inserted {
+			t.Fatalf("authoritative ingest inserted=%v err=%v", inserted, err)
+		}
+		completed := load(t, path)
+		if completed.Items[0].Status != domain.LearningPathItemCompleted || !completed.Items[0].FrozenRequirements[0].Satisfied {
+			t.Fatalf("authoritative evidence did not complete exact requirement: %+v", completed.Items[0])
+		}
+		closed, err := actions.GetPracticeLearningAction(ctx, path.StudentID, instanceID)
+		if err != nil || closed.LifecycleStatus != domain.PracticeLearningActionClosed {
+			t.Fatalf("binding did not close atomically: %+v err=%v", closed, err)
+		}
+		inserted, err = actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now.Add(4*time.Second))
+		if err != nil || inserted || load(t, path).Version != completed.Version {
+			t.Fatalf("authoritative replay changed aggregate: inserted=%v err=%v", inserted, err)
+		}
+		var raw, audit, mastery, facts int
+		if err = pool.QueryRow(ctx, `SELECT
+            (SELECT count(*) FROM student_practice_evidence_receipt WHERE evidence_id=$1),
+            (SELECT count(*) FROM student_practice_target_evidence WHERE evidence_id=$1),
+            (SELECT count(*) FROM student_practice_target_mastery_audit WHERE evidence_id=$1),
+            (SELECT count(*) FROM student_target_mastery WHERE student_id=$2),
+            (SELECT count(*) FROM student_lesson_activity_fact WHERE item_id=$3)`, evidenceID, path.StudentID, item.ID).Scan(&receipts, &raw, &audit, &mastery, &facts); err != nil {
+			t.Fatal(err)
+		}
+		if receipts != 1 || raw != 1 || audit != 1 || mastery != 1 || facts != 1 {
+			t.Fatalf("expected one atomic receipt/evidence/audit/mastery/fact; got %d/%d/%d/%d/%d", receipts, raw, audit, mastery, facts)
+		}
+	})
+	t.Run("I_same_lesson_twice_and_legacy_coexist", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		second := path.Items[0]
+		second.ID = uuid.NewString()
+		second.Position = 1
+		second.Status = domain.LearningPathItemPlanned
+		second.FrozenRequirements = append([]domain.LessonRequirement(nil), second.FrozenRequirements...)
+		second.FrozenRequirements[0].ID = uuid.NewString()
+		legacy := domain.LearningPathItem{ReferenceType: "lesson", ReferenceID: path.Items[0].ReferenceID, Position: 2, Status: domain.LearningPathItemPlanned, ReasonCode: "legacy_compatibility"}
+		path.Items = append(path.Items, second, legacy)
+		version := path.Version
+		path.Version++
+		path.UpdatedAt = time.Now().UTC()
+		updated, err := repo.ReplaceLearningPath(ctx, path, version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		apply(t, factFor(updated, 0))
+		got := load(t, updated)
+		if got.Items[0].Status != domain.LearningPathItemCompleted || got.Items[1].Status == domain.LearningPathItemCompleted || got.Items[1].FrozenRequirements[0].Satisfied || got.Items[2].LessonRevisionID != "" {
+			t.Fatalf("item correlation leaked or legacy fabricated: %+v", got.Items)
+		}
+	})
+}
+
+func completionProofMigrate(t *testing.T, ctx context.Context, databaseURL, directory string) {
+	t.Helper()
+	runner, err := migrations.New(ctx, databaseURL, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Close()
+	if _, err = runner.Up(ctx); err != nil {
+		t.Fatalf("full migration runner: %v", err)
+	}
+	if applied, err := runner.Up(ctx); err != nil || len(applied) != 0 {
+		t.Fatalf("migration replay: applied=%v err=%v", applied, err)
+	}
+}
+
+func completionProofLearningPath(studentID, pathID, courseID, lessonID string, now time.Time) domain.StudentLearningPath {
+	return domain.StudentLearningPath{ID: pathID, StudentID: studentID, CourseID: courseID, GoalCode: "go.backend", CurriculumRevision: "r10", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "completion integration proof", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: lessonID, Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap"}}}
+}
+
+func completionProofMigrationDirectory(t *testing.T) string {
+	t.Helper()
+	for _, p := range []string{filepath.Join("db", "migrations"), filepath.Join("..", "..", "db", "migrations")} {
+		if st, e := os.Stat(p); e == nil && st.IsDir() {
+			return p
+		}
+	}
+	t.Fatal("repository migration directory not found")
+	return ""
+}

@@ -1,0 +1,110 @@
+package telegram
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumResponseBytes = 64 << 10
+
+type Client struct {
+	BaseURL    string
+	BotToken   string
+	HTTPClient *http.Client
+}
+
+func (client Client) SendText(ctx context.Context, chatID int64, text string) (int64, error) {
+	if chatID <= 0 || strings.TrimSpace(text) == "" || !utf8.ValidString(text) || utf8.RuneCountInString(text) > 12000 {
+		return 0, domain.ErrTelegramUnavailable
+	}
+	runes := []rune(text)
+	var lastMessageID int64
+	for start := 0; start < len(runes); start += 4096 {
+		end := start + 4096
+		if end > len(runes) {
+			end = len(runes)
+		}
+		messageID, err := client.sendChunk(ctx, chatID, string(runes[start:end]))
+		if err != nil {
+			return 0, err
+		}
+		lastMessageID = messageID
+	}
+	return lastMessageID, nil
+}
+
+func (client Client) sendChunk(ctx context.Context, chatID int64, text string) (int64, error) {
+	payload, err := json.Marshal(map[string]any{"chat_id": chatID, "text": text})
+	if err != nil {
+		return 0, domain.ErrTelegramUnavailable
+	}
+	endpoint, err := client.endpoint()
+	if err != nil {
+		return 0, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrTelegramUnavailable, err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrTelegramUnavailable, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != http.StatusTooManyRequests {
+		return 0, fmt.Errorf("%w: status %d", domain.ErrTelegramRejected, response.StatusCode)
+	}
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("%w: status %d", domain.ErrTelegramUnavailable, response.StatusCode)
+	}
+	limited := &io.LimitedReader{R: response.Body, N: maximumResponseBytes + 1}
+	var body struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(&body); err != nil || limited.N == 0 || !body.OK || body.Result.MessageID <= 0 {
+		return 0, fmt.Errorf("%w: invalid Telegram response", domain.ErrTelegramUnavailable)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("%w: multiple Telegram response values", domain.ErrTelegramUnavailable)
+	}
+	return body.Result.MessageID, nil
+}
+
+func (client Client) endpoint() (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(client.BaseURL), "/")
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	token := strings.TrimSpace(client.BotToken)
+	if token == "" || strings.ContainsAny(token, "/?#") {
+		return "", domain.ErrTelegramUnavailable
+	}
+	parsed, err := url.ParseRequestURI(base + "/bot" + token + "/sendMessage")
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", domain.ErrTelegramUnavailable
+	}
+	return parsed.String(), nil
+}
+
+var _ repository.TelegramSender = Client{}

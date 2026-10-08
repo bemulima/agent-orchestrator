@@ -1,0 +1,207 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+	"github.com/google/uuid"
+)
+
+type DiagnosticCatalogReader interface {
+	GetDiagnosticAssessmentCatalog(context.Context, string) (domain.DiagnosticAssessmentCatalog, error)
+}
+type DiagnosticTaskReader interface {
+	GetDiagnosticTask(context.Context, string) (*answer.TaskMetadata, error)
+}
+
+type DiagnosticClock interface{ Now() time.Time }
+
+// DiagnosticAssessments is intentionally disconnected from the ordinary answer
+// lifecycle. Its dependencies are limited to its own repository and Course.
+type DiagnosticAssessments struct {
+	Attempts repository.DiagnosticAssessmentRepository
+	Catalog  DiagnosticCatalogReader
+	Tasks    DiagnosticTaskReader
+	Clock    DiagnosticClock
+}
+
+type ReserveDiagnosticAssessmentInput struct {
+	Plan                   domain.DiagnosticAssessmentPlan
+	RequestID, RequestHash string
+}
+
+func (uc DiagnosticAssessments) Reserve(ctx context.Context, input ReserveDiagnosticAssessmentInput) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	if uc.Attempts == nil || uc.Catalog == nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, errors.New("diagnostic assessments are not configured")
+	}
+	plan, err := domain.NormalizeDiagnosticAssessmentPlan(input.Plan)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if plan.ID != input.RequestID {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	if replay, found, replayErr := uc.Attempts.ReplayDiagnosticReservation(ctx, plan.StudentID, plan.ID, input.RequestID, input.RequestHash); replayErr != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, replayErr
+	} else if found {
+		return replay, true, nil
+	}
+	catalog, err := uc.Catalog.GetDiagnosticAssessmentCatalog(ctx, plan.CourseID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if !diagnosticPlanMatchesCatalog(plan, catalog) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	return uc.Attempts.ReserveDiagnosticAssessment(ctx, repository.DiagnosticAssessmentReserveCommand{Plan: plan, RequestID: input.RequestID, RequestHash: input.RequestHash, OccurredAt: diagnosticNow(uc.Clock)})
+}
+func (uc DiagnosticAssessments) Get(ctx context.Context, studentID, attemptID string) (domain.DiagnosticAssessmentAttempt, error) {
+	if uc.Attempts == nil {
+		return domain.DiagnosticAssessmentAttempt{}, errors.New("diagnostic assessments are not configured")
+	}
+	return uc.Attempts.GetDiagnosticAssessment(ctx, studentID, attemptID)
+}
+func (uc DiagnosticAssessments) GetCurrent(ctx context.Context, studentID string) (domain.DiagnosticAssessmentAttempt, error) {
+	if uc.Attempts == nil || !canonicalDiagnosticUsecaseID(studentID) {
+		return domain.DiagnosticAssessmentAttempt{}, domain.ErrNotFound
+	}
+	return uc.Attempts.GetCurrentDiagnosticAssessment(ctx, studentID)
+}
+
+// GetTask makes the trusted Course task capability reachable only after an
+// owned frozen attempt has been loaded and exact metadata parity is proved.
+func (uc DiagnosticAssessments) GetTask(ctx context.Context, studentID, attemptID, taskID string) (*answer.TaskMetadata, error) {
+	if uc.Attempts == nil || uc.Tasks == nil || !canonicalDiagnosticUsecaseID(studentID) || !canonicalDiagnosticUsecaseID(attemptID) || !canonicalDiagnosticUsecaseID(taskID) {
+		return nil, domain.ErrNotFound
+	}
+	attempt, err := uc.Attempts.GetDiagnosticAssessment(ctx, studentID, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	frozen := diagnosticFrozenItem(attempt, taskID)
+	if frozen == nil {
+		return nil, domain.ErrNotFound
+	}
+	task, err := uc.Tasks.GetDiagnosticTask(ctx, frozen.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if !diagnosticTaskMatches(*frozen, task) || task.EvaluationMode != "AUTO" {
+		return nil, domain.ErrConflict
+	}
+	return task, nil
+}
+
+type SubmitDiagnosticAssessmentInput struct {
+	StudentID, AttemptID, TaskID, RequestID, RequestHash string
+	Response                                             json.RawMessage
+}
+
+func (uc DiagnosticAssessments) Submit(ctx context.Context, input SubmitDiagnosticAssessmentInput) (domain.DiagnosticAssessmentAttempt, bool, error) {
+	if uc.Attempts == nil || uc.Tasks == nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, errors.New("diagnostic assessments are not configured")
+	}
+	if !canonicalDiagnosticUsecaseID(input.StudentID) || !canonicalDiagnosticUsecaseID(input.AttemptID) || !canonicalDiagnosticUsecaseID(input.TaskID) {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrValidation
+	}
+	if replay, found, replayErr := uc.Attempts.ReplayDiagnosticSubmission(ctx, input.StudentID, input.AttemptID, input.TaskID, input.RequestID, input.RequestHash); replayErr != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, replayErr
+	} else if found {
+		return replay, true, nil
+	}
+	attempt, err := uc.Attempts.GetDiagnosticAssessment(ctx, input.StudentID, input.AttemptID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	frozen := diagnosticFrozenItem(attempt, input.TaskID)
+	if frozen == nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrNotFound
+	}
+	task, err := uc.Tasks.GetDiagnosticTask(ctx, frozen.TaskID)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	if !diagnosticTaskMatches(*frozen, task) || task.EvaluationMode != "AUTO" {
+		return domain.DiagnosticAssessmentAttempt{}, false, domain.ErrConflict
+	}
+	correct, err := answer.EvaluateDiagnosticStructuredAssessment(task, input.Response)
+	if err != nil {
+		return domain.DiagnosticAssessmentAttempt{}, false, err
+	}
+	return uc.Attempts.SubmitDiagnosticAssessment(ctx, repository.DiagnosticAssessmentSubmitCommand{StudentID: input.StudentID, AttemptID: input.AttemptID, TaskID: frozen.TaskID, RequestID: input.RequestID, RequestHash: input.RequestHash, Response: input.Response, Correct: correct, OccurredAt: diagnosticNow(uc.Clock)})
+}
+func diagnosticFrozenItem(attempt domain.DiagnosticAssessmentAttempt, taskID string) *domain.DiagnosticAssessmentPlanItem {
+	for index := range attempt.Items {
+		if attempt.Items[index].TaskID == taskID {
+			return &attempt.Items[index]
+		}
+	}
+	return nil
+}
+
+type CompleteDiagnosticAssessmentInput struct{ StudentID, AttemptID, RequestID, RequestHash string }
+
+func (uc DiagnosticAssessments) Complete(ctx context.Context, input CompleteDiagnosticAssessmentInput) (domain.DiagnosticAssessmentResult, bool, error) {
+	if uc.Attempts == nil {
+		return domain.DiagnosticAssessmentResult{}, false, errors.New("diagnostic assessments are not configured")
+	}
+	return uc.Attempts.CompleteDiagnosticAssessment(ctx, repository.DiagnosticAssessmentCompleteCommand{StudentID: input.StudentID, AttemptID: input.AttemptID, RequestID: input.RequestID, RequestHash: input.RequestHash, OccurredAt: diagnosticNow(uc.Clock)})
+}
+func diagnosticNow(clock DiagnosticClock) time.Time {
+	if clock == nil {
+		return time.Now().UTC()
+	}
+	return clock.Now().UTC()
+}
+func canonicalDiagnosticUsecaseID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+func diagnosticPlanMatchesCatalog(plan domain.DiagnosticAssessmentPlan, catalog domain.DiagnosticAssessmentCatalog) bool {
+	if catalog.Schema != "course-diagnostic-assessment-catalog.v1" || catalog.CourseID != plan.CourseID || catalog.CurriculumRevision != plan.CourseContentRevision {
+		return false
+	}
+	byTask := make(map[string]domain.DiagnosticAssessmentCatalogItem, len(catalog.Items))
+	for _, item := range catalog.Items {
+		byTask[item.TaskID] = item
+	}
+	for _, item := range plan.Assessments {
+		current, ok := byTask[item.TaskID]
+		if !ok || current.LessonID != item.LessonID || current.TaskVersion != item.TaskVersion || !current.UpdatedAt.UTC().Equal(item.UpdatedAt.UTC()) || current.LessonOrder != item.LessonOrder || current.TaskOrder != item.TaskOrder || current.AssessmentPurpose != "diagnostic" || !diagnosticTargetsEqual(current.LearningTargets, item.LearningTargets) {
+			return false
+		}
+	}
+	return true
+}
+func diagnosticTaskMatches(frozen domain.DiagnosticAssessmentPlanItem, task *answer.TaskMetadata) bool {
+	if task == nil || task.ID != frozen.TaskID || task.LessonID != frozen.LessonID || task.Version != frozen.TaskVersion || !task.UpdatedAt.UTC().Equal(frozen.UpdatedAt.UTC()) || task.AssessmentPurpose != "diagnostic" || !diagnosticTaskType(task.Type) {
+		return false
+	}
+	return diagnosticTargetsEqual(task.LearningTargets, frozen.LearningTargets)
+}
+func diagnosticTaskType(value int16) bool {
+	switch value {
+	case 11, 12, 13:
+		return true
+	default:
+		return false
+	}
+}
+func diagnosticTargetsEqual(left, right []domain.LearningTargetRef) bool {
+	left, err := domain.NormalizeDiagnosticLearningTargets(left)
+	if err != nil {
+		return false
+	}
+	right, err = domain.NormalizeDiagnosticLearningTargets(right)
+	if err != nil || len(left) != len(right) {
+		return false
+	}
+	encodedLeft, _ := json.Marshal(left)
+	encodedRight, _ := json.Marshal(right)
+	return string(encodedLeft) == string(encodedRight)
+}

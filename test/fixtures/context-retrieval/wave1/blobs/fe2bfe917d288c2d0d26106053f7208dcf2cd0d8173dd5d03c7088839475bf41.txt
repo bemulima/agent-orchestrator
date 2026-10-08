@@ -1,0 +1,147 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func t14AssignedPath() StudentLearningPath {
+	return StudentLearningPath{ID: "11111111-1111-4111-8111-111111111111", StudentID: "22222222-2222-4222-8222-222222222222", CourseID: "33333333-3333-4333-8333-333333333333", Status: LearningPathStatusPaused, Items: []LearningPathItem{{ID: "44444444-4444-4444-8444-444444444444", ReferenceType: "lesson", ReferenceID: "55555555-5555-4555-8555-555555555555", LessonRevisionID: "66666666-6666-4666-8666-666666666666", LessonContent: json.RawMessage(`{"title":"  <Frozen> ","excerpt":"line\n\tquote\"","description":"old 😀 body","translations":[{"title":"replacement"}],"tasks":[{"answer_key":"private"}],"private_suite_ref":"private"}`)}}}
+}
+
+func TestT14AssignedProjectionExactDigestAndWhitelist(t *testing.T) {
+	path := t14AssignedPath()
+	result, err := ProjectAssignedLessonContext(path, path.Items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedBytes, _ := json.Marshal([3]string{"  <Frozen> ", "line\n\tquote\"", "old 😀 body"})
+	digest := sha256.Sum256(expectedBytes)
+	if result.ContentDigest != fmt.Sprintf("sha256:%x", digest) || result.Content.Title != "  <Frozen> " {
+		t.Fatalf("exact digest/content lost: %#v", result)
+	}
+	raw, _ := json.Marshal(result)
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &fields)
+	if len(fields) != 9 {
+		t.Fatalf("unexpected projection fields: %s", raw)
+	}
+	var content map[string]json.RawMessage
+	_ = json.Unmarshal(fields["content"], &content)
+	if len(content) != 3 || strings.Contains(string(raw), "private") || strings.Contains(string(raw), "replacement") {
+		t.Fatalf("private or translated content leaked: %s", raw)
+	}
+	if result.Schema != AssignedLessonContextSchema || result.StudentID != path.StudentID || result.LearningPathID != path.ID || result.CourseID != path.CourseID || result.LessonID != path.Items[0].ReferenceID || result.LessonRevisionID != path.Items[0].LessonRevisionID {
+		t.Fatalf("identity mismatch: %#v", result)
+	}
+}
+
+func TestT14AssignedProjectionBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		title, excerpt, description string
+		ok                          bool
+	}{
+		{"rune boundaries", strings.Repeat("😀", 1000), strings.Repeat("😀", 4000), strings.Repeat("x", 1<<20), true},
+		{"title overflow", strings.Repeat("😀", 1001), "", "", false},
+		{"excerpt overflow", "", strings.Repeat("😀", 4001), "", false},
+		{"description byte overflow", "", "", strings.Repeat("😀", (1<<18)+1), false},
+		{"wire escape expansion", "", "", strings.Repeat("<", 1<<20), false},
+		{"wire control expansion", "", "", strings.Repeat("\x00", 1<<20), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t14AssignedPath()
+			path.Items[0].LessonContent, _ = json.Marshal(AssignedLessonContent{tc.title, tc.excerpt, tc.description})
+			result, err := ProjectAssignedLessonContext(path, path.Items[0].ID)
+			if (err == nil) != tc.ok {
+				t.Fatalf("ok=%v err=%v", tc.ok, err)
+			}
+			if tc.ok {
+				raw, _ := json.Marshal(result)
+				if len(raw) > AssignedLessonContextMaxBytes {
+					t.Fatalf("wire too large %d", len(raw))
+				}
+			}
+		})
+	}
+}
+
+func TestT14AssignedProjectionMalformedAndForeign(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*StudentLearningPath)
+	}{
+		{"missing item", func(p *StudentLearningPath) { p.Items = nil }},
+		{"ambiguous item", func(p *StudentLearningPath) { p.Items = append(p.Items, p.Items[0]) }},
+		{"foreign course", func(p *StudentLearningPath) { p.CourseID = "bad" }},
+		{"missing revision", func(p *StudentLearningPath) { p.Items[0].LessonRevisionID = "" }},
+		{"nil revision", func(p *StudentLearningPath) { p.Items[0].LessonRevisionID = "00000000-0000-0000-0000-000000000000" }},
+		{"noncanonical lesson", func(p *StudentLearningPath) { p.Items[0].ReferenceID = "55555555555545558555555555555555" }},
+		{"practice", func(p *StudentLearningPath) { p.Items[0].ReferenceType = "practice" }},
+		{"missing content", func(p *StudentLearningPath) { p.Items[0].LessonContent = nil }},
+		{"missing field", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = json.RawMessage(`{"title":"x","description":"x"}`)
+		}},
+		{"null field", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = json.RawMessage(`{"title":null,"excerpt":"","description":""}`)
+		}},
+		{"nonstring field", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = json.RawMessage(`{"title":1,"excerpt":"","description":""}`)
+		}},
+		{"duplicate field", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = json.RawMessage(`{"title":"x","title":"y","excerpt":"","description":""}`)
+		}},
+		{"trailing json", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = append(p.Items[0].LessonContent, []byte(` {}`)...)
+		}},
+		{"invalid UTF8", func(p *StudentLearningPath) {
+			p.Items[0].LessonContent = json.RawMessage(append([]byte(`{"title":"`), append([]byte{0xff}, []byte(`","excerpt":"","description":""}`)...)...))
+		}},
+		{"array content", func(p *StudentLearningPath) { p.Items[0].LessonContent = json.RawMessage(`[]`) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := t14AssignedPath()
+			tc.mutate(&p)
+			if _, err := ProjectAssignedLessonContext(p, "44444444-4444-4444-8444-444444444444"); err == nil {
+				t.Fatal("invalid projection accepted")
+			}
+		})
+	}
+	for _, key := range []string{"course_id", "lesson_id", "lesson_revision_id", "learning_path_id", "learning_path_item_id"} {
+		t.Run("crossref "+key, func(t *testing.T) {
+			p := t14AssignedPath()
+			p.Items[0].LessonContent = json.RawMessage(fmt.Sprintf(`{"title":"x","excerpt":"","description":"","%s":"77777777-7777-4777-8777-777777777777"}`, key))
+			if _, err := ProjectAssignedLessonContext(p, p.Items[0].ID); err == nil {
+				t.Fatal("foreign crossref accepted")
+			}
+		})
+	}
+}
+
+func TestT14AssignedProjectionExactWireBoundary(t *testing.T) {
+	path := t14AssignedPath()
+	path.Items[0].LessonContent = json.RawMessage(`{"title":"","excerpt":"","description":""}`)
+	base, err := ProjectAssignedLessonContext(path, path.Items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(base)
+	available := AssignedLessonContextMaxBytes - len(raw)
+	description := strings.Repeat("<", available/6) + strings.Repeat("x", available%6)
+	path.Items[0].LessonContent, _ = json.Marshal(AssignedLessonContent{Description: description})
+	result, err := ProjectAssignedLessonContext(path, path.Items[0].ID)
+	if err != nil {
+		t.Fatalf("exact wire boundary rejected: %v", err)
+	}
+	raw, _ = json.Marshal(result)
+	if len(raw) != AssignedLessonContextMaxBytes {
+		t.Fatalf("expected exact cap, got %d", len(raw))
+	}
+	path.Items[0].LessonContent, _ = json.Marshal(AssignedLessonContent{Description: description + "x"})
+	if _, err := ProjectAssignedLessonContext(path, path.Items[0].ID); err == nil {
+		t.Fatal("one extra encoded byte accepted")
+	}
+}

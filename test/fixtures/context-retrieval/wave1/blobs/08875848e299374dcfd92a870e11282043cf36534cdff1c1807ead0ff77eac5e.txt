@@ -1,0 +1,256 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/go-chi/chi/v5"
+)
+
+const (
+	defaultKnowledgeImportBatchMaxOperations = 10_000
+	defaultKnowledgeImportBatchMaxBodyBytes  = 64 << 20
+	batchFailureBodyLimit                    = 64 << 10
+)
+
+var knowledgeImportWritePaths = map[string][]*regexp.Regexp{
+	http.MethodPost: {
+		regexp.MustCompile(`^/(?:course|track|level|course-group|module|section|lesson|task)/create$`),
+		regexp.MustCompile(`^/course-i18n/create/[0-9a-fA-F-]{36}$`),
+		regexp.MustCompile(`^/(?:track-relations/add-level|level-relations/add-course-group|course-group-relations/add-course|course-relations/add-module|module-relations/add-section|section-relations/add-lesson)/[0-9a-fA-F-]{36}$`),
+	},
+	http.MethodPut: {
+		regexp.MustCompile(`^/(?:course|track|level|course-group|module|section|lesson|task)/update/[0-9a-fA-F-]{36}$`),
+		regexp.MustCompile(`^/course-relations/update-(?:tags|techs)/[0-9a-fA-F-]{36}$`),
+		regexp.MustCompile(`^/(?:track-relations/replace-levels|level-relations/replace-course-groups|course-group-relations/replace-courses)/[0-9a-fA-F-]{36}$`),
+		regexp.MustCompile(`^/(?:course-relations/replace-modules|module-relations/replace-sections|section-relations/replace-lessons)/[0-9a-fA-F-]{36}$`),
+		regexp.MustCompile(`^/(?:lesson-relations/replace|lesson-examples/replace|example-relations/replace)/[0-9a-fA-F-]{36}$`),
+	},
+	http.MethodDelete: {
+		regexp.MustCompile(`^/task/delete/[0-9a-fA-F-]{36}$`),
+	},
+}
+
+type knowledgeImportBatchOperation struct {
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Body   json.RawMessage `json:"body"`
+}
+
+type knowledgeImportBatchRequest struct {
+	Operations []knowledgeImportBatchOperation `json:"operations"`
+}
+
+type knowledgeImportBatchFailure struct {
+	Index      int
+	Method     string
+	Path       string
+	StatusCode int
+	Response   string
+}
+
+func (e *knowledgeImportBatchFailure) Error() string {
+	message := fmt.Sprintf("operation %d (%s %s) failed with status %d", e.Index, e.Method, e.Path, e.StatusCode)
+	if e.Response != "" {
+		message += ": " + e.Response
+	}
+	return message
+}
+
+// KnowledgeImportBatchHandler executes an allowlisted sequence of existing
+// admin writes in one outer database transaction.
+type KnowledgeImportBatchHandler struct {
+	Tx            repository.TransactionManager
+	Dispatch      http.Handler
+	MaxOperations int
+	MaxBodyBytes  int64
+}
+
+// Apply handles POST /knowledge-import/batch.
+func (h *KnowledgeImportBatchHandler) Apply(w http.ResponseWriter, r *http.Request) {
+	if h == nil || h.Tx == nil || h.Dispatch == nil {
+		http.Error(w, "knowledge import batch is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	maxBodyBytes := h.MaxBodyBytes
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = defaultKnowledgeImportBatchMaxBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request knowledgeImportBatchRequest
+	if err := decoder.Decode(&request); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeKnowledgeImportBatchError(w, http.StatusRequestEntityTooLarge, "batch_too_large", err.Error(), nil)
+			return
+		}
+		writeKnowledgeImportBatchError(w, http.StatusBadRequest, "invalid_batch", err.Error(), nil)
+		return
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		writeKnowledgeImportBatchError(w, http.StatusBadRequest, "invalid_batch", err.Error(), nil)
+		return
+	}
+
+	maxOperations := h.MaxOperations
+	if maxOperations <= 0 {
+		maxOperations = defaultKnowledgeImportBatchMaxOperations
+	}
+	if len(request.Operations) == 0 || len(request.Operations) > maxOperations {
+		writeKnowledgeImportBatchError(
+			w,
+			http.StatusUnprocessableEntity,
+			"invalid_batch",
+			fmt.Sprintf("operations must contain between 1 and %d items", maxOperations),
+			nil,
+		)
+		return
+	}
+	for index, operation := range request.Operations {
+		if err := validateKnowledgeImportOperation(operation); err != nil {
+			writeKnowledgeImportBatchError(w, http.StatusUnprocessableEntity, "invalid_operation", err.Error(), &index)
+			return
+		}
+	}
+
+	err := h.Tx.WithTx(r.Context(), func(ctx repository.Context) error {
+		for index, operation := range request.Operations {
+			body := bytes.NewReader(operation.Body)
+			operationContext := context.WithValue(ctx, chi.RouteCtxKey, chi.NewRouteContext())
+			subrequest, err := http.NewRequestWithContext(operationContext, operation.Method, operation.Path, body)
+			if err != nil {
+				return &knowledgeImportBatchFailure{
+					Index:      index,
+					Method:     operation.Method,
+					Path:       operation.Path,
+					StatusCode: http.StatusUnprocessableEntity,
+					Response:   err.Error(),
+				}
+			}
+			subrequest.Header.Set("Content-Type", "application/json")
+			subrequest.Header.Set("X-User-ID", r.Header.Get("X-User-ID"))
+			subrequest.Header.Set("X-User-Role", r.Header.Get("X-User-Role"))
+			response := newKnowledgeImportBatchResponseWriter()
+			h.Dispatch.ServeHTTP(response, subrequest)
+			if response.StatusCode() < http.StatusOK || response.StatusCode() >= http.StatusMultipleChoices {
+				return &knowledgeImportBatchFailure{
+					Index:      index,
+					Method:     operation.Method,
+					Path:       operation.Path,
+					StatusCode: response.StatusCode(),
+					Response:   strings.TrimSpace(response.body.String()),
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		var failure *knowledgeImportBatchFailure
+		if errors.As(err, &failure) {
+			writeKnowledgeImportBatchError(w, http.StatusUnprocessableEntity, "operation_failed", failure.Error(), &failure.Index)
+			return
+		}
+		writeKnowledgeImportBatchError(w, http.StatusInternalServerError, "batch_failed", err.Error(), nil)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"applied": len(request.Operations)})
+}
+
+type knowledgeImportBatchResponseWriter struct {
+	header http.Header
+	body   strings.Builder
+	status int
+}
+
+func newKnowledgeImportBatchResponseWriter() *knowledgeImportBatchResponseWriter {
+	return &knowledgeImportBatchResponseWriter{header: make(http.Header)}
+}
+
+func (w *knowledgeImportBatchResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *knowledgeImportBatchResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *knowledgeImportBatchResponseWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	remaining := batchFailureBodyLimit - w.body.Len()
+	if remaining > len(payload) {
+		remaining = len(payload)
+	}
+	if remaining > 0 {
+		_, _ = w.body.Write(payload[:remaining])
+	}
+	return len(payload), nil
+}
+
+func (w *knowledgeImportBatchResponseWriter) StatusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func validateKnowledgeImportOperation(operation knowledgeImportBatchOperation) error {
+	if operation.Method != http.MethodPost && operation.Method != http.MethodPut && operation.Method != http.MethodDelete {
+		return fmt.Errorf("method %q is not allowed", operation.Method)
+	}
+	if operation.Path == "" || strings.ContainsAny(operation.Path, "?#") {
+		return fmt.Errorf("path %q is not an allowlisted admin path", operation.Path)
+	}
+	allowed := false
+	for _, pattern := range knowledgeImportWritePaths[operation.Method] {
+		if pattern.MatchString(operation.Path) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("%s %s is not allowed in a knowledge import batch", operation.Method, operation.Path)
+	}
+	body := bytes.TrimSpace(operation.Body)
+	if len(body) == 0 || body[0] != '{' || !json.Valid(body) {
+		return fmt.Errorf("%s %s body must be a JSON object", operation.Method, operation.Path)
+	}
+	return nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain one JSON document")
+		}
+		return err
+	}
+	return nil
+}
+
+func writeKnowledgeImportBatchError(w http.ResponseWriter, status int, code string, message string, index *int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	payload := map[string]any{"error": code, "message": message}
+	if index != nil {
+		payload["operation_index"] = *index
+	}
+	_ = json.NewEncoder(w).Encode(payload)
+}

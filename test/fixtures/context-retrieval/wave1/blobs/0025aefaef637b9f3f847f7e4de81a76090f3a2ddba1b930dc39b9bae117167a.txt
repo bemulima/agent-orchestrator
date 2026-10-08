@@ -1,0 +1,107 @@
+package outbox_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/outbox"
+)
+
+type mutableClock struct {
+	now time.Time
+}
+
+func (clock *mutableClock) Now() time.Time { return clock.now }
+
+type outboxFake struct {
+	events           []domain.IntegrationEvent
+	claim            repository.OutboxClaim
+	published        []string
+	failed           []string
+	retryAt          time.Time
+	failureMessage   string
+	markPublishedErr error
+	markFailedErr    error
+}
+
+func (fake *outboxFake) Claim(_ context.Context, claim repository.OutboxClaim) ([]domain.IntegrationEvent, error) {
+	fake.claim = claim
+	return fake.events, nil
+}
+
+func (fake *outboxFake) MarkPublished(_ context.Context, eventID, _ string, _ time.Time) error {
+	fake.published = append(fake.published, eventID)
+	return fake.markPublishedErr
+}
+
+func (fake *outboxFake) MarkFailed(_ context.Context, eventID, _ string, message string, retryAt time.Time) error {
+	fake.failed = append(fake.failed, eventID)
+	fake.failureMessage = message
+	fake.retryAt = retryAt
+	return fake.markFailedErr
+}
+
+type publisherFake struct {
+	published []string
+	err       error
+}
+
+func (fake *publisherFake) Publish(_ context.Context, event domain.IntegrationEvent) error {
+	fake.published = append(fake.published, event.EventID)
+	return fake.err
+}
+
+func relayFixture(events []domain.IntegrationEvent) (outbox.Relay, *outboxFake, *publisherFake, *mutableClock) {
+	clock := &mutableClock{now: time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)}
+	storage := &outboxFake{events: events}
+	publisher := &publisherFake{}
+	return outbox.Relay{
+		Outbox:         storage,
+		Publisher:      publisher,
+		Clock:          clock,
+		WorkerID:       "worker-1",
+		BatchSize:      50,
+		LockTTL:        5 * time.Minute,
+		PublishTimeout: 5 * time.Second,
+		RetryBaseDelay: time.Second,
+		RetryMaxDelay:  5 * time.Minute,
+	}, storage, publisher, clock
+}
+
+func TestRelayMarksAcknowledgedEventPublished(t *testing.T) {
+	relay, storage, publisher, _ := relayFixture([]domain.IntegrationEvent{{EventID: "00000000-0000-0000-0000-000000000003", Attempts: 1}})
+	processed, err := relay.ProcessBatch(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, processed)
+	require.Equal(t, []string{"00000000-0000-0000-0000-000000000003"}, publisher.published)
+	require.Equal(t, []string{"00000000-0000-0000-0000-000000000003"}, storage.published)
+	require.Empty(t, storage.failed)
+}
+
+func TestRelaySchedulesExponentialRetry(t *testing.T) {
+	relay, storage, publisher, clock := relayFixture([]domain.IntegrationEvent{{EventID: "00000000-0000-0000-0000-000000000003", Attempts: 3}})
+	publisher.err = errors.New("broker unavailable")
+	processed, err := relay.ProcessBatch(context.Background())
+	require.ErrorContains(t, err, "broker unavailable")
+	require.Equal(t, 1, processed)
+	require.Equal(t, []string{"00000000-0000-0000-0000-000000000003"}, storage.failed)
+	require.Equal(t, "broker unavailable", storage.failureMessage)
+	require.Equal(t, clock.now.Add(4*time.Second), storage.retryAt)
+	require.Empty(t, storage.published)
+}
+
+func TestRelayUsesBoundedLease(t *testing.T) {
+	relay, storage, _, clock := relayFixture(nil)
+	processed, err := relay.ProcessBatch(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, processed)
+	require.Equal(t, "worker-1", storage.claim.WorkerID)
+	require.Equal(t, 50, storage.claim.Limit)
+	require.Equal(t, clock.now.Add(5*time.Minute), storage.claim.LockedUntil)
+}

@@ -1,0 +1,111 @@
+package internalapi
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"mime"
+	"net/http"
+
+	"github.com/example/ms-student-service/internal/domain"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+// Planner plans may contain five items with up to one hundred target refs;
+// keep enough bounded room for their canonical JSON representation.
+const diagnosticReserveBodyLimit int64 = 512 << 10
+
+func (handler *Handler) ReserveDiagnosticAssessment(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if handler.DiagnosticAssessments == nil {
+		http.Error(w, "diagnostic assessments are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, diagnosticReserveBodyLimit+1))
+	if err != nil || int64(len(body)) > diagnosticReserveBodyLimit {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var plan domain.DiagnosticAssessmentPlan
+	if err = decoder.Decode(&plan); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err = decoder.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	studentID, planID := chi.URLParam(r, "studentID"), chi.URLParam(r, "planID")
+	if plan.StudentID != studentID || plan.ID != planID {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	requestID := r.Header.Get("Idempotency-Key")
+	parsedRequestID, parseErr := uuid.Parse(requestID)
+	if parseErr != nil || parsedRequestID.String() != requestID || requestID != planID {
+		http.Error(w, "invalid idempotency key", http.StatusBadRequest)
+		return
+	}
+	sum := sha256.Sum256(append([]byte(r.Method+":"+r.URL.Path+":"), body...))
+	attempt, _, err := handler.DiagnosticAssessments.Reserve(r.Context(), studentuc.ReserveDiagnosticAssessmentInput{Plan: plan, RequestID: requestID, RequestHash: "sha256:" + hex.EncodeToString(sum[:])})
+	if err != nil {
+		writeDiagnosticInternalError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Schema       string `json:"schema"`
+		ID           string `json:"id"`
+		PlanID       string `json:"plan_id"`
+		PlanRevision int    `json:"plan_revision"`
+		PlanDigest   string `json:"plan_digest"`
+	}{"student-diagnostic-assessment-reservation.v1", attempt.ID, attempt.PlanID, attempt.PlanRevision, attempt.PlanDigest})
+}
+func writeDiagnosticInternalError(w http.ResponseWriter, err error) {
+	switch err {
+	case domain.ErrNotFound:
+		http.Error(w, "not found", http.StatusNotFound)
+	case domain.ErrConflict:
+		http.Error(w, "conflict", http.StatusConflict)
+	case domain.ErrValidation:
+		http.Error(w, "invalid request", http.StatusBadRequest)
+	default:
+		http.Error(w, "diagnostic assessments unavailable", http.StatusServiceUnavailable)
+	}
+}
+
+func (handler *Handler) GetDiagnosticAssessmentResult(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if handler.DiagnosticAssessments == nil {
+		http.Error(w, "diagnostic assessments are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	studentID, attemptID := chi.URLParam(r, "studentID"), chi.URLParam(r, "attemptID")
+	if !canonicalDiagnosticInternalID(studentID) || !canonicalDiagnosticInternalID(attemptID) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	attempt, err := handler.DiagnosticAssessments.Get(r.Context(), studentID, attemptID)
+	if err != nil || attempt.Result == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(attempt.Result)
+}
+
+func canonicalDiagnosticInternalID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}

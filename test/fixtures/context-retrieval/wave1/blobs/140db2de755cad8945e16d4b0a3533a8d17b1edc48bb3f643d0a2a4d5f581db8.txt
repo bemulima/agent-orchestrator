@@ -1,0 +1,101 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.StudentPlanningReadinessReader = (*StudentOnboardingRepoPG)(nil)
+
+// ReadPlanningReadiness deliberately uses a repeatable-read, read-only
+// transaction. Draft, profile, accepted provenance, and selected path must be
+// observed together, but this projection never creates receipts or mutations.
+func (repo *StudentOnboardingRepoPG) ReadPlanningReadiness(
+	ctx context.Context,
+	studentID string,
+) (domain.StudentPlanningReadinessSource, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentPlanningReadinessSource{}, errors.New("student onboarding repository pool is required")
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	source := domain.StudentPlanningReadinessSource{StudentID: studentID}
+	draft, err := getStudentOnboardingDraft(ctx, tx, studentID, false)
+	if err == nil {
+		source.Draft = &draft
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	profile, err := scanStudentOnboarding(tx.QueryRow(ctx, `SELECT `+studentOnboardingColumns+` FROM student_onboarding WHERE student_id=$1`, studentID))
+	if err == nil {
+		source.Profile = &profile
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	provenance, err := listPlanningReadinessProvenance(ctx, tx, studentID)
+	if err != nil {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	source.Provenance = provenance
+	path, err := getPlanningReadinessSelectedPath(ctx, tx, studentID)
+	if err == nil {
+		source.ActivePath = &path
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentPlanningReadinessSource{}, err
+	}
+	return source, nil
+}
+
+func listPlanningReadinessProvenance(ctx context.Context, tx pgx.Tx, studentID string) ([]domain.StudentPlanningReadinessProvenance, error) {
+	rows, err := tx.Query(ctx, `SELECT DISTINCT ON (slot_code)
+slot_code, code_value, stacks_value, accepted_draft_version, accepted_profile_version, origin
+FROM student_onboarding_turn_provenance
+WHERE student_id=$1
+ORDER BY slot_code, created_at DESC, provenance_id DESC`, studentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.StudentPlanningReadinessProvenance, 0, 9)
+	for rows.Next() {
+		var item domain.StudentPlanningReadinessProvenance
+		var stacks []string
+		if err := rows.Scan(&item.SlotCode, &item.CodeValue, &stacks, &item.AcceptedDraftVersion, &item.AcceptedProfileVersion, &item.Origin); err != nil {
+			return nil, err
+		}
+		if stacks != nil {
+			copied := append([]string{}, stacks...)
+			item.StacksValue = &copied
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func getPlanningReadinessSelectedPath(ctx context.Context, tx pgx.Tx, studentID string) (domain.StudentPlanningReadinessActivePath, error) {
+	var result domain.StudentPlanningReadinessActivePath
+	err := tx.QueryRow(ctx, `SELECT p.id, p.version, p.course_id, p.goal_code
+FROM student_learning_context c
+JOIN student_learning_path p ON p.id=c.selected_learning_path_id AND p.student_id=c.student_id
+WHERE c.student_id=$1 AND p.status='ACTIVE'`, studentID).Scan(
+		&result.LearningPathID, &result.Version, &result.CourseID, &result.GoalCode,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentPlanningReadinessActivePath{}, domain.ErrNotFound
+	}
+	result.Status = "ACTIVE"
+	return result, err
+}

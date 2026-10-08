@@ -1,0 +1,278 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// UUID fixtures are retained in the explicitly disposable proof database.
+// This suite never migrates, resets a schema, or starts a runtime.
+func TestNextActionSnapshotPostgres(t *testing.T) {
+	dsn := os.Getenv("NEXT_ACTION_TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = os.Getenv("LESSON_COMPLETION_TEST_DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("set NEXT_ACTION_TEST_DATABASE_URL to migrated isolated loopback *_integration_proof database")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (cfg.ConnConfig.Host != "127.0.0.1" && cfg.ConnConfig.Host != "localhost" && cfg.ConnConfig.Host != "::1") || !strings.HasSuffix(cfg.ConnConfig.Database, "_integration_proof") {
+		t.Fatal("NBA proof requires isolated loopback *_integration_proof database")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	practice := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	read := func(t *testing.T, student string) domain.NextActionSnapshot {
+		t.Helper()
+		s, e := journey.ReadNextActionSnapshot(ctx, student)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return s
+	}
+	newPath := func(t *testing.T, types ...string) domain.StudentLearningPath {
+		t.Helper()
+		now := time.Now().UTC()
+		item := domain.LearningPathItem{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap", LessonRevisionID: uuid.NewString(), LessonContent: json.RawMessage(`{"title":"frozen R10"}`), Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.loops", Version: "v1"}}}
+		for _, kind := range types {
+			r := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: kind, Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString()}}
+			if kind != "theory_acknowledged" {
+				r.SourceReference.RevisionID = uuid.NewString()
+			}
+			if kind == "practice_completed" {
+				r.SourceReference.ID = r.SourceReference.RevisionID
+			}
+			item.FrozenRequirements = append(item.FrozenRequirements, r)
+		}
+		path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: uuid.NewString(), CourseID: uuid.NewString(), GoalCode: "go.backend", CurriculumRevision: "r10", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "planner-v1", ReasonCode: "initial_plan", ReasonSummary: "NBA integration fixture", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{item}}
+		p, replayed, e := journey.CreateLearningPathIdempotently(ctx, path, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+		if e != nil || replayed {
+			t.Fatalf("create path: replay=%v err=%v", replayed, e)
+		}
+		return p
+	}
+	fact := func(t *testing.T, path domain.StudentLearningPath, index int) {
+		t.Helper()
+		i := path.Items[0]
+		r := i.FrozenRequirements[index]
+		_, changed, e := journey.ApplyLessonFact(ctx, domain.LessonActivityFact{StudentID: path.StudentID, ItemID: i.ID, RequirementID: r.ID, Type: r.Type, SourceID: r.SourceReference.ID, SourceRevisionID: r.SourceReference.RevisionID, FactID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil || !changed {
+			t.Fatalf("successful fact: changed=%v err=%v", changed, e)
+		}
+	}
+	reserve := func(t *testing.T, path domain.StudentLearningPath, r domain.LessonRequirement) domain.PracticeLearningActionBinding {
+		t.Helper()
+		instance := uuid.NewString()
+		input, e := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: path.StudentID, TaskInstanceID: instance, TaskRevisionID: r.SourceReference.RevisionID, TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), SurfaceClassification: "practice", LearningTargets: path.Items[0].Targets, LearningPathID: path.ID, LearningPathItemID: path.Items[0].ID, RequirementID: r.ID, IdempotencyKey: instance, LearningActionID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		binding, replayed, e := practice.ReservePracticeLearningAction(ctx, input)
+		if e != nil || replayed {
+			t.Fatalf("reserve: replay=%v err=%v", replayed, e)
+		}
+		return binding
+	}
+	t.Run("no_selected_lifecycle_and_real_planning_fence", func(t *testing.T) {
+		student := uuid.NewString()
+		if s := read(t, student); s.LifecycleReason != "onboarding_required" || s.SelectedPath != nil {
+			t.Fatalf("new learner: %+v", s)
+		}
+		now := time.Now().UTC()
+		profile := domain.StudentOnboarding{StudentID: student, DirectionCode: "backend", SelfAssessedExperience: "basic", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 60, PreferredPace: "regular", Version: 1, CreatedAt: now, UpdatedAt: now}
+		if _, e := (&postgres.StudentOnboardingRepoPG{Pool: pool}).Save(ctx, profile, 0); e != nil {
+			t.Fatal(e)
+		}
+		if s := read(t, student); s.LifecycleReason != "" {
+			t.Fatalf("ready profile: %+v", s)
+		}
+		admission := &postgres.OnboardingPathAdmissionRepoPG{Pool: pool}
+		request := domain.OnboardingPathAdmissionRequest{Schema: domain.OnboardingPathAdmissionRequestSchema, HandoffID: uuid.NewString(), ExecutionID: uuid.NewString(), ExpectedStateRef: domain.StudentPlanningReadinessStateRef{Kind: "finalized_profile", Version: 1}, Goal: domain.OnboardingPathGoal{Code: "go.backend", Version: "v1", GraphVersion: "v1"}}
+		if _, _, e := admission.Reserve(ctx, request, student, uuid.NewString(), now, time.Minute); e != nil {
+			t.Fatal(e)
+		}
+		s := read(t, student)
+		nba := domain.ResolveNextAction(s, nil)
+		if s.LifecycleReason != "planning_in_progress" || nba.Status != "WAITING" || nba.Primary != nil {
+			t.Fatalf("live planning fence: source=%+v NBA=%+v", s, nba)
+		}
+	})
+	t.Run("frozen_requirements_fact_versions_and_completed_route", func(t *testing.T) {
+		path := newPath(t, "theory_acknowledged")
+		before := read(t, path.StudentID)
+		if before.SelectedPath == nil || before.SelectedPath.ID != path.ID || before.SelectedPath.Items[0].LessonRevisionID != path.Items[0].LessonRevisionID {
+			t.Fatal("exact selected frozen assignment missing")
+		}
+		fact(t, path, 0)
+		after := read(t, path.StudentID)
+		if after.SelectedPath.Version != before.SelectedPath.Version+1 || after.Context.Version != before.Context.Version+1 || !after.SelectedPath.Items[0].FrozenRequirements[0].Satisfied || after.SelectedPath.Items[0].Status != domain.LearningPathItemCompleted {
+			t.Fatalf("successful fact not reflected: before=%+v after=%+v", before, after)
+		}
+		current := after.SelectedPath
+		command := domain.LearningPathPlanningCommand{Schema: domain.LearningPathNoGapRequestSchema, Kind: domain.LearningPathPlanningCommandNoGap, StudentID: path.StudentID, LearningPathID: path.ID, PlanningRequestID: uuid.NewString(), IdempotencyKey: uuid.NewString(), CourseID: path.CourseID, GoalCode: path.GoalCode, CourseFingerprint: current.CourseFingerprint, PlannerPolicyVersion: path.PlannerPolicyVersion, ReasonCode: "mastery_no_gap", ReasonSummary: "No remaining route gap", ExpectedPathVersion: current.Version, RequestHash: strings.Repeat("c", 64), OccurredAt: time.Now().UTC()}
+		if _, _, e := journey.ApplyLearningPathPlanningCommand(ctx, command); e != nil {
+			t.Fatal(e)
+		}
+		done := read(t, path.StudentID)
+		nba := domain.ResolveNextAction(done, nil)
+		if done.LifecycleReason != "path_completed" || nba.Primary != nil || nba.Status != "NO_PROGRESSION" {
+			t.Fatalf("completed path became planning: source=%+v NBA=%+v", done, nba)
+		}
+		if foreign := read(t, uuid.NewString()); foreign.SelectedPath != nil || len(foreign.Bindings) != 0 {
+			t.Fatal("snapshot leaked another owner")
+		}
+	})
+	t.Run("owned_required_and_optional_active_practice", func(t *testing.T) {
+		path := newPath(t, "practice_completed", "practice_completed")
+		path.Items[0].FrozenRequirements[1].Required = false
+		path.Version++
+		path.UpdatedAt = time.Now().UTC()
+		var e error
+		path, e = journey.ReplaceLearningPath(ctx, path, path.Version-1)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, r := range path.Items[0].FrozenRequirements {
+			binding := reserve(t, path, r)
+			if _, _, e := practice.OpenPracticeLearningAction(ctx, path.StudentID, binding.TaskInstanceID, binding.LearningActionID, time.Now().UTC()); e != nil {
+				t.Fatal(e)
+			}
+		}
+		s := read(t, path.StudentID)
+		if len(s.Bindings) != 2 {
+			t.Fatalf("missing owner bindings: %+v", s.Bindings)
+		}
+		required, optional := 0, 0
+		for _, b := range s.Bindings {
+			if b.LifecycleStatus != domain.PracticeLearningActionOpen || b.LearningPathItemID != path.Items[0].ID {
+				t.Fatalf("lost exact binding: %+v", b)
+			}
+			if domain.RequiredNextActionBinding(s, b) {
+				required++
+			} else {
+				optional++
+			}
+		}
+		if required != 1 || optional != 1 {
+			t.Fatalf("required=%d optional=%d", required, optional)
+		}
+		if _, e := journey.PauseLearningPath(ctx, path.StudentID, path.ID, s.Context.Version, time.Now().UTC()); e != nil {
+			t.Fatal(e)
+		}
+		paused := read(t, path.StudentID)
+		if paused.SelectedPath != nil || len(paused.BindingRequirements) != 2 || len(paused.Bindings) != 2 {
+			t.Fatalf("paused path lost exact requirement facts: %+v", paused)
+		}
+		required, optional = 0, 0
+		for _, b := range paused.Bindings {
+			if domain.RequiredNextActionBinding(paused, b) {
+				required++
+			} else {
+				optional++
+			}
+		}
+		if required != 1 || optional != 1 {
+			t.Fatalf("no-selected binding classification required=%d optional=%d", required, optional)
+		}
+	})
+	t.Run("stale_practice_recommendation_cannot_reserve_completed_requirement", func(t *testing.T) {
+		path := newPath(t, "practice_completed")
+		s := read(t, path.StudentID)
+		nba := domain.ResolveNextAction(s, nil)
+		if nba.Primary == nil || nba.Primary.Kind != "START_PRACTICE" {
+			t.Fatalf("initial NBA: %+v", nba)
+		}
+		fact(t, path, 0)
+		r := path.Items[0].FrozenRequirements[0]
+		instance := uuid.NewString()
+		input, e := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: path.StudentID, TaskInstanceID: instance, TaskRevisionID: r.SourceReference.RevisionID, TaskRevisionDigest: "sha256:" + strings.Repeat("d", 64), SurfaceClassification: "practice", LearningTargets: path.Items[0].Targets, LearningPathID: path.ID, LearningPathItemID: path.Items[0].ID, RequirementID: r.ID, IdempotencyKey: instance, LearningActionID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, _, e := practice.ReservePracticeLearningAction(ctx, input); !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("stale NBA forced invalid transition: %v", e)
+		}
+		if len(read(t, path.StudentID).Bindings) != 0 {
+			t.Fatal("stale command inserted a binding")
+		}
+	})
+	t.Run("latest_correlated_official_review_blocks_progression", func(t *testing.T) {
+		path := newPath(t, "quiz_passed")
+		item := path.Items[0]
+		r := item.FrozenRequirements[0]
+		oldID, newID := uuid.NewString(), uuid.NewString()
+		now := time.Now().UTC()
+		for _, a := range []struct {
+			id              string
+			status, attempt int
+			when            time.Time
+		}{{oldID, domain.StudentTaskAnswerStatusFailed, 1, now.Add(-time.Minute)}, {newID, domain.StudentTaskAnswerStatusUnderReview, 2, now}} {
+			_, e := pool.Exec(ctx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt,created_at,updated_at,learning_path_item_id,requirement_id,frozen_task_json) VALUES($1,$2,$3,$4,$5,$6,$4,$4,$7,$8,'{}')`, a.id, path.StudentID, r.SourceReference.ID, a.when, a.status, a.attempt, item.ID, r.ID)
+			if e != nil {
+				t.Fatal(e)
+			}
+		}
+		if _, e := pool.Exec(ctx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt) VALUES($1,$2,$3,now(),2,3)`, uuid.NewString(), path.StudentID, r.SourceReference.ID); e != nil {
+			t.Fatal(e)
+		}
+		s := read(t, path.StudentID)
+		nba := domain.ResolveNextAction(s, nil)
+		if len(s.Answers) != 1 || s.Answers[0].AnswerID != newID || nba.Status != "WAITING" || nba.Primary != nil {
+			t.Fatalf("official review ignored: source=%+v NBA=%+v", s, nba)
+		}
+	})
+	t.Run("standalone_practice_command_rechecks_current_predecessor", func(t *testing.T) {
+		path := newPath(t, "theory_acknowledged")
+		revision := uuid.NewString()
+		path.Items = append(path.Items, domain.LearningPathItem{ReferenceType: "practice", ReferenceID: revision, Position: 1, Status: domain.LearningPathItemPlanned, ReasonCode: "prerequisite_sequence", Targets: path.Items[0].Targets})
+		path.Version++
+		path.UpdatedAt = time.Now().UTC()
+		var e error
+		path, e = journey.ReplaceLearningPath(ctx, path, path.Version-1)
+		if e != nil {
+			t.Fatal(e)
+		}
+		instance := uuid.NewString()
+		input, e := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: path.StudentID, TaskInstanceID: instance, TaskRevisionID: revision, TaskRevisionDigest: "sha256:" + strings.Repeat("e", 64), SurfaceClassification: "practice", LearningTargets: path.Items[0].Targets, LearningPathID: path.ID, IdempotencyKey: instance, LearningActionID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, _, e := practice.ReservePracticeLearningAction(ctx, input); !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("future planned Practice bypassed required lesson: %v", e)
+		}
+		fact(t, path, 0)
+		s := read(t, path.StudentID)
+		nba := domain.ResolveNextAction(s, nil)
+		if nba.Primary == nil || nba.Primary.Kind != "START_PRACTICE" || nba.Primary.Target.PracticeRevisionID != revision {
+			t.Fatalf("next required route item NBA: %+v", nba)
+		}
+		if _, _, e := practice.ReservePracticeLearningAction(ctx, input); e != nil {
+			t.Fatalf("valid next Practice refused after predecessor completion: %v", e)
+		}
+	})
+}

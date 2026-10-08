@@ -1,0 +1,262 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func TestObjectiveEvidenceBuildsReplaySafeMasteryProjection(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	target := domain.LearningTargetRef{Type: domain.LearningTargetCapability, Key: "go.errors.wrap", Version: "v1"}
+	defer cleanupMasteryStudent(t, pool, studentID)
+
+	taskOne := uuid.NewString()
+	firstAssistance := closeAndAssistApplication(t, pool, studentID, taskOne, target, domain.TeacherSupportIndependent)
+	secondAssistance := closeAndAssistApplication(t, pool, studentID, taskOne, target, domain.TeacherSupportIndependent)
+	thirdAssistance := closeAndAssistApplication(t, pool, studentID, uuid.NewString(), target, domain.TeacherSupportIndependent)
+
+	var state string
+	var masteryScore, confidence float64
+	var independentCount, assistedCount, failureCount, evidenceCount int
+	err := pool.QueryRow(ctx, `
+SELECT state, mastery_score, confidence, independent_success_count,
+       assisted_success_count, failure_count, evidence_count
+FROM student_target_mastery
+WHERE student_id = $1 AND target_type = $2 AND target_key = $3 AND target_version = $4
+`, studentID, target.Type, target.Key, target.Version).Scan(
+		&state,
+		&masteryScore,
+		&confidence,
+		&independentCount,
+		&assistedCount,
+		&failureCount,
+		&evidenceCount,
+	)
+	if err != nil {
+		t.Fatalf("load mastery projection: %v", err)
+	}
+	if state != string(domain.TargetMasteryMastered) || masteryScore != 1 || confidence != 0.6 {
+		t.Fatalf("unexpected mastery projection state=%s score=%v confidence=%v", state, masteryScore, confidence)
+	}
+	if independentCount != 3 || assistedCount != 0 || failureCount != 0 || evidenceCount != 3 {
+		t.Fatalf("unexpected mastery counts independent=%d assisted=%d failure=%d evidence=%d", independentCount, assistedCount, failureCount, evidenceCount)
+	}
+
+	var targetEvidenceCount, auditCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_action_target_evidence WHERE student_id = $1`, studentID).Scan(&targetEvidenceCount); err != nil {
+		t.Fatalf("count target evidence: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_target_mastery_audit WHERE student_id = $1`, studentID).Scan(&auditCount); err != nil {
+		t.Fatalf("count mastery audit: %v", err)
+	}
+	if targetEvidenceCount != 3 || auditCount != 3 {
+		t.Fatalf("target evidence=%d audit=%d, want 3 each", targetEvidenceCount, auditCount)
+	}
+
+	repository := &postgres.LearningEvidenceRepoPG{Pool: pool}
+	listed, err := repository.ListStudentTargetMastery(ctx, studentID, []domain.LearningTargetRef{
+		target,
+		{Type: domain.LearningTargetConcept, Key: "go.interfaces"},
+	})
+	if err != nil {
+		t.Fatalf("list target mastery: %v", err)
+	}
+	if len(listed) != 1 || listed[0].State != domain.TargetMasteryMastered {
+		t.Fatalf("unexpected stored mastery list: %+v", listed)
+	}
+	applied, err := repository.ApplyTeacherAssistance(ctx, firstAssistance)
+	if err != nil || applied {
+		t.Fatalf("duplicate assistance result applied=%v err=%v", applied, err)
+	}
+
+	_ = secondAssistance
+	_ = thirdAssistance
+}
+
+func TestObjectiveEvidenceRejectsAssistanceOutsideFrozenTargets(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "go.errors"}
+	defer cleanupMasteryStudent(t, pool, studentID)
+
+	answer, action, closure := closeApplication(t, pool, studentID, uuid.NewString(), target)
+	assistance := independentAssistance(t, action, closure)
+	assistance.Observations[0].Target.Key = "go.interfaces"
+	repository := &postgres.LearningEvidenceRepoPG{Pool: pool}
+	applied, err := repository.ApplyTeacherAssistance(ctx, assistance)
+	if applied || !errors.Is(err, domain.ErrEvidenceContract) {
+		t.Fatalf("mismatched assistance result applied=%v err=%v", applied, err)
+	}
+
+	var inboxCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_integration_inbox WHERE event_id = $1`, assistance.EventID).Scan(&inboxCount); err != nil {
+		t.Fatalf("count rejected inbox event: %v", err)
+	}
+	if inboxCount != 0 {
+		t.Fatalf("rejected assistance left %d inbox rows", inboxCount)
+	}
+	_ = answer
+}
+
+func TestGuidedApplicationRemainsPracticed(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	target := domain.LearningTargetRef{Type: domain.LearningTargetConcept, Key: "go.interfaces"}
+	defer cleanupMasteryStudent(t, pool, studentID)
+
+	closeAndAssistApplication(t, pool, studentID, uuid.NewString(), target, domain.TeacherSupportGuided)
+	var state string
+	var masteryScore float64
+	var independentCount, assistedCount int
+	if err := pool.QueryRow(ctx, `
+SELECT state, mastery_score, independent_success_count, assisted_success_count
+FROM student_target_mastery
+WHERE student_id = $1 AND target_type = $2 AND target_key = $3 AND target_version = ''
+`, studentID, target.Type, target.Key).Scan(&state, &masteryScore, &independentCount, &assistedCount); err != nil {
+		t.Fatalf("load guided mastery: %v", err)
+	}
+	if state != string(domain.TargetMasteryPracticed) || masteryScore != 0.5 || independentCount != 0 || assistedCount != 1 {
+		t.Fatalf("unexpected guided mastery state=%s score=%v independent=%d assisted=%d", state, masteryScore, independentCount, assistedCount)
+	}
+}
+
+func closeAndAssistApplication(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	studentID string,
+	taskID string,
+	target domain.LearningTargetRef,
+	support domain.TeacherSupportContext,
+) domain.TeacherAssistance {
+	t.Helper()
+	_, action, closure := closeApplication(t, pool, studentID, taskID, target)
+	assistance := independentAssistance(t, action, closure)
+	if support == domain.TeacherSupportGuided {
+		assistance.SupportContext = support
+		assistance.Observations[0].Kind = domain.TeacherObservationGuidedContext
+	}
+	normalized, err := domain.NewTeacherAssistance(assistance)
+	if err != nil {
+		t.Fatalf("normalize teacher assistance: %v", err)
+	}
+	repository := &postgres.LearningEvidenceRepoPG{Pool: pool}
+	applied, err := repository.ApplyTeacherAssistance(context.Background(), normalized)
+	if err != nil || !applied {
+		t.Fatalf("apply teacher assistance result applied=%v err=%v", applied, err)
+	}
+	return normalized
+}
+
+func closeApplication(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	studentID string,
+	taskID string,
+	target domain.LearningTargetRef,
+) (domain.StudentTaskAnswer, domain.StudentLearningAction, domain.IntegrationEvent) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	answer := domain.StudentTaskAnswer{
+		ID:        uuid.NewString(),
+		StudentID: studentID,
+		TaskID:    taskID,
+		StartedAt: now.Add(-time.Minute),
+		Status:    domain.StudentTaskAnswerStatusInProgress,
+		CreatedAt: now.Add(-time.Minute),
+		UpdatedAt: now.Add(-time.Minute),
+	}
+	action, err := domain.NewStudentLearningAction(domain.StudentLearningAction{
+		ID:                  uuid.NewString(),
+		StudentTaskAnswerID: answer.ID,
+		StudentID:           studentID,
+		TaskID:              taskID,
+		ContextType:         domain.LearningContextLessonTask,
+		ContextID:           taskID,
+		LearningTargets:     []domain.LearningTargetRef{target},
+		EvidenceClass:       domain.LearningEvidenceApplication,
+		OpenedAt:            answer.StartedAt,
+	})
+	if err != nil {
+		t.Fatalf("create learning action: %v", err)
+	}
+	lifecycle := &postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	answer, action, err = lifecycle.CreateAnswer(ctx, answer, nil, action)
+	if err != nil {
+		t.Fatalf("create answer/action: %v", err)
+	}
+	closedAt := now
+	answer.Status = domain.StudentTaskAnswerStatusPassed
+	answer.EndedAt = &closedAt
+	answer.UpdatedAt = closedAt
+	closure, err := domain.NewLearningActionClosedEvent(uuid.NewString(), action, closedAt)
+	if err != nil {
+		t.Fatalf("create action closure: %v", err)
+	}
+	action.Outcome = domain.LearningActionPassed
+	action.OutcomePolicyVersion = domain.MasteryPolicyVersion
+	if err := lifecycle.CloseAnswer(ctx, answer, action, closure); err != nil {
+		t.Fatalf("close answer/action: %v", err)
+	}
+	action.ClosedAt = &closedAt
+	return answer, action, closure
+}
+
+func independentAssistance(t *testing.T, action domain.StudentLearningAction, closure domain.IntegrationEvent) domain.TeacherAssistance {
+	t.Helper()
+	assistance, err := domain.NewTeacherAssistance(domain.TeacherAssistance{
+		EventID:          uuid.NewString(),
+		StudentID:        action.StudentID,
+		CorrelationID:    action.ID,
+		CausationID:      closure.EventID,
+		LearningActionID: action.ID,
+		ContextType:      action.ContextType,
+		ContextID:        action.ContextID,
+		SupportContext:   domain.TeacherSupportIndependent,
+		Observations: []domain.TeacherAssistanceObservation{
+			{Target: action.LearningTargets[0], Kind: domain.TeacherObservationIndependentContext},
+		},
+		PolicyVersion: "teacher-assistance-v1",
+		OccurredAt:    closure.OccurredAt.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("create teacher assistance: %v", err)
+	}
+	return assistance
+}
+
+func cleanupMasteryStudent(t *testing.T, pool *pgxpool.Pool, studentID string) {
+	t.Helper()
+	ctx := context.Background()
+	statements := []string{
+		`DELETE FROM student_target_mastery_audit WHERE student_id = $1`,
+		`DELETE FROM student_target_mastery WHERE student_id = $1`,
+		`DELETE FROM student_learning_evidence WHERE student_id = $1`,
+		`DELETE FROM student_learning_action_assistance WHERE student_id = $1`,
+		`DELETE FROM student_integration_inbox WHERE student_id = $1`,
+		`DELETE FROM student_outbox WHERE student_id = $1`,
+		`DELETE FROM student_task_answer WHERE student_id = $1`,
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement, studentID); err != nil {
+			t.Errorf("cleanup mastery student: %v", err)
+		}
+	}
+}

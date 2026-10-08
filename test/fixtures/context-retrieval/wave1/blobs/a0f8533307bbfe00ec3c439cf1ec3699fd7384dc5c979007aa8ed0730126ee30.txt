@@ -1,0 +1,218 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/example/ms-student-service/internal/domain"
+	courseclient "github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	publichttp "github.com/example/ms-student-service/internal/transport/http/api/v1"
+	publichandlers "github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	privatehttp "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Synthetic learner identity, real Course HTTP provider, owner assignment usecase,
+// exact PG path storage and production registered public/private projections.
+func TestT14ServeAssignedLessonHTTP(t *testing.T) {
+	if os.Getenv("T14_SERVE_STUDENT") != "true" {
+		t.Skip("owned T14 Student gate absent")
+	}
+	ready, stop, result := os.Getenv("T14_STUDENT_READY_FILE"), os.Getenv("T14_STUDENT_STOP_FILE"), os.Getenv("T14_STUDENT_RESULT_FILE")
+	token := os.Getenv("T14_STUDENT_TOKEN")
+	cfg, e := pgxpool.ParseConfig(os.Getenv("STUDENT_TEST_DATABASE_URL"))
+	if e != nil || (!strings.HasSuffix(cfg.ConnConfig.Database, "_test") && cfg.ConnConfig.Database != "student_remediation_integration_proof") || token == "" || ready == "" || stop == "" || result == "" {
+		t.Fatal("SETUP: missing owned Student configuration")
+	}
+	if _, e = os.Stat(stop); !os.IsNotExist(e) {
+		t.Fatal("SETUP: stop marker must be absent")
+	}
+	var course struct {
+		URL      string `json:"url"`
+		CourseID string `json:"course_id"`
+		LessonID string `json:"lesson_id"`
+		Revision string `json:"revision_r1"`
+		Digest   string `json:"digest_r1"`
+	}
+	raw, e := os.ReadFile(os.Getenv("T14_COURSE_READY_FILE"))
+	if e != nil || json.Unmarshal(raw, &course) != nil {
+		t.Fatal("SETUP: Course metadata unavailable")
+	}
+	u, e := url.Parse(course.URL)
+	if e != nil || u.Hostname() != "127.0.0.1" || u.Scheme != "http" || os.Getenv("T14_COURSE_TOKEN") == "" {
+		t.Fatal("SETUP: Course must be owned loopback provider")
+	}
+	ctx := context.Background()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal("SETUP: Student pool unavailable")
+	}
+	defer pool.Close()
+	if pool.Ping(ctx) != nil {
+		t.Fatal("SETUP: Student database unavailable")
+	}
+	owner := uuid.NewString()
+	repo := &LearningJourneyRepoPG{Pool: pool}
+	clock := t14StudentClock{}
+	defer func() {
+		for _, q := range []string{`DELETE FROM student_learning_context WHERE student_id=$1`, `DELETE FROM student_learning_path_request WHERE student_id=$1`, `DELETE FROM student_learning_path WHERE student_id=$1`} {
+			if _, e := pool.Exec(context.Background(), q, owner); e != nil {
+				t.Error("owned Student cleanup failed")
+			}
+		}
+	}()
+	provider := courseclient.Client{BaseURL: course.URL, InternalToken: os.Getenv("T14_COURSE_TOKEN"), HTTPClient: &http.Client{Timeout: 10 * time.Second}}
+	assign := studentuc.ReplaceLearningPath{Revisions: provider, Journey: repo, Clock: clock, IDs: t14StudentIDs{}}
+	makePath := func(ctx context.Context) (domain.StudentLearningPath, error) {
+		return assign.Handle(ctx, studentuc.ReplaceLearningPathInput{StudentID: owner, PlanningRequestID: uuid.NewString(), IdempotencyKey: uuid.NewString(), CourseID: course.CourseID, GoalCode: "go.backend", CurriculumRevision: "t14-authored", PlannerPolicyVersion: "t14-fixture-v1", ReasonCode: "planned", ReasonSummary: "Owned frozen lesson proof", Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: course.LessonID, Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "next_gap"}}})
+	}
+	path, e := makePath(ctx)
+	if e != nil || len(path.Items) != 1 || path.Items[0].LessonRevisionID != course.Revision {
+		t.Fatal("SETUP: actual Student R1 assignment failed")
+	}
+	projection := studentuc.AssignedLessonContext{Paths: repo}
+	r1, e := projection.Handle(ctx, owner, path.ID, path.Items[0].ID)
+	if e != nil || r1.ContentDigest != course.Digest {
+		t.Fatal("SETUP: actual Student R1 projection failed")
+	}
+	var mu sync.Mutex
+	var r2 *domain.AssignedLessonContext
+	outage := false
+	metadata := func() map[string]any {
+		v := map[string]any{"student_id": owner, "learning_path_id": r1.LearningPathID, "learning_path_item_id": r1.LearningPathItemID, "course_id": r1.CourseID, "lesson_id": r1.LessonID, "lesson_revision_id": r1.LessonRevisionID, "content_digest": r1.ContentDigest, "classification": "actual owner ReplaceLearningPath + Course HTTP revision provider + Student PG + registered public/private projection; synthetic learner identity"}
+		if r2 != nil {
+			v["new_assignment"] = map[string]string{"learning_path_id": r2.LearningPathID, "learning_path_item_id": r2.LearningPathItemID, "lesson_revision_id": r2.LessonRevisionID, "content_digest": r2.ContentDigest}
+		}
+		return v
+	}
+	journey := &publichandlers.StudentLearningJourneyHandler{AssignedLessons: projection, Paths: studentuc.GetLearningPath{Journey: repo}, PathCollection: studentuc.LearningPaths{Paths: repo, Clock: clock}, Completion: studentuc.LessonCompletion{Repository: repo, Clock: clock}}
+	registered := chi.NewRouter()
+	registered.Mount("/internal", privatehttp.NewRouter(&privatehandlers.Handler{AssignedLessons: projection}, token))
+	registered.Group(func(r chi.Router) {
+		r.Use((middleware.AuthMiddleware{}).Middleware)
+		r.Mount("/api/v1", publichttp.NewRouter(&publichandlers.AnswerHandler{}, nil, nil, nil, nil, nil, false, journey))
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__t14/assign-r2", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(401)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if r2 == nil {
+			p, err := makePath(r.Context())
+			if err != nil {
+				w.WriteHeader(500)
+				return
+			}
+			next, err := projection.Handle(r.Context(), owner, p.ID, p.Items[0].ID)
+			old, oldErr := projection.Handle(r.Context(), owner, r1.LearningPathID, r1.LearningPathItemID)
+			if err != nil || oldErr != nil || !reflect.DeepEqual(old, r1) || next.LessonRevisionID == r1.LessonRevisionID || next.ContentDigest == r1.ContentDigest || next.LearningPathItemID == r1.LearningPathItemID {
+				w.WriteHeader(409)
+				return
+			}
+			r2 = &next
+		}
+		_ = json.NewEncoder(w).Encode(metadata())
+	})
+	mux.HandleFunc("POST /__t14/outage", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(401)
+			return
+		}
+		var v struct {
+			Enabled bool `json:"enabled"`
+		}
+		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128))
+		d.DisallowUnknownFields()
+		if d.Decode(&v) != nil {
+			w.WriteHeader(400)
+			return
+		}
+		mu.Lock()
+		outage = v.Enabled
+		mu.Unlock()
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("GET /__t14/inspect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(401)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(metadata())
+	})
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		down := outage
+		mu.Unlock()
+		if down {
+			w.WriteHeader(503)
+			return
+		}
+		registered.ServeHTTP(w, r)
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	v := metadata()
+	v["url"] = server.URL
+	var schema string
+	if pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema) != nil {
+		t.Fatal("SETUP: Student schema read failed")
+	}
+	v["database_schema"] = schema
+	t14StudentWrite(t, ready, v)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("owned Student deadline exceeded")
+		case <-ticker.C:
+			if _, e := os.Stat(stop); e == nil {
+				mu.Lock()
+				v = metadata()
+				mu.Unlock()
+				v["url"] = server.URL
+				t14StudentWrite(t, result, v)
+				return
+			} else if !os.IsNotExist(e) {
+				t.Fatal("owned stop marker read failed")
+			}
+		}
+	}
+}
+func t14StudentWrite(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, e := json.MarshalIndent(value, "", "  ")
+	if e != nil || os.WriteFile(path+".tmp", append(raw, '\n'), 0600) != nil || os.Rename(path+".tmp", path) != nil {
+		t.Fatal("safe metadata export failed")
+	}
+}
+
+type t14StudentClock struct{}
+
+func (t14StudentClock) Now() time.Time { return time.Now().UTC() }
+
+type t14StudentIDs struct{}
+
+func (t14StudentIDs) NewID() string { return uuid.NewString() }

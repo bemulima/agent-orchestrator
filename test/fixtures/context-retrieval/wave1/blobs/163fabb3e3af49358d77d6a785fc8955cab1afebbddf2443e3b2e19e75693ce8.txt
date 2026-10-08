@@ -1,0 +1,143 @@
+package filestorage
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+const starterArchiveTTLMinutes = 60
+
+func (client Client) UploadStarterArchive(
+	ctx context.Context,
+	taskID string,
+	originalFilename string,
+	archiveData []byte,
+) (string, error) {
+	baseURL, err := client.apiBaseURL()
+	if err != nil {
+		return "", err
+	}
+
+	filename := strings.TrimSpace(originalFilename)
+	if filename == "" {
+		filename = taskID + ".zip"
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	fileWriter, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return "", fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := fileWriter.Write(archiveData); err != nil {
+		return "", fmt.Errorf("write archive payload: %w", err)
+	}
+	_ = writer.WriteField("file_kind", "PREVIEW_ENV_ARCHIVE")
+	_ = writer.WriteField("owner_id", taskID)
+	_ = writer.WriteField("is_archive", "true")
+	_ = writer.WriteField("archive_format", "zip")
+	_ = writer.WriteField("is_temp", "true")
+	_ = writer.WriteField("ttl_minutes", fmt.Sprintf("%d", starterArchiveTTLMinutes))
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 60 * time.Second}
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/files/upload", &body)
+	if err != nil {
+		return "", fmt.Errorf("create upload request: %w", err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	client.authorize(request)
+
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("upload starter archive: %w", err)
+	}
+	defer func() {
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode != http.StatusCreated {
+		payload, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("upload starter archive failed: %s", strings.TrimSpace(string(payload)))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode upload response: %w", err)
+	}
+	if strings.TrimSpace(result.ID) == "" {
+		return "", fmt.Errorf("upload response does not contain file id")
+	}
+	return result.ID, nil
+}
+
+// ActivateStarterArchive makes a staged starter archive permanent after the
+// owning course transaction commits. The FileStorage operation is idempotent.
+func (client Client) ActivateStarterArchive(ctx context.Context, fileID string) error {
+	baseURL, err := client.apiBaseURL()
+	if err != nil {
+		return err
+	}
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return fmt.Errorf("filestorage file id is empty")
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/files/"+fileID+"/activate", nil)
+	if err != nil {
+		return fmt.Errorf("create activate request: %w", err)
+	}
+	client.authorize(request)
+	response, err := client.httpClient().Do(request)
+	if err != nil {
+		return fmt.Errorf("activate starter archive: %w", err)
+	}
+	defer func() {
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return fmt.Errorf("activate starter archive failed with status %d: %s", response.StatusCode, strings.TrimSpace(string(payload)))
+	}
+	return nil
+}
+
+func (client Client) apiBaseURL() (string, error) {
+	baseURL := strings.TrimSuffix(strings.TrimRight(client.BaseURL, "/"), "/api/v1")
+	if baseURL == "" {
+		return "", fmt.Errorf("filestorage base url is empty")
+	}
+	if !strings.HasSuffix(baseURL, "/internal/v1") {
+		baseURL += "/internal/v1"
+	}
+	return baseURL, nil
+}
+func (client Client) authorize(request *http.Request) {
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+}
+
+func (client Client) httpClient() *http.Client {
+	if client.HTTPClient != nil {
+		return client.HTTPClient
+	}
+	return &http.Client{Timeout: 60 * time.Second}
+}

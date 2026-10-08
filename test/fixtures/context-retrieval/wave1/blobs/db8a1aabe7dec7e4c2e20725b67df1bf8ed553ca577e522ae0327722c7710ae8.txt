@@ -1,0 +1,156 @@
+-- Practice owns v2 task execution.  Student owns only the durable learning-action
+-- binding below; it deliberately has no student_task_answer or Practice runtime row.
+ALTER TABLE student_learning_action
+    ADD COLUMN IF NOT EXISTS source_kind varchar(32) NOT NULL DEFAULT 'course_answer',
+    ADD COLUMN IF NOT EXISTS lifecycle_status varchar(16) NOT NULL DEFAULT 'OPEN',
+    ADD COLUMN IF NOT EXISTS practice_task_instance_id uuid NULL,
+    ADD COLUMN IF NOT EXISTS practice_task_revision_id uuid NULL,
+    ADD COLUMN IF NOT EXISTS practice_task_revision_digest varchar(71) NULL,
+    ADD COLUMN IF NOT EXISTS surface_classification varchar(16) NULL,
+    ADD COLUMN IF NOT EXISTS learning_path_id uuid NULL,
+    ADD COLUMN IF NOT EXISTS learning_path_version_at_reservation bigint NULL,
+    ADD COLUMN IF NOT EXISTS learning_path_position_at_reservation integer NULL,
+    ADD COLUMN IF NOT EXISTS ensure_request_hash char(64) NULL,
+    ADD COLUMN IF NOT EXISTS cancel_reason varchar(64) NULL;
+
+ALTER TABLE student_learning_action
+    ALTER COLUMN student_task_answer_id DROP NOT NULL,
+    ALTER COLUMN task_id DROP NOT NULL,
+    ALTER COLUMN opened_at DROP NOT NULL;
+
+-- A practice action has no answer cycle.  Keep zero unavailable to Course rows.
+ALTER TABLE student_learning_action
+    DROP CONSTRAINT IF EXISTS student_learning_action_cycle_check;
+ALTER TABLE student_learning_action
+    ADD CONSTRAINT student_learning_action_cycle_check CHECK (cycle >= 0);
+
+UPDATE student_learning_action
+SET source_kind = 'course_answer',
+    lifecycle_status = CASE WHEN closed_at IS NULL THEN 'OPEN' ELSE 'CLOSED' END;
+
+ALTER TABLE student_learning_action
+    DROP CONSTRAINT IF EXISTS student_learning_action_source_lifecycle_check,
+    DROP CONSTRAINT IF EXISTS student_learning_action_practice_path_snapshot_check,
+    DROP CONSTRAINT IF EXISTS student_learning_action_practice_timing_check,
+    DROP CONSTRAINT IF EXISTS student_learning_action_closed_outcome_check;
+
+ALTER TABLE student_learning_action
+    ADD CONSTRAINT student_learning_action_source_lifecycle_check CHECK (
+        (
+            source_kind = 'course_answer'
+            AND lifecycle_status IN ('OPEN', 'CLOSED')
+            AND student_task_answer_id IS NOT NULL AND task_id IS NOT NULL AND cycle > 0
+            AND opened_at IS NOT NULL
+            AND ((lifecycle_status = 'OPEN' AND closed_at IS NULL)
+                 OR (lifecycle_status = 'CLOSED' AND closed_at IS NOT NULL))
+            AND practice_task_instance_id IS NULL AND practice_task_revision_id IS NULL
+            AND practice_task_revision_digest IS NULL AND surface_classification IS NULL
+            AND learning_path_id IS NULL AND learning_path_version_at_reservation IS NULL
+            AND learning_path_position_at_reservation IS NULL AND ensure_request_hash IS NULL
+            AND cancel_reason IS NULL
+        )
+        OR
+        (
+            source_kind = 'practice_v2'
+            AND lifecycle_status IN ('RESERVED', 'OPEN', 'CANCELLED')
+            AND student_task_answer_id IS NULL AND task_id IS NULL AND cycle = 0
+            AND practice_task_instance_id IS NOT NULL AND practice_task_revision_id IS NOT NULL
+            AND practice_task_revision_digest ~ '^sha256:[0-9a-f]{64}$'
+            AND surface_classification IN ('practice', 'project')
+            AND ensure_request_hash ~ '^[0-9a-f]{64}$'
+            AND evidence_class IS NULL AND outcome IS NULL AND outcome_policy_version IS NULL
+            AND context_id = practice_task_instance_id::text
+            AND ((surface_classification = 'practice' AND context_type = 'practice_task')
+                 OR (surface_classification = 'project' AND context_type = 'project'))
+            AND (
+                (lifecycle_status = 'RESERVED' AND opened_at IS NULL AND closed_at IS NULL AND cancel_reason IS NULL)
+                OR (lifecycle_status = 'OPEN' AND opened_at IS NOT NULL AND closed_at IS NULL AND cancel_reason IS NULL)
+                OR (lifecycle_status = 'CANCELLED' AND closed_at IS NOT NULL
+                    AND cancel_reason = 'practice_provisioning_failed'
+                    AND (opened_at IS NULL OR closed_at >= opened_at))
+            )
+        )
+    ),
+    ADD CONSTRAINT student_learning_action_practice_path_snapshot_check CHECK (
+        source_kind <> 'practice_v2'
+        OR (learning_path_id IS NULL
+            AND learning_path_version_at_reservation IS NULL
+            AND learning_path_position_at_reservation IS NULL)
+        OR (learning_path_id IS NOT NULL
+            AND learning_path_version_at_reservation >= 1
+            AND learning_path_position_at_reservation >= 0)
+    ),
+    -- Historical Course rows can predate an outcome snapshot.  The old
+    -- constraint was intentionally NOT VALID; retain that compatibility while
+    -- excluding the non-evidence Practice cancellation lifecycle.
+    ADD CONSTRAINT student_learning_action_closed_outcome_check
+        CHECK (
+            source_kind = 'practice_v2'
+            OR closed_at IS NULL
+            OR (outcome IS NOT NULL AND outcome_policy_version = 'student-mastery-v1')
+        ) NOT VALID;
+
+ALTER TABLE student_learning_action
+    ADD CONSTRAINT fk_student_learning_action_owned_path
+    FOREIGN KEY (learning_path_id, student_id)
+    REFERENCES student_learning_path (id, student_id)
+    ON DELETE RESTRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_student_learning_action_practice_instance
+    ON student_learning_action (practice_task_instance_id)
+    WHERE source_kind = 'practice_v2';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_student_learning_action_practice_active_path_revision
+    ON student_learning_action (student_id, learning_path_id, practice_task_revision_id)
+    WHERE source_kind = 'practice_v2'
+      AND lifecycle_status IN ('RESERVED', 'OPEN')
+      AND learning_path_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION student_learning_action_enforce_binding()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    -- Source kind is the aggregate discriminator.  In particular, a v2
+    -- Practice binding can never be rewritten into a Course action to escape
+    -- its immutable binding/lifecycle rules.
+    IF NEW.source_kind IS DISTINCT FROM OLD.source_kind THEN
+        RAISE EXCEPTION 'student learning action source is immutable' USING ERRCODE = '23514';
+    END IF;
+
+    IF OLD.source_kind = 'course_answer' THEN
+        NEW.lifecycle_status := CASE WHEN NEW.closed_at IS NULL THEN 'OPEN' ELSE 'CLOSED' END;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.source_kind <> 'practice_v2'
+       OR NEW.source_kind <> OLD.source_kind
+       OR NEW.student_id IS DISTINCT FROM OLD.student_id
+       OR NEW.student_task_answer_id IS DISTINCT FROM OLD.student_task_answer_id
+       OR NEW.task_id IS DISTINCT FROM OLD.task_id
+       OR NEW.cycle IS DISTINCT FROM OLD.cycle
+       OR NEW.context_type IS DISTINCT FROM OLD.context_type
+       OR NEW.context_id IS DISTINCT FROM OLD.context_id
+       OR NEW.learning_targets IS DISTINCT FROM OLD.learning_targets
+       OR NEW.practice_task_instance_id IS DISTINCT FROM OLD.practice_task_instance_id
+       OR NEW.practice_task_revision_id IS DISTINCT FROM OLD.practice_task_revision_id
+       OR NEW.practice_task_revision_digest IS DISTINCT FROM OLD.practice_task_revision_digest
+       OR NEW.surface_classification IS DISTINCT FROM OLD.surface_classification
+       OR NEW.learning_path_id IS DISTINCT FROM OLD.learning_path_id
+       OR NEW.learning_path_version_at_reservation IS DISTINCT FROM OLD.learning_path_version_at_reservation
+       OR NEW.learning_path_position_at_reservation IS DISTINCT FROM OLD.learning_path_position_at_reservation
+       OR NEW.ensure_request_hash IS DISTINCT FROM OLD.ensure_request_hash THEN
+        RAISE EXCEPTION 'student learning action binding is immutable' USING ERRCODE = '23514';
+    END IF;
+
+    IF OLD.lifecycle_status = 'RESERVED' AND NEW.lifecycle_status NOT IN ('RESERVED', 'OPEN', 'CANCELLED')
+       OR OLD.lifecycle_status = 'OPEN' AND NEW.lifecycle_status NOT IN ('OPEN', 'CANCELLED')
+       OR OLD.lifecycle_status = 'CANCELLED' AND NEW.lifecycle_status <> 'CANCELLED' THEN
+        RAISE EXCEPTION 'invalid practice learning action lifecycle transition' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_student_learning_action_enforce_binding ON student_learning_action;
+CREATE TRIGGER trg_student_learning_action_enforce_binding
+BEFORE UPDATE ON student_learning_action
+FOR EACH ROW EXECUTE FUNCTION student_learning_action_enforce_binding();

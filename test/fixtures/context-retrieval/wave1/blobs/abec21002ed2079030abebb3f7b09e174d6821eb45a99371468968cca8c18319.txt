@@ -1,0 +1,227 @@
+# Database contract
+
+The service owns its PostgreSQL schema. Other services must use HTTP/events and must not query these tables.
+
+## `personal_teacher`
+
+- `id`: internal UUID primary key;
+- `student_id`: opaque external student identifier, unique;
+- teacher profile and behavior setting columns;
+- `version`: optimistic concurrency version starting at `1`;
+- UTC creation and update timestamps.
+
+The table contains no student learning state and has no cross-database foreign keys.
+
+## `personal_teacher_soul`
+
+Stores exactly one soul per `(personal_teacher_id, student_id)` with an
+independent optimistic `version`. The composite foreign key guarantees that a
+soul cannot be attached to another student's teacher. Fields are limited to
+display name, persona code, voice, relationship, and evidence-based
+encouragement styles. Mastery, learning paths, attempts, evidence, dialog
+history, prompts, and raw events are forbidden. Migration `006` backfills one
+default but independently mutable row for every existing PersonalTeacher.
+
+## `teacher_decision`
+
+Stores the immutable pedagogical decision trace: teaching mode, context reference, optional `learning_action_id`, selected pedagogy method/version/stage, strategy, selected action, optional hint level, reason code/summary, policy version, correlation/causation IDs, and timestamp. New lesson-task, practice-task, and project decisions require `learning_action_id` and use it as `correlation_id`. Legacy task rows without an action link remain readable but cannot be attributed during finalization. Migration `007` identifies legacy decisions explicitly and makes every new replaceable method auditable. `reason_summary` is a concise business explanation; raw model reasoning, prompts, student code, and dialog history are forbidden.
+
+## `teacher_outbox`
+
+Stores the complete versioned event envelope until a JetStream acknowledgement is received. Relay replicas claim rows with a bounded lease and `SKIP LOCKED`. Failed publication releases the lease and schedules exponential retry; successful publication records `published_at`. Rows are not deleted by the relay, preserving an operational audit trail.
+
+## `teacher_learning_action_assistance`
+
+Stores exactly one immutable teacher-owned summary per `(student_id, learning_action_id)`: guided/independent context, hint aggregate, intervention flag, up to 300 provider-neutral target observations, and policy version. `correlation_id` equals `learning_action_id`; `causation_id` identifies the student closure event. The row does not contain task outcome, score, confidence, or mastery.
+
+## `teacher_integration_inbox`
+
+Stores one immutable processed marker per source `event_id` and enforces one closure per `(student_id, learning_action_id)`. Finalization inserts this marker, the optional assistance row, and the optional `teacher.assistance.observed` outbox envelope in one transaction. Targetless actions intentionally commit only the inbox marker.
+
+## `teacher_dialog_job`
+
+Stores one durable orchestration record per `dialog.teacher.requested.event_id` and enforces one request per `(dialog_id, source_message_id)`. It preserves Dialog's v2 causation separately from the Teacher-job causation derived from `event_id`, and contains request identities, status, fenced lease metadata, retry timing, optional decision/delivery IDs, and a bounded error code. It never contains Student context, Dialog history, prompt variables, rendered prompts, raw provider responses, or chain-of-thought.
+
+The lifecycle is `queued -> processing -> delivery_pending -> delivered`, with
+`completed` for proof-backed `failed_no_effect` and `blocked` for permanent or
+reconciliation work. Migration `017` adds nullable v2 dense-turn identities, a
+unique `(dialog_id, teacher_turn_sequence)` fence, and
+`teacher_dialog_turn_cursor`, `teacher_dialog_turn_proof`, and
+`teacher_dialog_turn_outcome`. v2 jobs are claimable only at the cursor's next
+sequence when dense ordering is enabled; v1 keeps its legacy claim path.
+Delivery or proof-backed no-effect and cursor advancement commit atomically;
+retry, lease expiry, `unknown`, `partial`, and `committed_unreconciled` never
+advance the cursor. The parsed response body remains private transient delivery
+state and is cleared only after verified idempotent Dialog append.
+
+Migration `025` permits a private response to remain on a `blocked` job only
+when it was already generated for legacy `practice_task|project`, has a decision
+and a positive attempt count, and has no delivered-message identity or delivery
+time. The original 48,000-byte UTF-8 limit remains; retained text is also limited
+to 12,000 characters. `Block` and reconciliation preserve that exact pending
+body without changing claimability, attempts, ordering, or operator policy.
+Coordinator and other context behavior stays unchanged. A known committed
+Dialog append, including `committed_unreconciled` with a delivery identity,
+clears the body. Migration rollback locks the table and fails closed if any
+blocked body remains; it never deletes a pending response to restore the old
+constraint. An unused/drained install can restore the previous constraint and
+apply `025` again.
+
+The proof table stores a durable Student no-effect reference. The outcome table
+stores the recoverable terminal result and its distinct turn correlation; it
+does not repurpose `TeacherDecision.correlation_id`. The job's proof/outcome
+UUIDs are foreign keys, so arbitrary identities cannot satisfy
+`failed_no_effect`.
+
+## `teacher_intervention_inbox`
+
+Stores one processed record per `learning.activity.interesting.event_id`. Its
+bounded state is the signal type, selected `intervene`/`stay_silent` action,
+offer text when applicable, and optional committed Dialog delivery identity.
+The row links the same student and PersonalTeacher through a composite foreign
+key. A partial unique index permits at most one proactive offer per student and
+analytics session; redelivery uses the source event ID as the Dialog
+idempotency key. Raw analytics, error text/fingerprints, code, mastery, and
+dialog history are never persisted here.
+
+## Telegram channel tables
+
+`teacher_telegram_link_code` stores a 32-byte SHA-256 digest, the exact
+student/PersonalTeacher/general-Dialog binding, expiry, and bounded consumption
+evidence. Plaintext codes and bot secrets are never persisted.
+
+`teacher_telegram_binding` has `student_id` as its primary key and independent
+unique constraints on the numeric Telegram user and private chat identifiers.
+Re-linking the same authenticated student replaces only that student's binding;
+one Telegram identity cannot be assigned to two students.
+
+`teacher_telegram_delivery` is keyed by the source Dialog message UUID. It
+stores only the target chat, pending response body, finite lease/retry state,
+and acknowledged Telegram message ID. It is not a conversation history and is
+terminal after `sent` or `blocked`.
+
+## `teacher_course_plan_notification_inbox`
+
+Stores one immutable terminal Learning Planner outcome per `event_id` for a
+Teacher-originated request. It contains bounded request/result identities,
+Teacher audit references, a localized business notification, and optional
+idempotent Dialog delivery identity. It stores no generated curriculum,
+mastery, prompt, provider error, or chain-of-thought. Acceptance commits before
+Dialog delivery; redelivery reuses the event ID and repairs an interrupted
+append without producing a second message.
+
+## `teacher_onboarding_action_receipt`
+
+Migration `016` stores one private receipt per public UUID idempotency key, with
+one active `claimed|applied` action per student/general Dialog. It stores only
+binding/source/block/action identities, request hash, versions, status,
+downstream command/message UUIDs, lease and timestamps—never answers, labels,
+option values, profile text, or message bodies.
+
+Migration `018` adds the complete canonical-materialization contract. Every row
+has `execution_mode=legacy|canonical`. A canonical claim has a stable required
+`canonical_message_command_id`; only `materialized` has a required
+`canonical_student_message_id`, cleared lease, and completion timestamp. The
+partial unique key `(dialog_id, source_message_id, source_message_version,
+block_id, action_id)` prevents two canonical receipts for the same frozen UI
+action. Legacy `claimed|applied|completed|rejected` shapes remain valid and
+unchanged. Rollback fails closed once canonical mode, either canonical identity,
+or `materialized` has been used, then restores the migration-016 constraints.
+
+## Unified onboarding coordinator ledger
+
+Migration `019` adds `teacher_onboarding_interaction` and
+`teacher_onboarding_turn` plus coordinator staging fields on
+`teacher_dialog_job`. One Dialog has at most one active/reserved frozen prompt
+interaction. One turn is bound to the exact Teacher job/source event and stable
+Student/response command UUIDs. It may retain only one causal or fallback AI
+execution and a digest-bound selected semantic command/confirmation projection;
+provider envelopes, prompt variables, model bodies, unselected candidates, and
+the user-visible reply are excluded. The visible reply stays only in the
+existing private job delivery field until normal Dialog append. This migration
+is additive and remains dark by default.
+
+Migration `020` adds an immutable `closed` interaction state with exact reason
+`planning_ready|active_path_exists` and `closed_at`. It lets terminal ensure
+invalidate an unreserved prompt without a fake successor, job, receipt, UI, or
+body marker. Active prompt replacement, terminal close, and new canonical
+receipt claim use a per-Dialog transactional fence. A reserved or action-claimed
+prompt is never stolen. Down migration requires a drain and is fail-closed when
+close evidence or a canonical `claimed|applied|materialized` prompt-effect
+receipt exists.
+
+For an accepted policy-v2 Student effect, the existing turn remains
+`student_staged` during exact-receipt recovery and the Planner read. Product
+response body/UI, job `delivery_pending`, and turn `delivery_pending` then
+commit together. Planner reason/path/graph data is not persisted.
+
+## Durable onboarding Planner handoff
+
+Migration `021` adds `teacher_onboarding_plan_handoff`, a bounded Teacher-owned
+command/outbox and notification checkpoint. Its exact natural fence is
+`(student_id, state_ref_kind, state_ref_version)`; a different goal cannot
+create a second local intent for the same authoritative snapshot. Stable UUIDs
+and an immutable request hash bind Planner dispatch and deterministic Dialog
+notification retries. The only business projection is the supported goal
+identity and locale. Student profile, raw model/message bodies, opaque graph
+payload, and course/path/lesson identities are forbidden.
+
+The lifecycle is `queued -> dispatching -> accepted -> message_pending ->
+delivered`, with `active_path` and `blocked` alternatives. Planner acceptance
+persists its handoff ID and canonical `readiness_observed_at`, but means only a
+historical non-executable admission: execution is `NOT_STARTED` and content is
+`NOT_CREATED`. An S5-origin enqueue atomically changes the reserved prompt to
+`handoff_pending` and releases the source job without advancing its dense
+cursor. After the one idempotent Dialog notification is proven, ledger,
+interaction, turn, job, outcome, and cursor complete in one transaction.
+
+Planner acknowledgement (`planner_handoff_id`, `accepted_at`, and
+`readiness_observed_at`) and Dialog delivery acknowledgement
+(`notification_message_id` and `delivered_at`) are write-once database
+evidence. They may transition together from absent to present exactly once;
+they can never be cleared or replaced. The database also permits only the
+documented lifecycle transitions, while lease, retry and error fields remain
+mutable within those transitions.
+
+Both Planner and Dialog ambiguous acknowledgements replay exact stable command
+keys. Expired leases are reclaimable; malformed/semantic conflicts block and
+5xx/timeouts retry. The down migration starts an explicit transaction, takes
+`ACCESS EXCLUSIVE` locks on the ledger and interaction table, and fails closed
+permanently after any ledger row or `handoff_pending` interaction exists. It is
+valid only for an unused empty installation. To roll back service behaviour,
+operators disable new S8 admissions and drain the worker while retaining all
+immutable ledger evidence; there is no destructive cleanup path.
+
+Migration `022` adds the default-dark `teacher_onboarding_path_outcome_inbox`.
+It accepts one strict Planner outcome per `execution_id`, fences it to the
+immutable S8 `planner_handoff_id`, and stores only the exact Student/Dialog/
+Teacher identities, bounded status-specific path IDs, localized message body,
+and idempotent Dialog delivery checkpoint. `PATH_READY` requires course,
+learning-path, and first-lesson UUIDs; `ACTIVE_PATH_EXISTS` and
+`STATE_CHANGED` forbid them. No Planner graph/profile/provider/error or browser
+metadata is stored. Acceptance precedes Dialog append and replay reuses the
+event ID. The down migration refuses to remove retained outcome evidence.
+
+## Canonical onboarding session cutover
+
+Migration `023` is installed only during a quiesced deployment; S10 and S11
+writers must never coexist after it commits. Before changing the schema it
+independently rejects every nonterminal interaction, onboarding turn (including
+text turns with no interaction link), onboarding coordinator job (including a
+job with no turn), and `claimed|applied` receipt. Existing terminal interaction
+rows are not assigned a guessed version.
+
+Every new interaction then requires immutable `session_schema_version=1|2|3`.
+S11 admits only version 3, while recovery keeps the exact stored version. The
+narrow `teacher_onboarding_terminal_session` table records only direct
+`ACTIVE_PATH_EXISTS` recovery evidence: deterministic identity, exact
+Student/Teacher/Dialog and Student state reference, schema version 3, stable
+Dialog command, and `message_pending|delivered` acknowledgement. It contains
+no message body, answers, goal, graph, course, path, lesson, or AI data. The
+pending row commits before Dialog append; exact concurrent retries reuse the
+command and acknowledgement. Causal identity is immutable, and delete and
+truncate are rejected. Down migration refuses any stamped interaction or
+terminal row, so operational rollback keeps migration 023 and disables only
+new admission after draining writers.
+
+Migrations are paired, ordered SQL files under `db/migrations`. Migration `002` drops the outbox before the referenced decision table during rollback. Migration `004` adds the action link and inbox; its task-correlation checks are `NOT VALID` so legacy rows do not block upgrade while new rows are enforced. Migration `005` adds the private teacher-dialog job table, `006` adds per-student souls, and `007` adds pedagogy audit metadata. Migration `008` requeues only untouched general jobs previously blocked as unsupported. Migration `009` does the same for lesson jobs after Dialog has gained revision/selection anchors. Migration `010` adds the intervention inbox, `011` adds Telegram links/bindings/delivery, `012` persists the source channel on durable Dialog jobs, `013` adds the idempotent Learning Planner outcome inbox, and published migrations `014`–`016` remain prerequisites. Checkpoint migrations `017`, `018`, and `019` then add dense v2 turn ordering, canonical action materialization, and the default-dark unified onboarding coordinator respectively. Migration `020` adds S7 terminal interaction closure, migration `021` adds the default-dark S8 handoff ledger, migration `022` adds the default-dark S9 Planner outcome inbox, and migration `023` enforces the canonical session-version cutover and direct active-path terminal ledger. Any unrelated unpublished local migration must use the next available number in its own patch.

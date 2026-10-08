@@ -1,0 +1,434 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"github.com/google/uuid"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func hybridApplicationFixture(t *testing.T) (StudentPlanningSnapshot, StudentLearningPath, HybridConsequence) {
+	t.Helper()
+	source, r := planningSnapshotFixture()
+	future := source.Path.Items[0]
+	future.ID = planningSnapshotID(100)
+	future.Position = 2
+	future.Status = LearningPathItemPlanned
+	future.FrozenRequirements = append([]LessonRequirement{}, future.FrozenRequirements...)
+	future.FrozenRequirements[0].Satisfied = false
+	source.Path.Items = append(source.Path.Items, future)
+	s, err := BuildStudentPlanningSnapshot(source, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := HybridScopeIdentity{GoalCode: s.Path.GoalCode, DirectionCode: s.Profile.DirectionCode, DesiredStacks: append([]string{}, s.Profile.DesiredStacks...)}
+	c := HybridConsequence{Schema: HybridConsequenceSchema, StudentID: s.StudentID, LearningPathID: s.LearningPathID, ExpectedPathRevision: s.Path.Version, SnapshotRef: s.References.SnapshotRef, SnapshotTargets: s.RequestedTargets, PolicyVersion: HybridReplanPolicyVersion, PolicyInputHash: "sha256:" + strings.Repeat("a", 64), Outcome: HybridOutcomeReplanNeeded, ApplicationMode: HybridApplicationAuto, ReasonCodes: []string{"TARGET_MASTERED_STABLE"}, BaselineScope: scope, DesiredScope: scope, Mutations: []HybridFutureMutation{{Kind: "SKIP_REDUNDANT_PENDING_ITEM", ItemID: future.ID}}}
+	c.ConsequenceID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("planner-hybrid-consequence.v1\x00"+c.StudentID+"\x00"+c.LearningPathID+"\x00"+c.SnapshotRef+"\x00"+c.PolicyVersion)).String()
+	return s, source.Path, c
+}
+func TestHybridApplicationFutureSkipPreservesCurrentPrivateAssignment(t *testing.T) {
+	s, path, c := hybridApplicationFixture(t)
+	result, status, err := ValidateAndPlanHybridApplication(s, path, c, nil)
+	if err != nil || status != HybridApplicationApplied || result.Version != path.Version+1 || result.Items[2].Status != LearningPathItemSkippedMastered || !reflect.DeepEqual(result.Items[:2], path.Items[:2]) || string(result.Items[0].LessonContent) != string(path.Items[0].LessonContent) {
+		t.Fatalf("status=%s err=%v version=%d future=%s", status, err, result.Version, result.Items[2].Status)
+	}
+}
+func TestHybridApplicationAutoCannotMutateCurrentExecution(t *testing.T) {
+	s, path, c := hybridApplicationFixture(t)
+	c.Mutations[0].ItemID = path.Items[1].ID
+	_, _, err := ValidateAndPlanHybridApplication(s, path, c, nil)
+	if !errors.Is(err, ErrHybridUnsafe) {
+		t.Fatalf("current mutation accepted err=%v", err)
+	}
+}
+
+func rehashHybridApplication(t *testing.T, s *StudentPlanningSnapshot, c *HybridConsequence) {
+	t.Helper()
+	var e error
+	s.References, e = snapshotReferences(*s)
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.SnapshotRef = s.References.SnapshotRef
+	c.ConsequenceID = HybridConsequenceID(c.StudentID, c.LearningPathID, c.SnapshotRef, c.PolicyVersion)
+}
+func makeHybridApplicationIntent(t *testing.T, s *StudentPlanningSnapshot, c *HybridConsequence, kind string) *HybridLearningIntentProjection {
+	t.Helper()
+	intent := &HybridLearningIntentProjection{IntentID: planningSnapshotID(900), StudentID: s.StudentID, LearningPathID: s.LearningPathID, ExpectedPathRevision: s.Path.Version, Kind: kind, CreatedAt: s.CapturedAt, RequestedChange: HybridRequestedChange{Scope: c.DesiredScope, Mutations: cloneHybridApplicationMutations(c.Mutations)}}
+	s.PendingIntent = intent
+	c.ApplicationMode = HybridApplicationRequiresIntent
+	c.IntentID = intent.IntentID
+	c.RequiredIntentKind = kind
+	c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+	rehashHybridApplication(t, s, c)
+	return intent
+}
+func TestHybridApplicationStaleAndTamperedConsequenceMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*StudentPlanningSnapshot, *StudentLearningPath, *HybridConsequence)
+		want   error
+	}{
+		{"path revision", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.ExpectedPathRevision++
+		}, ErrHybridStale},
+		{"snapshot reference", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.SnapshotRef = "sha256:" + strings.Repeat("b", 64)
+			c.ConsequenceID = HybridConsequenceID(c.StudentID, c.LearningPathID, c.SnapshotRef, c.PolicyVersion)
+		}, ErrHybridStale},
+		{"foreign owner", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.StudentID = planningSnapshotID(777)
+			c.ConsequenceID = HybridConsequenceID(c.StudentID, c.LearningPathID, c.SnapshotRef, c.PolicyVersion)
+		}, ErrHybridStale},
+		{"changed private path projection", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			p.Items[2].ReferenceID = planningSnapshotID(778)
+		}, ErrHybridStale},
+		{"changed scope", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.BaselineScope.GoalCode = "other"
+			c.DesiredScope.GoalCode = "other"
+		}, ErrHybridStale},
+		{"policy version", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.PolicyVersion = "new-policy"
+		}, ErrValidation},
+		{"missing target coverage", func(s *StudentPlanningSnapshot, p *StudentLearningPath, c *HybridConsequence) {
+			c.SnapshotTargets = c.SnapshotTargets[:1]
+		}, ErrHybridStale},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, p, c := hybridApplicationFixture(t)
+			tc.change(&s, &p, &c)
+			before := cloneHybridPath(p)
+			result, _, err := ValidateAndPlanHybridApplication(s, p, c, nil)
+			if !errors.Is(err, tc.want) || !reflect.DeepEqual(result, before) {
+				t.Fatalf("err=%v want=%v mutated=%v", err, tc.want, !reflect.DeepEqual(result, before))
+			}
+		})
+	}
+}
+func TestHybridApplicationNoChangeIsReadOnlyAndOwnsPrivateBytes(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	c.Outcome = HybridOutcomeNoChange
+	c.ApplicationMode = ""
+	c.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+	c.Mutations = []HybridFutureMutation{}
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+	if e != nil || status != HybridApplicationNoChange || !reflect.DeepEqual(p, result) {
+		t.Fatalf("status=%s err=%v", status, e)
+	}
+	result.Items[0].LessonContent[0] = 'x'
+	result.Items[0].FrozenRequirements[0].Satisfied = false
+	result.Items[0].Targets[0].Key = "mutated"
+	if p.Items[0].LessonContent[0] == 'x' || !p.Items[0].FrozenRequirements[0].Satisfied || p.Items[0].Targets[0].Key == "mutated" {
+		t.Fatal("result aliases private owner assignment")
+	}
+}
+func TestHybridApplicationHistoryAndSatisfiedPendingAreProtected(t *testing.T) {
+	for _, idx := range []int{0, 2} {
+		t.Run(string(rune('a'+idx)), func(t *testing.T) {
+			s, p, c := hybridApplicationFixture(t)
+			if idx == 2 {
+				p.Items[2].FrozenRequirements[0].Satisfied = true
+				s.Path.Items[2].FrozenRequirements[0].Satisfied = true
+				rehashHybridApplication(t, &s, &c)
+			}
+			c.Mutations[0].ItemID = p.Items[idx].ID
+			_, _, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+			if !errors.Is(e, ErrHybridUnsafe) {
+				t.Fatalf("protected item err=%v", e)
+			}
+		})
+	}
+}
+func hybridApplicationFourItems(t *testing.T) (StudentPlanningSnapshot, StudentLearningPath, HybridConsequence) {
+	t.Helper()
+	s, p, c := hybridApplicationFixture(t)
+	fourth := cloneHybridItem(p.Items[2])
+	fourth.ID = planningSnapshotID(101)
+	fourth.Position = 3
+	p.Items = append(p.Items, fourth)
+	w := s.Path.Items[2]
+	w.ID = fourth.ID
+	w.Position = 3
+	w.FrozenRequirements = append([]LessonRequirement{}, w.FrozenRequirements...)
+	s.Path.Items = append(s.Path.Items, w)
+	rehashHybridApplication(t, &s, &c)
+	return s, p, c
+}
+func TestHybridApplicationReorderPermutesFutureSlotsAndPreservesPrivateContent(t *testing.T) {
+	s, p, c := hybridApplicationFourItems(t)
+	a, b := 3, 2
+	c.Mutations = []HybridFutureMutation{{Kind: "REORDER_PENDING_ITEMS", ItemID: p.Items[2].ID, TargetPosition: &a}, {Kind: "REORDER_PENDING_ITEMS", ItemID: p.Items[3].ID, TargetPosition: &b}}
+	c.ReasonCodes = []string{"EXISTING_PREREQUISITE_GAP"}
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+	if e != nil || status != HybridApplicationApplied || result.Items[2].ID != p.Items[3].ID || result.Items[3].ID != p.Items[2].ID || !reflect.DeepEqual(result.Items[:2], p.Items[:2]) || string(result.Items[2].LessonContent) != string(p.Items[3].LessonContent) {
+		t.Fatalf("status=%s err=%v", status, e)
+	}
+	c.Mutations = c.Mutations[:1]
+	if _, _, e = ValidateAndPlanHybridApplication(s, p, c, nil); !errors.Is(e, ErrHybridConflict) {
+		t.Fatalf("half permutation err=%v", e)
+	}
+}
+func TestHybridApplicationMajorRequiresExactIntentAndWaitsDuringExecution(t *testing.T) {
+	s, p, c := hybridApplicationFourItems(t)
+	a, b := 3, 2
+	c.Mutations = []HybridFutureMutation{{Kind: "REORDER_PENDING_ITEMS", ItemID: p.Items[2].ID, TargetPosition: &a}, {Kind: "REORDER_PENDING_ITEMS", ItemID: p.Items[3].ID, TargetPosition: &b}}
+	intent := makeHybridApplicationIntent(t, &s, &c, "SUBSTANTIAL_SCOPE_CHANGE")
+	if _, _, e := ValidateAndPlanHybridApplication(s, p, c, nil); !errors.Is(e, ErrHybridIntentRequired) {
+		t.Fatalf("implicit intent err=%v", e)
+	}
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, intent)
+	if e != nil || status != HybridApplicationWaitingSafeBoundary || !reflect.DeepEqual(result, p) {
+		t.Fatalf("active boundary status=%s err=%v", status, e)
+	}
+	bad := *intent
+	bad.IntentID = planningSnapshotID(999)
+	if _, _, e = ValidateAndPlanHybridApplication(s, p, c, &bad); !errors.Is(e, ErrHybridIntentRequired) {
+		t.Fatalf("other intent err=%v", e)
+	}
+	s.CourseBindings = []PlanningCourseActionBinding{}
+	s.PracticeBindings = []PlanningSnapshotPracticeBinding{}
+	s.Path.Items[1].Status = LearningPathItemReady
+	p.Items[1].Status = LearningPathItemReady
+	rehashHybridApplication(t, &s, &c)
+	result, status, e = ValidateAndPlanHybridApplication(s, p, c, intent)
+	if e != nil || status != HybridApplicationApplied || result.Items[2].ID != p.Items[3].ID {
+		t.Fatalf("safe matching intent status=%s err=%v", status, e)
+	}
+}
+func TestHybridApplicationFrozenReplacementAndInsertionCloneTemplate(t *testing.T) {
+	s, p, c := hybridApplicationFourItems(t)
+	p.Items[3].ReferenceID = planningSnapshotID(301)
+	s.Path.Items[3].ReferenceID = p.Items[3].ReferenceID
+	p.Items[3].LessonRevisionID = planningSnapshotID(302)
+	s.Path.Items[3].LessonRevisionID = p.Items[3].LessonRevisionID
+	p.Items[3].LessonContent = json.RawMessage(`{"private":"frozen template"}`)
+	rehashHybridApplication(t, &s, &c)
+	c.Mutations = []HybridFutureMutation{{Kind: "REPLACE_PENDING_ITEM_WITH_EQUIVALENT_SAME_GOAL_ITEM", ItemID: p.Items[2].ID, TemplateItemID: p.Items[3].ID}}
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+	if e != nil || status != HybridApplicationApplied || result.Items[2].ID != p.Items[2].ID || result.Items[2].ReferenceID != p.Items[3].ReferenceID || string(result.Items[2].LessonContent) != string(p.Items[3].LessonContent) {
+		t.Fatalf("replacement status=%s err=%v", status, e)
+	}
+	pos := 3
+	c.Mutations = []HybridFutureMutation{{Kind: "INSERT_FUTURE_REMEDIATION", ItemID: p.Items[2].ID, TemplateItemID: p.Items[3].ID, NewItemID: planningSnapshotID(400), TargetPosition: &pos}}
+	c.ReasonCodes = []string{"EXISTING_PREREQUISITE_GAP"}
+	result, status, e = ValidateAndPlanHybridApplication(s, p, c, nil)
+	if e != nil || status != HybridApplicationApplied || len(result.Items) != 5 || result.Items[3].ID != planningSnapshotID(400) || result.Items[4].ID != p.Items[3].ID || !reflect.DeepEqual(result.Items[:2], p.Items[:2]) {
+		t.Fatalf("insertion status=%s err=%v len=%d", status, e, len(result.Items))
+	}
+	c.ReasonCodes = []string{"TARGET_MASTERED_STABLE"}
+	if _, _, e = ValidateAndPlanHybridApplication(s, p, c, nil); !errors.Is(e, ErrHybridUnsupported) {
+		t.Fatalf("insertion without accepted gap err=%v", e)
+	}
+}
+func TestHybridLearningIntentCreationMeaningScopeAndServerTimeReplay(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	intent := HybridLearningIntentProjection{IntentID: planningSnapshotID(500), StudentID: s.StudentID, LearningPathID: s.LearningPathID, ExpectedPathRevision: s.Path.Version, Kind: "CHANGE_GOAL", CreatedAt: s.CapturedAt, RequestedChange: HybridRequestedChange{Scope: HybridScopeIdentity{GoalCode: "go.advanced", DirectionCode: s.Profile.DirectionCode, DesiredStacks: []string{"go"}}, Mutations: []HybridFutureMutation{}}}
+	if e := ValidateHybridLearningIntentForCreation(s, p, intent); e != nil {
+		t.Fatalf("meaningful scope proposal refused:%v", e)
+	}
+	hash, e := HybridLearningIntentPayloadHash(intent)
+	if e != nil {
+		t.Fatal(e)
+	}
+	intent.CreatedAt = intent.CreatedAt.Add(1000000000)
+	again, e := HybridLearningIntentPayloadHash(intent)
+	if e != nil || hash != again {
+		t.Fatal("server clock destroyed idempotent request hash")
+	}
+	intent.RequestedChange.Scope.GoalCode = s.Path.GoalCode
+	if e = ValidateHybridLearningIntentForCreation(s, p, intent); !errors.Is(e, ErrHybridConflict) {
+		t.Fatalf("noop accepted:%v", e)
+	}
+	intent.Kind = "CHANGE_TRACK"
+	if e = ValidateHybridLearningIntentForCreation(s, p, intent); !errors.Is(e, ErrHybridUnsupported) {
+		t.Fatalf("invented track accepted:%v", e)
+	}
+	_ = c
+}
+func TestHybridApplicationCrossScopeHasExplicitUnsupportedSafeBoundary(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	s.CourseBindings = []PlanningCourseActionBinding{}
+	s.PracticeBindings = []PlanningSnapshotPracticeBinding{}
+	s.Path.Items[1].Status = LearningPathItemReady
+	p.Items[1].Status = LearningPathItemReady
+	c.DesiredScope = HybridScopeIdentity{GoalCode: "go.advanced", DirectionCode: c.BaselineScope.DirectionCode, DesiredStacks: []string{"go"}}
+	c.Mutations = []HybridFutureMutation{}
+	intent := makeHybridApplicationIntent(t, &s, &c, "CHANGE_GOAL")
+	result, _, e := ValidateAndPlanHybridApplication(s, p, c, intent)
+	if !errors.Is(e, ErrHybridUnsupported) || !reflect.DeepEqual(result, p) {
+		t.Fatalf("unmapped Course scope err=%v", e)
+	}
+}
+
+func TestHybridApplicationInsertBatchIdentityAndMaximumPath(t *testing.T) {
+	for _, count := range []int{498, 499} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			s, p, c := hybridApplicationFourItems(t)
+			for len(p.Items) < count {
+				i := cloneHybridItem(p.Items[2])
+				i.ID = planningSnapshotID(1000 + len(p.Items))
+				i.Position = len(p.Items)
+				p.Items = append(p.Items, i)
+				w := s.Path.Items[2]
+				w.ID = i.ID
+				w.Position = i.Position
+				w.FrozenRequirements = append([]LessonRequirement{}, w.FrozenRequirements...)
+				s.Path.Items = append(s.Path.Items, w)
+			}
+			rehashHybridApplication(t, &s, &c)
+			pos := 3
+			c.Mutations = []HybridFutureMutation{{Kind: "INSERT_FUTURE_REMEDIATION", ItemID: p.Items[2].ID, TemplateItemID: p.Items[2].ID, NewItemID: planningSnapshotID(8000), TargetPosition: &pos}, {Kind: "INSERT_FUTURE_REMEDIATION", ItemID: p.Items[3].ID, TemplateItemID: p.Items[3].ID, NewItemID: planningSnapshotID(8001), TargetPosition: &pos}}
+			c.ReasonCodes = []string{"EXISTING_PREREQUISITE_GAP"}
+			result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+			if count == 498 {
+				if e != nil || status != HybridApplicationApplied || len(result.Items) != 500 {
+					t.Fatalf("exact ceiling status=%s err=%v len=%d", status, e, len(result.Items))
+				}
+			} else {
+				if !errors.Is(e, ErrHybridConflict) || len(result.Items) != 499 {
+					t.Fatalf("overflow accepted err=%v len=%d", e, len(result.Items))
+				}
+			}
+			c.Mutations[1].NewItemID = c.Mutations[0].NewItemID
+			if _, _, e = ValidateAndPlanHybridApplication(s, p, c, nil); !errors.Is(e, ErrValidation) {
+				t.Fatalf("duplicate identity err=%v", e)
+			}
+		})
+	}
+}
+func TestHybridApplicationLegacyNilPrivateAssignmentRemainsExact(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	p.Items[0].LessonRevisionID = ""
+	p.Items[0].FrozenRequirements = nil
+	s.Path.Items[0].LessonRevisionID = ""
+	s.Path.Items[0].FrozenRequirements = []LessonRequirement{}
+	s.ActivityFacts = []PlanningSnapshotActivityFact{}
+	rehashHybridApplication(t, &s, &c)
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+	if e != nil || status != HybridApplicationApplied || !reflect.DeepEqual(result.Items[0], p.Items[0]) {
+		t.Fatalf("legacy assignment changed status=%s err=%v", status, e)
+	}
+}
+
+func TestHybridApplicationExactIntentCanReplaceUnstartedReadyAtSafeBoundary(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	s.CourseBindings = []PlanningCourseActionBinding{}
+	s.PracticeBindings = []PlanningSnapshotPracticeBinding{}
+	p.Items[1].Status = LearningPathItemReady
+	s.Path.Items[1].Status = LearningPathItemReady
+	c.Mutations = []HybridFutureMutation{{Kind: "REPLACE_ACTIVE_ACTIVITY", ItemID: p.Items[1].ID, TemplateItemID: p.Items[2].ID}}
+	intent := makeHybridApplicationIntent(t, &s, &c, "REPLACE_ACTIVE_ACTIVITY")
+	result, status, e := ValidateAndPlanHybridApplication(s, p, c, intent)
+	if e != nil || status != HybridApplicationApplied || result.Items[1].ID != p.Items[1].ID || result.Items[1].Position != p.Items[1].Position || result.Items[1].Status != LearningPathItemReady || result.Items[1].LessonRevisionID != p.Items[2].LessonRevisionID || string(result.Items[1].LessonContent) != string(p.Items[2].LessonContent) || !reflect.DeepEqual(result.Items[0], p.Items[0]) {
+		t.Fatalf("safe active replacement status=%s err=%v", status, e)
+	}
+	p.Items[1].Status = LearningPathItemInProgress
+	s.Path.Items[1].Status = LearningPathItemInProgress
+	rehashHybridApplication(t, &s, &c)
+	result, status, e = ValidateAndPlanHybridApplication(s, p, c, intent)
+	if e != nil || status != HybridApplicationWaitingSafeBoundary || !reflect.DeepEqual(result, p) {
+		t.Fatalf("started current replacement status=%s err=%v", status, e)
+	}
+}
+
+func TestHybridApplicationRejectsOmittedOwnerTargetScope(t *testing.T) {
+	for _, surface := range []string{"path", "course binding", "practice binding"} {
+		t.Run(surface, func(t *testing.T) {
+			s, p, c := hybridApplicationFixture(t)
+			extra := LearningTargetRef{Type: LearningTargetConcept, Key: "go.omitted-owner-target", Version: "v1"}
+			switch surface {
+			case "path":
+				p.Items[2].Targets = append(p.Items[2].Targets, extra)
+				sortPlanningTargets(p.Items[2].Targets)
+				s.Path.Items[2].Targets = append([]LearningTargetRef{}, p.Items[2].Targets...)
+			case "course binding":
+				s.CourseBindings[0].LearningTargets = append(s.CourseBindings[0].LearningTargets, extra)
+				sortPlanningTargets(s.CourseBindings[0].LearningTargets)
+			case "practice binding":
+				s.PracticeBindings[0].LearningTargets = append(s.PracticeBindings[0].LearningTargets, extra)
+				sortPlanningTargets(s.PracticeBindings[0].LearningTargets)
+			}
+			rehashHybridApplication(t, &s, &c)
+			if _, e := NormalizeStudentPlanningSnapshot(s); e != nil {
+				t.Fatalf("regression requires otherwise valid coherent subset snapshot: %v", e)
+			}
+			_, _, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+			if !errors.Is(e, ErrHybridStale) {
+				t.Fatalf("omitted %s target was accepted for application: %v", surface, e)
+			}
+		})
+	}
+}
+
+func TestHybridLearningIntentRecordsMeaningfulCancelWithoutFabricatingTransition(t *testing.T) {
+	s, p, c := hybridApplicationFixture(t)
+	s.CourseBindings = []PlanningCourseActionBinding{}
+	s.PracticeBindings = []PlanningSnapshotPracticeBinding{}
+	p.Items[1].Status = LearningPathItemReady
+	s.Path.Items[1].Status = LearningPathItemReady
+	c.Mutations = []HybridFutureMutation{{Kind: "CANCEL_ACTIVE_ACTIVITY", ItemID: p.Items[1].ID}}
+	intent := makeHybridApplicationIntent(t, &s, &c, "CANCEL_ACTIVE_ACTIVITY")
+	if e := ValidateHybridLearningIntentForCreation(s, p, *intent); e != nil {
+		t.Fatalf("meaningful explicit cancel cannot be recorded: %v", e)
+	}
+	result, _, e := ValidateAndPlanHybridApplication(s, p, c, intent)
+	if !errors.Is(e, ErrHybridUnsupported) || !reflect.DeepEqual(result, p) {
+		t.Fatalf("unsupported cancellation fabricated state err=%v", e)
+	}
+}
+
+func TestHybridLearningIntentCancelRecordingRejectsNoncurrentAndMalformedScope(t *testing.T) {
+	for _, status := range []LearningPathItemStatus{LearningPathItemPlanned, LearningPathItemCompleted, LearningPathItemSkippedMastered} {
+		t.Run(string(status), func(t *testing.T) {
+			s, p, c := hybridApplicationFixture(t)
+			s.CourseBindings = []PlanningCourseActionBinding{}
+			s.PracticeBindings = []PlanningSnapshotPracticeBinding{}
+			p.Items[1].Status = status
+			s.Path.Items[1].Status = status
+			c.Mutations = []HybridFutureMutation{{Kind: "CANCEL_ACTIVE_ACTIVITY", ItemID: p.Items[1].ID}}
+			intent := makeHybridApplicationIntent(t, &s, &c, "CANCEL_ACTIVE_ACTIVITY")
+			if e := ValidateHybridLearningIntentForCreation(s, p, *intent); !errors.Is(e, ErrHybridUnsafe) {
+				t.Fatalf("cancel recorded against %s:%v", status, e)
+			}
+		})
+	}
+	s, p, c := hybridApplicationFixture(t)
+	c.Mutations = []HybridFutureMutation{{Kind: "CANCEL_ACTIVE_ACTIVITY", ItemID: p.Items[1].ID}}
+	c.DesiredScope = HybridScopeIdentity{GoalCode: "other.goal", DirectionCode: s.Profile.DirectionCode, DesiredStacks: []string{"go"}}
+	intent := makeHybridApplicationIntent(t, &s, &c, "CANCEL_ACTIVE_ACTIVITY")
+	if e := ValidateHybridLearningIntentForCreation(s, p, *intent); !errors.Is(e, ErrHybridConflict) {
+		t.Fatalf("cancel smuggled scope change:%v", e)
+	}
+}
+
+func TestHybridApplicationMatchedInactiveNoChangeAcknowledgesWithoutMutation(t *testing.T) {
+	for _, state := range []LearningPathStatus{LearningPathStatusPaused, LearningPathStatusCompleted, LearningPathStatusArchived} {
+		t.Run(string(state), func(t *testing.T) {
+			s, p, c := hybridApplicationFixture(t)
+			p.Status = state
+			p.IsPrimary = false
+			s.Path.Status = state
+			s.Path.IsPrimary = false
+			rehashHybridApplication(t, &s, &c)
+			replan := c
+			c.Outcome = HybridOutcomeNoChange
+			c.ApplicationMode = ""
+			c.Mutations = []HybridFutureMutation{}
+			c.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+			if _, e := NormalizeStudentPlanningSnapshot(s); e != nil {
+				t.Fatalf("regression needs valid coherent inactive owner snapshot: %v", e)
+			}
+			result, status, e := ValidateAndPlanHybridApplication(s, p, c, nil)
+			if e != nil || status != HybridApplicationNoChange || !reflect.DeepEqual(result, p) || result.Version != p.Version {
+				t.Fatalf("matched %s NO_CHANGE refused status=%s err=%v", state, status, e)
+			}
+			_, _, e = ValidateAndPlanHybridApplication(s, p, replan, nil)
+			if !errors.Is(e, ErrHybridUnsafe) {
+				t.Fatalf("inactive REPLAN accepted: %v", e)
+			}
+		})
+	}
+}

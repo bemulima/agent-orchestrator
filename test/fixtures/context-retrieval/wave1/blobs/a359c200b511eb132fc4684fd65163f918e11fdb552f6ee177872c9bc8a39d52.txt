@@ -1,0 +1,126 @@
+package internalapi
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+)
+
+type learningPathPlanningHTTPStub struct {
+	studentID  string
+	pathID     string
+	replan     studentuc.LearningPathReplanInput
+	completion studentuc.LearningPathNoGapInput
+	err        error
+}
+
+func (stub *learningPathPlanningHTTPStub) Get(
+	_ context.Context, studentID, pathID string,
+) (domain.LearningPathPlanningState, error) {
+	stub.studentID, stub.pathID = studentID, pathID
+	return domain.LearningPathPlanningState{Schema: domain.LearningPathPlanningStateSchema}, stub.err
+}
+
+func (stub *learningPathPlanningHTTPStub) Replan(
+	_ context.Context, input studentuc.LearningPathReplanInput,
+) (domain.LearningPathPlanningCommandResult, error) {
+	stub.replan = input
+	return domain.LearningPathPlanningCommandResult{Schema: domain.LearningPathCommandResultSchema}, stub.err
+}
+
+func (stub *learningPathPlanningHTTPStub) CompleteNoGap(
+	_ context.Context, input studentuc.LearningPathNoGapInput,
+) (domain.LearningPathPlanningCommandResult, error) {
+	stub.completion = input
+	return domain.LearningPathPlanningCommandResult{Schema: domain.LearningPathCommandResultSchema}, stub.err
+}
+
+func TestExactPathPlanningReadRequiresDedicatedPlannerToken(t *testing.T) {
+	stub := &learningPathPlanningHTTPStub{}
+	router := NewRouter(&Handler{LearningPathPlanning: stub}, "general-token", "planner-token")
+	path := "/students/11111111-1111-4111-8111-111111111111/learning-paths/" +
+		"22222222-2222-4222-8222-222222222222/planning-state"
+	for _, testCase := range []struct {
+		name   string
+		token  string
+		status int
+	}{
+		{name: "general token", token: "general-token", status: http.StatusForbidden},
+		{name: "planner token", token: "planner-token", status: http.StatusOK},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("X-Internal-Token", testCase.token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.status {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, testCase.status, response.Body.String())
+			}
+		})
+	}
+	if stub.studentID != "11111111-1111-4111-8111-111111111111" ||
+		stub.pathID != "22222222-2222-4222-8222-222222222222" {
+		t.Fatalf("read was not exact-path scoped: %+v", stub)
+	}
+}
+
+func TestExactPathReplanForwardsStrictVersionAndIdempotencyIdentity(t *testing.T) {
+	stub := &learningPathPlanningHTTPStub{}
+	router := NewRouter(&Handler{LearningPathPlanning: stub}, "general-token", "planner-token")
+	body := `{
+      "schema":"student-learning-path-replan.v1",
+      "planning_request_id":"33333333-3333-4333-8333-333333333333",
+      "course_id":"44444444-4444-4444-8444-444444444444",
+      "goal_code":"go.backend",
+      "course_fingerprint":"fingerprint-v1",
+      "planner_policy_version":"planner-v2",
+      "reason_code":"replan",
+      "reason_summary":"Refresh route",
+      "expected_version":7,
+      "items":[{"reference_type":"lesson","reference_id":"55555555-5555-4555-8555-555555555555","position":0,"status":"READY","targets":[],"reason_code":"next_gap"}]
+    }`
+	request := httptest.NewRequest(http.MethodPut,
+		"/students/11111111-1111-4111-8111-111111111111/learning-paths/22222222-2222-4222-8222-222222222222",
+		strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", "planner-token")
+	request.Header.Set("Idempotency-Key", "66666666-6666-4666-8666-666666666666")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || stub.replan.ExpectedPathVersion != 7 ||
+		stub.replan.PlanningRequestID != "33333333-3333-4333-8333-333333333333" ||
+		stub.replan.IdempotencyKey != "66666666-6666-4666-8666-666666666666" ||
+		stub.replan.LearningPathID != "22222222-2222-4222-8222-222222222222" {
+		t.Fatalf("status=%d input=%+v body=%s", response.Code, stub.replan, response.Body.String())
+	}
+}
+
+func TestExactPathNoGapRejectsReplanFieldsAndMapsConflict(t *testing.T) {
+	stub := &learningPathPlanningHTTPStub{}
+	router := NewRouter(&Handler{LearningPathPlanning: stub}, "general-token", "planner-token")
+	path := "/students/11111111-1111-4111-8111-111111111111/learning-paths/" +
+		"22222222-2222-4222-8222-222222222222/completion"
+	body := `{"schema":"student-learning-path-no-gap.v1","planning_request_id":"33333333-3333-4333-8333-333333333333","course_id":"44444444-4444-4444-8444-444444444444","goal_code":"go.backend","course_fingerprint":"fingerprint-v1","planner_policy_version":"planner-v2","reason_code":"mastery_no_gap","reason_summary":"Already mastered","expected_version":2}`
+
+	unknownFieldRequest := httptest.NewRequest(http.MethodPut, path, strings.NewReader(strings.TrimSuffix(body, "}")+`,"items":[]}`))
+	unknownFieldRequest.Header.Set("X-Internal-Token", "planner-token")
+	unknownFieldResponse := httptest.NewRecorder()
+	router.ServeHTTP(unknownFieldResponse, unknownFieldRequest)
+	if unknownFieldResponse.Code != http.StatusBadRequest {
+		t.Fatalf("unknown no-gap field status=%d body=%s", unknownFieldResponse.Code, unknownFieldResponse.Body.String())
+	}
+
+	stub.err = domain.ErrConflict
+	request := httptest.NewRequest(http.MethodPut, path, strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", "planner-token")
+	request.Header.Set("Idempotency-Key", "66666666-6666-4666-8666-666666666666")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("conflict status=%d body=%s", response.Code, response.Body.String())
+	}
+}

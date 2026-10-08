@@ -1,0 +1,77 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.LearningWorkspaceSnapshotReader = (*LearningJourneyRepoPG)(nil)
+
+const learningWorkspacePathColumns = `p.id, p.student_id, p.course_id, p.goal_code, p.curriculum_revision,
+p.policy_version, p.planner_policy_version, p.reason_code, p.reason_summary, p.status, p.is_primary,
+p.version, p.created_at, p.updated_at`
+
+// ReadLearningWorkspace observes the selected context, its exact ACTIVE path,
+// and ordered item statuses in one repeatable-read, read-only transaction. It
+// never creates receipts, changes progress, or leaks another student's path.
+func (repo *LearningJourneyRepoPG) ReadLearningWorkspace(
+	ctx context.Context,
+	studentID string,
+) (domain.StudentLearningWorkspaceSource, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningWorkspaceSource{}, errors.New("learning journey repository pool is required")
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return domain.StudentLearningWorkspaceSource{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	source := domain.StudentLearningWorkspaceSource{StudentID: studentID}
+	contextValue, err := getLearningContext(ctx, tx, studentID, false)
+	if errors.Is(err, domain.ErrNotFound) {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentLearningWorkspaceSource{}, err
+		}
+		return source, nil
+	}
+	if err != nil {
+		return domain.StudentLearningWorkspaceSource{}, err
+	}
+	source.Context = contextValue
+	if contextValue.SelectedLearningPathID == "" {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentLearningWorkspaceSource{}, err
+		}
+		return source, nil
+	}
+
+	path, err := scanLearningPath(tx.QueryRow(ctx, `SELECT `+learningWorkspacePathColumns+`
+FROM student_learning_context c
+JOIN student_learning_path p ON p.id=c.selected_learning_path_id
+  AND p.student_id=c.student_id
+  AND p.status='ACTIVE'
+WHERE c.student_id=$1 AND c.selected_learning_path_id=$2 AND c.selected_path_status='ACTIVE'`, studentID, contextValue.SelectedLearningPathID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningWorkspaceSource{}, domain.ErrStateChanged
+	}
+	if err != nil {
+		return domain.StudentLearningWorkspaceSource{}, err
+	}
+	if err := loadLearningPathItems(ctx, tx, &path); err != nil {
+		return domain.StudentLearningWorkspaceSource{}, err
+	}
+	path, err = domain.NormalizeStudentLearningPath(path)
+	if err != nil {
+		return domain.StudentLearningWorkspaceSource{}, domain.ErrStateChanged
+	}
+	source.SelectedPath = &path
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentLearningWorkspaceSource{}, err
+	}
+	return source, nil
+}

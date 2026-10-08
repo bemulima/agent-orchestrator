@@ -1,0 +1,365 @@
+package learningplanner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/curriculum"
+	"github.com/google/uuid"
+)
+
+const (
+	maximumResponseBytes          = 1 << 20
+	maximumReadinessResponseBytes = 64 << 10
+	maximumHandoffResponseBytes   = 64 << 10
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HandoffToken  string
+	HTTPClient    *http.Client
+}
+
+func (client Client) CreateOnboardingPlanHandoff(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent) (domain.TeacherOnboardingPlanHandoff, error) {
+	intent, err := domain.NewTeacherOnboardingHandoffIntent(intent)
+	if err != nil || intent.Status != domain.TeacherOnboardingHandoffDispatching || strings.TrimSpace(client.BaseURL) == "" ||
+		strings.TrimSpace(client.HandoffToken) == "" || client.HTTPClient == nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	requestBody, err := domain.NewTeacherOnboardingPlanHandoffRequest(intent)
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	requestHash, err := domain.TeacherOnboardingPlanHandoffRequestHash(intent.StudentID, requestBody)
+	if err != nil || requestHash != intent.RequestHash {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffConflict
+	}
+	payload, err := json.Marshal(requestBody)
+	if err != nil || len(payload) > 16<<10 {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	endpoint := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" + url.PathEscape(intent.StudentID) + "/onboarding-plan-handoffs"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	request.Header.Set("X-Internal-Token", client.HandoffToken)
+	request.Header.Set("Idempotency-Key", intent.CommandID)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	switch response.StatusCode {
+	case http.StatusOK, http.StatusCreated:
+	case http.StatusConflict:
+		code, parseErr := plannerHandoffErrorCode(response, maximumHandoffResponseBytes)
+		if parseErr != nil {
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+		}
+		switch code {
+		case "idempotency_conflict":
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffConflict
+		case "state_changed":
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffStateChanged
+		case "active_path_exists":
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffActivePath
+		default:
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+		}
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		code, parseErr := plannerHandoffErrorCode(response, maximumHandoffResponseBytes)
+		if parseErr != nil {
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+		}
+		validCode := response.StatusCode == http.StatusBadRequest && code == "invalid_student_id"
+		validCode = validCode || response.StatusCode == http.StatusUnprocessableEntity && (code == "invalid_idempotency_key" || code == "invalid_request" || code == "not_ready")
+		if !validCode {
+			return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+		}
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffRejected
+	default:
+		return domain.TeacherOnboardingPlanHandoff{}, fmt.Errorf("%w: status %d", domain.ErrTeacherOnboardingHandoffUnavailable, response.StatusCode)
+	}
+	if !jsonMediaType(response.Header.Get("Content-Type")) {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumHandoffResponseBytes+1))
+	if err != nil || len(contents) > maximumHandoffResponseBytes {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	var wire struct {
+		Schema              string                                 `json:"schema"`
+		HandoffID           string                                 `json:"handoff_id"`
+		Status              string                                 `json:"status"`
+		StateRef            domain.TeacherStudentReadinessStateRef `json:"state_ref"`
+		Goal                domain.TeacherLearningReadinessGoal    `json:"goal"`
+		ExecutionStatus     string                                 `json:"execution_status"`
+		ContentStatus       string                                 `json:"content_status"`
+		ReadinessObservedAt string                                 `json:"readiness_observed_at"`
+		Replayed            *bool                                  `json:"replayed"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	if wire.Replayed == nil {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	result := domain.TeacherOnboardingPlanHandoff{
+		Schema: wire.Schema, HandoffID: wire.HandoffID, Status: wire.Status, StateRef: wire.StateRef, Goal: wire.Goal,
+		ExecutionStatus: wire.ExecutionStatus, ContentStatus: wire.ContentStatus, ReadinessObservedAt: wire.ReadinessObservedAt,
+		Replayed: *wire.Replayed,
+	}
+	result, err = domain.NormalizeTeacherOnboardingPlanHandoff(result, intent)
+	if err != nil || (response.StatusCode == http.StatusOK) != result.Replayed {
+		return domain.TeacherOnboardingPlanHandoff{}, domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	return result, nil
+}
+
+func plannerHandoffErrorCode(response *http.Response, limit int64) (string, error) {
+	if !jsonMediaType(response.Header.Get("Content-Type")) {
+		return "", domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil || int64(len(contents)) > limit {
+		return "", domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&envelope) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(envelope.Error.Code) != envelope.Error.Code || envelope.Error.Code == "" {
+		return "", domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+	switch envelope.Error.Code {
+	case "invalid_student_id", "invalid_idempotency_key", "invalid_request", "not_ready", "idempotency_conflict", "state_changed", "active_path_exists":
+		return envelope.Error.Code, nil
+	default:
+		return "", domain.ErrTeacherOnboardingHandoffInvalidResponse
+	}
+}
+
+func (client Client) ResolveLearningReadiness(ctx context.Context, studentID string, expected domain.TeacherStudentReadinessStateRef) (domain.TeacherLearningReadiness, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" || client.HTTPClient == nil || !canonicalUUID(studentID) {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	expected, err := domain.NormalizeTeacherStudentReadinessStateRef(expected)
+	if err != nil {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	payload, err := json.Marshal(domain.TeacherLearningReadinessRequest{
+		Schema: domain.TeacherLearningReadinessRequestSchema, ExpectedStateRef: &expected,
+	})
+	if err != nil || len(payload) > 16<<10 {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	endpoint := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" + url.PathEscape(studentID) + "/learning-readiness"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusConflict {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessStale
+	}
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherLearningReadiness{}, fmt.Errorf("%w: status %d", domain.ErrTeacherLearningReadinessUnavailable, response.StatusCode)
+	}
+	if !jsonMediaType(response.Header.Get("Content-Type")) {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumReadinessResponseBytes+1))
+	if err != nil || len(contents) > maximumReadinessResponseBytes {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	var readiness domain.TeacherLearningReadiness
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&readiness); err != nil {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+	}
+	return domain.NormalizeTeacherLearningReadiness(readiness, &expected)
+}
+
+func (client Client) CreateCoursePlan(ctx context.Context, input curriculum.PlanInput) (curriculum.PlanResult, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" || client.HTTPClient == nil {
+		return curriculum.PlanResult{}, domain.ErrCurriculumUnavailable
+	}
+	payload, err := json.Marshal(struct {
+		DiagnosticPlanID string                     `json:"diagnostic_plan_id,omitempty"`
+		GoalCode         string                     `json:"goal_code"`
+		DesiredOutcome   string                     `json:"desired_outcome"`
+		RequestedTargets []domain.LearningTargetRef `json:"requested_targets"`
+		Constraints      curriculum.PlanConstraints `json:"constraints"`
+		AuditRefs        curriculum.PlanAuditRefs   `json:"audit_refs"`
+		Reason           curriculum.PlanReason      `json:"reason"`
+	}{input.DiagnosticPlanID, input.GoalCode, input.DesiredOutcome, input.Targets, input.Constraints, input.AuditRefs, input.Reason})
+	if err != nil {
+		return curriculum.PlanResult{}, domain.ErrInvalidCurriculum
+	}
+	endpoint := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(input.StudentID) + "/course-plans"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return curriculum.PlanResult{}, domain.ErrCurriculumUnavailable
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Idempotency-Key", input.IdempotencyKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.do(request)
+	if err != nil {
+		return curriculum.PlanResult{}, domain.ErrCurriculumUnavailable
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusAccepted {
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			return curriculum.PlanResult{}, coursePlanContractError(input)
+		}
+		switch response.StatusCode {
+		case http.StatusConflict:
+			return curriculum.PlanResult{}, domain.ErrTeacherGenerationConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotFound, http.StatusForbidden:
+			return curriculum.PlanResult{}, domain.ErrInvalidCurriculum
+		default:
+			return curriculum.PlanResult{}, fmt.Errorf("%w: status %d", domain.ErrCurriculumUnavailable, response.StatusCode)
+		}
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumResponseBytes+1))
+	if err != nil {
+		return curriculum.PlanResult{}, domain.ErrCurriculumUnavailable
+	}
+	if len(contents) > maximumResponseBytes {
+		return curriculum.PlanResult{}, coursePlanContractError(input)
+	}
+	if !jsonMediaType(response.Header.Get("Content-Type")) {
+		return curriculum.PlanResult{}, coursePlanContractError(input)
+	}
+	var wire struct {
+		RequestID      string                `json:"request_id"`
+		GoalCode       string                `json:"goal_code"`
+		Status         string                `json:"status"`
+		ResultCode     string                `json:"result_code,omitempty"`
+		CourseID       string                `json:"course_id,omitempty"`
+		LearningPathID string                `json:"learning_path_id,omitempty"`
+		Reused         bool                  `json:"reused"`
+		Attempts       int                   `json:"attempts"`
+		CreatedAt      string                `json:"created_at"`
+		UpdatedAt      string                `json:"updated_at"`
+		CompletedAt    string                `json:"completed_at,omitempty"`
+		Source         string                `json:"source"`
+		Reason         curriculum.PlanReason `json:"reason"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return curriculum.PlanResult{}, coursePlanContractError(input)
+	}
+	createdAt, createdErr := parseCanonicalPlannerTimestamp(wire.CreatedAt)
+	updatedAt, updatedErr := parseCanonicalPlannerTimestamp(wire.UpdatedAt)
+	var completedAt time.Time
+	var completedErr error
+	if wire.CompletedAt != "" {
+		completedAt, completedErr = parseCanonicalPlannerTimestamp(wire.CompletedAt)
+	}
+	if !canonicalUUID(wire.RequestID) || wire.GoalCode != input.GoalCode ||
+		(wire.Status != "PLANNING" && wire.Status != "COMPLETED" && wire.Status != "FAILED") || wire.Attempts < 0 ||
+		wire.Source != "TEACHER" || wire.Reason != input.Reason || createdErr != nil || updatedErr != nil || updatedAt.Before(createdAt) ||
+		(wire.CourseID != "" && !canonicalUUID(wire.CourseID)) || (wire.LearningPathID != "" && !canonicalUUID(wire.LearningPathID)) ||
+		(wire.CompletedAt != "" && (completedErr != nil || completedAt.Before(createdAt) || completedAt.After(updatedAt))) ||
+		(wire.Status == "PLANNING" && (response.StatusCode != http.StatusAccepted || wire.CompletedAt != "" || wire.ResultCode != "" || wire.CourseID != "" || wire.Reused)) ||
+		(wire.Status != "PLANNING" && (response.StatusCode != http.StatusOK || wire.CompletedAt == "")) ||
+		(wire.Status == "FAILED" && (wire.ResultCode != "" || wire.CourseID != "" || wire.Reused)) ||
+		(wire.Status == "COMPLETED" && !validCoursePlanResult(wire.ResultCode, wire.CourseID, wire.Reused)) {
+		return curriculum.PlanResult{}, coursePlanContractError(input)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return curriculum.PlanResult{}, coursePlanContractError(input)
+	}
+	return curriculum.PlanResult{
+		RequestID: wire.RequestID, GoalCode: wire.GoalCode, Status: wire.Status,
+		ResultCode: wire.ResultCode, CourseID: wire.CourseID, Reused: wire.Reused,
+	}, nil
+}
+
+func coursePlanContractError(input curriculum.PlanInput) error {
+
+	return domain.ErrCurriculumUnavailable
+}
+
+func validCoursePlanResult(resultCode, courseID string, reused bool) bool {
+	switch resultCode {
+	case "COURSE_CREATED":
+		return courseID != "" && !reused
+	case "COURSE_REUSED":
+		return courseID != "" && reused
+	case "NO_GAP":
+		return !reused
+	default:
+		return false
+	}
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	if client.HTTPClient == nil {
+		return nil, errors.New("HTTP client is required")
+	}
+	noRedirect := *client.HTTPClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return noRedirect.Do(request)
+}
+
+func jsonMediaType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && mediaType == "application/json"
+}
+
+func canonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func parseCanonicalPlannerTimestamp(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || !strings.HasSuffix(value, "Z") || parsed.UTC().Format(time.RFC3339Nano) != value {
+		return time.Time{}, errors.New("invalid Planner timestamp")
+	}
+	return parsed.UTC(), nil
+}
+
+var _ curriculum.LearningPlanner = Client{}
+var _ repository.TeacherLearningReadinessResolver = Client{}
+var _ repository.TeacherOnboardingPlanHandoffGateway = Client{}

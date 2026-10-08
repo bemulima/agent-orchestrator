@@ -1,0 +1,214 @@
+package internalapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+const (
+	admissionStudentID = "11111111-1111-4111-8111-111111111111"
+	admissionID        = "22222222-2222-4222-8222-222222222222"
+	admissionHandoffID = "33333333-3333-4333-8333-333333333333"
+	admissionExecution = "44444444-4444-4444-8444-444444444444"
+	admissionKey       = "55555555-5555-4555-8555-555555555555"
+	admissionCourseID  = "66666666-6666-4666-8666-666666666666"
+	admissionLessonID  = "77777777-7777-4777-8777-777777777777"
+)
+
+type onboardingPathAdmissionHTTPStub struct {
+	reserve     domain.OnboardingPathAdmissionRequest
+	materialize domain.OnboardingPathMaterialization
+	abortErr    error
+}
+
+func (s *onboardingPathAdmissionHTTPStub) Reserve(_ context.Context, student, key string, request domain.OnboardingPathAdmissionRequest) (domain.OnboardingPathAdmission, bool, error) {
+	s.reserve = request
+	return domain.OnboardingPathAdmission{Schema: domain.OnboardingPathAdmissionSchema, AdmissionID: admissionID, StudentID: student, HandoffID: request.HandoffID, ExecutionID: request.ExecutionID, StateRef: request.ExpectedStateRef, Goal: request.Goal, Status: domain.OnboardingPathAdmissionReserved, Fence: 1, ExpiresAt: time.Now().UTC().Add(time.Minute)}, false, nil
+}
+func (s *onboardingPathAdmissionHTTPStub) Renew(_ context.Context, student, id, execution, key string, fence int64) (domain.OnboardingPathAdmission, bool, error) {
+	return domain.OnboardingPathAdmission{Schema: domain.OnboardingPathAdmissionSchema, AdmissionID: id, StudentID: student, HandoffID: admissionHandoffID, ExecutionID: execution, StateRef: domain.StudentPlanningReadinessStateRef{Kind: "accepted_draft", Version: 1}, Goal: domain.OnboardingPathGoal{Code: "go.backend", Version: "v1", GraphVersion: "g1"}, Status: domain.OnboardingPathAdmissionReserved, Fence: fence + 1, ExpiresAt: time.Now().UTC().Add(time.Minute)}, false, nil
+}
+func (s *onboardingPathAdmissionHTTPStub) Materialize(_ context.Context, student, id, key string, materialization domain.OnboardingPathMaterialization) (domain.OnboardingPathMaterializationResult, bool, error) {
+	s.materialize = materialization
+	return domain.OnboardingPathMaterializationResult{Schema: domain.OnboardingPathMaterializationResultSchema, AdmissionID: id, Status: domain.OnboardingPathAdmissionMaterialized, CourseID: materialization.Course.CourseID, AssignmentID: admissionID, LearningPathID: admissionHandoffID, FirstLessonID: materialization.Lessons[0].LessonID, LearningPathVersion: 1, JourneyVersion: 1}, false, nil
+}
+func (s *onboardingPathAdmissionHTTPStub) Abort(_ context.Context, student, id, key string, abort domain.OnboardingPathAbort) (domain.OnboardingPathAdmission, bool, error) {
+	if s.abortErr != nil {
+		return domain.OnboardingPathAdmission{}, false, s.abortErr
+	}
+	return domain.OnboardingPathAdmission{Schema: domain.OnboardingPathAdmissionSchema, AdmissionID: id, StudentID: student, HandoffID: admissionHandoffID, ExecutionID: abort.ExecutionID, StateRef: domain.StudentPlanningReadinessStateRef{Kind: "accepted_draft", Version: 1}, Goal: domain.OnboardingPathGoal{Code: "go.backend", Version: "v1", GraphVersion: "g1"}, Status: domain.OnboardingPathAdmissionAborted, Fence: abort.Fence, ExpiresAt: time.Now().UTC()}, false, nil
+}
+
+func TestOnboardingPathAdmissionRequiresPlannerTokenAndStrictReserve(t *testing.T) {
+	stub := &onboardingPathAdmissionHTTPStub{}
+	router := NewRouter(&Handler{OnboardingPathAdmissions: stub}, "general-token", "planner-token")
+	body := `{"schema":"student-onboarding-path-admission-request.v1","handoff_id":"` + admissionHandoffID + `","execution_id":"` + admissionExecution + `","expected_state_ref":{"kind":"accepted_draft","version":1},"goal":{"code":"go.backend","version":"v1","graph_version":"g1"}}`
+	for _, tc := range []struct {
+		token string
+		want  int
+	}{{"general-token", http.StatusForbidden}, {"planner-token", http.StatusCreated}} {
+		req := httptest.NewRequest(http.MethodPost, "/students/"+admissionStudentID+"/onboarding-path-admissions", strings.NewReader(body))
+		req.Header.Set("X-Internal-Token", tc.token)
+		req.Header.Set("Idempotency-Key", admissionKey)
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != tc.want {
+			t.Fatalf("token=%s status=%d body=%s", tc.token, res.Code, res.Body.String())
+		}
+	}
+	if stub.reserve.Schema != domain.OnboardingPathAdmissionRequestSchema || stub.reserve.HandoffID != admissionHandoffID {
+		t.Fatalf("reserve was not forwarded exactly: %#v", stub.reserve)
+	}
+}
+
+func TestOnboardingPathMaterializationUsesSeparateRequestAndResultSchemas(t *testing.T) {
+	stub := &onboardingPathAdmissionHTTPStub{}
+	router := NewRouter(&Handler{OnboardingPathAdmissions: stub}, "general-token", "planner-token")
+	body := `{"schema":"student-onboarding-path-admission-materialization.v1","execution_id":"` + admissionExecution + `","fence":1,"course":{"course_id":"` + admissionCourseID + `","course_fingerprint":"sha256:course","planner_policy_version":"planner-v1","reason_code":"initial","reason_summary":"Initial onboarding route"},"lessons":[{"lesson_id":"` + admissionLessonID + `","targets":[{"type":"concept","key":"go.http","version":"v1"}]}]}`
+	req := httptest.NewRequest(http.MethodPut, "/students/"+admissionStudentID+"/onboarding-path-admissions/"+admissionID+"/materialization", strings.NewReader(body))
+	req.Header.Set("X-Internal-Token", "planner-token")
+	req.Header.Set("Idempotency-Key", admissionKey)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusCreated || stub.materialize.Course.CourseID != admissionCourseID {
+		t.Fatalf("status=%d input=%#v body=%s", res.Code, stub.materialize, res.Body.String())
+	}
+	var response domain.OnboardingPathMaterializationResult
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil || response.Schema != domain.OnboardingPathMaterializationResultSchema || response.FirstLessonID != admissionLessonID {
+		t.Fatalf("response=%s err=%v", res.Body.String(), err)
+	}
+}
+
+func TestOnboardingPathAdmissionRejectsUnknownBodyAndInvalidStudent(t *testing.T) {
+	router := NewRouter(&Handler{OnboardingPathAdmissions: &onboardingPathAdmissionHTTPStub{}}, "general-token", "planner-token")
+	for _, tc := range []struct {
+		path, body string
+		want       int
+	}{
+		{"/students/not-a-uuid/onboarding-path-admissions", `{}`, http.StatusBadRequest},
+		{"/students/" + admissionStudentID + "/onboarding-path-admissions", `{"schema":"student-onboarding-path-admission-request.v1","unknown":true}`, http.StatusUnprocessableEntity},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("X-Internal-Token", "planner-token")
+		req.Header.Set("Idempotency-Key", admissionKey)
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != tc.want {
+			t.Fatalf("path=%s status=%d body=%s", tc.path, res.Code, res.Body.String())
+		}
+	}
+}
+
+func TestOnboardingPathAdmissionRejectsNonCanonicalAdmissionRouteAndIdempotencyIDs(t *testing.T) {
+	router := NewRouter(&Handler{OnboardingPathAdmissions: &onboardingPathAdmissionHTTPStub{}}, "general-token", "planner-token")
+	body := `{"schema":"student-onboarding-path-admission-renewal.v1","execution_id":"` + admissionExecution + `","fence":1}`
+	canonicalRouteID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	canonicalKey := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	for _, tc := range []struct {
+		name, admissionRouteID, key string
+		want                        int
+	}{
+		{name: "uppercase route", admissionRouteID: strings.ToUpper(canonicalRouteID), key: canonicalKey, want: http.StatusUnprocessableEntity},
+		{name: "braced route", admissionRouteID: "{" + canonicalRouteID + "}", key: canonicalKey, want: http.StatusUnprocessableEntity},
+		{name: "padded route", admissionRouteID: " " + canonicalRouteID, key: canonicalKey, want: http.StatusUnprocessableEntity},
+		{name: "uppercase key", admissionRouteID: canonicalRouteID, key: strings.ToUpper(canonicalKey), want: http.StatusUnprocessableEntity},
+		{name: "braced key", admissionRouteID: canonicalRouteID, key: "{" + canonicalKey + "}", want: http.StatusUnprocessableEntity},
+		{name: "padded key", admissionRouteID: canonicalRouteID, key: " " + canonicalKey, want: http.StatusUnprocessableEntity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/students/"+admissionStudentID+"/onboarding-path-admissions/"+url.PathEscape(tc.admissionRouteID)+"/renewal", strings.NewReader(body))
+			req.Header.Set("X-Internal-Token", "planner-token")
+			req.Header.Set("Idempotency-Key", tc.key)
+			req.Header.Set("Content-Type", "application/json")
+			res := httptest.NewRecorder()
+			router.ServeHTTP(res, req)
+			if res.Code != tc.want {
+				t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+			}
+			if !strings.Contains(res.Body.String(), `"invalid_request"`) {
+				t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+			}
+		})
+	}
+	badStudent := httptest.NewRequest(http.MethodPost, "/students/"+strings.ToUpper(canonicalRouteID)+"/onboarding-path-admissions/"+canonicalRouteID+"/renewal", strings.NewReader(body))
+	badStudent.Header.Set("X-Internal-Token", "planner-token")
+	badStudent.Header.Set("Idempotency-Key", canonicalKey)
+	badStudent.Header.Set("Content-Type", "application/json")
+	badStudentResult := httptest.NewRecorder()
+	router.ServeHTTP(badStudentResult, badStudent)
+	if badStudentResult.Code != http.StatusBadRequest || !strings.Contains(badStudentResult.Body.String(), `"invalid_student_id"`) {
+		t.Fatalf("bad student status=%d body=%s", badStudentResult.Code, badStudentResult.Body.String())
+	}
+	for _, keys := range [][]string{{canonicalKey, admissionHandoffID}, {}} {
+		req := httptest.NewRequest(http.MethodPost, "/students/"+admissionStudentID+"/onboarding-path-admissions/"+canonicalRouteID+"/renewal", strings.NewReader(body))
+		req.Header.Set("X-Internal-Token", "planner-token")
+		for _, key := range keys {
+			req.Header.Add("Idempotency-Key", key)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("keys=%v status=%d body=%s", keys, res.Code, res.Body.String())
+		}
+	}
+}
+
+func TestOnboardingPathAdmissionRouteErrorContractAppliesToEveryOperation(t *testing.T) {
+	router := NewRouter(&Handler{OnboardingPathAdmissions: &onboardingPathAdmissionHTTPStub{}}, "general-token", "planner-token")
+	for _, tc := range []struct {
+		method, suffix, body string
+	}{
+		{http.MethodPost, "renewal", `{"schema":"student-onboarding-path-admission-renewal.v1","execution_id":"` + admissionExecution + `","fence":1}`},
+		{http.MethodPut, "materialization", `{"schema":"student-onboarding-path-admission-materialization.v1","execution_id":"` + admissionExecution + `","fence":1,"course":{"course_id":"` + admissionCourseID + `","course_fingerprint":"r1","planner_policy_version":"p1","reason_code":"initial","reason_summary":"test"},"lessons":[{"lesson_id":"` + admissionLessonID + `"}]}`},
+		{http.MethodPost, "abort", `{"schema":"student-onboarding-path-admission-abort.v1","execution_id":"` + admissionExecution + `","fence":1,"reason":"CANCELLED"}`},
+	} {
+		t.Run(tc.suffix, func(t *testing.T) {
+			invalidAdmission := httptest.NewRequest(tc.method, "/students/"+admissionStudentID+"/onboarding-path-admissions/{"+admissionID+"}/"+tc.suffix, strings.NewReader(tc.body))
+			invalidAdmission.Header.Set("X-Internal-Token", "planner-token")
+			invalidAdmission.Header.Set("Idempotency-Key", admissionKey)
+			invalidAdmission.Header.Set("Content-Type", "application/json")
+			invalidAdmissionResult := httptest.NewRecorder()
+			router.ServeHTTP(invalidAdmissionResult, invalidAdmission)
+			if invalidAdmissionResult.Code != http.StatusUnprocessableEntity || !strings.Contains(invalidAdmissionResult.Body.String(), `"invalid_request"`) {
+				t.Fatalf("invalid admission status=%d body=%s", invalidAdmissionResult.Code, invalidAdmissionResult.Body.String())
+			}
+
+			invalidStudent := httptest.NewRequest(tc.method, "/students/not-a-uuid/onboarding-path-admissions/"+admissionID+"/"+tc.suffix, strings.NewReader(tc.body))
+			invalidStudent.Header.Set("X-Internal-Token", "planner-token")
+			invalidStudent.Header.Set("Idempotency-Key", admissionKey)
+			invalidStudent.Header.Set("Content-Type", "application/json")
+			invalidStudentResult := httptest.NewRecorder()
+			router.ServeHTTP(invalidStudentResult, invalidStudent)
+			if invalidStudentResult.Code != http.StatusBadRequest || !strings.Contains(invalidStudentResult.Body.String(), `"invalid_student_id"`) {
+				t.Fatalf("invalid student status=%d body=%s", invalidStudentResult.Code, invalidStudentResult.Body.String())
+			}
+		})
+	}
+}
+
+func TestOnboardingPathMaterializedAbortConflictMapsToIdempotencyConflict(t *testing.T) {
+	stub := &onboardingPathAdmissionHTTPStub{abortErr: domain.ErrConflict}
+	router := NewRouter(&Handler{OnboardingPathAdmissions: stub}, "general-token", "planner-token")
+	body := `{"schema":"student-onboarding-path-admission-abort.v1","execution_id":"` + admissionExecution + `","fence":1,"reason":"CANCELLED"}`
+	req := httptest.NewRequest(http.MethodPost, "/students/"+admissionStudentID+"/onboarding-path-admissions/"+admissionID+"/abort", strings.NewReader(body))
+	req.Header.Set("X-Internal-Token", "planner-token")
+	req.Header.Set("Idempotency-Key", admissionKey)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusConflict || !strings.Contains(res.Body.String(), `"idempotency_conflict"`) {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}

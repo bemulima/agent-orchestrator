@@ -1,0 +1,123 @@
+package studentcontext
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// BuildInput identifies one active task action. The authenticated student ID
+// remains authoritative; Student verifies action ownership.
+type BuildInput struct {
+	StudentID        string
+	LearningActionID string
+	ContextType      domain.LearningContextType
+	ContextID        string
+}
+
+// Build creates one bounded, in-memory StudentContext for task-scoped policy.
+type Build struct {
+	Actions            repository.StudentLearningActionContextReader
+	Code               repository.StudentLearningActionCodeContextReader
+	Mastery            repository.StudentTargetMasteryReader
+	Overview           repository.StudentLearnerOverviewReader
+	Practice           repository.PracticeTaskContextReader
+	PracticeValidation repository.PracticeTeacherValidationContextReader
+}
+
+func (useCase Build) Execute(ctx context.Context, input BuildInput) (domain.StudentContext, error) {
+	studentID := strings.TrimSpace(input.StudentID)
+	learningActionID := strings.TrimSpace(input.LearningActionID)
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.StudentContext{}, domain.ErrInvalidStudentContext
+	}
+	if input.ContextType == domain.LearningContextGeneral || input.ContextType == domain.LearningContextLesson {
+		if useCase.Overview == nil || learningActionID != "" {
+			return domain.StudentContext{}, errors.New("learner overview dependency is required")
+		}
+		overview, err := useCase.Overview.GetLearnerOverview(ctx, studentID)
+		if err != nil {
+			return domain.StudentContext{}, err
+		}
+		contextValue, err := domain.NewGeneralStudentContext(overview)
+		if input.ContextType == domain.LearningContextLesson {
+			contextValue, err = domain.NewLessonStudentContext(overview, input.ContextID)
+		}
+		if err != nil || contextValue.StudentID != studentID {
+			return domain.StudentContext{}, domain.ErrInvalidStudentContext
+		}
+		return contextValue, nil
+	}
+	if input.ContextType == domain.LearningContextPracticeTask || input.ContextType == domain.LearningContextProject {
+		if useCase.Practice == nil || useCase.Mastery == nil {
+			return domain.StudentContext{}, errors.New("practice context dependencies are required")
+		}
+		if _, err := uuid.Parse(learningActionID); err != nil {
+			return domain.StudentContext{}, domain.ErrInvalidStudentContext
+		}
+		practice, err := useCase.Practice.GetPracticeTaskContext(ctx, studentID, input.ContextID)
+		if err != nil {
+			return domain.StudentContext{}, err
+		}
+		var mastery []domain.StudentTargetMastery
+		if len(practice.LearningTargets) > 0 {
+			mastery, err = useCase.Mastery.GetTargetMastery(ctx, studentID, practice.LearningTargets)
+			if err != nil {
+				return domain.StudentContext{}, err
+			}
+		}
+		result, err := domain.NewPracticeStudentContext(practice, learningActionID, input.ContextType, mastery)
+		if err != nil || input.ContextType != domain.LearningContextPracticeTask || useCase.PracticeValidation == nil {
+			return result, err
+		}
+		validation, validationErr := useCase.PracticeValidation.GetPracticeTeacherValidationContext(ctx, practice, learningActionID)
+		if validationErr != nil {
+			if errors.Is(validationErr, domain.ErrStudentStateUnavailable) || errors.Is(validationErr, domain.ErrStudentContextNotFound) {
+				return result, nil
+			}
+			return domain.StudentContext{}, validationErr
+		}
+		if validation.Available {
+			result.PracticeValidation = &validation
+		}
+		return result, nil
+	}
+	if useCase.Actions == nil || useCase.Mastery == nil {
+		return domain.StudentContext{}, errors.New("student context dependencies are required")
+	}
+	if _, err := uuid.Parse(learningActionID); err != nil {
+		return domain.StudentContext{}, domain.ErrInvalidStudentContext
+	}
+	snapshot, err := useCase.Actions.GetLearningActionContext(ctx, studentID, learningActionID)
+	if err != nil {
+		return domain.StudentContext{}, err
+	}
+	snapshot, err = domain.NormalizeStudentLearningActionSnapshot(snapshot)
+	if err != nil || snapshot.StudentID != studentID || snapshot.LearningActionID != learningActionID {
+		return domain.StudentContext{}, domain.ErrInvalidStudentContext
+	}
+	if snapshot.Status != domain.LearningActionStatusOpen {
+		return domain.StudentContext{}, domain.ErrLearningActionClosed
+	}
+	var mastery []domain.StudentTargetMastery
+	if len(snapshot.LearningTargets) > 0 {
+		mastery, err = useCase.Mastery.GetTargetMastery(ctx, studentID, snapshot.LearningTargets)
+		if err != nil {
+			return domain.StudentContext{}, err
+		}
+	}
+	result, err := domain.NewStudentContext(snapshot, mastery)
+	if err != nil || useCase.Code == nil {
+		return result, err
+	}
+	codeContext, err := useCase.Code.GetLearningActionCodeContext(ctx, studentID, learningActionID)
+	if err != nil {
+		return domain.StudentContext{}, err
+	}
+	return domain.WithStudentCodeContext(result, codeContext)
+}

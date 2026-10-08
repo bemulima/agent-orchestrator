@@ -1,0 +1,111 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumOnboardingTurnRequestBytes = 16 << 10
+
+func (client Client) ApplyTeacherOnboardingTurn(ctx context.Context, studentID string, command domain.TeacherStudentOnboardingTurnCommand) (domain.TeacherStudentOnboardingTurnResult, error) {
+	normalized, err := domain.NewTeacherStudentOnboardingTurnCommand(command)
+	if err != nil || !validStudentOnboardingTurnUUID(studentID) {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return client.doTeacherOnboardingTurn(ctx, http.MethodPost, studentID, normalized.StudentCommandID, "", normalized)
+}
+
+func (client Client) GetTeacherOnboardingTurn(ctx context.Context, studentID, studentCommandID string) (domain.TeacherStudentOnboardingTurnResult, error) {
+	if !validStudentOnboardingTurnUUID(studentID) || !validStudentOnboardingTurnUUID(studentCommandID) {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return client.doTeacherOnboardingTurn(ctx, http.MethodGet, studentID, studentCommandID, "", nil)
+}
+
+func (client Client) ProveTeacherOnboardingTurnNoEffect(ctx context.Context, studentID, studentCommandID string, proof domain.TeacherStudentOnboardingTurnNoEffectProof) (domain.TeacherStudentOnboardingTurnResult, error) {
+	if !validStudentOnboardingTurnUUID(studentID) || !validStudentOnboardingTurnUUID(studentCommandID) || proof.Schema != domain.TeacherStudentOnboardingProofSchema || proof.Command.StudentCommandID != studentCommandID {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrInvalidTeacherOnboarding
+	}
+	if _, err := domain.NewTeacherStudentOnboardingTurnCommand(proof.Command); err != nil {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return client.doTeacherOnboardingTurn(ctx, http.MethodPost, studentID, studentCommandID, "/prove-no-effect", proof)
+}
+
+func (client Client) doTeacherOnboardingTurn(ctx context.Context, method, studentID, commandID, suffix string, value any) (domain.TeacherStudentOnboardingTurnResult, error) {
+	path := "/internal/v1/teacher/students/" + url.PathEscape(strings.TrimSpace(studentID)) + "/onboarding/turns/" + url.PathEscape(strings.TrimSpace(commandID))
+	if method == http.MethodPost && suffix == "" {
+		path = "/internal/v1/teacher/students/" + url.PathEscape(strings.TrimSpace(studentID)) + "/onboarding/turns"
+	}
+	path += suffix
+	endpoint, err := client.endpointWithToken(path, client.LearningWorkspaceToken)
+	if err != nil {
+		return domain.TeacherStudentOnboardingTurnResult{}, err
+	}
+	var body *bytes.Reader
+	if value != nil {
+		encoded, marshalErr := json.Marshal(value)
+		if marshalErr != nil || len(encoded) > maximumOnboardingTurnRequestBytes {
+			return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrInvalidTeacherOnboarding
+		}
+		body = bytes.NewReader(encoded)
+	} else {
+		body = bytes.NewReader(nil)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return domain.TeacherStudentOnboardingTurnResult{}, unavailable(err)
+	}
+	client.authorizeWithToken(request, client.LearningWorkspaceToken)
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", commandID)
+	}
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherStudentOnboardingTurnResult{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return domain.TeacherStudentOnboardingTurnResult{}, domain.ErrTeacherOnboardingTurnUnknown
+	}
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherStudentOnboardingTurnResult{}, mapOnboardingStatus(response.StatusCode, response.Status)
+	}
+	var result domain.TeacherStudentOnboardingTurnResult
+	if err := decodeStrict(response.Body, &result); err != nil || !validStudentOnboardingTurnResult(result, commandID) {
+		return domain.TeacherStudentOnboardingTurnResult{}, unavailable(domain.ErrInvalidTeacherOnboarding)
+	}
+	return result, nil
+}
+
+func validStudentOnboardingTurnUUID(value string) bool {
+	_, err := uuid.Parse(strings.TrimSpace(value))
+	return err == nil
+}
+
+func validStudentOnboardingTurnResult(result domain.TeacherStudentOnboardingTurnResult, commandID string) bool {
+	if result.Schema != domain.TeacherStudentOnboardingTurnResultSchema || result.StudentCommandID != commandID || !validStudentOnboardingTurnUUID(result.CanonicalStudentMessageID) {
+		return false
+	}
+	switch result.StudentEffectState {
+	case "accepted":
+		return result.ResultDraftVersion != nil && *result.ResultDraftVersion >= 1 && result.NoEffectProofID == nil &&
+			(result.ResultProfileVersion == nil || *result.ResultProfileVersion >= 0)
+	case "no_effect":
+		return result.ResultDraftVersion == nil && result.ResultProfileVersion == nil && result.NoEffectProofID != nil && validStudentOnboardingTurnUUID(*result.NoEffectProofID)
+	default:
+		return false
+	}
+}
+
+var _ repository.TeacherStudentOnboardingTurnGateway = Client{}

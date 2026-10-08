@@ -1,0 +1,139 @@
+package course
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumResponseBytes = 2 << 20
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+type lessonContextResponse struct {
+	LessonID        string `json:"lesson_id"`
+	CourseID        string `json:"course_id"`
+	SectionID       string `json:"section_id"`
+	Language        string `json:"language"`
+	Title           string `json:"title"`
+	Excerpt         string `json:"excerpt"`
+	Description     string `json:"description"`
+	ContentRevision string `json:"content_revision"`
+}
+
+func (client Client) GetLessonContext(ctx context.Context, lessonID, language string) (domain.CourseLessonContent, error) {
+	lessonID = strings.TrimSpace(lessonID)
+	language = strings.ToLower(strings.TrimSpace(language))
+	if lessonID == "" || len(language) > 35 {
+		return domain.CourseLessonContent{}, domain.ErrInvalidLessonContext
+	}
+	endpoint, err := client.endpoint("/internal/lesson/" + url.PathEscape(lessonID) + "/teacher-context")
+	if err != nil {
+		return domain.CourseLessonContent{}, err
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return domain.CourseLessonContent{}, unavailable(err)
+	}
+	query := parsed.Query()
+	query.Set("language", language)
+	parsed.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return domain.CourseLessonContent{}, unavailable(err)
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.CourseLessonContent{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusUnprocessableEntity:
+		return domain.CourseLessonContent{}, domain.ErrLessonContextNotFound
+	default:
+		return domain.CourseLessonContent{}, unavailable(fmt.Errorf("unexpected Course response %s", response.Status))
+	}
+	var payload lessonContextResponse
+	if err := decodeStrict(response.Body, &payload); err != nil {
+		return domain.CourseLessonContent{}, unavailable(err)
+	}
+	payload.LessonID = strings.TrimSpace(payload.LessonID)
+	payload.CourseID = strings.TrimSpace(payload.CourseID)
+	payload.SectionID = strings.TrimSpace(payload.SectionID)
+	revision, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(payload.ContentRevision))
+	payload.Language = strings.ToLower(strings.TrimSpace(payload.Language))
+	if err != nil || payload.LessonID != lessonID || uuid.Validate(payload.CourseID) != nil ||
+		(payload.SectionID != "" && uuid.Validate(payload.SectionID) != nil) ||
+		payload.Language == "" || len(payload.Language) > 35 ||
+		strings.TrimSpace(payload.Title) == "" || strings.TrimSpace(payload.Description) == "" ||
+		!utf8.ValidString(payload.Title) || !utf8.ValidString(payload.Excerpt) || !utf8.ValidString(payload.Description) {
+		return domain.CourseLessonContent{}, unavailable(domain.ErrInvalidLessonContext)
+	}
+	return domain.CourseLessonContent{
+		LessonID: payload.LessonID, CourseID: payload.CourseID, SectionID: payload.SectionID,
+		Language: payload.Language, Title: payload.Title,
+		Excerpt: payload.Excerpt, Description: payload.Description,
+		ContentRevision: revision.UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+func (client Client) endpoint(path string) (string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(client.BaseURL), "/")
+	if baseURL == "" || strings.TrimSpace(client.InternalToken) == "" {
+		return "", unavailable(errors.New("course service URL and internal token are required"))
+	}
+	parsed, err := url.ParseRequestURI(baseURL + path)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", unavailable(errors.New("invalid course service URL"))
+	}
+	return parsed.String(), nil
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 3 * time.Second}
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	return response, nil
+}
+
+func decodeStrict(reader io.Reader, target any) error {
+	limited := &io.LimitedReader{R: reader, N: maximumResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || limited.N == 0 {
+		return errors.New("invalid Course lesson context response")
+	}
+	return nil
+}
+
+func unavailable(cause error) error {
+	return fmt.Errorf("%w: %v", domain.ErrLessonContextUnavailable, cause)
+}
+
+var _ repository.CourseLessonContextReader = Client{}

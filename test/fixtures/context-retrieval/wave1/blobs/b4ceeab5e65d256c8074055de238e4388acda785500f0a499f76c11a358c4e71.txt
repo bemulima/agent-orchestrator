@@ -1,0 +1,105 @@
+package outbox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+const maximumStoredErrorLength = 2000
+
+// Clock makes publication leasing and retries deterministic.
+type Clock interface {
+	Now() time.Time
+}
+
+// Relay publishes one sequential, bounded student outbox batch.
+type Relay struct {
+	Outbox         repository.Outbox
+	Publisher      domain.DurableEventPublisher
+	Clock          Clock
+	WorkerID       string
+	BatchSize      int
+	LockTTL        time.Duration
+	PublishTimeout time.Duration
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+}
+
+// ProcessBatch delivers at least once and marks only acknowledged events complete.
+func (relay Relay) ProcessBatch(ctx context.Context) (int, error) {
+	if err := relay.Validate(); err != nil {
+		return 0, err
+	}
+	now := relay.Clock.Now().UTC()
+	events, err := relay.Outbox.Claim(ctx, repository.OutboxClaim{
+		WorkerID:    relay.WorkerID,
+		Limit:       relay.BatchSize,
+		Now:         now,
+		LockedUntil: now.Add(relay.LockTTL),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var failures []error
+	for _, event := range events {
+		publishContext, cancel := context.WithTimeout(ctx, relay.PublishTimeout)
+		publishErr := relay.Publisher.Publish(publishContext, event)
+		cancel()
+		if publishErr != nil {
+			retryAt := relay.Clock.Now().UTC().Add(relay.retryDelay(event.Attempts))
+			message := truncateError(publishErr.Error())
+			if markErr := relay.Outbox.MarkFailed(ctx, event.EventID, relay.WorkerID, message, retryAt); markErr != nil {
+				failures = append(failures, fmt.Errorf("publish %s: %w; mark failed: %v", event.EventID, publishErr, markErr))
+			} else {
+				failures = append(failures, fmt.Errorf("publish %s: %w", event.EventID, publishErr))
+			}
+			continue
+		}
+		if err := relay.Outbox.MarkPublished(ctx, event.EventID, relay.WorkerID, relay.Clock.Now().UTC()); err != nil {
+			failures = append(failures, fmt.Errorf("mark published %s: %w", event.EventID, err))
+		}
+	}
+	return len(events), errors.Join(failures...)
+}
+
+// Validate checks relay dependencies and ensures a sequential batch cannot
+// consume its lease under the configured per-message timeout.
+func (relay Relay) Validate() error {
+	if relay.Outbox == nil || relay.Publisher == nil || relay.Clock == nil ||
+		strings.TrimSpace(relay.WorkerID) == "" || relay.BatchSize <= 0 || relay.LockTTL <= 0 ||
+		relay.PublishTimeout <= 0 || relay.LockTTL <= time.Duration(relay.BatchSize)*relay.PublishTimeout ||
+		relay.RetryBaseDelay <= 0 || relay.RetryMaxDelay < relay.RetryBaseDelay {
+		return errors.New("invalid outbox relay configuration")
+	}
+	return nil
+}
+
+func (relay Relay) retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := relay.RetryBaseDelay
+	for current := 1; current < attempt && delay < relay.RetryMaxDelay; current++ {
+		if delay > relay.RetryMaxDelay/2 {
+			return relay.RetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > relay.RetryMaxDelay {
+		return relay.RetryMaxDelay
+	}
+	return delay
+}
+
+func truncateError(message string) string {
+	if len(message) <= maximumStoredErrorLength {
+		return message
+	}
+	return message[:maximumStoredErrorLength]
+}

@@ -1,0 +1,142 @@
+schema_version: 1
+status: implemented
+produced_stream: TEACHER_EVENTS
+subjects_produced:
+  - name: teacher.decision.recorded
+    schema_version: 2
+    owner: ms-go-teacher-agent
+    payload: TeacherDecision
+    v2_additions: [pedagogy_method, pedagogy_method_version, pedagogy_stage]
+  - name: teacher.assistance.observed
+    schema_version: 1
+    owner: ms-go-teacher-agent
+    payload: LearningActionAssistanceEventData
+    granularity: one immutable summary per learning_action_id
+    excludes: [success, failure, score, confidence, mastery]
+subjects_consumed:
+  - name: learning_action.closed
+    stream: TASKANSWER_EVENTS
+    schema_version: 1
+    owner: ms-go-student
+    durable: ms-teacher-learning-action-closed-v1
+    queue: ms-teacher-learning-action-closed
+    payload: action/context identity plus zero-to-100 frozen ordered learning targets
+    excludes: [success, failure, score, confidence, mastery]
+  - name: dialog.teacher.requested
+    stream: DIALOG_EVENTS
+    schema_versions: [1, 2]
+    current_schema_version: 2
+    owner: ms-go-dialog
+    durable: ms-teacher-dialog-requested-v1
+    queue: ms-teacher-dialog-requested
+    runtime_status: composed; action contexts execute through the durable TeacherOrchestrator worker
+    payload: source/dialog/student/PersonalTeacher identities, source channel, educational context, optional learning_action_id, and v2 dense-turn correlation evidence
+    excludes: [message body, mastery, dialog history]
+  - name: learning.activity.interesting
+    stream: LEARNING_ANALYTICS_EVENTS
+    schema_version: 1
+    owner: ms-go-statistic
+    durable: ms-teacher-learning-activity-v1
+    queue: ms-teacher-learning-activity
+    payload: bounded activity counters and opaque course, lesson, task, analytics-session references
+    excludes: [student code, compiler output, raw error, mastery, dialog history]
+  - name: course.plan.completed|course.plan.failed
+    stream: LEARNING_PLANNER_EVENTS
+    schema_version: 1
+    owner: ms-go-learning-planner
+    durable: ms-teacher-course-plan-outcome-v1
+    queue: ms-teacher-course-plan-outcome
+    payload: terminal planning result plus source, reason, and bounded Teacher audit references
+    excludes: [generated curriculum, mastery, prompts, provider errors, chain-of-thought]
+delivery:
+  producer: PostgreSQL transactional outbox
+  consumer: idempotent inbox or processed-event ledger
+  consistency: at-least-once publication; consumers deduplicate by event_id
+envelopes:
+  teacher_turn_s0:
+    schema: teacher-turn-s0.v1
+    correlation_fields: [source_event_id, teacher_turn_sequence, dialog_id, canonical_student_message_id, source_message_sequence, student_id, personal_teacher_id, correlation_id, causation_id]
+    optional: [teacher_job_id, action_receipt_id, student_command_id, ai_execution_id, learning_action_id]
+    source_event_id: equals dialog.teacher.requested.event_id and is stable across retries
+    correlation_semantics: correlation_id_is_uuid; dialog_event_causation_id_is_preserved_as_dialog_causation_id_and_equals_canonical_student_message_id_for_v2_text_turns; teacher_job_causation_id_is_derived_from_source_event_id_at_intake; action_turn_uses_action_receipt_id; text_turn_uses_canonical_student_message_id
+    causation_scope: teacher_job_intake_only; AI_Prompt_Student_and_Dialog_response_boundaries_define_their_own_causation_ids
+    teacher_turn_sequence: dense per-dialog expected ordering; turn N+1 is ineligible until N is safe
+    source_message_sequence: evidence only; never an eligibility cursor
+    cursor_advance: delivered (confirmed teacher_response_message_id) or proven failed_no_effect (no_effect_proof_id + recoverable_outcome_id + failure_code; attempted student_command_id may be present; no committed effect)
+    reconciliation_blocking_states: unknown|partial|committed_unreconciled
+    action_receipt_evidence: canonical-student-turn-interaction.v1/teacher_action_receipt; source prompt ID/version; block/action ASCII <=128; lowercase SHA-256 source_ui_digest
+    boundary_chain: prompt -> receipt -> canonical_student_message_id -> source_event_id -> teacher_job_id -> teacher_response_message_id
+    observability: IDs in structured logs only; metrics use low-cardinality categories and no ID labels; no subsystem in S0
+    llm: AI Prompt boundary only; no Student mutation authority
+    runtime: v1 and v2 are dual-read; v2 requires positive teacher_turn_sequence and all shared Teacher-job correlation fields; v2 is stored but not claimable while dense ordering is disabled
+  teacher_events_and_learning_action_closed:
+    required: [event_id, event_type, correlation_id, causation_id, student_id, occurred_at, schema_version, data]
+  dialog_teacher_requested:
+    required: [schema_version, event_id, occurred_at, dialog_id, event_sequence, source_message_id, source_message_sequence, channel, student_id, personal_teacher_id, context_type]
+    optional: [context_id, learning_action_id]
+    schema_versions: [1, 2]
+    v2_required: [teacher_turn_sequence, canonical_student_message_id, correlation_id, causation_id]
+    v2_optional: [action_receipt_id, source_message_version, reply_to_message_id]
+    v2_forbidden: [student_command_id]
+    v2_constraints: teacher_turn_sequence_positive; envelope_causation_id_is_dialog_event_causation_and_is_preserved; dialog_event_causation_id_matches_canonical_student_message_id; teacher_job_causation_id_is_derived_from_event_id; correlation_matches_canonical_message_or_action_receipt
+  learning_activity_interesting:
+    required: [schema_version, event_id, event_type, correlation_id, student_id, occurred_at, data]
+    correlation: correlation_id equals analytics_session_id
+retention:
+  scope: TEACHER_EVENTS
+  max_age_days: 7
+  duplicate_window_minutes: 10
+student_consumer:
+  service: ms-go-student
+  acknowledgement: after inbox and curated evidence commit
+  mastery_update: forbidden from teacher facts alone
+teacher_consumer:
+  service: ms-go-teacher-agent
+  acknowledgement: after inbox plus optional assistance/outbox commit
+  poison_message: terminate invalid envelope, unknown field, subject, version, identity, context, or target
+  transient_failure: negative acknowledgement with delay
+  targetless: inbox-only; no teacher event
+dialog_consumer:
+  service: ms-go-teacher-agent
+  acknowledgement_target: after teacher_dialog_job accepts the request or confirms an identical duplicate
+  poison_message: terminate invalid JSON, unknown field, unsupported version, identity, or context shape
+  conflicting_identity: terminate when an event or source-message identity is reused with different request metadata
+  transient_failure: negative acknowledgement with delay
+  context_read: exact source plus at most 49 prior messages through the internal Dialog API
+  supported_contexts: general, selected-text lesson, lesson_task, practice_task, and project are processed asynchronously after acknowledgement
+  lesson_verification: source carries current content_revision plus selected_text; Teacher requires exact Course revision and substring and sends only the fragment to the model
+  deferred_contexts: whole-lesson tutoring without a selected fragment remains unsupported
+  delivery: generated body is retained only while idempotent Dialog append is pending and cleared after verified delivery
+  channel_delivery: web uses normal Dialog realtime; Telegram additionally enqueues one delivery by source_message_id after Dialog append
+  mastery_consistency: response delivery does not wait for assistance evidence consumption or mastery recalculation
+learning_activity_consumer:
+  service: ms-go-teacher-agent
+  acknowledgement_target: after intervention inbox/decision/outbox commit and any required idempotent Dialog delivery
+  policy: replaceable deterministic policy selected by PersonalTeacher intervention_mode
+  poison_message: terminate invalid JSON, unknown field, unsupported version, identity drift, or out-of-bounds aggregate
+  transient_failure: negative acknowledgement with delay
+  delivery: at most one proactive offer per student and analytics session through the general PersonalTeacher Dialog
+  progress_rule: progressing observations stay silent
+course_plan_outcome_consumer:
+  service: ms-go-teacher-agent
+  acknowledgement_target: Teacher-source outcome accepted into an idempotent inbox and any required Dialog append completed; other sources are acknowledged without state
+  poison_message: terminate invalid JSON, unknown field, unsupported subject/version/status, identity drift, or invalid audit references
+  transient_failure: negative acknowledgement with delay
+  delivery: bounded localized business notification using event_id as Dialog idempotency key
+planner_onboarding_path_outcome_consumer:
+  service: ms-go-teacher-agent
+  subject: planner.onboarding-path.outcome.v1
+  stream: LEARNING_PLANNER_EVENTS
+  durable: ms-teacher-planner-onboarding-path-outcome-v1
+  acknowledgement_target: exact S8 handoff-correlated outcome inbox plus idempotent localized personal-teacher Dialog append
+  poison_message: terminate invalid JSON, unknown field, unsupported subject/version/status, status-specific ID violation, or identity drift
+  transient_failure: negative acknowledgement with delay
+  delivery: event_id is the Dialog idempotency key; PATH_READY carries bounded course/path/first-lesson IDs and conflict statuses carry none
+correlation:
+  learning_action_closed: correlation_id equals learning_action_id; causation_id equals answer_id
+  teacher_assistance_observed: correlation_id equals learning_action_id; causation_id equals closure event_id
+retry:
+  strategy: exponential
+  minimum_seconds: 1
+  maximum_seconds: 300
+  terminal_dead_letter: false

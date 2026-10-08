@@ -1,0 +1,150 @@
+package telegram
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const DefaultLinkTTL = 10 * time.Minute
+
+type TeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+
+type TokenGenerator interface{ NewID() string }
+
+type Clock interface{ Now() time.Time }
+
+type Service struct {
+	Teachers    TeacherEnsurer
+	Dialogs     repository.TeacherDialogProvisioner
+	Messages    repository.DialogStudentChannelAppender
+	Store       repository.TelegramLinkStore
+	Tokens      TokenGenerator
+	Clock       Clock
+	BotUsername string
+	LinkTTL     time.Duration
+}
+
+func (service Service) IssueLinkCode(ctx context.Context, studentID string) (domain.TelegramLinkCode, error) {
+	studentID = strings.TrimSpace(studentID)
+	if service.Teachers == nil || service.Dialogs == nil || service.Store == nil || service.Tokens == nil || service.Clock == nil ||
+		!validBotUsername(service.BotUsername) {
+		return domain.TelegramLinkCode{}, domain.ErrTelegramUnavailable
+	}
+	teacher, err := service.Teachers.Execute(ctx, studentID)
+	if err != nil {
+		return domain.TelegramLinkCode{}, err
+	}
+	binding, err := service.Dialogs.EnsureTeacherDialog(ctx, studentID, teacher.ID, domain.LearningContextGeneral, "")
+	if err != nil {
+		return domain.TelegramLinkCode{}, err
+	}
+	code := service.Tokens.NewID()
+	if _, err := uuid.Parse(code); err != nil {
+		return domain.TelegramLinkCode{}, domain.ErrTelegramUnavailable
+	}
+	now := service.Clock.Now().UTC()
+	ttl := service.LinkTTL
+	if ttl <= 0 {
+		ttl = DefaultLinkTTL
+	}
+	expiresAt := now.Add(ttl)
+	if err := service.Store.IssueLinkCode(ctx, sha256.Sum256([]byte(code)), domain.TelegramLinkRecord{
+		StudentID: studentID, PersonalTeacherID: teacher.ID, DialogID: binding.ID,
+		ExpiresAt: expiresAt, CreatedAt: now,
+	}); err != nil {
+		return domain.TelegramLinkCode{}, err
+	}
+	return domain.TelegramLinkCode{
+		Code: code, BotURL: "https://t.me/" + strings.TrimPrefix(strings.TrimSpace(service.BotUsername), "@") + "?start=" + url.QueryEscape(code),
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (service Service) ProcessUpdate(ctx context.Context, input domain.TelegramInboundUpdate) (domain.TelegramInboundResult, error) {
+	update, err := domain.NormalizeTelegramInboundUpdate(input)
+	if err != nil || service.Store == nil || service.Messages == nil || service.Clock == nil {
+		return domain.TelegramInboundResult{}, domain.ErrInvalidTelegramUpdate
+	}
+	if code, ok := startCode(update.Text); ok {
+		binding, consumeErr := service.Store.ConsumeLinkCode(
+			ctx, sha256.Sum256([]byte(code)), update.TelegramUserID, update.ChatID, service.Clock.Now().UTC(),
+		)
+		if consumeErr != nil {
+			return domain.TelegramInboundResult{ReplyText: "Ссылка недействительна или истекла. Создай новую ссылку в приложении."}, consumeErr
+		}
+		_ = binding
+		return domain.TelegramInboundResult{Accepted: true, ReplyText: "Telegram подключён. Здесь отвечает тот же персональный учитель, а история сохраняется в приложении."}, nil
+	}
+	binding, err := service.Store.GetBindingByChat(ctx, update.TelegramUserID, update.ChatID)
+	if err != nil {
+		if err == domain.ErrTelegramBindingNotFound {
+			return domain.TelegramInboundResult{ReplyText: "Сначала подключи Telegram в настройках персонального учителя."}, err
+		}
+		return domain.TelegramInboundResult{}, err
+	}
+	dialogBinding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: binding.DialogID, StudentID: binding.StudentID, PersonalTeacherID: binding.PersonalTeacherID,
+		ContextType: domain.LearningContextGeneral,
+	})
+	if err != nil {
+		return domain.TelegramInboundResult{}, domain.ErrTelegramUnavailable
+	}
+	message, err := service.Messages.AppendStudentChannelMessage(
+		ctx, dialogBinding, updateIdempotencyKey(update.UpdateID), domain.DialogMessageChannelTelegram, update.Text,
+	)
+	if err != nil {
+		return domain.TelegramInboundResult{}, err
+	}
+	if message.Channel != domain.DialogMessageChannelTelegram || message.SenderID != binding.StudentID {
+		return domain.TelegramInboundResult{}, domain.ErrTelegramUnavailable
+	}
+	return domain.TelegramInboundResult{Accepted: true}, nil
+}
+
+func startCode(text string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) != 2 {
+		return "", false
+	}
+	command := strings.ToLower(fields[0])
+	if command != "/start" && !strings.HasPrefix(command, "/start@") {
+		return "", false
+	}
+	if _, err := uuid.Parse(fields[1]); err != nil {
+		return "", false
+	}
+	return fields[1], true
+}
+
+func updateIdempotencyKey(updateID int64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("telegram-update-v1:%d", updateID)))
+	digest[6] = (digest[6] & 0x0f) | 0x50
+	digest[8] = (digest[8] & 0x3f) | 0x80
+	value, _ := uuid.FromBytes(digest[:16])
+	return value.String()
+}
+
+func validBotUsername(value string) bool {
+	value = strings.TrimPrefix(strings.TrimSpace(value), "@")
+	if len(value) < 5 || len(value) > 32 {
+		return false
+	}
+	for _, symbol := range value {
+		if (symbol < 'a' || symbol > 'z') && (symbol < 'A' || symbol > 'Z') &&
+			(symbol < '0' || symbol > '9') && symbol != '_' {
+			return false
+		}
+	}
+	return true
+}

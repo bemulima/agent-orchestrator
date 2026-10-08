@@ -1,0 +1,413 @@
+package generatedcourse
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+type IDGenerator interface {
+	NewID() string
+}
+
+type Clock interface {
+	Now() time.Time
+}
+
+type revisionResolver interface {
+	FreezeGeneratedReceipt(context.Context, string, []domain.GeneratedLessonBinding) ([]domain.GeneratedLessonBinding, error)
+}
+
+type Ensure struct {
+	Revisions      revisionResolver
+	Generated      repository.GeneratedCourseRepository
+	Courses        repository.CourseRepository
+	CourseI18n     repository.CourseI18nRepository
+	Modules        repository.ModuleRepository
+	ModuleI18n     repository.ModuleI18nRepository
+	CourseModules  repository.CourseModuleRepository
+	Sections       repository.SectionRepository
+	SectionI18n    repository.SectionI18nRepository
+	ModuleSections repository.ModuleSectionRepository
+	Lessons        repository.LessonRepository
+	LessonI18n     repository.LessonI18nRepository
+	SectionLessons repository.SectionLessonRepository
+	Examples       repository.LessonExampleRepository
+	Tasks          repository.TaskRepository
+	TaskI18n       repository.TaskI18nRepository
+	TaskTargets    repository.TaskLearningTargetRepository
+	StructureTypes repository.CodeStructureTypeRepository
+	I18n           repository.I18nRepository
+	Tx             repository.TransactionManager
+	Publisher      domain.EventPublisher
+	IDs            IDGenerator
+	Clock          Clock
+}
+
+func (useCase Ensure) Handle(
+	ctx context.Context,
+	idempotencyKey string,
+	input domain.GeneratedCourse,
+) (domain.EnsureGeneratedCourseResult, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if _, err := uuid.Parse(idempotencyKey); err != nil || !useCase.configured() {
+		return domain.EnsureGeneratedCourseResult{}, domain.ErrValidation
+	}
+	normalized, err := domain.NormalizeGeneratedCourse(input)
+	if err != nil {
+		return domain.EnsureGeneratedCourseResult{}, err
+	}
+	planJSON, err := json.Marshal(normalized)
+	if err != nil {
+		return domain.EnsureGeneratedCourseResult{}, err
+	}
+	if len(planJSON) > domain.MaximumGeneratedCoursePayloadBytes {
+		return domain.EnsureGeneratedCourseResult{}, domain.ErrValidation
+	}
+	digest := sha256.Sum256(planJSON)
+	requestHash := hex.EncodeToString(digest[:])
+	result := domain.EnsureGeneratedCourseResult{}
+	createdCourse := false
+	err = useCase.Tx.WithTx(ctx, func(ctx context.Context) error {
+		if err := useCase.Generated.Lock(ctx, "generated-course-request", idempotencyKey); err != nil {
+			return err
+		}
+		existingRequest, err := useCase.Generated.GetRequest(ctx, idempotencyKey)
+		switch {
+		case err == nil:
+			if existingRequest.RequestHash != requestHash {
+				return domain.ErrConflict
+			}
+			result = domain.EnsureGeneratedCourseResult{
+				CourseID: existingRequest.CourseID, Reused: existingRequest.Reused,
+			}
+			return nil
+		case !errors.Is(err, domain.ErrNotFound):
+			return err
+		}
+		fingerprintKey := normalized.FingerprintVersion + ":" + normalized.Fingerprint
+		if err := useCase.Generated.Lock(ctx, "generated-course-fingerprint", fingerprintKey); err != nil {
+			return err
+		}
+		courseID, err := useCase.Generated.GetCourseIDByFingerprint(
+			ctx, domain.GeneratedCourseOriginLearningPlanner, normalized.FingerprintVersion, normalized.Fingerprint,
+		)
+		switch {
+		case err == nil:
+			result = domain.EnsureGeneratedCourseResult{CourseID: courseID, Reused: true}
+			return useCase.Generated.CreateRequest(ctx, domain.GeneratedCourseRequest{
+				IdempotencyKey: idempotencyKey, RequestHash: requestHash, CourseID: courseID, Reused: true,
+			})
+		case !errors.Is(err, domain.ErrNotFound):
+			return err
+		}
+		courseID, err = useCase.nextID()
+		if err != nil {
+			return err
+		}
+		if err := useCase.createCourse(ctx, courseID, normalized, planJSON); err != nil {
+			return err
+		}
+		if err := useCase.Generated.CreateRequest(ctx, domain.GeneratedCourseRequest{
+			IdempotencyKey: idempotencyKey, RequestHash: requestHash, CourseID: courseID, Reused: false,
+		}); err != nil {
+			return err
+		}
+		result = domain.EnsureGeneratedCourseResult{CourseID: courseID, Reused: false}
+		createdCourse = true
+		return nil
+	})
+	if err != nil {
+		return domain.EnsureGeneratedCourseResult{}, err
+	}
+	result.Lessons, err = useCase.Generated.ListLessonBindings(ctx, result.CourseID)
+	if err != nil || len(result.Lessons) == 0 {
+		if err == nil {
+			err = domain.ErrValidation
+		}
+		return domain.EnsureGeneratedCourseResult{}, err
+	}
+	if useCase.Revisions != nil {
+		result.Lessons, err = useCase.Revisions.FreezeGeneratedReceipt(ctx, idempotencyKey, result.Lessons)
+		if err != nil {
+			return domain.EnsureGeneratedCourseResult{}, err
+		}
+	}
+	if createdCourse && useCase.Publisher != nil {
+		_ = useCase.Publisher.Publish(ctx, domain.SubjectCourseCreated, map[string]any{
+			"course_id": result.CourseID, "slug": "planned-" + normalized.Fingerprint,
+		})
+	}
+	return result, nil
+}
+
+func (useCase Ensure) configured() bool {
+	return useCase.Generated != nil && useCase.Courses != nil && useCase.CourseI18n != nil &&
+		useCase.Modules != nil && useCase.ModuleI18n != nil && useCase.CourseModules != nil &&
+		useCase.Sections != nil && useCase.SectionI18n != nil && useCase.ModuleSections != nil &&
+		useCase.Lessons != nil && useCase.LessonI18n != nil && useCase.SectionLessons != nil &&
+		useCase.Examples != nil && useCase.Tasks != nil && useCase.TaskI18n != nil && useCase.TaskTargets != nil &&
+		useCase.StructureTypes != nil && useCase.I18n != nil && useCase.Tx != nil && useCase.IDs != nil && useCase.Clock != nil
+}
+
+func (useCase Ensure) createCourse(
+	ctx context.Context,
+	courseID string,
+	input domain.GeneratedCourse,
+	planJSON []byte,
+) error {
+	language, err := useCase.I18n.GetByLanguage(ctx, input.Language)
+	if errors.Is(err, domain.ErrNotFound) {
+		if err := useCase.I18n.Create(ctx, domain.I18n{Language: input.Language}); err != nil {
+			return err
+		}
+		language, err = useCase.I18n.GetByLanguage(ctx, input.Language)
+	}
+	if err != nil {
+		return err
+	}
+	now := useCase.Clock.Now().UTC()
+	course := domain.Course{
+		ID: courseID, Slug: "planned-" + input.Fingerprint,
+		SourceKey: generatedSourceKey("course", input.Fingerprint, input.GoalCode, input.GoalVersion),
+		CreatedAt: now, UpdatedAt: now, Status: domain.CourseStatusActive, CatalogVisible: false,
+	}
+	if err := useCase.Courses.Create(ctx, course); err != nil {
+		return err
+	}
+	if err := useCase.CourseI18n.Upsert(ctx, domain.CourseI18n{
+		CourseID: courseID, I18nID: language.ID, Title: input.Title, Description: input.Description,
+	}); err != nil {
+		return err
+	}
+	if err := useCase.Generated.CreateCourseRecord(ctx, domain.GeneratedCourseRecord{
+		CourseID: courseID, Origin: domain.GeneratedCourseOriginLearningPlanner,
+		Fingerprint: input.Fingerprint, FingerprintVersion: input.FingerprintVersion,
+		GoalCode: input.GoalCode, GoalVersion: input.GoalVersion, Language: input.Language,
+		PlannerVersion: input.PlannerVersion, PedagogyProfile: input.PedagogyProfile,
+		PresentationStyle: input.PresentationStyle, GenerationPolicy: input.GenerationPolicy,
+		PlanJSON: planJSON,
+	}); err != nil {
+		return err
+	}
+	for _, plannedModule := range input.Modules {
+		moduleID, err := useCase.nextID()
+		if err != nil {
+			return err
+		}
+		module := domain.Module{
+			ID: moduleID, SourceKey: generatedSourceKey("module", input.Fingerprint, plannedModule.Code),
+			Status: domain.ModuleStatusActive, Visibility: domain.ModuleVisibilityCourseOnly,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := useCase.Modules.Create(ctx, module); err != nil {
+			return err
+		}
+		if err := useCase.ModuleI18n.Upsert(ctx, domain.ModuleI18n{
+			ModuleID: moduleID, I18nID: language.ID, Language: input.Language, Title: plannedModule.Title,
+		}); err != nil {
+			return err
+		}
+		if err := useCase.CourseModules.Add(ctx, courseID, moduleID, plannedModule.Order); err != nil {
+			return err
+		}
+		for _, plannedSection := range plannedModule.Sections {
+			sectionID, err := useCase.nextID()
+			if err != nil {
+				return err
+			}
+			section := domain.Section{
+				ID:        sectionID,
+				SourceKey: generatedSourceKey("section", input.Fingerprint, plannedModule.Code, plannedSection.Code),
+				Status:    domain.SectionStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := useCase.Sections.Create(ctx, section); err != nil {
+				return err
+			}
+			if err := useCase.SectionI18n.Upsert(ctx, domain.SectionI18n{
+				SectionID: sectionID, I18nID: language.ID, Language: input.Language, Title: plannedSection.Title,
+			}); err != nil {
+				return err
+			}
+			if err := useCase.ModuleSections.Add(ctx, moduleID, sectionID, plannedSection.Order); err != nil {
+				return err
+			}
+			for _, plannedLesson := range plannedSection.Lessons {
+				lessonID, err := useCase.nextID()
+				if err != nil {
+					return err
+				}
+				lesson := domain.Lesson{
+					ID: lessonID,
+					SourceKey: generatedSourceKey(
+						"lesson", input.Fingerprint, plannedModule.Code, plannedSection.Code, plannedLesson.Code,
+					),
+					Title: plannedLesson.Title, Excerpt: plannedLesson.Excerpt,
+					Description: plannedLesson.DescriptionMarkdown,
+					Status:      domain.LessonStatusActive, CreatedAt: now, UpdatedAt: now,
+				}
+				if err := useCase.Lessons.Create(ctx, lesson); err != nil {
+					return err
+				}
+				if err := useCase.LessonI18n.Upsert(ctx, domain.LessonI18n{
+					LessonID: lessonID, I18nID: language.ID, Language: input.Language,
+					Title: plannedLesson.Title, Excerpt: plannedLesson.Excerpt,
+					Description: plannedLesson.DescriptionMarkdown,
+				}); err != nil {
+					return err
+				}
+				if err := useCase.SectionLessons.Add(ctx, sectionID, lessonID, plannedLesson.Order); err != nil {
+					return err
+				}
+				targetsJSON, err := marshalArray(plannedLesson.Targets)
+				if err != nil {
+					return err
+				}
+				prerequisitesJSON, err := marshalArray(plannedLesson.Prerequisites)
+				if err != nil {
+					return err
+				}
+				transitionsJSON, err := marshalArray(plannedLesson.TransitionKnowledge)
+				if err != nil {
+					return err
+				}
+				strategiesJSON, err := marshalArray(plannedLesson.PedagogyStrategies)
+				if err != nil {
+					return err
+				}
+				if err := useCase.Generated.CreateLessonRecord(ctx, domain.GeneratedLessonRecord{
+					LessonID: lessonID, CourseID: courseID, ModuleCode: plannedModule.Code,
+					SectionCode: plannedSection.Code, LessonCode: plannedLesson.Code,
+					TargetsJSON: targetsJSON, PrerequisitesJSON: prerequisitesJSON,
+					TransitionKnowledgeJSON: transitionsJSON, PedagogyStrategiesJSON: strategiesJSON,
+				}); err != nil {
+					return err
+				}
+				if err := useCase.createLessonArtifacts(ctx, language.ID, input, plannedModule, plannedSection, plannedLesson, lessonID, now); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (useCase Ensure) createLessonArtifacts(
+	ctx context.Context,
+	languageID int,
+	course domain.GeneratedCourse,
+	module domain.GeneratedCourseModule,
+	section domain.GeneratedCourseSection,
+	lesson domain.GeneratedCourseLesson,
+	lessonID string,
+	now time.Time,
+) error {
+	examples := make([]domain.LessonExample, 0, len(lesson.Examples))
+	for index, planned := range lesson.Examples {
+		exampleID, err := useCase.nextID()
+		if err != nil {
+			return err
+		}
+		var primary *string
+		if planned.PrimaryStack != "" {
+			value := planned.PrimaryStack
+			primary = &value
+		}
+		examples = append(examples, domain.LessonExample{
+			ID:        exampleID,
+			SourceKey: generatedSourceKey("example", course.Fingerprint, module.Code, section.Code, lesson.Code, strconv.Itoa(index)),
+			LessonID:  lessonID, Order: index + 1, Status: domain.LessonExampleStatusActive,
+			Mode: "explanation", PrimaryStack: primary, Stacks: planned.Stacks,
+			TargetConcepts: planned.TargetConcepts,
+			Translations: []domain.LessonExampleI18n{{
+				ExampleID: exampleID, I18nID: languageID, Language: course.Language,
+				Title: planned.Title, Description: planned.DescriptionMarkdown,
+			}}, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	if err := useCase.Examples.ReplaceByLesson(ctx, lessonID, examples); err != nil {
+		return err
+	}
+	structure, err := useCase.StructureTypes.GetByCode(ctx, "QUIZ_TEXT_BASIC")
+	if err != nil {
+		return err
+	}
+	if structure == nil || structure.Code != "QUIZ_TEXT_BASIC" {
+		return domain.ErrValidation
+	}
+	if _, err := uuid.Parse(structure.ID); err != nil {
+		return domain.ErrValidation
+	}
+	for index, planned := range lesson.Tasks {
+		taskID, err := useCase.nextID()
+		if err != nil {
+			return err
+		}
+		structureJSON, err := json.Marshal(map[string]any{
+			"type": "quiz_theory",
+			"quiz": map[string]any{"expected_answers": planned.ExpectedAnswers, "ignore_case": true, "trim_space": true},
+		})
+		if err != nil || domain.ValidateTaskContract(domain.TaskTypeQuizTheory, structureJSON) != nil {
+			return domain.ErrValidation
+		}
+		task := domain.Task{
+			ID:        taskID,
+			SourceKey: generatedSourceKey("task", course.Fingerprint, module.Code, section.Code, lesson.Code, strconv.Itoa(index)),
+			LessonID:  lessonID, Title: planned.Title, Description: planned.DescriptionMarkdown,
+			CodeStructureTypeID: structure.ID, CodeStructure: structureJSON,
+			Type: domain.TaskTypeQuizTheory, ExecutionMode: domain.TaskExecutionModeNoRun,
+			EvaluationMode: domain.TaskEvaluationModeAuto, UIMode: domain.TaskUIModeQuiz,
+			SubmissionMode: domain.TaskSubmissionModeAnswerPayload, RequiresSandbox: false,
+			Order: index + 1, Status: domain.TaskStatusActive, Version: 1,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := useCase.Tasks.Create(ctx, task); err != nil {
+			return err
+		}
+		if err := useCase.TaskI18n.Upsert(ctx, domain.TaskI18n{
+			TaskID: taskID, I18nID: languageID, Language: course.Language,
+			Title: planned.Title, Description: planned.DescriptionMarkdown,
+		}); err != nil {
+			return err
+		}
+		targets := make([]domain.TaskLearningTarget, len(lesson.Targets))
+		for targetIndex, target := range lesson.Targets {
+			targets[targetIndex] = domain.TaskLearningTarget{
+				TaskID: taskID, Type: target.Type, Key: target.Key, Version: target.Version, Order: targetIndex,
+			}
+		}
+		if err := useCase.TaskTargets.ReplaceForTask(ctx, taskID, targets); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (useCase Ensure) nextID() (string, error) {
+	value := useCase.IDs.NewID()
+	if _, err := uuid.Parse(value); err != nil {
+		return "", domain.ErrValidation
+	}
+	return value, nil
+}
+
+func generatedSourceKey(kind string, parts ...string) string {
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "learning-planner/" + kind + "/" + hex.EncodeToString(digest[:])
+}
+
+func marshalArray[T any](items []T) ([]byte, error) {
+	if items == nil {
+		items = make([]T, 0)
+	}
+	return json.Marshal(items)
+}

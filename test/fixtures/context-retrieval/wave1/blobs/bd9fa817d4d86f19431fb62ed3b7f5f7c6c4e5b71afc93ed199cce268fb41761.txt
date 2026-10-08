@@ -1,0 +1,278 @@
+package onboarding
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type handoffWorkerStore struct {
+	dispatch, notification                            domain.TeacherOnboardingHandoffIntent
+	accepted, activePath, delivered, retried, blocked int
+	markDeliveredErrors                               []error
+}
+
+func (*handoffWorkerStore) Enqueue(context.Context, repository.TeacherOnboardingHandoffEnqueue, time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*handoffWorkerStore) GetByStudentState(context.Context, string, domain.TeacherStudentReadinessStateRef, domain.TeacherLearningReadinessGoal) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (store *handoffWorkerStore) ClaimDispatch(_ context.Context, token, worker string, now, until time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.dispatch.ID == "" {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	result := store.dispatch
+	store.dispatch = domain.TeacherOnboardingHandoffIntent{}
+	result.Status, result.ClaimToken, result.LockedBy, result.LockedUntil, result.Attempts = domain.TeacherOnboardingHandoffDispatching, token, worker, until, result.Attempts+1
+	return result, true, nil
+}
+func (store *handoffWorkerStore) RetryDispatch(context.Context, string, string, string, time.Time, time.Time) error {
+	store.retried++
+	return nil
+}
+func (store *handoffWorkerStore) MarkAccepted(_ context.Context, _, _ string, _ domain.TeacherOnboardingPlanHandoff, _ time.Time) error {
+	store.accepted++
+	return nil
+}
+func (store *handoffWorkerStore) ClaimNotification(_ context.Context, token, worker string, now, until time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	if store.notification.ID == "" {
+		return domain.TeacherOnboardingHandoffIntent{}, false, nil
+	}
+	result := store.notification
+	result.Status, result.ClaimToken, result.LockedBy, result.LockedUntil = domain.TeacherOnboardingHandoffMessagePending, token, worker, until
+	return result, true, nil
+}
+func (store *handoffWorkerStore) RetryNotification(context.Context, string, string, string, time.Time, time.Time) error {
+	store.retried++
+	return nil
+}
+func (store *handoffWorkerStore) MarkDelivered(_ context.Context, _, _, _ string, _ time.Time) error {
+	if len(store.markDeliveredErrors) != 0 {
+		err := store.markDeliveredErrors[0]
+		store.markDeliveredErrors = store.markDeliveredErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	store.delivered++
+	store.notification = domain.TeacherOnboardingHandoffIntent{}
+	return nil
+}
+func (store *handoffWorkerStore) MarkActivePath(context.Context, string, string, time.Time) error {
+	store.activePath++
+	return nil
+}
+func (store *handoffWorkerStore) Block(context.Context, string, string, string, time.Time) error {
+	store.blocked++
+	return nil
+}
+
+type handoffWorkerPlanner struct {
+	result domain.TeacherOnboardingPlanHandoff
+	err    error
+	calls  int
+}
+
+func (planner *handoffWorkerPlanner) CreateOnboardingPlanHandoff(context.Context, domain.TeacherOnboardingHandoffIntent) (domain.TeacherOnboardingPlanHandoff, error) {
+	planner.calls++
+	return planner.result, planner.err
+}
+
+type handoffWorkerReadiness struct {
+	result domain.TeacherLearningReadiness
+	err    error
+	calls  int
+}
+
+func (resolver *handoffWorkerReadiness) ResolveLearningReadiness(context.Context, string, domain.TeacherStudentReadinessStateRef) (domain.TeacherLearningReadiness, error) {
+	resolver.calls++
+	return resolver.result, resolver.err
+}
+
+type handoffWorkerDialog struct {
+	messages         map[string]domain.DialogMessage
+	calls, mutations int
+}
+
+func (dialog *handoffWorkerDialog) AppendTeacherProactive(_ context.Context, binding domain.TeacherDialogBinding, key, body string) (domain.DialogMessage, error) {
+	if message, ok := dialog.messages[key]; ok {
+		dialog.calls++
+		return message, nil
+	}
+	dialog.calls++
+	dialog.mutations++
+	message := domain.DialogMessage{ID: domain.DeterministicOnboardingUUID("handoff-message", key), DialogID: binding.ID, AuthorType: domain.DialogMessageAuthorPersonalTeacher,
+		Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: binding.PersonalTeacherID, Body: body, Status: 1, Version: 1,
+		MessageSequence: 1, LastEventSequence: 1, CreatedAt: time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)}
+	dialog.messages[key] = message
+	return message, nil
+}
+func (dialog *handoffWorkerDialog) AppendTeacherResponse(_ context.Context, request domain.DialogTeacherRequest, key, body string) (domain.DialogMessage, error) {
+	if message, ok := dialog.messages[key]; ok {
+		dialog.calls++
+		return message, nil
+	}
+	dialog.calls++
+	dialog.mutations++
+	message := domain.DialogMessage{ID: domain.DeterministicOnboardingUUID("handoff-message", key), DialogID: request.DialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher,
+		Channel: request.SourceChannel, PersonalTeacherID: request.PersonalTeacherID, LearningActionID: request.LearningActionID, ReplyToMessageID: request.SourceMessageID,
+		Body: body, Status: 1, Version: 1, MessageSequence: 2, LastEventSequence: 2, CreatedAt: time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)}
+	dialog.messages[key] = message
+	return message, nil
+}
+
+func TestHandoffWorkerPersistsPlannerAcceptanceBeforeNotification(t *testing.T) {
+	intent := workerHandoffIntent(t)
+	store := &handoffWorkerStore{dispatch: intent}
+	planner := &handoffWorkerPlanner{result: workerHandoffResult(intent)}
+	worker := newHandoffWorker(store, planner, &handoffWorkerReadiness{}, &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}})
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, planner.calls)
+	require.Equal(t, 1, store.accepted)
+	require.Zero(t, store.delivered)
+}
+
+func TestHandoffWorkerPrioritizesAcceptedNotificationOverDispatchBacklog(t *testing.T) {
+	dispatch := workerHandoffIntent(t)
+	notification := workerHandoffIntent(t)
+	notification.ID = "99999999-9999-4999-8999-999999999999"
+	notification.Status = domain.TeacherOnboardingHandoffAcceptedStatus
+	notification.PlannerHandoffID = "66666666-6666-4666-8666-666666666666"
+	notification.AcceptedAt = time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	notification.ReadinessObservedAt = notification.AcceptedAt.Add(-time.Minute)
+	store := &handoffWorkerStore{dispatch: dispatch, notification: notification}
+	planner := &handoffWorkerPlanner{result: workerHandoffResult(dispatch)}
+	dialog := &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}}
+	worker := newHandoffWorker(store, planner, &handoffWorkerReadiness{}, dialog)
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Zero(t, planner.calls, "a dispatch backlog may not starve accepted notifications and their dense cursors")
+	require.Equal(t, 1, dialog.mutations)
+	require.Equal(t, 1, store.delivered)
+	require.NotEmpty(t, store.dispatch.ID, "the queued dispatch remains eligible for the next drain iteration")
+}
+
+func TestHandoffWorkerDoesNotLetContinuousNotificationsStarveDispatch(t *testing.T) {
+	dispatch := workerHandoffIntent(t)
+	notification := workerHandoffIntent(t)
+	notification.ID = "99999999-9999-4999-8999-999999999999"
+	notification.Status = domain.TeacherOnboardingHandoffAcceptedStatus
+	notification.PlannerHandoffID = "66666666-6666-4666-8666-666666666666"
+	notification.AcceptedAt = time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	notification.ReadinessObservedAt = notification.AcceptedAt.Add(-time.Minute)
+	store := &handoffWorkerStore{dispatch: dispatch, notification: notification}
+	planner := &handoffWorkerPlanner{result: workerHandoffResult(dispatch)}
+	worker := newHandoffWorker(store, planner, &handoffWorkerReadiness{}, &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}})
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	// A new accepted item arrives before the next drain iteration.
+	store.notification = notification
+	claimed, err = worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, planner.calls)
+	require.NotEmpty(t, store.notification.ID)
+}
+
+func TestHandoffWorkerDialogReplayAfterLocalCrashIsExactlyOneMutation(t *testing.T) {
+	intent := workerHandoffIntent(t)
+	intent.Status = domain.TeacherOnboardingHandoffAcceptedStatus
+	intent.PlannerHandoffID = "66666666-6666-4666-8666-666666666666"
+	intent.AcceptedAt = time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	intent.ReadinessObservedAt = intent.AcceptedAt.Add(-time.Minute)
+	store := &handoffWorkerStore{notification: intent, markDeliveredErrors: []error{errors.New("crash after Dialog commit"), nil}}
+	dialog := &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}}
+	worker := newHandoffWorker(store, &handoffWorkerPlanner{}, &handoffWorkerReadiness{}, dialog)
+	claimed, err := worker.ProcessNext(context.Background())
+	require.True(t, claimed)
+	require.Error(t, err)
+	claimed, err = worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 2, dialog.calls)
+	require.Equal(t, 1, dialog.mutations)
+	require.Equal(t, 1, store.delivered)
+	for _, message := range dialog.messages {
+		require.Contains(t, message.Body, "Подготовка ещё не началась")
+		require.Contains(t, message.Body, "не созданы")
+	}
+}
+
+func TestHandoffWorkerReconcilesActivePathWithoutPlannerMutation(t *testing.T) {
+	intent := workerHandoffIntent(t)
+	store := &handoffWorkerStore{dispatch: intent}
+	readiness := &handoffWorkerReadiness{result: domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema,
+		Result: domain.TeacherLearningReadinessNotReady, ReasonCodes: []string{domain.TeacherReadinessReasonActivePathExists}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: intent.StateRef, ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated,
+		ActivePath: &domain.TeacherLearningReadinessActivePath{LearningPathID: "77777777-7777-4777-8777-777777777777", Version: 1, CourseID: "88888888-8888-4888-8888-888888888888", GoalCode: "programming.foundation", Status: "ACTIVE"}}}
+	planner := &handoffWorkerPlanner{err: domain.ErrTeacherOnboardingHandoffActivePath}
+	worker := newHandoffWorker(store, planner, readiness, &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}})
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, readiness.calls)
+	require.Equal(t, 1, store.activePath)
+	require.Zero(t, store.accepted)
+}
+
+func TestHandoffWorkerRetriesOperationalAndBlocksInvalidOrHashConflict(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		failure      error
+		retry, block int
+	}{
+		{name: "5xx timeout", failure: domain.ErrTeacherOnboardingHandoffUnavailable, retry: 1},
+		{name: "malformed", failure: domain.ErrTeacherOnboardingHandoffInvalidResponse, block: 1},
+		{name: "idempotency conflict", failure: domain.ErrTeacherOnboardingHandoffConflict, block: 1},
+		{name: "422", failure: domain.ErrTeacherOnboardingHandoffRejected, block: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := &handoffWorkerStore{dispatch: workerHandoffIntent(t)}
+			worker := newHandoffWorker(store, &handoffWorkerPlanner{err: testCase.failure}, &handoffWorkerReadiness{}, &handoffWorkerDialog{messages: map[string]domain.DialogMessage{}})
+			claimed, err := worker.ProcessNext(context.Background())
+			require.True(t, claimed)
+			require.Error(t, err)
+			require.Equal(t, testCase.retry, store.retried)
+			require.Equal(t, testCase.block, store.blocked)
+		})
+	}
+}
+
+func newHandoffWorker(store repository.TeacherOnboardingHandoffStore, planner repository.TeacherOnboardingPlanHandoffGateway, readiness repository.TeacherLearningReadinessResolver, dialog *handoffWorkerDialog) HandoffWorker {
+	return HandoffWorker{Store: store, Planner: planner, Readiness: readiness, Responses: dialog, Proactive: dialog, IDs: &testIDs{},
+		Clock: &testClock{now: time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)}, WorkerID: "handoff-worker", LeaseTTL: time.Minute,
+		RetryBaseDelay: time.Second, RetryMaxDelay: time.Minute, MaxAttempts: 20}
+}
+
+func workerHandoffIntent(t *testing.T) domain.TeacherOnboardingHandoffIntent {
+	t.Helper()
+	now := time.Date(2026, 9, 11, 9, 0, 0, 0, time.UTC)
+	readiness := domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion}}
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID},
+		domain.TeacherDialogBinding{ID: testDialogID, StudentID: testStudentID, PersonalTeacherID: testTeacherID, ContextType: domain.LearningContextGeneral}, readiness, "ru", "", "", now)
+	require.NoError(t, err)
+	return intent
+}
+
+func workerHandoffResult(intent domain.TeacherOnboardingHandoffIntent) domain.TeacherOnboardingPlanHandoff {
+	return domain.TeacherOnboardingPlanHandoff{Schema: domain.TeacherOnboardingPlanHandoffSchema, HandoffID: "66666666-6666-4666-8666-666666666666",
+		Status: domain.TeacherOnboardingHandoffAccepted, StateRef: intent.StateRef, Goal: intent.Goal,
+		ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated,
+		ReadinessObservedAt: "2026-09-11T09:59:00Z"}
+}

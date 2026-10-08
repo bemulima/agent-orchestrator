@@ -1,0 +1,95 @@
+package courseplannotification
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+
+type Clock interface{ Now() time.Time }
+
+type Handler struct {
+	Teachers TeacherEnsurer
+	Store    repository.CoursePlanNotificationStore
+	Dialogs  repository.DialogTeacherProactiveAppender
+	Clock    Clock
+}
+
+// Handle owns a Teacher-originated result before attempting idempotent Dialog
+// delivery. Student- and system-originated requests have no Teacher notification.
+func (handler Handler) Handle(ctx context.Context, raw domain.CoursePlanOutcome) (bool, error) {
+	outcome, err := domain.NormalizeCoursePlanOutcome(raw)
+	if err != nil {
+		return false, err
+	}
+	if outcome.Source != domain.CoursePlanSourceTeacher {
+		return false, nil
+	}
+	// Planner v2's learning_path_id is accepted for compatibility but is not
+	// yet part of Teacher's notification schema. Drop it before persistence so
+	// the v1 inbox remains the complete replay/deduplication contract.
+	outcome.LearningPathID = ""
+	if handler.Teachers == nil || handler.Store == nil || handler.Dialogs == nil || handler.Clock == nil {
+		return false, errors.New("course plan notification dependencies are required")
+	}
+	teacher, err := handler.Teachers.Execute(ctx, outcome.StudentID)
+	if err != nil {
+		return false, err
+	}
+	notification, created, err := handler.Store.Accept(ctx, domain.CoursePlanNotification{
+		Outcome: outcome, PersonalTeacherID: teacher.ID, Body: notificationBody(teacher.Language, outcome),
+		AcceptedAt: handler.Clock.Now().UTC(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if notification.DeliveredAt != nil {
+		return created, nil
+	}
+	if outcome.AuditRefs.DialogID == "" {
+		return created, nil
+	}
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: outcome.AuditRefs.DialogID, StudentID: outcome.StudentID,
+		PersonalTeacherID: notification.PersonalTeacherID, ContextType: domain.LearningContextGeneral,
+	})
+	if err != nil {
+		return false, err
+	}
+	message, err := handler.Dialogs.AppendTeacherProactive(ctx, binding, outcome.EventID, notification.Body)
+	if err != nil {
+		return false, err
+	}
+	if err := handler.Store.MarkDelivered(ctx, outcome.EventID, message.ID, handler.Clock.Now().UTC()); err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
+func notificationBody(language string, outcome domain.CoursePlanOutcome) string {
+	english := strings.HasPrefix(strings.ToLower(strings.TrimSpace(language)), "en")
+	if outcome.Status == domain.CoursePlanStatusFailed {
+		if english {
+			return "I couldn't prepare the updated learning plan yet. Your current path is unchanged; please try the planning request again later."
+		}
+		return "Пока не удалось подготовить обновлённый учебный план. Текущий маршрут не изменён; попробуй повторить запрос позже."
+	}
+	if outcome.CourseID == "" {
+		if english {
+			return "The learning plan is ready. No new course is needed for the requested outcome right now."
+		}
+		return "Учебный план готов. Для выбранного результата новый курс сейчас не требуется."
+	}
+	if english {
+		return "The learning plan is ready. The course has been assigned and the first available lesson is in your learning path."
+	}
+	return "Учебный план готов. Курс назначен, а первый доступный урок добавлен в твой learning path."
+}

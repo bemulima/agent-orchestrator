@@ -294,3 +294,31 @@ func TestAdaptRoutingCoverageRejectsTamperingAndKeepsHistoricalUnknown(t *testin
 		t.Fatal("nil coverage supplied false historical completeness")
 	}
 }
+
+func TestTaskRouteKeepsContractsAndBindsOnlyExplicitQuestion(t *testing.T) {
+	route := domain.RoutingResult{Status: domain.RoutingStatusResolved, Routes: []domain.RoutedTarget{{RouteReference: domain.RouteReference{ProjectID: "fixture", RouteID: "usecase"}, Paths: []string{"wanted.go", "sibling.go"}}}, EvidenceIDs: []string{"wanted", "sibling"}, EvidenceIndex: []domain.RoutingEvidence{{ID: "wanted", ProjectID: "fixture", Path: "wanted.go", Checksum: strings.Repeat("a", 64)}, {ID: "sibling", ProjectID: "fixture", Path: "sibling.go", Checksum: strings.Repeat("b", 64)}}}
+	contract := domain.ContractPlan{Required: true, Boundaries: []domain.PlannedContractBoundary{{Kind: "provider", Owner: domain.RouteReference{ProjectID: "provider", RouteID: "domain"}, TargetPath: "missing.go", Existing: false}}}
+	sources := map[string]core.SourceAdmission{"fixture": {Identity: "local:fixture"}, "provider": {Identity: "local:provider", Neighbor: true}}
+	adapted, err := AdaptTaskRoute(route, sources, &contract, nil, []core.Facet{{ID: "question", SourceIdentity: "local:fixture", Path: "wanted.go"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractRetained, hashRetained := false, false
+	for _, f := range adapted.SeedFacets {
+		if f.Path == "sibling.go" {
+			t.Fatal("generic sibling became task obligation")
+		}
+		contractRetained = contractRetained || f.SourceIdentity == "local:provider" && f.Path == "missing.go" && f.Required
+		hashRetained = hashRetained || f.Path == "wanted.go" && f.ExpectedHash == strings.Repeat("a", 64)
+	}
+	if !contractRetained || !hashRetained || len(adapted.Owners) != 1 || adapted.Owners[0] != "local:fixture" {
+		t.Fatal("contract/source freshness/owner admission changed")
+	}
+}
+func TestRoutingCompactionPreservesDistinctSafetyStatesAndCounts(t *testing.T) {
+	rows := []core.CoverageResult{{SourceIdentity: "source", Stage: "routing_symbols:a.go", Status: core.Complete, Complete: true, CandidateCount: 2, SelectedCount: 2}, {SourceIdentity: "source", Stage: "routing_symbols:b.go", Status: core.Complete, Complete: true, CandidateCount: 3, SelectedCount: 3}, {SourceIdentity: "source", Stage: "routing_symbols:c.go", Status: core.Partial, Complete: false, CandidateCount: 4, SelectedCount: 2, Omitted: 2, TerminatedByLimit: true, Reasons: []string{"symbol_or_import_match_limit"}}, {SourceIdentity: "source", Stage: "routing_omission:facts", Status: core.Partial, Omitted: 2, Reasons: []string{"facts_bytes_limit"}}, {SourceIdentity: "source", Stage: "routing_omission:facts", Status: core.Partial, Omitted: 3, Reasons: []string{"facts_bytes_limit"}}, {Stage: "routing_required:source", FacetID: "late", Status: core.Unknown, Complete: false, RequirementState: core.NotVerified, Reasons: []string{"unscanned"}}}
+	compact := compactRoutingCoverage(rows)
+	if len(compact) != 4 || compact[0].CandidateCount != 5 || compact[0].SelectedCount != 5 || !compact[0].Complete || compact[1].Status != core.Partial || compact[1].Omitted != 2 || compact[2].Omitted != 5 || compact[3].FacetID != "late" || compact[3].RequirementState != core.NotVerified {
+		t.Fatalf("safety/count projection lost: %+v", compact)
+	}
+}

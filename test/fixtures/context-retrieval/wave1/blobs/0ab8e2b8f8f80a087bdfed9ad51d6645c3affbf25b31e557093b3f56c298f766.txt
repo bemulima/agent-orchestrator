@@ -1,0 +1,221 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	httptransport "github.com/bemulima/ms-go-teacher-agent/internal/transport/http"
+	adminhandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/admin/v1/handlers"
+	apihandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/bemulima/ms-go-teacher-agent/internal/transport/http/private/handlers"
+)
+
+// This regression uses the production root router and protected HealthHandler.
+// PostgreSQL is opt-in through the existing disposable integration fixture.
+func TestT15DenseReadinessFlagOffPendingV2(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool}
+	job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	before := t15ReadinessFacts(t, repository, fixture.teacherID)
+	require.ErrorIs(t, repository.CheckDenseOrderingReadiness(context.Background()), ErrDenseTeacherOrderingDisabledWithPendingV2)
+	const token = "t15-synthetic-readiness-token"
+	router := httptransport.NewRouter(httptransport.RouterDependencies{
+		APIPersonalTeacher:   &apihandlers.PersonalTeacherHandler{},
+		APITeacherDialog:     &apihandlers.TeacherDialogHandler{},
+		AdminPersonalTeacher: &adminhandlers.PersonalTeacherHandler{},
+		PrivateHealth:        t15ReadinessHandler(repository),
+		InternalToken:        token,
+	})
+	for _, provided := range []string{"", "wrong-synthetic-token", token + " "} {
+		request := httptest.NewRequest(http.MethodGet, "/internal/readyz", nil)
+		request.Header.Set("X-Internal-Token", provided)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		require.Equal(t, http.StatusForbidden, response.Code)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/internal/readyz", nil)
+	request.Header.Set("X-Internal-Token", token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code,
+		"a durable V2 job cannot drain while dense claiming is disabled")
+	require.JSONEq(t, `{"status":"not ready","error_code":"dense_teacher_ordering_disabled_with_pending_v2"}`, response.Body.String())
+	for _, private := range []string{token, job.Request.EventID, job.Request.SourceMessageID, fixture.studentID, fixture.teacherID} {
+		require.NotContains(t, response.Body.String(), private)
+	}
+	require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID), "readiness must not modify durable facts")
+	repository.DenseOrderingEnabled = true
+	require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+}
+
+func t15ReadinessHandler(repository TeacherDialogJobRepository) *privatehandlers.HealthHandler {
+	return &privatehandlers.HealthHandler{
+		Ready: repository.CheckDenseOrderingReadiness,
+		ReadinessFailureCode: func(err error) string {
+			if errors.Is(err, ErrDenseTeacherOrderingDisabledWithPendingV2) {
+				return "dense_teacher_ordering_disabled_with_pending_v2"
+			}
+			return ""
+		},
+	}
+}
+
+func TestT15DenseReadinessPendingStates(t *testing.T) {
+	for _, state := range []string{"processing", "delivery_pending", "unknown", "partial", "committed_unreconciled"} {
+		t.Run(state, func(t *testing.T) {
+			fixture := newTeacherDecisionIntegrationFixture(t)
+			repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+			job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+			claimed, ok := claimDenseJob(t, repository, "t15-readiness-worker", time.Now().UTC())
+			require.True(t, ok)
+			switch state {
+			case "processing":
+			case "delivery_pending":
+				decision, event := fixture.decision(uuid.NewString(), job.Request.EventID, domain.LearningContextGeneral, "", "", job.Request.DialogID)
+				require.NoError(t, repository.SaveGenerated(context.Background(), job.Request.EventID, claimed.ClaimToken, decision, event, "t15-private-pending-body", uuid.NewString(), time.Now().UTC()))
+				now := time.Now().UTC()
+				require.NoError(t, repository.Retry(context.Background(), job.Request.EventID, claimed.ClaimToken, "delivery_unavailable", now.Add(time.Minute), now))
+			default:
+				require.NoError(t, repository.MarkReconciliation(context.Background(), job.Request.EventID, claimed.ClaimToken, domain.TeacherTurnReconciliationState(state), "t15_unresolved", time.Now().UTC()))
+			}
+			before := t15ReadinessFacts(t, repository, fixture.teacherID)
+			repository.DenseOrderingEnabled = false
+			err := repository.CheckDenseOrderingReadiness(context.Background())
+			require.ErrorIs(t, err, ErrDenseTeacherOrderingDisabledWithPendingV2)
+			require.EqualError(t, err, "dense_teacher_ordering_disabled_with_pending_v2")
+			response := httptest.NewRecorder()
+			t15ReadinessHandler(repository).Readyz(response, httptest.NewRequest(http.MethodGet, "/internal/readyz", nil))
+			require.Equal(t, http.StatusServiceUnavailable, response.Code)
+			require.JSONEq(t, `{"status":"not ready","error_code":"dense_teacher_ordering_disabled_with_pending_v2"}`, response.Body.String())
+			require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+			repository.DenseOrderingEnabled = true
+			require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+			require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+		})
+	}
+}
+
+func TestT15DenseReadinessNoPendingV2(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool}
+	require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	request := domain.DialogTeacherRequest{
+		EventID: uuid.NewString(), DialogID: uuid.NewString(), EventSequence: 1,
+		SourceMessageID: uuid.NewString(), SourceSequence: 1, StudentID: fixture.studentID,
+		PersonalTeacherID: fixture.teacherID, ContextType: domain.LearningContextGeneral,
+		SourceChannel: domain.DialogMessageChannelWeb, OccurredAt: time.Now().UTC(),
+	}
+	job, err := domain.NewTeacherDialogJob(request, time.Now().UTC())
+	require.NoError(t, err)
+	accepted, err := repository.Accept(context.Background(), job)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	before := t15ReadinessFacts(t, repository, fixture.teacherID)
+	require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+}
+
+func TestT15DenseReadinessDeliveredHistory(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	claimed, ok := claimDenseJob(t, repository, "t15-terminal-worker", time.Now().UTC())
+	require.True(t, ok)
+	decision, event := fixture.decision(uuid.NewString(), job.Request.EventID, domain.LearningContextGeneral, "", "", job.Request.DialogID)
+	require.NoError(t, repository.SaveGenerated(context.Background(), job.Request.EventID, claimed.ClaimToken, decision, event, "t15-delivered-response", uuid.NewString(), time.Now().UTC()))
+	require.NoError(t, repository.CompleteDelivery(context.Background(), job.Request.EventID, claimed.ClaimToken, uuid.NewString(), time.Now().UTC()))
+	before := t15ReadinessFacts(t, repository, fixture.teacherID)
+	repository.DenseOrderingEnabled = false
+	require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+}
+
+func TestT15DenseReadinessUnavailableRepository(t *testing.T) {
+	repository := TeacherDialogJobRepository{}
+	require.Error(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	response := httptest.NewRecorder()
+	t15ReadinessHandler(repository).Readyz(response, httptest.NewRequest(http.MethodGet, "/internal/readyz", nil))
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.JSONEq(t, `{"status":"not ready"}`, response.Body.String())
+}
+
+func TestT15DenseReadinessQueryFailuresStayClosed(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, repository.CheckDenseOrderingReadiness(ctx), context.Canceled)
+
+	// A separate read-only connection hides application tables through its
+	// search path; this verifies missing-table failure without schema mutation.
+	config := fixture.pool.Config()
+	config.ConnConfig.RuntimeParams["search_path"] = "pg_catalog"
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	repository.Pool = pool
+	err = repository.CheckDenseOrderingReadiness(context.Background())
+	var postgresError *pgconn.PgError
+	require.ErrorAs(t, err, &postgresError)
+	require.Equal(t, "42P01", postgresError.Code)
+	response := httptest.NewRecorder()
+	t15ReadinessHandler(repository).Readyz(response, httptest.NewRequest(http.MethodGet, "/internal/readyz", nil))
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.JSONEq(t, `{"status":"not ready"}`, response.Body.String())
+}
+
+// This is a synthetic HISTORICAL terminal table fixture using the existing
+// proof-backed persistence contract. It verifies only the readiness filter;
+// it does not prove Student effect absence or authorize skipping blocked work.
+func TestT15DenseReadinessSyntheticCompletedHistory(t *testing.T) {
+	fixture := newTeacherDecisionIntegrationFixture(t)
+	repository := TeacherDialogJobRepository{Pool: fixture.pool, DenseOrderingEnabled: true}
+	job := acceptDenseJob(t, repository, fixture, uuid.NewString(), 1)
+	claimed, ok := claimDenseJob(t, repository, "t15-synthetic-history-worker", time.Now().UTC())
+	require.True(t, ok)
+	now := time.Now().UTC()
+	proof := domain.TeacherDialogNoEffectProof{
+		ID: uuid.NewString(), SourceEventID: job.Request.EventID, TeacherJobID: claimed.TeacherJobID,
+		StudentCommandID: uuid.NewString(), RecordedAt: now,
+	}
+	outcome := domain.TeacherDialogRecoverableOutcome{
+		ID: uuid.NewString(), SourceEventID: job.Request.EventID, TeacherJobID: claimed.TeacherJobID,
+		TurnCorrelationID: job.Request.CorrelationID, CreatedAt: now,
+	}
+	require.NoError(t, repository.RecordFailedNoEffect(context.Background(), job.Request.EventID, claimed.ClaimToken, proof, outcome, "synthetic_historical_absence", now))
+	before := t15ReadinessFacts(t, repository, fixture.teacherID)
+	repository.DenseOrderingEnabled = false
+	require.NoError(t, repository.CheckDenseOrderingReadiness(context.Background()))
+	require.Equal(t, before, t15ReadinessFacts(t, repository, fixture.teacherID))
+}
+
+func t15ReadinessFacts(t *testing.T, repository TeacherDialogJobRepository, teacherID string) string {
+	t.Helper()
+	var facts string
+	require.NoError(t, repository.Pool.QueryRow(context.Background(), `
+SELECT json_build_object(
+    'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY j.event_id), '[]'::jsonb)
+             FROM teacher_dialog_job j WHERE personal_teacher_id=$1),
+    'cursors', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.dialog_id), '[]'::jsonb)
+                FROM teacher_dialog_turn_cursor c WHERE dialog_id IN
+                     (SELECT dialog_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)),
+    'proofs', (SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.source_event_id), '[]'::jsonb)
+               FROM teacher_dialog_turn_proof p WHERE source_event_id IN
+                    (SELECT event_id FROM teacher_dialog_job WHERE personal_teacher_id=$1)),
+    'outcomes', (SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY o.source_event_id), '[]'::jsonb)
+                 FROM teacher_dialog_turn_outcome o WHERE source_event_id IN
+                      (SELECT event_id FROM teacher_dialog_job WHERE personal_teacher_id=$1))
+)::text`, teacherID).Scan(&facts))
+	return facts
+}

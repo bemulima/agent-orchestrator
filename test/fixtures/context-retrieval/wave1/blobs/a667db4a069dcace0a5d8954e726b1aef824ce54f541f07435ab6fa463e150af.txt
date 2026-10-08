@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+class MigrationContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(__file__).resolve().parents[2]
+        self.migrations = self.root / "db/migrations"
+
+    def test_every_up_migration_has_a_down_pair(self) -> None:
+        up_names = {path.name.removesuffix(".up.sql") for path in self.migrations.glob("*.up.sql")}
+        down_names = {path.name.removesuffix(".down.sql") for path in self.migrations.glob("*.down.sql")}
+        self.assertEqual(up_names, down_names)
+
+    def test_task_migrations_exclude_macos_appledouble_files(self) -> None:
+        taskfile = (self.root / "Taskfile.yml").read_text(encoding="utf-8")
+        self.assertEqual(2, taskfile.count("! -name '._*'"))
+
+    def test_decision_and_outbox_integrity_contract(self) -> None:
+        sql = (self.migrations / "002_create_teacher_decision_outbox.up.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE teacher_decision", sql)
+        self.assertIn("CREATE TABLE teacher_outbox", sql)
+        self.assertIn("FOREIGN KEY (personal_teacher_id, student_id)", sql)
+        self.assertIn("payload ->> 'event_id' = event_id::TEXT", sql)
+        self.assertIn("payload ->> 'causation_id' = COALESCE(causation_id, '')", sql)
+
+    def test_outbox_rolls_back_before_decision_and_teacher_constraint(self) -> None:
+        sql = (self.migrations / "002_create_teacher_decision_outbox.down.sql").read_text(encoding="utf-8")
+        self.assertLess(sql.index("DROP TABLE teacher_outbox"), sql.index("DROP TABLE teacher_decision"))
+        self.assertLess(sql.index("DROP TABLE teacher_decision"), sql.index("ALTER TABLE personal_teacher"))
+
+    def test_learning_action_assistance_is_one_summary_per_action(self) -> None:
+        sql = (self.migrations / "003_create_learning_action_assistance.up.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE teacher_learning_action_assistance", sql)
+        self.assertIn("UNIQUE (student_id, learning_action_id)", sql)
+        self.assertIn("FOREIGN KEY (personal_teacher_id, student_id)", sql)
+        self.assertIn("jsonb_array_length(observations) BETWEEN 1 AND 100", sql)
+
+    def test_learning_action_closure_inbox_and_correlation_contract(self) -> None:
+        sql = (self.migrations / "004_consume_learning_action_closures.up.sql").read_text(encoding="utf-8")
+        self.assertIn("ADD COLUMN learning_action_id UUID", sql)
+        self.assertIn("CREATE TABLE teacher_integration_inbox", sql)
+        self.assertIn("UNIQUE (student_id, learning_action_id)", sql)
+        self.assertIn("correlation_id = learning_action_id::text", sql)
+        self.assertIn("jsonb_array_length(observations) BETWEEN 1 AND 300", sql)
+
+    def test_learning_action_closure_migration_is_reversible(self) -> None:
+        sql = (self.migrations / "004_consume_learning_action_closures.down.sql").read_text(encoding="utf-8")
+        self.assertLess(sql.index("DROP TABLE teacher_integration_inbox"), sql.index("DROP COLUMN learning_action_id"))
+
+    def test_teacher_dialog_job_is_durable_but_not_a_second_history(self) -> None:
+        sql = (self.migrations / "005_create_teacher_dialog_job.up.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE teacher_dialog_job", sql)
+        self.assertIn("UNIQUE (dialog_id, source_message_id)", sql)
+        self.assertIn("decision_id UUID REFERENCES teacher_decision(id) ON DELETE RESTRICT", sql)
+        self.assertIn("FOREIGN KEY (personal_teacher_id, student_id)", sql)
+        self.assertIn("claim_token IS NOT NULL AND locked_by IS NOT NULL AND locked_until IS NOT NULL", sql)
+        self.assertIn("response_body", sql)
+        self.assertIn("octet_length(response_body) <= 48000", sql)
+        self.assertIn("response_body IS NULL", sql)
+        for forbidden in ("dialog_messages", "student_context", "rendered_prompt", "raw_response"):
+            self.assertNotIn(forbidden, sql)
+
+    def test_teacher_dialog_job_migration_is_reversible(self) -> None:
+        sql = (self.migrations / "005_create_teacher_dialog_job.down.sql").read_text(encoding="utf-8")
+        self.assertIn("DROP TABLE teacher_dialog_job", sql)
+
+    def test_personal_teacher_soul_is_one_to_one_and_contains_no_student_state(self) -> None:
+        sql = (self.migrations / "006_create_personal_teacher_soul.up.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE personal_teacher_soul", sql)
+        self.assertIn("personal_teacher_id UUID PRIMARY KEY", sql)
+        self.assertIn("student_id TEXT NOT NULL UNIQUE", sql)
+        self.assertIn("FOREIGN KEY (personal_teacher_id, student_id)", sql)
+        self.assertIn("INSERT INTO personal_teacher_soul", sql)
+        for forbidden in ("mastery", "learning_path", "dialog_history", "student_context", "raw_event"):
+            self.assertNotIn(forbidden, sql)
+
+    def test_personal_teacher_soul_migration_is_reversible(self) -> None:
+        sql = (self.migrations / "006_create_personal_teacher_soul.down.sql").read_text(encoding="utf-8")
+        self.assertIn("DROP TABLE personal_teacher_soul", sql)
+
+    def test_teacher_decision_records_replaceable_pedagogy_identity(self) -> None:
+        sql = (self.migrations / "007_add_teacher_decision_pedagogy_metadata.up.sql").read_text(encoding="utf-8")
+        for column in ("pedagogy_method", "pedagogy_method_version", "pedagogy_stage"):
+            self.assertIn(f"ADD COLUMN {column}", sql)
+        self.assertIn("DEFAULT 'legacy'", sql)
+
+    def test_teacher_decision_pedagogy_migration_is_reversible(self) -> None:
+        sql = (self.migrations / "007_add_teacher_decision_pedagogy_metadata.down.sql").read_text(encoding="utf-8")
+        for column in ("pedagogy_method", "pedagogy_method_version", "pedagogy_stage"):
+            self.assertIn(f"DROP COLUMN {column}", sql)
+
+    def test_general_teacher_enablement_requeues_only_safe_blocked_jobs(self) -> None:
+        sql = (self.migrations / "008_enable_general_teacher_dialogs.up.sql").read_text(encoding="utf-8")
+        self.assertIn("context_type = 'general'", sql)
+        self.assertIn("status = 'blocked'", sql)
+        self.assertIn("error_code = 'unsupported_context'", sql)
+        self.assertIn("attempts = 0", sql)
+        self.assertIn("decision_id IS NULL", sql)
+
+    def test_general_teacher_disablement_fails_closed_after_processing(self) -> None:
+        sql = (self.migrations / "008_enable_general_teacher_dialogs.down.sql").read_text(encoding="utf-8")
+        self.assertIn("RAISE EXCEPTION", sql)
+        self.assertIn("cannot disable general teacher dialogs", sql)
+
+
+    def test_teacher_dialog_dense_turn_migration_is_fenced_and_reversible(self) -> None:
+        up = (self.migrations / "017_create_teacher_dialog_dense_turns.up.sql").read_text(encoding="utf-8")
+        down = (self.migrations / "017_create_teacher_dialog_dense_turns.down.sql").read_text(encoding="utf-8")
+        for required in (
+            "dialog_causation_id UUID",
+            "teacher_turn_schema_version",
+            "teacher_turn_sequence",
+            "UNIQUE (dialog_id, teacher_turn_sequence)",
+            "UNIQUE (teacher_job_id, event_id)",
+            "CREATE TABLE teacher_dialog_turn_cursor",
+            "CREATE TABLE teacher_dialog_turn_proof",
+            "CREATE TABLE teacher_dialog_turn_outcome",
+            "teacher_dialog_job_proof_fk",
+            "teacher_dialog_job_outcome_fk",
+            "turn_correlation_id UUID",
+            "FOREIGN KEY (teacher_job_id, source_event_id)",
+            "next_teacher_turn_sequence",
+        ):
+            self.assertIn(required, up)
+        self.assertIn("dialog_causation_id = canonical_student_message_id", up)
+        self.assertIn("causation_id = event_id", up)
+        self.assertIn("RAISE EXCEPTION", down)
+        self.assertIn("refusing migration 017 down", down)
+        self.assertLess(down.index("refusing migration 017 down"), down.index("DROP TABLE teacher_dialog_turn_outcome"))
+        self.assertLess(down.index("teacher_dialog_job_outcome_fk"), down.index("DROP TABLE teacher_dialog_turn_outcome"))
+        for column in (
+            "teacher_response_message_id",
+            "recoverable_outcome_id",
+            "no_effect_proof_id",
+            "dialog_causation_id",
+            "teacher_turn_sequence",
+            "teacher_turn_schema_version",
+            "teacher_job_id",
+        ):
+            self.assertIn(f"DROP COLUMN {column}", down)
+
+    def test_teacher_onboarding_canonical_actions_are_frozen_and_fail_closed(self) -> None:
+        up = (self.migrations / "018_teacher_onboarding_canonical_actions.up.sql").read_text(encoding="utf-8")
+        down = (self.migrations / "018_teacher_onboarding_canonical_actions.down.sql").read_text(encoding="utf-8")
+        for required in (
+            "execution_mode VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+            "canonical_message_command_id UUID",
+            "canonical_student_message_id UUID",
+            "execution_mode IN ('legacy', 'canonical')",
+            "status IN ('claimed', 'applied', 'completed', 'rejected', 'materialized')",
+            "status = 'materialized'",
+            "uq_teacher_onboarding_canonical_source_action",
+            "WHERE execution_mode = 'canonical';",
+        ):
+            self.assertIn(required, up)
+        self.assertIn("cannot remove canonical onboarding receipts after use", down)
+        self.assertIn("DROP COLUMN canonical_student_message_id", down)
+        self.assertIn("DROP COLUMN canonical_message_command_id", down)
+
+
+if __name__ == "__main__":
+    unittest.main()

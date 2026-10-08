@@ -1,0 +1,496 @@
+package teacherdialog
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/studentcontext"
+)
+
+type IDGenerator interface {
+	NewID() string
+}
+
+type PersonalTeacherReader interface {
+	Execute(ctx context.Context, studentID string) (domain.PersonalTeacher, error)
+}
+
+type PersonalTeacherSoulReader interface {
+	Execute(ctx context.Context, studentID string) (domain.TeacherSoul, error)
+}
+
+type StudentContextBuilder interface {
+	Execute(ctx context.Context, input studentcontext.BuildInput) (domain.StudentContext, error)
+}
+
+type TeacherPromptContextBuilder interface {
+	Build(ctx context.Context, dialog domain.DialogRequestContext, languageCode string, now time.Time) (domain.TeacherPromptDialogContext, error)
+}
+
+// UnifiedOnboardingCoordinator owns only the dark S5 branch. It receives a
+// durable claimed job; generic chat remains the Worker path when it returns
+// handled=false. A canonical action is never allowed to fall through there.
+type UnifiedOnboardingCoordinator interface {
+	Process(context.Context, domain.TeacherDialogJob) (bool, error)
+	NeedsDelivery(context.Context, domain.TeacherDialogJob) (bool, error)
+	Deliver(context.Context, domain.TeacherDialogJob) error
+}
+
+// Worker is a shared stateless orchestrator over fenced durable jobs. Private
+// context exists only for the duration of one processing attempt.
+type Worker struct {
+	Jobs                      repository.TeacherDialogJob
+	Teachers                  PersonalTeacherReader
+	Souls                     PersonalTeacherSoulReader
+	StudentContext            StudentContextBuilder
+	NextActions               repository.StudentNextActionReader
+	PromptContext             TeacherPromptContextBuilder
+	CourseLessons             repository.CourseLessonContextReader
+	AssignedLessons           repository.StudentAssignedLessonContextReader
+	DialogReader              repository.DialogRequestContextReader
+	DialogAppender            repository.DialogTeacherResponseAppender
+	Decisions                 repository.TeacherDecisionReader
+	Pedagogy                  PedagogyPlanner
+	Generator                 repository.TeacherResponseGenerator
+	ChannelDelivery           repository.TelegramDeliveryEnqueuer
+	PracticeAssistance        repository.PracticeTaskAssistanceRecorder
+	IDs                       IDGenerator
+	Clock                     Clock
+	WorkerID                  string
+	LeaseTTL                  time.Duration
+	LeaseRenewInterval        time.Duration
+	MaxAttempts               int
+	RetryBaseDelay            time.Duration
+	RetryMaxDelay             time.Duration
+	UnifiedCoordinatorEnabled bool
+	OnboardingCoordinator     UnifiedOnboardingCoordinator
+}
+
+func (worker Worker) ProcessNext(ctx context.Context) (bool, error) {
+	if err := worker.validate(); err != nil {
+		return false, err
+	}
+	now := worker.Clock.Now().UTC()
+	claimToken := worker.IDs.NewID()
+	job, claimed, err := worker.Jobs.Claim(ctx, repository.TeacherDialogClaim{
+		ClaimToken: claimToken, WorkerID: worker.WorkerID, Now: now, LockedUntil: now.Add(worker.LeaseTTL),
+	})
+	if err != nil || !claimed {
+		return claimed, err
+	}
+	if job.ResponseBody != "" {
+		// A durable S5 response is a recovery obligation, not a current feature
+		// decision. Never route it through legacy append after a flag rollback.
+		if job.CoordinatorMode != "legacy" {
+			if worker.OnboardingCoordinator == nil {
+				return true, worker.handleFailure(ctx, job, domain.TeacherDialogErrorDelivery, domain.ErrTeacherOnboardingUnavailable)
+			}
+			ready, readyErr := worker.OnboardingCoordinator.NeedsDelivery(ctx, job)
+			if readyErr != nil {
+				return true, worker.handleFailure(ctx, job, domain.TeacherDialogErrorDelivery, readyErr)
+			}
+			if !ready {
+				if _, err := worker.processCoordinatorWithLease(ctx, job); err != nil {
+					return true, worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, err)
+				}
+				return true, nil
+			}
+			if err := worker.withLease(ctx, job, func(runContext context.Context) error {
+				return worker.OnboardingCoordinator.Deliver(runContext, job)
+			}); err != nil {
+				return true, worker.handleFailure(ctx, job, domain.TeacherDialogErrorDelivery, err)
+			}
+			return true, nil
+		}
+		if err := worker.deliver(ctx, job); err != nil {
+			return true, worker.handleFailure(ctx, job, domain.TeacherDialogErrorDelivery, err)
+		}
+		return true, nil
+	}
+	if err := worker.generateAndDeliver(ctx, job); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (worker Worker) generateAndDeliver(ctx context.Context, job domain.TeacherDialogJob) error {
+	request := job.Request
+	if worker.UnifiedCoordinatorEnabled || job.CoordinatorMode != "legacy" {
+		if worker.OnboardingCoordinator == nil {
+			return worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, domain.ErrTeacherOnboardingUnavailable)
+		}
+		handled, err := worker.processCoordinatorWithLease(ctx, job)
+		if handled {
+			if err != nil {
+				return worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, err)
+			}
+			return nil
+		}
+	}
+	// S2 safety gate: canonical UI actions are materialized by Dialog and must
+	// never fall through the generic LLM path before S5 enables coordination.
+	if request.ActionReceiptID != "" {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorUnsupportedContext, domain.ErrTeacherDialogCanonicalActionBlocked)
+	}
+	teacher, err := worker.Teachers.Execute(ctx, request.StudentID)
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorTeacherIdentity, err)
+	}
+	if teacher.ID != request.PersonalTeacherID || teacher.StudentID != request.StudentID {
+		return worker.handleFailure(
+			ctx, job, domain.TeacherDialogErrorTeacherIdentity, domain.ErrInvalidTeacherDialogJob,
+		)
+	}
+	soul, err := worker.Souls.Execute(ctx, request.StudentID)
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorTeacherIdentity, err)
+	}
+	soul, err = domain.NormalizeTeacherSoul(soul)
+	if err != nil || soul.PersonalTeacherID != teacher.ID || soul.StudentID != teacher.StudentID {
+		return worker.handleFailure(
+			ctx, job, domain.TeacherDialogErrorTeacherIdentity, domain.ErrInvalidTeacherDialogJob,
+		)
+	}
+	dialogContext, err := worker.DialogReader.GetTeacherRequestContext(ctx, request, 49)
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, err)
+	}
+	if dialogContext.Messages[len(dialogContext.Messages)-1].Channel != request.SourceChannel {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, domain.ErrInvalidDialogContext)
+	}
+	if request.ContextType == domain.LearningContextGeneral && asksNextAction(dialogContext.Messages[len(dialogContext.Messages)-1].Body) {
+		return worker.answerNextAction(ctx, job, teacher)
+	}
+	languageCode := supportedTeacherLanguage(teacher.Language)
+	promptContext, err := worker.PromptContext.Build(ctx, dialogContext, languageCode, worker.Clock.Now().UTC())
+	if err != nil {
+		code := domain.TeacherDialogErrorDialogContext
+		if errors.Is(err, domain.ErrTeacherContextSourceTooLarge) {
+			code = domain.TeacherDialogErrorContextBudget
+		}
+		return worker.handleFailure(ctx, job, code, err)
+	}
+	studentContext, err := worker.StudentContext.Execute(ctx, studentcontext.BuildInput{
+		StudentID: request.StudentID, LearningActionID: request.LearningActionID,
+		ContextType: request.ContextType, ContextID: request.ContextID,
+	})
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorStudentContext, err)
+	}
+	practiceStepID := ""
+	if request.ContextType == domain.LearningContextPracticeTask || request.ContextType == domain.LearningContextProject {
+		if studentContext.PracticeTask == nil || strings.TrimSpace(studentContext.PracticeTask.Step.ID) == "" {
+			return worker.handleFailure(ctx, job, domain.TeacherDialogErrorStudentContext, domain.ErrInvalidStudentContext)
+		}
+		practiceStepID = studentContext.PracticeTask.Step.ID
+	}
+	var lessonContext *domain.LessonTeachingContext
+	if request.ContextType == domain.LearningContextLesson {
+
+		source := dialogContext.Messages[len(dialogContext.Messages)-1]
+		normalized, normalizeErr := domain.NormalizeCurrentLessonMessageContext(source.LessonContext)
+		if normalizeErr != nil {
+			return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, normalizeErr)
+		}
+		var verified domain.LessonTeachingContext
+		var verifyErr error
+		if normalized.Schema == domain.LessonMessageContextSchemaVersionV2 {
+			if worker.AssignedLessons == nil {
+				return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, domain.ErrLessonContextUnavailable)
+			}
+			content, contentErr := worker.AssignedLessons.GetAssignedLessonContext(ctx, request.StudentID, normalized.LearningPathID, normalized.LearningPathItemID)
+			if contentErr != nil {
+				return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, contentErr)
+			}
+			verified, verifyErr = domain.VerifyAssignedLessonContext(request.StudentID, request.ContextID, normalized, content)
+		} else {
+			if worker.CourseLessons == nil {
+				return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, domain.ErrLessonContextUnavailable)
+			}
+			content, contentErr := worker.CourseLessons.GetLessonContext(ctx, request.ContextID, teacher.Language)
+			if contentErr != nil {
+				return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, contentErr)
+			}
+			verified, verifyErr = domain.VerifyLessonContext(request.ContextID, normalized, content)
+		}
+		if verifyErr != nil {
+			return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDialogContext, verifyErr)
+		}
+
+		lessonContext = &verified
+	}
+	var decisions []domain.TeacherDecision
+	if request.LearningActionID != "" {
+		decisions, err = worker.Decisions.ListByLearningAction(ctx, request.StudentID, request.LearningActionID)
+		if err != nil {
+			return worker.handleFailure(ctx, job, domain.TeacherDialogErrorPersistence, err)
+		}
+	}
+	plan, err := worker.Pedagogy.Plan(teacher, request, studentContext, dialogContext, decisions)
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorStudentContext, err)
+	}
+	generationRequest, err := domain.NewTeacherGenerationRequest(domain.TeacherGenerationRequest{
+		IdempotencyKey: request.EventID, LanguageCode: languageCode, Teacher: teacher,
+		Soul: soul, Plan: plan, Student: studentContext, Dialog: dialogContext, PromptContext: promptContext, Lesson: lessonContext,
+	})
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, err)
+	}
+	generated, err := worker.generateWithLease(ctx, job, generationRequest)
+	if errors.Is(err, domain.ErrTeacherGenerationConflict) {
+		generated, err = worker.Generator.Replay(ctx, request.EventID)
+	}
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, err)
+	}
+	generated, err = domain.NewTeacherGeneratedResponse(generated)
+	if err != nil || generated.IdempotencyKey != request.EventID || generated.LanguageCode != languageCode ||
+		!generated.ExpiresAt.After(worker.Clock.Now().UTC()) {
+		if err == nil {
+			err = domain.ErrInvalidTeacherGeneration
+		}
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorGeneration, err)
+	}
+	now := worker.Clock.Now().UTC()
+	var hintLevel *int
+	if plan.Action == domain.TeacherActionGiveHint {
+		value := plan.HintLevel
+		hintLevel = &value
+	}
+	correlationID := request.LearningActionID
+	if correlationID == "" {
+		correlationID = request.DialogID
+	}
+	decision, err := domain.NewTeacherDecision(domain.TeacherDecision{
+		ID: worker.IDs.NewID(), PersonalTeacherID: teacher.ID, StudentID: request.StudentID,
+		CorrelationID: correlationID, CausationID: request.EventID,
+		LearningActionID: request.LearningActionID, TeachingMode: plan.TeachingMode,
+		ContextType: request.ContextType, ContextID: request.ContextID, PracticeStepID: practiceStepID, Strategy: plan.Strategy,
+		PedagogyMethod: plan.MethodCode, PedagogyVersion: plan.MethodVersion, PedagogyStage: plan.Stage,
+		Action: plan.Action, HintLevel: hintLevel, ReasonCode: plan.ReasonCode,
+		ReasonSummary: plan.ReasonSummary, PolicyVersion: plan.PolicyVersion, CreatedAt: now,
+	})
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorPersistence, err)
+	}
+	event, err := domain.NewIntegrationEvent(
+		worker.IDs.NewID(), domain.SubjectTeacherDecisionRecorded, decision.CorrelationID,
+		decision.CausationID, decision.StudentID, decision.CreatedAt,
+		domain.TeacherDecisionRecordedSchemaVersion, decision,
+	)
+	if err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorPersistence, err)
+	}
+	if err := worker.Jobs.SaveGenerated(
+		ctx, request.EventID, job.ClaimToken, decision, event, generated.Body, generated.ExecutionID, now,
+	); err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorPersistence, err)
+	}
+	job.DecisionID = decision.ID
+	job.ResponseBody = generated.Body
+	if err := worker.deliver(ctx, job); err != nil {
+		return worker.handleFailure(ctx, job, domain.TeacherDialogErrorDelivery, err)
+	}
+	return nil
+}
+
+func (worker Worker) processCoordinatorWithLease(ctx context.Context, job domain.TeacherDialogJob) (bool, error) {
+	var handled bool
+	err := worker.withLease(ctx, job, func(runContext context.Context) error {
+		var processErr error
+		handled, processErr = worker.OnboardingCoordinator.Process(runContext, job)
+		return processErr
+	})
+	return handled, err
+}
+
+func (worker Worker) deliver(ctx context.Context, job domain.TeacherDialogJob) error {
+	if (job.Request.ContextType == domain.LearningContextPracticeTask || job.Request.ContextType == domain.LearningContextProject) && worker.PracticeAssistance != nil {
+		decisions, err := worker.Decisions.ListByLearningAction(ctx, job.Request.StudentID, job.Request.LearningActionID)
+		if err != nil {
+			return err
+		}
+		var decision *domain.TeacherDecision
+		for index := range decisions {
+			if decisions[index].ID == job.DecisionID {
+				decision = &decisions[index]
+				break
+			}
+		}
+		if decision == nil {
+			return domain.ErrInvalidTeacherDialogJob
+		}
+		if err := worker.PracticeAssistance.RecordPracticeTaskAssistance(
+			ctx, job.Request.ContextID, job.Request.StudentID, decision.PracticeStepID, decision.ID, decision.Action, decision.HintLevel,
+		); err != nil {
+			return err
+		}
+	}
+	message, err := worker.DialogAppender.AppendTeacherResponse(
+		ctx, job.Request, job.Request.EventID, job.ResponseBody,
+	)
+	if err != nil {
+		return err
+	}
+	message, err = domain.NewDialogTeacherResponse(job.Request, message)
+	if err != nil || message.Body != job.ResponseBody || message.Channel != job.Request.SourceChannel {
+		return domain.ErrInvalidDialogContext
+	}
+	if job.Request.SourceChannel == domain.DialogMessageChannelTelegram {
+		if worker.ChannelDelivery == nil {
+			return domain.ErrTelegramUnavailable
+		}
+		if err := worker.ChannelDelivery.EnqueueDelivery(
+			ctx, job.Request.SourceMessageID, job.Request.StudentID, job.ResponseBody, worker.Clock.Now().UTC(),
+		); err != nil {
+			return err
+		}
+	}
+	return worker.Jobs.CompleteDelivery(
+		ctx, job.Request.EventID, job.ClaimToken, message.ID, worker.Clock.Now().UTC(),
+	)
+}
+
+func (worker Worker) generateWithLease(
+	ctx context.Context,
+	job domain.TeacherDialogJob,
+	request domain.TeacherGenerationRequest,
+) (domain.TeacherGeneratedResponse, error) {
+	var generated domain.TeacherGeneratedResponse
+	err := worker.withLease(ctx, job, func(runContext context.Context) error {
+		response, generateErr := worker.Generator.Generate(runContext, request)
+		generated = response
+		return generateErr
+	})
+	return generated, err
+}
+
+// withLease protects every potentially slow coordinator boundary (AI Prompt,
+// Student and Dialog), not only legacy generation. A renew failure cancels
+// the in-flight call so an unfenced worker cannot continue staging effects.
+func (worker Worker) withLease(ctx context.Context, job domain.TeacherDialogJob, run func(context.Context) error) error {
+	if worker.LeaseRenewInterval <= 0 {
+		return run(ctx)
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	renewalDone := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(worker.LeaseRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runContext.Done():
+				renewalDone <- nil
+				return
+			case now := <-ticker.C:
+				if err := worker.Jobs.RenewLease(runContext, job.Request.EventID, job.ClaimToken, now.UTC(), now.UTC().Add(worker.LeaseTTL)); err != nil {
+					cancel()
+					renewalDone <- err
+					return
+				}
+			}
+		}
+	}()
+	runErr := run(runContext)
+	cancel()
+	renewalErr := <-renewalDone
+	if runErr != nil {
+		return runErr
+	}
+	if renewalErr != nil {
+		return renewalErr
+	}
+	return nil
+}
+
+func (worker Worker) handleFailure(
+	ctx context.Context,
+	job domain.TeacherDialogJob,
+	errorCode string,
+	cause error,
+) error {
+	now := worker.Clock.Now().UTC()
+	var stateErr error
+	if permanentTeacherDialogFailure(cause) {
+		stateErr = worker.Jobs.Block(ctx, job.Request.EventID, job.ClaimToken, errorCode, now)
+	} else if worker.MaxAttempts > 0 && job.Attempts >= worker.MaxAttempts {
+		stateErr = worker.Jobs.MarkReconciliation(ctx, job.Request.EventID, job.ClaimToken, domain.TeacherTurnUnknown, errorCode, now)
+	} else {
+		stateErr = worker.Jobs.Retry(
+			ctx, job.Request.EventID, job.ClaimToken, errorCode,
+			now.Add(worker.retryDelay(job.Attempts)), now,
+		)
+	}
+	if stateErr != nil {
+		return errors.Join(cause, fmt.Errorf("update teacher dialog job state: %w", stateErr))
+	}
+	return cause
+}
+
+func (worker Worker) retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := worker.RetryBaseDelay
+	for current := 1; current < attempt && delay < worker.RetryMaxDelay; current++ {
+		if delay > worker.RetryMaxDelay/2 {
+			return worker.RetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > worker.RetryMaxDelay {
+		return worker.RetryMaxDelay
+	}
+	return delay
+}
+
+func (worker Worker) validate() error {
+	if worker.Jobs == nil || worker.Teachers == nil || worker.Souls == nil || worker.StudentContext == nil ||
+		worker.PromptContext == nil || worker.DialogReader == nil || worker.DialogAppender == nil || worker.Decisions == nil ||
+		worker.Pedagogy == nil || worker.Generator == nil || worker.IDs == nil || worker.Clock == nil ||
+		strings.TrimSpace(worker.WorkerID) == "" || worker.LeaseTTL <= 0 || worker.LeaseRenewInterval <= 0 || worker.LeaseRenewInterval*2 >= worker.LeaseTTL || worker.MaxAttempts < 1 || worker.RetryBaseDelay <= 0 ||
+		worker.RetryMaxDelay < worker.RetryBaseDelay {
+		return errors.New("invalid teacher dialog worker configuration")
+	}
+	if worker.UnifiedCoordinatorEnabled && worker.OnboardingCoordinator == nil {
+		return errors.New("unified onboarding coordinator is required when enabled")
+	}
+	return nil
+}
+
+func permanentTeacherDialogFailure(err error) bool {
+	return errors.Is(err, domain.ErrInvalidTeacherDialogJob) ||
+		errors.Is(err, domain.ErrPersonalTeacherNotFound) ||
+		errors.Is(err, domain.ErrTeacherSoulNotFound) ||
+		errors.Is(err, domain.ErrInvalidDialogContext) ||
+		errors.Is(err, domain.ErrDialogRequestNotFound) ||
+		errors.Is(err, domain.ErrInvalidStudentContext) ||
+		errors.Is(err, domain.ErrStudentContextNotFound) ||
+		errors.Is(err, domain.ErrLearningActionClosed) ||
+		errors.Is(err, domain.ErrInvalidTeacherGeneration) ||
+		errors.Is(err, domain.ErrTeacherOnboardingConflict) ||
+		errors.Is(err, domain.ErrInvalidTeacherOnboardingSemantic) ||
+		errors.Is(err, domain.ErrTeacherOnboardingSemanticConflict) ||
+		errors.Is(err, domain.ErrTeacherOnboardingSemanticCapabilityDisabled) ||
+		errors.Is(err, domain.ErrInvalidLessonContext) ||
+		errors.Is(err, domain.ErrTeacherContextSourceTooLarge) ||
+		errors.Is(err, domain.ErrLessonContextNotFound)
+}
+
+func supportedTeacherLanguage(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if separator := strings.IndexAny(normalized, "-_"); separator >= 0 {
+		normalized = normalized[:separator]
+	}
+	if normalized == "en" || normalized == "ru" {
+		return normalized
+	}
+	return domain.DefaultLanguage
+}

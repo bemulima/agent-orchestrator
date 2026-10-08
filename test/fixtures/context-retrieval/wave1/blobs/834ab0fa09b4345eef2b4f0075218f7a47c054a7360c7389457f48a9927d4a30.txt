@@ -1,0 +1,382 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Fixture writes below create explicitly named owner metadata only. They are
+// not evidence-ingestion, Runtime-state, or quality/stability-policy proofs.
+func TestT201PlanningSnapshotPostgresConsistency(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("STUDENT_T201_PLANNING_SNAPSHOT_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("STUDENT_T201_PLANNING_SNAPSHOT_DATABASE_URL not configured")
+	}
+	cfg, e := pgxpool.ParseConfig(dsn)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if cfg.ConnConfig.Host != "127.0.0.1" || (cfg.ConnConfig.Port != 58998 && cfg.ConnConfig.Port != 58999) || cfg.ConnConfig.Database != "remediation_t201_student_integration_proof" {
+		t.Fatal("T20.1 requires the exact new isolated database at127.0.0.1:58998 (container) or 58999 (owned native proof)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pool.Close()
+	if e = pool.Ping(ctx); e != nil {
+		t.Fatal(e)
+	}
+	f := newT201PlanningSnapshotFixture(t, ctx, pool)
+	repo := &LearningJourneyRepoPG{Pool: pool}
+	request := domain.PlanningSnapshotRequest{Targets: f.Targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "owner_metadata_fixture", Reason: "T201_read_consistency"}}
+	read := func() domain.StudentPlanningSnapshot {
+		t.Helper()
+		source, e := repo.ReadPlanningSnapshot(ctx, f.StudentID, f.PathID, request.Targets)
+		if e != nil {
+			t.Fatal(e)
+		}
+		out, e := domain.BuildStudentPlanningSnapshot(source, request)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return out
+	}
+	before := t201SnapshotRowsSignature(t, ctx, pool, f)
+	base := read()
+	same := read()
+	after := t201SnapshotRowsSignature(t, ctx, pool, f)
+	if before != after {
+		t.Fatal("read mutated owned rows/xmin")
+	}
+	if base.References != same.References {
+		t.Fatal("identical read changed applicability")
+	}
+	if len(base.Evidence) != 3 || len(base.Mastery) != 3 || base.Mastery[2].State != domain.TargetMasteryUnknown {
+		t.Fatalf("requested offpath evidence/UNKNOWN projection incomplete: %+v", base.Mastery)
+	}
+	if base.Path.Items[0].Status != domain.LearningPathItemCompleted || base.Path.Items[1].Status != domain.LearningPathItemInProgress || len(base.PracticeBindings) != 1 || len(base.CourseBindings) != 1 || len(base.ActivityFacts) != 1 {
+		t.Fatal("protected items or local associations were lost")
+	}
+	raw, _ := json.Marshal(base)
+	for _, canary := range []string{"T201_PRIVATE_LESSON_CANARY", "T201_PRIVATE_ANSWER_CANARY", "T201_PRIVATE_GOAL_CANARY", "workspace_digest", "lesson_content", "answer_payload", "quality_score"} {
+		if strings.Contains(string(raw), canary) {
+			t.Fatalf("private canary leaked: %s", canary)
+		}
+	}
+	for _, signal := range []domain.PlanningSnapshotUnavailable{base.Availability.EvidenceQuality, base.Availability.Stability} {
+		if signal.Status != "DERIVED_BY_PLANNER" || signal.Value != nil || signal.ReasonCode != "PLANNER_POLICY_HYBRID_V1" {
+			t.Fatal("Planner quality/stability ownership missing")
+		}
+	}
+	for _, evidence := range base.Evidence {
+		if evidence.SourceKind == "practice_v2" && evidence.SurfaceClassification != "practice" {
+			t.Fatal("frozen Practice surface missing")
+		}
+		if evidence.SourceKind != "practice_v2" && evidence.SurfaceClassification != "" {
+			t.Fatal("source surface was inferred")
+		}
+	}
+	if base.Availability.EvidenceQuality.Value != nil || base.Availability.Stability.Value != nil || base.Availability.AutomaticAdaptation.Value != nil || base.Availability.RuntimeHold.Value != nil {
+		t.Fatal("unavailable hybrid semantics fabricated a value")
+	}
+	t.Run("one_read_snapshot_across_atomic_owner_change", func(t *testing.T) {
+		tracer := &t201SnapshotBarrier{PathID: f.PathID, Seen: make(chan struct{}), Release: make(chan struct{})}
+		tracedCfg := cfg.Copy()
+		tracedCfg.ConnConfig.Tracer = tracer
+		traced, e := pgxpool.NewWithConfig(ctx, tracedCfg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer traced.Close()
+		tracedRepo := &LearningJourneyRepoPG{Pool: traced}
+		type observation struct {
+			s domain.PlanningSnapshotSource
+			e error
+		}
+		done := make(chan observation, 1)
+		go func() {
+			s, e := tracedRepo.ReadPlanningSnapshot(ctx, f.StudentID, f.PathID, f.Targets)
+			done <- observation{s, e}
+		}()
+		select {
+		case <-tracer.Seen:
+		case <-ctx.Done():
+			t.Fatal("consistent reader never reached first owned path read")
+		}
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			close(tracer.Release)
+			t.Fatal(e)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		for _, query := range []string{`UPDATE student_onboarding SET version=2,weekly_minutes=120,goal_code='go.backend',updated_at=clock_timestamp() WHERE student_id=$1`, `UPDATE student_learning_path SET version=2,updated_at=clock_timestamp() WHERE student_id=$1`, `UPDATE student_learning_context SET version=2,updated_at=clock_timestamp() WHERE student_id=$1`} {
+			if _, e = tx.Exec(ctx, query, f.StudentID); e != nil {
+				close(tracer.Release)
+				t.Fatal(e)
+			}
+		}
+		insertT201OrdinaryMetadataEvidence(t, ctx, tx, f.StudentID, f.Targets[1], f.Now.Add(time.Second))
+		if _, e = tx.Exec(ctx, `UPDATE student_target_mastery SET independent_success_count=2,evidence_count=2,confidence=.5,last_seen_at=$2,updated_at=clock_timestamp() WHERE student_id=$1 AND target_key=$3`, f.StudentID, f.Now.Add(time.Second), f.Targets[1].Key); e != nil {
+			close(tracer.Release)
+			t.Fatal(e)
+		}
+		if e = tx.Commit(ctx); e != nil {
+			close(tracer.Release)
+			t.Fatal(e)
+		}
+		close(tracer.Release)
+		old := <-done
+		if old.e != nil {
+			t.Fatal(old.e)
+		}
+		if old.s.Path.Version != 1 || old.s.Context.Version != 1 || old.s.Profile.Version != 1 || old.s.Profile.WeeklyMinutes != 60 || old.s.Mastery[1].EvidenceCount != 1 || len(old.s.Evidence) != 3 {
+			t.Fatal("reader mixed precommit and postcommit owner facts")
+		}
+		if tracer.Isolation != "repeatable read" || tracer.ReadOnly != "on" {
+			t.Fatalf("actual transaction mode:%s/%s", tracer.Isolation, tracer.ReadOnly)
+		}
+		oldDTO, e := domain.BuildStudentPlanningSnapshot(old.s, request)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if oldDTO.References != base.References {
+			t.Fatal("old coherent applicability was not preserved")
+		}
+		fresh := read()
+		if fresh.Profile.OwnerVersion != 2 || fresh.Path.Version != 2 || fresh.Path.JourneyVersion != 2 || fresh.Mastery[1].EvidenceCount != 2 || len(fresh.Evidence) != 4 {
+			t.Fatal("fresh read failed to see complete committed owner transaction")
+		}
+		if fresh.References.SnapshotRef == base.References.SnapshotRef || fresh.References.MasteryRef == base.References.MasteryRef || fresh.References.GoalRef == base.References.GoalRef || fresh.References.ConstraintsRef == base.References.ConstraintsRef {
+			t.Fatal("applicable owner changes did not change references")
+		}
+	})
+	t.Run("protected_answer_status_changes_reference", func(t *testing.T) {
+		prior := read()
+		if _, e = pool.Exec(ctx, `UPDATE student_task_answer SET status=2,updated_at=clock_timestamp() WHERE id=$1`, f.OpenAnswerID); e != nil {
+			t.Fatal(e)
+		}
+		next := read()
+		if prior.References.SnapshotRef == next.References.SnapshotRef || prior.References.MasteryRef != next.References.MasteryRef {
+			t.Fatal("UNDER_REVIEW binding change missing or polluted mastery reference")
+		}
+	})
+	t.Run("capture_trigger_cosmetic_time_and_target_order_stable", func(t *testing.T) {
+		prior := read()
+		if _, e = pool.Exec(ctx, `UPDATE student_onboarding SET updated_at=clock_timestamp() WHERE student_id=$1`, f.StudentID); e != nil {
+			t.Fatal(e)
+		}
+		request.TriggerContext.Reason = "another_trace"
+		request.Targets = []domain.LearningTargetRef{f.Targets[2], f.Targets[0], f.Targets[1]}
+		next := read()
+		if prior.References != next.References {
+			t.Fatal("cosmetic observation changed applicability")
+		}
+	})
+	t.Run("foreign_path_and_transient_error_fail_closed", func(t *testing.T) {
+		if _, e = repo.ReadPlanningSnapshot(ctx, uuid.NewString(), f.PathID, f.Targets); !errors.Is(e, domain.ErrNotFound) {
+			t.Fatalf("foreign path: %v", e)
+		}
+		canceled, stop := context.WithCancel(ctx)
+		stop()
+		if _, e = repo.ReadPlanningSnapshot(canceled, f.StudentID, f.PathID, f.Targets); e == nil || errors.Is(e, domain.ErrValidation) || errors.Is(e, domain.ErrNotFound) {
+			t.Fatalf("read failure was converted to a valid/validation result:%v", e)
+		}
+	})
+	t.Run("dangling_protected_binding_fails_closed", func(t *testing.T) {
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		// Corrupt only mutable current requirements in a private test transaction;
+		// use the adapter helper against that same snapshot, then roll it back.
+		if _, e = tx.Exec(ctx, `UPDATE student_learning_path_item SET frozen_requirements=$2 WHERE id=$1`, f.ActiveItemID, string(t201JSON(t, []domain.LessonRequirement{f.TaskRequirement}))); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = readPlanningSnapshotSource(ctx, tx, f.StudentID, f.PathID, f.Targets); !errors.Is(e, domain.ErrValidation) {
+			t.Fatalf("dangling OPEN Practice work silently lost: %v", e)
+		}
+	})
+	finalBefore := t201SnapshotRowsSignature(t, ctx, pool, f)
+	_ = read()
+	finalAfter := t201SnapshotRowsSignature(t, ctx, pool, f)
+	if finalBefore != finalAfter {
+		t.Fatal("final repeat read mutated owner state")
+	}
+}
+
+type t201PlanningSnapshotFixture struct {
+	StudentID, PathID, ActiveItemID, OpenAnswerID string
+	Targets                                       []domain.LearningTargetRef
+	TaskRequirement                               domain.LessonRequirement
+	Now                                           time.Time
+}
+type t201FixtureExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func newT201PlanningSnapshotFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) t201PlanningSnapshotFixture {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	f := t201PlanningSnapshotFixture{StudentID: uuid.NewString(), PathID: uuid.NewString(), ActiveItemID: uuid.NewString(), OpenAnswerID: uuid.NewString(), Now: now, Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "t201.a-route", Version: "v1"}, {Type: domain.LearningTargetConcept, Key: "t201.b-offpath", Version: "v1"}, {Type: domain.LearningTargetConcept, Key: "t201.c-unknown"}}}
+	profile := domain.StudentOnboarding{StudentID: f.StudentID, DirectionCode: "backend", SelfAssessedExperience: "beginner", DesiredStacks: []string{"go"}, GoalCode: "learn_programming", GoalText: "T201_PRIVATE_GOAL_CANARY", PreferredLanguage: "en", WeeklyMinutes: 60, PreferredPace: "standard", ProfileVersion: domain.StudentOnboardingProfileVersion, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if _, e := (&StudentOnboardingRepoPG{Pool: pool}).Save(ctx, profile, 0); e != nil {
+		t.Fatal(e)
+	}
+	completeItem := uuid.NewString()
+	theoryID := uuid.NewString()
+	theory := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "theory_acknowledged", Required: true, SourceReference: domain.LessonSourceReference{ID: theoryID}, Satisfied: true}
+	practiceRevision := uuid.NewString()
+	practice := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "practice_completed", Required: true, SourceReference: domain.LessonSourceReference{ID: practiceRevision, RevisionID: practiceRevision}}
+	taskID := uuid.NewString()
+	f.TaskRequirement = domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "task_passed", Required: true, SourceReference: domain.LessonSourceReference{ID: taskID, RevisionID: uuid.NewString()}}
+	path := domain.StudentLearningPath{ID: f.PathID, StudentID: f.StudentID, CourseID: uuid.NewString(), GoalCode: "go.backend", CourseFingerprint: strings.Repeat("a", 64), PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "T201 owner metadata fixture", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ID: completeItem, LessonRevisionID: uuid.NewString(), LessonContent: json.RawMessage(`{"canary":"T201_PRIVATE_LESSON_CANARY"}`), ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemCompleted, Targets: []domain.LearningTargetRef{f.Targets[0]}, ReasonCode: "initial_plan", FrozenRequirements: []domain.LessonRequirement{theory}}, {ID: f.ActiveItemID, LessonRevisionID: uuid.NewString(), LessonContent: json.RawMessage(`{"canary":"T201_PRIVATE_LESSON_CANARY"}`), ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 1, Status: domain.LearningPathItemInProgress, Targets: []domain.LearningTargetRef{f.Targets[0]}, ReasonCode: "initial_plan", FrozenRequirements: []domain.LessonRequirement{practice, f.TaskRequirement}}}}
+	if _, e := (&LearningJourneyRepoPG{Pool: pool}).ReplaceLearningPath(ctx, path, 0); e != nil {
+		t.Fatal(e)
+	}
+	tx, e := pool.Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	t201Exec(t, ctx, tx, `INSERT INTO student_lesson_activity_fact(source_type,fact_id,student_id,item_id,requirement_id,request_hash,occurred_at) VALUES('theory_acknowledged',$1,$2,$3,$4,$5,$6)`, uuid.NewString(), f.StudentID, completeItem, theory.ID, "sha256:"+strings.Repeat("a", 64), now)
+	t201Exec(t, ctx, tx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt,learning_path_item_id,requirement_id,frozen_task_json,answer_payload) VALUES($1,$2,$3,$4,1,1,$5,$6,'{"canary":"T201_PRIVATE_ANSWER_CANARY"}','{"canary":"T201_PRIVATE_ANSWER_CANARY"}')`, f.OpenAnswerID, f.StudentID, taskID, now, f.ActiveItemID, f.TaskRequirement.ID)
+	t201Exec(t, ctx, tx, `INSERT INTO student_learning_action(id,student_task_answer_id,student_id,task_id,cycle,context_type,context_id,learning_targets,opened_at,source_kind,lifecycle_status,learning_path_item_id,requirement_id) VALUES($1,$2,$3,$4::uuid,1,'lesson_task',$4::uuid::text,$5::jsonb,$6,'course_answer','OPEN',$7,$8)`, uuid.NewString(), f.OpenAnswerID, f.StudentID, taskID, string(t201JSON(t, []domain.LearningTargetRef{f.Targets[0]})), now, f.ActiveItemID, f.TaskRequirement.ID)
+	insertT201OrdinaryMetadataEvidence(t, ctx, tx, f.StudentID, f.Targets[1], now)
+	legacyEvidence := uuid.NewString()
+	legacyInstance := uuid.NewString()
+	legacyRevision := uuid.NewString()
+	t201Exec(t, ctx, tx, `INSERT INTO student_practice_evidence_receipt(evidence_id,student_id,task_instance_id,task_revision_id,submission_id,request_hash,outcome,assistance_policy_version,hints_used,teacher_assistance_used,occurred_at,policy_version) VALUES($1,$2,$3,$4,$1,$5,'passed','teacher-assistance-v1',0,false,$6,'practice-competency-evidence-v1')`, legacyEvidence, f.StudentID, legacyInstance, legacyRevision, "sha256:"+strings.Repeat("a", 64), now)
+	t201Exec(t, ctx, tx, `INSERT INTO student_practice_target_evidence(evidence_id,student_id,task_instance_id,target_type,target_key,target_version,correctness,independence,confidence,step_ids,support_context,evidence_kind,occurred_at) VALUES($1,$2,$3,$4,$5,$6,1,1,1,'["metadata-step"]','independent','independent_application',$7)`, legacyEvidence, f.StudentID, legacyInstance, f.Targets[0].Type, f.Targets[0].Key, f.Targets[0].Version, now)
+	closedAction := uuid.NewString()
+	closedInstance := uuid.NewString()
+	closedRevision := uuid.NewString()
+	v2Evidence := uuid.NewString()
+	insertT201PracticeBinding(t, ctx, tx, f.StudentID, closedAction, closedInstance, closedRevision, "", "", "", 0, 0, "CLOSED", f.Targets[0], now)
+	t201Exec(t, ctx, tx, `INSERT INTO student_practice_evidence_receipt(evidence_id,student_id,task_instance_id,task_revision_id,submission_id,request_hash,outcome,assistance_policy_version,hints_used,teacher_assistance_used,occurred_at,policy_version,learning_action_id,task_revision_digest,workspace_digest) VALUES($1,$2,$3,$4,$1,$5,'passed','teacher-assistance-v1',0,false,$6,'practice-competency-evidence-v2',$7,$5,$5)`, v2Evidence, f.StudentID, closedInstance, closedRevision, "sha256:"+strings.Repeat("a", 64), now, closedAction)
+	t201Exec(t, ctx, tx, `INSERT INTO student_practice_target_evidence(evidence_id,student_id,task_instance_id,target_type,target_key,target_version,correctness,independence,confidence,step_ids,support_context,evidence_kind,occurred_at) VALUES($1,$2,$3,$4,$5,$6,1,1,1,'["metadata-step"]','independent','independent_application',$7)`, v2Evidence, f.StudentID, closedInstance, f.Targets[0].Type, f.Targets[0].Key, f.Targets[0].Version, now)
+	insertT201PracticeBinding(t, ctx, tx, f.StudentID, uuid.NewString(), uuid.NewString(), practiceRevision, f.PathID, f.ActiveItemID, practice.ID, 1, 1, "OPEN", f.Targets[0], now)
+	// T02 allows removing this cancelled future occurrence. Its immutable old
+	// binding remains history, while current snapshot must stay readable.
+	insertT201PracticeBinding(t, ctx, tx, f.StudentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), f.PathID, uuid.NewString(), uuid.NewString(), 1, 2, "CANCELLED", f.Targets[0], now)
+	for i, count := range []int{2, 1} {
+		state := "APPLIED"
+		confidence := .5
+		if i == 1 {
+			state = "UNDERSTOOD"
+			confidence = .33333
+		}
+		r := f.Targets[i]
+		t201Exec(t, ctx, tx, `INSERT INTO student_target_mastery(student_id,target_type,target_key,target_version,state,mastery_score,confidence,independent_success_count,assisted_success_count,failure_count,evidence_count,last_seen_at,policy_version) VALUES($1,$2,$3,$4,$5,1,$6,$7,0,0,$7,$8,'student-mastery-v1')`, f.StudentID, r.Type, r.Key, r.Version, state, confidence, count, now)
+	}
+	if e = tx.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+	t.Logf("named T201 owner metadata fixture student=%s path=%s; no ingestion/runtime/quality policy claim", f.StudentID, f.PathID)
+	return f
+}
+func insertT201OrdinaryMetadataEvidence(t *testing.T, ctx context.Context, q t201FixtureExecutor, sid string, r domain.LearningTargetRef, at time.Time) {
+	t.Helper()
+	answer := uuid.NewString()
+	action := uuid.NewString()
+	task := uuid.NewString()
+	targets := string(t201JSON(t, []domain.LearningTargetRef{r}))
+	t201Exec(t, ctx, q, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,ended_at,status,attempt) VALUES($1,$2,$3,$4,$4,5,1)`, answer, sid, task, at)
+	t201Exec(t, ctx, q, `INSERT INTO student_learning_action(id,student_task_answer_id,student_id,task_id,cycle,context_type,context_id,learning_targets,opened_at,closed_at,evidence_class,outcome,outcome_policy_version,source_kind,lifecycle_status) VALUES($1,$2,$3,$4::uuid,1,'lesson_task',$4::uuid::text,$5::jsonb,$6,$6,'knowledge_check','passed','student-mastery-v1','course_answer','CLOSED')`, action, answer, sid, task, targets, at)
+	t201Exec(t, ctx, q, `INSERT INTO student_learning_action_target_evidence(learning_action_id,student_id,task_id,target_type,target_key,target_version,evidence_class,outcome,support_context,evidence_kind,hints_used,intervention_used,teacher_policy_version,mastery_policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,'knowledge_check','passed','independent','independent_understanding',0,false,'teacher-assistance-v1','student-mastery-v1',$7)`, action, sid, task, r.Type, r.Key, r.Version, at)
+}
+func insertT201PracticeBinding(t *testing.T, ctx context.Context, q t201FixtureExecutor, sid, action, instance, revision, path, item, requirement string, version int64, position int, status string, target domain.LearningTargetRef, at time.Time) {
+	t.Helper()
+	var opened, closed any = at, nil
+	var outcome, evidenceClass, outcomePolicy, cancelReason any
+	if status == "CLOSED" {
+		closed = at
+		outcome = "passed"
+		evidenceClass = "application"
+		outcomePolicy = "student-mastery-v1"
+	}
+	if status == "CANCELLED" {
+		opened = nil
+		closed = at
+		cancelReason = "practice_provisioning_failed"
+	}
+	t201Exec(t, ctx, q, `INSERT INTO student_learning_action(id,student_id,cycle,context_type,context_id,learning_targets,opened_at,closed_at,source_kind,lifecycle_status,practice_task_instance_id,practice_task_revision_id,practice_task_revision_digest,surface_classification,learning_path_id,learning_path_version_at_reservation,learning_path_position_at_reservation,ensure_request_hash,learning_path_item_id,requirement_id,evidence_class,outcome,outcome_policy_version,cancel_reason) VALUES($1,$2,0,'practice_task',$3::uuid::text,$4::jsonb,$5,$6,'practice_v2',$7,$3::uuid,$8,$9,'practice',NULLIF($10,'')::uuid,NULLIF($11::bigint,0::bigint),CASE WHEN $10::text='' THEN NULL::integer ELSE $12::integer END,$13,NULLIF($14,'')::uuid,NULLIF($15,'')::uuid,$16,$17,$18,$19)`, action, sid, instance, string(t201JSON(t, []domain.LearningTargetRef{target})), opened, closed, status, revision, "sha256:"+strings.Repeat("a", 64), path, version, position, strings.Repeat("a", 64), item, requirement, evidenceClass, outcome, outcomePolicy, cancelReason)
+}
+func t201Exec(t *testing.T, ctx context.Context, q t201FixtureExecutor, query string, args ...any) {
+	t.Helper()
+	if _, e := q.Exec(ctx, query, args...); e != nil {
+		statement, _, _ := strings.Cut(query, "(")
+		t.Fatalf("fixture %s: %v", statement, e)
+	}
+}
+func t201JSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, e := json.Marshal(v)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return raw
+}
+func t201SnapshotRowsSignature(t *testing.T, ctx context.Context, pool *pgxpool.Pool, f t201PlanningSnapshotFixture) string {
+	t.Helper()
+	parts := []string{}
+	for _, table := range []string{"student_onboarding", "student_learning_path", "student_learning_context", "student_task_answer", "student_learning_action", "student_lesson_activity_fact", "student_learning_action_target_evidence", "student_target_mastery", "student_practice_evidence_receipt", "student_practice_target_evidence", "student_outbox", "student_learning_evidence"} {
+		var hash string
+		query := fmt.Sprintf(`SELECT md5(COALESCE(string_agg(row_to_json(t)::text||':'||t.xmin::text,'|' ORDER BY row_to_json(t)::text),'')) FROM %s t WHERE student_id=$1`, table)
+		if e := pool.QueryRow(ctx, query, f.StudentID).Scan(&hash); e != nil {
+			t.Fatal(e)
+		}
+		parts = append(parts, table+":"+hash)
+	}
+	for _, table := range []string{"student_learning_path_item", "student_learning_path_revision"} {
+		var hash string
+		query := fmt.Sprintf(`SELECT md5(COALESCE(string_agg(row_to_json(t)::text||':'||t.xmin::text,'|' ORDER BY row_to_json(t)::text),'')) FROM %s t WHERE student_learning_path_id=$1`, table)
+		if e := pool.QueryRow(ctx, query, f.PathID).Scan(&hash); e != nil {
+			t.Fatal(e)
+		}
+		parts = append(parts, table+":"+hash)
+	}
+	return strings.Join(parts, "\n")
+}
+
+type t201SnapshotSQLKey struct{}
+type t201SnapshotBarrier struct {
+	PathID              string
+	Seen, Release       chan struct{}
+	once                sync.Once
+	Isolation, ReadOnly string
+}
+
+func (b *t201SnapshotBarrier) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, t201SnapshotSQLKey{}, data.SQL)
+}
+func (b *t201SnapshotBarrier) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
+	query, _ := ctx.Value(t201SnapshotSQLKey{}).(string)
+	if data.Err != nil || !strings.Contains(query, "FROM student_learning_path WHERE student_id=$1 AND id=$2") {
+		return
+	}
+	b.once.Do(func() {
+		_ = conn.QueryRow(ctx, `SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')`).Scan(&b.Isolation, &b.ReadOnly)
+		close(b.Seen)
+		select {
+		case <-b.Release:
+		case <-ctx.Done():
+		}
+	})
+}

@@ -1,0 +1,499 @@
+package answer
+
+import (
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	"golang.org/x/net/html"
+)
+
+type htmlElementRule struct {
+	Tag                string
+	Required           bool
+	RequiredAttributes map[string][]string
+	RequiredChildren   []htmlElementRule
+	TextContainsAny    []string
+	MinChildren        int
+}
+
+type parsedHTMLDocument struct {
+	Path         string
+	Doc          *html.Node
+	HasDoctype   bool
+	ExplicitTags map[string][]map[string]string
+}
+
+func validateHTMLDocumentRules(rules map[string]any, requiredFiles []string, fileContents map[string]string) ([]ValidationError, bool, error) {
+	if rules == nil {
+		return nil, false, nil
+	}
+	_, hasDoctypeRule := rules["doctype"]
+	_, hasHTMLRule := rules["html"]
+	_, hasHeadRule := rules["head"]
+	_, hasBodyRule := rules["body"]
+	if !hasDoctypeRule && !hasHTMLRule && !hasHeadRule && !hasBodyRule {
+		return nil, false, nil
+	}
+
+	path, content := selectHTMLDocumentForValidation(requiredFiles, fileContents)
+	if path == "" {
+		return []ValidationError{{
+			Code:    "HTML_DOCUMENT_MISSING",
+			Message: "HTML document is missing",
+			File:    strings.Join(requiredFiles, ","),
+		}}, true, nil
+	}
+
+	doc, err := parseHTMLDocument(path, content)
+	if err != nil {
+		return nil, true, err
+	}
+
+	errors := make([]ValidationError, 0)
+	if required, _ := rules["doctype"].(bool); required && !doc.HasDoctype {
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_DOCTYPE_MISSING",
+			Message: "Required doctype is missing",
+			File:    doc.Path,
+		})
+	}
+
+	for _, topLevelTag := range []string{"html", "head", "body"} {
+		rawRule, exists := rules[topLevelTag]
+		if !exists {
+			continue
+		}
+		rule := extractHTMLElementRule(rawRule, topLevelTag, true)
+		errors = append(errors, validateTopLevelHTMLRule(doc, rule)...)
+	}
+
+	return errors, true, nil
+}
+
+func selectHTMLDocumentForValidation(requiredFiles []string, fileContents map[string]string) (string, string) {
+	for _, path := range requiredFiles {
+		normalized := normalizePath(path)
+		if !isHTMLFilePath(normalized) {
+			continue
+		}
+		if content, exists := fileContents[normalized]; exists {
+			return normalized, content
+		}
+	}
+	if content, exists := fileContents["index.html"]; exists {
+		return "index.html", content
+	}
+
+	htmlPaths := make([]string, 0)
+	for path := range fileContents {
+		if isHTMLFilePath(path) {
+			htmlPaths = append(htmlPaths, path)
+		}
+	}
+	sort.Strings(htmlPaths)
+	if len(htmlPaths) == 0 {
+		return "", ""
+	}
+	return htmlPaths[0], fileContents[htmlPaths[0]]
+}
+
+func parseHTMLDocument(path, content string) (*parsedHTMLDocument, error) {
+	tokenizer := html.NewTokenizer(strings.NewReader(content))
+	explicitTags := make(map[string][]map[string]string)
+	hasDoctype := false
+
+tokenize:
+	for {
+		switch tokenizer.Next() {
+		case html.ErrorToken:
+			if err := tokenizer.Err(); err != nil && err != io.EOF {
+				return nil, err
+			}
+			break tokenize
+		case html.DoctypeToken:
+			hasDoctype = true
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			tag := strings.ToLower(strings.TrimSpace(token.Data))
+			if tag == "" {
+				continue
+			}
+			attrs := make(map[string]string, len(token.Attr))
+			for _, attr := range token.Attr {
+				attrs[strings.ToLower(strings.TrimSpace(attr.Key))] = strings.TrimSpace(attr.Val)
+			}
+			explicitTags[tag] = append(explicitTags[tag], attrs)
+		}
+	}
+
+	doc, err := html.Parse(strings.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	return &parsedHTMLDocument{
+		Path:         path,
+		Doc:          doc,
+		HasDoctype:   hasDoctype,
+		ExplicitTags: explicitTags,
+	}, nil
+}
+
+func validateTopLevelHTMLRule(doc *parsedHTMLDocument, rule htmlElementRule) []ValidationError {
+	if doc == nil || rule.Tag == "" {
+		return nil
+	}
+
+	explicitAttrs := doc.ExplicitTags[rule.Tag]
+	if rule.Required && len(explicitAttrs) == 0 {
+		return []ValidationError{{
+			Code:    "REQUIRED_TAG_MISSING",
+			Message: fmt.Sprintf("Required tag is missing: %s", rule.Tag),
+			File:    doc.Path,
+		}}
+	}
+	if len(rule.RequiredAttributes) > 0 {
+		if ok, attrErr := explicitTagAttributesSatisfy(rule.Tag, explicitAttrs, rule.RequiredAttributes, doc.Path); !ok {
+			return []ValidationError{attrErr}
+		}
+	}
+
+	nodes := findHTMLNodesByTag(doc.Doc, rule.Tag)
+	if len(nodes) == 0 {
+		return []ValidationError{{
+			Code:    "REQUIRED_TAG_MISSING",
+			Message: fmt.Sprintf("Required tag is missing: %s", rule.Tag),
+			File:    doc.Path,
+		}}
+	}
+
+	for _, node := range nodes {
+		if nodeErrors := validateHTMLElementNode(node, rule, doc.Path); len(nodeErrors) == 0 {
+			return nil
+		}
+	}
+	return validateHTMLElementNode(nodes[0], rule, doc.Path)
+}
+
+func validateHTMLElementNode(node *html.Node, rule htmlElementRule, path string) []ValidationError {
+	if node == nil || node.Type != html.ElementNode || !strings.EqualFold(node.Data, rule.Tag) {
+		return []ValidationError{{
+			Code:    "REQUIRED_TAG_MISSING",
+			Message: fmt.Sprintf("Required tag is missing: %s", rule.Tag),
+			File:    path,
+		}}
+	}
+
+	errors := make([]ValidationError, 0)
+	errors = append(errors, validateHTMLAttributes(node, rule.Tag, rule.RequiredAttributes, path)...)
+
+	if len(rule.TextContainsAny) > 0 && !htmlNodeContainsAnyText(node, rule.TextContainsAny) {
+		errors = append(errors, ValidationError{
+			Code:    "REQUIRED_TEXT_MISSING",
+			Message: fmt.Sprintf("Required text is missing inside <%s>: %s", rule.Tag, strings.Join(rule.TextContainsAny, ", ")),
+			File:    path,
+		})
+	}
+
+	if rule.MinChildren > 0 {
+		if count := countMatchingDirectChildElements(node, rule.RequiredChildren); count < rule.MinChildren {
+			errors = append(errors, ValidationError{
+				Code:    "REQUIRED_MIN_CHILDREN",
+				Message: fmt.Sprintf("Tag <%s> must contain at least %d matching child elements", rule.Tag, rule.MinChildren),
+				File:    path,
+			})
+		}
+	}
+
+	if rule.MinChildren > 0 && len(rule.RequiredChildren) > 0 {
+		return errors
+	}
+
+	for _, childRule := range rule.RequiredChildren {
+		candidates := findHTMLDescendantsByTag(node, childRule.Tag)
+		if len(candidates) == 0 {
+			errors = append(errors, ValidationError{
+				Code:    "REQUIRED_CHILD_MISSING",
+				Message: fmt.Sprintf("Required child tag is missing inside <%s>: %s", rule.Tag, childRule.Tag),
+				File:    path,
+			})
+			continue
+		}
+
+		matched := false
+		var candidateErrors []ValidationError
+		for _, candidate := range candidates {
+			nodeErrors := validateHTMLElementNode(candidate, childRule, path)
+			if len(nodeErrors) == 0 {
+				matched = true
+				break
+			}
+			if candidateErrors == nil {
+				candidateErrors = nodeErrors
+			}
+		}
+		if !matched && len(candidateErrors) > 0 {
+			errors = append(errors, candidateErrors...)
+		}
+	}
+
+	return errors
+}
+
+func extractHTMLElementRule(raw any, defaultTag string, defaultRequired bool) htmlElementRule {
+	rule := htmlElementRule{
+		Tag:                strings.ToLower(strings.TrimSpace(defaultTag)),
+		Required:           defaultRequired,
+		RequiredAttributes: nil,
+		RequiredChildren:   nil,
+		TextContainsAny:    nil,
+		MinChildren:        0,
+	}
+
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return rule
+	}
+
+	if tag, ok := obj["tag"].(string); ok && strings.TrimSpace(tag) != "" {
+		rule.Tag = strings.ToLower(strings.TrimSpace(tag))
+	}
+	if required, ok := obj["required"].(bool); ok {
+		rule.Required = required
+	}
+	rule.RequiredAttributes = extractHTMLRequiredAttributes(obj["required_attributes"])
+	rule.TextContainsAny = extractRequiredStrings(obj["text_contains_any"])
+	rule.MinChildren = extractInt(obj["min_children"])
+	rule.RequiredChildren = append(rule.RequiredChildren, extractHTMLChildRules(obj["required_children"])...)
+	rule.RequiredChildren = append(rule.RequiredChildren, extractHTMLChildRules(obj["children"])...)
+	return rule
+}
+
+func extractHTMLChildRules(raw any) []htmlElementRule {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]htmlElementRule, 0, len(arr))
+	for _, item := range arr {
+		rule := extractHTMLElementRule(item, "", true)
+		if rule.Tag == "" {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
+}
+
+func extractHTMLRequiredAttributes(raw any) map[string][]string {
+	switch typed := raw.(type) {
+	case []any:
+		out := make(map[string][]string, len(typed))
+		for _, item := range typed {
+			name, ok := item.(string)
+			if !ok {
+				continue
+			}
+			trimmed := strings.ToLower(strings.TrimSpace(name))
+			if trimmed == "" {
+				continue
+			}
+			out[trimmed] = nil
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case map[string]any:
+		out := make(map[string][]string, len(typed))
+		for rawName, value := range typed {
+			name := strings.ToLower(strings.TrimSpace(rawName))
+			if name == "" {
+				continue
+			}
+			switch allowed := value.(type) {
+			case []any:
+				values := make([]string, 0, len(allowed))
+				for _, item := range allowed {
+					text, ok := item.(string)
+					if !ok {
+						continue
+					}
+					text = strings.TrimSpace(text)
+					if text == "" {
+						continue
+					}
+					values = append(values, text)
+				}
+				out[name] = values
+			case string:
+				trimmed := strings.TrimSpace(allowed)
+				if trimmed == "" {
+					out[name] = nil
+				} else {
+					out[name] = []string{trimmed}
+				}
+			case bool:
+				if allowed {
+					out[name] = nil
+				}
+			default:
+				out[name] = nil
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func explicitTagAttributesSatisfy(tag string, variants []map[string]string, required map[string][]string, path string) (bool, ValidationError) {
+	if len(required) == 0 {
+		return true, ValidationError{}
+	}
+	if len(variants) == 0 {
+		return false, ValidationError{
+			Code:    "REQUIRED_TAG_MISSING",
+			Message: fmt.Sprintf("Required tag is missing: %s", tag),
+			File:    path,
+		}
+	}
+
+	var firstErr ValidationError
+	for _, attrs := range variants {
+		if errs := validateHTMLAttributesMap(tag, attrs, required, path); len(errs) == 0 {
+			return true, ValidationError{}
+		} else if firstErr.Code == "" {
+			firstErr = errs[0]
+		}
+	}
+	return false, firstErr
+}
+
+func validateHTMLAttributes(node *html.Node, tag string, required map[string][]string, path string) []ValidationError {
+	if len(required) == 0 {
+		return nil
+	}
+	attrs := make(map[string]string, len(node.Attr))
+	for _, attr := range node.Attr {
+		attrs[strings.ToLower(strings.TrimSpace(attr.Key))] = strings.TrimSpace(attr.Val)
+	}
+	return validateHTMLAttributesMap(tag, attrs, required, path)
+}
+
+func validateHTMLAttributesMap(tag string, attrs map[string]string, required map[string][]string, path string) []ValidationError {
+	errors := make([]ValidationError, 0)
+	for name, allowedValues := range required {
+		value, exists := attrs[name]
+		if !exists || strings.TrimSpace(value) == "" {
+			errors = append(errors, ValidationError{
+				Code:    "REQUIRED_ATTRIBUTE_MISSING",
+				Message: fmt.Sprintf("Required attribute is missing on <%s>: %s", tag, name),
+				File:    path,
+			})
+			continue
+		}
+		if len(allowedValues) > 0 && !matchesAllowedAttributeValue(value, allowedValues) {
+			errors = append(errors, ValidationError{
+				Code:    "REQUIRED_ATTRIBUTE_VALUE_INVALID",
+				Message: fmt.Sprintf("Required attribute has invalid value on <%s>: %s", tag, name),
+				File:    path,
+			})
+		}
+	}
+	return errors
+}
+
+func matchesAllowedAttributeValue(actual string, allowed []string) bool {
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(actual), strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func findHTMLNodesByTag(root *html.Node, tag string) []*html.Node {
+	out := make([]*html.Node, 0)
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type == html.ElementNode && strings.EqualFold(node.Data, tag) {
+			out = append(out, node)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return out
+}
+
+func findHTMLDescendantsByTag(root *html.Node, tag string) []*html.Node {
+	out := make([]*html.Node, 0)
+	for child := root.FirstChild; child != nil; child = child.NextSibling {
+		out = append(out, findHTMLNodesByTag(child, tag)...)
+	}
+	return out
+}
+
+func htmlNodeContainsAnyText(node *html.Node, options []string) bool {
+	text := collapseWhitespace(extractHTMLText(node))
+	if text == "" {
+		return false
+	}
+	for _, option := range options {
+		if option == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(text), strings.ToLower(collapseWhitespace(option))) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractHTMLText(node *html.Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.Type == html.TextNode {
+		return node.Data
+	}
+	var builder strings.Builder
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		builder.WriteString(extractHTMLText(child))
+		builder.WriteString(" ")
+	}
+	return builder.String()
+}
+
+func collapseWhitespace(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func countMatchingDirectChildElements(node *html.Node, childRules []htmlElementRule) int {
+	count := 0
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type != html.ElementNode {
+			continue
+		}
+		if len(childRules) == 0 {
+			count++
+			continue
+		}
+		for _, rule := range childRules {
+			if strings.EqualFold(child.Data, rule.Tag) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}

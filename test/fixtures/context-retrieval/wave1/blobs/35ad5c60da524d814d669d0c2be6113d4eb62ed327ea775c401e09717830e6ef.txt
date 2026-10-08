@@ -1,0 +1,286 @@
+package validators
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// Wire doubles use only unique subjects on the explicitly owned proof broker.
+// They never subscribe to the real CSS provider subject.
+func cssWireFixture(t *testing.T, reply func([]byte) []byte) *CSSValidator {
+	t.Helper()
+	serverURL := os.Getenv("T101_CSS_UNIT_NATS_URL")
+	if serverURL == "" {
+		t.Skip("set T101_CSS_UNIT_NATS_URL to the owned isolated proof broker")
+	}
+	conn, err := natsgo.Connect(serverURL, natsgo.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("connect isolated unit broker: %v", err)
+	}
+	t.Cleanup(conn.Close)
+	subject := "t101.css.unit." + uuid.NewString()
+	if reply != nil {
+		_, err = conn.Subscribe(subject, func(msg *natsgo.Msg) {
+			_ = msg.Respond(reply(msg.Data))
+		})
+		if err != nil {
+			t.Fatalf("subscribe unit reply double: %v", err)
+		}
+		if err := conn.FlushTimeout(2 * time.Second); err != nil {
+			t.Fatalf("flush unit reply double: %v", err)
+		}
+	}
+	return &CSSValidator{conn: conn, subject: subject}
+}
+
+func cssTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func TestCSSValidatorSendsEveryStylesheetWithExistingContract(t *testing.T) {
+	var mu sync.Mutex
+	var requests []map[string]any
+	v := cssWireFixture(t, func(data []byte) []byte {
+		var request map[string]any
+		if err := json.Unmarshal(data, &request); err != nil {
+			return []byte(`{"isValid":false,"errors":[{"code":"bad.test.request","message":"invalid request"}]}`)
+		}
+		mu.Lock()
+		requests = append(requests, request)
+		mu.Unlock()
+		return []byte(`{"isValid":true,"errors":[]}`)
+	})
+	files := []WorkspaceFile{
+		{Path: "index.html", Content: "ignore non-stylesheet"},
+		{Path: "styles/MAIN.CSS", Content: ".main { color: red; }"},
+		{Path: "styles/layout.scss", Content: "$gap: 1rem; .layout { gap: $gap; }"},
+		{Path: "styles/utility.acss", Content: ".utility { display: grid; }"},
+		{Path: "styles/empty.css", Content: ""},
+	}
+	result, err := v.ValidateAll(cssTestContext(t), "task-css-contract", files)
+	if err != nil || result == nil || !result.Valid || len(result.Errors) != 0 {
+		t.Fatalf("valid provider result: result=%#v error=%v", result, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 4 {
+		t.Fatalf("provider requests=%d, want every stylesheet including empty existing file (4)", len(requests))
+	}
+	byPath := make(map[string]map[string]any)
+	for _, request := range requests {
+		meta, ok := request["meta"].(map[string]any)
+		if !ok || meta["taskId"] != "task-css-contract" {
+			t.Fatalf("missing exact task metadata: %#v", request)
+		}
+		path, ok := meta["path"].(string)
+		if !ok {
+			t.Fatalf("missing source path: %#v", request)
+		}
+		byPath[path] = request
+		rules, ok := request["rules"].(map[string]any)
+		if !ok {
+			t.Fatalf("missing provider rules envelope: %#v", request)
+		}
+		list, ok := rules["rules"].([]any)
+		if !ok || len(list) != 0 || request["locale"] != "en" {
+			t.Fatalf("invented rubric or incompatible locale: %#v", request)
+		}
+	}
+	wantLanguages := map[string]string{"styles/MAIN.CSS": "css", "styles/layout.scss": "scss", "styles/utility.acss": "acss", "styles/empty.css": "css"}
+	for _, file := range files[1:] {
+		request := byPath[file.Path]
+		if request == nil || request["code"] != file.Content || request["language"] != wantLanguages[file.Path] {
+			t.Fatalf("source/language mismatch for %s: %#v", file.Path, request)
+		}
+	}
+}
+
+func TestCSSValidatorMapsNegativeForEveryFile(t *testing.T) {
+	var mu sync.Mutex
+	count := 0
+	v := cssWireFixture(t, func([]byte) []byte {
+		mu.Lock()
+		count++
+		mu.Unlock()
+		return []byte(`{"isValid":false,"errors":[{"code":"selector.not_found","message":"Expected selector","position":{"line":3,"column":7}}]}`)
+	})
+	result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "first.css", Content: "a{}"}, {Path: "second.scss", Content: "b{}"}})
+	if err != nil || result == nil || result.Valid || len(result.Errors) != 2 {
+		t.Fatalf("all provider negatives must aggregate: result=%#v error=%v", result, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 2 {
+		t.Fatalf("provider requests=%d, want both files", count)
+	}
+	for index, path := range []string{"first.css", "second.scss"} {
+		got := result.Errors[index]
+		if got.Code != "selector.not_found" || got.File != path || got.Line != 3 || got.Column != 7 {
+			t.Fatalf("lost exact source/error mapping: %#v", got)
+		}
+	}
+}
+
+func TestCSSValidatorSemanticErrorsDoNotExposeProviderText(t *testing.T) {
+	codes := []string{
+		"selector.not_found", "selector.not_found_in_media", "declaration.not_found",
+		"declaration.value_mismatch", "declaration.not_allowed_value", "occurrence.min",
+		"occurrence.max", "media.not_found",
+	}
+	for _, code := range codes {
+		t.Run(code, func(t *testing.T) {
+			v := cssWireFixture(t, func([]byte) []byte {
+				data, _ := json.Marshal(map[string]any{"isValid": false, "errors": []any{map[string]any{
+					"code": code, "message": "provider-private-source", "file": "provider-private-path",
+					"position": map[string]int{"line": 3, "column": 7},
+				}}})
+				return data
+			})
+			result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "styles/main.css", Content: "a{}"}})
+			if err != nil || result == nil || result.Valid || len(result.Errors) != 1 {
+				t.Fatalf("known semantic code must remain negative: result=%#v error=%v", result, err)
+			}
+			got := result.Errors[0]
+			if got.Code != code || got.File != "styles/main.css" || got.Line != 3 || got.Column != 7 {
+				t.Fatalf("lost safe code/source position: %#v", got)
+			}
+			if got.Message != "Stylesheet validation failed" {
+				t.Fatalf("provider message exposed instead of static safe feedback: %#v", got)
+			}
+		})
+	}
+}
+
+func TestCSSValidatorUnknownProviderCodeIsTechnical(t *testing.T) {
+	v := cssWireFixture(t, func([]byte) []byte {
+		return []byte(`{"isValid":false,"errors":[{"code":"provider-private-source","message":"provider-private-message"}]}`)
+	})
+	result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+	if err == nil || result != nil {
+		t.Fatalf("unknown provider code must be protocol error: result=%#v error=%v", result, err)
+	}
+	if strings.Contains(err.Error(), "provider-private") {
+		t.Fatalf("unknown provider code/text exposed in technical error: %v", err)
+	}
+}
+
+func TestCSSValidatorRejectsMissingSource(t *testing.T) {
+	v := cssWireFixture(t, nil)
+	for _, files := range [][]WorkspaceFile{nil, {{Path: "index.html", Content: "<main/>"}}} {
+		result, err := v.ValidateAll(cssTestContext(t), "task", files)
+		if err != nil || result == nil || result.Valid || len(result.Errors) != 1 || result.Errors[0].Code != "NO_CSS_FILE" {
+			t.Fatalf("missing stylesheet must be semantic negative: result=%#v error=%v", result, err)
+		}
+	}
+}
+
+func TestCSSValidatorUnsupportedSassPreflight(t *testing.T) {
+	var mu sync.Mutex
+	count := 0
+	v := cssWireFixture(t, func([]byte) []byte {
+		mu.Lock()
+		count++
+		mu.Unlock()
+		return []byte(`{"isValid":true,"errors":[]}`)
+	})
+	result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "first.css", Content: "a{}"}, {Path: "second.SASS", Content: "provider-private-source"}})
+	if err == nil || result != nil || strings.Contains(err.Error(), "provider-private-source") {
+		t.Fatalf("unsupported Sass must be generic technical error: result=%#v error=%v", result, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 0 {
+		t.Fatalf("unsupported source must be discovered before any provider request; requests=%d", count)
+	}
+}
+
+func TestCSSValidatorRejectsMalformedProtocol(t *testing.T) {
+	cases := map[string]string{
+		"invalid JSON":            `provider-private-source`,
+		"null object":             `null`,
+		"missing validity":        `{"errors":[]}`,
+		"null validity":           `{"isValid":null,"errors":[]}`,
+		"nonboolean validity":     `{"isValid":"true","errors":[]}`,
+		"missing errors":          `{"isValid":true}`,
+		"null errors":             `{"isValid":true,"errors":null}`,
+		"wrong errors shape":      `{"isValid":true,"errors":{}}`,
+		"contradictory positive":  `{"isValid":true,"errors":[{"code":"invalid","message":"provider-private-source"}]}`,
+		"negative without errors": `{"isValid":false,"errors":[]}`,
+		"null error":              `{"isValid":false,"errors":[null]}`,
+		"missing code":            `{"isValid":false,"errors":[{"message":"provider-private-source"}]}`,
+		"missing message":         `{"isValid":false,"errors":[{"code":"invalid"}]}`,
+		"blank code":              `{"isValid":false,"errors":[{"code":"  ","message":"invalid"}]}`,
+		"blank message":           `{"isValid":false,"errors":[{"code":"invalid","message":"  "}]}`,
+		"wrong position":          `{"isValid":false,"errors":[{"code":"invalid","message":"provider-private-source","position":{"line":"wrong"}}]}`,
+		"trailing JSON":           `{"isValid":true,"errors":[]} {"private":"provider-private-source"}`,
+	}
+	for name, reply := range cases {
+		t.Run(name, func(t *testing.T) {
+			v := cssWireFixture(t, func([]byte) []byte { return []byte(reply) })
+			result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+			if err == nil || result != nil {
+				t.Fatalf("malformed provider response must be technical: result=%#v error=%v", result, err)
+			}
+			if strings.Contains(err.Error(), "provider-private-source") {
+				t.Fatalf("provider response exposed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCSSValidatorCompilerErrorIsGenericTechnical(t *testing.T) {
+	v := cssWireFixture(t, func([]byte) []byte {
+		return []byte(`{"isValid":false,"errors":[{"code":"internal.compiler_error","message":"provider-private-source","received":"private-value"}]}`)
+	})
+	result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "style.css", Content: "a{"}})
+	if err == nil || result != nil {
+		t.Fatalf("conflated compiler/environment error must not become learner failure: result=%#v error=%v", result, err)
+	}
+	if strings.Contains(err.Error(), "provider-private-source") || strings.Contains(err.Error(), "private-value") || strings.Contains(err.Error(), "a{") {
+		t.Fatalf("technical error exposed provider data/source: %v", err)
+	}
+}
+
+func TestCSSValidatorTransportFailsClosed(t *testing.T) {
+	t.Run("no responders", func(t *testing.T) {
+		v := cssWireFixture(t, nil)
+		result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+		if err == nil || result != nil {
+			t.Fatalf("no responders must not pass: result=%#v error=%v", result, err)
+		}
+	})
+	t.Run("cancelled context", func(t *testing.T) {
+		v := cssWireFixture(t, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result, err := v.ValidateAll(ctx, "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+		if err == nil || result != nil {
+			t.Fatalf("cancelled request must not pass: result=%#v error=%v", result, err)
+		}
+	})
+	t.Run("nil connection", func(t *testing.T) {
+		result, err := (&CSSValidator{subject: "t101.css.unit.unused"}).ValidateAll(context.Background(), "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+		if err == nil || result != nil {
+			t.Fatalf("nil connection must be technical: result=%#v error=%v", result, err)
+		}
+	})
+	t.Run("empty subject", func(t *testing.T) {
+		v := cssWireFixture(t, nil)
+		v.subject = " "
+		result, err := v.ValidateAll(cssTestContext(t), "task", []WorkspaceFile{{Path: "style.css", Content: "a{}"}})
+		if err == nil || result != nil {
+			t.Fatalf("empty subject must be technical: result=%#v error=%v", result, err)
+		}
+	})
+}

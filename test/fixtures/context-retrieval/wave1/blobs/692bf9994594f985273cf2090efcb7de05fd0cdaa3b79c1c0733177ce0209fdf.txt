@@ -1,0 +1,95 @@
+package task
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+)
+
+type StarterArchiveUploader interface {
+	UploadStarterArchive(ctx context.Context, taskID string, originalFilename string, archiveData []byte) (string, error)
+}
+
+type StarterArchiveActivator interface {
+	ActivateStarterArchive(ctx context.Context, fileID string) error
+}
+
+type UploadStarterArchiveInput struct {
+	TaskID           string
+	OriginalFilename string
+	ArchiveData      []byte
+}
+
+type UploadStarterArchiveOutput struct {
+	StarterFiles []domain.TaskFileStorage
+}
+
+type UploadStarterArchive struct {
+	Tasks     repository.TaskRepository
+	TaskFiles repository.TaskFileStorageRepository
+	Uploader  StarterArchiveUploader
+	Activator StarterArchiveActivator
+	Tx        repository.TransactionManager
+}
+
+func (useCase UploadStarterArchive) Handle(
+	ctx context.Context,
+	input UploadStarterArchiveInput,
+) (*UploadStarterArchiveOutput, error) {
+	taskID := strings.TrimSpace(input.TaskID)
+	if taskID == "" || len(input.ArchiveData) == 0 {
+		return nil, domain.ErrValidation
+	}
+	if useCase.Tasks == nil || useCase.TaskFiles == nil || useCase.Uploader == nil || useCase.Activator == nil || useCase.Tx == nil {
+		return nil, domain.ErrValidation
+	}
+	if _, err := useCase.Tasks.Get(ctx, taskID); err != nil {
+		return nil, err
+	}
+
+	fileID, err := useCase.Uploader.UploadStarterArchive(
+		ctx,
+		taskID,
+		input.OriginalFilename,
+		input.ArchiveData,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	starterFiles := []domain.TaskFileStorage{{
+		TaskID:        taskID,
+		Type:          domain.TaskFileStorageTypeStarterArchive,
+		FileStorageID: fileID,
+		Order:         1,
+	}}
+	var previousFiles []domain.TaskFileStorage
+	if err := useCase.Tx.WithTx(ctx, func(ctx context.Context) error {
+		var err error
+		previousFiles, err = useCase.TaskFiles.ListByTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		return useCase.TaskFiles.ReplaceForTask(ctx, taskID, starterFiles)
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := useCase.Activator.ActivateStarterArchive(ctx, fileID); err != nil {
+		activationErr := fmt.Errorf("activate starter archive: %w", err)
+		compensationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if restoreErr := useCase.Tx.WithTx(compensationCtx, func(ctx context.Context) error {
+			return useCase.TaskFiles.ReplaceForTask(ctx, taskID, previousFiles)
+		}); restoreErr != nil {
+			return nil, errors.Join(activationErr, fmt.Errorf("restore previous starter files: %w", restoreErr))
+		}
+		return nil, activationErr
+	}
+	return &UploadStarterArchiveOutput{StarterFiles: starterFiles}, nil
+}

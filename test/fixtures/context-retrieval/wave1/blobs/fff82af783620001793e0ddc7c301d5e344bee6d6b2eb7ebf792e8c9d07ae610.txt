@@ -1,0 +1,204 @@
+package practice
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const (
+	maximumPracticeResponseBytes          int64 = 2 << 20
+	maximumTeacherValidationResponseBytes int64 = 32 << 10
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+func (client Client) GetPracticeTaskContext(ctx context.Context, studentID, taskInstanceID string) (domain.PracticeTaskContext, error) {
+	request, err := client.request(ctx, http.MethodGet,
+		"/internal/task-instances/"+url.PathEscape(taskInstanceID)+"/teacher-context?student_id="+url.QueryEscape(studentID), nil)
+	if err != nil {
+		return domain.PracticeTaskContext{}, err
+	}
+	response, err := client.do(request)
+	if err != nil {
+		return domain.PracticeTaskContext{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return domain.PracticeTaskContext{}, domain.ErrStudentContextNotFound
+	}
+	if response.StatusCode != http.StatusOK {
+		return domain.PracticeTaskContext{}, domain.ErrStudentStateUnavailable
+	}
+	var result domain.PracticeTaskContext
+	if err := decodeStrict(response.Body, &result); err != nil {
+		return domain.PracticeTaskContext{}, domain.ErrInvalidStudentContext
+	}
+	return domain.NormalizePracticeTaskContext(result, studentID, taskInstanceID)
+}
+
+func (client Client) GetPracticeTeacherValidationContext(
+	ctx context.Context,
+	practice domain.PracticeTaskContext,
+	learningActionID string,
+) (domain.PracticeTeacherValidationContext, error) {
+	request, err := client.request(ctx, http.MethodGet,
+		"/internal/task-instances/"+url.PathEscape(practice.TaskInstanceID)+"/teacher-validation-explanation?student_id="+url.QueryEscape(practice.StudentID), nil)
+	if err != nil {
+		return domain.PracticeTeacherValidationContext{}, err
+	}
+	response, err := client.do(request)
+	if err != nil {
+		return domain.PracticeTeacherValidationContext{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maximumTeacherValidationResponseBytes))
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusUnprocessableEntity {
+			return domain.PracticeTeacherValidationContext{}, domain.ErrInvalidStudentContext
+		}
+		return domain.PracticeTeacherValidationContext{}, domain.ErrStudentStateUnavailable
+	}
+	var result domain.PracticeTeacherValidationContext
+	if err := decodeStrictLimited(response.Body, &result, maximumTeacherValidationResponseBytes); err != nil {
+		return domain.PracticeTeacherValidationContext{}, domain.ErrInvalidStudentContext
+	}
+	return domain.NormalizePracticeTeacherValidationContext(result, practice, learningActionID)
+}
+
+func (client Client) RecordPracticeTaskAssistance(ctx context.Context, taskInstanceID, studentID, stepID, usageID string, action domain.TeacherAction, hintLevel *int) error {
+	stepID = strings.TrimSpace(stepID)
+	if stepID == "" || len(stepID) > 128 {
+		return domain.ErrInvalidStudentContext
+	}
+	kind := "TEACHER_EXPLANATION"
+	switch action {
+	case domain.TeacherActionGiveHint:
+		kind = "HINT"
+	case domain.TeacherActionAskQuestion:
+		kind = "TEACHER_QUESTION"
+	}
+	payload, err := json.Marshal(map[string]any{
+		"usage_id": usageID, "student_id": studentID,
+		"assistance": map[string]any{"schema": "practice-task-assistance-usage.v1", "step_id": stepID, "kind": kind, "hint_level": hintLevel},
+	})
+	if err != nil {
+		return err
+	}
+	request, err := client.request(ctx, http.MethodPost, "/internal/task-instances/"+url.PathEscape(taskInstanceID)+"/teacher-assistance", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maximumPracticeResponseBytes))
+		return domain.ErrStudentStateUnavailable
+	}
+	var result struct {
+		ID             string    `json:"id"`
+		TaskInstanceID string    `json:"task_instance_id"`
+		StudentID      string    `json:"student_id"`
+		StepID         string    `json:"step_id"`
+		Kind           string    `json:"kind"`
+		HintLevel      *int      `json:"hint_level,omitempty"`
+		PolicyVersion  string    `json:"policy_version"`
+		CreatedAt      time.Time `json:"created_at"`
+	}
+	if err := decodeStrict(response.Body, &result); err != nil || result.ID != usageID ||
+		result.TaskInstanceID != taskInstanceID || result.StudentID != studentID || result.StepID != stepID || result.Kind != kind ||
+		result.PolicyVersion != "practice-task-assistance-policy.v1" || result.CreatedAt.IsZero() ||
+		!sameHintLevel(result.HintLevel, hintLevel) {
+		return domain.ErrStudentStateUnavailable
+	}
+	_, offset := result.CreatedAt.Zone()
+	if offset != 0 {
+		return domain.ErrStudentStateUnavailable
+	}
+	return nil
+}
+
+func sameHintLevel(received, requested *int) bool {
+	if received == nil || requested == nil {
+		return received == nil && requested == nil
+	}
+	return *received == *requested
+}
+
+func (client Client) request(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" {
+		return nil, domain.ErrStudentStateUnavailable
+	}
+	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(client.BaseURL, "/")+path, body)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	return request, nil
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 3 * time.Second}
+	}
+	redirectSafeClient := *httpClient
+	priorCheckRedirect := httpClient.CheckRedirect
+	redirectSafeClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) > 0 && !sameOrigin(via[0].URL, next.URL) {
+			return http.ErrUseLastResponse
+		}
+		if priorCheckRedirect != nil {
+			return priorCheckRedirect(next, via)
+		}
+		return nil
+	}
+	response, err := redirectSafeClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: Practice request: %v", domain.ErrStudentStateUnavailable, err)
+	}
+	return response, nil
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return left != nil && right != nil && left.Scheme == right.Scheme && left.Host == right.Host
+}
+
+func decodeStrict(reader io.Reader, target any) error {
+	return decodeStrictLimited(reader, target, maximumPracticeResponseBytes)
+}
+
+func decodeStrictLimited(reader io.Reader, target any, maximumBytes int64) error {
+	limited := &io.LimitedReader{R: reader, N: maximumBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || limited.N == 0 {
+		return errors.New("trailing or oversized Practice response")
+	}
+	return nil
+}
+
+var _ repository.PracticeTaskContextReader = Client{}
+var _ repository.PracticeTeacherValidationContextReader = Client{}
+var _ repository.PracticeTaskAssistanceRecorder = Client{}

@@ -1,0 +1,79 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type hybridRecordedStatement struct {
+	sql  string
+	args []any
+}
+type hybridRecordingTx struct {
+	pgx.Tx
+	statements []hybridRecordedStatement
+}
+
+func (t *hybridRecordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	t.statements = append(t.statements, hybridRecordedStatement{sql, args})
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+
+func TestHybridTargetedPersistenceRejectsProtectedRewrite(t *testing.T) {
+	current := domain.StudentLearningPath{ID: "path", StudentID: "student", Version: 1, Items: []domain.LearningPathItem{{ID: "current", Status: domain.LearningPathItemReady, Position: 0}, {ID: "future", Status: domain.LearningPathItemPlanned, Position: 1}}}
+	desired := current
+	desired.Version++
+	desired.Items = append([]domain.LearningPathItem{}, current.Items...)
+	desired.Items[0].Status = domain.LearningPathItemSkippedMastered
+	tx := &hybridRecordingTx{}
+	if err := persistHybridFuturePath(context.Background(), tx, current, desired, ""); !errors.Is(err, domain.ErrHybridUnsafe) {
+		t.Fatalf("protected row rewrite accepted: %v", err)
+	}
+	if len(tx.statements) != 0 {
+		t.Fatal("protected guard ran after SQL mutation")
+	}
+}
+
+func TestHybridTargetedPersistenceKeepsProtectedRowsAndUsesPositivePermutation(t *testing.T) {
+	current := domain.StudentLearningPath{ID: "path", StudentID: "student", Version: 1, Items: []domain.LearningPathItem{{ID: "current", Status: domain.LearningPathItemReady, Position: 0}, {ID: "future-a", Status: domain.LearningPathItemPlanned, Position: 1}, {ID: "future-b", Status: domain.LearningPathItemPlanned, Position: 2}}}
+	desired := current
+	desired.Version++
+	desired.Items = append([]domain.LearningPathItem{}, current.Items...)
+	desired.Items[1], desired.Items[2] = desired.Items[2], desired.Items[1]
+	desired.Items[1].Position = 1
+	desired.Items[2].Position = 2
+	tx := &hybridRecordingTx{}
+	if err := persistHybridFuturePath(context.Background(), tx, current, desired, ""); err != nil {
+		t.Fatal(err)
+	}
+	temporary := 0
+	revision := 0
+	for _, statement := range tx.statements {
+		if strings.Contains(statement.sql, "DELETE") {
+			t.Fatal("targeted writer deleted owner rows")
+		}
+		if strings.Contains(statement.sql, "UPDATE student_learning_path_item") {
+			if statement.args[1] == "current" {
+				t.Fatal("targeted writer touched protected current occurrence")
+			}
+			if strings.Contains(statement.sql, "SET position=$3") {
+				temporary++
+				if statement.args[2].(int) <= 2 {
+					t.Fatal("temporary position collides with existing path")
+				}
+			}
+		}
+		if strings.Contains(statement.sql, "INSERT INTO student_learning_path_revision") {
+			revision++
+		}
+	}
+	if temporary != 2 || revision != 1 {
+		t.Fatalf("permutation=%d revisions=%d", temporary, revision)
+	}
+}

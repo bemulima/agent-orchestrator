@@ -1,0 +1,798 @@
+package teacherdialog
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// OnboardingCoordinator is the dark S5 convergence point. It does not own a
+// second conversation API: it receives the durable Dialog v2 job already
+// admitted by S1/S2. The action branch is deterministic and makes zero AI
+// calls; an attached text turn uses the one typed S4 semantic execution and
+// never leaks into the generic teacher.response prompt.
+type OnboardingCoordinator struct {
+	Jobs                  repository.TeacherDialogJob
+	Turns                 repository.TeacherOnboardingTurnStore
+	Receipts              repository.OnboardingActionReceiptLookup
+	StudentTurns          repository.TeacherStudentOnboardingTurnGateway
+	Students              repository.StudentOnboardingGateway
+	Readiness             repository.TeacherLearningReadinessResolver
+	Semantic              repository.TeacherOnboardingSemanticInterpreter
+	DialogReader          repository.DialogRequestContextReader
+	Appender              repository.DialogTeacherCoordinatedResponseAppender
+	Deliveries            repository.TeacherOnboardingDeliveryStore
+	ProductResponses      repository.TeacherProductAwareOnboardingResponseStore
+	Handoffs              repository.TeacherOnboardingHandoffStore
+	PlannerHandoffEnabled bool
+	Clock                 Clock
+}
+
+// errKnownOnboardingStale is produced only after Dialog context was read and
+// its source identity/reply/status were verified. It is intentionally private:
+// transport, malformed-context and UI-digest failures must retry/block rather
+// than being converted into a locally generated stale warning.
+var errKnownOnboardingStale = errors.New("known onboarding prompt is stale")
+
+func (coordinator OnboardingCoordinator) Process(ctx context.Context, job domain.TeacherDialogJob) (bool, error) {
+	if !coordinator.valid() {
+		return true, domain.ErrTeacherOnboardingUnavailable
+	}
+	if job.Request.ActionReceiptID != "" {
+		if !eligibleS5OnboardingRequest(job.Request) {
+			return true, domain.ErrTeacherDialogCanonicalActionBlocked
+		}
+		return true, coordinator.processAction(ctx, job)
+	}
+	if !eligibleS5OnboardingRequest(job.Request) {
+		return false, nil
+	}
+	interaction, policyVersion, found, err := coordinator.currentInteraction(ctx, job)
+	if err != nil {
+		if errors.Is(err, errKnownOnboardingStale) {
+			return coordinator.handleKnownStaleText(ctx, job)
+		}
+		return true, err
+	}
+	if !found {
+		return coordinator.handleKnownStaleText(ctx, job)
+	}
+	return true, coordinator.processText(ctx, job, interaction, policyVersion)
+}
+
+func (coordinator OnboardingCoordinator) handleKnownStaleText(ctx context.Context, job domain.TeacherDialogJob) (bool, error) {
+	interaction, known, err := coordinator.Turns.GetInteraction(ctx, job.Request.DialogID, job.Request.ReplyToMessageID, job.Request.PersonalTeacherID)
+	if err != nil {
+		return true, err
+	}
+	if !known {
+		return false, nil
+	}
+	return true, coordinator.processStaleText(ctx, job, interaction)
+}
+
+func (coordinator OnboardingCoordinator) Deliver(ctx context.Context, job domain.TeacherDialogJob) error {
+	if !coordinator.valid() || job.CoordinatorMode == "legacy" {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	turn, found, err := coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+	if err != nil || !found || turn.Stage != domain.TeacherOnboardingTurnDeliveryPending || turn.ResponseCommandID == "" {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	response, err := domain.NewTeacherCoordinatedDialogResponse(domain.TeacherCoordinatedDialogResponse{
+		Mode: job.CoordinatorMode, Body: job.ResponseBody, AssistantUI: job.ResponseAssistantUI,
+	})
+	if err != nil {
+		return err
+	}
+	message, err := coordinator.Appender.AppendTeacherCoordinatedResponse(ctx, job.Request, turn.ResponseCommandID, response)
+	if err != nil {
+		return err
+	}
+	disposition, err := domain.ProductAwareOnboardingDeliveryDisposition(turn, len(job.ResponseAssistantUI) != 0)
+	if err != nil {
+		return err
+	}
+	preserveActiveInteraction := disposition == domain.TeacherOnboardingDeliveryPreserve
+	var next *domain.TeacherOnboardingInteraction
+	if disposition == domain.TeacherOnboardingDeliveryReplace {
+		next, err = coordinator.nextDeliveredPromptInteraction(ctx, job, turn, message)
+		if err != nil {
+			return err
+		}
+	}
+	return coordinator.Deliveries.CompleteOnboardingDelivery(ctx, job.Request.EventID, job.ClaimToken, message.ID, next, preserveActiveInteraction, coordinator.Clock.Now().UTC())
+}
+
+// NeedsDelivery distinguishes a persisted semantic reply in a still-processing
+// ai_staged turn from the final delivery_pending response. Both use the
+// existing job.response_body, but only the latter may call Dialog append.
+func (coordinator OnboardingCoordinator) NeedsDelivery(ctx context.Context, job domain.TeacherDialogJob) (bool, error) {
+	if !coordinator.valid() || job.CoordinatorMode == "legacy" {
+		return false, domain.ErrTeacherOnboardingUnavailable
+	}
+	turn, found, err := coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+	if err != nil || !found {
+		if err != nil {
+			return false, err
+		}
+		return false, domain.ErrTeacherOnboardingConflict
+	}
+	return turn.Stage == domain.TeacherOnboardingTurnDeliveryPending, nil
+}
+
+func (coordinator OnboardingCoordinator) processAction(ctx context.Context, job domain.TeacherDialogJob) error {
+	if coordinator.Receipts == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	interaction, policyVersion, found, err := coordinator.currentInteraction(ctx, job)
+	if err != nil || !found {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingConflict
+	}
+	receipt, receiptFound, err := coordinator.Receipts.Get(ctx, job.Request.ActionReceiptID)
+	if err != nil || !receiptFound || !actionReceiptMatchesJob(receipt, job) {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingConflict
+	}
+	if interaction.State == domain.TeacherOnboardingInteractionReserved && interaction.ReservedTeacherJobID != job.TeacherJobID {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	interaction, err = coordinator.Turns.ReserveInteraction(ctx, interaction.ID, job.TeacherJobID, domain.TeacherOnboardingCoordinatorAction, receipt.IdempotencyKey, coordinator.Clock.Now().UTC())
+	if err != nil {
+		return err
+	}
+	turn, _, err := coordinator.Turns.EnsureTurn(ctx, domain.TeacherOnboardingTurn{
+		TeacherJobID: job.TeacherJobID, SourceEventID: job.Request.EventID, InteractionID: interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorAction, Stage: domain.TeacherOnboardingTurnReceived,
+		// Dialog v2 intentionally does not carry a Student command ID. The
+		// canonical receipt is the only trusted, immutable action source for it.
+		ActionReceiptID: receipt.IdempotencyKey, StudentCommandID: receipt.StudentCommandID,
+		ResponseCommandID:  domain.DeterministicOnboardingUUID("response", job.TeacherJobID),
+		StudentEffectState: domain.TeacherOnboardingEffectNotAttempted, CreatedAt: coordinator.Clock.Now().UTC(), UpdatedAt: coordinator.Clock.Now().UTC(),
+	}, job.ClaimToken)
+	if err != nil {
+		return err
+	}
+	if turn.Stage == domain.TeacherOnboardingTurnReceived {
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnReceived, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingEffectNotAttempted, "", "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+	}
+	switch turn.Stage {
+	case domain.TeacherOnboardingTurnInteractionReserved:
+		var command domain.TeacherStudentOnboardingTurnCommand
+		var hasEffect bool
+		var buildErr error
+		if receipt.Step == domain.OnboardingStepConfirmation {
+			proposal, found, proposalErr := coordinator.Turns.GetConfirmationProposal(ctx, interaction)
+			if proposalErr != nil {
+				return proposalErr
+			}
+			if !found {
+				return domain.ErrTeacherOnboardingConflict
+			}
+			command, hasEffect, buildErr = domain.BuildS5ConfirmedProposalTurn(job, interaction, receipt, proposal)
+		} else {
+			command, hasEffect, buildErr = domain.BuildS5DeterministicActionTurn(job, interaction, receipt)
+		}
+		if buildErr != nil {
+			return buildErr
+		}
+		if !hasEffect {
+			return domain.ErrTeacherOnboardingConflict // v1 finalization stays outside S5.
+		}
+		result, applyErr := coordinator.StudentTurns.ApplyTeacherOnboardingTurn(ctx, job.Request.StudentID, command)
+		if applyErr != nil {
+			// A timeout can be reconciled only by the exact receipt read. A 404
+			// is unknown, not authorization to issue a no-effect proof.
+			result, applyErr = coordinator.StudentTurns.GetTeacherOnboardingTurn(ctx, job.Request.StudentID, command.StudentCommandID)
+			if applyErr != nil {
+				return applyErr
+			}
+		}
+		if result.StudentCommandID != command.StudentCommandID || result.CanonicalStudentMessageID != command.CanonicalStudentMessageID {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		effect := domain.TeacherOnboardingEffectAccepted
+		proofID := ""
+		if result.StudentEffectState == "no_effect" {
+			effect = domain.TeacherOnboardingEffectNoEffect
+			if result.NoEffectProofID == nil {
+				return domain.ErrTeacherOnboardingConflict
+			}
+			proofID = *result.NoEffectProofID
+		}
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingTurnStudentStaged, effect, proofID, "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+		fallthrough
+	case domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnResponseStaged:
+		return coordinator.stageNextPrompt(ctx, job, turn, turn.StudentEffectState, policyVersion)
+	case domain.TeacherOnboardingTurnDeliveryPending, domain.TeacherOnboardingTurnDelivered:
+		return nil
+	default:
+		return domain.ErrTeacherOnboardingConflict
+	}
+}
+
+func (coordinator OnboardingCoordinator) processText(ctx context.Context, job domain.TeacherDialogJob, interaction domain.TeacherOnboardingInteraction, policyVersion int) error {
+	if coordinator.Semantic == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	if interaction.State == domain.TeacherOnboardingInteractionReserved && interaction.ReservedTeacherJobID != job.TeacherJobID {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	interaction, err := coordinator.Turns.ReserveInteraction(ctx, interaction.ID, job.TeacherJobID, domain.TeacherOnboardingCoordinatorText, "", coordinator.Clock.Now().UTC())
+	if err != nil {
+		return err
+	}
+	turn, _, err := coordinator.Turns.EnsureTurn(ctx, domain.TeacherOnboardingTurn{
+		TeacherJobID: job.TeacherJobID, SourceEventID: job.Request.EventID, InteractionID: interaction.ID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnReceived,
+		CausalAIExecutionID: domain.DeterministicOnboardingUUID("semantic-ai", job.TeacherJobID),
+		StudentCommandID:    domain.DeterministicOnboardingUUID("semantic-student", job.TeacherJobID),
+		ResponseCommandID:   domain.DeterministicOnboardingUUID("response", job.TeacherJobID),
+		StudentEffectState:  domain.TeacherOnboardingEffectNotAttempted, CreatedAt: coordinator.Clock.Now().UTC(), UpdatedAt: coordinator.Clock.Now().UTC(),
+	}, job.ClaimToken)
+	if err != nil {
+		return err
+	}
+	if turn.Stage == domain.TeacherOnboardingTurnReceived {
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnReceived, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingEffectNotAttempted, "", "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+	}
+	switch turn.Stage {
+	case domain.TeacherOnboardingTurnInteractionReserved:
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnInteractionReserved, domain.TeacherOnboardingTurnAIStaged, domain.TeacherOnboardingEffectNotAttempted, "", "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+		fallthrough
+	case domain.TeacherOnboardingTurnAIStaged:
+		decision, stagedTurn, semanticResponse, decisionErr := coordinator.ensureTextSemanticDecision(ctx, job, turn, interaction, policyVersion)
+		if decisionErr != nil {
+			return decisionErr
+		}
+		turn = stagedTurn
+		if decision.Kind != domain.TeacherOnboardingSemanticDecisionMutation {
+			return coordinator.stageTextResponse(ctx, job, turn, interaction, decision, semanticResponse, policyVersion)
+		}
+		var command domain.TeacherStudentOnboardingTurnCommand
+		var commandErr error
+		if policyVersion == domain.TeacherOnboardingPromptPolicyV2 {
+			command, commandErr = domain.BuildProductAwareInterpretedTextTurn(job, turn, interaction, decision)
+		} else if decision.Candidate != nil {
+			command, commandErr = domain.BuildS5InterpretedTextTurn(job, turn, interaction, *decision.Candidate)
+		} else {
+			commandErr = domain.ErrTeacherOnboardingConflict
+		}
+		if commandErr != nil {
+			return commandErr
+		}
+		result, applyErr := coordinator.StudentTurns.ApplyTeacherOnboardingTurn(ctx, job.Request.StudentID, command)
+		if applyErr != nil {
+			result, applyErr = coordinator.StudentTurns.GetTeacherOnboardingTurn(ctx, job.Request.StudentID, command.StudentCommandID)
+			if applyErr != nil {
+				return applyErr
+			}
+		}
+		if result.StudentCommandID != command.StudentCommandID || result.CanonicalStudentMessageID != command.CanonicalStudentMessageID {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		effect := domain.TeacherOnboardingEffectAccepted
+		proofID := ""
+		if result.StudentEffectState == "no_effect" {
+			effect = domain.TeacherOnboardingEffectNoEffect
+			if result.NoEffectProofID == nil {
+				return domain.ErrTeacherOnboardingConflict
+			}
+			proofID = *result.NoEffectProofID
+		}
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnAIStaged, domain.TeacherOnboardingTurnStudentStaged, effect, proofID, "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+		return coordinator.stageTextResponse(ctx, job, turn, interaction, decision, semanticResponse, policyVersion)
+	case domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnResponseStaged:
+		if turn.SemanticDecision == nil {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		semanticResponse, responseErr := coordinator.Turns.SaveSemanticDecision(ctx, job.TeacherJobID, job.ClaimToken, *turn.SemanticDecision, "", coordinator.Clock.Now().UTC())
+		if responseErr != nil {
+			return responseErr
+		}
+		return coordinator.stageTextResponse(ctx, job, turn, interaction, *turn.SemanticDecision, semanticResponse, policyVersion)
+	case domain.TeacherOnboardingTurnDeliveryPending, domain.TeacherOnboardingTurnDelivered:
+		return nil
+	default:
+		return domain.ErrTeacherOnboardingConflict
+	}
+}
+
+// processStaleText consumes a reply that targets a known but no-longer-current
+// prompt. It must not run generic chat or an LLM: the response is a durable,
+// deterministic warning and leaves the current interaction untouched.
+func (coordinator OnboardingCoordinator) processStaleText(ctx context.Context, job domain.TeacherDialogJob, interaction domain.TeacherOnboardingInteraction) error {
+	turn, _, err := coordinator.Turns.EnsureTurn(ctx, domain.TeacherOnboardingTurn{
+		TeacherJobID: job.TeacherJobID, SourceEventID: job.Request.EventID,
+		Mode: domain.TeacherOnboardingCoordinatorText, Stage: domain.TeacherOnboardingTurnReceived,
+		CausalAIExecutionID: domain.DeterministicOnboardingUUID("semantic-ai", job.TeacherJobID),
+		StudentCommandID:    domain.DeterministicOnboardingUUID("semantic-student", job.TeacherJobID),
+		ResponseCommandID:   domain.DeterministicOnboardingUUID("response", job.TeacherJobID),
+		StudentEffectState:  domain.TeacherOnboardingEffectNotAttempted,
+		CreatedAt:           coordinator.Clock.Now().UTC(), UpdatedAt: coordinator.Clock.Now().UTC(),
+	}, job.ClaimToken)
+	if err != nil {
+		return err
+	}
+	if turn.Stage == domain.TeacherOnboardingTurnReceived {
+		if err = coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnReceived, domain.TeacherOnboardingTurnResponseStaged, domain.TeacherOnboardingEffectNotAttempted, "", "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		turn, _, err = coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+		if err != nil {
+			return err
+		}
+	}
+	if turn.Stage != domain.TeacherOnboardingTurnResponseStaged && turn.Stage != domain.TeacherOnboardingTurnDeliveryPending && turn.Stage != domain.TeacherOnboardingTurnDelivered {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	if turn.Stage == domain.TeacherOnboardingTurnResponseStaged {
+		body := "Этот ответ относится к уже завершённому вопросу. Пожалуйста, используйте текущий вопрос."
+		if interaction.State == domain.TeacherOnboardingInteractionActive || interaction.State == domain.TeacherOnboardingInteractionReserved {
+			body = "Пожалуйста, ответьте на текущий вопрос — предыдущее сообщение больше не активно."
+		}
+		return coordinator.Jobs.SaveCoordinatedResponse(ctx, job.Request.EventID, job.ClaimToken, domain.TeacherCoordinatedDialogResponse{
+			Mode: string(domain.TeacherOnboardingCoordinatorText), Body: body,
+		}, coordinator.Clock.Now().UTC())
+	}
+	return nil
+}
+
+func (coordinator OnboardingCoordinator) ensureTextSemanticDecision(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn, interaction domain.TeacherOnboardingInteraction, policyVersion int) (domain.TeacherOnboardingSemanticDecision, domain.TeacherOnboardingTurn, string, error) {
+	if turn.SemanticDecision != nil {
+		response, err := coordinator.Turns.SaveSemanticDecision(ctx, job.TeacherJobID, job.ClaimToken, *turn.SemanticDecision, "", coordinator.Clock.Now().UTC())
+		return *turn.SemanticDecision, turn, response, err
+	}
+	execution, err := coordinator.interpretText(ctx, job, turn, interaction, policyVersion)
+	if err != nil {
+		// A known expired/missing execution has no Student effect because the
+		// decision has not been committed yet. Preserve the active prompt and
+		// emit a deterministic clarification rather than reusing its key.
+		if !errors.Is(err, domain.ErrTeacherOnboardingSemanticUnknown) {
+			return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", err
+		}
+		state, stateErr := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+		if stateErr != nil {
+			return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", stateErr
+		}
+		body := "Не удалось надёжно разобрать ответ. Пожалуйста, выберите вариант в текущем вопросе."
+		if domain.OnboardingLocale(state.Draft) == "en" {
+			body = "I could not safely interpret that answer. Please choose an option in the current question."
+		}
+		execution.Result, stateErr = domain.NormalizeTeacherOnboardingSemanticResult(domain.TeacherOnboardingSemanticResult{
+			Schema: domain.TeacherOnboardingSemanticSchemaCode, Response: body,
+			SlotCandidates: []domain.TeacherOnboardingSemanticCandidate{}, Questions: []domain.TeacherOnboardingSemanticQuestion{}, Uncertainties: []domain.TeacherOnboardingSemanticUncertainty{},
+		})
+		if stateErr != nil {
+			return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", stateErr
+		}
+	}
+	var decision domain.TeacherOnboardingSemanticDecision
+	var decisionErr error
+	if policyVersion == domain.TeacherOnboardingPromptPolicyV2 {
+		state, stateErr := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+		if stateErr != nil {
+			return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", stateErr
+		}
+		decision, decisionErr = domain.NewProductAwareTeacherOnboardingSemanticDecision(execution.Result, interaction, state)
+	} else {
+		decision, decisionErr = domain.NewTeacherOnboardingSemanticDecision(execution.Result, interaction)
+	}
+	if decisionErr != nil {
+		return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", decisionErr
+	}
+	semanticResponse, saveErr := coordinator.Turns.SaveSemanticDecision(ctx, job.TeacherJobID, job.ClaimToken, decision, execution.Result.Response, coordinator.Clock.Now().UTC())
+	if saveErr != nil {
+		return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", saveErr
+	}
+	staged, found, getErr := coordinator.Turns.GetTurn(ctx, job.TeacherJobID)
+	if getErr != nil || !found || staged.SemanticDecision == nil || staged.SemanticDecision.Digest != decision.Digest {
+		if getErr != nil {
+			return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", getErr
+		}
+		return domain.TeacherOnboardingSemanticDecision{}, domain.TeacherOnboardingTurn{}, "", domain.ErrTeacherOnboardingConflict
+	}
+	return *staged.SemanticDecision, staged, semanticResponse, nil
+}
+
+func (coordinator OnboardingCoordinator) stageNextPrompt(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn, effect domain.TeacherOnboardingStudentEffectState, policyVersion int) error {
+	if policyVersion == domain.TeacherOnboardingPromptPolicyV2 && effect == domain.TeacherOnboardingEffectAccepted {
+		return coordinator.stageProductAwareResponse(ctx, job, turn)
+	}
+	if policyVersion == domain.TeacherOnboardingPromptPolicyV2 && effect == domain.TeacherOnboardingEffectNoEffect {
+		if turn.Stage == domain.TeacherOnboardingTurnStudentStaged {
+			if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnResponseStaged, effect, turn.NoEffectProofID, "", coordinator.Clock.Now().UTC()); err != nil {
+				return err
+			}
+		} else if turn.Stage != domain.TeacherOnboardingTurnResponseStaged {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		return coordinator.Jobs.SaveCoordinatedResponse(ctx, job.Request.EventID, job.ClaimToken, domain.TeacherCoordinatedDialogResponse{
+			Mode: string(turn.Mode), Body: "Этот выбор не изменил данные. Пожалуйста, ответьте на текущий вопрос ещё раз.",
+		}, coordinator.Clock.Now().UTC())
+	}
+	state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+	if err != nil || state.Draft.Status != domain.StudentOnboardingDraftDraft {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	step, err := domain.NextTeacherOnboardingStep(state.Draft)
+	if err != nil || step == domain.OnboardingStepComplete {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	body, ui, err := domain.BuildTeacherOnboardingPrompt(step, domain.OnboardingLocale(state.Draft), state.Draft.Version)
+	if err != nil {
+		return err
+	}
+	if turn.Stage == domain.TeacherOnboardingTurnStudentStaged {
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnResponseStaged, effect, turn.NoEffectProofID, "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+	} else if turn.Stage != domain.TeacherOnboardingTurnResponseStaged {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	if err := coordinator.Jobs.SaveCoordinatedResponse(ctx, job.Request.EventID, job.ClaimToken, domain.TeacherCoordinatedDialogResponse{Mode: string(domain.TeacherOnboardingCoordinatorAction), Body: body, AssistantUI: ui}, coordinator.Clock.Now().UTC()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (coordinator OnboardingCoordinator) stageProductAwareResponse(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn) error {
+	if coordinator.Readiness == nil || coordinator.ProductResponses == nil || turn.Stage != domain.TeacherOnboardingTurnStudentStaged || turn.StudentEffectState != domain.TeacherOnboardingEffectAccepted {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	stateRef, state, err := coordinator.recoverAcceptedStudentState(ctx, job, turn)
+	if err != nil {
+		return err
+	}
+	readiness, err := coordinator.Readiness.ResolveLearningReadiness(ctx, job.Request.StudentID, stateRef)
+	if errors.Is(err, domain.ErrTeacherLearningReadinessStale) {
+		// A 409 is reconciled only through the immutable Student command
+		// receipt. If authoritative state still equals that receipt, repeat the
+		// same pure read once; otherwise block without advancing the cursor.
+		stateRef, state, err = coordinator.recoverAcceptedStudentState(ctx, job, turn)
+		if err != nil {
+			return err
+		}
+		readiness, err = coordinator.Readiness.ResolveLearningReadiness(ctx, job.Request.StudentID, stateRef)
+	}
+	if err != nil {
+		return err
+	}
+	plan, err := domain.BuildTeacherProductAwareOnboardingPlan(readiness, state, job.Request.StudentID, domain.OnboardingLocale(state.Draft))
+	if err != nil {
+		return err
+	}
+	sourceInteraction, found, err := coordinator.Turns.GetInteraction(ctx, job.Request.DialogID, job.Request.ReplyToMessageID, job.Request.PersonalTeacherID)
+	if err != nil || !found || sourceInteraction.ID != turn.InteractionID {
+		if err != nil {
+			return err
+		}
+		return domain.ErrTeacherOnboardingConflict
+	}
+	if sourceInteraction.SessionSchemaVersion == 3 && plan.Status == domain.TeacherOnboardingSessionPlanningReady {
+		if coordinator.Handoffs == nil || readiness.Goal == nil || turn.InteractionID == "" {
+			return domain.ErrTeacherOnboardingUnavailable
+		}
+		binding, bindingErr := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+			ID: job.Request.DialogID, StudentID: job.Request.StudentID, PersonalTeacherID: job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral,
+		})
+		if bindingErr != nil {
+			return bindingErr
+		}
+		intent, intentErr := domain.BuildTeacherOnboardingHandoffIntent(domain.PersonalTeacher{ID: job.Request.PersonalTeacherID, StudentID: job.Request.StudentID}, binding, readiness, domain.OnboardingLocale(state.Draft), job.TeacherJobID, turn.InteractionID, coordinator.Clock.Now().UTC())
+		if intentErr != nil {
+			return intentErr
+		}
+		_, _, enqueueErr := coordinator.Handoffs.Enqueue(ctx, repository.TeacherOnboardingHandoffEnqueue{
+			Intent: intent, EventID: job.Request.EventID, ClaimToken: job.ClaimToken,
+		}, coordinator.Clock.Now().UTC())
+		return enqueueErr
+	}
+	return coordinator.ProductResponses.StageProductAwareOnboardingResponse(ctx, job.Request.EventID, job.ClaimToken, domain.TeacherCoordinatedDialogResponse{
+		Mode: string(turn.Mode), Body: plan.Body, AssistantUI: plan.AssistantUI,
+	}, coordinator.Clock.Now().UTC())
+}
+
+func (coordinator OnboardingCoordinator) recoverAcceptedStudentState(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn) (domain.TeacherStudentReadinessStateRef, domain.TeacherStudentOnboardingState, error) {
+	receipt, err := coordinator.StudentTurns.GetTeacherOnboardingTurn(ctx, job.Request.StudentID, turn.StudentCommandID)
+	if err != nil || receipt.StudentCommandID != turn.StudentCommandID || receipt.CanonicalStudentMessageID != job.Request.CanonicalStudentMessageID ||
+		receipt.StudentEffectState != "accepted" || receipt.ResultDraftVersion == nil || *receipt.ResultDraftVersion < 1 || receipt.NoEffectProofID != nil {
+		if err != nil {
+			return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, err
+		}
+		return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, domain.ErrTeacherOnboardingConflict
+	}
+	stateRef := domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: *receipt.ResultDraftVersion}
+	state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+	if err != nil {
+		return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, err
+	}
+	currentRef, err := domain.TeacherReadinessStateRefFromOnboarding(state, job.Request.StudentID)
+	if err != nil {
+		return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, err
+	}
+	if currentRef != stateRef {
+		advanceErr := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, domain.TeacherOnboardingTurnStudentStaged, domain.TeacherOnboardingTurnBlockedUnknown, domain.TeacherOnboardingEffectCommittedUnreconciled, "", "", coordinator.Clock.Now().UTC())
+		if advanceErr != nil {
+			return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, advanceErr
+		}
+		return domain.TeacherStudentReadinessStateRef{}, domain.TeacherStudentOnboardingState{}, domain.ErrTeacherOnboardingConflict
+	}
+	return stateRef, state, nil
+}
+
+func (coordinator OnboardingCoordinator) interpretText(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn, interaction domain.TeacherOnboardingInteraction, policyVersion int) (domain.TeacherOnboardingSemanticExecution, error) {
+	contextValue, err := coordinator.DialogReader.GetTeacherRequestContext(ctx, job.Request, 49)
+	if err != nil || len(contextValue.Messages) == 0 {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingConflict
+	}
+	source := contextValue.Messages[len(contextValue.Messages)-1]
+	var prompt *domain.DialogMessage
+	for index := range contextValue.Messages {
+		if contextValue.Messages[index].ID == interaction.PromptMessageID {
+			prompt = &contextValue.Messages[index]
+			break
+		}
+	}
+	if prompt == nil {
+		return domain.TeacherOnboardingSemanticExecution{}, domain.ErrTeacherOnboardingConflict
+	}
+	state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	if policyVersion == domain.TeacherOnboardingPromptPolicyV2 && interaction.SlotCode == domain.TeacherOnboardingSlotDirection {
+		normalizedText := strings.ToLower(strings.TrimSpace(source.Body))
+		if normalizedText == "не знаю" || normalizedText == "не уверен" || normalizedText == "не уверена" || normalizedText == "i don't know" || normalizedText == "not sure" {
+			result, resultErr := domain.NormalizeTeacherOnboardingSemanticResult(domain.TeacherOnboardingSemanticResult{
+				Schema: domain.TeacherOnboardingSemanticSchemaCode, Response: "Спасибо, начнём с основ.",
+				SlotCandidates: []domain.TeacherOnboardingSemanticCandidate{{Slot: domain.TeacherOnboardingSlotDirection, CodeValue: "undecided", StringListValue: []string{}, ConfidenceBasisPoints: 10000}},
+				Questions:      []domain.TeacherOnboardingSemanticQuestion{}, Uncertainties: []domain.TeacherOnboardingSemanticUncertainty{},
+			})
+			return domain.TeacherOnboardingSemanticExecution{Result: result, LanguageCode: domain.OnboardingLocale(state.Draft), TemplateVersion: 1}, resultErr
+		}
+	}
+	request, err := domain.BuildS5TextSemanticRequest(job, turn, interaction, state, source, *prompt)
+	if err != nil {
+		return domain.TeacherOnboardingSemanticExecution{}, err
+	}
+	execution, err := coordinator.Semantic.InterpretOnboardingSemantic(ctx, request)
+	if err == nil {
+		return execution, nil
+	}
+	// A transport acknowledgement can be ambiguous. Reconciliation is always
+	// by the same caller-issued key; an unknown GET is not a no-effect proof and
+	// leaves the job retryable with that same immutable semantic binding.
+	if execution, replayErr := coordinator.Semantic.ReplayOnboardingSemantic(ctx, turn.CausalAIExecutionID); replayErr == nil {
+		return execution, nil
+	}
+	return domain.TeacherOnboardingSemanticExecution{}, err
+}
+
+func (coordinator OnboardingCoordinator) stageTextResponse(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn, interaction domain.TeacherOnboardingInteraction, decision domain.TeacherOnboardingSemanticDecision, semanticResponse string, policyVersion int) error {
+	if turn.Mode != domain.TeacherOnboardingCoordinatorText || turn.InteractionID != interaction.ID ||
+		(turn.Stage != domain.TeacherOnboardingTurnAIStaged && turn.Stage != domain.TeacherOnboardingTurnStudentStaged && turn.Stage != domain.TeacherOnboardingTurnResponseStaged) {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	// The persisted decision deliberately contains no provider wording.  These
+	// server-owned replies make recovery deterministic without retaining the
+	// raw semantic result; the final body itself exists only in the staged job
+	// and then Dialog history.
+	response := domain.TeacherCoordinatedDialogResponse{Mode: string(domain.TeacherOnboardingCoordinatorText), Body: "Спасибо, учту ваш ответ. Продолжим."}
+	switch turn.StudentEffectState {
+	case domain.TeacherOnboardingEffectAccepted:
+		// An accepted S3 effect is only valid for the exact low-risk candidate
+		// selected before the Apply call. A replayed AI result may never turn a
+		// previously staged Student effect into a different response/UI path.
+		if decision.Kind != domain.TeacherOnboardingSemanticDecisionMutation || (decision.Candidate == nil && len(decision.Candidates) == 0) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		if policyVersion == domain.TeacherOnboardingPromptPolicyV2 {
+			return coordinator.stageProductAwareResponse(ctx, job, turn)
+		}
+		state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+		if err != nil || state.Draft.Status != domain.StudentOnboardingDraftDraft || state.Draft.Version <= interaction.ExpectedDraftVersion {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		step, err := domain.NextTeacherOnboardingStep(state.Draft)
+		if err != nil || step == domain.OnboardingStepComplete {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		body, ui, err := domain.BuildTeacherOnboardingPrompt(step, domain.OnboardingLocale(state.Draft), state.Draft.Version)
+		if err != nil {
+			return err
+		}
+		response.Body, response.AssistantUI = body, ui
+	case domain.TeacherOnboardingEffectNoEffect:
+		// A no-effect receipt is still tied to the exact deterministic S3
+		// command. It cannot be reused to acknowledge a response-only model
+		// result, otherwise a later replay could hide a different attempted
+		// mutation behind the same Teacher turn.
+		if decision.Kind != domain.TeacherOnboardingSemanticDecisionMutation ||
+			(decision.Candidate == nil && len(decision.Candidates) == 0) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+	case domain.TeacherOnboardingEffectNotAttempted:
+		if policyVersion == domain.TeacherOnboardingPromptPolicyV2 && decision.Kind == domain.TeacherOnboardingSemanticDecisionResponseOnly {
+			response.Body = "Не удалось надёжно связать ответ с текущим вопросом. Пожалуйста, ответьте на него ещё раз."
+		} else if decision.Kind == domain.TeacherOnboardingSemanticDecisionResponseOnly && semanticResponse != "" {
+			response.Body = semanticResponse
+		} else {
+			response.Body = "Давайте уточним ответ в текущем вопросе."
+		}
+		if decision.Kind == domain.TeacherOnboardingSemanticDecisionMutation {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		if decision.Kind == domain.TeacherOnboardingSemanticDecisionConfirmation {
+			state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+			if err != nil || state.Draft.Status != domain.StudentOnboardingDraftDraft || state.Draft.Version != interaction.ExpectedDraftVersion || state.ProfileVersion != interaction.ExpectedProfileVersion {
+				return domain.ErrTeacherOnboardingConflict
+			}
+			var body string
+			var ui []byte
+			var buildErr error
+			if policyVersion == domain.TeacherOnboardingPromptPolicyV2 {
+				body, ui, buildErr = domain.BuildProductAwareTeacherOnboardingPrompt(domain.OnboardingStepConfirmation, domain.OnboardingLocale(state.Draft), state.Draft.Version)
+			} else {
+				body, ui, buildErr = domain.BuildTeacherOnboardingPrompt(domain.OnboardingStepConfirmation, domain.OnboardingLocale(state.Draft), state.Draft.Version)
+			}
+			if buildErr != nil {
+				return buildErr
+			}
+			response.Body, response.AssistantUI = body, ui
+		}
+	default:
+		return domain.ErrTeacherOnboardingConflict
+	}
+	if turn.Stage != domain.TeacherOnboardingTurnResponseStaged {
+		if err := coordinator.Turns.Advance(ctx, job.TeacherJobID, job.ClaimToken, turn.Stage, domain.TeacherOnboardingTurnResponseStaged, turn.StudentEffectState, turn.NoEffectProofID, "", coordinator.Clock.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	return coordinator.Jobs.SaveCoordinatedResponse(ctx, job.Request.EventID, job.ClaimToken, response, coordinator.Clock.Now().UTC())
+}
+
+func (coordinator OnboardingCoordinator) currentInteraction(ctx context.Context, job domain.TeacherDialogJob) (domain.TeacherOnboardingInteraction, int, bool, error) {
+	contextValue, err := coordinator.DialogReader.GetTeacherRequestContext(ctx, job.Request, 49)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, 0, false, err
+	}
+	if len(contextValue.Messages) == 0 {
+		return domain.TeacherOnboardingInteraction{}, 0, false, domain.ErrInvalidDialogContext
+	}
+	source := contextValue.Messages[len(contextValue.Messages)-1]
+	if source.ID != job.Request.SourceMessageID || source.ReplyToMessageID != job.Request.ReplyToMessageID || source.Status != 1 {
+		return domain.TeacherOnboardingInteraction{}, 0, false, domain.ErrTeacherOnboardingConflict
+	}
+	if source.Version != int(job.Request.SourceMessageVersion) {
+		return domain.TeacherOnboardingInteraction{}, 0, false, errKnownOnboardingStale
+	}
+	interaction, found, err := coordinator.Turns.GetActiveInteraction(ctx, job.Request.DialogID, job.Request.ReplyToMessageID, job.Request.PersonalTeacherID)
+	if err != nil || !found {
+		return interaction, 0, found, err
+	}
+	var prompt *domain.DialogMessage
+	for index := range contextValue.Messages {
+		if contextValue.Messages[index].ID == interaction.PromptMessageID {
+			prompt = &contextValue.Messages[index]
+			break
+		}
+	}
+	if prompt == nil || prompt.AuthorType != domain.DialogMessageAuthorPersonalTeacher || prompt.Status != 1 || prompt.Version != int(interaction.PromptMessageVersion) {
+		return domain.TeacherOnboardingInteraction{}, 0, false, domain.ErrTeacherOnboardingConflict
+	}
+	digest, digestErr := domain.DigestTeacherAssistantUI(prompt.AssistantUI)
+	if digestErr != nil || digest != interaction.PromptAssistantUIDigest {
+		return domain.TeacherOnboardingInteraction{}, 0, false, domain.ErrTeacherOnboardingConflict
+	}
+	policyVersion, policyErr := domain.TeacherOnboardingPromptPolicyVersion(prompt.AssistantUI)
+	if policyErr != nil {
+		return domain.TeacherOnboardingInteraction{}, 0, false, domain.ErrTeacherOnboardingConflict
+	}
+	return interaction, policyVersion, true, nil
+}
+
+func (coordinator OnboardingCoordinator) nextDeliveredPromptInteraction(ctx context.Context, job domain.TeacherDialogJob, turn domain.TeacherOnboardingTurn, message domain.DialogMessage) (*domain.TeacherOnboardingInteraction, error) {
+	if len(message.AssistantUI) == 0 {
+		return nil, nil
+	}
+	sourceInteraction, found, err := coordinator.Turns.GetInteraction(ctx, job.Request.DialogID, job.Request.ReplyToMessageID, job.Request.PersonalTeacherID)
+	if err != nil || !found || sourceInteraction.ID != turn.InteractionID {
+		if err != nil {
+			return nil, err
+		}
+		return nil, domain.ErrTeacherOnboardingConflict
+	}
+	interactionSessionSchemaVersion := sourceInteraction.SessionSchemaVersion
+	state, err := coordinator.Students.GetTeacherOnboardingState(ctx, job.Request.StudentID)
+	if err != nil || state.Draft.Status != domain.StudentOnboardingDraftDraft {
+		return nil, domain.ErrTeacherOnboardingConflict
+	}
+	step, policyVersion, err := domain.TeacherOnboardingPromptStep(message.AssistantUI)
+	if err != nil || step == domain.OnboardingStepComplete {
+		return nil, domain.ErrTeacherOnboardingConflict
+	}
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: job.Request.DialogID, StudentID: job.Request.StudentID, PersonalTeacherID: job.Request.PersonalTeacherID, ContextType: domain.LearningContextGeneral})
+	if err != nil {
+		return nil, err
+	}
+	if turn.Mode == domain.TeacherOnboardingCoordinatorText && turn.SemanticDecision != nil && turn.SemanticDecision.Kind == domain.TeacherOnboardingSemanticDecisionConfirmation {
+		if step != domain.OnboardingStepConfirmation || (turn.SemanticDecision.PolicyVersion == domain.TeacherOnboardingPromptPolicyV2) != (policyVersion == domain.TeacherOnboardingPromptPolicyV2) {
+			return nil, domain.ErrTeacherOnboardingConflict
+		}
+		interaction, confirmationErr := domain.NewS5ConfirmationInteractionForResponse(binding, message, job.Request.SourceMessageID, *turn.SemanticDecision, state.Draft.Version, state.ProfileVersion, interactionSessionSchemaVersion, coordinator.Clock.Now().UTC())
+		if confirmationErr != nil {
+			return nil, confirmationErr
+		}
+		return &interaction, nil
+	}
+	if policyVersion == domain.TeacherOnboardingPromptPolicyV1 {
+		expectedStep, stepErr := domain.NextTeacherOnboardingStep(state.Draft)
+		if stepErr != nil || expectedStep != step {
+			return nil, domain.ErrTeacherOnboardingConflict
+		}
+	}
+	interaction, err := domain.NewS5OnboardingInteractionForResponse(binding, message, job.Request.SourceMessageID, step, state.Draft.Version, state.ProfileVersion, interactionSessionSchemaVersion, coordinator.Clock.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	return &interaction, nil
+}
+
+func (coordinator OnboardingCoordinator) valid() bool {
+	// A canonical action must stay deterministic and available without an AI
+	// Prompt client. The text branch checks Semantic explicitly before it can
+	// issue its one semantic execution.
+	return coordinator.Jobs != nil && coordinator.Turns != nil && coordinator.StudentTurns != nil && coordinator.Students != nil && coordinator.DialogReader != nil && coordinator.Appender != nil && coordinator.Deliveries != nil && coordinator.Clock != nil
+}
+
+func eligibleS5OnboardingRequest(request domain.DialogTeacherRequest) bool {
+	return request.UsesDenseTeacherOrdering() && request.ContextType == domain.LearningContextGeneral && request.LearningActionID == "" && request.HasFrozenOnboardingReplyMetadata()
+}
+
+func actionReceiptMatchesJob(receipt domain.OnboardingActionReceipt, job domain.TeacherDialogJob) bool {
+	return receipt.IdempotencyKey == job.Request.ActionReceiptID && receipt.ExecutionMode == domain.OnboardingActionExecutionCanonical && receipt.Status == domain.OnboardingReceiptMaterialized &&
+		receipt.StudentID == job.Request.StudentID && receipt.PersonalTeacherID == job.Request.PersonalTeacherID && receipt.DialogID == job.Request.DialogID &&
+		receipt.CanonicalStudentMessageID == job.Request.CanonicalStudentMessageID && receipt.CanonicalStudentMessageID == job.Request.SourceMessageID &&
+		receipt.SourceMessageID == job.Request.ReplyToMessageID && receipt.SourceMessageVersion > 0
+}
+
+var _ UnifiedOnboardingCoordinator = OnboardingCoordinator{}

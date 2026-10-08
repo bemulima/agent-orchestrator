@@ -1,0 +1,204 @@
+package domain
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+type LessonSourceReference struct {
+	ID         string `json:"id"`
+	RevisionID string `json:"revision_id,omitempty"`
+}
+type LessonRequirement struct {
+	ID              string                `json:"requirement_id"`
+	ActivityID      string                `json:"activity_id"`
+	Type            string                `json:"type"`
+	Required        bool                  `json:"required"`
+	SourceReference LessonSourceReference `json:"source_reference"`
+	Satisfied       bool                  `json:"satisfied"`
+}
+type LessonRevisionActivity struct {
+	ID              string                `json:"activity_id"`
+	Type            string                `json:"type"`
+	Required        bool                  `json:"required"`
+	SourceReference LessonSourceReference `json:"source_reference"`
+}
+type LessonRevision struct {
+	Schema     string                   `json:"schema"`
+	LessonID   string                   `json:"lesson_id"`
+	ID         string                   `json:"lesson_revision_id"`
+	Content    json.RawMessage          `json:"content"`
+	Activities []LessonRevisionActivity `json:"activities"`
+}
+type LessonActivityFact struct {
+	StudentID, ItemID, RequirementID, Type, SourceID, SourceRevisionID, FactID string
+	OccurredAt                                                                 time.Time
+}
+
+func ValidateLessonAssignment(item LearningPathItem) error {
+	if item.ID != "" && !validJourneyUUID(item.ID) {
+		return ErrValidation
+	}
+	if item.LessonRevisionID == "" {
+		if len(item.FrozenRequirements) != 0 {
+			return ErrValidation
+		}
+		return nil
+	}
+	if item.ReferenceType != "lesson" || !validJourneyUUID(item.ID) || !validJourneyUUID(item.LessonRevisionID) || len(item.FrozenRequirements) == 0 || len(item.FrozenRequirements) > 500 {
+		return ErrValidation
+	}
+	seen := map[string]bool{}
+	required := false
+	for _, r := range item.FrozenRequirements {
+		if !validJourneyUUID(r.ID) || !validJourneyUUID(r.ActivityID) || seen[r.ID] || !validJourneyUUID(r.SourceReference.ID) {
+			return ErrValidation
+		}
+		seen[r.ID] = true
+		switch r.Type {
+		case "theory_acknowledged":
+		case "quiz_passed", "task_passed", "practice_completed":
+			if !validJourneyUUID(r.SourceReference.RevisionID) {
+				return ErrValidation
+			}
+		default:
+			return ErrValidation
+		}
+		required = required || r.Required
+	}
+	if !required {
+		return ErrValidation
+	}
+	return nil
+}
+
+// SatisfyLessonRequirement applies only a matching authoritative successful fact.
+// Attempt failures are deliberately absent from this contract.
+func SatisfyLessonRequirement(item LearningPathItem, fact LessonActivityFact) (LearningPathItem, bool, error) {
+	if err := ValidateLessonAssignment(item); err != nil || item.LessonRevisionID == "" || item.ID != fact.ItemID || !validJourneyUUID(fact.FactID) {
+		return item, false, ErrValidation
+	}
+	if item.Status == LearningPathItemSkippedMastered {
+		return item, false, ErrConflict
+	}
+	item.FrozenRequirements = append([]LessonRequirement(nil), item.FrozenRequirements...)
+	found := false
+	changed := false
+	for i, r := range item.FrozenRequirements {
+		if r.ID != fact.RequirementID {
+			continue
+		}
+		found = true
+		if r.Type != fact.Type || r.SourceReference.ID != fact.SourceID || r.SourceReference.RevisionID != fact.SourceRevisionID {
+			return item, false, ErrConflict
+		}
+		if !r.Satisfied {
+			item.FrozenRequirements[i].Satisfied = true
+			changed = true
+		}
+	}
+	if !found {
+		return item, false, ErrNotFound
+	}
+	if !changed {
+		return item, false, nil
+	}
+	complete := true
+	for _, r := range item.FrozenRequirements {
+		if r.Required && !r.Satisfied {
+			complete = false
+		}
+	}
+	if complete {
+		item.Status = LearningPathItemCompleted
+		item.ReasonCode = "lesson_requirements_satisfied"
+	} else {
+		item.Status = LearningPathItemInProgress
+		item.ReasonCode = "lesson_activity_satisfied"
+	}
+	return item, true, nil
+}
+
+func PublicLessonContent(raw json.RawMessage) (json.RawMessage, error) {
+	var content map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, fmt.Errorf("invalid frozen content: %w", err)
+	}
+	output := map[string]json.RawMessage{}
+	for _, key := range []string{"title", "excerpt", "description", "translations"} {
+		if v, ok := content[key]; ok {
+			output[key] = v
+		}
+	}
+	var tasks []map[string]json.RawMessage
+	if err := json.Unmarshal(content["tasks"], &tasks); err != nil && len(content["tasks"]) != 0 {
+		return nil, err
+	}
+	publicTasks := []any{}
+	for _, task := range tasks {
+		t := map[string]json.RawMessage{}
+		for _, key := range []string{"id", "lesson_id", "title", "description", "type", "task_kind", "execution_mode", "evaluation_mode", "ui_mode", "submission_mode", "order", "status", "max_attempts", "requires_sandbox", "exposes_preview", "exposes_terminal", "supports_live_validation"} {
+			if v, ok := task[key]; ok {
+				t[key] = v
+			}
+		}
+		var tests []map[string]json.RawMessage
+		_ = json.Unmarshal(task["tests"], &tests)
+		publicTests := []any{}
+		for _, test := range tests {
+			q := map[string]json.RawMessage{}
+			for _, key := range []string{"id", "kind", "title", "description", "order"} {
+				if v, ok := test[key]; ok {
+					q[key] = v
+				}
+			}
+			for _, key := range []string{"variants", "groups"} {
+				var rows []map[string]json.RawMessage
+				_ = json.Unmarshal(test[key], &rows)
+				clean := []any{}
+				for _, row := range rows {
+					r := map[string]json.RawMessage{}
+					for _, field := range []string{"id", "title", "text", "order"} {
+						if v, ok := row[field]; ok {
+							r[field] = v
+						}
+					}
+					clean = append(clean, r)
+				}
+				q[key], _ = json.Marshal(clean)
+			}
+			publicTests = append(publicTests, q)
+		}
+		var structure any
+		if json.Unmarshal(task["code_structure"], &structure) == nil {
+			var scrub func(any)
+			scrub = func(value any) {
+				switch x := value.(type) {
+				case map[string]any:
+					for k, v := range x {
+						switch k {
+						case "expected_answers", "reference_solution", "private_suite_ref", "private_test_suite", "negative_fixtures", "verifier_artifacts", "answer_key":
+							delete(x, k)
+						default:
+							scrub(v)
+						}
+					}
+				case []any:
+					for _, v := range x {
+						scrub(v)
+					}
+				}
+			}
+			scrub(structure)
+			t["code_structure"], _ = json.Marshal(structure)
+		}
+		if v, ok := task["code_structure_type_code"]; ok {
+			t["code_structure_type_code"] = v
+		}
+		t["tests"], _ = json.Marshal(publicTests)
+		publicTasks = append(publicTasks, t)
+	}
+	output["tasks"], _ = json.Marshal(publicTasks)
+	return json.Marshal(output)
+}

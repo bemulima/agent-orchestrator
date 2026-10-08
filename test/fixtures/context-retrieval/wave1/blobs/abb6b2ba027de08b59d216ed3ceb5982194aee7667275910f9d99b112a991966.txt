@@ -1,0 +1,163 @@
+package intervention
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/stretchr/testify/require"
+)
+
+type interventionTeacherStub struct{ teacher domain.PersonalTeacher }
+
+func (stub interventionTeacherStub) Execute(context.Context, string) (domain.PersonalTeacher, error) {
+	return stub.teacher, nil
+}
+
+type interventionStoreStub struct {
+	record      domain.InterventionRecord
+	decision    domain.TeacherDecision
+	already     bool
+	deliveredID string
+}
+
+func (stub *interventionStoreStub) Commit(_ context.Context, _ domain.LearningActivitySignal, record domain.InterventionRecord, decision domain.TeacherDecision, _ domain.IntegrationEvent) (domain.InterventionRecord, bool, error) {
+	stub.record = record
+	stub.decision = decision
+	return record, true, nil
+}
+func (stub *interventionStoreStub) HasDeliveredInSession(context.Context, string, string) (bool, error) {
+	return stub.already, nil
+}
+func (stub *interventionStoreStub) MarkDelivered(_ context.Context, _, _, messageID string, _ time.Time) error {
+	stub.deliveredID = messageID
+	return nil
+}
+
+type interventionDialogStub struct {
+	appended string
+	binding  domain.TeacherDialogBinding
+}
+
+func (stub *interventionDialogStub) EnsureTeacherDialog(_ context.Context, studentID, teacherID string, contextType domain.LearningContextType, contextID string) (domain.TeacherDialogBinding, error) {
+	stub.binding = domain.TeacherDialogBinding{
+		ID: "77777777-7777-4777-8777-777777777777", StudentID: studentID,
+		PersonalTeacherID: teacherID, ContextType: contextType, ContextID: contextID,
+	}
+	return stub.binding, nil
+}
+func (stub *interventionDialogStub) AppendTeacherProactive(_ context.Context, binding domain.TeacherDialogBinding, _, body string) (domain.DialogMessage, error) {
+	stub.appended = body
+	return domain.DialogMessage{ID: "88888888-8888-4888-8888-888888888888"}, nil
+}
+
+type interventionIDs struct{ values []string }
+
+func (stub *interventionIDs) NewID() string {
+	value := stub.values[0]
+	stub.values = stub.values[1:]
+	return value
+}
+
+type interventionClock struct{ now time.Time }
+
+func (clock interventionClock) Now() time.Time { return clock.now }
+
+func interventionRegistry(t *testing.T) *Registry {
+	registry, err := NewRegistry("balanced",
+		ThresholdPolicy{Mode: "balanced", MinimumFailures: 3, MinimumActiveSeconds: 480},
+		ThresholdPolicy{Mode: "quiet", MinimumFailures: 5, MinimumActiveSeconds: 900},
+		ThresholdPolicy{Mode: "proactive", MinimumFailures: 3, MinimumActiveSeconds: 300, OfferAfterIdleSeconds: 900},
+	)
+	require.NoError(t, err)
+	return registry
+}
+
+func interventionSignal() domain.LearningActivitySignal {
+	return domain.LearningActivitySignal{
+		EventID: "11111111-1111-4111-8111-111111111111", StudentID: "22222222-2222-4222-8222-222222222222",
+		AnalyticsSessionID: "33333333-3333-4333-8333-333333333333", CourseID: "44444444-4444-4444-8444-444444444444",
+		LessonID: "55555555-5555-4555-8555-555555555555", TaskID: "66666666-6666-4666-8666-666666666666",
+		SignalType: "repeated_failure", ConsecutiveFailures: 3, SameErrorCount: 3, ActiveSeconds: 480,
+		OccurredAt: time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestEngineOffersHelpAfterRepeatedFailureThreshold(t *testing.T) {
+	now := time.Date(2026, 8, 31, 18, 1, 0, 0, time.UTC)
+	store, dialogs := &interventionStoreStub{}, &interventionDialogStub{}
+	engine := Engine{
+		Teachers: interventionTeacherStub{teacher: domain.PersonalTeacher{
+			ID: "99999999-9999-4999-8999-999999999999", StudentID: interventionSignal().StudentID,
+			Language: "ru", PedagogyProfile: "adaptive", InterventionMode: "balanced",
+		}},
+		Policies: interventionRegistry(t), Store: store, Dialogs: dialogs,
+		IDs:   &interventionIDs{values: []string{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+		Clock: interventionClock{now: now},
+	}
+	processed, err := engine.Handle(context.Background(), interventionSignal())
+	require.NoError(t, err)
+	require.True(t, processed)
+	require.Equal(t, domain.TeacherActionIntervene, store.record.Action)
+	require.NotEmpty(t, dialogs.appended)
+	require.Equal(t, "88888888-8888-4888-8888-888888888888", store.deliveredID)
+}
+
+func TestEngineStaysSilentWhileTestsImprove(t *testing.T) {
+	signal := interventionSignal()
+	signal.SignalType, signal.Progressing = "progressing", true
+	store, dialogs := &interventionStoreStub{}, &interventionDialogStub{}
+	engine := Engine{
+		Teachers: interventionTeacherStub{teacher: domain.PersonalTeacher{
+			ID: "99999999-9999-4999-8999-999999999999", StudentID: signal.StudentID,
+			Language: "ru", PedagogyProfile: "adaptive", InterventionMode: "balanced",
+		}}, Policies: interventionRegistry(t), Store: store, Dialogs: dialogs,
+		IDs:   &interventionIDs{values: []string{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+		Clock: interventionClock{now: signal.OccurredAt},
+	}
+	_, err := engine.Handle(context.Background(), signal)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherActionStaySilent, store.record.Action)
+	require.Empty(t, dialogs.appended)
+}
+
+func TestRegistryAllowsInterventionPolicyReplacement(t *testing.T) {
+	replacement := ThresholdPolicy{Mode: "balanced", MinimumFailures: 4, MinimumActiveSeconds: 600}
+	registry, err := NewRegistry("balanced", replacement)
+	require.NoError(t, err)
+
+	teacher := domain.PersonalTeacher{Language: "ru"}
+	underReplacementThreshold := interventionSignal()
+	plan := registry.Resolve("balanced").Evaluate(teacher, underReplacementThreshold)
+	require.Equal(t, domain.TeacherActionStaySilent, plan.Action)
+
+	underReplacementThreshold.ConsecutiveFailures = 4
+	underReplacementThreshold.SameErrorCount = 4
+	underReplacementThreshold.ActiveSeconds = 600
+	plan = registry.Resolve("balanced").Evaluate(teacher, underReplacementThreshold)
+	require.Equal(t, domain.TeacherActionIntervene, plan.Action)
+}
+
+func TestRegistryRejectsUnsafeThresholdConfiguration(t *testing.T) {
+	_, err := NewRegistry("balanced", ThresholdPolicy{Mode: "balanced"})
+	require.Error(t, err)
+}
+
+func TestEngineKeepsOneProactiveOfferPerAnalyticsSession(t *testing.T) {
+	signal := interventionSignal()
+	store, dialogs := &interventionStoreStub{already: true}, &interventionDialogStub{}
+	engine := Engine{
+		Teachers: interventionTeacherStub{teacher: domain.PersonalTeacher{
+			ID: "99999999-9999-4999-8999-999999999999", StudentID: signal.StudentID,
+			Language: "ru", PedagogyProfile: "adaptive", InterventionMode: "balanced",
+		}}, Policies: interventionRegistry(t), Store: store, Dialogs: dialogs,
+		IDs:   &interventionIDs{values: []string{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+		Clock: interventionClock{now: signal.OccurredAt},
+	}
+	_, err := engine.Handle(context.Background(), signal)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherActionStaySilent, store.record.Action)
+	require.Equal(t, "session_intervention_cooldown", store.decision.ReasonCode)
+	require.Empty(t, dialogs.appended)
+}

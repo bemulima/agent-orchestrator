@@ -1,0 +1,363 @@
+package student
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+func (useCase StudentUseCase) SetPracticeTaskPublicationVisibility(
+	ctx context.Context,
+	studentID, studentPracticeTaskID, visibilityValue string,
+) (*domain.PracticeTaskPublicationView, error) {
+	visibility, err := parsePublicationVisibility(visibilityValue)
+	if err != nil {
+		return nil, err
+	}
+	if useCase.Publications == nil || useCase.PublicationFiles == nil {
+		return nil, fmt.Errorf("practice task publication is not configured")
+	}
+	project, err := useCase.GetStudentPracticeTask(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := useCase.Publications.GetPublicationByProjectID(ctx, project.ID)
+	if err != nil && err != domain.ErrNotFound {
+		return nil, err
+	}
+	if existing == nil && visibility == domain.PracticeTaskPublicationVisibilityPrivate {
+		return nil, nil
+	}
+
+	now := time.Now().UTC()
+	if existing != nil {
+		publishedAt := existing.PublishedAt
+		if visibility != domain.PracticeTaskPublicationVisibilityPrivate && publishedAt == nil {
+			publishedAt = &now
+		}
+		if existing.Status == domain.PracticeTaskPublicationStatusPending {
+			if err := useCase.PublicationFiles.Activate(ctx, existing.SnapshotStorageFileID); err != nil {
+				return nil, fmt.Errorf("activate publication snapshot: %w", err)
+			}
+			if err := useCase.Publications.MarkPublicationReady(ctx, existing.ID, visibility, publishedAt, now); err != nil {
+				return nil, err
+			}
+		} else if err := useCase.Publications.UpdatePublicationVisibility(ctx, existing.ID, visibility, publishedAt, now); err != nil {
+			return nil, err
+		}
+		return useCase.GetPracticeTaskPublicationForOwner(ctx, studentID, project.ID)
+	}
+	if project.Status != domain.StudentPracticeTaskStatusCompleted {
+		return nil, fmt.Errorf("%w: only a mentor-approved completed practice task can be published", domain.ErrInvalidStatus)
+	}
+
+	review, artifact, err := useCase.publicationSource(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	sourceArchive, err := useCase.PublicationFiles.DownloadSourceArchive(ctx, artifact.StorageFileID)
+	if err != nil {
+		return nil, fmt.Errorf("download approved submission artifact: %w", err)
+	}
+	prepared, err := preparePublicationSnapshot(sourceArchive)
+	if err != nil {
+		return nil, err
+	}
+	taskSnapshot, err := useCase.buildPublicationTaskSnapshot(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	resultSnapshot := domain.PracticeTaskPublicationResultSnapshot{
+		Passed:      true,
+		MentorScore: review.MentorScore,
+		CompletedAt: project.CompletedAt,
+		ReviewedAt:  review.ReviewedAt,
+	}
+	manifestJSON, err := json.Marshal(prepared.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	securityReportJSON, err := json.Marshal(prepared.SecurityReport)
+	if err != nil {
+		return nil, err
+	}
+	taskSnapshotJSON, err := json.Marshal(taskSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	resultSnapshotJSON, err := json.Marshal(resultSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	shareSlug, err := newPublicationShareSlug()
+	if err != nil {
+		return nil, err
+	}
+	fileID, err := useCase.PublicationFiles.UploadTemporaryArchive(
+		ctx,
+		project.StudentID,
+		"practice-task-"+shareSlug+".snapshot",
+		prepared.Archive,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("upload publication snapshot: %w", err)
+	}
+	publication := domain.StudentPracticeTaskPublication{
+		ID:                    uuid.NewString(),
+		StudentPracticeTaskID: project.ID,
+		StudentID:             project.StudentID,
+		ShareSlug:             shareSlug,
+		Visibility:            domain.PracticeTaskPublicationVisibilityPrivate,
+		Status:                domain.PracticeTaskPublicationStatusPending,
+		SnapshotStorageFileID: fileID,
+		SnapshotSHA256:        prepared.SHA256,
+		SnapshotManifestJSON:  manifestJSON,
+		SecurityReportJSON:    securityReportJSON,
+		TaskSnapshotJSON:      taskSnapshotJSON,
+		ResultSnapshotJSON:    resultSnapshotJSON,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+	}
+	if err := useCase.Publications.CreatePendingPublication(ctx, publication); err != nil {
+		return nil, err
+	}
+	if err := useCase.PublicationFiles.Activate(ctx, fileID); err != nil {
+		return nil, fmt.Errorf("activate publication snapshot: %w", err)
+	}
+	var publishedAt *time.Time
+	if visibility != domain.PracticeTaskPublicationVisibilityPrivate {
+		publishedAt = &now
+	}
+	if err := useCase.Publications.MarkPublicationReady(ctx, publication.ID, visibility, publishedAt, now); err != nil {
+		return nil, err
+	}
+	return useCase.GetPracticeTaskPublicationForOwner(ctx, studentID, project.ID)
+}
+
+func (useCase StudentUseCase) GetPracticeTaskPublicationForOwner(
+	ctx context.Context,
+	studentID, studentPracticeTaskID string,
+) (*domain.PracticeTaskPublicationView, error) {
+	if useCase.Publications == nil {
+		return nil, domain.ErrNotFound
+	}
+	project, err := useCase.GetStudentPracticeTask(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+	publication, err := useCase.Publications.GetPublicationByProjectID(ctx, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	return publicationView(publication, true, nil)
+}
+
+func (useCase StudentUseCase) GetPublicPracticeTaskPublication(
+	ctx context.Context,
+	shareSlug string,
+) (*domain.PracticeTaskPublicationView, error) {
+	if useCase.Publications == nil || useCase.PublicationFiles == nil || !validPublicationShareSlug(shareSlug) {
+		return nil, domain.ErrNotFound
+	}
+	publication, err := useCase.Publications.GetPublicationBySlug(ctx, shareSlug)
+	if err != nil {
+		return nil, err
+	}
+	archive, err := useCase.PublicationFiles.DownloadPublicationSnapshot(ctx, publication.SnapshotStorageFileID)
+	if err != nil {
+		return nil, fmt.Errorf("download publication snapshot: %w", err)
+	}
+	digest := sha256.Sum256(archive)
+	if hex.EncodeToString(digest[:]) != publication.SnapshotSHA256 {
+		return nil, fmt.Errorf("%w: publication snapshot checksum mismatch", domain.ErrValidation)
+	}
+	prepared, err := preparePublicationSnapshot(archive)
+	if err != nil {
+		return nil, err
+	}
+	return publicationView(publication, false, prepared.Files)
+}
+
+func (useCase StudentUseCase) ListPublicPracticeTaskPublications(
+	ctx context.Context,
+	studentID string,
+) ([]domain.PracticeTaskPublicationSummary, error) {
+	if useCase.Publications == nil {
+		return []domain.PracticeTaskPublicationSummary{}, nil
+	}
+	items, err := useCase.Publications.ListPublicationsByStudentID(ctx, studentID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]domain.PracticeTaskPublicationSummary, 0, len(items))
+	for index := range items {
+		view, err := publicationView(&items[index], false, nil)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, domain.PracticeTaskPublicationSummary{
+			ShareSlug: view.ShareSlug, PublishedAt: view.PublishedAt, Task: view.Task, Result: view.Result,
+		})
+	}
+	return result, nil
+}
+
+func (useCase StudentUseCase) publicationSource(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+) (*domain.StudentPracticeTaskFinalReview, *domain.StudentPracticeTaskArtifact, error) {
+	reviews, err := useCase.Students.ListFinalReviews(ctx, project.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var approved *domain.StudentPracticeTaskFinalReview
+	for index := range reviews {
+		if reviews[index].Status == domain.PracticeTaskFinalReviewStatusPassed &&
+			reviews[index].MentorStatus == domain.PracticeTaskMentorReviewStatusPassed &&
+			reviews[index].ArtifactID != nil {
+			item := reviews[index]
+			approved = &item
+			break
+		}
+	}
+	if approved == nil {
+		return nil, nil, fmt.Errorf("%w: a passed mentor review with an immutable artifact is required", domain.ErrInvalidStatus)
+	}
+	artifacts, err := useCase.Students.ListArtifacts(ctx, project.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for index := range artifacts {
+		if artifacts[index].ID == *approved.ArtifactID && strings.TrimSpace(artifacts[index].StorageFileID) != "" {
+			artifact := artifacts[index]
+			return approved, &artifact, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("%w: approved publication artifact was not found", domain.ErrValidation)
+}
+
+func (useCase StudentUseCase) buildPublicationTaskSnapshot(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+) (domain.PracticeTaskPublicationTaskSnapshot, error) {
+	runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, project)
+	if err != nil {
+		return domain.PracticeTaskPublicationTaskSnapshot{}, err
+	}
+	variant, err := selectPracticeTaskSolutionVariant(runtimeContext.SolutionVariants, project.PracticeTaskSolutionVariantID)
+	if err != nil {
+		return domain.PracticeTaskPublicationTaskSnapshot{}, err
+	}
+	milestones, err := milestonesForSolutionVariant(runtimeContext.PracticeTaskMilestones, variant)
+	if err != nil {
+		return domain.PracticeTaskPublicationTaskSnapshot{}, err
+	}
+	sort.SliceStable(milestones, func(left, right int) bool {
+		return milestones[left].SortOrder < milestones[right].SortOrder
+	})
+	milestoneSnapshots := make([]domain.PracticeTaskPublicationMilestoneSnapshot, 0, len(milestones))
+	for _, milestone := range milestones {
+		milestoneSnapshots = append(milestoneSnapshots, domain.PracticeTaskPublicationMilestoneSnapshot{
+			Title: milestone.Title, Description: milestone.Description,
+			StackCodes: append([]string(nil), milestone.StackCodes...), SortOrder: milestone.SortOrder,
+		})
+	}
+	return domain.PracticeTaskPublicationTaskSnapshot{
+		PracticeTaskID: runtimeContext.PracticeTask.ID,
+		RevisionNumber: runtimeContext.RevisionNumber,
+		Title:          runtimeContext.PracticeTask.Title,
+		Theme:          runtimeContext.PracticeTask.Theme,
+		VariantCode:    variant.Code,
+		VariantTitle:   variant.Title,
+		Topology:       variant.Topology,
+		StackCodes:     append([]string(nil), variant.StackCodes...),
+		Milestones:     milestoneSnapshots,
+	}, nil
+}
+
+func publicationView(
+	publication *domain.StudentPracticeTaskPublication,
+	includeSecurityReport bool,
+	files []domain.WorkspaceFile,
+) (*domain.PracticeTaskPublicationView, error) {
+	if publication == nil {
+		return nil, domain.ErrNotFound
+	}
+	var manifest domain.PracticeTaskPublicationManifest
+	if err := json.Unmarshal(publication.SnapshotManifestJSON, &manifest); err != nil {
+		return nil, fmt.Errorf("decode publication manifest: %w", err)
+	}
+	var task domain.PracticeTaskPublicationTaskSnapshot
+	if err := json.Unmarshal(publication.TaskSnapshotJSON, &task); err != nil {
+		return nil, fmt.Errorf("decode publication task snapshot: %w", err)
+	}
+	var result domain.PracticeTaskPublicationResultSnapshot
+	if err := json.Unmarshal(publication.ResultSnapshotJSON, &result); err != nil {
+		return nil, fmt.Errorf("decode publication result snapshot: %w", err)
+	}
+	view := &domain.PracticeTaskPublicationView{
+		ShareSlug:   publication.ShareSlug,
+		Visibility:  publicationVisibilityLabel(publication.Visibility),
+		PublishedAt: publication.PublishedAt, CreatedAt: publication.CreatedAt,
+		Task: task, Result: result, Manifest: manifest, Files: files,
+	}
+	if includeSecurityReport {
+		view.ID = publication.ID
+		var report domain.PracticeTaskPublicationSecurityReport
+		if err := json.Unmarshal(publication.SecurityReportJSON, &report); err != nil {
+			return nil, fmt.Errorf("decode publication security report: %w", err)
+		}
+		view.SecurityReport = &report
+	}
+	return view, nil
+}
+
+func parsePublicationVisibility(value string) (int16, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "private":
+		return domain.PracticeTaskPublicationVisibilityPrivate, nil
+	case "unlisted":
+		return domain.PracticeTaskPublicationVisibilityUnlisted, nil
+	case "public":
+		return domain.PracticeTaskPublicationVisibilityPublic, nil
+	default:
+		return 0, fmt.Errorf("%w: visibility must be private, unlisted, or public", domain.ErrValidation)
+	}
+}
+
+func publicationVisibilityLabel(value int16) string {
+	switch value {
+	case domain.PracticeTaskPublicationVisibilityUnlisted:
+		return "unlisted"
+	case domain.PracticeTaskPublicationVisibilityPublic:
+		return "public"
+	default:
+		return "private"
+	}
+}
+
+func newPublicationShareSlug() (string, error) {
+	buffer := make([]byte, 24)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("generate publication share slug: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+func validPublicationShareSlug(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	_, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil
+}

@@ -1,0 +1,129 @@
+package nats
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	natsgo "github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const (
+	DialogContextMutationConsumerQueue   = "ms-teacher-dialog-context-mutated"
+	DialogContextMutationConsumerDurable = "ms-teacher-dialog-context-mutated-v1"
+	maximumDialogContextMutationBytes    = 4 << 10
+)
+
+type dialogTeacherContextMutatedEnvelope struct {
+	SchemaVersion     int       `json:"schema_version"`
+	EventID           string    `json:"event_id"`
+	EventType         string    `json:"event_type"`
+	OccurredAt        time.Time `json:"occurred_at"`
+	DialogID          string    `json:"dialog_id"`
+	EventSequence     int64     `json:"event_sequence"`
+	StudentID         string    `json:"student_id"`
+	PersonalTeacherID string    `json:"personal_teacher_id"`
+	ContextType       string    `json:"context_type"`
+	ContextID         *string   `json:"context_id"`
+	MessageID         string    `json:"message_id"`
+	MessageSequence   int64     `json:"message_sequence"`
+	MessageVersion    int       `json:"message_version"`
+	LastEventSequence int64     `json:"last_event_sequence"`
+	Mutation          string    `json:"mutation"`
+}
+
+func DecodeDialogTeacherContextMutated(payload []byte) (domain.DialogTeacherContextMutation, error) {
+	if len(payload) == 0 || len(payload) > maximumDialogContextMutationBytes {
+		return domain.DialogTeacherContextMutation{}, errors.New("dialog teacher context mutation payload is empty or oversized")
+	}
+	var envelope dialogTeacherContextMutatedEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.DialogTeacherContextMutation{}, fmt.Errorf("decode dialog teacher context mutation: %w", err)
+	}
+	contextType, err := normalizeDialogContextType(envelope.ContextType)
+	if err != nil {
+		return domain.DialogTeacherContextMutation{}, err
+	}
+	return domain.NewDialogTeacherContextMutation(domain.DialogTeacherContextMutation{
+		SchemaVersion: envelope.SchemaVersion, EventID: envelope.EventID, EventType: envelope.EventType,
+		OccurredAt: envelope.OccurredAt, DialogID: envelope.DialogID, EventSequence: envelope.EventSequence,
+		StudentID: envelope.StudentID, PersonalTeacherID: envelope.PersonalTeacherID,
+		ContextType: contextType, ContextID: optionalString(envelope.ContextID), MessageID: envelope.MessageID,
+		MessageSequence: envelope.MessageSequence, MessageVersion: envelope.MessageVersion,
+		LastEventSequence: envelope.LastEventSequence,
+		Mutation:          domain.DialogTeacherContextMutationKind(envelope.Mutation),
+	})
+}
+
+type DialogTeacherContextMutatedSubscriber struct {
+	Conn       *natsgo.Conn
+	Handler    func(context.Context, domain.DialogTeacherContextMutation) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber DialogTeacherContextMutatedSubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil || subscriber.Handler == nil {
+		return errors.New("dialog teacher context mutation subscriber connection and handler are required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	jetStream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = jetStream.QueueSubscribe(
+		domain.SubjectDialogTeacherContextMutated,
+		DialogContextMutationConsumerQueue,
+		func(message *natsgo.Msg) {
+			mutation, decodeErr := DecodeDialogTeacherContextMutated(message.Data)
+			if decodeErr != nil {
+				logger.Warn("terminate invalid dialog teacher context mutation", zap.Error(decodeErr))
+				_ = message.Term()
+				return
+			}
+			processed, handleErr := subscriber.Handler(ctx, mutation)
+			if handleErr != nil {
+				if terminateDialogTeacherContextMutation(handleErr) {
+					logger.Warn("terminate conflicting dialog teacher context mutation", zap.String("event_id", mutation.EventID), zap.Error(handleErr))
+					_ = message.Term()
+					return
+				}
+				logger.Warn("retry dialog teacher context mutation", zap.String("event_id", mutation.EventID), zap.Error(handleErr))
+				_ = message.NakWithDelay(retryDelay)
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				logger.Warn("ack dialog teacher context mutation", zap.String("event_id", mutation.EventID), zap.Error(ackErr))
+				return
+			}
+			logger.Debug("dialog teacher context mutation handled", zap.String("event_id", mutation.EventID), zap.Bool("processed", processed))
+		},
+		natsgo.BindStream(DialogEventsStream), natsgo.Durable(DialogContextMutationConsumerDurable),
+		natsgo.ManualAck(), natsgo.AckExplicit(), natsgo.DeliverAll(), natsgo.AckWait(ackWait),
+	)
+	if err != nil {
+		return err
+	}
+	return subscriber.Conn.FlushTimeout(5 * time.Second)
+}
+
+func terminateDialogTeacherContextMutation(err error) bool {
+	return errors.Is(err, domain.ErrDialogTeacherContextMutationConflict) ||
+		errors.Is(err, domain.ErrInvalidDialogTeacherContextMutation)
+}

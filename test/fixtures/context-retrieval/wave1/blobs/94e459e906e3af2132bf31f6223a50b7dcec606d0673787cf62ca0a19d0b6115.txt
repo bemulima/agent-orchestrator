@@ -1,0 +1,398 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	courseclient "github.com/example/ms-student-service/internal/infrastructure/http/courseclient"
+	natsadapter "github.com/example/ms-student-service/internal/infrastructure/messaging/nats"
+	publichttp "github.com/example/ms-student-service/internal/transport/http/api/v1"
+	publichandlers "github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+	"github.com/example/ms-student-service/internal/transport/http/middleware"
+	privatehttp "github.com/example/ms-student-service/internal/transport/http/private"
+	privatehandlers "github.com/example/ms-student-service/internal/transport/http/private/handlers"
+	outboxuc "github.com/example/ms-student-service/internal/usecase/outbox"
+	studentuc "github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// Root owns infrastructure setup and launch. This provider composes registered
+// diagnostic HTTP, actual Course clients, scorer/usecase and PostgreSQL, plus
+// the production relay/publisher. It never reserves or completes an attempt
+// itself. The synthetic onboarding identity is the only learner fixture.
+func TestT18ServeDiagnosticStudentHTTP(t *testing.T) {
+	if os.Getenv("T18_SERVE_STUDENT") != "true" {
+		t.Skip("owned T18 Student provider gate absent")
+	}
+	ready, stop, result := os.Getenv("T18_STUDENT_READY_FILE"), os.Getenv("T18_STUDENT_STOP_FILE"), os.Getenv("T18_STUDENT_RESULT_FILE")
+	token, plannerToken := os.Getenv("T18_STUDENT_TOKEN"), os.Getenv("T18_STUDENT_PLANNER_TOKEN")
+	cfg, err := pgxpool.ParseConfig(os.Getenv("STUDENT_TEST_DATABASE_URL"))
+	host := os.Getenv("T18_ATTESTED_POSTGRES_HOST")
+	if err != nil || (!t18AcceptanceDatabase(t, cfg, "student") && (cfg.ConnConfig.Database != "remediation_t18_student_integration_proof" || os.Getenv("T18_OWNED_STUDENT_DATABASE_NAME") != cfg.ConnConfig.Database || host == "" || net.ParseIP(host) == nil || cfg.ConnConfig.Host != host)) || token == "" || plannerToken == "" || token == plannerToken || ready == "" || stop == "" || result == "" {
+		t.Fatal("SETUP: exact owned Student configuration required")
+	}
+	for _, path := range []string{ready, stop, result} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatal("SETUP: metadata and stop paths must be absent")
+		}
+	}
+	var course struct {
+		URL                string `json:"url"`
+		CourseID           string `json:"course_id"`
+		CurriculumRevision string `json:"curriculum_revision"`
+	}
+	raw, err := os.ReadFile(os.Getenv("T18_COURSE_READY_FILE"))
+	if err != nil || json.Unmarshal(raw, &course) != nil {
+		t.Fatal("SETUP: owned Course metadata unavailable")
+	}
+	courseURL, err := url.Parse(course.URL)
+	if err != nil || courseURL.Scheme != "http" || courseURL.Hostname() != "127.0.0.1" || courseURL.User != nil || courseURL.Path != "" || os.Getenv("T18_COURSE_TOKEN") == "" || os.Getenv("T18_COURSE_CATALOG_TOKEN") == "" || os.Getenv("T18_COURSE_TOKEN") == os.Getenv("T18_COURSE_CATALOG_TOKEN") {
+		t.Fatal("SETUP: owned loopback Course required")
+	}
+	natsURL, err := url.Parse(os.Getenv("T18_NATS_URL"))
+	if err != nil || (!t18AcceptanceNATS(t, os.Getenv("T18_NATS_URL")) && (natsURL.Scheme != "nats" || natsURL.Hostname() != "127.0.0.1" || natsURL.User != nil)) {
+		t.Fatal("SETUP: dedicated loopback NATS required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: Student pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact Student database unavailable")
+	}
+	t18AcceptanceDatabaseIdentity(t, ctx, pool)
+	nc, err := natsgo.Connect(natsURL.String(), natsgo.Timeout(5*time.Second), natsgo.MaxReconnects(-1))
+	if err != nil {
+		t.Fatal("SETUP: dedicated NATS unavailable")
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal("SETUP: JetStream unavailable")
+	}
+	stream, err := js.StreamInfo("STUDENT_DIAGNOSTIC_EVENTS", natsgo.Context(ctx))
+	if err != nil || len(stream.Config.Subjects) != 1 || stream.Config.Subjects[0] != "student.diagnostic-result.committed.v1" || stream.Config.Retention != natsgo.WorkQueuePolicy {
+		t.Fatal("SETUP: dedicated diagnostic stream unavailable")
+	}
+	clock := t18StudentProviderClock{}
+	owner := uuid.NewString()
+	profiles := &StudentOnboardingRepoPG{Pool: pool}
+	profile, err := (studentuc.PutStudentOnboarding{Profiles: profiles, Clock: clock}).Handle(ctx, studentuc.PutStudentOnboardingInput{StudentID: owner, DirectionCode: "backend", SelfAssessedExperience: "beginner", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "learn_programming", PreferredLanguage: "ru", WeeklyMinutes: 120, PreferredPace: "steady"})
+	if err != nil || profile.Version != 1 {
+		t.Fatal("SETUP: actual onboarding fixture failed")
+	}
+	// Facts are deliberately retained. Root disposes only its dedicated database.
+	httpClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	catalog := courseclient.DiagnosticCatalogClient{BaseURL: course.URL, InternalToken: os.Getenv("T18_COURSE_CATALOG_TOKEN"), HTTPClient: httpClient}
+	observed, err := catalog.GetDiagnosticAssessmentCatalog(ctx, course.CourseID)
+	if err != nil || observed.CurriculumRevision != course.CurriculumRevision || len(observed.Items) != 3 {
+		t.Fatal("SETUP: actual Course diagnostic catalog mismatch")
+	}
+	taskClient := courseclient.Client{BaseURL: course.URL, InternalToken: os.Getenv("T18_COURSE_TOKEN"), HTTPClient: httpClient}
+	// Verify the complete production trusted-task read, including its registered
+	// Course lesson fallback for course identity, before advertising readiness.
+	// This reads definitions only and never scores or submits an answer.
+	for _, item := range observed.Items {
+		task, err := taskClient.GetDiagnosticTask(ctx, item.TaskID)
+		if err != nil || task == nil || task.ID != item.TaskID || task.CourseID != course.CourseID || task.LessonID != item.LessonID || task.Version != item.TaskVersion || !task.UpdatedAt.Equal(item.UpdatedAt) || task.EvaluationMode != "AUTO" || task.AssessmentPurpose != "diagnostic" || task.Type != item.Type || !reflect.DeepEqual(task.LearningTargets, item.LearningTargets) || len(task.Tests) == 0 {
+			t.Fatal("SETUP: production Course diagnostic task preflight failed")
+		}
+	}
+	assessments := studentuc.DiagnosticAssessments{Attempts: &DiagnosticAssessmentRepoPG{Pool: pool}, Catalog: catalog, Tasks: taskClient, Clock: clock}
+	publisher := &t18StudentPublishCut{Publisher: &natsadapter.OutboxPublisher{Conn: nc}, StudentID: owner}
+	relay := outboxuc.Relay{Outbox: &OutboxRepoPG{Pool: pool}, Publisher: publisher, Clock: clock, WorkerID: "t18-" + uuid.NewString(), BatchSize: 10, LockTTL: time.Minute, PublishTimeout: 3 * time.Second, RetryBaseDelay: time.Second, RetryMaxDelay: 5 * time.Second}
+	if relay.Validate() != nil {
+		t.Fatal("SETUP: actual relay configuration invalid")
+	}
+	registered := chi.NewRouter()
+	learnerOverview := studentuc.GetLearnerOverview{Profiles: profiles, Mastery: &LearningEvidenceRepoPG{Pool: pool}, Journey: &LearningJourneyRepoPG{Pool: pool}}
+	registered.Mount("/internal", privatehttp.NewRouter(&privatehandlers.Handler{DiagnosticAssessments: &assessments, OnboardingProfiles: studentuc.GetStudentOnboarding{Profiles: profiles}, PlanningReadiness: studentuc.GetStudentPlanningReadiness{Reader: profiles}, LearnerOverview: learnerOverview}, token, plannerToken))
+	registered.Group(func(r chi.Router) {
+		r.Use((middleware.AuthMiddleware{}).Middleware)
+		r.Route("/api/v1", func(api chi.Router) {
+			api.Use(middleware.RequireRole("STUDENT", "STUDENT_PRO"))
+			publichttp.RegisterDiagnosticAssessmentRoutes(api, &publichandlers.DiagnosticAssessmentHandler{Assessments: assessments})
+		})
+	})
+	var mu sync.Mutex
+	outage := false
+	state := func(readCtx context.Context) (map[string]any, error) {
+		v := map[string]any{"student_id": owner, "course_id": course.CourseID, "onboarding_version": profile.Version, "goal_code": profile.GoalCode, "direction_code": profile.DirectionCode, "classification": "actual registered Student diagnostic HTTP/usecase/supported quiz scorer/PG and production outbox relay+JetStream publisher; synthetic onboarding; curated Course fixture"}
+		for _, item := range []struct{ name, query string }{
+			{"attempts", `SELECT count(*) FROM student_diagnostic_assessment_attempt WHERE student_id=$1`},
+			{"results", `SELECT count(*) FROM student_diagnostic_assessment_result WHERE student_id=$1`},
+			{"submissions", `SELECT count(*) FROM student_diagnostic_assessment_submission s JOIN student_diagnostic_assessment_attempt a ON a.id=s.attempt_id WHERE a.student_id=$1`},
+			{"outbox", `SELECT count(*) FROM student_outbox WHERE student_id=$1 AND subject='student.diagnostic-result.committed.v1'`},
+			{"published", `SELECT count(*) FROM student_outbox WHERE student_id=$1 AND subject='student.diagnostic-result.committed.v1' AND published_at IS NOT NULL`},
+			{"learning_actions", `SELECT count(*) FROM student_learning_action WHERE student_id=$1`},
+			{"learning_evidence", `SELECT count(*) FROM student_learning_evidence WHERE student_id=$1`},
+			{"target_mastery", `SELECT count(*) FROM student_target_mastery WHERE student_id=$1`},
+			{"learning_paths", `SELECT count(*) FROM student_learning_path WHERE student_id=$1`},
+			{"course_assignments", `SELECT count(*) FROM student_course_assignment WHERE student_id=$1`},
+			{"lesson_facts", `SELECT count(*) FROM student_lesson_activity_fact WHERE student_id=$1`},
+		} {
+			var count int64
+			if err := pool.QueryRow(readCtx, item.query, owner).Scan(&count); err != nil {
+				return nil, err
+			}
+			v[item.name] = count
+		}
+		v["actual_cut_used"] = publisher.Used()
+		return v, nil
+	}
+	mux := http.NewServeMux()
+	protected := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+	mux.HandleFunc("GET /__t18/state", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		readCtx, finish := context.WithTimeout(r.Context(), 5*time.Second)
+		defer finish()
+		v, err := state(readCtx)
+		if err != nil {
+			http.Error(w, "state unavailable", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(v)
+	})
+	mux.HandleFunc("POST /__t18/relay", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		deliveryCtx, finish := context.WithTimeout(r.Context(), 35*time.Second)
+		defer finish()
+		count, err := relay.ProcessBatch(deliveryCtx)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(503)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"claimed": count, "delivery_succeeded": err == nil})
+	})
+	mux.HandleFunc("POST /__t18/publish-cut", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var v struct {
+			Enabled *bool `json:"enabled"`
+		}
+		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128))
+		d.DisallowUnknownFields()
+		if d.Decode(&v) != nil || v.Enabled == nil || d.Decode(&struct{}{}) != io.EOF {
+			w.WriteHeader(400)
+			return
+		}
+		if !publisher.Arm(*v.Enabled) {
+			w.WriteHeader(409)
+			return
+		}
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("POST /__t18/outage", func(w http.ResponseWriter, r *http.Request) {
+		if !protected(w, r) {
+			return
+		}
+		var v struct {
+			Enabled bool `json:"enabled"`
+		}
+		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128))
+		d.DisallowUnknownFields()
+		if d.Decode(&v) != nil {
+			w.WriteHeader(400)
+			return
+		}
+		mu.Lock()
+		outage = v.Enabled
+		mu.Unlock()
+		w.WriteHeader(204)
+	})
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		down := outage
+		mu.Unlock()
+		if down {
+			w.WriteHeader(503)
+			return
+		}
+		registered.ServeHTTP(w, r)
+	}))
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.ReadHeaderTimeout = 5 * time.Second
+	server.Config.ReadTimeout = 40 * time.Second
+	server.Config.WriteTimeout = 40 * time.Second
+	server.Config.IdleTimeout = 5 * time.Second
+	server.Start()
+	defer server.Close()
+	defer server.CloseClientConnections()
+	metadata, err := state(ctx)
+	if err != nil {
+		t.Fatal("SETUP: initial state unavailable")
+	}
+	metadata["url"] = server.URL
+	metadata["desired_stacks"] = profile.DesiredStacks
+	metadata["preferred_language"] = profile.PreferredLanguage
+	t18StudentWriteExclusive(t, ready, metadata)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("owned Student 20-minute deadline exceeded")
+		case <-ticker.C:
+			if _, err := os.Stat(stop); err == nil {
+				v, err := state(ctx)
+				if err != nil {
+					t.Fatal("owned Student final state unavailable")
+				}
+				v["url"] = server.URL
+				t18StudentWriteExclusive(t, result, v)
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal("owned Student stop read failed")
+			}
+		}
+	}
+}
+func t18StudentWriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe Student metadata encoding failed")
+	}
+	file, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal("exclusive Student metadata creation failed")
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("safe Student metadata export failed")
+	}
+	if os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic metadata publication failed")
+	}
+}
+
+type t18StudentProviderClock struct{}
+
+func (t18StudentProviderClock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+
+// The only injected failure is after the production publisher has obtained a
+// real JetStream PubACK. Returning this test sentinel makes the real relay
+// persist its failure/retry rather than MarkPublished; neither the event wire
+// nor the message ID changes. Each arm can be consumed once, and only by this
+// provider's own diagnostic event. Failed broker publishes do not consume it.
+var t18StudentPublishCutError = errors.New("T18 test cut after acknowledged actual publish")
+
+type t18StudentPublishCut struct {
+	Publisher domain.DurableEventPublisher
+	StudentID string
+	mu        sync.Mutex
+	enabled   bool
+	used      int
+}
+
+func (publisher *t18StudentPublishCut) Publish(ctx context.Context, event domain.IntegrationEvent) error {
+	if err := publisher.Publisher.Publish(ctx, event); err != nil {
+		return err
+	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if publisher.enabled && event.StudentID == publisher.StudentID && event.Subject == "student.diagnostic-result.committed.v1" {
+		publisher.enabled = false
+		publisher.used++
+		return t18StudentPublishCutError
+	}
+	return nil
+}
+func (publisher *t18StudentPublishCut) Arm(enabled bool) bool {
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if enabled && publisher.enabled {
+		return false
+	}
+	publisher.enabled = enabled
+	return true
+}
+func (publisher *t18StudentPublishCut) Used() int {
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	return publisher.used
+}
+
+// t18AcceptanceDatabase permits only the coordinator's explicit isolated fixture.
+// Frozen historical fixture defaults remain available when this gate is absent.
+func t18AcceptanceDatabase(t *testing.T, cfg *pgxpool.Config, owner string) bool {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return false
+	}
+	if !t18AcceptanceDatabaseMatches(cfg, owner) {
+		t.Fatal("SETUP: explicitly attested isolated acceptance database required")
+	}
+	return true
+}
+
+func t18AcceptanceDatabaseMatches(cfg *pgxpool.Config, owner string) bool {
+	port, err := strconv.Atoi(os.Getenv("INFRA_ACCEPTANCE_POSTGRES_PORT"))
+	name := os.Getenv("INFRA_ACCEPTANCE_" + strings.ToUpper(owner) + "_DATABASE_NAME")
+	host := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_HOST")
+	backend := os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP")
+	return !(cfg == nil || err != nil || port < 1 || port > 65535 || host != "127.0.0.1" || net.ParseIP(backend) == nil || !regexp.MustCompile("^infra_acceptance_"+owner+"_[a-z0-9_]+_test$").MatchString(name) || cfg.ConnConfig.Host != host || int(cfg.ConnConfig.Port) != port || cfg.ConnConfig.Database != name || cfg.ConnConfig.User == "" || cfg.ConnConfig.TLSConfig != nil || len(cfg.ConnConfig.Fallbacks) != 0)
+}
+
+func t18AcceptanceDatabaseIdentity(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return
+	}
+	var database, backend string
+	if pool.QueryRow(ctx, `SELECT current_database(), host(inet_server_addr())`).Scan(&database, &backend) != nil || database != pool.Config().ConnConfig.Database || backend != os.Getenv("INFRA_ACCEPTANCE_POSTGRES_SERVER_IP") {
+		t.Fatal("SETUP: isolated acceptance PostgreSQL backend attestation failed")
+	}
+}
+
+func t18AcceptanceNATS(t *testing.T, address string) bool {
+	t.Helper()
+	if os.Getenv("INFRA_ACCEPTANCE_ISOLATED_FIXTURE") != "true" {
+		return false
+	}
+	port, err := strconv.Atoi(os.Getenv("INFRA_ACCEPTANCE_NATS_PORT"))
+	broker, parseErr := url.Parse(address)
+	if err != nil || port < 1 || port > 65535 || parseErr != nil || broker.Scheme != "nats" || broker.Host != "127.0.0.1:"+strconv.Itoa(port) || broker.User != nil || broker.Path != "" || broker.RawQuery != "" || broker.Fragment != "" {
+		t.Fatal("SETUP: explicitly attested isolated acceptance broker required")
+	}
+	return true
+}

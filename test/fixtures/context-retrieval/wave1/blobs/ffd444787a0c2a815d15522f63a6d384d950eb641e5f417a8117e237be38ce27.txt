@@ -1,0 +1,923 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LearningEvidenceRepoPG atomically commits the inbox marker, assistance facts,
+// normalized objective evidence, mastery projection, and reducer audit.
+type LearningEvidenceRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+var _ repository.LearningEvidence = (*LearningEvidenceRepoPG)(nil)
+var _ repository.PracticeEvidence = (*LearningEvidenceRepoPG)(nil)
+var _ repository.TargetMasteryReader = (*LearningEvidenceRepoPG)(nil)
+var _ repository.LearnerOverviewMasteryReader = (*LearningEvidenceRepoPG)(nil)
+
+func (repo *LearningEvidenceRepoPG) ListRecentStudentTargetMastery(
+	ctx context.Context,
+	studentID string,
+	limit int,
+) ([]domain.StudentTargetMastery, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("learning evidence repository pool is required")
+	}
+	if limit < 1 || limit > 20 {
+		return nil, domain.ErrValidation
+	}
+	rows, err := repo.Pool.Query(ctx, `
+SELECT student_id, target_type, target_key, target_version, state,
+       mastery_score, confidence, independent_success_count,
+       assisted_success_count, failure_count, evidence_count, last_seen_at,
+       last_practiced_at, last_failed_at, policy_version
+FROM student_target_mastery
+WHERE student_id=$1
+ORDER BY last_seen_at DESC, target_type, target_key, target_version
+LIMIT $2
+`, studentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.StudentTargetMastery, 0, limit)
+	for rows.Next() {
+		projection, scanErr := scanTargetMastery(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, projection)
+	}
+	return result, rows.Err()
+}
+
+func (repo *LearningEvidenceRepoPG) ListStudentTargetMastery(
+	ctx context.Context,
+	studentID string,
+	targets []domain.LearningTargetRef,
+) ([]domain.StudentTargetMastery, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("learning evidence repository pool is required")
+	}
+	encodedTargets, err := json.Marshal(targets)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := repo.Pool.Query(ctx, `
+WITH requested AS (
+    SELECT
+        item ->> 'type' AS target_type,
+        item ->> 'key' AS target_key,
+        COALESCE(item ->> 'version', '') AS target_version
+    FROM jsonb_array_elements($2::jsonb) AS item
+)
+SELECT mastery.student_id, mastery.target_type, mastery.target_key,
+       mastery.target_version, mastery.state, mastery.mastery_score,
+       mastery.confidence, mastery.independent_success_count,
+       mastery.assisted_success_count, mastery.failure_count,
+       mastery.evidence_count, mastery.last_seen_at,
+       mastery.last_practiced_at, mastery.last_failed_at,
+       mastery.policy_version
+FROM student_target_mastery AS mastery
+JOIN requested
+  ON requested.target_type = mastery.target_type
+ AND requested.target_key = mastery.target_key
+ AND requested.target_version = mastery.target_version
+WHERE mastery.student_id = $1
+`, studentID, string(encodedTargets))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.StudentTargetMastery, 0, len(targets))
+	for rows.Next() {
+		projection, scanErr := scanTargetMastery(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, projection)
+	}
+	return result, rows.Err()
+}
+
+func (repo *LearningEvidenceRepoPG) ApplyTeacherAssistance(ctx context.Context, assistance domain.TeacherAssistance) (bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return false, errors.New("learning evidence repository pool is required")
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	inserted, err := insertTeacherAssistanceInbox(ctx, tx, assistance)
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		if err := validateDuplicateTeacherAssistanceInbox(ctx, tx, assistance); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	action, err := loadClosedLearningAction(ctx, tx, assistance.LearningActionID)
+	if err != nil {
+		return false, evidenceContractError("closed learning action is unavailable", err)
+	}
+	if err := validateClosureCausation(ctx, tx, action, assistance); err != nil {
+		return false, err
+	}
+	if err := ensureNoAssistanceForAction(ctx, tx, assistance); err != nil {
+		return false, err
+	}
+	targetEvidence, err := domain.BuildLearningActionTargetEvidence(action, assistance)
+	if err != nil {
+		return false, evidenceContractError("invalid action assistance join", err)
+	}
+
+	if err := insertActionAssistance(ctx, tx, assistance); err != nil {
+		return false, err
+	}
+	if err := insertTeacherObservations(ctx, tx, assistance); err != nil {
+		return false, err
+	}
+	if err := applyActionTargetEvidence(ctx, tx, targetEvidence); err != nil {
+		return false, err
+	}
+	if len(targetEvidence) > 0 {
+		if err := enqueueObjectivePlanningState(ctx, tx, assistance.StudentID, action.ID, objectivePlanningTargets(targetEvidence), targetEvidence[0].OccurredAt); err != nil {
+			return false, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ApplyPracticeEvidence atomically accepts one immutable Practice result and
+// folds it into the same Student-owned mastery projection as learning actions.
+func (repo *LearningEvidenceRepoPG) ApplyPracticeEvidence(ctx context.Context, evidence domain.PracticeCompetencyEvidenceBundle) (bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return false, errors.New("learning evidence repository pool is required")
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	inserted, err := insertPracticeEvidenceReceipt(ctx, tx, evidence)
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		if err := validateDuplicatePracticeEvidenceReceipt(ctx, tx, evidence); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	reducerInputs, err := domain.PracticeEvidenceReducerInputs(evidence)
+	if err != nil {
+		return false, evidenceContractError("invalid practice evidence reducer input", err)
+	}
+	if err := applyPracticeTargetEvidence(ctx, tx, evidence, reducerInputs); err != nil {
+		return false, err
+	}
+	if err := enqueueObjectivePlanningState(ctx, tx, evidence.StudentID, evidence.EvidenceID, objectivePlanningTargets(reducerInputs), evidence.OccurredAt); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func insertPracticeEvidenceReceipt(ctx context.Context, tx pgx.Tx, evidence domain.PracticeCompetencyEvidenceBundle) (bool, error) {
+	var evidenceID string
+	err := tx.QueryRow(ctx, `
+INSERT INTO student_practice_evidence_receipt (
+    evidence_id, student_id, task_instance_id, task_revision_id, submission_id,
+    request_hash, outcome, assistance_policy_version, hints_used,
+    max_hint_level, teacher_assistance_used, occurred_at, policy_version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+ON CONFLICT (evidence_id) DO NOTHING
+RETURNING evidence_id
+`, evidence.EvidenceID, evidence.StudentID, evidence.TaskInstanceID,
+		evidence.TaskRevisionID, evidence.SubmissionID, evidence.RequestHash,
+		evidence.Outcome, evidence.AssistancePolicyVersion, evidence.HintsUsed,
+		evidence.MaxHintLevel, evidence.TeacherAssistanceUsed, evidence.OccurredAt,
+		evidence.PolicyVersion).Scan(&evidenceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func validateDuplicatePracticeEvidenceReceipt(ctx context.Context, tx pgx.Tx, evidence domain.PracticeCompetencyEvidenceBundle) error {
+	var studentID, taskInstanceID, taskRevisionID, submissionID, requestHash, policyVersion string
+	err := tx.QueryRow(ctx, `
+SELECT student_id::text, task_instance_id::text, task_revision_id::text,
+       submission_id::text, request_hash, policy_version
+FROM student_practice_evidence_receipt
+WHERE evidence_id=$1
+`, evidence.EvidenceID).Scan(&studentID, &taskInstanceID, &taskRevisionID, &submissionID, &requestHash, &policyVersion)
+	if err != nil {
+		return err
+	}
+	if studentID != evidence.StudentID || taskInstanceID != evidence.TaskInstanceID ||
+		taskRevisionID != evidence.TaskRevisionID || submissionID != evidence.SubmissionID ||
+		requestHash != evidence.RequestHash || policyVersion != evidence.PolicyVersion {
+		return evidenceContractError("evidence_id collides with a different practice evidence payload", nil)
+	}
+	return nil
+}
+
+func insertPracticeEvidenceReceiptV2(ctx context.Context, tx pgx.Tx, evidence domain.PracticeCompetencyEvidenceBundleV2) (bool, error) {
+	var evidenceID string
+	err := tx.QueryRow(ctx, `
+INSERT INTO student_practice_evidence_receipt (
+    evidence_id, student_id, task_instance_id, task_revision_id, task_revision_digest,
+    workspace_digest, learning_action_id, submission_id, request_hash, outcome,
+    assistance_policy_version, hints_used, max_hint_level, teacher_assistance_used,
+    occurred_at, policy_version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+ON CONFLICT (evidence_id) DO NOTHING
+RETURNING evidence_id
+`, evidence.EvidenceID, evidence.StudentID, evidence.TaskInstanceID, evidence.TaskRevisionID,
+		evidence.TaskRevisionDigest, evidence.WorkspaceDigest, evidence.LearningActionID,
+		evidence.SubmissionID, evidence.RequestHash, evidence.Outcome,
+		evidence.AssistancePolicyVersion, evidence.HintsUsed, evidence.MaxHintLevel,
+		evidence.TeacherAssistanceUsed, evidence.OccurredAt, evidence.PolicyVersion).Scan(&evidenceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func validateDuplicatePracticeEvidenceReceiptV2(ctx context.Context, tx pgx.Tx, evidence domain.PracticeCompetencyEvidenceBundleV2) error {
+	var studentID, taskInstanceID, taskRevisionID, taskRevisionDigest, workspaceDigest, learningActionID, submissionID, requestHash, policyVersion string
+	err := tx.QueryRow(ctx, `
+SELECT student_id::text, task_instance_id::text, task_revision_id::text,
+       COALESCE(task_revision_digest,''), COALESCE(workspace_digest,''), COALESCE(learning_action_id::text,''),
+       submission_id::text, request_hash, policy_version
+FROM student_practice_evidence_receipt WHERE evidence_id=$1
+`, evidence.EvidenceID).Scan(&studentID, &taskInstanceID, &taskRevisionID, &taskRevisionDigest, &workspaceDigest,
+		&learningActionID, &submissionID, &requestHash, &policyVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if studentID != evidence.StudentID || taskInstanceID != evidence.TaskInstanceID || taskRevisionID != evidence.TaskRevisionID ||
+		taskRevisionDigest != evidence.TaskRevisionDigest || workspaceDigest != evidence.WorkspaceDigest ||
+		learningActionID != evidence.LearningActionID || submissionID != evidence.SubmissionID ||
+		requestHash != evidence.RequestHash || policyVersion != evidence.PolicyVersion {
+		return evidenceContractError("evidence_id collides with a different practice evidence v2 payload", nil)
+	}
+	return nil
+}
+
+func applyPracticeTargetEvidence(ctx context.Context, tx pgx.Tx, bundle domain.PracticeCompetencyEvidenceBundle, reducerInputs []domain.LearningActionTargetEvidence) error {
+	byTarget := make(map[string]domain.PracticeCompetencyEvidence, len(bundle.Evidence))
+	for _, item := range bundle.Evidence {
+		byTarget[practiceTargetKey(item.Target)] = item
+	}
+	sort.Slice(reducerInputs, func(left, right int) bool {
+		return masteryLockKey(reducerInputs[left]) < masteryLockKey(reducerInputs[right])
+	})
+	for _, item := range reducerInputs {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, masteryLockKey(item)); err != nil {
+			return err
+		}
+		previous, exists, err := loadTargetMastery(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		raw, ok := byTarget[practiceTargetKey(item.Target)]
+		if !ok {
+			return evidenceContractError("practice evidence target is missing", nil)
+		}
+		if err := insertPracticeTargetEvidence(ctx, tx, bundle, raw, item); err != nil {
+			return err
+		}
+		allEvidence, err := loadTargetEvidence(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		next, err := domain.ReduceStudentTargetMastery(allEvidence)
+		if err != nil {
+			return err
+		}
+		if err := upsertTargetMastery(ctx, tx, next); err != nil {
+			return err
+		}
+		if !exists {
+			previous = domain.StudentTargetMastery{StudentID: item.StudentID, Target: item.Target, State: domain.TargetMasteryUnknown, PolicyVersion: domain.MasteryPolicyVersion}
+		}
+		if err := insertPracticeMasteryAudit(ctx, tx, bundle.EvidenceID, item, previous, next); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyPracticeTargetEvidenceV2(ctx context.Context, tx pgx.Tx, bundle domain.PracticeCompetencyEvidenceBundleV2, reducerInputs []domain.LearningActionTargetEvidence) error {
+	byTarget := make(map[string]domain.PracticeCompetencyEvidence, len(bundle.Evidence))
+	for _, item := range bundle.Evidence {
+		byTarget[practiceTargetKey(item.Target)] = item
+	}
+	sort.Slice(reducerInputs, func(left, right int) bool {
+		return masteryLockKey(reducerInputs[left]) < masteryLockKey(reducerInputs[right])
+	})
+	for _, item := range reducerInputs {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, masteryLockKey(item)); err != nil {
+			return err
+		}
+		previous, exists, err := loadTargetMastery(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		raw, ok := byTarget[practiceTargetKey(item.Target)]
+		if !ok {
+			return evidenceContractError("practice evidence v2 target is missing", nil)
+		}
+		if err := insertPracticeTargetEvidenceV2(ctx, tx, bundle, raw, item); err != nil {
+			return err
+		}
+		allEvidence, err := loadTargetEvidence(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		next, err := domain.ReduceStudentTargetMastery(allEvidence)
+		if err != nil {
+			return err
+		}
+		if err := upsertTargetMastery(ctx, tx, next); err != nil {
+			return err
+		}
+		if !exists {
+			previous = domain.StudentTargetMastery{StudentID: item.StudentID, Target: item.Target, State: domain.TargetMasteryUnknown, PolicyVersion: domain.MasteryPolicyVersion}
+		}
+		if err := insertPracticeMasteryAudit(ctx, tx, bundle.EvidenceID, item, previous, next); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertPracticeTargetEvidence(ctx context.Context, tx pgx.Tx, bundle domain.PracticeCompetencyEvidenceBundle, raw domain.PracticeCompetencyEvidence, reducerInput domain.LearningActionTargetEvidence) error {
+	stepIDs, err := json.Marshal(raw.StepIDs)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO student_practice_target_evidence (
+    evidence_id, student_id, task_instance_id, target_type, target_key,
+    target_version, correctness, independence, confidence, step_ids,
+    support_context, evidence_kind, occurred_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
+`, bundle.EvidenceID, bundle.StudentID, bundle.TaskInstanceID,
+		raw.Target.Type, raw.Target.Key, raw.Target.Version, raw.Correctness,
+		raw.Independence, raw.Confidence, string(stepIDs), reducerInput.SupportContext,
+		reducerInput.Kind, bundle.OccurredAt)
+	return err
+}
+
+func insertPracticeTargetEvidenceV2(ctx context.Context, tx pgx.Tx, bundle domain.PracticeCompetencyEvidenceBundleV2, raw domain.PracticeCompetencyEvidence, reducerInput domain.LearningActionTargetEvidence) error {
+	stepIDs, err := json.Marshal(raw.StepIDs)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO student_practice_target_evidence (
+    evidence_id, student_id, task_instance_id, target_type, target_key,
+    target_version, correctness, independence, confidence, step_ids,
+    support_context, evidence_kind, occurred_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
+`, bundle.EvidenceID, bundle.StudentID, bundle.TaskInstanceID,
+		raw.Target.Type, raw.Target.Key, raw.Target.Version, raw.Correctness,
+		raw.Independence, raw.Confidence, string(stepIDs), reducerInput.SupportContext,
+		reducerInput.Kind, bundle.OccurredAt)
+	return err
+}
+
+func insertPracticeMasteryAudit(ctx context.Context, tx pgx.Tx, evidenceID string, evidence domain.LearningActionTargetEvidence, previous, next domain.StudentTargetMastery) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_practice_target_mastery_audit (
+    evidence_id, student_id, target_type, target_key, target_version,
+    evidence_kind, previous_state, next_state, previous_mastery_score,
+    next_mastery_score, previous_confidence, next_confidence,
+    policy_version, evidence_occurred_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+`, evidenceID, evidence.StudentID, evidence.Target.Type, evidence.Target.Key,
+		evidence.Target.Version, evidence.Kind, previous.State, next.State,
+		previous.MasteryScore, next.MasteryScore, previous.Confidence,
+		next.Confidence, domain.MasteryPolicyVersion, evidence.OccurredAt)
+	return err
+}
+
+func practiceTargetKey(target domain.LearningTargetRef) string {
+	return string(target.Type) + "\x1f" + target.Key + "\x1f" + target.Version
+}
+
+func insertTeacherAssistanceInbox(ctx context.Context, tx pgx.Tx, assistance domain.TeacherAssistance) (bool, error) {
+	var insertedEventID string
+	err := tx.QueryRow(ctx, `
+INSERT INTO student_integration_inbox (
+    event_id,
+    subject,
+    schema_version,
+    student_id,
+    correlation_id,
+    causation_id,
+    occurred_at
+) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7)
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id
+`,
+		assistance.EventID,
+		domain.SubjectTeacherAssistanceObserved,
+		domain.TeacherAssistanceObservedSchemaVersion,
+		assistance.StudentID,
+		assistance.CorrelationID,
+		assistance.CausationID,
+		assistance.OccurredAt,
+	).Scan(&insertedEventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func validateDuplicateTeacherAssistanceInbox(ctx context.Context, tx pgx.Tx, assistance domain.TeacherAssistance) error {
+	var subject, studentID, correlationID string
+	var causationID sql.NullString
+	err := tx.QueryRow(ctx, `
+SELECT subject, student_id::text, correlation_id, causation_id
+FROM student_integration_inbox
+WHERE event_id = $1
+`, assistance.EventID).Scan(&subject, &studentID, &correlationID, &causationID)
+	if err != nil {
+		return err
+	}
+	if subject != domain.SubjectTeacherAssistanceObserved || studentID != assistance.StudentID ||
+		correlationID != assistance.CorrelationID || !causationID.Valid || causationID.String != assistance.CausationID {
+		return evidenceContractError("event_id collides with a different inbox envelope", nil)
+	}
+	return nil
+}
+
+func loadClosedLearningAction(ctx context.Context, tx pgx.Tx, learningActionID string) (domain.StudentLearningAction, error) {
+	return scanLearningAction(tx.QueryRow(ctx, `
+SELECT id, student_task_answer_id, student_id, task_id, cycle, context_type,
+       context_id, learning_targets, evidence_class, outcome,
+       outcome_policy_version, opened_at, closed_at
+FROM student_learning_action
+WHERE id = $1
+FOR UPDATE
+`, learningActionID))
+}
+
+func validateClosureCausation(ctx context.Context, tx pgx.Tx, action domain.StudentLearningAction, assistance domain.TeacherAssistance) error {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM student_outbox
+    WHERE event_id = $1
+      AND subject = $2
+      AND student_id = $3
+      AND correlation_id = $4
+      AND causation_id = $5
+)
+`, assistance.CausationID, domain.SubjectLearningActionClosed, action.StudentID, action.ID, action.StudentTaskAnswerID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return evidenceContractError("teacher causation does not identify the action closure", nil)
+	}
+	return nil
+}
+
+func ensureNoAssistanceForAction(ctx context.Context, tx pgx.Tx, assistance domain.TeacherAssistance) error {
+	var existingEventID string
+	err := tx.QueryRow(ctx, `
+SELECT source_event_id
+FROM student_learning_action_assistance
+WHERE student_id = $1 AND learning_action_id = $2
+`, assistance.StudentID, assistance.LearningActionID).Scan(&existingEventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return evidenceContractError("a different assistance event already owns the action", nil)
+}
+
+func insertActionAssistance(ctx context.Context, tx pgx.Tx, assistance domain.TeacherAssistance) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_learning_action_assistance (
+    source_event_id,
+    student_id,
+    learning_action_id,
+    context_type,
+    context_id,
+    support_context,
+    hints_used,
+    max_hint_level,
+    intervention_used,
+    policy_version,
+    occurred_at
+) VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11)
+`,
+		assistance.EventID,
+		assistance.StudentID,
+		assistance.LearningActionID,
+		assistance.ContextType,
+		assistance.ContextID,
+		assistance.SupportContext,
+		assistance.HintsUsed,
+		assistance.MaxHintLevel,
+		assistance.InterventionUsed,
+		assistance.PolicyVersion,
+		assistance.OccurredAt,
+	)
+	return err
+}
+
+func insertTeacherObservations(ctx context.Context, tx pgx.Tx, assistance domain.TeacherAssistance) error {
+	for index, observation := range assistance.Observations {
+		_, err := tx.Exec(ctx, `
+INSERT INTO student_learning_evidence (
+    source_event_id,
+    observation_index,
+    student_id,
+    learning_action_id,
+    target_type,
+    target_key,
+    target_version,
+    evidence_kind,
+    source_service,
+    occurred_at
+) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, 'ms-go-teacher-agent', $9)
+`,
+			assistance.EventID,
+			index,
+			assistance.StudentID,
+			assistance.LearningActionID,
+			observation.Target.Type,
+			observation.Target.Key,
+			observation.Target.Version,
+			observation.Kind,
+			assistance.OccurredAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyActionTargetEvidence(ctx context.Context, tx pgx.Tx, evidence []domain.LearningActionTargetEvidence) error {
+	sort.Slice(evidence, func(left, right int) bool {
+		return masteryLockKey(evidence[left]) < masteryLockKey(evidence[right])
+	})
+	for _, item := range evidence {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, masteryLockKey(item)); err != nil {
+			return err
+		}
+		previous, exists, err := loadTargetMastery(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		if err := insertTargetEvidence(ctx, tx, item); err != nil {
+			return err
+		}
+		allEvidence, err := loadTargetEvidence(ctx, tx, item.StudentID, item.Target)
+		if err != nil {
+			return err
+		}
+		next, err := domain.ReduceStudentTargetMastery(allEvidence)
+		if err != nil {
+			return err
+		}
+		if err := upsertTargetMastery(ctx, tx, next); err != nil {
+			return err
+		}
+		if !exists {
+			previous = domain.StudentTargetMastery{
+				StudentID:     item.StudentID,
+				Target:        item.Target,
+				State:         domain.TargetMasteryUnknown,
+				PolicyVersion: domain.MasteryPolicyVersion,
+			}
+		}
+		if err := insertMasteryAudit(ctx, tx, item, previous, next); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertTargetEvidence(ctx context.Context, tx pgx.Tx, item domain.LearningActionTargetEvidence) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_learning_action_target_evidence (
+    learning_action_id,
+    student_id,
+    task_id,
+    target_type,
+    target_key,
+    target_version,
+    evidence_class,
+    outcome,
+    support_context,
+    evidence_kind,
+    hints_used,
+    max_hint_level,
+    intervention_used,
+    teacher_policy_version,
+    mastery_policy_version,
+    occurred_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+`,
+		item.LearningActionID,
+		item.StudentID,
+		item.TaskID,
+		item.Target.Type,
+		item.Target.Key,
+		item.Target.Version,
+		item.EvidenceClass,
+		item.Outcome,
+		item.SupportContext,
+		item.Kind,
+		item.HintsUsed,
+		item.MaxHintLevel,
+		item.InterventionUsed,
+		item.TeacherPolicyVersion,
+		item.MasteryPolicyVersion,
+		item.OccurredAt,
+	)
+	return err
+}
+
+func loadTargetEvidence(ctx context.Context, tx pgx.Tx, studentID string, target domain.LearningTargetRef) ([]domain.LearningActionTargetEvidence, error) {
+	rows, err := tx.Query(ctx, `
+SELECT learning_action_id, student_id, task_id, target_type, target_key,
+       target_version, evidence_class, outcome, support_context, evidence_kind,
+       hints_used, max_hint_level, intervention_used, teacher_policy_version,
+       mastery_policy_version, occurred_at
+FROM (
+    SELECT learning_action_id, student_id, task_id, target_type, target_key,
+           target_version, evidence_class, outcome, support_context, evidence_kind,
+           hints_used, max_hint_level, intervention_used, teacher_policy_version,
+           mastery_policy_version, occurred_at
+    FROM student_learning_action_target_evidence
+    UNION ALL
+    SELECT COALESCE(receipt.learning_action_id, target.evidence_id) AS learning_action_id,
+           target.student_id,
+           target.task_instance_id AS task_id,
+           target.target_type,
+           target.target_key,
+           target.target_version,
+           'application' AS evidence_class,
+           receipt.outcome,
+           target.support_context,
+           target.evidence_kind,
+           receipt.hints_used,
+           receipt.max_hint_level,
+           receipt.teacher_assistance_used AS intervention_used,
+           receipt.assistance_policy_version AS teacher_policy_version,
+           'student-mastery-v1' AS mastery_policy_version,
+           target.occurred_at
+    FROM student_practice_target_evidence AS target
+    JOIN student_practice_evidence_receipt AS receipt USING (evidence_id)
+) AS evidence
+WHERE student_id = $1
+  AND target_type = $2
+  AND target_key = $3
+  AND target_version = $4
+ORDER BY occurred_at, learning_action_id
+`, studentID, target.Type, target.Key, target.Version)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]domain.LearningActionTargetEvidence, 0)
+	for rows.Next() {
+		var item domain.LearningActionTargetEvidence
+		var maxHintLevel sql.NullInt32
+		if err := rows.Scan(
+			&item.LearningActionID,
+			&item.StudentID,
+			&item.TaskID,
+			&item.Target.Type,
+			&item.Target.Key,
+			&item.Target.Version,
+			&item.EvidenceClass,
+			&item.Outcome,
+			&item.SupportContext,
+			&item.Kind,
+			&item.HintsUsed,
+			&maxHintLevel,
+			&item.InterventionUsed,
+			&item.TeacherPolicyVersion,
+			&item.MasteryPolicyVersion,
+			&item.OccurredAt,
+		); err != nil {
+			return nil, err
+		}
+		if maxHintLevel.Valid {
+			value := int(maxHintLevel.Int32)
+			item.MaxHintLevel = &value
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func loadTargetMastery(ctx context.Context, tx pgx.Tx, studentID string, target domain.LearningTargetRef) (domain.StudentTargetMastery, bool, error) {
+	projection, err := scanTargetMastery(tx.QueryRow(ctx, `
+SELECT student_id, target_type, target_key, target_version, state,
+       mastery_score, confidence, independent_success_count,
+       assisted_success_count, failure_count, evidence_count, last_seen_at,
+       last_practiced_at, last_failed_at, policy_version
+FROM student_target_mastery
+WHERE student_id = $1
+  AND target_type = $2
+  AND target_key = $3
+  AND target_version = $4
+FOR UPDATE
+`, studentID, target.Type, target.Key, target.Version))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentTargetMastery{}, false, nil
+	}
+	if err != nil {
+		return domain.StudentTargetMastery{}, false, err
+	}
+	return projection, true, nil
+}
+
+type targetMasteryRow interface {
+	Scan(dest ...any) error
+}
+
+func scanTargetMastery(row targetMasteryRow) (domain.StudentTargetMastery, error) {
+	var projection domain.StudentTargetMastery
+	var lastPracticedAt, lastFailedAt sql.NullTime
+	if err := row.Scan(
+		&projection.StudentID,
+		&projection.Target.Type,
+		&projection.Target.Key,
+		&projection.Target.Version,
+		&projection.State,
+		&projection.MasteryScore,
+		&projection.Confidence,
+		&projection.IndependentSuccessCount,
+		&projection.AssistedSuccessCount,
+		&projection.FailureCount,
+		&projection.EvidenceCount,
+		&projection.LastSeenAt,
+		&lastPracticedAt,
+		&lastFailedAt,
+		&projection.PolicyVersion,
+	); err != nil {
+		return domain.StudentTargetMastery{}, err
+	}
+	projection.LastSeenAt = projection.LastSeenAt.UTC()
+	if lastPracticedAt.Valid {
+		value := lastPracticedAt.Time.UTC()
+		projection.LastPracticedAt = &value
+	}
+	if lastFailedAt.Valid {
+		value := lastFailedAt.Time.UTC()
+		projection.LastFailedAt = &value
+	}
+	return projection, nil
+}
+
+func upsertTargetMastery(ctx context.Context, tx pgx.Tx, projection domain.StudentTargetMastery) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_target_mastery (
+    student_id,
+    target_type,
+    target_key,
+    target_version,
+    state,
+    mastery_score,
+    confidence,
+    independent_success_count,
+    assisted_success_count,
+    failure_count,
+    evidence_count,
+    last_seen_at,
+    last_practiced_at,
+    last_failed_at,
+    policy_version,
+    updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+ON CONFLICT (student_id, target_type, target_key, target_version) DO UPDATE SET
+    state = EXCLUDED.state,
+    mastery_score = EXCLUDED.mastery_score,
+    confidence = EXCLUDED.confidence,
+    independent_success_count = EXCLUDED.independent_success_count,
+    assisted_success_count = EXCLUDED.assisted_success_count,
+    failure_count = EXCLUDED.failure_count,
+    evidence_count = EXCLUDED.evidence_count,
+    last_seen_at = EXCLUDED.last_seen_at,
+    last_practiced_at = EXCLUDED.last_practiced_at,
+    last_failed_at = EXCLUDED.last_failed_at,
+    policy_version = EXCLUDED.policy_version,
+    updated_at = now()
+`,
+		projection.StudentID,
+		projection.Target.Type,
+		projection.Target.Key,
+		projection.Target.Version,
+		projection.State,
+		projection.MasteryScore,
+		projection.Confidence,
+		projection.IndependentSuccessCount,
+		projection.AssistedSuccessCount,
+		projection.FailureCount,
+		projection.EvidenceCount,
+		projection.LastSeenAt,
+		projection.LastPracticedAt,
+		projection.LastFailedAt,
+		projection.PolicyVersion,
+	)
+	return err
+}
+
+func insertMasteryAudit(
+	ctx context.Context,
+	tx pgx.Tx,
+	evidence domain.LearningActionTargetEvidence,
+	previous domain.StudentTargetMastery,
+	next domain.StudentTargetMastery,
+) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO student_target_mastery_audit (
+    learning_action_id,
+    student_id,
+    target_type,
+    target_key,
+    target_version,
+    evidence_kind,
+    previous_state,
+    next_state,
+    previous_mastery_score,
+    next_mastery_score,
+    previous_confidence,
+    next_confidence,
+    reason_code,
+    policy_version,
+    evidence_occurred_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+`,
+		evidence.LearningActionID,
+		evidence.StudentID,
+		evidence.Target.Type,
+		evidence.Target.Key,
+		evidence.Target.Version,
+		evidence.Kind,
+		previous.State,
+		next.State,
+		previous.MasteryScore,
+		next.MasteryScore,
+		previous.Confidence,
+		next.Confidence,
+		string(evidence.Kind),
+		domain.MasteryPolicyVersion,
+		evidence.OccurredAt,
+	)
+	return err
+}
+
+func masteryLockKey(evidence domain.LearningActionTargetEvidence) string {
+	return evidence.StudentID + "\x1f" + string(evidence.Target.Type) + "\x1f" +
+		evidence.Target.Key + "\x1f" + evidence.Target.Version
+}
+
+func evidenceContractError(message string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("%w: %s", domain.ErrEvidenceContract, message)
+	}
+	return fmt.Errorf("%w: %s: %v", domain.ErrEvidenceContract, message, cause)
+}

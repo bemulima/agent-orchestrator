@@ -1,0 +1,431 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"reflect"
+	"sort"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.HybridApplication = (*LearningJourneyRepoPG)(nil)
+
+func (repo *LearningJourneyRepoPG) CreateHybridLearningIntent(ctx context.Context, actorID string, intent domain.HybridLearningIntentProjection) (domain.HybridLearningIntentReceipt, error) {
+	var empty domain.HybridLearningIntentReceipt
+	if repo == nil || repo.Pool == nil || actorID != intent.StudentID || !domain.IsCanonicalPracticeLearningActionUUID(actorID) || !domain.IsCanonicalPracticeLearningActionUUID(intent.LearningPathID) {
+		return empty, domain.ErrForbidden
+	}
+	hash, err := domain.HybridLearningIntentPayloadHash(intent)
+	if err != nil {
+		return empty, err
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return empty, err
+	}
+	defer tx.Rollback(ctx)
+	if err = hybridAdvisoryLock(ctx, tx, "hybrid-intent:"+intent.IntentID); err != nil {
+		return empty, err
+	}
+	if stored, err := readHybridIntent(ctx, tx, intent.IntentID, false); err == nil {
+		if stored.Intent.StudentID != actorID || stored.PayloadHash != hash {
+			return empty, domain.ErrHybridConflict
+		}
+		return stored, tx.Commit(ctx)
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return empty, err
+	}
+	if err = lockStudentAdmissionFence(ctx, tx, actorID); err != nil {
+		return empty, err
+	}
+	path, err := getLearningPathByID(ctx, tx, actorID, intent.LearningPathID, true)
+	if err != nil {
+		return empty, err
+	}
+	if path.Version != intent.ExpectedPathRevision {
+		return empty, domain.ErrHybridStale
+	}
+	targets, err := hybridPathTargets(path)
+	if err != nil {
+		return empty, err
+	}
+	if err = lockHybridMasteryTargets(ctx, tx, actorID, targets); err != nil {
+		return empty, err
+	}
+	if err = lockHybridProfileAndContext(ctx, tx, actorID); err != nil {
+		return empty, err
+	}
+	source, err := readPlanningSnapshotSource(ctx, tx, actorID, path.ID, targets)
+	if err != nil {
+		return empty, err
+	}
+	snapshot, err := domain.BuildStudentPlanningSnapshot(source, hybridOwnerSnapshotRequest(targets))
+	if err != nil {
+		return empty, err
+	}
+	if err = domain.ValidateHybridLearningIntentForCreation(snapshot, path, intent); err != nil {
+		return empty, err
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return empty, err
+	}
+	now = now.UTC().Truncate(time.Microsecond)
+	intent.CreatedAt = now
+	receipt := domain.HybridLearningIntentReceipt{Intent: intent, PayloadHash: hash, Status: "PENDING", CommittedAt: now}
+	projectionRaw, _ := json.Marshal(intent)
+	changeRaw, _ := json.Marshal(intent.RequestedChange)
+	receiptRaw, _ := json.Marshal(receipt)
+	_, err = tx.Exec(ctx, `INSERT INTO student_learning_intent(intent_id,student_id,learning_path_id,expected_path_revision,kind,requested_change_json,projection_json,payload_hash,receipt_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, intent.IntentID, actorID, path.ID, intent.ExpectedPathRevision, intent.Kind, changeRaw, projectionRaw, hash, receiptRaw, now)
+	if err != nil {
+		return empty, mapHybridPersistenceError(err)
+	}
+	if err = EnqueuePlanningStateChangedOutbox(ctx, tx, actorID, path.ID, path.Version, domain.TriggerPlanningLearningIntent, intent.IntentID, targets, now); err != nil {
+		return empty, err
+	}
+	return receipt, tx.Commit(ctx)
+}
+
+func (repo *LearningJourneyRepoPG) GetHybridLearningIntent(ctx context.Context, actorID, pathID, intentID string) (domain.HybridLearningIntentReceipt, error) {
+	var empty domain.HybridLearningIntentReceipt
+	if repo == nil || repo.Pool == nil || !domain.IsCanonicalPracticeLearningActionUUID(actorID) || !domain.IsCanonicalPracticeLearningActionUUID(pathID) || !domain.IsCanonicalPracticeLearningActionUUID(intentID) {
+		return empty, domain.ErrValidation
+	}
+	receipt, err := readHybridIntent(ctx, repo.Pool, intentID, true)
+	if err != nil {
+		return empty, err
+	}
+	if receipt.Intent.StudentID != actorID || receipt.Intent.LearningPathID != pathID {
+		return empty, domain.ErrNotFound
+	}
+	return receipt, nil
+}
+
+func (repo *LearningJourneyRepoPG) ApplyHybridConsequence(ctx context.Context, c domain.HybridConsequence) (domain.HybridApplicationReceipt, error) {
+	var empty domain.HybridApplicationReceipt
+	if repo == nil || repo.Pool == nil {
+		return empty, domain.ErrValidation
+	}
+	hash, err := domain.HybridConsequencePayloadHash(c)
+	if err != nil {
+		return empty, err
+	}
+	tx, err := repo.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return empty, err
+	}
+	defer tx.Rollback(ctx)
+	if err = hybridAdvisoryLock(ctx, tx, "hybrid-consequence:"+c.ConsequenceID); err != nil {
+		return empty, err
+	}
+	admitted, receipt, err := readHybridApplication(ctx, tx, c.ConsequenceID, hash)
+	if err != nil {
+		return empty, err
+	}
+	if receipt != nil {
+		return *receipt, tx.Commit(ctx)
+	}
+	if err = lockStudentAdmissionFence(ctx, tx, c.StudentID); err != nil {
+		return empty, err
+	}
+	if err = lockHybridMasteryTargets(ctx, tx, c.StudentID, c.SnapshotTargets); err != nil {
+		return empty, err
+	}
+	path, err := getLearningPathByID(ctx, tx, c.StudentID, c.LearningPathID, true)
+	if err != nil {
+		return empty, err
+	}
+	if err = lockHybridProfileAndContext(ctx, tx, c.StudentID); err != nil {
+		return empty, err
+	}
+	source, err := readPlanningSnapshotSource(ctx, tx, c.StudentID, c.LearningPathID, c.SnapshotTargets)
+	if err != nil {
+		return empty, err
+	}
+	snapshot, err := domain.BuildStudentPlanningSnapshot(source, hybridOwnerSnapshotRequest(c.SnapshotTargets))
+	if err != nil {
+		return empty, err
+	}
+	path.IsSelected = source.Context.SelectedLearningPathID == path.ID
+	var intent *domain.HybridLearningIntentProjection
+	if c.ApplicationMode == domain.HybridApplicationRequiresIntent {
+		stored, readErr := readHybridIntent(ctx, tx, c.IntentID, true)
+		if errors.Is(readErr, domain.ErrNotFound) {
+			return empty, domain.ErrHybridIntentRequired
+		}
+		if readErr != nil {
+			return empty, readErr
+		}
+		if stored.ConsumedAt != nil {
+			return empty, domain.ErrHybridConflict
+		}
+		intent = &stored.Intent
+	}
+	planned, status, err := domain.ValidateAndPlanHybridApplication(snapshot, path, c, intent)
+	if err != nil {
+		return empty, err
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return empty, err
+	}
+	now = now.UTC().Truncate(time.Microsecond)
+	result := domain.HybridApplicationReceipt{ConsequenceID: c.ConsequenceID, PayloadHash: hash, LearningPathID: path.ID, PreviousRevision: path.Version, ResultingRevision: path.Version, Status: status, CommittedAt: now}
+	if !admitted {
+		raw, _ := json.Marshal(c)
+		_, err = tx.Exec(ctx, `INSERT INTO student_hybrid_application(consequence_id,student_id,learning_path_id,expected_path_revision,snapshot_ref,policy_version,payload_hash,consequence_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, c.ConsequenceID, c.StudentID, c.LearningPathID, c.ExpectedPathRevision, c.SnapshotRef, c.PolicyVersion, hash, raw, now)
+		if err != nil {
+			return empty, mapHybridPersistenceError(err)
+		}
+	}
+	if status == domain.HybridApplicationWaitingSafeBoundary {
+		return result, tx.Commit(ctx)
+	}
+	if status != domain.HybridApplicationApplied && status != domain.HybridApplicationNoChange {
+		return empty, domain.ErrValidation
+	}
+	if status == domain.HybridApplicationApplied {
+		planned.UpdatedAt = now
+		readyReplacementID := ""
+		if c.ApplicationMode == domain.HybridApplicationRequiresIntent && len(c.Mutations) == 1 && c.Mutations[0].Kind == "REPLACE_ACTIVE_ACTIVITY" {
+			readyReplacementID = c.Mutations[0].ItemID
+		}
+		if err = persistHybridFuturePath(ctx, tx, path, planned, readyReplacementID); err != nil {
+			return empty, err
+		}
+		contextValue, err := getLearningContext(ctx, tx, c.StudentID, true)
+		if err != nil {
+			return empty, err
+		}
+		// Hybrid application advances the journey audit without changing the
+		// independently selected path ID or selected_path_status.
+		updatedContext, updateErr := tx.Exec(ctx, `UPDATE student_learning_context SET version=version+1,updated_at=$3 WHERE student_id=$1 AND version=$2`, c.StudentID, contextValue.Version, now)
+		if updateErr != nil {
+			return empty, updateErr
+		}
+		if updatedContext.RowsAffected() != 1 {
+			return empty, domain.ErrHybridStale
+		}
+		result.ResultingRevision = planned.Version
+	}
+	raw, _ := json.Marshal(result)
+	_, err = tx.Exec(ctx, `INSERT INTO student_hybrid_application_receipt(consequence_id,receipt_json,status,previous_revision,resulting_revision,committed_at) VALUES($1,$2,$3,$4,$5,$6)`, c.ConsequenceID, raw, status, result.PreviousRevision, result.ResultingRevision, now)
+	if err != nil {
+		return empty, err
+	}
+	if intent != nil {
+		consumed, err := tx.Exec(ctx, `UPDATE student_learning_intent SET consumed_at=$2,consumed_by_consequence_id=$3 WHERE intent_id=$1 AND consumed_at IS NULL`, intent.IntentID, now, c.ConsequenceID)
+		if err != nil {
+			return empty, err
+		}
+		if consumed.RowsAffected() != 1 {
+			return empty, domain.ErrHybridConflict
+		}
+	}
+	return result, tx.Commit(ctx)
+}
+
+func hybridAdvisoryLock(ctx context.Context, tx pgx.Tx, key string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, key)
+	return err
+}
+func lockHybridMasteryTargets(ctx context.Context, tx pgx.Tx, studentID string, targets []domain.LearningTargetRef) error {
+	normalized, err := domain.NormalizePlanningSnapshotTargets(targets)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(normalized))
+	for _, target := range normalized {
+		keys = append(keys, masteryLockKey(domain.LearningActionTargetEvidence{StudentID: studentID, Target: target}))
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err = hybridAdvisoryLock(ctx, tx, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func lockHybridProfileAndContext(ctx context.Context, tx pgx.Tx, studentID string) error {
+	if _, err := getLearningContext(ctx, tx, studentID, true); err != nil {
+		return err
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT student_id::text FROM student_onboarding WHERE student_id=$1 FOR UPDATE`, studentID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	return err
+}
+func hybridPathTargets(path domain.StudentLearningPath) ([]domain.LearningTargetRef, error) {
+	byID := map[string]domain.LearningTargetRef{}
+	for _, item := range path.Items {
+		for _, target := range item.Targets {
+			byID[planningSnapshotTargetID(target)] = target
+		}
+	}
+	targets := make([]domain.LearningTargetRef, 0, len(byID))
+	for _, target := range byID {
+		targets = append(targets, target)
+	}
+	return domain.NormalizePlanningSnapshotTargets(targets)
+}
+func hybridOwnerSnapshotRequest(targets []domain.LearningTargetRef) domain.PlanningSnapshotRequest {
+	return domain.PlanningSnapshotRequest{Targets: targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "hybrid_owner_validation", Reason: "exact committed consequence"}}
+}
+
+func readHybridIntent(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, intentID string, includeConsumption bool) (domain.HybridLearningIntentReceipt, error) {
+	var receipt domain.HybridLearningIntentReceipt
+	var raw, projection []byte
+	var hash, consumedBy string
+	var consumedAt *time.Time
+	err := q.QueryRow(ctx, `SELECT receipt_json,projection_json,payload_hash,consumed_at,COALESCE(consumed_by_consequence_id::text,'') FROM student_learning_intent WHERE intent_id=$1`, intentID).Scan(&raw, &projection, &hash, &consumedAt, &consumedBy)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return receipt, domain.ErrNotFound
+	}
+	if err != nil {
+		return receipt, err
+	}
+	if err = decodeHybridOwnerJSON(raw, &receipt); err != nil {
+		return receipt, err
+	}
+	var intent domain.HybridLearningIntentProjection
+	if err = decodeHybridOwnerJSON(projection, &intent); err != nil {
+		return receipt, err
+	}
+	expected, err := domain.HybridLearningIntentPayloadHash(intent)
+	if err != nil || expected != hash || receipt.PayloadHash != hash || !reflect.DeepEqual(intent, receipt.Intent) || receipt.Intent.IntentID != intentID {
+		return receipt, domain.ErrValidation
+	}
+	if includeConsumption && consumedAt != nil {
+		at := consumedAt.UTC()
+		receipt.ConsumedAt = &at
+		receipt.ConsumedByConsequenceID = consumedBy
+		receipt.Status = "CONSUMED"
+	}
+	return receipt, nil
+}
+func readHybridApplication(ctx context.Context, tx pgx.Tx, id, hash string) (bool, *domain.HybridApplicationReceipt, error) {
+	var storedHash string
+	var raw []byte
+	err := tx.QueryRow(ctx, `SELECT a.payload_hash,r.receipt_json FROM student_hybrid_application a LEFT JOIN student_hybrid_application_receipt r ON r.consequence_id=a.consequence_id WHERE a.consequence_id=$1`, id).Scan(&storedHash, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if storedHash != hash {
+		return true, nil, domain.ErrHybridConflict
+	}
+	if len(raw) == 0 {
+		return true, nil, nil
+	}
+	var receipt domain.HybridApplicationReceipt
+	if err = decodeHybridOwnerJSON(raw, &receipt); err != nil {
+		return true, nil, err
+	}
+	if receipt.ConsequenceID != id || receipt.PayloadHash != hash || (receipt.Status != domain.HybridApplicationApplied && receipt.Status != domain.HybridApplicationNoChange) {
+		return true, nil, domain.ErrValidation
+	}
+	return true, &receipt, nil
+}
+func decodeHybridOwnerJSON(raw []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(value) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.ErrValidation
+	}
+	return nil
+}
+func mapHybridPersistenceError(err error) error {
+	if errors.Is(mapLearningPathCommandError(err), domain.ErrConflict) {
+		return domain.ErrHybridConflict
+	}
+	return err
+}
+
+// Update only changed future occurrences. Existing protected rows and their
+// private frozen material are never deleted or reinserted. Positive temporary
+// positions avoid the immediate (path,position) primary key during permutation.
+func persistHybridFuturePath(ctx context.Context, tx pgx.Tx, current, desired domain.StudentLearningPath, readyReplacementID string) error {
+	if desired.Version != current.Version+1 || desired.ID != current.ID || desired.StudentID != current.StudentID {
+		return domain.ErrValidation
+	}
+	existing := map[string]domain.LearningPathItem{}
+	maxPosition := 0
+	for _, item := range current.Items {
+		existing[item.ID] = item
+		if item.Position > maxPosition {
+			maxPosition = item.Position
+		}
+	}
+	desiredIDs := map[string]bool{}
+	for _, item := range desired.Items {
+		if desiredIDs[item.ID] {
+			return domain.ErrHybridConflict
+		}
+		desiredIDs[item.ID] = true
+		if old, ok := existing[item.ID]; ok && old.Status != domain.LearningPathItemPlanned && !reflect.DeepEqual(old, item) {
+			// This exception is supplied only after the pure validator accepted
+			// an exact learner intent for an unstarted READY replacement.
+			if item.ID != readyReplacementID || old.Status != domain.LearningPathItemReady || item.Status != domain.LearningPathItemReady || old.Position != item.Position {
+				return domain.ErrHybridUnsafe
+			}
+		}
+	}
+	for id := range existing {
+		if !desiredIDs[id] {
+			return domain.ErrHybridUnsafe
+		}
+	}
+	changed := []domain.LearningPathItem{}
+	for _, item := range desired.Items {
+		old, ok := existing[item.ID]
+		if !ok || !reflect.DeepEqual(old, item) {
+			changed = append(changed, item)
+		}
+	}
+	for index, item := range changed {
+		if _, ok := existing[item.ID]; ok {
+			result, err := tx.Exec(ctx, `UPDATE student_learning_path_item SET position=$3 WHERE student_learning_path_id=$1 AND id=$2`, current.ID, item.ID, maxPosition+len(desired.Items)+index+1)
+			if err != nil {
+				return err
+			}
+			if result.RowsAffected() != 1 {
+				return domain.ErrHybridConflict
+			}
+		}
+	}
+	for _, item := range changed {
+		targets, err := json.Marshal(item.Targets)
+		if err != nil {
+			return err
+		}
+		if _, ok := existing[item.ID]; ok {
+			_, err = tx.Exec(ctx, `UPDATE student_learning_path_item SET reference_type=$3,reference_id=$4,position=$5,status=$6,targets_json=$7,reason_code=$8,lesson_revision_id=NULLIF($9,'')::uuid,frozen_requirements=$10,lesson_content_json=$11 WHERE student_learning_path_id=$1 AND id=$2`, current.ID, item.ID, item.ReferenceType, item.ReferenceID, item.Position, item.Status, targets, item.ReasonCode, item.LessonRevisionID, requirementsJSON(item), nullableContent(item.LessonContent))
+		} else {
+			_, err = tx.Exec(ctx, `INSERT INTO student_learning_path_item(student_learning_path_id,id,reference_type,reference_id,position,status,targets_json,reason_code,lesson_revision_id,frozen_requirements,lesson_content_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::uuid,$10,$11)`, current.ID, item.ID, item.ReferenceType, item.ReferenceID, item.Position, item.Status, targets, item.ReasonCode, item.LessonRevisionID, requirementsJSON(item), nullableContent(item.LessonContent))
+		}
+		if err != nil {
+			return mapHybridPersistenceError(err)
+		}
+	}
+	result, err := tx.Exec(ctx, `UPDATE student_learning_path SET version=$3,updated_at=$4,planner_policy_version=$5,reason_code=$6,reason_summary=$7 WHERE id=$1 AND student_id=$2 AND version=$8`, current.ID, current.StudentID, desired.Version, desired.UpdatedAt, desired.PlannerPolicyVersion, desired.ReasonCode, desired.ReasonSummary, current.Version)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrHybridStale
+	}
+	return insertLearningPathRevision(ctx, tx, desired)
+}

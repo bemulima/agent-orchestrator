@@ -1,0 +1,213 @@
+package answer
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+type learningActionLifecycleStub struct {
+	repository.LearningActionLifecycleRepository
+	createdAction  domain.StudentLearningAction
+	reopenedAction domain.StudentLearningAction
+	closedAction   domain.StudentLearningAction
+	closedEvent    domain.IntegrationEvent
+	active         domain.StudentLearningAction
+}
+
+func (stub *learningActionLifecycleStub) CreateAnswer(
+	_ context.Context,
+	answer domain.StudentTaskAnswer,
+	_ *int,
+	action domain.StudentLearningAction,
+) (domain.StudentTaskAnswer, domain.StudentLearningAction, error) {
+	answer.Attempt = 1
+	action.Cycle = 1
+	stub.createdAction = action
+	stub.active = action
+	return answer, action, nil
+}
+
+func (stub *learningActionLifecycleStub) EnsureActive(_ context.Context, action domain.StudentLearningAction) (domain.StudentLearningAction, error) {
+	if stub.active.ID != "" {
+		return stub.active, nil
+	}
+	action.Cycle = 1
+	stub.active = action
+	return action, nil
+}
+
+func (stub *learningActionLifecycleStub) GetActiveByAnswer(context.Context, string) (domain.StudentLearningAction, error) {
+	if stub.active.ID == "" {
+		return domain.StudentLearningAction{}, domain.ErrNotFound
+	}
+	return stub.active, nil
+}
+
+func (stub *learningActionLifecycleStub) ReopenAnswer(
+	_ context.Context,
+	_ domain.StudentTaskAnswer,
+	action domain.StudentLearningAction,
+) (domain.StudentLearningAction, error) {
+	action.Cycle = stub.active.Cycle + 1
+	stub.reopenedAction = action
+	stub.active = action
+	return action, nil
+}
+
+func (stub *learningActionLifecycleStub) CloseAnswer(
+	_ context.Context,
+	_ domain.StudentTaskAnswer,
+	action domain.StudentLearningAction,
+	event domain.IntegrationEvent,
+) error {
+	stub.closedAction = action
+	stub.closedEvent = event
+	return nil
+}
+
+type lifecycleAnswerRepositoryStub struct {
+	repository.StudentTaskAnswerRepository
+	answer domain.StudentTaskAnswer
+}
+
+func (stub lifecycleAnswerRepositoryStub) GetByID(context.Context, string) (*domain.StudentTaskAnswer, error) {
+	answer := stub.answer
+	return &answer, nil
+}
+
+func (stub lifecycleAnswerRepositoryStub) Update(context.Context, domain.StudentTaskAnswer) error {
+	return nil
+}
+
+func TestStartTaskAnswerCreatesDistinctLearningActionWithTargetSnapshot(t *testing.T) {
+	const (
+		studentID = "11111111-1111-4111-8111-111111111111"
+		taskID    = "22222222-2222-4222-8222-222222222222"
+	)
+	lifecycle := &learningActionLifecycleStub{}
+	provider := progressionTaskProviderStub{tasks: map[string]*TaskMetadata{
+		taskID: {
+			ID:            taskID,
+			Status:        domain.TaskStatusActive,
+			Type:          9,
+			ExecutionMode: "NO_RUN",
+			LearningTargets: []domain.LearningTargetRef{
+				{Type: domain.LearningTargetCapability, Key: "learning.semantic-sequence"},
+			},
+		},
+	}}
+	output, err := (StartTaskAnswer{
+		TaskProvider:    provider,
+		LearningActions: lifecycle,
+	}).Handle(context.Background(), StartTaskAnswerInput{StudentID: studentID, TaskID: taskID})
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if output.LearningActionID == "" || output.LearningActionID == output.AnswerID {
+		t.Fatalf("answer_id=%q learning_action_id=%q must be distinct", output.AnswerID, output.LearningActionID)
+	}
+	if lifecycle.createdAction.ContextType != domain.LearningContextLessonTask || len(lifecycle.createdAction.LearningTargets) != 1 {
+		t.Fatalf("unexpected created action: %+v", lifecycle.createdAction)
+	}
+	if lifecycle.createdAction.EvidenceClass != domain.LearningEvidenceKnowledgeCheck {
+		t.Fatalf("evidence class=%q, want knowledge_check", lifecycle.createdAction.EvidenceClass)
+	}
+}
+
+func TestActivityAnswerReopenCreatesNewLearningActionCycle(t *testing.T) {
+	const (
+		studentID = "11111111-1111-4111-8111-111111111111"
+		answerID  = "22222222-2222-4222-8222-222222222222"
+		taskID    = "33333333-3333-4333-8333-333333333333"
+		actionID  = "44444444-4444-4444-8444-444444444444"
+	)
+	lifecycle := &learningActionLifecycleStub{active: domain.StudentLearningAction{ID: actionID, Cycle: 1}}
+	provider := progressionTaskProviderStub{tasks: map[string]*TaskMetadata{
+		taskID: {
+			ID:     taskID,
+			Status: domain.TaskStatusActive,
+			Type:   3,
+			LearningTargets: []domain.LearningTargetRef{
+				{Type: domain.LearningTargetConcept, Key: "program.instructions.sequence"},
+			},
+		},
+	}}
+	useCase := ActivityAnswer{
+		Answers: lifecycleAnswerRepositoryStub{answer: domain.StudentTaskAnswer{
+			ID:        answerID,
+			StudentID: studentID,
+			TaskID:    taskID,
+			Status:    domain.StudentTaskAnswerStatusFailed,
+			StartedAt: time.Now().Add(-time.Hour),
+		}},
+		TaskProvider:    provider,
+		LearningActions: lifecycle,
+	}
+	if err := useCase.Handle(context.Background(), ActivityAnswerInput{AnswerID: answerID, StudentID: studentID}); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if lifecycle.reopenedAction.ID == "" || lifecycle.reopenedAction.ID == actionID || lifecycle.reopenedAction.StudentTaskAnswerID != answerID {
+		t.Fatalf("unexpected reopened action: %+v", lifecycle.reopenedAction)
+	}
+	if lifecycle.reopenedAction.Cycle != 2 {
+		t.Fatalf("reopened cycle=%d, want 2", lifecycle.reopenedAction.Cycle)
+	}
+	if lifecycle.reopenedAction.EvidenceClass != domain.LearningEvidenceApplication {
+		t.Fatalf("evidence class=%q, want application", lifecycle.reopenedAction.EvidenceClass)
+	}
+}
+
+func TestCloseAnswerLearningActionCreatesDurableClosureEvent(t *testing.T) {
+	closedAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	lifecycle := &learningActionLifecycleStub{active: domain.StudentLearningAction{
+		ID:                  "11111111-1111-4111-8111-111111111111",
+		StudentTaskAnswerID: "22222222-2222-4222-8222-222222222222",
+		StudentID:           "33333333-3333-4333-8333-333333333333",
+		TaskID:              "44444444-4444-4444-8444-444444444444",
+		Cycle:               1,
+		ContextType:         domain.LearningContextLessonTask,
+		ContextID:           "44444444-4444-4444-8444-444444444444",
+		LearningTargets: []domain.LearningTargetRef{
+			{Type: domain.LearningTargetConcept, Key: "program.instructions.sequence"},
+		},
+		OpenedAt: closedAt.Add(-time.Minute),
+	}}
+	answer := domain.StudentTaskAnswer{
+		ID:        lifecycle.active.StudentTaskAnswerID,
+		StudentID: lifecycle.active.StudentID,
+		TaskID:    lifecycle.active.TaskID,
+		Status:    domain.StudentTaskAnswerStatusPassed,
+		UpdatedAt: closedAt,
+	}
+	if err := closeAnswerLearningAction(context.Background(), lifecycle, nil, answer, closedAt); err != nil {
+		t.Fatalf("closeAnswerLearningAction returned error: %v", err)
+	}
+	if lifecycle.closedEvent.Subject != domain.SubjectLearningActionClosed || lifecycle.closedEvent.CorrelationID != lifecycle.active.ID {
+		t.Fatalf("unexpected closure event: %+v", lifecycle.closedEvent)
+	}
+	if lifecycle.closedAction.Outcome != domain.LearningActionPassed || lifecycle.closedAction.OutcomePolicyVersion != domain.MasteryPolicyVersion {
+		t.Fatalf("outcome snapshot was not assigned: %+v", lifecycle.closedAction)
+	}
+}
+
+func TestLearningEvidenceClassForTask(t *testing.T) {
+	for _, taskType := range []int16{9, 11, 12, 13} {
+		class, err := learningEvidenceClassForTask(taskType)
+		if err != nil || class != domain.LearningEvidenceKnowledgeCheck {
+			t.Fatalf("task type %d class=%q err=%v", taskType, class, err)
+		}
+	}
+	for _, taskType := range []int16{1, 2, 3, 4, 5, 6, 7, 8, 10} {
+		class, err := learningEvidenceClassForTask(taskType)
+		if err != nil || class != domain.LearningEvidenceApplication {
+			t.Fatalf("task type %d class=%q err=%v", taskType, class, err)
+		}
+	}
+	if _, err := learningEvidenceClassForTask(0); err == nil {
+		t.Fatal("expected unknown task type to fail closed")
+	}
+}

@@ -1,0 +1,106 @@
+package student
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+type PracticeExecutionReader interface {
+	ReadExecutionProjection(context.Context, string, string) (domain.PracticeExecutionProjection, error)
+}
+type NextActionResolver struct {
+	Reader  repository.NextActionSnapshotReader
+	Runtime PracticeExecutionReader
+}
+
+func snapshotHash(s domain.NextActionSnapshot) [32]byte {
+	b, _ := json.Marshal(s)
+	return sha256.Sum256(b)
+}
+func (u NextActionResolver) Handle(ctx context.Context, studentID string) (domain.StudentNextAction, error) {
+	studentID = strings.TrimSpace(studentID)
+	if !validStudentUUID(studentID) {
+		return domain.StudentNextAction{}, domain.ErrValidation
+	}
+	if u.Reader == nil {
+		return domain.StudentNextAction{}, errors.New("next action reader required")
+	}
+	s, err := u.Reader.ReadNextActionSnapshot(ctx, studentID)
+	if err != nil {
+		return domain.StudentNextAction{}, err
+	}
+	if s.StudentID != studentID {
+		return domain.StudentNextAction{}, domain.ErrStateChanged
+	}
+	projections := map[string]domain.PracticeExecutionProjection{}
+	for _, b := range s.Bindings {
+		if !domain.RequiredNextActionBinding(s, b) || u.Runtime == nil {
+			continue
+		}
+		p, e := u.Runtime.ReadExecutionProjection(ctx, studentID, b.TaskInstanceID)
+		if e != nil {
+			continue
+		}
+		if validExecutionProjection(p, b, studentID) {
+			projections[b.TaskInstanceID] = p
+		}
+	}
+	// Cross-owner observations are not one distributed transaction. Fence Student
+	// changes during Runtime reads, report WAITING, and let callers read again.
+	if len(s.Bindings) > 0 {
+		latest, e := u.Reader.ReadNextActionSnapshot(ctx, studentID)
+		if e != nil {
+			return domain.StudentNextAction{}, e
+		}
+		if snapshotHash(s) != snapshotHash(latest) {
+			result := domain.ResolveNextAction(latest, nil)
+			result.Status = "WAITING"
+			result.Primary = nil
+			result.ReasonCode = "state_changed"
+			return result, nil
+		}
+	}
+	return domain.ResolveNextAction(s, projections), nil
+}
+func validExecutionProjection(p domain.PracticeExecutionProjection, b domain.PracticeLearningActionBinding, studentID string) bool {
+	if p.Schema != "practice-execution-projection.v1" || p.StudentID != studentID || b.StudentID != studentID || p.TaskInstanceID != b.TaskInstanceID || p.LearningActionID != b.LearningActionID || p.TaskRevisionID != b.TaskRevisionID || p.TaskRevisionDigest != b.TaskRevisionDigest || p.LearningPathID != b.LearningPathID || p.LearningPathItemID != b.LearningPathItemID || p.RequirementID != b.RequirementID || p.Version == "" || len(p.Version) > 128 || p.ReasonCode == "" || len(p.ReasonCode) > 128 || len(p.AvailableActions) > 8 {
+		return false
+	}
+	for _, id := range []string{p.StepID, p.MilestoneID, p.SubmissionID} {
+		if id != "" && !validStudentUUID(id) {
+			return false
+		}
+	}
+	if p.SubmissionScope != "" && p.SubmissionScope != "MILESTONE" && p.SubmissionScope != "FINAL" {
+		return false
+	}
+	switch p.Status {
+	case "READY":
+		if !domain.IsPracticeProgressionAction(p.SuggestedAction) {
+			return false
+		}
+	case "BLOCKED", "COMPLETED", "CANCELLED":
+		if p.SuggestedAction != "" {
+			return false
+		}
+	default:
+		return false
+	}
+	seen := map[string]bool{}
+	for _, a := range p.AvailableActions {
+		if !domain.IsPracticeProgressionAction(a) || seen[a] {
+			return false
+		}
+		seen[a] = true
+	}
+	if p.Status == "READY" && !seen[p.SuggestedAction] {
+		return false
+	}
+	return true
+}

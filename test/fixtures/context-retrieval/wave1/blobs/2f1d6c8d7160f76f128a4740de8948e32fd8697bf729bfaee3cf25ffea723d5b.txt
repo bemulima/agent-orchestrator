@@ -1,0 +1,152 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/config"
+	pgadapter "github.com/example/mc-course-service/internal/infrastructure/persistence/postgres"
+	"github.com/example/mc-course-service/internal/usecase/diagnosticfixture"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	migrateFreshCommand                         = "migrate-fresh"
+	provisionDiagnosticAssessmentFixtureCommand = "provision-diagnostic-assessment-fixture"
+	defaultMigrationsDirectory                  = "db/migrations"
+)
+
+var v2FixtureRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+type diagnosticFixtureFailure struct {
+	Schema string `json:"schema"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+func runFreshMigrationsCommand(ctx context.Context) int {
+	cfg, err := config.Load()
+	if err != nil {
+		return writeMigrationResult(pgadapter.FreshMigrationResult{Schema: pgadapter.FreshMigrationResultSchema, Status: "failed", Reason: "invalid_configuration"})
+	}
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return writeMigrationResult(pgadapter.FreshMigrationResult{Schema: pgadapter.FreshMigrationResultSchema, Status: "failed", Reason: "database_unavailable"})
+	}
+	defer pool.Close()
+
+	directory := strings.TrimSpace(os.Getenv("COURSE_MIGRATIONS_DIR"))
+	if directory == "" {
+		directory = defaultMigrationsDirectory
+	}
+	result, runErr := pgadapter.RunFreshMigrations(ctx, pool, os.DirFS(filepath.Clean(directory)))
+	if runErr != nil {
+		return writeMigrationResult(result)
+	}
+	return writeMigrationResult(result)
+}
+
+func runDiagnosticAssessmentFixtureCommand(ctx context.Context) int {
+	cfg, err := config.Load()
+	if err != nil {
+		return writeDiagnosticFixtureFailure("invalid_configuration")
+	}
+	pool, err := pgadapter.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return writeDiagnosticFixtureFailure("database_unavailable")
+	}
+	defer pool.Close()
+
+	if err := validateV2FixtureTarget(ctx, pool); err != nil {
+		return writeDiagnosticFixtureFailure("target_guard_rejected")
+	}
+	definition, err := diagnosticfixture.LoadDefinition()
+	if err != nil {
+		return writeDiagnosticFixtureFailure("fixture_contract_invalid")
+	}
+	provisioner := diagnosticfixture.Provisioner{
+		Definition: definition,
+		Dependencies: diagnosticfixture.Dependencies{
+			Tx:              pgadapter.TxManagerPG{Pool: pool},
+			Courses:         pgadapter.CourseRepoPG{Pool: pool},
+			CourseI18n:      pgadapter.CourseI18nRepoPG{Pool: pool},
+			I18n:            pgadapter.I18nRepoPG{Pool: pool},
+			CodeStructures:  pgadapter.CodeStructureTypeRepoPG{Pool: pool},
+			Modules:         pgadapter.ModuleRepoPG{Pool: pool},
+			ModuleI18n:      pgadapter.ModuleI18nRepoPG{Pool: pool},
+			CourseModules:   pgadapter.CourseModuleRepoPG{Pool: pool},
+			Sections:        pgadapter.SectionRepoPG{Pool: pool},
+			SectionI18n:     pgadapter.SectionI18nRepoPG{Pool: pool},
+			ModuleSections:  pgadapter.ModuleSectionRepoPG{Pool: pool},
+			Lessons:         pgadapter.LessonRepoPG{Pool: pool},
+			LessonI18n:      pgadapter.LessonI18nRepoPG{Pool: pool},
+			SectionLessons:  pgadapter.SectionLessonRepoPG{Pool: pool},
+			Tasks:           pgadapter.TaskRepoPG{Pool: pool},
+			TaskI18n:        pgadapter.TaskI18nRepoPG{Pool: pool},
+			TaskTests:       pgadapter.TaskTestRepoPG{Pool: pool},
+			LearningTargets: pgadapter.TaskLearningTargetRepoPG{Pool: pool},
+		},
+	}
+	result, err := provisioner.Ensure(ctx)
+	if err != nil {
+		if errors.Is(err, diagnosticfixture.ErrDrift) {
+			// The returned CLI payload stays deliberately coarse and safe. The
+			// owner log keeps the static contract path so operators can resolve
+			// a fixture drift without exposing questions, variants, or answers.
+			log.Printf("diagnostic assessment fixture drift: %v", err)
+			return writeDiagnosticFixtureFailure("fixture_drift")
+		}
+		// Keep the machine-readable payload coarse while preserving an
+		// operator-actionable, content-free failure chain in the owner log.
+		log.Printf("diagnostic assessment fixture provisioning failed: %v", err)
+		return writeDiagnosticFixtureFailure("provisioning_failed")
+	}
+	if err := writeJSON(result); err != nil {
+		return 2
+	}
+	return 0
+}
+
+func validateV2FixtureTarget(ctx context.Context, pool *pgxpool.Pool) error {
+	runID := strings.TrimSpace(os.Getenv("LW_V2_COURSE_FIXTURE_RUN_ID"))
+	targetDatabase := strings.TrimSpace(os.Getenv("LW_V2_COURSE_FIXTURE_TARGET_DATABASE"))
+	if !v2FixtureRunIDPattern.MatchString(runID) || targetDatabase == "" {
+		return errors.New("missing or invalid V2 fixture target guard")
+	}
+	var connectedDatabase string
+	if err := pool.QueryRow(ctx, `SELECT current_database()`).Scan(&connectedDatabase); err != nil {
+		return fmt.Errorf("prove V2 fixture target database: %w", err)
+	}
+	if connectedDatabase != targetDatabase {
+		return errors.New("V2 fixture target database does not match connected database")
+	}
+	return nil
+}
+
+func writeMigrationResult(result pgadapter.FreshMigrationResult) int {
+	if err := writeJSON(result); err != nil {
+		return 2
+	}
+	if result.Status != "applied" {
+		return 2
+	}
+	return 0
+}
+
+func writeDiagnosticFixtureFailure(reason string) int {
+	if err := writeJSON(diagnosticFixtureFailure{Schema: "course-diagnostic-assessment-fixture-result.v1", Status: "failed", Reason: reason}); err != nil {
+		return 2
+	}
+	return 2
+}
+
+func writeJSON(value any) error {
+	return json.NewEncoder(os.Stdout).Encode(value)
+}

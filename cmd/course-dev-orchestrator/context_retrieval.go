@@ -126,7 +126,7 @@ func loadContextCommandRequest(values contextCommandFlags) (contextretrieval.Ret
 			return request, fmt.Errorf("bind routing coverage: %w", err)
 		}
 	}
-	adapted, err := contextadapter.AdaptRoute(route, admitted, contract, coverage)
+	adapted, err := contextadapter.AdaptTaskRoute(route, admitted, contract, coverage, append(append([]contextretrieval.Facet{}, request.RequiredFacets...), request.OptionalFacets...))
 	if err != nil {
 		return request, fmt.Errorf("adapt route: %w", err)
 	}

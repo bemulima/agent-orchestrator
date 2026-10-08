@@ -1,0 +1,758 @@
+package teacherdialog_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/studentcontext"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/teacherdialog"
+)
+
+type workerJobs struct {
+	job              domain.TeacherDialogJob
+	hasJob           bool
+	claim            repository.TeacherDialogClaim
+	savedDecision    domain.TeacherDecision
+	savedEvent       domain.IntegrationEvent
+	savedBody        string
+	completedMessage string
+	retriedCode      string
+	blockedCode      string
+	renewed          int
+	reconcileState   domain.TeacherTurnReconciliationState
+}
+
+type workerUnifiedCoordinator struct {
+	processCalls  int
+	deliveryCalls int
+	processErr    error
+	needsDelivery bool
+}
+
+func (coordinator *workerUnifiedCoordinator) Process(context.Context, domain.TeacherDialogJob) (bool, error) {
+	coordinator.processCalls++
+	return true, coordinator.processErr
+}
+func (coordinator *workerUnifiedCoordinator) NeedsDelivery(context.Context, domain.TeacherDialogJob) (bool, error) {
+	return coordinator.needsDelivery, nil
+}
+func (coordinator *workerUnifiedCoordinator) Deliver(context.Context, domain.TeacherDialogJob) error {
+	coordinator.deliveryCalls++
+	return nil
+}
+
+func (jobs *workerJobs) Accept(context.Context, domain.TeacherDialogJob) (bool, error) {
+	return false, nil
+}
+func (jobs *workerJobs) Claim(_ context.Context, claim repository.TeacherDialogClaim) (domain.TeacherDialogJob, bool, error) {
+	jobs.claim = claim
+	if !jobs.hasJob {
+		return domain.TeacherDialogJob{}, false, nil
+	}
+	jobs.job.Status = domain.TeacherDialogJobProcessing
+	jobs.job.ClaimToken = claim.ClaimToken
+	jobs.job.WorkerID = claim.WorkerID
+	jobs.job.LockedUntil = claim.LockedUntil
+	jobs.job.Attempts++
+	return jobs.job, true, nil
+}
+func (jobs *workerJobs) SaveGenerated(
+	_ context.Context, _, _ string, decision domain.TeacherDecision, event domain.IntegrationEvent,
+	body, _ string, _ time.Time,
+) error {
+	jobs.savedDecision = decision
+	jobs.savedEvent = event
+	jobs.savedBody = body
+	jobs.job.DecisionID = decision.ID
+	jobs.job.ResponseBody = body
+	return nil
+}
+func (jobs *workerJobs) SaveCoordinatedResponse(_ context.Context, _, _ string, response domain.TeacherCoordinatedDialogResponse, _ time.Time) error {
+	jobs.savedBody = response.Body
+	return nil
+}
+func (jobs *workerJobs) RenewLease(context.Context, string, string, time.Time, time.Time) error {
+	jobs.renewed++
+	return nil
+}
+func (jobs *workerJobs) RecordFailedNoEffect(context.Context, string, string, domain.TeacherDialogNoEffectProof, domain.TeacherDialogRecoverableOutcome, string, time.Time) error {
+	return nil
+}
+func (jobs *workerJobs) MarkReconciliation(_ context.Context, _, _ string, state domain.TeacherTurnReconciliationState, _ string, _ time.Time) error {
+	jobs.reconcileState = state
+	return nil
+}
+func (jobs *workerJobs) GetCursor(context.Context, string) (domain.TeacherDialogTurnCursor, error) {
+	return domain.TeacherDialogTurnCursor{}, nil
+}
+func (jobs *workerJobs) CompleteDelivery(_ context.Context, _, _, messageID string, _ time.Time) error {
+	jobs.completedMessage = messageID
+	jobs.job.ResponseBody = ""
+	jobs.hasJob = false
+	return nil
+}
+func (jobs *workerJobs) Retry(_ context.Context, _, _, code string, _, _ time.Time) error {
+	jobs.retriedCode = code
+	return nil
+}
+func (jobs *workerJobs) Block(_ context.Context, _, _, code string, _ time.Time) error {
+	jobs.blockedCode = code
+	return nil
+}
+
+type teacherReader struct {
+	teacher domain.PersonalTeacher
+	err     error
+}
+
+func (reader teacherReader) Execute(context.Context, string) (domain.PersonalTeacher, error) {
+	return reader.teacher, reader.err
+}
+
+type soulReader struct {
+	soul  domain.TeacherSoul
+	err   error
+	calls int
+}
+
+func (reader *soulReader) Execute(context.Context, string) (domain.TeacherSoul, error) {
+	reader.calls++
+	return reader.soul, reader.err
+}
+
+type studentBuilder struct {
+	value domain.StudentContext
+	err   error
+	calls int
+}
+
+func (builder *studentBuilder) Execute(_ context.Context, input studentcontext.BuildInput) (domain.StudentContext, error) {
+	builder.calls++
+	value := builder.value
+	value.StudentID = input.StudentID
+	value.LearningActionID = input.LearningActionID
+	value.ContextType = input.ContextType
+	value.ContextID = input.ContextID
+	if input.ContextType == domain.LearningContextPracticeTask || input.ContextType == domain.LearningContextProject {
+		practice := domain.PracticeTaskContext{
+			Schema: domain.PracticeTaskContextSchemaV1, TaskInstanceID: input.ContextID,
+			StudentID: input.StudentID, TaskRevisionID: "88888888-8888-4888-8888-888888888888",
+			LearningActionID: input.LearningActionID, Surface: "practice", Locale: "ru", Status: "ACTIVE",
+			Step:             domain.PracticeTaskStepContext{ID: "implement", Title: "Implement", Objective: "Build", Status: "AVAILABLE"},
+			AssistancePolicy: domain.PracticeTaskAssistancePolicy{Version: 1, MaxHintLevel: 2, Teacher: domain.PracticeTeacherPolicy{MayExplain: true}},
+		}
+		value.TaskID = practice.TaskRevisionID
+		value.PracticeTask = &practice
+	} else {
+		value.PracticeTask = nil
+	}
+	return value, builder.err
+}
+
+type dialogBoundary struct {
+	context     domain.DialogRequestContext
+	contextErr  error
+	appendErr   error
+	readCalls   int
+	appendCalls int
+	appendKey   string
+	appendBody  string
+}
+
+func (boundary *dialogBoundary) GetTeacherRequestContext(context.Context, domain.DialogTeacherRequest, int) (domain.DialogRequestContext, error) {
+	boundary.readCalls++
+	return boundary.context, boundary.contextErr
+}
+func (boundary *dialogBoundary) AppendTeacherResponse(
+	_ context.Context, request domain.DialogTeacherRequest, key, body string,
+) (domain.DialogMessage, error) {
+	boundary.appendCalls++
+	boundary.appendKey = key
+	boundary.appendBody = body
+	if boundary.appendErr != nil {
+		return domain.DialogMessage{}, boundary.appendErr
+	}
+	return domain.DialogMessage{
+		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", DialogID: request.DialogID,
+		AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: request.SourceChannel, PersonalTeacherID: request.PersonalTeacherID,
+		LearningActionID: request.LearningActionID, ReplyToMessageID: request.SourceMessageID,
+		Body: body, Status: 1, MessageSequence: request.SourceSequence + 1,
+		LastEventSequence: request.EventSequence + 1, CreatedAt: time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+type decisionHistory struct {
+	values []domain.TeacherDecision
+	jobs   *workerJobs
+}
+
+func (history decisionHistory) ListByLearningAction(context.Context, string, string) ([]domain.TeacherDecision, error) {
+	if history.jobs != nil && history.jobs.savedDecision.ID != "" {
+		return []domain.TeacherDecision{history.jobs.savedDecision}, nil
+	}
+	return history.values, nil
+}
+
+type practiceAssistanceRecorder struct {
+	calls      int
+	instanceID string
+	studentID  string
+	action     domain.TeacherAction
+	hintLevel  *int
+	stepID     string
+	usageID    string
+	err        error
+}
+
+func (recorder *practiceAssistanceRecorder) RecordPracticeTaskAssistance(
+	_ context.Context, instanceID, studentID, stepID, usageID string, action domain.TeacherAction, hintLevel *int,
+) error {
+	recorder.calls++
+	recorder.instanceID, recorder.studentID, recorder.action, recorder.hintLevel = instanceID, studentID, action, hintLevel
+	recorder.stepID = stepID
+	recorder.usageID = usageID
+	return recorder.err
+}
+
+type responseGenerator struct {
+	response    domain.TeacherGeneratedResponse
+	generateErr error
+	replayErr   error
+	generated   int
+	replayed    int
+	request     domain.TeacherGenerationRequest
+}
+
+func (generator *responseGenerator) Generate(_ context.Context, request domain.TeacherGenerationRequest) (domain.TeacherGeneratedResponse, error) {
+	generator.generated++
+	generator.request = request
+	return generator.response, generator.generateErr
+}
+
+type courseLessonReader struct {
+	content  domain.CourseLessonContent
+	err      error
+	calls    int
+	lessonID string
+	language string
+}
+
+type channelDeliveryStub struct {
+	sourceMessageID string
+	studentID       string
+	body            string
+}
+
+func (stub *channelDeliveryStub) EnqueueDelivery(_ context.Context, sourceMessageID, studentID, body string, _ time.Time) error {
+	stub.sourceMessageID, stub.studentID, stub.body = sourceMessageID, studentID, body
+	return nil
+}
+
+func (reader *courseLessonReader) GetLessonContext(_ context.Context, lessonID, language string) (domain.CourseLessonContent, error) {
+	reader.calls++
+	reader.lessonID = lessonID
+	reader.language = language
+	return reader.content, reader.err
+}
+func (generator *responseGenerator) Replay(context.Context, string) (domain.TeacherGeneratedResponse, error) {
+	generator.replayed++
+	return generator.response, generator.replayErr
+}
+
+type workerIDs struct{ values []string }
+
+func (ids *workerIDs) NewID() string {
+	value := ids.values[0]
+	ids.values = ids.values[1:]
+	return value
+}
+
+func TestWorkerAtomicallyStagesDecisionThenDeliversWithSourceEventKey(t *testing.T) {
+	worker, jobs, dialog, generator, _, _ := validWorkerFixture(t)
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherActionGiveHint, jobs.savedDecision.Action)
+	require.Equal(t, 1, *jobs.savedDecision.HintLevel)
+	require.Equal(t, validDialogRequest().EventID, jobs.savedDecision.CausationID)
+	require.Equal(t, domain.SubjectTeacherDecisionRecorded, jobs.savedEvent.Subject)
+	require.Equal(t, "Проверь границу цикла.", jobs.savedBody)
+	require.Equal(t, validDialogRequest().EventID, dialog.appendKey)
+	require.Equal(t, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", jobs.completedMessage)
+	require.Equal(t, 1, generator.generated)
+}
+
+func TestWorkerProcessesGeneralTeacherRequestFromLearnerOverview(t *testing.T) {
+	worker, jobs, dialog, _, builder, _ := validWorkerFixture(t)
+	request := jobs.job.Request
+	request.ContextType = domain.LearningContextGeneral
+	request.ContextID = ""
+	request.LearningActionID = ""
+	jobs.job.Request = request
+	builder.value = domain.StudentContext{StudentID: request.StudentID, ContextType: domain.LearningContextGeneral}
+	dialog.context.ContextType = domain.LearningContextGeneral
+	dialog.context.ContextID = ""
+	dialog.context.LearningActionID = ""
+	dialog.context.Messages[0].LearningActionID = ""
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherActionRespond, jobs.savedDecision.Action)
+	require.Nil(t, jobs.savedDecision.HintLevel)
+	require.Equal(t, request.DialogID, jobs.savedDecision.CorrelationID)
+	require.Equal(t, domain.LearningContextGeneral, jobs.savedDecision.ContextType)
+}
+
+func TestWorkerProcessesSelectionVerifiedAgainstExactCourseRevision(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	request := jobs.job.Request
+	request.ContextType = domain.LearningContextLesson
+	request.LearningActionID = ""
+	jobs.job.Request = request
+	revision := "2026-08-31T09:00:00Z"
+	selectedText := "errors.Is(err, target)"
+	builder.value = domain.StudentContext{
+		StudentID: request.StudentID, ContextType: domain.LearningContextLesson, ContextID: request.ContextID,
+	}
+	dialog.context.ContextType = domain.LearningContextLesson
+	dialog.context.LearningActionID = ""
+	dialog.context.Messages[0].LearningActionID = ""
+	dialog.context.Messages[0].LessonContext = &domain.LessonMessageContext{
+		Schema: domain.LessonMessageContextSchemaVersion, Mode: domain.LessonMessageModeSelection,
+		CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", LessonID: request.ContextID,
+		ContentRevision: revision, SelectedText: selectedText,
+	}
+	course := &courseLessonReader{content: domain.CourseLessonContent{
+		LessonID: request.ContextID, CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		SectionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Language: "ru", Title: "Ошибки",
+		Description: "Проверяйте цепочку через errors.Is(err, target).", ContentRevision: revision,
+	}}
+	worker.CourseLessons = course
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, course.calls)
+	require.Equal(t, request.ContextID, course.lessonID)
+	require.Equal(t, "ru", course.language)
+	require.Equal(t, domain.TeacherActionRespond, jobs.savedDecision.Action)
+	require.NotNil(t, generator.request.Lesson)
+	require.Equal(t, domain.LessonMessageModeSelection, generator.request.Lesson.Mode)
+	require.Equal(t, selectedText, generator.request.Lesson.SelectedText)
+	require.Empty(t, generator.request.Lesson.Title)
+	require.Empty(t, generator.request.Lesson.Excerpt)
+}
+
+func TestWorkerProcessesOverviewWithBoundedCourseProjectionAndExistingStudentContext(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	request := jobs.job.Request
+	request.ContextType = domain.LearningContextLesson
+	request.LearningActionID = ""
+	jobs.job.Request = request
+	revision := "2026-08-31T09:00:00Z"
+	builder.value = domain.StudentContext{
+		StudentID: request.StudentID, ContextType: domain.LearningContextLesson, ContextID: request.ContextID,
+	}
+	dialog.context.ContextType = domain.LearningContextLesson
+	dialog.context.LearningActionID = ""
+	dialog.context.Messages[0].LearningActionID = ""
+	dialog.context.Messages[0].LessonContext = &domain.LessonMessageContext{
+		Schema: domain.LessonMessageContextSchemaVersion, Mode: domain.LessonMessageModeOverview,
+		CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", LessonID: request.ContextID,
+		ContentRevision: revision,
+	}
+	course := &courseLessonReader{content: domain.CourseLessonContent{
+		LessonID: request.ContextID, CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		SectionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Language: "ru", Title: "Ошибки",
+		Excerpt: "Краткое публичное введение.", Description: "Полный приватный контент урока.",
+		ContentRevision: revision,
+	}}
+	worker.CourseLessons = course
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, builder.calls)
+	require.Equal(t, domain.TeacherActionRespond, jobs.savedDecision.Action)
+	require.Equal(t, "verified_lesson_overview", jobs.savedDecision.ReasonCode)
+	require.NotNil(t, generator.request.Lesson)
+	require.Equal(t, domain.LessonMessageModeOverview, generator.request.Lesson.Mode)
+	require.Equal(t, course.content.Title, generator.request.Lesson.Title)
+	require.Equal(t, course.content.Excerpt, generator.request.Lesson.Excerpt)
+	require.Equal(t, course.content.SectionID, generator.request.Lesson.SectionID)
+	require.Empty(t, generator.request.Lesson.SelectedText)
+	require.NotContains(t, generator.request.Lesson.Excerpt, course.content.Description)
+}
+
+func TestWorkerBlocksStaleMismatchedOrOversizedLessonContext(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*domain.LessonMessageContext, *domain.CourseLessonContent)
+	}{
+		{
+			name: "stale revision",
+			mutate: func(_ *domain.LessonMessageContext, content *domain.CourseLessonContent) {
+				content.ContentRevision = "2026-08-31T09:01:00Z"
+			},
+		},
+		{
+			name: "course mismatch",
+			mutate: func(_ *domain.LessonMessageContext, content *domain.CourseLessonContent) {
+				content.CourseID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+			},
+		},
+		{
+			name: "oversized excerpt",
+			mutate: func(_ *domain.LessonMessageContext, content *domain.CourseLessonContent) {
+				content.Excerpt = strings.Repeat("я", domain.MaximumLessonOverviewExcerptRunes+1)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+			request := jobs.job.Request
+			request.ContextType = domain.LearningContextLesson
+			request.LearningActionID = ""
+			jobs.job.Request = request
+			builder.value = domain.StudentContext{
+				StudentID: request.StudentID, ContextType: domain.LearningContextLesson, ContextID: request.ContextID,
+			}
+			dialog.context.ContextType = domain.LearningContextLesson
+			dialog.context.LearningActionID = ""
+			dialog.context.Messages[0].LearningActionID = ""
+			source := &domain.LessonMessageContext{
+				Schema: domain.LessonMessageContextSchemaVersion, Mode: domain.LessonMessageModeOverview,
+				CourseID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", LessonID: request.ContextID,
+				ContentRevision: "2026-08-31T09:00:00Z",
+			}
+			dialog.context.Messages[0].LessonContext = source
+			content := domain.CourseLessonContent{
+				LessonID: request.ContextID, CourseID: source.CourseID, Language: "ru", Title: "Ошибки",
+				Excerpt: "Краткое введение.", Description: "Полный контент.", ContentRevision: source.ContentRevision,
+			}
+			tt.mutate(source, &content)
+			worker.CourseLessons = &courseLessonReader{content: content}
+
+			claimed, err := worker.ProcessNext(context.Background())
+			require.ErrorIs(t, err, domain.ErrInvalidLessonContext)
+			require.True(t, claimed)
+			require.Equal(t, domain.TeacherDialogErrorDialogContext, jobs.blockedCode)
+			require.Zero(t, generator.generated)
+		})
+	}
+}
+
+func TestWorkerResumesPendingDeliveryWithoutReloadingPrivateContext(t *testing.T) {
+	worker, jobs, dialog, generator, builder, souls := validWorkerFixture(t)
+	jobs.job.Status = domain.TeacherDialogJobDeliveryPending
+	jobs.job.DecisionID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	jobs.job.ResponseBody = "Уже сгенерированный ответ."
+	jobs.job.Attempts = 1
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Zero(t, dialog.readCalls)
+	require.Zero(t, builder.calls)
+	require.Zero(t, souls.calls)
+	require.Zero(t, generator.generated)
+	require.Equal(t, "Уже сгенерированный ответ.", dialog.appendBody)
+}
+
+func TestWorkerQueuesTelegramDeliveryAfterCanonicalDialogAppend(t *testing.T) {
+	worker, jobs, dialog, _, _, _ := validWorkerFixture(t)
+	jobs.job.Request.SourceChannel = domain.DialogMessageChannelTelegram
+	dialog.context.Messages[len(dialog.context.Messages)-1].Channel = domain.DialogMessageChannelTelegram
+	delivery := &channelDeliveryStub{}
+	worker.ChannelDelivery = delivery
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, jobs.job.Request.SourceMessageID, delivery.sourceMessageID)
+	require.Equal(t, jobs.job.Request.StudentID, delivery.studentID)
+	require.Equal(t, "Проверь границу цикла.", delivery.body)
+}
+
+func TestWorkerRecoversCommittedGenerationThroughReplayAfterHashConflict(t *testing.T) {
+	worker, _, _, generator, _, _ := validWorkerFixture(t)
+	generator.generateErr = domain.ErrTeacherGenerationConflict
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, generator.generated)
+	require.Equal(t, 1, generator.replayed)
+}
+
+func TestWorkerRetriesWhenConflictingGenerationHasNoReplayableResult(t *testing.T) {
+	worker, jobs, _, generator, _, _ := validWorkerFixture(t)
+	generator.generateErr = domain.ErrTeacherGenerationConflict
+	generator.replayErr = domain.ErrTeacherGenerationNotFound
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrTeacherGenerationNotFound)
+	require.True(t, claimed)
+	require.Equal(t, 1, generator.generated)
+	require.Equal(t, 1, generator.replayed)
+	require.Equal(t, domain.TeacherDialogErrorGeneration, jobs.retriedCode)
+	require.Empty(t, jobs.blockedCode)
+}
+
+func TestWorkerBlocksPermanentlyClosedStudentContext(t *testing.T) {
+	worker, jobs, _, _, builder, _ := validWorkerFixture(t)
+	builder.err = domain.ErrLearningActionClosed
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrLearningActionClosed)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherDialogErrorStudentContext, jobs.blockedCode)
+	require.Empty(t, jobs.retriedCode)
+}
+
+func TestWorkerSchedulesBoundedRetryForTransientGenerationFailure(t *testing.T) {
+	worker, jobs, _, generator, _, _ := validWorkerFixture(t)
+	generator.generateErr = domain.ErrTeacherGenerationUnavailable
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrTeacherGenerationUnavailable)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherDialogErrorGeneration, jobs.retriedCode)
+	require.Empty(t, jobs.blockedCode)
+}
+
+func TestWorkerBlocksActionReceiptBeforeAnyLLMOrStudentWork(t *testing.T) {
+	for _, coordinatorEnabled := range []bool{false} {
+		t.Run(map[bool]string{false: "dark"}[coordinatorEnabled], func(t *testing.T) {
+			worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+			jobs.job.Request.ActionReceiptID = "77777777-7777-4777-8777-777777777777"
+			worker.UnifiedCoordinatorEnabled = coordinatorEnabled
+			claimed, err := worker.ProcessNext(context.Background())
+			require.ErrorIs(t, err, domain.ErrTeacherDialogCanonicalActionBlocked)
+			require.True(t, claimed)
+			require.Zero(t, generator.generated)
+			require.Zero(t, builder.calls)
+			require.Zero(t, dialog.readCalls)
+			require.Zero(t, dialog.appendCalls)
+			require.Equal(t, domain.TeacherDialogErrorUnsupportedContext, jobs.retriedCode)
+		})
+	}
+}
+
+func TestWorkerRoutesPersistedCanonicalActionByDurableModeWithAdmissionFlagOff(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	jobs.job.Request.ActionReceiptID = "77777777-7777-4777-8777-777777777777"
+	jobs.job.CoordinatorMode = string(domain.TeacherOnboardingCoordinatorAction)
+	coordinator := &workerUnifiedCoordinator{}
+	worker.UnifiedCoordinatorEnabled = false
+	worker.OnboardingCoordinator = coordinator
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, coordinator.processCalls)
+	require.Zero(t, generator.generated)
+	require.Zero(t, builder.calls)
+	require.Zero(t, dialog.readCalls)
+	require.Zero(t, dialog.appendCalls)
+}
+
+func TestWorkerEnabledCoordinatorFailureFailsClosedBeforeGenericLLM(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	jobs.job.Request.ActionReceiptID = "77777777-7777-4777-8777-777777777777"
+	coordinator := &workerUnifiedCoordinator{processErr: domain.ErrTeacherOnboardingUnavailable}
+	worker.UnifiedCoordinatorEnabled = true
+	worker.OnboardingCoordinator = coordinator
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	require.True(t, claimed)
+	require.Equal(t, 1, coordinator.processCalls)
+	require.Zero(t, generator.generated)
+	require.Zero(t, builder.calls)
+	require.Zero(t, dialog.readCalls)
+	require.Zero(t, dialog.appendCalls)
+}
+
+func TestWorkerReclaimsSemanticResponseStagedBeforeStudentAsCoordinatorProcessNotDelivery(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	// This is the crash window after S5 atomically stores the validated
+	// response body with its ai_staged decision, but before Student Apply.
+	// response_body alone must never select Dialog delivery.
+	jobs.job.ResponseBody = "validated semantic reply"
+	jobs.job.CoordinatorMode = string(domain.TeacherOnboardingCoordinatorText)
+	coordinator := &workerUnifiedCoordinator{needsDelivery: false}
+	worker.UnifiedCoordinatorEnabled = true
+	worker.OnboardingCoordinator = coordinator
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, coordinator.processCalls)
+	require.Zero(t, coordinator.deliveryCalls)
+	require.Zero(t, generator.generated)
+	require.Zero(t, builder.calls)
+	require.Zero(t, dialog.readCalls)
+	require.Zero(t, dialog.appendCalls)
+}
+
+func TestWorkerDeliversOnlyWhenCoordinatorMarksPersistedTurnDeliveryPending(t *testing.T) {
+	worker, jobs, _, generator, builder, _ := validWorkerFixture(t)
+	jobs.job.ResponseBody = "final staged response"
+	jobs.job.CoordinatorMode = string(domain.TeacherOnboardingCoordinatorText)
+	coordinator := &workerUnifiedCoordinator{needsDelivery: true}
+	worker.UnifiedCoordinatorEnabled = true
+	worker.OnboardingCoordinator = coordinator
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Zero(t, coordinator.processCalls)
+	require.Equal(t, 1, coordinator.deliveryCalls)
+	require.Zero(t, generator.generated)
+	require.Zero(t, builder.calls)
+}
+
+func TestWorkerPersistsAndReusesExactPracticeStepForAssistanceDelivery(t *testing.T) {
+	worker, jobs, _, _, _, _ := validWorkerFixture(t)
+	recorder := &practiceAssistanceRecorder{}
+	worker.PracticeAssistance = recorder
+	worker.Decisions = decisionHistory{jobs: jobs}
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, "implement", jobs.savedDecision.PracticeStepID)
+	require.Equal(t, "implement", recorder.stepID)
+	require.Equal(t, jobs.savedDecision.ID, recorder.usageID)
+}
+
+func TestWorkerRetryExhaustionBlocksForReconciliationWithoutAdvancing(t *testing.T) {
+	worker, jobs, _, generator, _, _ := validWorkerFixture(t)
+	jobs.job.Attempts = worker.MaxAttempts - 1
+	generator.generateErr = domain.ErrTeacherGenerationUnavailable
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrTeacherGenerationUnavailable)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherTurnUnknown, jobs.reconcileState)
+	require.Empty(t, jobs.retriedCode)
+}
+
+func TestWorkerBlocksOversizedExactSourceWithBoundedContextCode(t *testing.T) {
+	worker, jobs, dialog, generator, builder, _ := validWorkerFixture(t)
+	dialog.context.Messages[len(dialog.context.Messages)-1].Body = strings.Repeat("я", domain.TeacherContextMaximumExcerptRunes+1)
+
+	claimed, err := worker.ProcessNext(context.Background())
+	require.ErrorIs(t, err, domain.ErrTeacherContextSourceTooLarge)
+	require.True(t, claimed)
+	require.Equal(t, domain.TeacherDialogErrorContextBudget, jobs.blockedCode)
+	require.Zero(t, builder.calls)
+	require.Zero(t, generator.generated)
+}
+
+func validWorkerFixture(t *testing.T) (
+	teacherdialog.Worker,
+	*workerJobs,
+	*dialogBoundary,
+	*responseGenerator,
+	*studentBuilder,
+	*soulReader,
+) {
+	t.Helper()
+	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+	job, err := domain.NewTeacherDialogJob(validDialogRequest(), now.Add(-time.Minute))
+	require.NoError(t, err)
+	jobs := &workerJobs{job: job, hasJob: true}
+	dialog := &dialogBoundary{context: validDialogContext()}
+	builder := &studentBuilder{value: validStudentContext()}
+	soul, err := domain.NewTeacherSoul(
+		validDialogRequest().PersonalTeacherID, validDialogRequest().StudentID,
+		domain.DefaultTeacherSoulSettings(), now.Add(-time.Hour),
+	)
+	require.NoError(t, err)
+	souls := &soulReader{soul: soul}
+	generator := &responseGenerator{response: domain.TeacherGeneratedResponse{
+		ExecutionID: "99999999-9999-4999-8999-999999999999", IdempotencyKey: validDialogRequest().EventID,
+		TemplateCode: domain.TeacherResponseTemplateCode, TemplateVersion: 1,
+		ProviderCode: "openai", ProviderModel: "teacher-model", LanguageCode: "ru",
+		ResponseSchemaCode: domain.TeacherResponseSchemaCode, Body: "Проверь границу цикла.",
+		CreatedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour),
+	}}
+	return teacherdialog.Worker{
+		Jobs: jobs, Teachers: teacherReader{teacher: validTeacher()}, Souls: souls, StudentContext: builder,
+		PromptContext: teacherdialog.ContextBuilder{},
+		DialogReader:  dialog, DialogAppender: dialog, Decisions: decisionHistory{},
+		Pedagogy: pedagogyRegistry(t), Generator: generator,
+		IDs: &workerIDs{values: []string{
+			"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+			"dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+			"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+		}},
+		Clock: dialogClock{value: now}, WorkerID: "teacher-worker-test", LeaseTTL: 2 * time.Minute,
+		LeaseRenewInterval: 10 * time.Second, MaxAttempts: 20,
+		RetryBaseDelay: time.Second, RetryMaxDelay: 5 * time.Minute,
+	}, jobs, dialog, generator, builder, souls
+}
+
+func TestT13WorkerRecoversAfterAssistanceThenAppendFaultWithoutRegeneration(t *testing.T) {
+	worker, jobs, dialog, generator, builder, souls := validWorkerFixture(t)
+	recorder := &practiceAssistanceRecorder{}
+	worker.PracticeAssistance = recorder
+	worker.Decisions = decisionHistory{jobs: jobs}
+	dialog.appendErr = domain.ErrStudentStateUnavailable
+	claimed, err := worker.ProcessNext(context.Background())
+	require.True(t, claimed)
+	require.ErrorIs(t, err, domain.ErrStudentStateUnavailable)
+	require.Equal(t, 1, recorder.calls)
+	require.Equal(t, 1, generator.generated)
+	require.Equal(t, 1, dialog.appendCalls)
+	require.Empty(t, jobs.completedMessage)
+	require.NotEmpty(t, jobs.job.ResponseBody)
+	decision := jobs.savedDecision
+	require.Equal(t, decision.ID, recorder.usageID)
+	require.Equal(t, decision.PracticeStepID, recorder.stepID)
+	require.Equal(t, decision.Action, recorder.action)
+	require.Equal(t, decision.HintLevel, recorder.hintLevel)
+	require.Equal(t, domain.TeacherDialogErrorDelivery, jobs.retriedCode)
+	// Reconstruct the worker with the durable job/decision and an unavailable
+	// fresh context. Recovery must deliver the saved body with the same usage.
+	reads, builds, soulReads := dialog.readCalls, builder.calls, souls.calls
+	builder.err = domain.ErrLearningActionClosed
+	generator.generateErr = domain.ErrTeacherGenerationUnavailable
+	dialog.appendErr = nil
+	recoveredWorker := worker
+	recoveredWorker.IDs = &workerIDs{values: []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"}}
+	claimed, err = recoveredWorker.ProcessNext(context.Background())
+	require.True(t, claimed)
+	require.NoError(t, err)
+	require.Equal(t, 2, recorder.calls)
+	require.Equal(t, decision.ID, recorder.usageID)
+	require.Equal(t, decision.PracticeStepID, recorder.stepID)
+	require.Equal(t, decision.Action, recorder.action)
+	require.Equal(t, decision.HintLevel, recorder.hintLevel)
+	require.Equal(t, jobs.job.Request.ContextID, recorder.instanceID)
+	require.Equal(t, jobs.job.Request.StudentID, recorder.studentID)
+	require.Equal(t, 1, generator.generated)
+	require.Zero(t, generator.replayed)
+	require.Equal(t, reads, dialog.readCalls)
+	require.Equal(t, builds, builder.calls)
+	require.Equal(t, soulReads, souls.calls)
+	require.Equal(t, 2, dialog.appendCalls)
+	require.Equal(t, jobs.job.Request.EventID, dialog.appendKey)
+	require.NotEmpty(t, jobs.completedMessage)
+	require.Empty(t, jobs.job.ResponseBody)
+	claimed, err = recoveredWorker.ProcessNext(context.Background())
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.Equal(t, 2, recorder.calls)
+}

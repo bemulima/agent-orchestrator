@@ -1,0 +1,17 @@
+# Wave 1 integration corpus
+
+These fixtures support actual CDO routing, bound R1 coverage, AdaptRoute, Prepare and Expand for the 39 primary Wave 1 scenarios. They do not contain a captured Route for replay. The existing retrieval-gold/v1 schema and prior 71 cases remain independent.
+
+`manifest.json` lists the 39 case files and six source manifests. Each case keeps its original independent labels, task, admissions, facets, expansion selector, budget, limits and trusted policy registrations. Original labels can contain historical host paths; execution uses only identities and relative paths from `portable_input`. Proposed source-based layer/capability label corrections are recorded separately in `label-amendments.json` with `applied: false`.
+
+Each source manifest maps sorted relative document paths to a SHA-256 blob in `blobs/`. Verify every blob before materializing private fixture roots. The corpus contains 2,034 source documents, 10,191,081 source bytes and 1,988 distinct blobs (10,134,361 bytes). All source bytes are inert CDO test data, not service implementation changes or separate retrieval engines.
+
+The source loader captured approved filesystem bytes after the managed CDO base and change contracts were frozen. Existing independent content pins have no captured drift. Relevant current physical source checks matched 213 independently pinned files; one canonical policy path lacked a prior independent file pin. The declared service Git revisions do not certify dirty filesystem bytes. Replay must recompute snapshot identities and retain dirty/unverified provenance.
+
+Statistic's original admission is `ReadPaths: ["."]`. The common capture omitted its migrations and auxiliary files; thirteen prior safe snapshot paths, verified against the saved artifact manifest and applicable independent content pins, restore that admitted corpus. Captured coverage is historical provenance of each capture, not an assertion that the combined fixture replay has identical acquisition counts. Replay computes its actual coverage. All `.ai/testing/policy` content remains excluded.
+
+Excluded documents contribute path/reason records only. The corpus omits eleven files rejected by the unchanged secret-content policy. Auth signin's mandatory `test/unit/auth_handler_test.go` remains unavailable with historical `SECRET_CONTENT_EXCLUDED` provenance. A fixture filesystem missing that document cannot independently recreate the same content exclusion; the integration report must preserve the captured omission basis or explicitly describe that limit. Do not create replacement credential-like content, relax policy, silently remove the mandatory selector, or report full mandatory recall.
+
+SQL `QuerySchema` remains unsupported. A separately frozen `QueryExact` fallback may obtain migration bytes with `database_schema_query` authority while preserving the unsupported semantic query. No query fallback or label amendment is applied here. The missing `average_grade` meaning and Auth/User owner decisions remain honest partial or blocked results.
+
+Evaluate both Prepare and cumulative Expand using the independent relevance labels, exact owner/layers, full canonical budget including prompt reserve, required facet outcomes, and forbidden neighbor ownership/writes. Preserve original mixed Student task wording and layer discrepancies. Source-based amendments need independent review before use; observations never establish relevance labels. Empty evidence precision is undefined empirically. Test-source retrieval does not certify test execution.

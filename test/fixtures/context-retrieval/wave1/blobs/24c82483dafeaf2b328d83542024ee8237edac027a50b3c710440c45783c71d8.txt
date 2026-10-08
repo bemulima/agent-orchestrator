@@ -1,0 +1,118 @@
+package student
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type planningSnapshotReaderStub struct {
+	source            domain.PlanningSnapshotSource
+	err               error
+	calls             int
+	studentID, pathID string
+	targets           []domain.LearningTargetRef
+}
+
+func (s *planningSnapshotReaderStub) ReadPlanningSnapshot(_ context.Context, sid, pid string, targets []domain.LearningTargetRef) (domain.PlanningSnapshotSource, error) {
+	s.calls++
+	s.studentID = sid
+	s.pathID = pid
+	s.targets = append([]domain.LearningTargetRef(nil), targets...)
+	return s.source, s.err
+}
+func snapshotUseCaseFixture() (*planningSnapshotReaderStub, domain.PlanningSnapshotRequest) {
+	now := time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC)
+	sid := "11111111-1111-4111-8111-111111111111"
+	pid := "22222222-2222-4222-8222-222222222222"
+	targets := []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.versioned", Version: "v1"}, {Type: domain.LearningTargetConcept, Key: "legacy.opaque"}}
+	s := &planningSnapshotReaderStub{source: domain.PlanningSnapshotSource{StudentID: sid, RequestedTargets: targets, CapturedAt: now,
+		Profile: domain.StudentOnboarding{StudentID: sid, DirectionCode: "backend", SelfAssessedExperience: "basic", DesiredStacks: []string{"go"}, GoalCode: "first-job", PreferredLanguage: "ru", WeeklyMinutes: 300, PreferredPace: "balanced", ProfileVersion: domain.StudentOnboardingProfileVersion, Version: 1, CreatedAt: now, UpdatedAt: now},
+		Path:    domain.StudentLearningPath{ID: pid, StudentID: sid, CourseID: "33333333-3333-4333-8333-333333333333", GoalCode: "go.backend", CurriculumRevision: "course-fingerprint", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Private historical reason", Status: domain.LearningPathStatusActive, Version: 3, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ID: "44444444-4444-4444-8444-444444444444", ReferenceType: "lesson", ReferenceID: "55555555-5555-4555-8555-555555555555", Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_gap", Targets: targets}}},
+		Context: domain.StudentLearningContext{Schema: domain.LearningContextSchemaVersion, StudentID: sid, SelectedLearningPathID: pid, Version: 4, UpdatedAt: &now},
+	}}
+	return s, domain.PlanningSnapshotRequest{Targets: targets, TriggerContext: domain.PlanningSnapshotTrigger{Kind: "manual", Reason: "caller request"}}
+}
+func TestGetPlanningSnapshotMakesOneExactOwnerReadAndCompletesMissingProjection(t *testing.T) {
+	reader, request := snapshotUseCaseFixture()
+	u := GetPlanningSnapshot{Reader: reader}
+	result, err := u.Handle(context.Background(), reader.source.StudentID, reader.source.Path.ID, request)
+	if err != nil || reader.calls != 1 || reader.studentID != reader.source.StudentID || reader.pathID != reader.source.Path.ID {
+		t.Fatalf("owner read: err=%v reader=%#v", err, reader)
+	}
+	if !reflect.DeepEqual(reader.targets, result.RequestedTargets) || len(result.Mastery) != 2 || result.Mastery[0].State != domain.TargetMasteryUnknown || result.Mastery[1].Target.Version != "" || result.Mastery[1].EvidenceCount != 0 {
+		t.Fatalf("missing projections/legacy identity changed: %#v", result.Mastery)
+	}
+	if result.Availability.EvidenceQuality.Value != nil || result.Availability.Stability.Value != nil || result.Availability.AutomaticAdaptation.Value != nil {
+		t.Fatal("unsupported semantics were fabricated")
+	}
+	if result.References.SnapshotRef == "" || result.References.GoalRef == "" || result.References.ConstraintsRef == "" {
+		t.Fatal("missing applicability refs")
+	}
+}
+func TestGetPlanningSnapshotRejectsCallerInputBeforeRepositoryRead(t *testing.T) {
+	for _, name := range []string{"student", "path", "empty_targets", "duplicate_targets", "trace", "correlation"} {
+		t.Run(name, func(t *testing.T) {
+			reader, request := snapshotUseCaseFixture()
+			sid, pid := reader.source.StudentID, reader.source.Path.ID
+			switch name {
+			case "student":
+				sid = "bad"
+			case "path":
+				pid = "bad"
+			case "empty_targets":
+				request.Targets = nil
+			case "duplicate_targets":
+				request.Targets = append(request.Targets, request.Targets[0])
+			case "trace":
+				request.TriggerContext.Reason = " "
+			case "correlation":
+				request.TriggerContext.CorrelationID = "not-uuid"
+			}
+			if _, err := (GetPlanningSnapshot{Reader: reader}).Handle(context.Background(), sid, pid, request); !errors.Is(err, domain.ErrValidation) || reader.calls != 0 {
+				t.Fatalf("invalid caller read owner: err=%v calls=%d", err, reader.calls)
+			}
+		})
+	}
+}
+func TestGetPlanningSnapshotRejectsForeignIncompleteAndMalformedOwnerObservation(t *testing.T) {
+	for _, name := range []string{"student", "path", "profile", "request_set", "capture"} {
+		t.Run(name, func(t *testing.T) {
+			reader, request := snapshotUseCaseFixture()
+			sid, pid := reader.source.StudentID, reader.source.Path.ID
+			switch name {
+			case "student":
+				reader.source.StudentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+			case "path":
+				reader.source.Path.ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+			case "profile":
+				reader.source.Profile.StudentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+			case "request_set":
+				reader.source.RequestedTargets = reader.source.RequestedTargets[:1]
+			case "capture":
+				reader.source.CapturedAt = time.Time{}
+			}
+			if _, err := (GetPlanningSnapshot{Reader: reader}).Handle(context.Background(), sid, pid, request); !errors.Is(err, domain.ErrPlanningSnapshotSourceInvalid) || reader.calls != 1 {
+				t.Fatalf("owner source repaired/accepted: err=%v calls=%d", err, reader.calls)
+			}
+		})
+	}
+}
+func TestGetPlanningSnapshotPropagatesOwnerAvailabilityWithoutFallbackOrWrite(t *testing.T) {
+	for _, cause := range []error{domain.ErrNotFound, domain.ErrConflict, context.Canceled, errors.New("read transaction unavailable"), domain.ErrValidation} {
+		reader, request := snapshotUseCaseFixture()
+		reader.err = cause
+		_, err := (GetPlanningSnapshot{Reader: reader}).Handle(context.Background(), reader.source.StudentID, reader.source.Path.ID, request)
+		expected := cause
+		if errors.Is(cause, domain.ErrValidation) {
+			expected = domain.ErrPlanningSnapshotSourceInvalid
+		}
+		if !errors.Is(err, expected) || reader.calls != 1 {
+			t.Fatalf("availability lost or retried: cause=%v err=%v calls=%d", cause, err, reader.calls)
+		}
+	}
+}

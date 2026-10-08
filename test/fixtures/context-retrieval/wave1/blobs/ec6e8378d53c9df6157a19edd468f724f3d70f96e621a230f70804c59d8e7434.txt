@@ -1,0 +1,290 @@
+package student
+
+import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+const (
+	publicationMaxArchiveBytes = 20 << 20
+	publicationMaxFileBytes    = 512 << 10
+	publicationMaxTotalBytes   = 5 << 20
+	publicationMaxFiles        = 500
+)
+
+var (
+	publicationTextExtensions = map[string]struct{}{
+		".bash": {}, ".c": {}, ".cc": {}, ".conf": {}, ".cpp": {}, ".cs": {}, ".css": {},
+		".dart": {}, ".env.example": {}, ".go": {}, ".gql": {}, ".graphql": {}, ".h": {},
+		".hpp": {}, ".htm": {}, ".html": {}, ".ini": {}, ".java": {}, ".js": {}, ".json": {},
+		".jsx": {}, ".kt": {}, ".kts": {}, ".less": {}, ".md": {}, ".mod": {}, ".php": {},
+		".properties": {}, ".proto": {}, ".py": {}, ".rb": {}, ".rs": {}, ".sass": {},
+		".scss": {}, ".sh": {}, ".sql": {}, ".sum": {}, ".svelte": {}, ".swift": {}, ".toml": {},
+		".ts": {}, ".tsx": {}, ".txt": {}, ".vue": {}, ".xml": {}, ".yaml": {}, ".yml": {}, ".zsh": {},
+	}
+	publicationAllowedExtensionless = map[string]struct{}{
+		"dockerfile": {}, "makefile": {}, "procfile": {},
+	}
+	publicationExcludedSegments = map[string]struct{}{
+		".git": {}, ".idea": {}, ".next": {}, ".ssh": {}, ".vscode": {}, "build": {},
+		"coverage": {}, "dist": {}, "node_modules": {}, "target": {}, "vendor": {},
+	}
+	publicationSensitiveNames = map[string]struct{}{
+		".env": {}, ".netrc": {}, ".npmrc": {}, "credentials": {}, "credentials.json": {},
+		"id_ed25519": {}, "id_rsa": {}, "secrets.json": {},
+	}
+	publicationSensitiveSuffixes = []string{".key", ".p12", ".pem", ".pfx", ".sqlite", ".sqlite3"}
+	publicationSecretPatterns    = []struct {
+		code    string
+		pattern *regexp.Regexp
+		value   int
+	}{
+		{code: "private_key", pattern: regexp.MustCompile(`-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)},
+		{code: "aws_access_key", pattern: regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`)},
+		{code: "github_token", pattern: regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{30,}\b`)},
+		{code: "jwt", pattern: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)},
+		{
+			code:    "credential_assignment",
+			pattern: regexp.MustCompile(`(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|secret[_-]?key)\s*[:=]\s*["']?([^\s"',;]{8,})`),
+			value:   2,
+		},
+		{
+			code:    "credential_uri",
+			pattern: regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s:/]+:([^\s/@]{8,})@`),
+			value:   1,
+		},
+	}
+)
+
+type publicationSecurityFinding struct {
+	Path string `json:"path"`
+	Code string `json:"code"`
+	Line int    `json:"line,omitempty"`
+}
+
+type PublicationSecurityError struct {
+	Findings []publicationSecurityFinding `json:"findings"`
+}
+
+func (err *PublicationSecurityError) Error() string {
+	return "publication snapshot contains possible secrets"
+}
+
+type preparedPublicationSnapshot struct {
+	Archive        []byte
+	SHA256         string
+	Manifest       domain.PracticeTaskPublicationManifest
+	SecurityReport domain.PracticeTaskPublicationSecurityReport
+	Files          []domain.WorkspaceFile
+}
+
+func preparePublicationSnapshot(source []byte) (*preparedPublicationSnapshot, error) {
+	if len(source) == 0 || len(source) > publicationMaxArchiveBytes {
+		return nil, fmt.Errorf("%w: submission archive must be between 1 byte and %d bytes", domain.ErrValidation, publicationMaxArchiveBytes)
+	}
+	reader, err := zip.NewReader(bytes.NewReader(source), int64(len(source)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: submission artifact is not a valid zip archive", domain.ErrValidation)
+	}
+
+	files := make([]domain.WorkspaceFile, 0, len(reader.File))
+	excluded := make([]string, 0)
+	seen := make(map[string]struct{}, len(reader.File))
+	findings := make([]publicationSecurityFinding, 0)
+	totalBytes := 0
+	for _, archived := range reader.File {
+		filePath, include := publicCodePath(archived.Name)
+		if !include || archived.FileInfo().IsDir() {
+			if filePath != "" && !archived.FileInfo().IsDir() {
+				excluded = append(excluded, filePath)
+			}
+			continue
+		}
+		if archived.Mode()&0o170000 != 0 && !archived.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: publication archive contains a non-regular entry", domain.ErrValidation)
+		}
+		if _, duplicate := seen[filePath]; duplicate {
+			return nil, fmt.Errorf("%w: publication archive contains duplicate path %s", domain.ErrValidation, filePath)
+		}
+		seen[filePath] = struct{}{}
+		if len(files) >= publicationMaxFiles || archived.UncompressedSize64 > publicationMaxFileBytes {
+			return nil, fmt.Errorf("%w: publication code exceeds file count or per-file size limit", domain.ErrValidation)
+		}
+		content, err := readPublicationZipFile(archived)
+		if err != nil {
+			return nil, err
+		}
+		if !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0 {
+			excluded = append(excluded, filePath)
+			continue
+		}
+		totalBytes += len(content)
+		if totalBytes > publicationMaxTotalBytes {
+			return nil, fmt.Errorf("%w: publication code exceeds total size limit", domain.ErrValidation)
+		}
+		findings = append(findings, scanPublicationSecrets(filePath, string(content))...)
+		files = append(files, domain.WorkspaceFile{Path: filePath, Content: string(content)})
+	}
+	if len(findings) > 0 {
+		sort.Slice(findings, func(left, right int) bool {
+			if findings[left].Path != findings[right].Path {
+				return findings[left].Path < findings[right].Path
+			}
+			if findings[left].Line != findings[right].Line {
+				return findings[left].Line < findings[right].Line
+			}
+			return findings[left].Code < findings[right].Code
+		})
+		return nil, &PublicationSecurityError{Findings: findings}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("%w: publication snapshot has no safe text source files", domain.ErrValidation)
+	}
+	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
+	sort.Strings(excluded)
+	excluded = uniqueStrings(excluded)
+
+	archive, err := buildDeterministicPublicationArchive(files)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(archive)
+	manifestFiles := make([]domain.PracticeTaskPublicationFile, 0, len(files))
+	for _, file := range files {
+		fileDigest := sha256.Sum256([]byte(file.Content))
+		manifestFiles = append(manifestFiles, domain.PracticeTaskPublicationFile{
+			Path: file.Path, Size: len(file.Content), SHA256: hex.EncodeToString(fileDigest[:]),
+		})
+	}
+	return &preparedPublicationSnapshot{
+		Archive: archive,
+		SHA256:  hex.EncodeToString(digest[:]),
+		Manifest: domain.PracticeTaskPublicationManifest{
+			Version: 1, Files: manifestFiles, TotalBytes: totalBytes, ExcludedFilesCount: len(excluded),
+		},
+		SecurityReport: domain.PracticeTaskPublicationSecurityReport{Version: 1, ExcludedPaths: excluded},
+		Files:          files,
+	}, nil
+}
+
+func publicCodePath(value string) (string, bool) {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	clean := path.Clean(value)
+	if value == "" || clean == "." || strings.HasPrefix(clean, "/") || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", false
+	}
+	segments := strings.Split(clean, "/")
+	for _, segment := range segments {
+		lower := strings.ToLower(segment)
+		if _, blocked := publicationExcludedSegments[lower]; blocked {
+			return clean, false
+		}
+	}
+	base := strings.ToLower(segments[len(segments)-1])
+	if _, sensitive := publicationSensitiveNames[base]; sensitive || strings.HasPrefix(base, ".env.") {
+		return clean, false
+	}
+	for _, suffix := range publicationSensitiveSuffixes {
+		if strings.HasSuffix(base, suffix) {
+			return clean, false
+		}
+	}
+	if _, allowed := publicationAllowedExtensionless[base]; allowed {
+		return clean, true
+	}
+	extension := strings.ToLower(path.Ext(base))
+	if base == ".gitignore" || base == ".dockerignore" {
+		return clean, true
+	}
+	_, allowed := publicationTextExtensions[extension]
+	return clean, allowed
+}
+
+func readPublicationZipFile(file *zip.File) ([]byte, error) {
+	reader, err := file.Open()
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot open publication file", domain.ErrValidation)
+	}
+	defer func() { _ = reader.Close() }()
+	content, err := io.ReadAll(io.LimitReader(reader, publicationMaxFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot read publication file", domain.ErrValidation)
+	}
+	if len(content) > publicationMaxFileBytes {
+		return nil, fmt.Errorf("%w: publication file exceeds size limit", domain.ErrValidation)
+	}
+	return content, nil
+}
+
+func scanPublicationSecrets(filePath, content string) []publicationSecurityFinding {
+	findings := make([]publicationSecurityFinding, 0)
+	for lineIndex, line := range strings.Split(content, "\n") {
+		for _, candidate := range publicationSecretPatterns {
+			matches := candidate.pattern.FindAllStringSubmatch(line, -1)
+			for _, match := range matches {
+				if candidate.value > 0 && candidate.value < len(match) && safePublicationCredentialValue(match[candidate.value]) {
+					continue
+				}
+				findings = append(findings, publicationSecurityFinding{Path: filePath, Code: candidate.code, Line: lineIndex + 1})
+			}
+		}
+	}
+	return findings
+}
+
+func safePublicationCredentialValue(value string) bool {
+	normalized := strings.ToLower(strings.Trim(value, `"'`))
+	for _, marker := range []string{
+		"change-me", "changeme", "dummy", "example", "fake", "placeholder", "redacted", "test", "your_", "your-",
+		"getenv", "process.env", "os.environ", "env(", "${", "{{",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildDeterministicPublicationArchive(files []domain.WorkspaceFile) ([]byte, error) {
+	buffer := bytes.NewBuffer(nil)
+	writer := zip.NewWriter(buffer)
+	fixedTime := time.Unix(0, 0).UTC()
+	for _, file := range files {
+		header := &zip.FileHeader{Name: file.Path, Method: zip.Deflate}
+		header.SetMode(0o644)
+		header.Modified = fixedTime
+		entry, err := writer.CreateHeader(header)
+		if err != nil {
+			return nil, fmt.Errorf("build publication archive: %w", err)
+		}
+		if _, err := entry.Write([]byte(file.Content)); err != nil {
+			return nil, fmt.Errorf("build publication archive: %w", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("build publication archive: %w", err)
+	}
+	return buffer.Bytes(), nil
+}
+
+func uniqueStrings(values []string) []string {
+	result := values[:0]
+	for _, value := range values {
+		if len(result) == 0 || result[len(result)-1] != value {
+			result = append(result, value)
+		}
+	}
+	return result
+}

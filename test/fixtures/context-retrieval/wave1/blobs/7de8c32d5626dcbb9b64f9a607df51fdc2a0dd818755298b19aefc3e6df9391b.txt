@@ -1,0 +1,107 @@
+package intervention
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+
+type IDGenerator interface{ NewID() string }
+type Clock interface{ Now() time.Time }
+
+type DialogGateway interface {
+	repository.TeacherDialogProvisioner
+	repository.DialogTeacherProactiveAppender
+}
+
+type Result struct {
+	Decision  domain.TeacherDecision
+	Delivered bool
+}
+
+type Engine struct {
+	Teachers TeacherEnsurer
+	Policies *Registry
+	Store    repository.InterventionStore
+	Dialogs  DialogGateway
+	IDs      IDGenerator
+	Clock    Clock
+}
+
+func (engine Engine) Handle(ctx context.Context, raw domain.LearningActivitySignal) (bool, error) {
+	signal, err := domain.NewLearningActivitySignal(raw)
+	if err != nil {
+		return false, err
+	}
+	if engine.Teachers == nil || engine.Policies == nil || engine.Store == nil || engine.Dialogs == nil || engine.IDs == nil || engine.Clock == nil {
+		return false, errors.New("intervention engine dependencies are required")
+	}
+	teacher, err := engine.Teachers.Execute(ctx, signal.StudentID)
+	if err != nil {
+		return false, err
+	}
+	policy := engine.Policies.Resolve(teacher.InterventionMode)
+	if policy == nil {
+		return false, errors.New("intervention policy is unavailable")
+	}
+	plan := policy.Evaluate(teacher, signal)
+	if plan.Action == domain.TeacherActionIntervene {
+		alreadyDelivered, checkErr := engine.Store.HasDeliveredInSession(ctx, signal.StudentID, signal.AnalyticsSessionID)
+		if checkErr != nil {
+			return false, checkErr
+		}
+		if alreadyDelivered {
+			plan = silent("session_intervention_cooldown", "A proactive offer was already delivered in this analytics session.")
+		}
+	}
+	now := engine.Clock.Now().UTC()
+	decision, err := domain.NewTeacherDecision(domain.TeacherDecision{
+		ID: engine.IDs.NewID(), PersonalTeacherID: teacher.ID, StudentID: signal.StudentID,
+		CorrelationID: signal.AnalyticsSessionID, CausationID: signal.EventID,
+		TeachingMode: domain.TeachingModePractice, ContextType: domain.LearningContextGeneral,
+		PedagogyMethod: "intervention-" + policy.Code(), PedagogyVersion: policy.Version(), PedagogyStage: "monitor",
+		Strategy: "timely_support", Action: plan.Action, ReasonCode: plan.ReasonCode,
+		ReasonSummary: plan.ReasonSummary, PolicyVersion: policy.Version(), CreatedAt: now,
+	})
+	if err != nil {
+		return false, err
+	}
+	event, err := domain.NewIntegrationEvent(
+		engine.IDs.NewID(), domain.SubjectTeacherDecisionRecorded, decision.CorrelationID,
+		decision.CausationID, decision.StudentID, decision.CreatedAt,
+		domain.TeacherDecisionRecordedSchemaVersion, decision,
+	)
+	if err != nil {
+		return false, err
+	}
+	record, created, err := engine.Store.Commit(ctx, signal, domain.InterventionRecord{
+		EventID: signal.EventID, StudentID: signal.StudentID, AnalyticsSessionID: signal.AnalyticsSessionID,
+		PersonalTeacherID: teacher.ID, DecisionID: decision.ID, SignalType: signal.SignalType, Action: decision.Action,
+		OfferBody: plan.OfferBody, CreatedAt: now,
+	}, decision, event)
+	if err != nil {
+		return false, err
+	}
+	if record.Action == domain.TeacherActionStaySilent || record.DeliveredAt != nil {
+		return created, nil
+	}
+	binding, err := engine.Dialogs.EnsureTeacherDialog(ctx, record.StudentID, record.PersonalTeacherID, domain.LearningContextGeneral, "")
+	if err != nil {
+		return false, err
+	}
+	message, err := engine.Dialogs.AppendTeacherProactive(ctx, binding, record.EventID, record.OfferBody)
+	if err != nil {
+		return false, err
+	}
+	if err := engine.Store.MarkDelivered(ctx, record.EventID, binding.ID, message.ID, engine.Clock.Now()); err != nil {
+		return false, err
+	}
+	return created, nil
+}

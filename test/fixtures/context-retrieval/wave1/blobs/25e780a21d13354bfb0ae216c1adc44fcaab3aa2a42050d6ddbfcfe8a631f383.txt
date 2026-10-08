@@ -1,0 +1,421 @@
+package answer
+
+import (
+	"context"
+	"sort"
+	"strings"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+)
+
+const (
+	courseContentStatusActive = 1
+
+	blockingReasonLessonInactive     = "LESSON_INACTIVE"
+	blockingReasonTaskInactive       = "TASK_INACTIVE"
+	blockingReasonCompletePrevTask   = "COMPLETE_PREVIOUS_TASK"
+	blockingReasonCompletePrevLesson = "COMPLETE_PREVIOUS_LESSON"
+)
+
+type TaskLockedError struct {
+	TaskID           string
+	RedirectLessonID string
+	RedirectTaskID   string
+}
+
+func (e *TaskLockedError) Error() string {
+	return domain.ErrTaskLocked.Error()
+}
+
+func (e *TaskLockedError) Unwrap() error {
+	return domain.ErrTaskLocked
+}
+
+type CourseProgression struct {
+	CourseID        string               `json:"course_id"`
+	CurrentLessonID string               `json:"current_lesson_id,omitempty"`
+	CurrentTaskID   string               `json:"current_task_id,omitempty"`
+	CourseCompleted bool                 `json:"course_completed"`
+	Lessons         []CourseLessonAccess `json:"lessons"`
+}
+
+type CourseLessonAccess struct {
+	ID             string             `json:"id"`
+	CourseID       string             `json:"course_id,omitempty"`
+	Title          string             `json:"title"`
+	Description    string             `json:"description"`
+	Order          int                `json:"order"`
+	Status         int                `json:"status"`
+	Locked         bool               `json:"locked"`
+	Completed      bool               `json:"completed"`
+	Current        bool               `json:"current"`
+	BlockingReason string             `json:"blocking_reason,omitempty"`
+	Tasks          []CourseTaskAccess `json:"tasks"`
+}
+
+type CourseTaskAccess struct {
+	ID              string `json:"id"`
+	LessonID        string `json:"lesson_id"`
+	CourseID        string `json:"course_id,omitempty"`
+	Title           string `json:"title"`
+	Description     string `json:"description"`
+	Type            int16  `json:"type"`
+	TaskKind        string `json:"task_kind,omitempty"`
+	Order           int    `json:"order"`
+	Status          int    `json:"status"`
+	EvaluationMode  string `json:"evaluation_mode"`
+	Locked          bool   `json:"locked"`
+	Completed       bool   `json:"completed"`
+	Current         bool   `json:"current"`
+	Readonly        bool   `json:"readonly"`
+	EffectiveStatus string `json:"effective_status,omitempty"`
+	LatestAnswerID  string `json:"latest_answer_id,omitempty"`
+	BlockingReason  string `json:"blocking_reason,omitempty"`
+}
+
+type TaskAccess struct {
+	TaskID           string `json:"task_id"`
+	LessonID         string `json:"lesson_id"`
+	CourseID         string `json:"course_id"`
+	Locked           bool   `json:"locked"`
+	Completed        bool   `json:"completed"`
+	Current          bool   `json:"current"`
+	Readonly         bool   `json:"readonly"`
+	BlockingReason   string `json:"blocking_reason,omitempty"`
+	RedirectLessonID string `json:"redirect_lesson_id,omitempty"`
+	RedirectTaskID   string `json:"redirect_task_id,omitempty"`
+}
+
+type LessonAccess struct {
+	LessonID         string `json:"lesson_id"`
+	CourseID         string `json:"course_id,omitempty"`
+	Locked           bool   `json:"locked"`
+	Completed        bool   `json:"completed"`
+	Current          bool   `json:"current"`
+	BlockingReason   string `json:"blocking_reason,omitempty"`
+	RedirectLessonID string `json:"redirect_lesson_id,omitempty"`
+	RedirectTaskID   string `json:"redirect_task_id,omitempty"`
+}
+
+type PracticeTaskScopedAccessResolver interface {
+	ResolvePracticeTaskLessonAccess(ctx context.Context, userID, lessonID string) (*LessonAccess, error)
+	ResolvePracticeTaskTaskAccess(ctx context.Context, userID, taskID string) (*TaskAccess, error)
+}
+
+// ProgressionService resolves student access through ordered lessons/tasks.
+type ProgressionService struct {
+	TaskProvider       TaskProvider
+	Lessons            LessonProvider
+	Answers            repository.StudentTaskAnswerRepository
+	PracticeTaskAccess PracticeTaskScopedAccessResolver
+}
+
+func (s ProgressionService) ResolveCourse(ctx context.Context, userID string, courseID string) (*CourseProgression, error) {
+	if s.TaskProvider == nil || s.Answers == nil {
+		return nil, domain.ErrValidation
+	}
+
+	structure, err := s.TaskProvider.GetCourseStructure(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
+	if structure.CourseID != "" {
+		courseID = structure.CourseID
+	}
+
+	lessons := append([]CourseStructureLesson(nil), structure.Lessons...)
+
+	taskIDs := make([]string, 0)
+	for _, lesson := range lessons {
+		for _, task := range lesson.Tasks {
+			taskIDs = append(taskIDs, task.ID)
+		}
+	}
+	progressMap, err := s.Answers.GetProgressByTaskIDs(ctx, userID, taskIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &CourseProgression{
+		CourseID: courseID,
+		Lessons:  make([]CourseLessonAccess, 0, len(lessons)),
+	}
+
+	currentAssigned := false
+	for _, lesson := range lessons {
+		tasks := append([]CourseStructureTask(nil), lesson.Tasks...)
+		sort.SliceStable(tasks, func(i, j int) bool {
+			if tasks[i].Order == tasks[j].Order {
+				return tasks[i].ID < tasks[j].ID
+			}
+			return tasks[i].Order < tasks[j].Order
+		})
+
+		lessonResp := CourseLessonAccess{
+			ID:          lesson.ID,
+			CourseID:    lesson.CourseID,
+			Title:       lesson.Title,
+			Description: lesson.Description,
+			Order:       lesson.Order,
+			Status:      lesson.Status,
+			Tasks:       make([]CourseTaskAccess, 0, len(tasks)),
+		}
+
+		lessonCompleted := true
+		lessonCurrent := false
+		firstIncompleteLocked := false
+		firstIncompleteSeen := false
+
+		for _, task := range tasks {
+			item := CourseTaskAccess{
+				ID:             task.ID,
+				LessonID:       task.LessonID,
+				CourseID:       task.CourseID,
+				Title:          task.Title,
+				Description:    task.Description,
+				Type:           task.Type,
+				TaskKind:       taskKindFromType(task.Type),
+				Order:          task.Order,
+				Status:         task.Status,
+				EvaluationMode: strings.ToUpper(strings.TrimSpace(task.EvaluationMode)),
+			}
+
+			if lesson.Status != courseContentStatusActive {
+				item.Locked = true
+				item.BlockingReason = blockingReasonLessonInactive
+				lessonResp.Tasks = append(lessonResp.Tasks, item)
+				continue
+			}
+			if task.Status != courseContentStatusActive {
+				item.Locked = true
+				item.BlockingReason = blockingReasonTaskInactive
+				lessonResp.Tasks = append(lessonResp.Tasks, item)
+				continue
+			}
+
+			progress := progressMap[task.ID]
+			item.EffectiveStatus = answerStatusName(progress.LatestStatus)
+			item.LatestAnswerID = progress.LatestAnswerID
+			item.Readonly = progress.HasPassed
+			item.Completed = isProgressionTaskCompleted(item.EvaluationMode, progress)
+
+			if item.Completed {
+				lessonResp.Tasks = append(lessonResp.Tasks, item)
+				continue
+			}
+
+			lessonCompleted = false
+			if !firstIncompleteSeen {
+				firstIncompleteSeen = true
+			}
+
+			if !currentAssigned {
+				item.Current = true
+				lessonCurrent = true
+				currentAssigned = true
+				result.CurrentLessonID = lesson.ID
+				result.CurrentTaskID = task.ID
+			} else {
+				item.Locked = true
+				if result.CurrentLessonID == lesson.ID {
+					item.BlockingReason = blockingReasonCompletePrevTask
+				} else {
+					item.BlockingReason = blockingReasonCompletePrevLesson
+				}
+				if !firstIncompleteLocked {
+					firstIncompleteLocked = true
+				}
+			}
+
+			lessonResp.Tasks = append(lessonResp.Tasks, item)
+		}
+
+		lessonResp.Completed = lessonCompleted
+		lessonResp.Current = lessonCurrent
+		lessonResp.Locked = !lessonCompleted && !lessonCurrent && firstIncompleteLocked
+		if lessonResp.Locked {
+			if lessonResp.BlockingReason == "" && result.CurrentLessonID != "" {
+				if result.CurrentLessonID == lesson.ID {
+					lessonResp.BlockingReason = blockingReasonCompletePrevTask
+				} else {
+					lessonResp.BlockingReason = blockingReasonCompletePrevLesson
+				}
+			}
+		}
+		if lesson.Status != courseContentStatusActive {
+			lessonResp.Locked = true
+			lessonResp.Current = false
+			lessonResp.Completed = false
+			lessonResp.BlockingReason = blockingReasonLessonInactive
+		}
+
+		result.Lessons = append(result.Lessons, lessonResp)
+	}
+
+	result.CourseCompleted = result.CurrentTaskID == ""
+	return result, nil
+}
+
+func (s ProgressionService) ResolveTaskAccess(ctx context.Context, userID string, taskID string) (*TaskAccess, error) {
+	if _, ok := PracticeTaskScopeFromContext(ctx); ok && s.PracticeTaskAccess != nil {
+		return s.PracticeTaskAccess.ResolvePracticeTaskTaskAccess(ctx, userID, taskID)
+	}
+	if s.TaskProvider == nil {
+		return nil, domain.ErrValidation
+	}
+	task, err := s.TaskProvider.GetTask(WithTaskLookupContext(ctx, userID, ""), taskID)
+	if err != nil {
+		return nil, err
+	}
+	task = NormalizeTaskMetadata(task)
+	if isPracticeTaskRuntimeTask(task) {
+		return &TaskAccess{
+			TaskID:           task.ID,
+			LessonID:         task.LessonID,
+			CourseID:         task.CourseID,
+			Locked:           task.Locked,
+			Completed:        task.Completed,
+			Current:          !task.Locked,
+			Readonly:         task.Readonly,
+			BlockingReason:   task.BlockingReason,
+			RedirectLessonID: task.RedirectLessonID,
+			RedirectTaskID:   task.RedirectTaskID,
+		}, nil
+	}
+	if relationID, publicRequest := PublicContentAccessFromContext(ctx); publicRequest && relationID != "" {
+		if s.Answers == nil {
+			return nil, domain.ErrValidation
+		}
+		progressMap, err := s.Answers.GetProgressByTaskIDs(ctx, userID, []string{task.ID})
+		if err != nil {
+			return nil, err
+		}
+		progress := progressMap[task.ID]
+		completed := isProgressionTaskCompleted(task.EvaluationMode, progress)
+		return &TaskAccess{
+			TaskID:    task.ID,
+			LessonID:  task.LessonID,
+			CourseID:  task.CourseID,
+			Completed: completed,
+			Current:   !completed,
+			Readonly:  progress.HasPassed,
+		}, nil
+	}
+	progression, err := s.ResolveCourse(ctx, userID, task.CourseID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, lesson := range progression.Lessons {
+		for _, item := range lesson.Tasks {
+			if item.ID != taskID {
+				continue
+			}
+			return &TaskAccess{
+				TaskID:           item.ID,
+				LessonID:         lesson.ID,
+				CourseID:         progression.CourseID,
+				Locked:           item.Locked,
+				Completed:        item.Completed,
+				Current:          item.Current,
+				Readonly:         item.Readonly,
+				BlockingReason:   item.BlockingReason,
+				RedirectLessonID: progression.CurrentLessonID,
+				RedirectTaskID:   progression.CurrentTaskID,
+			}, nil
+		}
+	}
+
+	return nil, domain.ErrNotFound
+}
+
+func (s *ProgressionService) RequireTaskUnlocked(ctx context.Context, userID string, taskID string) error {
+	if s == nil {
+		return nil
+	}
+	access, err := s.ResolveTaskAccess(ctx, userID, taskID)
+	if err != nil {
+		return err
+	}
+	if !access.Locked {
+		return nil
+	}
+	return &TaskLockedError{
+		TaskID:           taskID,
+		RedirectLessonID: access.RedirectLessonID,
+		RedirectTaskID:   access.RedirectTaskID,
+	}
+}
+
+func (s ProgressionService) ResolveLessonAccess(ctx context.Context, userID string, lessonID string) (*LessonAccess, error) {
+	if _, ok := PracticeTaskScopeFromContext(ctx); ok && s.PracticeTaskAccess != nil {
+		return s.PracticeTaskAccess.ResolvePracticeTaskLessonAccess(ctx, userID, lessonID)
+	}
+	if s.Lessons == nil || s.TaskProvider == nil {
+		return nil, domain.ErrValidation
+	}
+
+	lesson, err := s.Lessons.GetLesson(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	if relationID, publicRequest := PublicContentAccessFromContext(ctx); publicRequest && relationID != "" {
+		return &LessonAccess{
+			LessonID: lesson.ID,
+			CourseID: lesson.CourseID,
+			Current:  true,
+		}, nil
+	}
+	progression, err := s.ResolveCourse(ctx, userID, lesson.CourseID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range progression.Lessons {
+		if item.ID != lessonID {
+			continue
+		}
+		return &LessonAccess{
+			LessonID:         item.ID,
+			CourseID:         item.CourseID,
+			Locked:           item.Locked,
+			Completed:        item.Completed,
+			Current:          item.Current,
+			BlockingReason:   item.BlockingReason,
+			RedirectLessonID: progression.CurrentLessonID,
+			RedirectTaskID:   progression.CurrentTaskID,
+		}, nil
+	}
+
+	return nil, domain.ErrNotFound
+}
+
+func isProgressionTaskCompleted(evaluationMode string, progress domain.StudentTaskProgress) bool {
+	if progress.HasPassed {
+		return true
+	}
+	switch strings.ToUpper(strings.TrimSpace(evaluationMode)) {
+	case taskEvaluationManual, taskEvaluationHybrid:
+		return progress.HasUnderReview
+	default:
+		return false
+	}
+}
+
+func answerStatusName(status int) string {
+	switch status {
+	case domain.StudentTaskAnswerStatusInProgress:
+		return "IN_PROGRESS"
+	case domain.StudentTaskAnswerStatusUnderReview:
+		return "UNDER_REVIEW"
+	case domain.StudentTaskAnswerStatusFailed:
+		return "FAILED"
+	case domain.StudentTaskAnswerStatusRejected:
+		return "REJECTED"
+	case domain.StudentTaskAnswerStatusPassed:
+		return "PASSED"
+	default:
+		return ""
+	}
+}

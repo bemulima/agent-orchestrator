@@ -1,0 +1,246 @@
+package filestorage
+
+import (
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"strings"
+	"time"
+)
+
+const maxPublicationArchiveBytes = 20 << 20
+
+var publicationCipherHeader = []byte("MSSTUDENTPUB\x01")
+
+type Client struct {
+	BaseURL       string
+	EncryptionKey []byte
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+func NewClient(baseURL, internalToken, encodedEncryptionKey string) (Client, error) {
+	client := Client{BaseURL: baseURL, InternalToken: internalToken}
+	encodedEncryptionKey = strings.TrimSpace(encodedEncryptionKey)
+	if encodedEncryptionKey == "" {
+		return client, nil
+	}
+	key, err := decodeEncryptionKey(encodedEncryptionKey)
+	if err != nil {
+		return Client{}, err
+	}
+	client.EncryptionKey = key
+	return client, nil
+}
+
+func (client Client) DownloadSourceArchive(ctx context.Context, fileID string) ([]byte, error) {
+	return client.download(ctx, fileID, maxPublicationArchiveBytes)
+}
+
+func (client Client) DownloadPublicationSnapshot(ctx context.Context, fileID string) ([]byte, error) {
+	content, err := client.download(ctx, fileID, maxPublicationArchiveBytes+(1<<20))
+	if err != nil {
+		return nil, err
+	}
+	return client.decryptPublicationSnapshot(content)
+}
+
+func (client Client) download(ctx context.Context, fileID string, maxBytes int64) ([]byte, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("%s/internal/v1/files/%s/download", strings.TrimRight(client.BaseURL, "/"), fileID),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	client.authorize(request)
+	response, err := client.httpClient().Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("filestorage download failed: %s", response.Status)
+	}
+	content, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > maxBytes {
+		return nil, fmt.Errorf("filestorage download exceeds size limit")
+	}
+	return content, nil
+}
+
+func (client Client) UploadTemporaryArchive(
+	ctx context.Context,
+	ownerID, filename string,
+	content []byte,
+) (string, error) {
+	if len(content) == 0 || len(content) > maxPublicationArchiveBytes {
+		return "", fmt.Errorf("publication archive must be between 1 byte and %d bytes", maxPublicationArchiveBytes)
+	}
+	protectedContent, err := client.encryptPublicationSnapshot(content)
+	if err != nil {
+		return "", err
+	}
+	body := bytes.NewBuffer(nil)
+	writer := multipart.NewWriter(body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, strings.ReplaceAll(filename, `"`, "")))
+	header.Set("Content-Type", "application/octet-stream")
+	filePart, err := writer.CreatePart(header)
+	if err != nil {
+		return "", err
+	}
+	if _, err := filePart.Write(protectedContent); err != nil {
+		return "", err
+	}
+	for key, value := range map[string]string{
+		"file_kind":      "STUDENT_SUBMISSION",
+		"owner_id":       ownerID,
+		"is_archive":     "false",
+		"archive_format": "",
+		"is_temp":        "true",
+		"ttl_minutes":    "60",
+	} {
+		if err := writer.WriteField(key, value); err != nil {
+			return "", err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		strings.TrimRight(client.BaseURL, "/")+"/internal/v1/files/upload",
+		body,
+	)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	client.authorize(request)
+	response, err := client.httpClient().Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("filestorage upload failed: %s", response.Status)
+	}
+	var payload struct {
+		ID string `json:"ID"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.ID) == "" {
+		return "", fmt.Errorf("filestorage upload response is missing ID")
+	}
+	return payload.ID, nil
+}
+
+func (client Client) encryptPublicationSnapshot(plaintext []byte) ([]byte, error) {
+	aead, err := client.publicationAEAD()
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generate publication encryption nonce: %w", err)
+	}
+	result := make([]byte, 0, len(publicationCipherHeader)+len(nonce)+len(plaintext)+aead.Overhead())
+	result = append(result, publicationCipherHeader...)
+	result = append(result, nonce...)
+	result = aead.Seal(result, nonce, plaintext, publicationCipherHeader)
+	return result, nil
+}
+
+func (client Client) decryptPublicationSnapshot(ciphertext []byte) ([]byte, error) {
+	aead, err := client.publicationAEAD()
+	if err != nil {
+		return nil, err
+	}
+	prefixBytes := len(publicationCipherHeader) + aead.NonceSize()
+	if len(ciphertext) < prefixBytes+aead.Overhead() || !bytes.Equal(ciphertext[:len(publicationCipherHeader)], publicationCipherHeader) {
+		return nil, fmt.Errorf("publication snapshot has an invalid encryption envelope")
+	}
+	nonce := ciphertext[len(publicationCipherHeader):prefixBytes]
+	plaintext, err := aead.Open(nil, nonce, ciphertext[prefixBytes:], publicationCipherHeader)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt publication snapshot: %w", err)
+	}
+	if len(plaintext) == 0 || len(plaintext) > maxPublicationArchiveBytes {
+		return nil, fmt.Errorf("decrypted publication snapshot exceeds size limit")
+	}
+	return plaintext, nil
+}
+
+func (client Client) publicationAEAD() (cipher.AEAD, error) {
+	if len(client.EncryptionKey) != 32 {
+		return nil, fmt.Errorf("practice task publication encryption is not configured")
+	}
+	block, err := aes.NewCipher(client.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func decodeEncryptionKey(value string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+	}
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(value)
+		if err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
+	}
+	return nil, fmt.Errorf("PRACTICE_TASK_PUBLICATION_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+}
+
+func (client Client) Activate(ctx context.Context, fileID string) error {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("%s/internal/v1/files/%s/activate", strings.TrimRight(client.BaseURL, "/"), fileID),
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	client.authorize(request)
+	response, err := client.httpClient().Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("filestorage activation failed: %s", response.Status)
+	}
+	return nil
+}
+func (client Client) authorize(request *http.Request) {
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+}
+
+func (client Client) httpClient() *http.Client {
+	if client.HTTPClient != nil {
+		return client.HTTPClient
+	}
+	return &http.Client{Timeout: 30 * time.Second}
+}

@@ -1,0 +1,212 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherContextSummaryRepository struct {
+	Pool *pgxpool.Pool
+}
+
+const teacherContextSummaryColumns = `
+student_id,personal_teacher_id,dialog_id,context_type,context_id,
+covered_from_sequence,covered_through_sequence,digest_from_sequence,digest_through_sequence,
+digest_event_sequence,source_digest,summary_json,schema_code,policy_version,revision,created_at,updated_at`
+
+func (store TeacherContextSummaryRepository) Latest(
+	ctx context.Context,
+	scope domain.TeacherContextScope,
+) (domain.TeacherContextSummary, bool, error) {
+	if store.Pool == nil {
+		return domain.TeacherContextSummary{}, false, errors.New("teacher context summary repository pool is required")
+	}
+	normalized, err := domain.NewTeacherContextScope(scope)
+	if err != nil {
+		return domain.TeacherContextSummary{}, false, err
+	}
+	item, err := scanTeacherContextSummary(store.Pool.QueryRow(ctx, `SELECT `+teacherContextSummaryColumns+`
+FROM teacher_context_summary
+WHERE student_id=$1 AND personal_teacher_id=$2 AND dialog_id=$3 AND context_type=$4 AND context_id=$5
+  AND invalidation_epoch=2 AND invalidated_at IS NULL
+`, normalized.StudentID, normalized.PersonalTeacherID, normalized.DialogID, normalized.ContextType, summaryContextID(normalized)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherContextSummary{}, false, nil
+	}
+	return item, err == nil, err
+}
+
+func (store TeacherContextSummaryRepository) Store(
+	ctx context.Context,
+	update domain.TeacherContextSummaryUpdate,
+) (domain.TeacherContextSummary, bool, error) {
+	if store.Pool == nil {
+		return domain.TeacherContextSummary{}, false, errors.New("teacher context summary repository pool is required")
+	}
+	normalized, err := domain.NormalizeTeacherContextSummaryUpdate(update)
+	if err != nil {
+		return domain.TeacherContextSummary{}, false, err
+	}
+	item := normalized.Summary
+	summaryJSON, err := json.Marshal(item.Payload)
+	if err != nil {
+		return domain.TeacherContextSummary{}, false, domain.ErrInvalidTeacherContextSummary
+	}
+	stored, err := scanTeacherContextSummary(store.Pool.QueryRow(ctx, `
+WITH summary_scope_lock AS (
+    SELECT pg_advisory_xact_lock(hashtextextended($19,0))
+)
+INSERT INTO teacher_context_summary (
+    student_id,personal_teacher_id,dialog_id,context_type,context_id,
+    covered_from_sequence,covered_through_sequence,digest_from_sequence,digest_through_sequence,
+    digest_event_sequence,source_digest,summary_json,schema_code,policy_version,revision,created_at,updated_at,invalidation_epoch
+)
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,$15,$16,2
+FROM summary_scope_lock
+WHERE NOT EXISTS (
+    SELECT 1 FROM teacher_dialog_context_mutation_fence AS fence
+    WHERE fence.student_id=$1 AND fence.personal_teacher_id=$2 AND fence.dialog_id=$3
+      AND fence.context_type=$4 AND fence.context_id=$5
+      AND fence.message_sequence BETWEEN $6 AND $7
+      AND fence.last_event_sequence>$10
+)
+ON CONFLICT (student_id,personal_teacher_id,dialog_id,context_type,context_id) DO UPDATE SET
+    covered_from_sequence=EXCLUDED.covered_from_sequence,
+    covered_through_sequence=EXCLUDED.covered_through_sequence,
+    digest_from_sequence=EXCLUDED.digest_from_sequence,
+    digest_through_sequence=EXCLUDED.digest_through_sequence,
+    digest_event_sequence=EXCLUDED.digest_event_sequence,
+    source_digest=EXCLUDED.source_digest,
+    summary_json=EXCLUDED.summary_json,
+    schema_code=EXCLUDED.schema_code,
+    policy_version=EXCLUDED.policy_version,
+    invalidation_epoch=2,
+    revision=teacher_context_summary.revision+1,
+    created_at=CASE WHEN teacher_context_summary.invalidated_at IS NULL THEN teacher_context_summary.created_at ELSE EXCLUDED.created_at END,
+    updated_at=EXCLUDED.updated_at,
+    invalidated_at=NULL
+WHERE (
+    teacher_context_summary.invalidated_at IS NOT NULL AND $17=0
+) OR (
+	    teacher_context_summary.invalidated_at IS NULL
+	    AND teacher_context_summary.covered_through_sequence=$17
+	    AND EXCLUDED.covered_from_sequence=teacher_context_summary.covered_from_sequence
+	    AND $18>teacher_context_summary.covered_through_sequence
+)
+RETURNING `+teacherContextSummaryColumns,
+		item.Scope.StudentID, item.Scope.PersonalTeacherID, item.Scope.DialogID, item.Scope.ContextType,
+		summaryContextID(item.Scope), item.CoveredFromSequence, item.CoveredThroughSequence,
+		item.DigestFromSequence, item.DigestThroughSequence, item.DigestEventSequence,
+		item.SourceDigest, summaryJSON, item.SchemaCode, item.PolicyVersion, item.CreatedAt, item.UpdatedAt,
+		normalized.ExpectedThroughSequence, normalized.NewFromSequence, summaryScopeLockKey(item.Scope)))
+	if err == nil {
+		return stored, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherContextSummary{}, false, err
+	}
+	existing, found, latestErr := store.Latest(ctx, item.Scope)
+	if latestErr != nil {
+		return domain.TeacherContextSummary{}, false, latestErr
+	}
+	if found && sameTeacherContextSummary(existing, item) {
+		return existing, false, nil
+	}
+	return domain.TeacherContextSummary{}, false, domain.ErrTeacherContextSummaryConflict
+}
+
+func (store TeacherContextSummaryRepository) Invalidate(
+	ctx context.Context,
+	scope domain.TeacherContextScope,
+	expectedThroughSequence int64,
+	at time.Time,
+) (bool, error) {
+	if store.Pool == nil || expectedThroughSequence < 1 || at.IsZero() {
+		return false, domain.ErrInvalidTeacherContextSummary
+	}
+	normalized, err := domain.NewTeacherContextScope(scope)
+	if err != nil {
+		return false, err
+	}
+	command, err := store.Pool.Exec(ctx, `
+UPDATE teacher_context_summary SET
+    invalidated_at=GREATEST($7,created_at,updated_at),
+    updated_at=GREATEST($7,created_at,updated_at),
+    revision=revision+1
+WHERE student_id=$1 AND personal_teacher_id=$2 AND dialog_id=$3 AND context_type=$4 AND context_id=$5
+  AND invalidation_epoch=2 AND covered_through_sequence=$6 AND invalidated_at IS NULL
+`, normalized.StudentID, normalized.PersonalTeacherID, normalized.DialogID, normalized.ContextType,
+		summaryContextID(normalized), expectedThroughSequence, at.UTC())
+	if err != nil {
+		return false, err
+	}
+	return command.RowsAffected() == 1, nil
+}
+
+func scanTeacherContextSummary(row pgx.Row) (domain.TeacherContextSummary, error) {
+	var item domain.TeacherContextSummary
+	var payload []byte
+	var contextID uuid.UUID
+	err := row.Scan(
+		&item.Scope.StudentID, &item.Scope.PersonalTeacherID, &item.Scope.DialogID, &item.Scope.ContextType, &contextID,
+		&item.CoveredFromSequence, &item.CoveredThroughSequence, &item.DigestFromSequence, &item.DigestThroughSequence,
+		&item.DigestEventSequence, &item.SourceDigest, &payload, &item.SchemaCode, &item.PolicyVersion,
+		&item.Revision, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		return domain.TeacherContextSummary{}, err
+	}
+	if contextID != uuid.Nil {
+		item.Scope.ContextID = contextID.String()
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&item.Payload); err != nil {
+		return domain.TeacherContextSummary{}, domain.ErrInvalidTeacherContextSummary
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TeacherContextSummary{}, domain.ErrInvalidTeacherContextSummary
+	}
+	return domain.NormalizeTeacherContextSummary(item)
+}
+
+func summaryContextID(scope domain.TeacherContextScope) string {
+	if scope.ContextID == "" {
+		return uuid.Nil.String()
+	}
+	return scope.ContextID
+}
+
+const zeroUUID = "00000000-0000-0000-0000-000000000000"
+
+func summaryScopeLockKey(scope domain.TeacherContextScope) string {
+	return scope.StudentID + "\x1f" + scope.PersonalTeacherID + "\x1f" + scope.DialogID + "\x1f" + string(scope.ContextType) + "\x1f" + summaryContextID(scope)
+}
+
+func sameTeacherContextSummary(first, second domain.TeacherContextSummary) bool {
+	return first.Scope == second.Scope && first.CoveredFromSequence == second.CoveredFromSequence &&
+		first.CoveredThroughSequence == second.CoveredThroughSequence &&
+		first.DigestFromSequence == second.DigestFromSequence && first.DigestThroughSequence == second.DigestThroughSequence &&
+		first.DigestEventSequence == second.DigestEventSequence && first.SourceDigest == second.SourceDigest &&
+		first.SchemaCode == second.SchemaCode && first.PolicyVersion == second.PolicyVersion &&
+		payloadsEqual(first.Payload, second.Payload)
+}
+
+func payloadsEqual(first, second domain.TeacherContextSummaryPayload) bool {
+	firstJSON, firstErr := json.Marshal(first)
+	secondJSON, secondErr := json.Marshal(second)
+	return firstErr == nil && secondErr == nil && string(firstJSON) == string(secondJSON)
+}
+
+var _ repository.TeacherContextSummaryRepository = TeacherContextSummaryRepository{}

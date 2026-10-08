@@ -1,0 +1,484 @@
+package postgres
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	onboardingDraftCommandReplace  = "REPLACE"
+	onboardingDraftCommandFinalize = "FINALIZE"
+)
+
+var _ repository.StudentOnboardingDraftRepository = (*StudentOnboardingRepoPG)(nil)
+
+const studentOnboardingDraftColumns = `student_id, schema_version, status,
+direction_code, self_assessed_experience, known_stacks, desired_stacks,
+goal_code, goal_text, preferred_language, weekly_minutes, preferred_pace,
+version, completed_profile_version, created_at, updated_at, completed_at`
+
+func (repo *StudentOnboardingRepoPG) GetDraft(
+	ctx context.Context,
+	studentID string,
+) (domain.StudentOnboardingDraft, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingDraft{}, errors.New("student onboarding repository pool is required")
+	}
+	draft, err := getStudentOnboardingDraft(ctx, repo.Pool, studentID, false)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.EmptyStudentOnboardingDraft(studentID)
+	}
+	return draft, err
+}
+
+func (repo *StudentOnboardingRepoPG) ReplaceDraft(
+	ctx context.Context,
+	command repository.StudentOnboardingDraftReplaceCommand,
+) (domain.StudentOnboardingDraft, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingDraft{}, false, errors.New("student onboarding repository pool is required")
+	}
+	answers, err := domain.NormalizeStudentOnboardingDraftAnswers(command.Answers)
+	if err != nil || !validOnboardingDraftCommand(
+		command.StudentID, command.RequestID, command.RequestHash, command.ExpectedVersion, command.OccurredAt,
+	) {
+		return domain.StudentOnboardingDraft{}, false, domain.ErrValidation
+	}
+	command.Answers = answers
+	command.OccurredAt = command.OccurredAt.UTC()
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, command.StudentID); err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+	if err := lockOnboardingDraftCommand(ctx, tx, command.RequestID, command.StudentID); err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+
+	receipt, err := getOnboardingDraftReceipt(ctx, tx, command.RequestID)
+	if err == nil {
+		if receipt.StudentID != command.StudentID || receipt.CommandKind != onboardingDraftCommandReplace ||
+			receipt.RequestHash != command.RequestHash {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+		current, currentErr := getStudentOnboardingDraft(ctx, tx, command.StudentID, true)
+		if currentErr != nil {
+			return domain.StudentOnboardingDraft{}, false, currentErr
+		}
+		// Completion is terminal even for an otherwise replayable replace. This
+		// prevents an old PUT receipt from exposing answers that were deliberately
+		// cleared when the final profile became authoritative.
+		if current.Status == domain.StudentOnboardingDraftStatusCompleted {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+		var replay domain.StudentOnboardingDraft
+		if err := json.Unmarshal(receipt.ResponseJSON, &replay); err != nil {
+			return domain.StudentOnboardingDraft{}, false, err
+		}
+		replay, err = domain.NormalizeStudentOnboardingDraft(replay)
+		if err != nil || replay.StudentID != receipt.StudentID || replay.Version != receipt.ResultDraftVersion ||
+			receipt.ResultProfileVersion != nil {
+			return domain.StudentOnboardingDraft{}, false, errors.New("invalid onboarding draft replace receipt")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentOnboardingDraft{}, false, err
+		}
+		return replay, true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+
+	stored, err := getStudentOnboardingDraft(ctx, tx, command.StudentID, true)
+	createdAt := command.OccurredAt
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		if command.ExpectedVersion != 0 {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+	case err != nil:
+		return domain.StudentOnboardingDraft{}, false, err
+	default:
+		if stored.Status != domain.StudentOnboardingDraftStatusDraft || stored.Version != command.ExpectedVersion {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+		createdAt = *stored.CreatedAt
+	}
+	draft, err := domain.NormalizeStudentOnboardingDraft(domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: command.StudentID,
+		Status: domain.StudentOnboardingDraftStatusDraft, StudentOnboardingDraftAnswers: command.Answers,
+		Version: command.ExpectedVersion + 1, CreatedAt: &createdAt, UpdatedAt: &command.OccurredAt,
+	})
+	if err != nil {
+		return domain.StudentOnboardingDraft{}, false, domain.ErrValidation
+	}
+	if command.ExpectedVersion == 0 {
+		result, execErr := tx.Exec(ctx, `INSERT INTO student_onboarding_draft (`+studentOnboardingDraftColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+ON CONFLICT (student_id) DO NOTHING`, onboardingDraftValues(draft)...)
+		if execErr != nil {
+			return domain.StudentOnboardingDraft{}, false, mapOnboardingDraftError(execErr)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+	} else {
+		result, execErr := tx.Exec(ctx, `UPDATE student_onboarding_draft SET
+schema_version=$2, status=$3, direction_code=$4, self_assessed_experience=$5,
+known_stacks=$6, desired_stacks=$7, goal_code=$8, goal_text=$9,
+preferred_language=$10, weekly_minutes=$11, preferred_pace=$12,
+version=$13, completed_profile_version=$14, created_at=$15, updated_at=$16, completed_at=$17
+WHERE student_id=$1 AND version=$18 AND status='DRAFT'`, append(onboardingDraftValues(draft), command.ExpectedVersion)...)
+		if execErr != nil {
+			return domain.StudentOnboardingDraft{}, false, mapOnboardingDraftError(execErr)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.StudentOnboardingDraft{}, false, domain.ErrConflict
+		}
+	}
+	responseJSON, err := json.Marshal(draft)
+	if err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+	if err := insertOnboardingDraftReceipt(ctx, tx, onboardingDraftReceipt{
+		RequestID: command.RequestID, StudentID: command.StudentID, CommandKind: onboardingDraftCommandReplace,
+		RequestHash: command.RequestHash, ResultDraftVersion: draft.Version, ResponseJSON: responseJSON,
+		CreatedAt: command.OccurredAt,
+	}); err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentOnboardingDraft{}, false, err
+	}
+	return draft, false, nil
+}
+
+func (repo *StudentOnboardingRepoPG) FinalizeDraft(
+	ctx context.Context,
+	command repository.StudentOnboardingDraftFinalizeCommand,
+) (domain.StudentOnboardingFinalizeResult, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, errors.New("student onboarding repository pool is required")
+	}
+	if !validOnboardingDraftCommand(
+		command.StudentID, command.RequestID, command.RequestHash, command.ExpectedDraftVersion, command.OccurredAt,
+	) || command.ExpectedDraftVersion < 1 || command.ExpectedProfileVersion < 0 {
+		return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrValidation
+	}
+	command.OccurredAt = command.OccurredAt.UTC()
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, command.StudentID); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	if err := lockOnboardingDraftCommand(ctx, tx, command.RequestID, command.StudentID); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+
+	receipt, err := getOnboardingDraftReceipt(ctx, tx, command.RequestID)
+	if err == nil {
+		if receipt.StudentID != command.StudentID || receipt.CommandKind != onboardingDraftCommandFinalize ||
+			receipt.RequestHash != command.RequestHash {
+			return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrConflict
+		}
+		var replay domain.StudentOnboardingFinalizeResult
+		if err := json.Unmarshal(receipt.ResponseJSON, &replay); err != nil {
+			return domain.StudentOnboardingFinalizeResult{}, false, err
+		}
+		replay, err = domain.NormalizeStudentOnboardingFinalizeResult(replay)
+		if err != nil || replay.Draft.Version != receipt.ResultDraftVersion || receipt.ResultProfileVersion == nil ||
+			replay.Profile.Version != *receipt.ResultProfileVersion {
+			return domain.StudentOnboardingFinalizeResult{}, false, errors.New("invalid onboarding draft finalize receipt")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentOnboardingFinalizeResult{}, false, err
+		}
+		return replay, true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+
+	draft, err := getStudentOnboardingDraft(ctx, tx, command.StudentID, true)
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	if draft.Status != domain.StudentOnboardingDraftStatusDraft || draft.Version != command.ExpectedDraftVersion {
+		return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrConflict
+	}
+	storedProfile, profileErr := getStudentOnboardingForUpdate(ctx, tx, command.StudentID)
+	profileCreatedAt, profileVersion := command.OccurredAt, int64(1)
+	profileExists := profileErr == nil
+	switch {
+	case errors.Is(profileErr, domain.ErrNotFound):
+		if command.ExpectedProfileVersion != 0 {
+			return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrConflict
+		}
+	case profileErr != nil:
+		return domain.StudentOnboardingFinalizeResult{}, false, profileErr
+	default:
+		if storedProfile.Version != command.ExpectedProfileVersion {
+			return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrConflict
+		}
+		profileCreatedAt, profileVersion = storedProfile.CreatedAt, storedProfile.Version+1
+	}
+	profile, err := domain.BuildStudentOnboardingFromDraft(
+		draft, profileVersion, profileCreatedAt, command.OccurredAt,
+	)
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrValidation
+	}
+	if err := saveStudentOnboardingInTransaction(
+		ctx, tx, profile, command.ExpectedProfileVersion, profileExists,
+	); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	completedProfileVersion := profile.Version
+	completedAt := command.OccurredAt
+	completedDraft, err := domain.NormalizeStudentOnboardingDraft(domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: command.StudentID,
+		Status: domain.StudentOnboardingDraftStatusCompleted, Version: draft.Version + 1,
+		CompletedProfileVersion: &completedProfileVersion, CreatedAt: draft.CreatedAt,
+		UpdatedAt: &completedAt, CompletedAt: &completedAt,
+	})
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	result, err := tx.Exec(ctx, `UPDATE student_onboarding_draft SET
+status='COMPLETED', direction_code=NULL, self_assessed_experience=NULL,
+known_stacks=NULL, desired_stacks=NULL, goal_code=NULL, goal_text=NULL,
+preferred_language=NULL, weekly_minutes=NULL, preferred_pace=NULL,
+version=$2, completed_profile_version=$3, updated_at=$4, completed_at=$4
+WHERE student_id=$1 AND version=$5 AND status='DRAFT'`, command.StudentID, completedDraft.Version,
+		completedProfileVersion, completedAt, command.ExpectedDraftVersion)
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, mapOnboardingDraftError(err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.StudentOnboardingFinalizeResult{}, false, domain.ErrConflict
+	}
+	// Active replace receipts need their exact response for lost-response replay.
+	// Once completion is committed, every PUT is terminally rejected, so retaining
+	// historical partial answers in those private receipts is unnecessary.
+	if _, err := tx.Exec(ctx, `UPDATE student_onboarding_draft_command
+SET response_json='{"redacted":true}'::jsonb
+WHERE student_id=$1 AND command_kind='REPLACE'`, command.StudentID); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	finalized, err := domain.NormalizeStudentOnboardingFinalizeResult(domain.StudentOnboardingFinalizeResult{
+		Schema: domain.StudentOnboardingFinalizeResultSchema, Draft: completedDraft, Profile: profile,
+	})
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	responseJSON, err := json.Marshal(finalized)
+	if err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	if err := insertOnboardingDraftReceipt(ctx, tx, onboardingDraftReceipt{
+		RequestID: command.RequestID, StudentID: command.StudentID, CommandKind: onboardingDraftCommandFinalize,
+		RequestHash: command.RequestHash, ResultDraftVersion: completedDraft.Version,
+		ResultProfileVersion: &completedProfileVersion, ResponseJSON: responseJSON, CreatedAt: command.OccurredAt,
+	}); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentOnboardingFinalizeResult{}, false, err
+	}
+	return finalized, false, nil
+}
+
+type onboardingDraftQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func getStudentOnboardingDraft(
+	ctx context.Context,
+	querier onboardingDraftQuerier,
+	studentID string,
+	forUpdate bool,
+) (domain.StudentOnboardingDraft, error) {
+	query := `SELECT ` + studentOnboardingDraftColumns + ` FROM student_onboarding_draft WHERE student_id=$1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	draft, err := scanStudentOnboardingDraft(querier.QueryRow(ctx, query, studentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentOnboardingDraft{}, domain.ErrNotFound
+	}
+	return draft, err
+}
+
+func scanStudentOnboardingDraft(row pgx.Row) (domain.StudentOnboardingDraft, error) {
+	var draft domain.StudentOnboardingDraft
+	if err := row.Scan(
+		&draft.StudentID, &draft.Schema, &draft.Status,
+		&draft.DirectionCode, &draft.SelfAssessedExperience, &draft.KnownStacks, &draft.DesiredStacks,
+		&draft.GoalCode, &draft.GoalText, &draft.PreferredLanguage, &draft.WeeklyMinutes, &draft.PreferredPace,
+		&draft.Version, &draft.CompletedProfileVersion, &draft.CreatedAt, &draft.UpdatedAt, &draft.CompletedAt,
+	); err != nil {
+		return domain.StudentOnboardingDraft{}, err
+	}
+	return domain.NormalizeStudentOnboardingDraft(draft)
+}
+
+func getStudentOnboardingForUpdate(
+	ctx context.Context,
+	querier onboardingDraftQuerier,
+	studentID string,
+) (domain.StudentOnboarding, error) {
+	profile, err := scanStudentOnboarding(querier.QueryRow(ctx, `SELECT `+studentOnboardingColumns+`
+FROM student_onboarding WHERE student_id=$1 FOR UPDATE`, studentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentOnboarding{}, domain.ErrNotFound
+	}
+	return profile, err
+}
+
+func saveStudentOnboardingInTransaction(
+	ctx context.Context,
+	tx pgx.Tx,
+	profile domain.StudentOnboarding,
+	expectedVersion int64,
+	profileExists bool,
+) error {
+	if !profileExists {
+		result, err := tx.Exec(ctx, `INSERT INTO student_onboarding (`+studentOnboardingColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT (student_id) DO NOTHING`, profile.StudentID, profile.DirectionCode, profile.SelfAssessedExperience,
+			profile.KnownStacks, profile.DesiredStacks, profile.GoalCode, profile.GoalText,
+			profile.PreferredLanguage, profile.WeeklyMinutes, profile.PreferredPace,
+			profile.ProfileVersion, profile.Version, profile.CreatedAt, profile.UpdatedAt)
+		if err != nil {
+			return mapOnboardingDraftError(err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	result, err := tx.Exec(ctx, `UPDATE student_onboarding SET
+direction_code=$2, self_assessed_experience=$3, known_stacks=$4,
+desired_stacks=$5, goal_code=$6, goal_text=$7, preferred_language=$8,
+weekly_minutes=$9, preferred_pace=$10, profile_version=$11,
+version=$12, updated_at=$13
+WHERE student_id=$1 AND version=$14`, profile.StudentID, profile.DirectionCode, profile.SelfAssessedExperience,
+		profile.KnownStacks, profile.DesiredStacks, profile.GoalCode, profile.GoalText,
+		profile.PreferredLanguage, profile.WeeklyMinutes, profile.PreferredPace,
+		profile.ProfileVersion, profile.Version, profile.UpdatedAt, expectedVersion)
+	if err != nil {
+		return mapOnboardingDraftError(err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+type onboardingDraftReceipt struct {
+	RequestID            string
+	StudentID            string
+	CommandKind          string
+	RequestHash          string
+	ResultDraftVersion   int64
+	ResultProfileVersion *int64
+	ResponseJSON         []byte
+	CreatedAt            time.Time
+}
+
+func getOnboardingDraftReceipt(
+	ctx context.Context,
+	querier onboardingDraftQuerier,
+	requestID string,
+) (onboardingDraftReceipt, error) {
+	var receipt onboardingDraftReceipt
+	err := querier.QueryRow(ctx, `SELECT request_id, student_id, command_kind, request_hash,
+result_draft_version, result_profile_version, response_json, created_at
+FROM student_onboarding_draft_command WHERE request_id=$1`, requestID).Scan(
+		&receipt.RequestID, &receipt.StudentID, &receipt.CommandKind, &receipt.RequestHash,
+		&receipt.ResultDraftVersion, &receipt.ResultProfileVersion, &receipt.ResponseJSON, &receipt.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return onboardingDraftReceipt{}, domain.ErrNotFound
+	}
+	return receipt, err
+}
+
+func insertOnboardingDraftReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	receipt onboardingDraftReceipt,
+) error {
+	_, err := tx.Exec(ctx, `INSERT INTO student_onboarding_draft_command
+(request_id, student_id, command_kind, request_hash, result_draft_version,
+result_profile_version, response_json, created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, receipt.RequestID, receipt.StudentID,
+		receipt.CommandKind, receipt.RequestHash, receipt.ResultDraftVersion,
+		receipt.ResultProfileVersion, receipt.ResponseJSON, receipt.CreatedAt)
+	return mapOnboardingDraftError(err)
+}
+
+func lockOnboardingDraftCommand(ctx context.Context, tx pgx.Tx, requestID, studentID string) error {
+	for _, key := range []string{"onboarding-draft-request:" + requestID, "onboarding-draft-student:" + studentID} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func onboardingDraftValues(draft domain.StudentOnboardingDraft) []any {
+	return []any{
+		draft.StudentID, draft.Schema, draft.Status, draft.DirectionCode, draft.SelfAssessedExperience,
+		onboardingDraftStringSliceValue(draft.KnownStacks), onboardingDraftStringSliceValue(draft.DesiredStacks), draft.GoalCode, draft.GoalText, draft.PreferredLanguage,
+		draft.WeeklyMinutes, draft.PreferredPace, draft.Version, draft.CompletedProfileVersion,
+		draft.CreatedAt, draft.UpdatedAt, draft.CompletedAt,
+	}
+}
+
+func onboardingDraftStringSliceValue(value *[]string) any {
+	if value == nil {
+		return nil
+	}
+	return append([]string{}, (*value)...)
+}
+
+func validOnboardingDraftCommand(
+	studentID string,
+	requestID string,
+	requestHash string,
+	expectedVersion int64,
+	occurredAt time.Time,
+) bool {
+	_, studentErr := uuid.Parse(studentID)
+	_, requestErr := uuid.Parse(requestID)
+	decodedHash, hashErr := hex.DecodeString(requestHash)
+	return studentErr == nil && requestErr == nil && requestHash == strings.ToLower(strings.TrimSpace(requestHash)) &&
+		hashErr == nil && len(decodedHash) == sha256Size && expectedVersion >= 0 && !occurredAt.IsZero()
+}
+
+const sha256Size = 32
+
+func mapOnboardingDraftError(err error) error {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+		return domain.ErrConflict
+	}
+	return err
+}

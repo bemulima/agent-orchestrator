@@ -1,0 +1,275 @@
+package task
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+// UpdateTaskInput holds updated fields.
+type UpdateTaskInput struct {
+	ID                     string
+	Title                  string
+	Description            string
+	Translations           []domain.TaskI18n
+	LearningTargets        *[]domain.TaskLearningTarget
+	CodeStructure          []byte
+	ComposeConfig          *[]byte
+	Type                   *string
+	AssessmentPurpose      *string
+	ExecutionMode          *string
+	EvaluationMode         *string
+	UIMode                 *string
+	SubmissionMode         *string
+	RequiresSandbox        *bool
+	ExposesPreview         *bool
+	ExposesTerminal        *bool
+	SupportsLiveValidation *bool
+	AllowedErrorsCount     *int
+	Order                  int
+	Status                 int
+	Tests                  []domain.TaskTest
+	StarterFiles           *[]domain.TaskFileStorage
+	MaxAttempts            *int
+}
+
+// UpdateTask updates stored task.
+type UpdateTask struct {
+	Tasks           repository.TaskRepository
+	Lessons         repository.LessonRepository
+	TaskI18n        repository.TaskI18nRepository
+	TaskTests       repository.TaskTestRepository
+	TaskFiles       repository.TaskFileStorageRepository
+	LearningTargets repository.TaskLearningTargetRepository
+	Publisher       domain.EventPublisher
+	ComposeConfigs  repository.ComposeConfigRepository
+	StructureRes    repository.CodeStructureTypeRepository
+	Tx              repository.TransactionManager
+}
+
+// Handle updates task entity.
+func (uc UpdateTask) Handle(ctx context.Context, in UpdateTaskInput) (*domain.Task, error) {
+	var normalizedLearningTargets []domain.TaskLearningTarget
+	if in.LearningTargets != nil {
+		var err error
+		normalizedLearningTargets, err = domain.NormalizeTaskLearningTargets(*in.LearningTargets)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var task *domain.Task
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		var err error
+		task, err = uc.Tasks.Get(ctx, in.ID)
+		if err != nil {
+			return err
+		}
+
+		translations := normalizeTranslations(in.Translations)
+		if len(translations) == 0 {
+			return domain.ErrValidation
+		}
+		task.Title = translations[0].Title
+		task.Description = translations[0].Description
+
+		nextType := task.Type
+		if task.AssessmentPurpose == "" {
+			task.AssessmentPurpose = domain.AssessmentPurposeKnowledgeCheck
+		}
+		if in.AssessmentPurpose != nil {
+			purpose, purposeErr := domain.NormalizeAssessmentPurpose(*in.AssessmentPurpose)
+			if purposeErr != nil {
+				return purposeErr
+			}
+			task.AssessmentPurpose = purpose
+		}
+		if parsedType, err := requestedTaskTypeCode(in.Type); err != nil {
+			return err
+		} else if parsedType != 0 {
+			nextType = parsedType
+		}
+		if task.Status == domain.TaskStatusActive && nextType != task.Type {
+			return fmt.Errorf("%w: cannot change task type while task is active", domain.ErrValidation)
+		}
+		isAssessmentTask := domain.IsAssessmentTaskType(nextType)
+		assessmentKind := domain.TaskAssessmentKind(nextType)
+		if task.AssessmentPurpose == domain.AssessmentPurposeDiagnostic && !isAssessmentTask {
+			return domain.ErrValidation
+		}
+		if domain.IsAssessmentTaskType(task.Type) && nextType != task.Type {
+			return domain.ErrValidation
+		}
+
+		if isAssessmentTask {
+			allowedErrorsCount := task.AllowedErrorsCount
+			if in.AllowedErrorsCount != nil {
+				allowedErrorsCount = *in.AllowedErrorsCount
+			}
+			if err := normalizeTaskTestSourceKeys(in.Tests, assessmentKind); err != nil {
+				return err
+			}
+			if err := domain.ValidateTaskAssessments(in.Tests, allowedErrorsCount, assessmentKind); err != nil {
+				return err
+			}
+			structureType, err := uc.StructureRes.GetByCode(ctx, domain.TaskAssessmentCodeStructureType(nextType))
+			if err != nil {
+				return err
+			}
+			task.CodeStructureTypeID = structureType.ID
+			task.CodeStructure = domain.DefaultTaskAssessmentCodeStructure(assessmentKind)
+			task.ComposeConfig = nil
+			task.ComposeConfigID = nil
+			task.AllowedErrorsCount = allowedErrorsCount
+		} else {
+			if strings.TrimSpace(task.CodeStructureTypeID) == "" {
+				return domain.ErrValidation
+			}
+			if len(in.Tests) > 0 {
+				return domain.ErrValidation
+			}
+			if len(bytes.TrimSpace(in.CodeStructure)) == 0 {
+				return domain.ErrValidation
+			}
+			if err := domain.ValidateTaskContract(nextType, in.CodeStructure); err != nil {
+				return err
+			}
+			task.CodeStructure = in.CodeStructure
+			task.AllowedErrorsCount = 0
+		}
+
+		if in.ComposeConfig != nil && !isAssessmentTask {
+			composeConfig := bytes.TrimSpace(*in.ComposeConfig)
+			if len(composeConfig) == 0 {
+				task.ComposeConfig = nil
+			} else {
+				task.ComposeConfig = composeConfig
+			}
+			task.ComposeConfigID = nil
+			if len(composeConfig) > 0 && uc.ComposeConfigs != nil {
+				existing, err := uc.ComposeConfigs.GetByConfig(ctx, composeConfig)
+				if err != nil && err != domain.ErrNotFound {
+					return err
+				}
+				if existing != nil {
+					task.ComposeConfigID = &existing.ID
+				} else {
+					title, description := domain.DeriveComposeConfigMeta(composeConfig)
+					config := domain.ComposeConfig{
+						ID:          uuid.NewString(),
+						Title:       &title,
+						Description: &description,
+						Config:      composeConfig,
+						CreatedAt:   time.Now().UTC(),
+					}
+					if err := uc.ComposeConfigs.Create(ctx, config); err != nil {
+						return err
+					}
+					task.ComposeConfigID = &config.ID
+				}
+			}
+		}
+		task.Order = in.Order
+		if in.MaxAttempts != nil {
+			task.MaxAttempts = in.MaxAttempts
+		}
+		caps, err := domain.MergeTaskCapabilities(*task, domain.TaskCapabilityInput{
+			Type:                   in.Type,
+			ExecutionMode:          in.ExecutionMode,
+			EvaluationMode:         in.EvaluationMode,
+			UIMode:                 in.UIMode,
+			SubmissionMode:         in.SubmissionMode,
+			RequiresSandbox:        in.RequiresSandbox,
+			ExposesPreview:         in.ExposesPreview,
+			ExposesTerminal:        in.ExposesTerminal,
+			SupportsLiveValidation: in.SupportsLiveValidation,
+		})
+		if err != nil {
+			return err
+		}
+		if err := domain.ValidatePHPCoreLiveValidationCapability(task.CodeStructure, caps.SupportsLiveValidation); err != nil {
+			return err
+		}
+		domain.ApplyTaskCapabilities(task, caps)
+		if err := validateSandboxRuntime(ctx, uc.Lessons, task); err != nil {
+			return err
+		}
+		if task.Status == domain.TaskStatusActive && in.Status == domain.TaskStatusNoActive && uc.Lessons != nil {
+			parentLesson, err := uc.Lessons.Get(ctx, task.LessonID)
+			if err != nil {
+				return err
+			}
+			if parentLesson.Status == domain.LessonStatusActive {
+				return fmt.Errorf("%w: cannot deactivate task while parent lesson is active", domain.ErrValidation)
+			}
+		}
+		task.Status = in.Status
+		task.UpdatedAt = time.Now().UTC()
+		if err := uc.Tasks.Update(ctx, *task); err != nil {
+			return err
+		}
+		if in.LearningTargets != nil {
+			if uc.LearningTargets == nil {
+				return domain.ErrValidation
+			}
+			for index := range normalizedLearningTargets {
+				normalizedLearningTargets[index].TaskID = task.ID
+			}
+			if err := uc.LearningTargets.ReplaceForTask(ctx, task.ID, normalizedLearningTargets); err != nil {
+				return err
+			}
+		}
+		if uc.TaskTests != nil {
+			var tests []domain.TaskTest
+			if isAssessmentTask {
+				tests = prepareTaskTests(task.ID, in.Tests)
+			}
+			if err := uc.TaskTests.ReplaceForTask(ctx, task.ID, tests); err != nil {
+				return err
+			}
+		}
+		if uc.TaskFiles != nil && in.StarterFiles != nil {
+			if err := uc.TaskFiles.ReplaceForTask(ctx, task.ID, normalizeTaskStarterFiles(task.ID, *in.StarterFiles)); err != nil {
+				return err
+			}
+		}
+
+		if uc.TaskI18n != nil {
+			for _, translation := range translations {
+				translation.TaskID = task.ID
+				if err := uc.TaskI18n.Upsert(ctx, translation); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Reload persisted task to return fresh translations (with language metadata).
+		refreshed, err := uc.Tasks.Get(ctx, in.ID)
+		if err != nil {
+			return err
+		}
+		task = refreshed
+		if uc.LearningTargets != nil {
+			task.LearningTargets, err = uc.LearningTargets.ListByTask(ctx, task.ID)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	_ = uc.Publisher.Publish(ctx, domain.SubjectTaskUpdated, map[string]any{"task_id": task.ID})
+	return task, nil
+}

@@ -4,15 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestRoutingCoverageCompatibilityBaseline(t *testing.T) {
-	output := validRoutedOutput(t, plannerControlPlane(t))
+	catalog, err := agentcontrol.LoadCatalog(legacyRoutingCatalogFS{FS: os.DirFS("../..")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := validRoutedOutput(t, catalog)
 	raw, err := json.Marshal(output)
 	if err != nil {
 		t.Fatal(err)
@@ -105,12 +112,12 @@ func TestRoutingCoverageLateMandatoryFile(t *testing.T) {
 	}
 	files["z/late_test.go"] = "package z\nfunc TestLate() {}"
 	writeFixtureFiles(t, root, files)
-	_, report := coverageBuild(t, root, "change business process")
+	routing, report := coverageBuild(t, root, "change business process")
 	if report.Status != "PARTIAL" || !report.Projects[0].UnscannedRemainder || report.Projects[0].RemainderCountKnown {
 		t.Fatalf("late file looked complete: %#v", report)
 	}
-	if len(report.Requirements) == 0 || report.Requirements[0].Status != "REQUIRED_NOT_VERIFIED" {
-		t.Fatalf("unresolved profile is not verified: %#v", report.Requirements)
+	if len(routing.Profiles) != 1 || routing.Profiles[0].Status != domain.ProfileResolutionResolved {
+		t.Fatalf("fair acquisition lost real canonical source: %#v", routing.Profiles)
 	}
 	if report.Projects[0].IndexedFiles != maxRoutingEvidence {
 		t.Fatal("selection cap changed")
@@ -471,4 +478,25 @@ func TestValidateRoutingCoverageBindings(t *testing.T) {
 	if err := ValidateRoutingCoverage(historical, route, plan); err != nil {
 		t.Fatalf("valid UNKNOWN report rejected: %v", err)
 	}
+}
+
+// The historical fingerprint binds historical catalog bytes. New profile
+// releases must not overwrite that fixture or compare a different catalog.
+type legacyRoutingCatalogFS struct{ fs.FS }
+
+func (f legacyRoutingCatalogFS) Open(name string) (fs.File, error) {
+	if name != "agent-system/manifest.yaml" && name != "agent-system/profiles/go-canonical.yaml" {
+		return f.FS.Open(name)
+	}
+	raw, err := fs.ReadFile(f.FS, name)
+	if err != nil {
+		return nil, err
+	}
+	text := string(raw)
+	if strings.HasSuffix(name, "manifest.yaml") {
+		text = strings.Replace(text, "version: 1.3.1", "version: 1.3.0", 1)
+	} else {
+		text = strings.Replace(text, ", internal/infrastructure/http/**]", "]", 1)
+	}
+	return fstest.MapFS{name: &fstest.MapFile{Data: []byte(text)}}.Open(name)
 }

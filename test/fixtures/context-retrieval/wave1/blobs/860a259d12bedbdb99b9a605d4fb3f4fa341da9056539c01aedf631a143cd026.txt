@@ -1,0 +1,244 @@
+package postgres
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+func TestMigration023RejectsIndependentNonterminalWork(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		insertTurn bool
+		want       string
+	}{
+		{name: "text turn without interaction link", insertTurn: true, want: "nonterminal onboarding turns must drain"},
+		{name: "coordinator job without turn", want: "nonterminal onboarding coordinator jobs must drain"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := migration023IntegrationPool(t, 22)
+			studentID, teacherID := insertMigration023Teacher(t, pool)
+			now := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+			eventID, jobID := uuid.NewString(), uuid.NewString()
+			_, err := pool.Exec(context.Background(), `
+INSERT INTO teacher_dialog_job (
+ event_id,teacher_job_id,dialog_id,event_sequence,source_message_id,source_message_sequence,
+ student_id,personal_teacher_id,context_type,occurred_at,status,next_attempt_at,accepted_at,updated_at,coordinator_mode
+) VALUES ($1,$2,$3,1,$4,1,$5,$6,'general',$7,'queued',$7,$7,$7,'onboarding_text')
+`, eventID, jobID, uuid.NewString(), uuid.NewString(), studentID, teacherID, now)
+			require.NoError(t, err)
+			if testCase.insertTurn {
+				_, err = pool.Exec(context.Background(), `
+INSERT INTO teacher_onboarding_turn (
+ teacher_job_id,source_event_id,interaction_id,coordinator_mode,stage,
+ student_command_id,response_command_id,student_effect_state,created_at,updated_at
+) VALUES ($1,$2,NULL,'onboarding_text','received',$3,$4,'not_attempted',$5,$5)
+`, jobID, eventID, uuid.NewString(), uuid.NewString(), now)
+				require.NoError(t, err)
+			}
+
+			migration := migration023SQL(t, ".up.sql")
+			_, err = pool.Exec(context.Background(), migration)
+			require.ErrorContains(t, err, testCase.want)
+		})
+	}
+}
+
+func TestMigration023TerminalRepositoryConcurrencyFenceAndGuards(t *testing.T) {
+	pool := migration023IntegrationPool(t, 23)
+	ctx := context.Background()
+	studentID, teacherID := insertMigration023Teacher(t, pool)
+	dialogID := uuid.NewString()
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral,
+	})
+	require.NoError(t, err)
+	teacher := domain.PersonalTeacher{ID: teacherID, StudentID: studentID}
+	first, err := domain.NewTeacherOnboardingActivePathTerminalSession(teacher, binding,
+		domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		time.Date(2026, 9, 12, 9, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	second := first
+	second.CreatedAt = second.CreatedAt.Add(time.Second)
+	second.UpdatedAt = second.CreatedAt
+
+	store := TeacherOnboardingTerminalSessionRepository{Pool: pool}
+	start := make(chan struct{})
+	results := make([]domain.TeacherOnboardingTerminalSession, 2)
+	created := make([]bool, 2)
+	errors := make([]error, 2)
+	var wait sync.WaitGroup
+	for index, candidate := range []domain.TeacherOnboardingTerminalSession{first, second} {
+		wait.Add(1)
+		go func(index int, candidate domain.TeacherOnboardingTerminalSession) {
+			defer wait.Done()
+			<-start
+			results[index], created[index], errors[index] = store.EnsurePending(ctx, candidate)
+		}(index, candidate)
+	}
+	close(start)
+	wait.Wait()
+	require.NoError(t, errors[0])
+	require.NoError(t, errors[1])
+	require.Equal(t, results[0].ID, results[1].ID)
+	require.NotEqual(t, created[0], created[1], "exact concurrent Ensure calls create once and replay once even when clocks differ")
+
+	dialogMessageID := uuid.NewString()
+	ackStart := make(chan struct{})
+	ackErrors := make([]error, 2)
+	for index := range ackErrors {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-ackStart
+			_, ackErrors[index] = store.MarkDelivered(ctx, first.ID, dialogMessageID, time.Date(2026, 9, 12, 9, 1, index, 0, time.UTC))
+		}(index)
+	}
+	close(ackStart)
+	wait.Wait()
+	require.NoError(t, ackErrors[0])
+	require.NoError(t, ackErrors[1], "a losing delivery CAS re-reads and accepts the exact acknowledgement")
+
+	_, err = pool.Exec(ctx, `DELETE FROM teacher_onboarding_terminal_session WHERE terminal_session_id=$1`, first.ID)
+	require.ErrorContains(t, err, "terminal session evidence cannot be deleted")
+	_, err = pool.Exec(ctx, `TRUNCATE teacher_onboarding_terminal_session`)
+	require.ErrorContains(t, err, "terminal session evidence cannot be deleted")
+	_, err = pool.Exec(ctx, migration023SQL(t, ".down.sql"))
+	require.ErrorContains(t, err, "terminal onboarding session evidence is retained permanently")
+}
+
+func TestTerminalActivePathCannotClosePromptWithEffectCapableReceipt(t *testing.T) {
+	pool := migration023IntegrationPool(t, 23)
+	ctx := context.Background()
+	studentID, teacherID := insertMigration023Teacher(t, pool)
+	dialogID, promptID := uuid.NewString(), uuid.NewString()
+	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
+	body, ui, err := domain.BuildProductAwareTeacherOnboardingPrompt(domain.OnboardingStepDirection, "en", 0)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	interaction, err := domain.NewS5OnboardingInteraction(binding, domain.DialogMessage{
+		ID: promptID, DialogID: dialogID, AuthorType: domain.DialogMessageAuthorPersonalTeacher,
+		Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: teacherID, Body: body, AssistantUI: ui,
+		Status: 1, Version: 1, MessageSequence: 1, LastEventSequence: 1, CreatedAt: now,
+	}, domain.OnboardingStepDirection, 0, 0, 3, now)
+	require.NoError(t, err)
+	_, _, err = (TeacherOnboardingTurnRepository{Pool: pool}).EnsureActiveInteraction(ctx, interaction)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_interaction SET session_schema_version=2 WHERE interaction_id=$1`, interaction.ID)
+	require.ErrorContains(t, err, "session schema version is immutable")
+	for _, version := range []any{nil, 4} {
+		_, err = pool.Exec(ctx, `
+INSERT INTO teacher_onboarding_interaction (
+ interaction_id,dialog_id,student_id,personal_teacher_id,prompt_message_id,prompt_message_version,
+ prompt_assistant_ui_digest,slot_code,expected_draft_version,expected_profile_version,session_schema_version,state,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,1,$6,'direction_code',0,0,$7,'active',$8,$8)
+`, uuid.NewString(), uuid.NewString(), studentID, teacherID, uuid.NewString(), strings.Repeat("f", 64), version, now)
+		require.ErrorContains(t, err, "requires session schema version 1..3")
+	}
+
+	request := domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: dialogID,
+		MessageID: promptID, MessageVersion: 1, BlockID: "onboarding.direction.d0.v2",
+		ActionID: "direction.backend", IdempotencyKey: uuid.NewString()}
+	receipt, err := domain.NewOnboardingActionReceiptForMode(request, studentID, teacherID, uuid.NewString(), now.Add(time.Second), now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	terminal, err := domain.NewTeacherOnboardingActivePathTerminalSession(domain.PersonalTeacher{ID: teacherID, StudentID: studentID}, binding,
+		domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 1}, now.Add(2*time.Second))
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	var claimErr, terminalErr error
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		<-start
+		_, _, claimErr = (OnboardingActionRepository{Pool: pool}).Claim(ctx, receipt)
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		_, _, terminalErr = (TeacherOnboardingTerminalSessionRepository{Pool: pool}).EnsurePending(ctx, terminal)
+	}()
+	close(start)
+	wait.Wait()
+
+	var state string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT state FROM teacher_onboarding_interaction WHERE interaction_id=$1`, interaction.ID).Scan(&state))
+	var terminalCount int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM teacher_onboarding_terminal_session WHERE student_id=$1`, studentID).Scan(&terminalCount))
+	if claimErr == nil {
+		require.ErrorIs(t, terminalErr, domain.ErrTeacherOnboardingBusy)
+		require.Equal(t, "active", state)
+		require.Zero(t, terminalCount)
+	} else {
+		require.ErrorIs(t, claimErr, domain.ErrTeacherOnboardingConflict)
+		require.NoError(t, terminalErr)
+		require.Equal(t, "closed", state)
+		require.Equal(t, 1, terminalCount)
+	}
+	_, err = pool.Exec(ctx, migration023SQL(t, ".down.sql"))
+	require.ErrorContains(t, err, "stamped onboarding session evidence is retained permanently")
+}
+
+func migration023IntegrationPool(t *testing.T, maximum int) *pgxpool.Pool {
+	t.Helper()
+	base := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	schema := "teacher_s11_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err := base.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	config := base.Config().Copy()
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = base.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+	paths, err := migrationUpPathsThrough(migration019RepositoryRoot(t), maximum)
+	require.NoError(t, err)
+	for _, path := range paths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := pool.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+	return pool
+}
+
+func insertMigration023Teacher(t *testing.T, pool *pgxpool.Pool) (string, string) {
+	t.Helper()
+	studentID, teacherID := uuid.NewString(), uuid.NewString()
+	now := time.Date(2026, 9, 12, 7, 0, 0, 0, time.UTC)
+	_, err := pool.Exec(context.Background(), `
+INSERT INTO personal_teacher (
+ id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,
+ hint_policy,intervention_mode,version,created_at,updated_at
+) VALUES ($1,$2,'s11-integration','en','direct','scaffold','scaffold','manual',1,$3,$3)
+`, teacherID, studentID, now)
+	require.NoError(t, err)
+	return studentID, teacherID
+}
+
+func migration023SQL(t *testing.T, suffix string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(migration019RepositoryRoot(t), "db", "migrations", "023_teacher_onboarding_session_contract"+suffix))
+	require.NoError(t, err)
+	return string(content)
+}

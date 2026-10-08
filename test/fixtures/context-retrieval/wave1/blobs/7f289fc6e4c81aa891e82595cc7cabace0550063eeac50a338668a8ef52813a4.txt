@@ -1,0 +1,185 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	studentNATSBootstrapTestURL   = "STUDENT_NATS_BOOTSTRAP_TEST_URL"
+	studentNATSBootstrapTestAllow = "STUDENT_NATS_BOOTSTRAP_TEST_ALLOW_MUTATION"
+)
+
+// This opt-in integration test requires an empty, disposable JetStream account.
+// It invokes the repository bootstrap twice and validates the exact stream
+// names and contracts without deleting or changing pre-existing streams.
+func TestStudentNATSBootstrapIntegration(t *testing.T) {
+	serverURL := os.Getenv(studentNATSBootstrapTestURL)
+	if serverURL == "" || os.Getenv(studentNATSBootstrapTestAllow) != "1" {
+		t.Skipf("set %s and %s=1 to opt into the disposable NATS bootstrap test", studentNATSBootstrapTestURL, studentNATSBootstrapTestAllow)
+	}
+	if !isLoopbackNATSTestURL(serverURL) {
+		t.Fatal("refusing NATS bootstrap mutation for a non-loopback URL; use 127.0.0.1, localhost, or ::1")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	if names := studentNATSStreamNames(t, ctx, serverURL); len(names) != 0 {
+		t.Fatalf("refusing to modify disposable test account with existing streams: %v", names)
+	}
+
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate Student NATS bootstrap source")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+	bootstrapScript := filepath.Join(repositoryRoot, "docker", "bootstrap-nats.sh")
+	for attempt := 1; attempt <= 2; attempt++ {
+		command := exec.CommandContext(ctx, "sh", bootstrapScript)
+		command.Dir = repositoryRoot
+		command.Env = studentNATSBootstrapEnvironment(serverURL)
+		if _, err := command.CombinedOutput(); err != nil {
+			// Do not echo output that may contain the caller's authenticated URL.
+			t.Fatalf("Student NATS bootstrap attempt %d failed: %v", attempt, err)
+		}
+	}
+
+	wantNames := []string{"TASKANSWER_EVENTS", "TEACHER_EVENTS"}
+	gotNames := studentNATSStreamNames(t, ctx, serverURL)
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("stream names after repeated bootstrap = %v, want exactly %v", gotNames, wantNames)
+	}
+
+	studentNATSAssertStreamContract(t, ctx, serverURL, "TEACHER_EVENTS", []string{
+		"teacher.assistance.observed",
+		"teacher.decision.recorded",
+	}, 7*24*time.Hour, 10*time.Minute)
+	studentNATSAssertStreamContract(t, ctx, serverURL, "TASKANSWER_EVENTS", []string{
+		"learning_action.closed",
+		"taskAnswer.autoReview.applied",
+		"taskAnswer.reviewed",
+		"taskAnswer.started",
+	}, 0, 2*time.Minute)
+}
+
+func studentNATSStreamNames(t *testing.T, ctx context.Context, serverURL string) []string {
+	t.Helper()
+	payload := studentNATSCommand(t, ctx, serverURL, "stream", "ls", "--json")
+	var nameList []string
+	if err := json.Unmarshal(payload, &nameList); err == nil {
+		sort.Strings(nameList)
+		return nameList
+	}
+	var response struct {
+		Streams []json.RawMessage `json:"streams"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decode NATS stream list JSON: %v", err)
+	}
+	names := make([]string, 0, len(response.Streams))
+	for _, encoded := range response.Streams {
+		var stream struct {
+			Name   string `json:"name"`
+			Config struct {
+				Name string `json:"name"`
+			} `json:"config"`
+		}
+		if err := json.Unmarshal(encoded, &stream); err != nil {
+			t.Fatalf("decode NATS stream list entry: %v", err)
+		}
+		name := stream.Name
+		if name == "" {
+			name = stream.Config.Name
+		}
+		if name == "" {
+			t.Fatalf("NATS stream list entry has no name: %s", encoded)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func studentNATSAssertStreamContract(t *testing.T, ctx context.Context, serverURL, name string, subjects []string, maxAge, duplicateWindow time.Duration) {
+	t.Helper()
+	payload := studentNATSCommand(t, ctx, serverURL, "stream", "info", name, "--json")
+	var response struct {
+		Config struct {
+			Name            string   `json:"name"`
+			Subjects        []string `json:"subjects"`
+			Retention       string   `json:"retention"`
+			Storage         string   `json:"storage"`
+			Replicas        int      `json:"num_replicas"`
+			MaxAge          any      `json:"max_age"`
+			DuplicateWindow any      `json:"duplicate_window"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decode NATS stream %s JSON: %v", name, err)
+	}
+	gotSubjects := append([]string(nil), response.Config.Subjects...)
+	sort.Strings(gotSubjects)
+	if response.Config.Name != name || !reflect.DeepEqual(gotSubjects, subjects) {
+		t.Fatalf("NATS stream %s identity/subjects = %q %v, want %q %v", name, response.Config.Name, gotSubjects, name, subjects)
+	}
+	if !strings.EqualFold(response.Config.Retention, "limits") || !strings.EqualFold(response.Config.Storage, "file") || response.Config.Replicas != 1 {
+		t.Fatalf("NATS stream %s retention/storage/replicas = %q/%q/%d, want limits/file/1", name, response.Config.Retention, response.Config.Storage, response.Config.Replicas)
+	}
+	if got := studentNATSDuration(t, name, "max_age", response.Config.MaxAge); got != int64(maxAge) {
+		t.Fatalf("NATS stream %s max_age = %d ns, want %d ns", name, got, maxAge)
+	}
+	if got := studentNATSDuration(t, name, "duplicate_window", response.Config.DuplicateWindow); got != int64(duplicateWindow) {
+		t.Fatalf("NATS stream %s duplicate_window = %d ns, want %d ns", name, got, duplicateWindow)
+	}
+}
+
+func studentNATSDuration(t *testing.T, stream, field string, value any) int64 {
+	t.Helper()
+	switch value := value.(type) {
+	case float64:
+		return int64(value)
+	case string:
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			t.Fatalf("parse NATS stream %s %s duration: %v", stream, field, err)
+		}
+		return int64(duration)
+	default:
+		t.Fatalf("NATS stream %s %s has unsupported JSON type %T", stream, field, value)
+		return 0
+	}
+}
+
+func studentNATSCommand(t *testing.T, ctx context.Context, serverURL string, args ...string) []byte {
+	t.Helper()
+	commandArgs := append([]string{"--server", serverURL}, args...)
+	command := exec.CommandContext(ctx, "nats", commandArgs...)
+	output, err := command.Output()
+	if err != nil {
+		// Keep the supplied URL out of diagnostics because it may contain auth.
+		t.Fatalf("NATS CLI %s failed: %v", strings.Join(args, " "), err)
+	}
+	return output
+}
+
+func studentNATSBootstrapEnvironment(serverURL string) []string {
+	environment := make([]string, 0, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "NATS_URL=") {
+			environment = append(environment, value)
+		}
+	}
+	return append(environment, "NATS_URL="+serverURL)
+}

@@ -1,0 +1,193 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+// LearningActionAssistanceRepository stores the assistance audit and outbox
+// envelope in one transaction.
+type LearningActionAssistanceRepository struct {
+	Pool *pgxpool.Pool
+}
+
+func (repository LearningActionAssistanceRepository) Record(
+	ctx context.Context,
+	assistance domain.LearningActionAssistance,
+	event domain.IntegrationEvent,
+) error {
+	if repository.Pool == nil {
+		return errors.New("learning action assistance repository pool is required")
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := insertAssistanceAndEvent(ctx, tx, assistance, event); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// Finalize atomically records source-event deduplication and optional output.
+func (repository LearningActionAssistanceRepository) Finalize(
+	ctx context.Context,
+	closure domain.LearningActionClosed,
+	assistance *domain.LearningActionAssistance,
+	event *domain.IntegrationEvent,
+) (bool, error) {
+	if repository.Pool == nil {
+		return false, errors.New("learning action assistance repository pool is required")
+	}
+	normalized, err := domain.NewLearningActionClosed(closure)
+	if err != nil {
+		return false, err
+	}
+	if (assistance == nil) != (event == nil) {
+		return false, errors.New("assistance and event must both be present or absent")
+	}
+	if assistance != nil && (assistance.StudentID != normalized.StudentID ||
+		assistance.LearningActionID != normalized.LearningActionID ||
+		assistance.CorrelationID != normalized.CorrelationID ||
+		assistance.CausationID != normalized.EventID ||
+		assistance.ContextType != normalized.ContextType || assistance.ContextID != normalized.ContextID) {
+		return false, errors.New("teacher assistance does not match learning action closure")
+	}
+
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	result, err := tx.Exec(ctx, `
+INSERT INTO teacher_integration_inbox (
+    event_id,
+    event_type,
+    schema_version,
+    student_id,
+    correlation_id,
+    causation_id,
+    learning_action_id,
+    occurred_at,
+    processed_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+ON CONFLICT DO NOTHING
+`,
+		normalized.EventID,
+		domain.SubjectLearningActionClosed,
+		domain.LearningActionClosedSchemaVersion,
+		normalized.StudentID,
+		normalized.CorrelationID,
+		normalized.CausationID,
+		normalized.LearningActionID,
+		normalized.OccurredAt,
+	)
+	if err != nil {
+		return false, err
+	}
+	if result.RowsAffected() == 0 {
+		return false, nil
+	}
+	if assistance != nil {
+		if err := insertAssistanceAndEvent(ctx, tx, *assistance, *event); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func insertAssistanceAndEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	assistance domain.LearningActionAssistance,
+	event domain.IntegrationEvent,
+) error {
+	if event.Subject != domain.SubjectTeacherAssistanceObserved || event.StudentID != assistance.StudentID ||
+		event.CorrelationID != assistance.CorrelationID || event.CausationID != assistance.CausationID ||
+		!event.OccurredAt.Equal(assistance.CreatedAt) {
+		return errors.New("teacher assistance event does not match assistance")
+	}
+	observations, err := json.Marshal(assistance.Observations)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO teacher_learning_action_assistance (
+    id,
+    personal_teacher_id,
+    student_id,
+    correlation_id,
+    causation_id,
+    learning_action_id,
+    context_type,
+    context_id,
+    support_context,
+    hints_used,
+    max_hint_level,
+    intervention_used,
+    observations,
+    policy_version,
+    created_at
+) VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, NULLIF($8, ''), $9, $10, $11, $12, $13::jsonb, $14, $15)
+`,
+		assistance.ID,
+		assistance.PersonalTeacherID,
+		assistance.StudentID,
+		assistance.CorrelationID,
+		assistance.CausationID,
+		assistance.LearningActionID,
+		assistance.ContextType,
+		assistance.ContextID,
+		assistance.SupportContext,
+		assistance.HintsUsed,
+		assistance.MaxHintLevel,
+		assistance.InterventionUsed,
+		string(observations),
+		assistance.PolicyVersion,
+		assistance.CreatedAt,
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx, `
+INSERT INTO teacher_outbox (
+    event_id,
+    subject,
+    schema_version,
+    student_id,
+    correlation_id,
+    causation_id,
+    occurred_at,
+    payload,
+    next_attempt_at,
+    created_at
+) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8::jsonb, $9, $10)
+`,
+		event.EventID,
+		event.Subject,
+		event.SchemaVersion,
+		event.StudentID,
+		event.CorrelationID,
+		event.CausationID,
+		event.OccurredAt,
+		string(event.Payload),
+		event.OccurredAt,
+		event.OccurredAt,
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}

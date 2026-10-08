@@ -1,0 +1,610 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+// TeacherOnboardingTurnRepository is deliberately a narrow S5 ledger.  It
+// stores no draft/profile or model values and every state change is fenced by
+// the claimed Teacher job.
+type TeacherOnboardingTurnRepository struct{ Pool *pgxpool.Pool }
+
+var _ repository.TeacherOnboardingTurnStore = TeacherOnboardingTurnRepository{}
+
+func (store TeacherOnboardingTurnRepository) EnsureTurn(ctx context.Context, candidate domain.TeacherOnboardingTurn, claimToken string) (domain.TeacherOnboardingTurn, bool, error) {
+	normalized, err := domain.NewTeacherOnboardingTurn(candidate)
+	if store.Pool == nil || err != nil || !validUUIDString(claimToken) {
+		return domain.TeacherOnboardingTurn{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var lockedJobID string
+	claimErr := tx.QueryRow(ctx, `
+SELECT teacher_job_id::text FROM teacher_dialog_job
+WHERE teacher_job_id=$1 AND event_id=$2 AND claim_token=$3 AND status='processing'
+FOR SHARE
+`, normalized.TeacherJobID, normalized.SourceEventID, claimToken).Scan(&lockedJobID)
+	if errors.Is(claimErr, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingTurn{}, false, domain.ErrTeacherDialogLeaseLost
+	}
+	if claimErr != nil {
+		return domain.TeacherOnboardingTurn{}, false, claimErr
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_turn (
+ teacher_job_id,source_event_id,interaction_id,coordinator_mode,stage,action_receipt_id,
+ causal_ai_execution_id,fallback_ai_execution_id,student_command_id,response_command_id,
+ student_effect_state,no_effect_proof_id,recoverable_outcome_id,response_assistant_ui_digest,semantic_decision,semantic_decision_digest,created_at,updated_at
+) VALUES ($1,$2,NULLIF($3,'')::uuid,$4,$5,NULLIF($6,'')::uuid,NULLIF($7,'')::uuid,NULLIF($8,'')::uuid,$9,$10,$11,NULLIF($12,'')::uuid,NULLIF($13,'')::uuid,NULLIF($14,''),NULL,NULL,$15,$16)
+ON CONFLICT DO NOTHING
+	`, lockedJobID, normalized.SourceEventID, normalized.InteractionID, normalized.Mode, normalized.Stage, normalized.ActionReceiptID,
+		normalized.CausalAIExecutionID, normalized.FallbackAIExecutionID, normalized.StudentCommandID, normalized.ResponseCommandID,
+		normalized.StudentEffectState, normalized.NoEffectProofID, normalized.RecoverableOutcomeID, normalized.ResponseAssistantUIDigest,
+		normalized.CreatedAt, normalized.UpdatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	stored, err := scanTeacherOnboardingTurn(tx.QueryRow(ctx, teacherOnboardingTurnColumns+` WHERE teacher_job_id=$1`, normalized.TeacherJobID))
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	if !sameTeacherOnboardingTurnIdentity(stored, normalized) {
+		return domain.TeacherOnboardingTurn{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	return stored, command.RowsAffected() == 1, nil
+}
+
+func (store TeacherOnboardingTurnRepository) GetTurn(ctx context.Context, teacherJobID string) (domain.TeacherOnboardingTurn, bool, error) {
+	if store.Pool == nil || !validUUIDString(teacherJobID) {
+		return domain.TeacherOnboardingTurn{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	turn, err := scanTeacherOnboardingTurn(store.Pool.QueryRow(ctx, teacherOnboardingTurnColumns+` WHERE teacher_job_id=$1`, teacherJobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingTurn{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, false, err
+	}
+	return turn, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) EnsureActiveInteraction(ctx context.Context, candidate domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingInteraction, bool, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingInteraction(candidate)
+	if store.Pool == nil || err != nil || normalized.State != domain.TeacherOnboardingInteractionActive {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOnboardingDialog(ctx, tx, normalized.DialogID); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	current, currentErr := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND state IN ('active','reserved')
+ORDER BY created_at DESC,interaction_id DESC LIMIT 1
+FOR UPDATE
+`, normalized.DialogID))
+	if currentErr == nil {
+		if sameTeacherOnboardingInteraction(current, normalized) {
+			if err := tx.Commit(ctx); err != nil {
+				return domain.TeacherOnboardingInteraction{}, false, err
+			}
+			return current, false, nil
+		}
+		if current.State != domain.TeacherOnboardingInteractionActive ||
+			normalized.SessionSchemaVersion != current.SessionSchemaVersion ||
+			normalized.ExpectedDraftVersion < current.ExpectedDraftVersion || normalized.ExpectedProfileVersion < current.ExpectedProfileVersion {
+			return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		command, replaceErr := tx.Exec(ctx, `
+WITH superseded AS (
+ UPDATE teacher_onboarding_interaction SET
+  state='superseded',superseded_by_interaction_id=$2,updated_at=$13
+ WHERE interaction_id=$1 AND state='active'
+ RETURNING interaction_id
+)
+INSERT INTO teacher_onboarding_interaction (
+ interaction_id,dialog_id,student_id,personal_teacher_id,prompt_message_id,prompt_message_version,prompt_assistant_ui_digest,slot_code,
+ expected_draft_version,expected_profile_version,session_schema_version,state,created_at,updated_at
+)
+SELECT $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active',$13,$13 FROM superseded
+`, current.ID, normalized.ID, normalized.DialogID, normalized.StudentID, normalized.PersonalTeacherID, normalized.PromptMessageID,
+			normalized.PromptMessageVersion, normalized.PromptAssistantUIDigest, normalized.SlotCode, normalized.ExpectedDraftVersion,
+			normalized.ExpectedProfileVersion, normalized.SessionSchemaVersion, normalized.CreatedAt)
+		if replaceErr != nil {
+			return domain.TeacherOnboardingInteraction{}, false, replaceErr
+		}
+		if command.RowsAffected() != 1 {
+			return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		stored, scanErr := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+` WHERE interaction_id=$1`, normalized.ID))
+		if scanErr != nil || !sameTeacherOnboardingInteraction(stored, normalized) {
+			if scanErr != nil {
+				return domain.TeacherOnboardingInteraction{}, false, scanErr
+			}
+			return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingInteraction{}, false, err
+		}
+		return stored, true, nil
+	}
+	if !errors.Is(currentErr, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingInteraction{}, false, currentErr
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_interaction (
+ interaction_id,dialog_id,student_id,personal_teacher_id,prompt_message_id,prompt_message_version,prompt_assistant_ui_digest,slot_code,
+ expected_draft_version,expected_profile_version,session_schema_version,state,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$12)
+ON CONFLICT DO NOTHING
+`, normalized.ID, normalized.DialogID, normalized.StudentID, normalized.PersonalTeacherID, normalized.PromptMessageID,
+		normalized.PromptMessageVersion, normalized.PromptAssistantUIDigest, normalized.SlotCode, normalized.ExpectedDraftVersion,
+		normalized.ExpectedProfileVersion, normalized.SessionSchemaVersion, normalized.CreatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	stored, err := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+` WHERE interaction_id=$1`, normalized.ID))
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if stored.ID != normalized.ID || stored.PromptMessageID != normalized.PromptMessageID || stored.PromptMessageVersion != normalized.PromptMessageVersion ||
+		stored.PromptAssistantUIDigest != normalized.PromptAssistantUIDigest || stored.SlotCode != normalized.SlotCode || stored.ExpectedDraftVersion != normalized.ExpectedDraftVersion || stored.ExpectedProfileVersion != normalized.ExpectedProfileVersion {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	if stored.SessionSchemaVersion != normalized.SessionSchemaVersion {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	return stored, command.RowsAffected() == 1, nil
+}
+
+func (store TeacherOnboardingTurnRepository) CloseActiveInteractionForTerminal(
+	ctx context.Context,
+	dialogID, personalTeacherID string,
+	reason domain.TeacherOnboardingInteractionClosedReason,
+	now time.Time,
+) (domain.TeacherOnboardingInteraction, bool, error) {
+	if store.Pool == nil || !validUUIDString(dialogID) || !validUUIDString(personalTeacherID) || now.IsZero() ||
+		(reason != domain.TeacherOnboardingClosedPlanningReady && reason != domain.TeacherOnboardingClosedActivePathExists) {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOnboardingDialog(ctx, tx, dialogID); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	interaction, err := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND personal_teacher_id=$2 AND state IN ('active','reserved')
+ORDER BY created_at DESC,interaction_id DESC LIMIT 1
+FOR UPDATE
+`, dialogID, personalTeacherID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingInteraction{}, false, err
+		}
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if interaction.State == domain.TeacherOnboardingInteractionReserved {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingInteraction{}, false, err
+		}
+		return interaction, true, nil
+	}
+	var actionPending bool
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS (
+ SELECT 1 FROM teacher_onboarding_action_receipt
+ WHERE dialog_id=$1 AND personal_teacher_id=$2 AND source_message_id=$3 AND source_message_version=$4
+   AND status IN ('claimed','applied','materialized')
+)`, dialogID, personalTeacherID, interaction.PromptMessageID, interaction.PromptMessageVersion).Scan(&actionPending); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if actionPending {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingInteraction{}, false, err
+		}
+		return interaction, true, nil
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET
+ state='closed',closed_reason=$3,closed_at=$4,updated_at=$4
+WHERE interaction_id=$1 AND personal_teacher_id=$2 AND state='active'
+`, interaction.ID, personalTeacherID, reason, now.UTC())
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	interaction.State = domain.TeacherOnboardingInteractionClosed
+	interaction.ClosedReason = reason
+	interaction.ClosedAt = now.UTC()
+	interaction.UpdatedAt = now.UTC()
+	if _, err := domain.NormalizeTeacherOnboardingInteraction(interaction); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	return interaction, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) GetActiveInteraction(ctx context.Context, dialogID, promptMessageID, personalTeacherID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	if store.Pool == nil || !validUUIDString(dialogID) || !validUUIDString(promptMessageID) || !validUUIDString(personalTeacherID) {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	interaction, err := scanTeacherOnboardingInteraction(store.Pool.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND prompt_message_id=$2 AND personal_teacher_id=$3 AND state IN ('active','reserved')
+`, dialogID, promptMessageID, personalTeacherID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	return interaction, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) FindRecoverableInteractionForStudent(ctx context.Context, studentID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	rows, err := store.Pool.Query(ctx, teacherOnboardingInteractionColumns+`
+WHERE student_id=$1 AND state IN ('active','reserved','handoff_pending')
+ORDER BY interaction_id LIMIT 2
+`, studentID)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	defer rows.Close()
+	var interaction domain.TeacherOnboardingInteraction
+	count := 0
+	for rows.Next() {
+		interaction, err = scanTeacherOnboardingInteraction(rows)
+		if err != nil {
+			return domain.TeacherOnboardingInteraction{}, false, err
+		}
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if count > 1 {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if count == 0 {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	return interaction, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) HasInteractionHistory(ctx context.Context, studentID string) (bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return false, domain.ErrInvalidTeacherOnboarding
+	}
+	var found bool
+	err := store.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM teacher_onboarding_interaction WHERE student_id=$1)`, studentID).Scan(&found)
+	return found, err
+}
+
+func (store TeacherOnboardingTurnRepository) GetInteraction(ctx context.Context, dialogID, promptMessageID, personalTeacherID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	if store.Pool == nil || !validUUIDString(dialogID) || !validUUIDString(promptMessageID) || !validUUIDString(personalTeacherID) {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	interaction, err := scanTeacherOnboardingInteraction(store.Pool.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND prompt_message_id=$2 AND personal_teacher_id=$3
+ORDER BY updated_at DESC,interaction_id DESC LIMIT 1
+`, dialogID, promptMessageID, personalTeacherID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	return interaction, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) GetConfirmationProposal(ctx context.Context, interaction domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingSemanticDecision, bool, error) {
+	if store.Pool == nil || interaction.State != domain.TeacherOnboardingInteractionReserved || !validUUIDString(interaction.ID) ||
+		!validUUIDString(interaction.DialogID) || !validUUIDString(interaction.PersonalTeacherID) || !validUUIDString(interaction.PromptMessageID) {
+		return domain.TeacherOnboardingSemanticDecision{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	var encoded []byte
+	var digest string
+	err := store.Pool.QueryRow(ctx, `
+SELECT turn.semantic_decision,turn.semantic_decision_digest
+FROM teacher_onboarding_turn AS turn
+JOIN teacher_dialog_job AS job ON job.teacher_job_id=turn.teacher_job_id
+WHERE job.dialog_id=$1 AND job.personal_teacher_id=$2 AND job.delivered_message_id=$3
+  AND turn.coordinator_mode='onboarding_text'
+  AND turn.semantic_decision->>'kind'='confirmation'
+  AND turn.semantic_decision IS NOT NULL AND turn.semantic_decision_digest IS NOT NULL
+ORDER BY turn.updated_at DESC
+LIMIT 1
+`, interaction.DialogID, interaction.PersonalTeacherID, interaction.PromptMessageID).Scan(&encoded, &digest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingSemanticDecision{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingSemanticDecision{}, false, err
+	}
+	var decision domain.TeacherOnboardingSemanticDecision
+	if json.Unmarshal(encoded, &decision) != nil {
+		return domain.TeacherOnboardingSemanticDecision{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	decision.Digest = digest
+	normalized, normalizeErr := domain.NormalizeTeacherOnboardingSemanticDecision(decision)
+	if normalizeErr != nil || normalized.Kind != domain.TeacherOnboardingSemanticDecisionConfirmation || normalized.Candidate == nil || normalized.Candidate.Slot != interaction.SlotCode {
+		return domain.TeacherOnboardingSemanticDecision{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	return normalized, true, nil
+}
+
+func (store TeacherOnboardingTurnRepository) ReserveInteraction(ctx context.Context, interactionID, teacherJobID string, mode domain.TeacherOnboardingCoordinatorMode, actionReceiptID string, now time.Time) (domain.TeacherOnboardingInteraction, error) {
+	if store.Pool == nil || !validUUIDString(interactionID) || !validUUIDString(teacherJobID) || now.IsZero() ||
+		(mode != domain.TeacherOnboardingCoordinatorAction && mode != domain.TeacherOnboardingCoordinatorText) ||
+		(mode == domain.TeacherOnboardingCoordinatorAction && !validUUIDString(actionReceiptID)) ||
+		(mode == domain.TeacherOnboardingCoordinatorText && strings.TrimSpace(actionReceiptID) != "") {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	interaction, err := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+` WHERE interaction_id=$1 FOR UPDATE`, interactionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrTeacherOnboardingConflict
+	}
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	if interaction.State == domain.TeacherOnboardingInteractionReserved && interaction.ReservedTeacherJobID == teacherJobID && interaction.ReservationMode == mode && interaction.ReservedActionReceiptID == strings.TrimSpace(actionReceiptID) {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingInteraction{}, err
+		}
+		return interaction, nil
+	}
+	if interaction.State != domain.TeacherOnboardingInteractionActive {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrTeacherOnboardingConflict
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET
+ state='reserved',reserved_teacher_job_id=$2,reserved_action_receipt_id=NULLIF($3,'')::uuid,reservation_mode=$4,updated_at=$5
+WHERE interaction_id=$1 AND state='active'
+`, interactionID, teacherJobID, strings.TrimSpace(actionReceiptID), mode, now.UTC())
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrTeacherOnboardingConflict
+	}
+	stored, err := scanTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+` WHERE interaction_id=$1`, interactionID))
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	return stored, nil
+}
+
+func (store TeacherOnboardingTurnRepository) SaveSemanticDecision(ctx context.Context, teacherJobID, claimToken string, decision domain.TeacherOnboardingSemanticDecision, responseBody string, now time.Time) (string, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingSemanticDecision(decision)
+	responseBody, responseErr := domain.NormalizeTeacherResponseBody(responseBody)
+	if store.Pool == nil || err != nil || (responseBody != "" && responseErr != nil) || !validUUIDString(teacherJobID) || !validUUIDString(claimToken) || now.IsZero() {
+		return "", domain.ErrInvalidTeacherOnboarding
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil || len(encoded) == 0 || len(encoded) > 128<<10 {
+		return "", domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_turn AS turn SET
+ semantic_decision=$3::jsonb,semantic_decision_digest=$4,updated_at=$5
+FROM teacher_dialog_job AS job
+WHERE turn.teacher_job_id=$1 AND job.teacher_job_id=turn.teacher_job_id
+  AND job.claim_token=$2 AND job.status='processing'
+  AND turn.coordinator_mode='onboarding_text' AND turn.stage='ai_staged'
+  AND turn.semantic_decision IS NULL
+`, teacherJobID, claimToken, string(encoded), normalized.Digest, now.UTC())
+	if err != nil {
+		return "", err
+	}
+	var storedJSON []byte
+	var storedDigest, storedResponse string
+	if command.RowsAffected() == 1 {
+		if responseBody == "" {
+			return "", domain.ErrTeacherOnboardingConflict
+		}
+		if err := tx.QueryRow(ctx, `
+UPDATE teacher_dialog_job SET coordinator_mode='onboarding_text',response_body=$3,updated_at=$4
+WHERE teacher_job_id=$1 AND claim_token=$2 AND status='processing' AND decision_id IS NULL AND response_body IS NULL
+RETURNING response_body
+`, teacherJobID, claimToken, responseBody, now.UTC()).Scan(&storedResponse); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", domain.ErrTeacherDialogLeaseLost
+			}
+			return "", err
+		}
+	} else {
+		storedErr := tx.QueryRow(ctx, `
+SELECT turn.semantic_decision,turn.semantic_decision_digest,job.response_body
+FROM teacher_onboarding_turn AS turn
+JOIN teacher_dialog_job AS job ON job.teacher_job_id=turn.teacher_job_id
+WHERE turn.teacher_job_id=$1 AND job.claim_token=$2 AND job.status='processing'
+  AND turn.coordinator_mode='onboarding_text' AND turn.stage='ai_staged'
+FOR UPDATE OF turn,job
+`, teacherJobID, claimToken).Scan(&storedJSON, &storedDigest, &storedResponse)
+		if errors.Is(storedErr, pgx.ErrNoRows) {
+			return "", domain.ErrTeacherDialogLeaseLost
+		}
+		if storedErr != nil {
+			return "", storedErr
+		}
+		var stored domain.TeacherOnboardingSemanticDecision
+		if json.Unmarshal(storedJSON, &stored) != nil {
+			return "", domain.ErrTeacherOnboardingConflict
+		}
+		stored.Digest = storedDigest
+		stored, storedErr = domain.NormalizeTeacherOnboardingSemanticDecision(stored)
+		if storedErr != nil || stored.Digest != normalized.Digest || storedResponse == "" || (responseBody != "" && storedResponse != responseBody) {
+			return "", domain.ErrTeacherOnboardingConflict
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return storedResponse, nil
+}
+
+func (store TeacherOnboardingTurnRepository) Advance(ctx context.Context, teacherJobID, claimToken string, expected, next domain.TeacherOnboardingTurnStage, effect domain.TeacherOnboardingStudentEffectState, proofID, outcomeID string, now time.Time) error {
+	if store.Pool == nil || !validUUIDString(teacherJobID) || !validUUIDString(claimToken) || now.IsZero() {
+		return domain.ErrInvalidTeacherOnboarding
+	}
+	if !domain.CanAdvanceTeacherOnboardingTurn(expected, next) ||
+		(effect != domain.TeacherOnboardingEffectNotAttempted && effect != domain.TeacherOnboardingEffectAccepted && effect != domain.TeacherOnboardingEffectNoEffect && effect != domain.TeacherOnboardingEffectUnknown && effect != domain.TeacherOnboardingEffectCommittedUnreconciled) ||
+		(effect == domain.TeacherOnboardingEffectNoEffect) != validUUIDString(strings.TrimSpace(proofID)) ||
+		(next == domain.TeacherOnboardingTurnFailedNoEffect && (effect != domain.TeacherOnboardingEffectNoEffect || !validUUIDString(outcomeID))) ||
+		(next != domain.TeacherOnboardingTurnFailedNoEffect && strings.TrimSpace(outcomeID) != "") {
+		return domain.ErrInvalidTeacherOnboarding
+	}
+	command, err := store.Pool.Exec(ctx, `
+UPDATE teacher_onboarding_turn AS turn SET
+ stage=$4,student_effect_state=$5,no_effect_proof_id=NULLIF($6,'')::uuid,recoverable_outcome_id=NULLIF($7,'')::uuid,updated_at=$8
+FROM teacher_dialog_job AS job
+WHERE turn.teacher_job_id=$1 AND job.teacher_job_id=turn.teacher_job_id AND job.claim_token=$2 AND job.status='processing' AND turn.stage=$3
+`, teacherJobID, claimToken, expected, next, effect, strings.TrimSpace(proofID), strings.TrimSpace(outcomeID), now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	return nil
+}
+
+const teacherOnboardingInteractionColumns = `SELECT
+interaction_id,dialog_id,student_id,personal_teacher_id,prompt_message_id,prompt_message_version,prompt_assistant_ui_digest,slot_code,
+expected_draft_version,expected_profile_version,state,reserved_teacher_job_id,reserved_action_receipt_id,reservation_mode,superseded_by_interaction_id,
+session_schema_version,completed_at,to_jsonb(teacher_onboarding_interaction)->>'closed_reason',
+NULLIF(to_jsonb(teacher_onboarding_interaction)->>'closed_at','')::timestamptz,created_at,updated_at
+FROM teacher_onboarding_interaction`
+
+const teacherOnboardingTurnColumns = `SELECT
+teacher_job_id,source_event_id,interaction_id,coordinator_mode,stage,action_receipt_id,causal_ai_execution_id,fallback_ai_execution_id,
+student_command_id,response_command_id,student_effect_state,no_effect_proof_id,recoverable_outcome_id,response_assistant_ui_digest,
+semantic_decision,semantic_decision_digest,created_at,updated_at
+FROM teacher_onboarding_turn`
+
+type teacherOnboardingRow interface{ Scan(...any) error }
+
+func scanTeacherOnboardingInteraction(row teacherOnboardingRow) (domain.TeacherOnboardingInteraction, error) {
+	var interaction domain.TeacherOnboardingInteraction
+	var jobID, receiptID, mode, supersededBy, digest, closedReason *string
+	var sessionSchemaVersion *int16
+	var completedAt, closedAt *time.Time
+	err := row.Scan(&interaction.ID, &interaction.DialogID, &interaction.StudentID, &interaction.PersonalTeacherID, &interaction.PromptMessageID, &interaction.PromptMessageVersion, &digest, &interaction.SlotCode,
+		&interaction.ExpectedDraftVersion, &interaction.ExpectedProfileVersion, &interaction.State, &jobID, &receiptID, &mode, &supersededBy, &sessionSchemaVersion, &completedAt, &closedReason, &closedAt, &interaction.CreatedAt, &interaction.UpdatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, err
+	}
+	if sessionSchemaVersion == nil {
+		return domain.TeacherOnboardingInteraction{}, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	interaction.SessionSchemaVersion = int(*sessionSchemaVersion)
+	interaction.PromptAssistantUIDigest = valueOrEmpty(digest)
+	interaction.ReservedTeacherJobID = valueOrEmpty(jobID)
+	interaction.ReservedActionReceiptID = valueOrEmpty(receiptID)
+	interaction.ReservationMode = domain.TeacherOnboardingCoordinatorMode(valueOrEmpty(mode))
+	interaction.SupersededByID = valueOrEmpty(supersededBy)
+	interaction.CompletedAt = timeOrZero(completedAt)
+	interaction.ClosedReason = domain.TeacherOnboardingInteractionClosedReason(valueOrEmpty(closedReason))
+	interaction.ClosedAt = timeOrZero(closedAt)
+	return domain.NormalizeTeacherOnboardingInteraction(interaction)
+}
+
+func scanTeacherOnboardingTurn(row teacherOnboardingRow) (domain.TeacherOnboardingTurn, error) {
+	var turn domain.TeacherOnboardingTurn
+	var interactionID, actionReceiptID, causalAI, fallbackAI, proofID, outcomeID, digest *string
+	var semanticDecisionJSON []byte
+	var semanticDecisionDigest *string
+	err := row.Scan(&turn.TeacherJobID, &turn.SourceEventID, &interactionID, &turn.Mode, &turn.Stage, &actionReceiptID, &causalAI, &fallbackAI,
+		&turn.StudentCommandID, &turn.ResponseCommandID, &turn.StudentEffectState, &proofID, &outcomeID, &digest, &semanticDecisionJSON, &semanticDecisionDigest, &turn.CreatedAt, &turn.UpdatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingTurn{}, err
+	}
+	turn.InteractionID = valueOrEmpty(interactionID)
+	turn.ActionReceiptID = valueOrEmpty(actionReceiptID)
+	turn.CausalAIExecutionID = valueOrEmpty(causalAI)
+	turn.FallbackAIExecutionID = valueOrEmpty(fallbackAI)
+	turn.NoEffectProofID = valueOrEmpty(proofID)
+	turn.RecoverableOutcomeID = valueOrEmpty(outcomeID)
+	turn.ResponseAssistantUIDigest = valueOrEmpty(digest)
+	if len(semanticDecisionJSON) != 0 {
+		var decision domain.TeacherOnboardingSemanticDecision
+		if json.Unmarshal(semanticDecisionJSON, &decision) != nil {
+			return domain.TeacherOnboardingTurn{}, domain.ErrTeacherOnboardingConflict
+		}
+		decision.Digest = valueOrEmpty(semanticDecisionDigest)
+		normalized, normalizeErr := domain.NormalizeTeacherOnboardingSemanticDecision(decision)
+		if normalizeErr != nil {
+			return domain.TeacherOnboardingTurn{}, domain.ErrTeacherOnboardingConflict
+		}
+		turn.SemanticDecision = &normalized
+	} else if valueOrEmpty(semanticDecisionDigest) != "" {
+		return domain.TeacherOnboardingTurn{}, domain.ErrTeacherOnboardingConflict
+	}
+	return domain.NewTeacherOnboardingTurn(turn)
+}
+
+func sameTeacherOnboardingTurnIdentity(left, right domain.TeacherOnboardingTurn) bool {
+	return left.TeacherJobID == right.TeacherJobID && left.SourceEventID == right.SourceEventID && left.InteractionID == right.InteractionID &&
+		left.Mode == right.Mode && left.ActionReceiptID == right.ActionReceiptID && left.CausalAIExecutionID == right.CausalAIExecutionID &&
+		left.FallbackAIExecutionID == right.FallbackAIExecutionID && left.StudentCommandID == right.StudentCommandID && left.ResponseCommandID == right.ResponseCommandID
+}
+
+func sameTeacherOnboardingInteraction(left, right domain.TeacherOnboardingInteraction) bool {
+	return left.ID == right.ID && left.DialogID == right.DialogID && left.StudentID == right.StudentID &&
+		left.PersonalTeacherID == right.PersonalTeacherID && left.PromptMessageID == right.PromptMessageID &&
+		left.PromptMessageVersion == right.PromptMessageVersion && left.PromptAssistantUIDigest == right.PromptAssistantUIDigest &&
+		left.SlotCode == right.SlotCode && left.ExpectedDraftVersion == right.ExpectedDraftVersion &&
+		left.ExpectedProfileVersion == right.ExpectedProfileVersion && left.SessionSchemaVersion == right.SessionSchemaVersion && left.State == right.State
+}
+
+func lockOnboardingDialog(ctx context.Context, tx pgx.Tx, dialogID string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, dialogID)
+	return err
+}

@@ -1,0 +1,188 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type TeacherOnboardingPathOutcomeRepository struct{ Pool *pgxpool.Pool }
+
+var _ repository.TeacherOnboardingPathOutcomeStore = TeacherOnboardingPathOutcomeRepository{}
+var _ repository.TeacherOnboardingPathOutcomeProjectionReader = TeacherOnboardingPathOutcomeRepository{}
+
+const deliveredTeacherOnboardingPathOutcomeForSessionSQL = `
+SELECT outcome.status,outcome.dialog_message_id::text
+FROM teacher_onboarding_path_outcome_inbox AS outcome
+JOIN teacher_onboarding_plan_handoff AS handoff
+  ON handoff.planner_handoff_id=outcome.handoff_id
+ AND handoff.student_id=outcome.student_id
+ AND handoff.personal_teacher_id=outcome.personal_teacher_id
+ AND handoff.dialog_id=outcome.dialog_id
+ AND handoff.command_teacher_job_id=outcome.teacher_job_id
+WHERE outcome.student_id=$1
+  AND outcome.personal_teacher_id=$2
+  AND outcome.dialog_id=$3
+  AND handoff.state_ref_kind=$4
+  AND handoff.state_ref_version=$5
+  AND outcome.status IN ('PATH_READY','ACTIVE_PATH_EXISTS')
+  AND outcome.dialog_message_id IS NOT NULL
+  AND outcome.delivered_at IS NOT NULL
+ORDER BY outcome.delivered_at DESC,outcome.event_id DESC
+LIMIT 1`
+
+func (store TeacherOnboardingPathOutcomeRepository) FindDeliveredForSession(ctx context.Context, studentID, personalTeacherID, dialogID string, stateRef domain.TeacherStudentReadinessStateRef) (domain.TeacherOnboardingPathOutcomeMarker, bool, error) {
+	stateRef, err := domain.NormalizeTeacherStudentReadinessStateRef(stateRef)
+	if err != nil || store.Pool == nil || !validUUIDString(studentID) || !validUUIDString(personalTeacherID) || !validUUIDString(dialogID) {
+		return domain.TeacherOnboardingPathOutcomeMarker{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	var status domain.TeacherOnboardingPathOutcomeMarkerStatus
+	var messageID string
+	err = store.Pool.QueryRow(ctx, deliveredTeacherOnboardingPathOutcomeForSessionSQL,
+		studentID, personalTeacherID, dialogID, stateRef.Kind, stateRef.Version).Scan(&status, &messageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingPathOutcomeMarker{}, false, nil
+	}
+	if err != nil {
+		return domain.TeacherOnboardingPathOutcomeMarker{}, false, err
+	}
+	marker, err := domain.NormalizeTeacherOnboardingPathOutcomeMarker(domain.TeacherOnboardingPathOutcomeMarker{
+		Kind: domain.TeacherOnboardingPathOutcomeMarkerKind, Status: status, DialogMessageID: messageID,
+	})
+	return marker, err == nil, err
+}
+
+func (store TeacherOnboardingPathOutcomeRepository) Accept(ctx context.Context, input domain.TeacherOnboardingPathOutcomeRecord) (domain.TeacherOnboardingPathOutcomeRecord, bool, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingPathOutcomeRecord(input)
+	if err != nil || normalized.DeliveredAt != nil || store.Pool == nil {
+		if err != nil {
+			return domain.TeacherOnboardingPathOutcomeRecord{}, false, err
+		}
+		return domain.TeacherOnboardingPathOutcomeRecord{}, false, errors.New("teacher onboarding path outcome repository pool is required")
+	}
+	command, err := store.Pool.Exec(ctx, `
+INSERT INTO teacher_onboarding_path_outcome_inbox (
+ event_id,execution_id,handoff_id,student_id,dialog_id,teacher_job_id,status,
+ course_id,learning_path_id,first_lesson_id,personal_teacher_id,body,occurred_at,accepted_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,'')::uuid,NULLIF($9,'')::uuid,NULLIF($10,'')::uuid,$11,$12,$13,$14)
+ON CONFLICT (event_id) DO NOTHING
+`, normalized.Outcome.EventID, normalized.Outcome.ExecutionID, normalized.Outcome.HandoffID,
+		normalized.Outcome.StudentID, normalized.Outcome.DialogID, normalized.Outcome.TeacherJobID,
+		normalized.Outcome.Status, normalized.Outcome.CourseID, normalized.Outcome.LearningPathID,
+		normalized.Outcome.FirstLessonID, normalized.PersonalTeacherID, normalized.Body,
+		normalized.Outcome.OccurredAt, normalized.AcceptedAt)
+	if err != nil {
+		if isTeacherOnboardingPathOutcomeExecutionConflict(err) {
+			stored, readErr := store.getByExecutionID(ctx, normalized.Outcome.ExecutionID)
+			if readErr != nil {
+				return domain.TeacherOnboardingPathOutcomeRecord{}, false, readErr
+			}
+			return domain.TeacherOnboardingPathOutcomeRecord{}, false, conflictingTeacherOnboardingPathOutcomeReplay(stored, normalized)
+		}
+		return domain.TeacherOnboardingPathOutcomeRecord{}, false, err
+	}
+	stored, err := store.get(ctx, normalized.Outcome.EventID)
+	if err != nil {
+		return domain.TeacherOnboardingPathOutcomeRecord{}, false, err
+	}
+	if !sameTeacherOnboardingPathOutcome(stored, normalized) {
+		return domain.TeacherOnboardingPathOutcomeRecord{}, false, conflictingTeacherOnboardingPathOutcomeReplay(stored, normalized)
+	}
+	return stored, command.RowsAffected() == 1, nil
+}
+
+func (store TeacherOnboardingPathOutcomeRepository) MarkDelivered(ctx context.Context, eventID, messageID string, deliveredAt time.Time) error {
+	if store.Pool == nil || !validUUIDString(eventID) || !validUUIDString(messageID) || deliveredAt.IsZero() {
+		return domain.ErrInvalidTeacherOnboardingPathOutcome
+	}
+	command, err := store.Pool.Exec(ctx, `
+UPDATE teacher_onboarding_path_outcome_inbox
+SET dialog_message_id=$2,delivered_at=$3
+WHERE event_id=$1 AND delivered_at IS NULL
+`, eventID, messageID, deliveredAt.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 1 {
+		return nil
+	}
+	stored, err := store.get(ctx, eventID)
+	if err != nil {
+		return err
+	}
+	if stored.DeliveredAt != nil && stored.DialogMessageID == messageID {
+		return nil
+	}
+	return errors.New("teacher onboarding path outcome delivery state conflict")
+}
+
+func (store TeacherOnboardingPathOutcomeRepository) get(ctx context.Context, eventID string) (domain.TeacherOnboardingPathOutcomeRecord, error) {
+	return scanTeacherOnboardingPathOutcome(store.Pool.QueryRow(ctx, `
+SELECT event_id::text,execution_id::text,handoff_id::text,student_id,dialog_id::text,teacher_job_id::text,status,
+       COALESCE(course_id::text,''),COALESCE(learning_path_id::text,''),COALESCE(first_lesson_id::text,''),
+       personal_teacher_id::text,body,occurred_at,accepted_at,COALESCE(dialog_message_id::text,''),delivered_at
+FROM teacher_onboarding_path_outcome_inbox WHERE event_id=$1`, eventID))
+}
+
+func (store TeacherOnboardingPathOutcomeRepository) getByExecutionID(ctx context.Context, executionID string) (domain.TeacherOnboardingPathOutcomeRecord, error) {
+	return scanTeacherOnboardingPathOutcome(store.Pool.QueryRow(ctx, `
+SELECT event_id::text,execution_id::text,handoff_id::text,student_id,dialog_id::text,teacher_job_id::text,status,
+       COALESCE(course_id::text,''),COALESCE(learning_path_id::text,''),COALESCE(first_lesson_id::text,''),
+       personal_teacher_id::text,body,occurred_at,accepted_at,COALESCE(dialog_message_id::text,''),delivered_at
+FROM teacher_onboarding_path_outcome_inbox WHERE execution_id=$1`, executionID))
+}
+
+func isTeacherOnboardingPathOutcomeExecutionConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "teacher_onboarding_path_outcome_inbox_execution_id_key"
+}
+
+func conflictingTeacherOnboardingPathOutcomeReplay(stored, received domain.TeacherOnboardingPathOutcomeRecord) error {
+	if stored.Outcome.ExecutionID == received.Outcome.ExecutionID && stored.Outcome.EventID != received.Outcome.EventID {
+		return fmt.Errorf("%w: execution_id is already bound to a different event_id", domain.ErrInvalidTeacherOnboardingPathOutcome)
+	}
+	return fmt.Errorf("%w: event_id replay does not match immutable outcome evidence", domain.ErrInvalidTeacherOnboardingPathOutcome)
+}
+
+type teacherOnboardingPathOutcomeRow interface{ Scan(...any) error }
+
+func scanTeacherOnboardingPathOutcome(row teacherOnboardingPathOutcomeRow) (domain.TeacherOnboardingPathOutcomeRecord, error) {
+	var record domain.TeacherOnboardingPathOutcomeRecord
+	var deliveredAt *time.Time
+	err := row.Scan(&record.Outcome.EventID, &record.Outcome.ExecutionID, &record.Outcome.HandoffID,
+		&record.Outcome.StudentID, &record.Outcome.DialogID, &record.Outcome.TeacherJobID, &record.Outcome.Status,
+		&record.Outcome.CourseID, &record.Outcome.LearningPathID, &record.Outcome.FirstLessonID,
+		&record.PersonalTeacherID, &record.Body, &record.Outcome.OccurredAt, &record.AcceptedAt,
+		&record.DialogMessageID, &deliveredAt)
+	if err != nil {
+		return domain.TeacherOnboardingPathOutcomeRecord{}, err
+	}
+	record.Outcome.EventType = domain.TeacherOnboardingPathOutcomeSubject
+	record.Outcome.CorrelationID = ""
+	record.Outcome.CausationID = ""
+	record.DeliveredAt = deliveredAt
+	if record.Outcome.ExecutionID != "" {
+		record.Outcome.CorrelationID = record.Outcome.ExecutionID
+	}
+	if record.Outcome.HandoffID != "" {
+		record.Outcome.CausationID = record.Outcome.HandoffID
+	}
+	return domain.NormalizeTeacherOnboardingPathOutcomeRecord(record)
+}
+
+func sameTeacherOnboardingPathOutcome(left, right domain.TeacherOnboardingPathOutcomeRecord) bool {
+	return left.Outcome.EventID == right.Outcome.EventID && left.Outcome.ExecutionID == right.Outcome.ExecutionID &&
+		left.Outcome.HandoffID == right.Outcome.HandoffID && left.Outcome.StudentID == right.Outcome.StudentID &&
+		left.Outcome.DialogID == right.Outcome.DialogID && left.Outcome.TeacherJobID == right.Outcome.TeacherJobID &&
+		left.Outcome.Status == right.Outcome.Status && left.Outcome.CourseID == right.Outcome.CourseID &&
+		left.Outcome.LearningPathID == right.Outcome.LearningPathID && left.Outcome.FirstLessonID == right.Outcome.FirstLessonID &&
+		left.PersonalTeacherID == right.PersonalTeacherID && left.Body == right.Body &&
+		left.Outcome.OccurredAt.Equal(right.Outcome.OccurredAt)
+}

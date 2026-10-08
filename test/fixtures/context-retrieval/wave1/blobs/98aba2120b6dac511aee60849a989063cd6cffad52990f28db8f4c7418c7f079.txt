@@ -1,0 +1,332 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/example/ms-go-statistic/internal/domain"
+)
+
+type EventSink interface {
+	Publish(ctx context.Context, ev domain.Event) error
+}
+
+type InterestingActivityPublisher interface {
+	PublishInterestingActivity(ctx context.Context, activity domain.InterestingActivity) error
+}
+
+// ErrorLogger is the use-case logging port. Concrete logging stays in
+// infrastructure and is supplied by the composition root.
+type ErrorLogger interface {
+	Error(message string, err error, eventID string)
+}
+
+type EventService struct {
+	sink        EventSink
+	logger      ErrorLogger
+	interesting InterestingActivityPublisher
+}
+
+func NewEventService(sink EventSink, logger ErrorLogger, publishers ...InterestingActivityPublisher) *EventService {
+	service := &EventService{sink: sink, logger: logger}
+	if len(publishers) > 0 {
+		service.interesting = publishers[0]
+	}
+	return service
+}
+
+type RequestMeta struct {
+	UserID   uuid.UUID
+	Role     string
+	Language string
+}
+
+type SessionStartRequest struct {
+	CourseID   uuid.UUID
+	LessonID   uuid.UUID
+	TaskID     uuid.UUID
+	Platform   string
+	EditorMode string
+	ClientTS   *time.Time
+	Payload    map[string]any
+}
+
+type IncomingEvent struct {
+	EventID    uuid.UUID      `json:"event_id,omitempty"`
+	SessionID  uuid.UUID      `json:"session_id"`
+	EventType  string         `json:"event_type"`
+	EditorMode *string        `json:"editor_mode,omitempty"`
+	Platform   *string        `json:"platform,omitempty"`
+	ClientTS   *time.Time     `json:"client_ts,omitempty"`
+	Payload    map[string]any `json:"payload"`
+	CourseID   *uuid.UUID     `json:"course_id,omitempty"`
+	LessonID   *uuid.UUID     `json:"lesson_id,omitempty"`
+	TaskID     *uuid.UUID     `json:"task_id,omitempty"`
+}
+
+type EventsBatchRequest struct {
+	CourseID   uuid.UUID
+	LessonID   uuid.UUID
+	TaskID     uuid.UUID
+	Platform   string
+	EditorMode string
+	Events     []IncomingEvent
+}
+
+type SessionStartResponse struct {
+	SessionID uuid.UUID
+	StartedAt time.Time
+}
+
+var (
+	ErrInvalidInput = errors.New("invalid input")
+)
+
+func (s *EventService) StartSession(ctx context.Context, meta RequestMeta, req SessionStartRequest) (*SessionStartResponse, error) {
+	if err := validateMeta(meta); err != nil {
+		return nil, err
+	}
+	if err := validateSessionStart(req); err != nil {
+		return nil, err
+	}
+
+	sessionID := uuid.New()
+	now := time.Now().UTC()
+	payload, err := marshalPayload(req.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	ev := domain.Event{
+		EventTS:    now,
+		UserID:     meta.UserID,
+		Role:       meta.Role,
+		SessionID:  sessionID,
+		CourseID:   req.CourseID,
+		LessonID:   req.LessonID,
+		TaskID:     req.TaskID,
+		Platform:   req.Platform,
+		EditorMode: req.EditorMode,
+		ClientTS:   req.ClientTS,
+		EventType:  domain.EventTypeSessionStart,
+		Payload:    payload,
+	}
+
+	if err := s.sink.Publish(ctx, ev); err != nil {
+		return nil, err
+	}
+
+	return &SessionStartResponse{
+		SessionID: sessionID,
+		StartedAt: now,
+	}, nil
+}
+
+func (s *EventService) PublishBatch(ctx context.Context, meta RequestMeta, batch EventsBatchRequest) (int, error) {
+	if err := validateMeta(meta); err != nil {
+		return 0, err
+	}
+	if err := validateBatch(batch); err != nil {
+		return 0, err
+	}
+
+	accepted := 0
+	for _, inc := range batch.Events {
+		ev, err := s.buildEvent(meta, batch, inc)
+		if err != nil {
+			return accepted, err
+		}
+		activity, activityErr := interestingActivityFromEvent(ev)
+		if activityErr != nil {
+			return accepted, activityErr
+		}
+		if err := s.sink.Publish(ctx, ev); err != nil {
+			return accepted, err
+		}
+		accepted++
+		if s.interesting != nil && activity != nil {
+			if publishErr := s.interesting.PublishInterestingActivity(ctx, *activity); publishErr != nil {
+				s.logger.Error("failed to publish interesting learning activity", publishErr, activity.EventID.String())
+			}
+		}
+	}
+
+	return accepted, nil
+}
+
+func (s *EventService) buildEvent(meta RequestMeta, batch EventsBatchRequest, inc IncomingEvent) (domain.Event, error) {
+	if inc.SessionID == uuid.Nil {
+		return domain.Event{}, fmt.Errorf("session_id is required: %w", ErrInvalidInput)
+	}
+	if !isAllowedEventType(inc.EventType) {
+		return domain.Event{}, fmt.Errorf("unsupported event_type: %w", ErrInvalidInput)
+	}
+	if isInterestingEventType(inc.EventType) && inc.EventID == uuid.Nil {
+		return domain.Event{}, fmt.Errorf("event_id is required for intervention-relevant activity: %w", ErrInvalidInput)
+	}
+
+	eventCourseID := pickUUID(inc.CourseID, batch.CourseID)
+	eventLessonID := pickUUID(inc.LessonID, batch.LessonID)
+	eventTaskID := pickUUID(inc.TaskID, batch.TaskID)
+
+	if eventCourseID == uuid.Nil || eventLessonID == uuid.Nil || eventTaskID == uuid.Nil {
+		return domain.Event{}, fmt.Errorf("course_id, lesson_id and task_id are required: %w", ErrInvalidInput)
+	}
+
+	platform := batch.Platform
+	if inc.Platform != nil {
+		platform = *inc.Platform
+	}
+	editorMode := batch.EditorMode
+	if inc.EditorMode != nil {
+		editorMode = *inc.EditorMode
+	}
+
+	payload, err := marshalPayload(inc.Payload)
+	if err != nil {
+		return domain.Event{}, err
+	}
+
+	return domain.Event{
+		EventTS:       time.Now().UTC(),
+		SourceEventID: inc.EventID,
+		UserID:        meta.UserID,
+		Role:          meta.Role,
+		SessionID:     inc.SessionID,
+		CourseID:      eventCourseID,
+		LessonID:      eventLessonID,
+		TaskID:        eventTaskID,
+		Platform:      platform,
+		EditorMode:    editorMode,
+		ClientTS:      inc.ClientTS,
+		EventType:     inc.EventType,
+		Payload:       payload,
+	}, nil
+}
+
+func isInterestingEventType(eventType string) bool {
+	switch eventType {
+	case domain.EventTypeStudentStuck, domain.EventTypeStudentIdle, domain.EventTypeCompilerError,
+		domain.EventTypeTestFailed, domain.EventTypeTestPassed:
+		return true
+	default:
+		return false
+	}
+}
+
+func interestingActivityFromEvent(event domain.Event) (*domain.InterestingActivity, error) {
+	if !isInterestingEventType(event.EventType) {
+		return nil, nil
+	}
+	var payload struct {
+		ConsecutiveFailures int    `json:"consecutive_failures"`
+		SameErrorCount      int    `json:"same_error_count"`
+		ActiveSeconds       int    `json:"active_seconds"`
+		IdleSeconds         int    `json:"idle_seconds"`
+		Progressing         bool   `json:"progressing"`
+		ErrorFingerprint    string `json:"error_fingerprint"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return nil, fmt.Errorf("invalid activity payload: %w", ErrInvalidInput)
+	}
+	if payload.ConsecutiveFailures < 0 || payload.ConsecutiveFailures > 1000 || payload.SameErrorCount < 0 || payload.SameErrorCount > 1000 ||
+		payload.ActiveSeconds < 0 || payload.ActiveSeconds > 86400 || payload.IdleSeconds < 0 || payload.IdleSeconds > 86400 || len(payload.ErrorFingerprint) > 128 {
+		return nil, fmt.Errorf("activity aggregate is out of bounds: %w", ErrInvalidInput)
+	}
+	signalType := ""
+	switch event.EventType {
+	case domain.EventTypeStudentStuck:
+		signalType = "student_stuck"
+	case domain.EventTypeStudentIdle:
+		if payload.IdleSeconds < 480 {
+			return nil, nil
+		}
+		signalType = "student_idle"
+	case domain.EventTypeCompilerError, domain.EventTypeTestFailed:
+		if payload.SameErrorCount < 3 || payload.ActiveSeconds < 480 {
+			return nil, nil
+		}
+		signalType = "repeated_failure"
+	case domain.EventTypeTestPassed:
+		signalType, payload.Progressing = "progressing", true
+	}
+	return &domain.InterestingActivity{
+		EventID: event.SourceEventID, StudentID: event.UserID, AnalyticsSessionID: event.SessionID,
+		CourseID: event.CourseID, LessonID: event.LessonID, TaskID: event.TaskID, SignalType: signalType,
+		ConsecutiveFailures: payload.ConsecutiveFailures, SameErrorCount: payload.SameErrorCount,
+		ActiveSeconds: payload.ActiveSeconds, IdleSeconds: payload.IdleSeconds, Progressing: payload.Progressing,
+		ErrorFingerprint: payload.ErrorFingerprint, OccurredAt: event.EventTS,
+	}, nil
+}
+
+func validateMeta(meta RequestMeta) error {
+	if meta.UserID == uuid.Nil {
+		return fmt.Errorf("user_id is required: %w", ErrInvalidInput)
+	}
+	if meta.Role == "" {
+		return fmt.Errorf("role is required: %w", ErrInvalidInput)
+	}
+	return nil
+}
+
+func validateSessionStart(req SessionStartRequest) error {
+	if req.CourseID == uuid.Nil || req.LessonID == uuid.Nil || req.TaskID == uuid.Nil {
+		return fmt.Errorf("course_id, lesson_id and task_id are required: %w", ErrInvalidInput)
+	}
+	if req.Platform == "" {
+		return fmt.Errorf("platform is required: %w", ErrInvalidInput)
+	}
+	if req.EditorMode == "" {
+		return fmt.Errorf("editor_mode is required: %w", ErrInvalidInput)
+	}
+	return nil
+}
+
+func validateBatch(batch EventsBatchRequest) error {
+	if batch.CourseID == uuid.Nil || batch.LessonID == uuid.Nil || batch.TaskID == uuid.Nil {
+		return fmt.Errorf("course_id, lesson_id and task_id are required: %w", ErrInvalidInput)
+	}
+	if batch.Platform == "" {
+		return fmt.Errorf("platform is required: %w", ErrInvalidInput)
+	}
+	if batch.EditorMode == "" {
+		return fmt.Errorf("editor_mode is required: %w", ErrInvalidInput)
+	}
+	if len(batch.Events) == 0 {
+		return fmt.Errorf("events are required: %w", ErrInvalidInput)
+	}
+	return nil
+}
+
+func marshalPayload(payload map[string]any) ([]byte, error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("payload must be a valid json object: %w", ErrInvalidInput)
+	}
+	return data, nil
+}
+
+func isAllowedEventType(eventType string) bool {
+	if eventType == "" {
+		return false
+	}
+	if _, ok := domain.AllowedEventTypes[eventType]; ok {
+		return true
+	}
+	return false
+}
+
+func pickUUID(val *uuid.UUID, fallback uuid.UUID) uuid.UUID {
+	if val != nil {
+		return *val
+	}
+	return fallback
+}

@@ -1,0 +1,247 @@
+package domain
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+const productTestStudentID = "11111111-1111-4111-8111-111111111111"
+
+func TestProductAwarePromptPolicyV2KeepsV1ReplayImmutable(t *testing.T) {
+	_, legacyUI, err := BuildTeacherOnboardingPrompt(OnboardingStepExperience, "ru", 2)
+	require.NoError(t, err)
+	_, productUI, err := BuildProductAwareTeacherOnboardingPrompt(OnboardingStepExperience, "ru", 2)
+	require.NoError(t, err)
+	require.Contains(t, string(legacyUI), `"id":"experience.new"`)
+	require.NotContains(t, string(legacyUI), "experience.beginner")
+	require.Contains(t, string(productUI), `"id":"experience.beginner"`)
+	require.NotContains(t, string(productUI), "experience.new")
+	require.Contains(t, string(productUI), `.v2`)
+	policy, err := TeacherOnboardingPromptPolicyVersion(legacyUI)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingPromptPolicyV1, policy)
+	policy, err = TeacherOnboardingPromptPolicyVersion(productUI)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingPromptPolicyV2, policy)
+}
+
+func TestProductAwarePolicyUsesExactGoalUndecidedAndDeferredFields(t *testing.T) {
+	_, goalUI, err := BuildProductAwareTeacherOnboardingPrompt(OnboardingStepGoal, "ru", 0)
+	require.NoError(t, err)
+	require.Contains(t, string(goalUI), `"id":"goal.learn_programming"`)
+	require.Contains(t, string(goalUI), "learn_programming")
+	_, directionUI, err := BuildProductAwareTeacherOnboardingPrompt(OnboardingStepDirection, "ru", 1)
+	require.NoError(t, err)
+	require.Contains(t, string(directionUI), `"id":"direction.undecided"`)
+	require.Contains(t, string(directionUI), "Не знаю")
+	for _, deferred := range []TeacherOnboardingStep{OnboardingStepKnownStack, OnboardingStepWeeklyMinutes, OnboardingStepPace} {
+		_, _, err = BuildProductAwareTeacherOnboardingPrompt(deferred, "ru", 1)
+		require.ErrorIs(t, err, ErrInvalidTeacherOnboarding)
+	}
+}
+
+func TestProductAwarePlanCoversFoundationGoAndMissingCoreFields(t *testing.T) {
+	tests := []struct {
+		name       string
+		reason     string
+		result     string
+		goal       *TeacherLearningReadinessGoal
+		mutate     func(*TeacherStudentOnboardingState)
+		wantStatus TeacherOnboardingSessionV2Status
+		wantStep   TeacherOnboardingStep
+		wantText   string
+	}{
+		{name: "intent", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonLearningIntentMissing, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepGoal},
+		{name: "experience", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonProfileIncomplete, mutate: func(state *TeacherStudentOnboardingState) { goal := "learn_programming"; state.Draft.GoalCode = &goal }, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepExperience},
+		{name: "direction", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonProfileIncomplete, mutate: func(state *TeacherStudentOnboardingState) {
+			goal, experience := "learn_programming", "beginner"
+			state.Draft.GoalCode, state.Draft.SelfAssessedExperience = &goal, &experience
+		}, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepDirection},
+		{name: "language", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonContentLanguageUntrusted, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepLanguage},
+		{name: "stack", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonDesiredStacksUnresolved, mutate: func(state *TeacherStudentOnboardingState) {
+			direction := "backend"
+			state.Draft.DirectionCode = &direction
+		}, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepDesiredStack},
+		{name: "backend contradiction corrects stack", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonProfileContradictory, mutate: func(state *TeacherStudentOnboardingState) {
+			direction := "backend"
+			state.Draft.DirectionCode = &direction
+		}, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepDesiredStack},
+		{name: "undecided contradiction corrects direction", result: TeacherLearningReadinessNeedsClarification, reason: TeacherReadinessReasonProfileContradictory, mutate: func(state *TeacherStudentOnboardingState) {
+			direction := "undecided"
+			desired := []string{"go"}
+			state.Draft.DirectionCode, state.Draft.DesiredStacks = &direction, &desired
+		}, wantStatus: TeacherOnboardingSessionCollecting, wantStep: OnboardingStepDirection},
+		{name: "foundation", result: TeacherLearningReadinessReady, reason: TeacherReadinessReasonFoundationGraphResolved, goal: &TeacherLearningReadinessGoal{Code: TeacherFoundationGoalCode, Version: TeacherFoundationGoalVersion, GraphVersion: TeacherFoundationGraphVersion}, wantStatus: TeacherOnboardingSessionPlanningReady, wantText: TeacherFoundationGoalDisplayName},
+		{name: "go", result: TeacherLearningReadinessReady, reason: TeacherReadinessReasonGoBackendGraphResolved, goal: &TeacherLearningReadinessGoal{Code: TeacherGoBackendGoalCode, Version: TeacherGoBackendGoalVersion, GraphVersion: TeacherGoBackendGraphVersion}, wantStatus: TeacherOnboardingSessionPlanningReady, wantText: TeacherGoBackendGoalDisplayName},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			state := productDraftState(4)
+			if testCase.mutate != nil {
+				testCase.mutate(&state)
+			}
+			readiness := validProductReadiness(testCase.result, testCase.reason, testCase.goal, 4)
+			plan, err := BuildTeacherProductAwareOnboardingPlan(readiness, state, productTestStudentID, "ru")
+			require.NoError(t, err)
+			require.Equal(t, testCase.wantStatus, plan.Status)
+			require.Equal(t, testCase.wantStep, plan.Step)
+			if testCase.wantText != "" {
+				require.Contains(t, plan.Body, testCase.wantText)
+				require.Contains(t, plan.Body, "ещё не созданы")
+				require.Empty(t, plan.AssistantUI)
+			}
+		})
+	}
+}
+
+func TestProductAwareUndecidedReadyNeverAsksStackWeeklyOrPace(t *testing.T) {
+	state := productDraftState(4)
+	goal, experience, direction, language := "learn_programming", "beginner", "undecided", "ru"
+	state.Draft.GoalCode, state.Draft.SelfAssessedExperience, state.Draft.DirectionCode, state.Draft.PreferredLanguage = &goal, &experience, &direction, &language
+	readiness := validProductReadiness(TeacherLearningReadinessReady, TeacherReadinessReasonFoundationGraphResolved, &TeacherLearningReadinessGoal{Code: TeacherFoundationGoalCode, Version: TeacherFoundationGoalVersion, GraphVersion: TeacherFoundationGraphVersion}, 4)
+	plan, err := BuildTeacherProductAwareOnboardingPlan(readiness, state, productTestStudentID, "ru")
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingSessionPlanningReady, plan.Status)
+	for _, forbidden := range []string{"стек", "недел", "темп"} {
+		require.NotContains(t, plan.Body, forbidden)
+	}
+	inconsistent := validProductReadiness(TeacherLearningReadinessNeedsClarification, TeacherReadinessReasonDesiredStacksUnresolved, nil, 4)
+	_, err = BuildTeacherProductAwareOnboardingPlan(inconsistent, state, productTestStudentID, "ru")
+	require.ErrorIs(t, err, ErrTeacherLearningReadinessUnavailable, "undecided must never be redirected into a stack prompt")
+}
+
+func TestProductAwareActivePathAndUnsupportedNeverExposeRawIdentifiersOrFakeMutation(t *testing.T) {
+	state := productDraftState(4)
+	active := validProductReadiness(TeacherLearningReadinessNotReady, TeacherReadinessReasonActivePathExists, nil, 4)
+	active.ActivePath = &TeacherLearningReadinessActivePath{LearningPathID: "22222222-2222-4222-8222-222222222222", Version: 3, CourseID: "33333333-3333-4333-8333-333333333333", GoalCode: "learn_programming", Status: "ACTIVE"}
+	plan, err := BuildTeacherProductAwareOnboardingPlan(active, state, productTestStudentID, "ru")
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingSessionActivePathExists, plan.Status)
+	require.Empty(t, plan.AssistantUI)
+	require.NotContains(t, plan.Body, active.ActivePath.LearningPathID)
+	require.NotContains(t, plan.Body, active.ActivePath.CourseID)
+
+	unsupported := validProductReadiness(TeacherLearningReadinessNotReady, TeacherReadinessReasonProfileUnsupported, nil, 4)
+	plan, err = BuildTeacherProductAwareOnboardingPlan(unsupported, state, productTestStudentID, "ru")
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingSessionCollecting, plan.Status)
+	require.Equal(t, OnboardingStepDirection, plan.Step)
+	require.Contains(t, plan.Body, "пока не поддерживается")
+	require.NotContains(t, plan.Body, TeacherReadinessReasonProfileUnsupported)
+	require.NotEmpty(t, plan.AssistantUI)
+}
+
+func TestProductAwareSemanticAcceptsMultipleLowRiskFactsAtomically(t *testing.T) {
+	state := productDraftState(0)
+	interaction := TeacherOnboardingInteraction{SlotCode: TeacherOnboardingSlotGoalCode, ExpectedDraftVersion: 0, ExpectedProfileVersion: 0}
+	result, err := NormalizeTeacherOnboardingSemanticResult(TeacherOnboardingSemanticResult{
+		Schema: TeacherOnboardingSemanticSchemaCode, Response: "ok",
+		SlotCandidates: []TeacherOnboardingSemanticCandidate{
+			{Slot: TeacherOnboardingSlotGoalCode, CodeValue: "learn_programming", StringListValue: []string{}, ConfidenceBasisPoints: 9800},
+			{Slot: TeacherOnboardingSlotExperience, CodeValue: "beginner", StringListValue: []string{}, ConfidenceBasisPoints: 9700},
+			{Slot: TeacherOnboardingSlotLanguage, CodeValue: "ru", StringListValue: []string{}, ConfidenceBasisPoints: 9600},
+		}, Questions: []TeacherOnboardingSemanticQuestion{}, Uncertainties: []TeacherOnboardingSemanticUncertainty{},
+	})
+	require.NoError(t, err)
+	decision, err := NewProductAwareTeacherOnboardingSemanticDecision(result, interaction, state)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingSemanticDecisionMutation, decision.Kind)
+	require.Len(t, decision.Candidates, 3)
+	require.Nil(t, decision.Candidate)
+}
+
+func TestTeacherOnboardingSessionV2TerminalOmitsPromptAndRawPlannerData(t *testing.T) {
+	session, err := ProductAwareTeacherOnboardingSession(TeacherOnboardingSessionV2{
+		Schema: TeacherOnboardingSessionV2Schema, DialogID: "22222222-2222-4222-8222-222222222222",
+		Status: TeacherOnboardingSessionPlanningReady, Phase: TeacherOnboardingPhaseReadyToStart,
+		StateRef: TeacherStudentReadinessStateRef{Kind: TeacherReadinessStateDraft, Version: 4},
+		Terminal: &TeacherOnboardingTerminal{Kind: TeacherOnboardingSessionPlanningReady, DisplayName: TeacherFoundationGoalDisplayName},
+	})
+	require.NoError(t, err)
+	encoded, err := json.Marshal(session)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "current_prompt")
+	require.NotContains(t, string(encoded), "reason")
+	require.NotContains(t, string(encoded), "graph")
+}
+
+func TestTeacherOnboardingSessionV3PathOutcomeMarkerIsStrictAndTerminalOnly(t *testing.T) {
+	valid := TeacherOnboardingPathOutcomeMarker{
+		Kind: TeacherOnboardingPathOutcomeMarkerKind, Status: TeacherOnboardingPathOutcomeMarkerReady,
+		DialogMessageID: "99999999-9999-4999-8999-999999999999",
+	}
+	marker, err := NormalizeTeacherOnboardingPathOutcomeMarker(valid)
+	require.NoError(t, err)
+	require.Equal(t, valid, marker)
+
+	for _, invalid := range []TeacherOnboardingPathOutcomeMarker{
+		{Kind: "onboarding_path_outcome", Status: TeacherOnboardingPathOutcomeMarkerReady, DialogMessageID: valid.DialogMessageID},
+		{Kind: TeacherOnboardingPathOutcomeMarkerKind, Status: TeacherOnboardingPathOutcomeMarkerStatus(TeacherOnboardingPathStateChanged), DialogMessageID: valid.DialogMessageID},
+		{Kind: TeacherOnboardingPathOutcomeMarkerKind, Status: TeacherOnboardingPathOutcomeMarkerReady, DialogMessageID: "not-a-uuid"},
+	} {
+		_, err = NormalizeTeacherOnboardingPathOutcomeMarker(invalid)
+		require.ErrorIs(t, err, ErrInvalidTeacherOnboarding)
+	}
+
+	_, err = DurableHandoffTeacherOnboardingSession(TeacherOnboardingSessionV3{
+		Schema: TeacherOnboardingSessionV3Schema, DialogID: "33333333-3333-4333-8333-333333333333",
+		Status: TeacherOnboardingSessionV3Collecting, Phase: TeacherOnboardingPhaseGettingAcquainted,
+		StateRef:      TeacherStudentReadinessStateRef{Kind: TeacherReadinessStateDraft, Version: 4},
+		CurrentPrompt: &TeacherOnboardingCurrentPrompt{MessageID: "44444444-4444-4444-8444-444444444444", MessageVersion: 1},
+		PathOutcome:   &valid,
+	})
+	require.ErrorIs(t, err, ErrInvalidTeacherOnboarding)
+}
+
+func TestProductAwareDeliveryDispositionSeparatesTerminalFromTangentAfterRestart(t *testing.T) {
+	turn := TeacherOnboardingTurn{InteractionID: "22222222-2222-4222-8222-222222222222", StudentEffectState: TeacherOnboardingEffectAccepted}
+	disposition, err := ProductAwareOnboardingDeliveryDisposition(turn, false)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingDeliveryCloseTerminal, disposition)
+
+	turn.StudentEffectState = TeacherOnboardingEffectNotAttempted
+	disposition, err = ProductAwareOnboardingDeliveryDisposition(turn, false)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingDeliveryPreserve, disposition)
+
+	turn.StudentEffectState = TeacherOnboardingEffectAccepted
+	disposition, err = ProductAwareOnboardingDeliveryDisposition(turn, true)
+	require.NoError(t, err)
+	require.Equal(t, TeacherOnboardingDeliveryReplace, disposition)
+}
+
+func TestClosedOnboardingInteractionRequiresHonestTerminalEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 10, 18, 0, 0, 0, time.UTC)
+	interaction := TeacherOnboardingInteraction{
+		ID: "11111111-1111-4111-8111-111111111111", DialogID: "22222222-2222-4222-8222-222222222222",
+		StudentID: "33333333-3333-4333-8333-333333333333", PersonalTeacherID: "44444444-4444-4444-8444-444444444444",
+		PromptMessageID: "55555555-5555-4555-8555-555555555555", PromptMessageVersion: 1,
+		PromptAssistantUIDigest: strings.Repeat("a", 64), SlotCode: TeacherOnboardingSlotDirection,
+		SessionSchemaVersion: 3,
+		State:                TeacherOnboardingInteractionClosed, ClosedReason: TeacherOnboardingClosedPlanningReady, ClosedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	_, err := NormalizeTeacherOnboardingInteraction(interaction)
+	require.NoError(t, err)
+	interaction.ClosedReason = ""
+	_, err = NormalizeTeacherOnboardingInteraction(interaction)
+	require.ErrorIs(t, err, ErrInvalidTeacherOnboarding)
+}
+
+func productDraftState(version int64) TeacherStudentOnboardingState {
+	state := TeacherStudentOnboardingState{Schema: TeacherStudentOnboardingStateSchema, ProfileVersion: 0, Draft: StudentOnboardingDraft{Schema: StudentOnboardingDraftSchema, StudentID: productTestStudentID, Status: StudentOnboardingDraftDraft, Version: version}}
+	if version > 0 {
+		now := time.Date(2026, 9, 11, 1, 0, 0, 0, time.UTC)
+		state.Draft.CreatedAt, state.Draft.UpdatedAt = &now, &now
+	}
+	return state
+}
+
+func validProductReadiness(result, reason string, goal *TeacherLearningReadinessGoal, version int64) TeacherLearningReadiness {
+	return TeacherLearningReadiness{Schema: TeacherLearningReadinessSchema, Result: result, ReasonCodes: []string{reason}, ResolverVersion: TeacherLearningReadinessResolver,
+		StateRef: TeacherStudentReadinessStateRef{Kind: TeacherReadinessStateDraft, Version: version}, ReadinessScope: TeacherLearningReadinessScope,
+		Executable: false, ContentStatus: TeacherLearningContentNotCreated, Goal: goal}
+}

@@ -1,0 +1,248 @@
+package catalog
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/google/uuid"
+)
+
+// CreateTrackInput holds track creation data.
+type CreateTrackInput struct {
+	ID               string
+	Slug             string
+	SourceKey        string
+	Order            *int
+	Status           *int
+	LessonReadAccess *domain.LessonReadAccess
+	Translations     []domain.TrackI18n
+}
+
+// CreateTrack creates a top-level learning track.
+type CreateTrack struct {
+	Tracks    repository.TrackRepository
+	TrackI18n repository.TrackI18nRepository
+	I18n      repository.I18nRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc CreateTrack) Handle(ctx context.Context, in CreateTrackInput) (domain.Track, error) {
+	var item domain.Track
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		id := strings.TrimSpace(in.ID)
+		if id == "" {
+			id = uuid.NewString()
+		} else if _, err := uuid.Parse(id); err != nil {
+			return domain.ErrValidation
+		}
+		slug := strings.TrimSpace(in.Slug)
+		if slug == "" {
+			return domain.ErrValidation
+		}
+		status := domain.CatalogStatusActive
+		if in.Status != nil {
+			status = *in.Status
+		}
+		if !isValidCatalogStatus(status) {
+			return domain.ErrValidation
+		}
+		order, err := normalizeTrackOrder(in.Order)
+		if err != nil {
+			return err
+		}
+		sourceKey, err := domain.NormalizeContentSourceKey(in.SourceKey)
+		if err != nil {
+			return err
+		}
+		translations, err := normalizeTrackTranslations(in.Translations)
+		if err != nil {
+			return err
+		}
+		translationIDs := make([]int, 0, len(translations))
+		for _, translation := range translations {
+			translationIDs = append(translationIDs, translation.I18nID)
+		}
+		if err := validateCatalogTranslationLanguages(ctx, uc.I18n, translationIDs, status == domain.CatalogStatusActive); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if err := domain.ValidateLessonReadAccess(in.LessonReadAccess); err != nil {
+			return err
+		}
+		item = domain.Track{ID: id, Slug: slug, SourceKey: sourceKey, Order: order, Status: status, LessonReadAccess: in.LessonReadAccess, CreatedAt: now, UpdatedAt: now}
+		if err := uc.Tracks.Create(ctx, item); err != nil {
+			return err
+		}
+		for _, translation := range translations {
+			translation.TrackID = item.ID
+			if err := uc.TrackI18n.Upsert(ctx, translation); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return domain.Track{}, err
+	}
+	return item, nil
+}
+
+// UpdateTrackInput holds track update data.
+type UpdateTrackInput struct {
+	ID                  string
+	Slug                string
+	Order               *int
+	Status              int
+	LessonReadAccess    *domain.LessonReadAccess
+	LessonReadAccessSet bool
+	Translations        []domain.TrackI18n
+}
+
+// UpdateTrack updates a track.
+type UpdateTrack struct {
+	Tracks    repository.TrackRepository
+	TrackI18n repository.TrackI18nRepository
+	I18n      repository.I18nRepository
+	Tx        repository.TransactionManager
+}
+
+func (uc UpdateTrack) Handle(ctx context.Context, in UpdateTrackInput) (*domain.Track, error) {
+	id, err := normalizeCatalogID(in.ID)
+	if err != nil {
+		return nil, err
+	}
+	in.ID = id
+	var item *domain.Track
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		var err error
+		item, err = uc.Tracks.Get(ctx, in.ID)
+		if err != nil {
+			return err
+		}
+		slug := strings.TrimSpace(in.Slug)
+		if slug == "" || !isValidCatalogStatus(in.Status) {
+			return domain.ErrValidation
+		}
+		item.Slug = slug
+		if in.Order != nil {
+			order, err := normalizeTrackOrder(in.Order)
+			if err != nil {
+				return err
+			}
+			item.Order = order
+		}
+		item.Status = in.Status
+		if in.LessonReadAccessSet {
+			if err := domain.ValidateLessonReadAccess(in.LessonReadAccess); err != nil {
+				return err
+			}
+			item.LessonReadAccess = in.LessonReadAccess
+		}
+		item.UpdatedAt = time.Now().UTC()
+		translations, err := normalizeTrackTranslations(in.Translations)
+		if err != nil {
+			return err
+		}
+		translationIDs := make([]int, 0, len(translations))
+		for _, translation := range translations {
+			translationIDs = append(translationIDs, translation.I18nID)
+		}
+		if in.Status == domain.CatalogStatusActive && uc.TrackI18n != nil {
+			existing, err := uc.TrackI18n.ListByTrack(ctx, item.ID)
+			if err != nil {
+				return err
+			}
+			existingIDs := make([]int, 0, len(existing))
+			for _, translation := range existing {
+				existingIDs = append(existingIDs, translation.I18nID)
+			}
+			translationIDs = uniqueCatalogTranslationIDs(existingIDs, translationIDs)
+		}
+		if err := validateCatalogTranslationLanguages(ctx, uc.I18n, translationIDs, in.Status == domain.CatalogStatusActive); err != nil {
+			return err
+		}
+		if err := uc.Tracks.Update(ctx, *item); err != nil {
+			return err
+		}
+		for _, translation := range translations {
+			translation.TrackID = item.ID
+			if err := uc.TrackI18n.Upsert(ctx, translation); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func normalizeTrackOrder(order *int) (*int, error) {
+	if order == nil {
+		return nil, nil
+	}
+	if *order < 0 || *order > 32767 {
+		return nil, domain.ErrValidation
+	}
+	value := *order
+	return &value, nil
+}
+
+// GetTrack returns a track with translations.
+type GetTrack struct {
+	Tracks    repository.TrackRepository
+	TrackI18n repository.TrackI18nRepository
+}
+
+func (uc GetTrack) Handle(ctx context.Context, id string) (*domain.Track, []domain.TrackI18n, error) {
+	id, err := normalizeCatalogID(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	item, err := uc.Tracks.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	translations, err := uc.TrackI18n.ListByTrack(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return item, translations, nil
+}
+
+// ListTracks lists tracks.
+type ListTracks struct {
+	Tracks repository.TrackRepository
+}
+
+func (uc ListTracks) Handle(ctx context.Context, filter filters.TrackFilters) ([]domain.Track, error) {
+	return uc.Tracks.List(ctx, filter)
+}
+
+// DeleteTrack marks a track inactive.
+type DeleteTrack struct {
+	Tracks repository.TrackRepository
+}
+
+func (uc DeleteTrack) Handle(ctx context.Context, id string) error {
+	id, err := normalizeCatalogID(id)
+	if err != nil {
+		return err
+	}
+	return uc.Tracks.Delete(ctx, id)
+}

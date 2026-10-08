@@ -1,0 +1,303 @@
+package domain
+
+import (
+	"errors"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	StudentOnboardingTurnSchema              = "student-onboarding-turn.v2"
+	StudentOnboardingTurnResultSchema        = "student-onboarding-turn-result.v2"
+	StudentOnboardingTurnNoEffectProofSchema = "student-onboarding-turn-no-effect-proof.v2"
+	AuthenticatedUILocaleDefaultRule         = "authenticated_ui_locale.v1"
+)
+
+// StudentOnboardingTurnOrigin records why Student accepts a typed value. It is
+// deliberately not an LLM output type: Student validates both the origin and
+// the value before committing an effect.
+type StudentOnboardingTurnOrigin string
+
+const (
+	StudentOnboardingTurnOriginExplicitUI   StudentOnboardingTurnOrigin = "explicit_ui"
+	StudentOnboardingTurnOriginExplicitText StudentOnboardingTurnOrigin = "explicit_text"
+	StudentOnboardingTurnOriginInferred     StudentOnboardingTurnOrigin = "inferred"
+	StudentOnboardingTurnOriginDefault      StudentOnboardingTurnOrigin = "default"
+)
+
+type StudentOnboardingTurnEffectState string
+
+const (
+	StudentOnboardingTurnEffectAccepted StudentOnboardingTurnEffectState = "accepted"
+	StudentOnboardingTurnEffectNoEffect StudentOnboardingTurnEffectState = "no_effect"
+)
+
+const (
+	StudentOnboardingSlotDirectionCode          = "direction_code"
+	StudentOnboardingSlotSelfAssessedExperience = "self_assessed_experience"
+	StudentOnboardingSlotKnownStacks            = "known_stacks"
+	StudentOnboardingSlotDesiredStacks          = "desired_stacks"
+	StudentOnboardingSlotGoalCode               = "goal_code"
+	StudentOnboardingSlotGoalText               = "goal_text"
+	StudentOnboardingSlotPreferredLanguage      = "preferred_language"
+	StudentOnboardingSlotWeeklyMinutes          = "weekly_minutes"
+	StudentOnboardingSlotPreferredPace          = "preferred_pace"
+)
+
+var studentOnboardingTurnSlotOrder = map[string]int{
+	StudentOnboardingSlotDirectionCode:          0,
+	StudentOnboardingSlotSelfAssessedExperience: 1,
+	StudentOnboardingSlotKnownStacks:            2,
+	StudentOnboardingSlotDesiredStacks:          3,
+	StudentOnboardingSlotGoalCode:               4,
+	StudentOnboardingSlotGoalText:               5,
+	StudentOnboardingSlotPreferredLanguage:      6,
+	StudentOnboardingSlotWeeklyMinutes:          7,
+	StudentOnboardingSlotPreferredPace:          8,
+}
+
+// StudentOnboardingTurnSlot is a closed typed union. Exactly the value field
+// associated with SlotCode is populated after NormalizeStudentOnboardingTurn.
+// It intentionally contains neither map nor json.RawMessage.
+type StudentOnboardingTurnSlot struct {
+	SlotCode     string                      `json:"slot_code"`
+	CodeValue    *string                     `json:"code_value,omitempty"`
+	TextValue    *string                     `json:"text_value,omitempty"`
+	StacksValue  *[]string                   `json:"stacks_value,omitempty"`
+	IntegerValue *int                        `json:"integer_value,omitempty"`
+	Origin       StudentOnboardingTurnOrigin `json:"origin"`
+	// ConfidenceBasisPoints is the finite deterministic representation of the
+	// advisory [0,1] range: 0..10000; explicit UI must be exactly 10000.
+	ConfidenceBasisPoints *int    `json:"confidence_basis_points,omitempty"`
+	DefaultRuleCode       *string `json:"default_rule_code,omitempty"`
+}
+
+// StudentOnboardingTurnCommand is the bounded authoritative write request from
+// trusted Teacher. It has no public transport and no field accepting LLM JSON.
+type StudentOnboardingTurnCommand struct {
+	Schema                    string                      `json:"schema"`
+	StudentID                 string                      `json:"-"`
+	StudentCommandID          string                      `json:"student_command_id"`
+	DialogID                  string                      `json:"dialog_id"`
+	PersonalTeacherID         string                      `json:"personal_teacher_id"`
+	TeacherTurnSequence       int64                       `json:"teacher_turn_sequence"`
+	CanonicalStudentMessageID string                      `json:"canonical_student_message_id"`
+	ActionReceiptID           *string                     `json:"action_receipt_id,omitempty"`
+	SourceEventID             string                      `json:"source_event_id"`
+	DialogCausationID         string                      `json:"dialog_causation_id"`
+	TeacherJobID              string                      `json:"teacher_job_id"`
+	AIExecutionID             *string                     `json:"ai_execution_id,omitempty"`
+	CorrelationID             string                      `json:"correlation_id"`
+	CausationID               string                      `json:"causation_id"`
+	ExpectedDraftVersion      int64                       `json:"expected_draft_version"`
+	ExpectedProfileVersion    *int64                      `json:"expected_profile_version,omitempty"`
+	FinalizeCurrentV1         bool                        `json:"finalize_current_v1"`
+	Slots                     []StudentOnboardingTurnSlot `json:"slots"`
+	RequestHash               string                      `json:"-"`
+	OccurredAt                time.Time                   `json:"-"`
+}
+
+// StudentOnboardingTurnResult is deliberately a narrow recovery receipt: it
+// never exposes a message body, UI payload, LLM output, draft, or profile.
+type StudentOnboardingTurnResult struct {
+	Schema                    string                           `json:"schema"`
+	StudentCommandID          string                           `json:"student_command_id"`
+	CanonicalStudentMessageID string                           `json:"canonical_student_message_id"`
+	StudentEffectState        StudentOnboardingTurnEffectState `json:"student_effect_state"`
+	ResultDraftVersion        *int64                           `json:"result_draft_version,omitempty"`
+	ResultProfileVersion      *int64                           `json:"result_profile_version,omitempty"`
+	NoEffectProofID           *string                          `json:"no_effect_proof_id,omitempty"`
+	Replayed                  bool                             `json:"replayed"`
+}
+
+// StudentOnboardingTurnNoEffectProof fences a delayed apply after a failed
+// upstream turn. An unknown command is not a proof; it must be inserted under
+// the exact command/canonical-message locks by Student.
+type StudentOnboardingTurnNoEffectProof struct {
+	Schema     string                       `json:"schema"`
+	Command    StudentOnboardingTurnCommand `json:"command"`
+	OccurredAt time.Time                    `json:"-"`
+}
+
+func NormalizeStudentOnboardingTurn(input StudentOnboardingTurnCommand) (StudentOnboardingTurnCommand, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	var err error
+	for _, target := range []*string{
+		&input.StudentID, &input.StudentCommandID, &input.DialogID, &input.PersonalTeacherID,
+		&input.CanonicalStudentMessageID, &input.SourceEventID, &input.DialogCausationID,
+		&input.TeacherJobID, &input.CorrelationID, &input.CausationID,
+	} {
+		if *target, err = canonicalOnboardingTurnUUID(*target); err != nil {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+	}
+	if input.Schema != StudentOnboardingTurnSchema || input.TeacherTurnSequence <= 0 ||
+		input.ExpectedDraftVersion < 0 || input.DialogCausationID != input.CanonicalStudentMessageID || input.OccurredAt.IsZero() {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	if input.ExpectedProfileVersion != nil && *input.ExpectedProfileVersion < 0 {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	if input.FinalizeCurrentV1 != (input.ExpectedProfileVersion != nil) {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	if !input.FinalizeCurrentV1 && len(input.Slots) == 0 || len(input.Slots) > len(studentOnboardingTurnSlotOrder) {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	if input.FinalizeCurrentV1 && input.ExpectedDraftVersion == 0 {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	if input.ActionReceiptID != nil {
+		value, uuidErr := canonicalOnboardingTurnUUID(*input.ActionReceiptID)
+		if uuidErr != nil || input.AIExecutionID != nil || input.CorrelationID != value || input.CausationID != input.TeacherJobID {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+		input.ActionReceiptID = &value
+	} else {
+		if input.AIExecutionID == nil {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+		value, uuidErr := canonicalOnboardingTurnUUID(*input.AIExecutionID)
+		if uuidErr != nil || input.CorrelationID != input.CanonicalStudentMessageID || input.CausationID != value {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+		input.AIExecutionID = &value
+	}
+	if input.ActionReceiptID != nil && input.AIExecutionID != nil {
+		return StudentOnboardingTurnCommand{}, ErrValidation
+	}
+	seen := make(map[string]struct{}, len(input.Slots))
+	for index := range input.Slots {
+		normalized, err := normalizeStudentOnboardingTurnSlot(input.Slots[index], input.ActionReceiptID != nil)
+		if err != nil {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+		if _, exists := seen[normalized.SlotCode]; exists {
+			return StudentOnboardingTurnCommand{}, ErrValidation
+		}
+		seen[normalized.SlotCode] = struct{}{}
+		input.Slots[index] = normalized
+	}
+	sort.Slice(input.Slots, func(i, j int) bool {
+		return studentOnboardingTurnSlotOrder[input.Slots[i].SlotCode] < studentOnboardingTurnSlotOrder[input.Slots[j].SlotCode]
+	})
+	return input, nil
+}
+
+func NormalizeStudentOnboardingTurnNoEffectProof(input StudentOnboardingTurnNoEffectProof) (StudentOnboardingTurnNoEffectProof, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	if input.Schema != StudentOnboardingTurnNoEffectProofSchema || input.OccurredAt.IsZero() {
+		return StudentOnboardingTurnNoEffectProof{}, ErrValidation
+	}
+	input.Command.OccurredAt = input.OccurredAt
+	normalized, err := NormalizeStudentOnboardingTurn(input.Command)
+	if err != nil {
+		return StudentOnboardingTurnNoEffectProof{}, ErrValidation
+	}
+	input.Command = normalized
+	return input, nil
+}
+
+func (input StudentOnboardingTurnCommand) DraftAnswerPatch() (StudentOnboardingDraftAnswers, error) {
+	var answers StudentOnboardingDraftAnswers
+	for _, slot := range input.Slots {
+		switch slot.SlotCode {
+		case StudentOnboardingSlotDirectionCode:
+			answers.DirectionCode = slot.CodeValue
+		case StudentOnboardingSlotSelfAssessedExperience:
+			answers.SelfAssessedExperience = slot.CodeValue
+		case StudentOnboardingSlotKnownStacks:
+			answers.KnownStacks = slot.StacksValue
+		case StudentOnboardingSlotDesiredStacks:
+			answers.DesiredStacks = slot.StacksValue
+		case StudentOnboardingSlotGoalCode:
+			answers.GoalCode = slot.CodeValue
+		case StudentOnboardingSlotGoalText:
+			answers.GoalText = slot.TextValue
+		case StudentOnboardingSlotPreferredLanguage:
+			answers.PreferredLanguage = slot.CodeValue
+		case StudentOnboardingSlotWeeklyMinutes:
+			answers.WeeklyMinutes = slot.IntegerValue
+		case StudentOnboardingSlotPreferredPace:
+			answers.PreferredPace = slot.CodeValue
+		default:
+			return StudentOnboardingDraftAnswers{}, ErrValidation
+		}
+	}
+	return NormalizeStudentOnboardingDraftAnswers(answers)
+}
+
+func normalizeStudentOnboardingTurnSlot(input StudentOnboardingTurnSlot, deterministicAction bool) (StudentOnboardingTurnSlot, error) {
+	input.SlotCode = strings.TrimSpace(input.SlotCode)
+	if _, known := studentOnboardingTurnSlotOrder[input.SlotCode]; !known {
+		return StudentOnboardingTurnSlot{}, errors.New("unknown onboarding turn slot")
+	}
+	switch input.Origin {
+	case StudentOnboardingTurnOriginExplicitUI:
+		if !deterministicAction || input.ConfidenceBasisPoints == nil || *input.ConfidenceBasisPoints != 10000 || input.DefaultRuleCode != nil {
+			return StudentOnboardingTurnSlot{}, ErrValidation
+		}
+	case StudentOnboardingTurnOriginExplicitText:
+		if deterministicAction || input.DefaultRuleCode != nil || input.ConfidenceBasisPoints == nil || *input.ConfidenceBasisPoints < 0 || *input.ConfidenceBasisPoints > 10000 {
+			return StudentOnboardingTurnSlot{}, ErrValidation
+		}
+	default:
+		// inferred remains proposal-only and default needs authenticated locale
+		// evidence not introduced by S3.
+		return StudentOnboardingTurnSlot{}, errors.New("invalid onboarding turn origin")
+	}
+	valueCount := 0
+	if input.CodeValue != nil {
+		valueCount++
+	}
+	if input.TextValue != nil {
+		valueCount++
+	}
+	if input.StacksValue != nil {
+		valueCount++
+	}
+	if input.IntegerValue != nil {
+		valueCount++
+	}
+	if valueCount != 1 {
+		return StudentOnboardingTurnSlot{}, ErrValidation
+	}
+	answers, err := (StudentOnboardingTurnCommand{Slots: []StudentOnboardingTurnSlot{input}}).DraftAnswerPatch()
+	if err != nil || !hasDraftAnswers(answers) {
+		return StudentOnboardingTurnSlot{}, ErrValidation
+	}
+	// Reuse the draft normalizer's exact bounded values; this avoids a second
+	// semantic validator for the same Student-owned fields.
+	switch input.SlotCode {
+	case StudentOnboardingSlotDirectionCode:
+		input.CodeValue = answers.DirectionCode
+	case StudentOnboardingSlotSelfAssessedExperience:
+		input.CodeValue = answers.SelfAssessedExperience
+	case StudentOnboardingSlotKnownStacks:
+		input.StacksValue = answers.KnownStacks
+	case StudentOnboardingSlotDesiredStacks:
+		input.StacksValue = answers.DesiredStacks
+	case StudentOnboardingSlotGoalCode:
+		input.CodeValue = answers.GoalCode
+	case StudentOnboardingSlotGoalText:
+		input.TextValue = answers.GoalText
+	case StudentOnboardingSlotPreferredLanguage:
+		input.CodeValue = answers.PreferredLanguage
+	case StudentOnboardingSlotWeeklyMinutes:
+		input.IntegerValue = answers.WeeklyMinutes
+	case StudentOnboardingSlotPreferredPace:
+		input.CodeValue = answers.PreferredPace
+	}
+	return input, nil
+}
+
+func canonicalOnboardingTurnUUID(value string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}

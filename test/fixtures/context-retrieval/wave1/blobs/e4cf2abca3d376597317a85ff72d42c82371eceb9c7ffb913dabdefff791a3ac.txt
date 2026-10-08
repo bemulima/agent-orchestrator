@@ -1,0 +1,162 @@
+package personalteacher_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/personalteacher"
+)
+
+type fixedID string
+
+func (id fixedID) NewID() string { return string(id) }
+
+type fixedClock time.Time
+
+func (clock fixedClock) Now() time.Time { return time.Time(clock) }
+
+type memoryTeachers struct {
+	mu    sync.Mutex
+	byID  map[string]domain.PersonalTeacher
+	souls map[string]domain.TeacherSoul
+}
+
+func (repository *memoryTeachers) Ensure(
+	_ context.Context,
+	teacher domain.PersonalTeacher,
+	soul domain.TeacherSoul,
+) (domain.PersonalTeacher, domain.TeacherSoul, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	if existing, ok := repository.byID[teacher.StudentID]; ok {
+		return existing, repository.souls[teacher.StudentID], nil
+	}
+	repository.byID[teacher.StudentID] = teacher
+	repository.souls[teacher.StudentID] = soul
+	return teacher, soul, nil
+}
+
+func (repository *memoryTeachers) GetByStudentID(_ context.Context, studentID string) (domain.PersonalTeacher, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	teacher, ok := repository.byID[studentID]
+	if !ok {
+		return domain.PersonalTeacher{}, domain.ErrPersonalTeacherNotFound
+	}
+	return teacher, nil
+}
+
+func (repository *memoryTeachers) Update(_ context.Context, teacher domain.PersonalTeacher, expectedVersion int64) (domain.PersonalTeacher, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	current, ok := repository.byID[teacher.StudentID]
+	if !ok {
+		return domain.PersonalTeacher{}, domain.ErrPersonalTeacherNotFound
+	}
+	if current.Version != expectedVersion {
+		return domain.PersonalTeacher{}, domain.ErrVersionConflict
+	}
+	repository.byID[teacher.StudentID] = teacher
+	return teacher, nil
+}
+
+func (repository *memoryTeachers) GetSoulByStudentID(_ context.Context, studentID string) (domain.TeacherSoul, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	soul, ok := repository.souls[studentID]
+	if !ok {
+		return domain.TeacherSoul{}, domain.ErrTeacherSoulNotFound
+	}
+	return soul, nil
+}
+
+func (repository *memoryTeachers) UpdateSoul(
+	_ context.Context,
+	soul domain.TeacherSoul,
+	expectedVersion int64,
+) (domain.TeacherSoul, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	current, ok := repository.souls[soul.StudentID]
+	if !ok {
+		return domain.TeacherSoul{}, domain.ErrTeacherSoulNotFound
+	}
+	if current.Version != expectedVersion {
+		return domain.TeacherSoul{}, domain.ErrVersionConflict
+	}
+	repository.souls[soul.StudentID] = soul
+	return soul, nil
+}
+
+func TestEnsureIsIdempotentPerStudent(t *testing.T) {
+	repository := &memoryTeachers{byID: map[string]domain.PersonalTeacher{}, souls: map[string]domain.TeacherSoul{}}
+	uc := personalteacher.Ensure{
+		Teachers: repository,
+		IDs:      fixedID("00000000-0000-0000-0000-000000000001"),
+		Clock:    fixedClock(time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)),
+	}
+	first, err := uc.Execute(context.Background(), "student-1")
+	require.NoError(t, err)
+	second, err := uc.Execute(context.Background(), "student-1")
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	require.Len(t, repository.byID, 1)
+	require.Len(t, repository.souls, 1)
+}
+
+func TestUpdateChangesOnlyProvidedFields(t *testing.T) {
+	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+	teacher, err := domain.NewPersonalTeacher("00000000-0000-0000-0000-000000000001", "student-1", domain.DefaultPersonalTeacherSettings(), now)
+	require.NoError(t, err)
+	soul, err := domain.NewTeacherSoul(teacher.ID, teacher.StudentID, domain.DefaultTeacherSoulSettings(), now)
+	require.NoError(t, err)
+	repository := &memoryTeachers{
+		byID:  map[string]domain.PersonalTeacher{"student-1": teacher},
+		souls: map[string]domain.TeacherSoul{"student-1": soul},
+	}
+	uc := personalteacher.Update{Teachers: repository, Clock: fixedClock(now.Add(time.Minute))}
+	language := "en"
+
+	updated, err := uc.Execute(context.Background(), personalteacher.UpdateInput{
+		StudentID:       "student-1",
+		ExpectedVersion: 1,
+		Language:        &language,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "en", updated.Language)
+	require.Equal(t, domain.DefaultCommunication, updated.CommunicationStyle)
+	require.Equal(t, int64(2), updated.Version)
+}
+
+func TestSoulIsStoredAndUpdatedIndependentlyForEachStudent(t *testing.T) {
+	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+	repository := &memoryTeachers{byID: map[string]domain.PersonalTeacher{}, souls: map[string]domain.TeacherSoul{}}
+	firstEnsure := personalteacher.EnsureSoul{
+		Teachers: repository, IDs: fixedID("00000000-0000-4000-8000-000000000001"), Clock: fixedClock(now),
+	}
+	secondEnsure := personalteacher.EnsureSoul{
+		Teachers: repository, IDs: fixedID("00000000-0000-4000-8000-000000000002"), Clock: fixedClock(now),
+	}
+	first, err := firstEnsure.Execute(context.Background(), "student-1")
+	require.NoError(t, err)
+	second, err := secondEnsure.Execute(context.Background(), "student-2")
+	require.NoError(t, err)
+	require.NotEqual(t, first.PersonalTeacherID, second.PersonalTeacherID)
+
+	displayName := "Ada"
+	updated, err := (personalteacher.UpdateSoul{Teachers: repository, Clock: fixedClock(now.Add(time.Minute))}).Execute(
+		context.Background(), personalteacher.UpdateSoulInput{
+			StudentID: "student-1", ExpectedVersion: first.Version, DisplayName: &displayName,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "Ada", updated.DisplayName)
+	unchanged, err := repository.GetSoulByStudentID(context.Background(), "student-2")
+	require.NoError(t, err)
+	require.Equal(t, domain.DefaultTeacherSoulDisplayName, unchanged.DisplayName)
+}

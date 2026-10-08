@@ -1,0 +1,141 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	pg "github.com/example/mc-course-service/internal/infrastructure/persistence/postgres"
+	privatehttp "github.com/example/mc-course-service/internal/transport/http/private"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/generatedcourse"
+	"github.com/example/mc-course-service/internal/usecase/lessonrevision"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root starts this opt-in harness serially against an owned migrated database.
+// All Course persistence, hierarchy creation and revision receipts are real.
+// NATS publishing is deliberately absent; no lifecycle-event proof is claimed.
+func TestT08GeneratedCourseHTTPProvider(t *testing.T) {
+	dsn, token := os.Getenv("T08_COURSE_TEST_DATABASE_URL"), os.Getenv("T08_COURSE_TOKEN")
+	readyFile, stopFile := os.Getenv("T08_COURSE_READY_FILE"), os.Getenv("T08_COURSE_STOP_FILE")
+	if dsn == "" || token == "" || readyFile == "" || stopFile == "" {
+		t.Skip("owned T08 Course provider fixture is not configured")
+	}
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal("invalid owned T08 Course database configuration")
+	}
+	if !strings.HasPrefix(config.ConnConfig.Database, "remediation_t08_") || !strings.HasSuffix(config.ConnConfig.Database, "_test") {
+		t.Fatal("T08 Course database must be an owned remediation_t08_*_test database")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Migrations and reference seeding are separate root-owned operations.
+	var structureCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM code_structure_type WHERE code='QUIZ_TEXT_BASIC'`).Scan(&structureCount); err != nil || structureCount != 1 {
+		t.Fatalf("SETUP: owned Course QUIZ_TEXT_BASIC reference missing: count=%d err=%v", structureCount, err)
+	}
+	lessons := pg.LessonRepoPG{Pool: pool}
+	translations := pg.LessonI18nRepoPG{Pool: pool}
+	tasks := pg.TaskRepoPG{Pool: pool}
+	examples := pg.LessonExampleRepoPG{Pool: pool}
+	revisions := lessonrevision.Definitions{
+		Revisions: pg.LessonRevisionRepoPG{Pool: pool}, Lessons: lessons, Translations: translations,
+		Tasks: tasks, Tests: pg.TaskTestRepoPG{Pool: pool}, Files: pg.TaskFileStorageRepoPG{Pool: pool},
+		Examples: examples, Tx: pg.LessonRevisionTxPG{Pool: pool},
+	}
+	ensure := generatedcourse.Ensure{
+		Revisions: revisions, Generated: pg.GeneratedCourseRepoPG{Pool: pool},
+		Courses: pg.CourseRepoPG{Pool: pool}, CourseI18n: pg.CourseI18nRepoPG{Pool: pool},
+		Modules: pg.ModuleRepoPG{Pool: pool}, ModuleI18n: pg.ModuleI18nRepoPG{Pool: pool}, CourseModules: pg.CourseModuleRepoPG{Pool: pool},
+		Sections: pg.SectionRepoPG{Pool: pool}, SectionI18n: pg.SectionI18nRepoPG{Pool: pool}, ModuleSections: pg.ModuleSectionRepoPG{Pool: pool},
+		Lessons: lessons, LessonI18n: translations, SectionLessons: pg.SectionLessonRepoPG{Pool: pool},
+		Examples: examples, Tasks: tasks, TaskI18n: pg.TaskI18nRepoPG{Pool: pool}, TaskTargets: pg.TaskLearningTargetRepoPG{Pool: pool},
+		StructureTypes: pg.CodeStructureTypeRepoPG{Pool: pool}, I18n: pg.I18nRepoPG{Pool: pool}, Tx: pg.TxManagerPG{Pool: pool},
+		IDs: t08CourseIDs{}, Clock: t08CourseClock{},
+	}
+	router := chi.NewRouter()
+	router.Mount("/internal", privatehttp.NewRouter(nil, nil, nil, &privatehandlers.GeneratedCourseHandler{Ensure: ensure}, "", token, ""))
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	ready, err := json.Marshal(map[string]string{
+		"base_url":       server.URL,
+		"classification": "actual registered Course private HTTP + PostgreSQL + lesson revision receipts; no NATS/Start/validators",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readyFile, ready, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("T08 owned actual Course provider ready; credentials excluded")
+	t08WaitCourseStop(t, stopFile)
+	var courses, requests, lessonsCount, revisionsCount, revisionReceipts int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM generated_course), (SELECT count(*) FROM generated_course_request), (SELECT count(*) FROM generated_lesson), (SELECT count(*) FROM lesson_revision), (SELECT count(*) FROM generated_course_revision_receipt)`).Scan(&courses, &requests, &lessonsCount, &revisionsCount, &revisionReceipts); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("owned actual Course SQL readback: courses=%d requests=%d generatedLessons=%d lessonRevisions=%d revisionReceipts=%d", courses, requests, lessonsCount, revisionsCount, revisionReceipts)
+	rows, err := pool.Query(ctx, `SELECT r.idempotency_key::text,r.course_id::text,g.lesson_id::text,COALESCE(b.value->>'lesson_revision_id','')
+FROM generated_course_request r JOIN generated_lesson g ON g.course_id=r.course_id
+LEFT JOIN generated_course_revision_receipt rev ON rev.idempotency_key=r.idempotency_key
+LEFT JOIN LATERAL jsonb_array_elements(rev.lessons) b(value) ON b.value->>'lesson_id'=g.lesson_id::text
+ORDER BY r.idempotency_key,g.lesson_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requestID, courseID, lessonID, revisionID string
+		if err := rows.Scan(&requestID, &courseID, &lessonID, &revisionID); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("owned actual Course binding: request=%s course=%s lesson=%s revision=%s", requestID, courseID, lessonID, revisionID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type t08CourseIDs struct{}
+
+func (t08CourseIDs) NewID() string { return uuid.NewString() }
+
+type t08CourseClock struct{}
+
+func (t08CourseClock) Now() time.Time { return time.Now().UTC() }
+
+func t08WaitCourseStop(t *testing.T, stopFile string) {
+	t.Helper()
+	timer := time.NewTimer(15 * time.Minute)
+	defer timer.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(stopFile); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("T08 Course provider timed out awaiting root stop file")
+		case <-ticker.C:
+		}
+	}
+}

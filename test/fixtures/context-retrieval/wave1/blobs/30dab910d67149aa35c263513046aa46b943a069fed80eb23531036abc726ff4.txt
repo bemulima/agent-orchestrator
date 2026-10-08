@@ -1,0 +1,268 @@
+package lesson
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/usecase/contentaccess"
+	"github.com/google/uuid"
+)
+
+var materialStackPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// LessonMaterialTask combines a public Task with its assessment questions.
+type LessonMaterialTask struct {
+	Task  domain.Task
+	Tests []domain.TaskTest
+}
+
+// RelatedLessonMaterial is one authored Lesson relation and its student-facing target content.
+type RelatedLessonMaterial struct {
+	Relation domain.LessonRelation
+	Lesson   map[string]any
+	Examples []domain.LessonExample
+	Tasks    []LessonMaterialTask
+}
+
+// RelatedExampleMaterial is one authored Example relation and its complete target Example.
+type RelatedExampleMaterial struct {
+	Relation domain.LessonExampleRelation
+	Example  domain.LessonExample
+}
+
+// LessonMaterials is the read model used while a student reads one Lesson.
+type LessonMaterials struct {
+	Lesson          map[string]any
+	Stack           string
+	Examples        []domain.LessonExample
+	Tasks           []LessonMaterialTask
+	RelatedLessons  []RelatedLessonMaterial
+	RelatedExamples []RelatedExampleMaterial
+}
+
+// GetLessonMaterials aggregates existing Lesson and Example relations without adding a new authoring contract.
+type GetLessonMaterials struct {
+	Lessons          repository.LessonRepository
+	LessonRelations  repository.LessonRelationRepository
+	Examples         repository.LessonExampleRepository
+	ExampleRelations repository.LessonExampleRelationRepository
+	Tasks            repository.TaskRepository
+	TaskTests        repository.TaskTestRepository
+	Access           contentaccess.Service
+}
+
+// Handle returns active materials for one Lesson, optionally narrowed to one relation stack.
+func (uc GetLessonMaterials) Handle(ctx context.Context, lessonID, stack string) (*LessonMaterials, error) {
+	lessonID = strings.TrimSpace(lessonID)
+	if _, err := uuid.Parse(lessonID); err != nil || !uc.valid() {
+		return nil, domain.ErrValidation
+	}
+	rootReadDecision, err := uc.Access.AuthorizeLesson(ctx, lessonID, "")
+	if err != nil {
+		return nil, err
+	}
+	stack = strings.TrimSpace(stack)
+	if stack != "" && !materialStackPattern.MatchString(stack) {
+		return nil, domain.ErrValidation
+	}
+
+	root, err := uc.Lessons.Get(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	if root.Status != domain.LessonStatusActive {
+		return nil, domain.ErrNotFound
+	}
+	lessonView, err := uc.Lessons.GetWithFields(
+		ctx,
+		lessonID,
+		queryfields.Parse("", queryfields.LessonAllowedFields),
+	)
+	if err != nil {
+		return nil, err
+	}
+	applyReadDecision(lessonView, rootReadDecision)
+
+	examples, err := uc.Examples.ListByLesson(ctx, lessonID, true)
+	if err != nil {
+		return nil, err
+	}
+	examples = activeExamples(examples)
+	tasks, err := uc.lessonTasks(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+
+	lessonRelations, err := uc.LessonRelations.ListBySourceLesson(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	relatedLessons := make([]RelatedLessonMaterial, 0)
+	for _, relation := range lessonRelations {
+		if !matchesRelationStack(relation.PrimaryStack, relation.Stacks, stack) {
+			continue
+		}
+		targetReadDecision, err := uc.Access.AuthorizeLesson(ctx, relation.TargetLessonID, relation.ID)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrForbidden) {
+				continue
+			}
+			return nil, err
+		}
+		target, err := uc.Lessons.Get(ctx, relation.TargetLessonID)
+		if err != nil {
+			return nil, err
+		}
+		if target.Status != domain.LessonStatusActive {
+			continue
+		}
+		targetView, err := uc.Lessons.GetWithFields(
+			ctx,
+			relation.TargetLessonID,
+			queryfields.Parse("", queryfields.LessonAllowedFields),
+		)
+		if err != nil {
+			return nil, err
+		}
+		applyReadDecision(targetView, targetReadDecision)
+		targetExamples, err := uc.Examples.ListByLesson(ctx, relation.TargetLessonID, true)
+		if err != nil {
+			return nil, err
+		}
+		targetExamples = filterExamplesByStack(activeExamples(targetExamples), stack)
+		targetTasks, err := uc.lessonTasks(ctx, relation.TargetLessonID)
+		if err != nil {
+			return nil, err
+		}
+		relatedLessons = append(relatedLessons, RelatedLessonMaterial{
+			Relation: relation,
+			Lesson:   targetView,
+			Examples: targetExamples,
+			Tasks:    targetTasks,
+		})
+	}
+
+	relatedExamples := make([]RelatedExampleMaterial, 0)
+	for _, example := range examples {
+		relations, err := uc.ExampleRelations.ListBySourceExample(ctx, example.ID, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, relation := range relations {
+			if !matchesRelationStack(&relation.PrimaryStack, relation.Stacks, stack) {
+				continue
+			}
+			if err := uc.Access.RequireExample(ctx, relation.TargetExampleID, relation.ID); err != nil {
+				if errors.Is(err, domain.ErrNotFound) {
+					continue
+				}
+				return nil, err
+			}
+			target, err := uc.Examples.Get(ctx, relation.TargetExampleID)
+			if err != nil {
+				return nil, err
+			}
+			if target.Status != domain.LessonExampleStatusActive {
+				continue
+			}
+			targetLesson, err := uc.Lessons.Get(ctx, target.LessonID)
+			if err != nil {
+				return nil, err
+			}
+			if targetLesson.Status != domain.LessonStatusActive {
+				continue
+			}
+			relatedExamples = append(relatedExamples, RelatedExampleMaterial{
+				Relation: relation,
+				Example:  *target,
+			})
+		}
+	}
+
+	return &LessonMaterials{
+		Lesson:          lessonView,
+		Stack:           stack,
+		Examples:        examples,
+		Tasks:           tasks,
+		RelatedLessons:  relatedLessons,
+		RelatedExamples: relatedExamples,
+	}, nil
+}
+
+func applyReadDecision(lessonView map[string]any, decision contentaccess.LessonReadDecision) {
+	lessonView["effective_read_access"] = decision.Effective
+	lessonView["can_read"] = decision.CanRead
+	if decision.SourceType != "" {
+		lessonView["read_access_source_type"] = decision.SourceType
+	}
+}
+
+func (uc GetLessonMaterials) valid() bool {
+	return uc.Lessons != nil && uc.LessonRelations != nil && uc.Examples != nil &&
+		uc.ExampleRelations != nil && uc.Tasks != nil && uc.TaskTests != nil && uc.Access.Configured()
+}
+
+func (uc GetLessonMaterials) lessonTasks(ctx context.Context, lessonID string) ([]LessonMaterialTask, error) {
+	tasks, err := uc.Tasks.ListByLesson(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]LessonMaterialTask, 0, len(tasks))
+	for _, task := range tasks {
+		if task.Status != domain.TaskStatusActive {
+			continue
+		}
+		tests, err := uc.TaskTests.ListByTask(ctx, task.ID)
+		if err != nil {
+			return nil, err
+		}
+		if tests == nil {
+			tests = make([]domain.TaskTest, 0)
+		}
+		result = append(result, LessonMaterialTask{Task: task, Tests: tests})
+	}
+	return result, nil
+}
+
+func activeExamples(examples []domain.LessonExample) []domain.LessonExample {
+	result := make([]domain.LessonExample, 0, len(examples))
+	for _, example := range examples {
+		if example.Status == domain.LessonExampleStatusActive {
+			result = append(result, example)
+		}
+	}
+	return result
+}
+
+func filterExamplesByStack(examples []domain.LessonExample, stack string) []domain.LessonExample {
+	if stack == "" {
+		return examples
+	}
+	result := make([]domain.LessonExample, 0, len(examples))
+	for _, example := range examples {
+		if matchesRelationStack(example.PrimaryStack, example.Stacks, stack) {
+			result = append(result, example)
+		}
+	}
+	return result
+}
+
+func matchesRelationStack(primary *string, stacks []string, stack string) bool {
+	if stack == "" {
+		return true
+	}
+	if primary != nil && *primary == stack {
+		return true
+	}
+	for _, item := range stacks {
+		if item == stack {
+			return true
+		}
+	}
+	return false
+}

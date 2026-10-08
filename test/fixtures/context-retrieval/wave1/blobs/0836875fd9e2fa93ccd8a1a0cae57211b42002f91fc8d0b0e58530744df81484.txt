@@ -1,0 +1,184 @@
+# Durable onboarding Planner handoff (S8)
+
+S8 turns only an exact S7 `READY` result into a durable, non-executable
+Learning Planner admission. It does not create or reserve a course, learning
+path, lesson, NBA, or Practice object, and it does not call AI Prompt or mutate
+Student. Planner must re-read current state and atomically reserve any future
+execution in S9.
+
+## Rollout
+
+S11 makes the full capability chain an admission gate rather than a response
+selector. A request with no prior evidence is admitted only when dense
+ordering, canonical actions, unified coordination, product readiness, and the
+Planner handoff are all enabled; it is always stamped and returned as session
+v3. Disabling any flag stops new admission before Teacher, Dialog, Student, or
+Planner side effects. Exact already-admitted v1/v2/v3 interactions, coordinator
+jobs, handoffs, and terminal action receipts continue from durable evidence and
+are never upgraded or downgraded by current flags.
+
+Install migration 023 with all old writers quiesced and its drain probe clean.
+Do not run S10 and S11 writers concurrently after installation. Rollback is
+behavioural only: stop new admission, let persisted coordinator/handoff/terminal
+work recover, and retain migration 023. Its down migration deliberately refuses
+stamped interaction or terminal-session evidence. A terminal historical row
+without one exact reconstructible projection returns non-retryable HTTP 409
+`historical_session_unavailable`; it never falls back to current state or the
+latest Student record.
+
+`TEACHER_ONBOARDING_PLANNER_HANDOFF_ENABLED=false` remains the default. Enabling
+it requires product-aware onboarding, dense Dialog ordering, canonical actions,
+and the unified coordinator. Before migration 023, S8-off requests retained
+the S7 session contract. After the S11 cutover they are not newly admitted;
+the handoff worker and session reader still finish exact already-admitted
+evidence after a flag rollback.
+
+Teacher uses the dedicated `LEARNING_PLANNER_TEACHER_TOKEN`, which must match
+Planner's `TEACHER_ONBOARDING_HANDOFF_INTERNAL_TOKEN` and must differ from the
+general readiness/course-plan token. It may be empty only while S8 is dark and
+there is no pending local ledger work. A non-empty token is always checked for
+dedication, even with admissions off. Teacher probes migration `021` at
+startup: a deploy before that migration remains S7-compatible and sends no
+handoff-table queries; an enabled admission flag then fails readiness until the
+migration is present. Once the ledger exists, admissions can be disabled to
+drain it, but a missing handoff token makes readiness fail safely while pending
+rows remain.
+
+## Frozen wire contract
+
+Teacher sends a capped strict JSON request with a stable UUID
+`Idempotency-Key`:
+
+```json
+{
+  "schema": "teacher-onboarding-plan-handoff-request.v1",
+  "expected_state_ref": {"kind": "accepted_draft", "version": 4},
+  "dialog_id": "00000000-0000-4000-8000-000000000001",
+  "teacher_job_id": "00000000-0000-4000-8000-000000000002"
+}
+```
+
+`teacher_job_id` is the stable handoff command identity, not an executable job.
+The exact request hash includes the path Student identity and JSON request.
+A first success is `201`, an exact replay is `200`, and both carry strict
+`teacher-onboarding-plan-handoff.v1`:
+
+```json
+{
+  "schema": "teacher-onboarding-plan-handoff.v1",
+  "handoff_id": "00000000-0000-4000-8000-000000000003",
+  "status": "ACCEPTED",
+  "state_ref": {"kind": "accepted_draft", "version": 4},
+  "goal": {"code": "programming.foundation", "version": "v1", "graph_version": "programming-foundation-graph-v1"},
+  "execution_status": "NOT_STARTED",
+  "content_status": "NOT_CREATED",
+  "readiness_observed_at": "2026-09-11T12:00:00Z",
+  "replayed": false
+}
+```
+
+The client requires JSON content type, one bounded object, no unknown fields,
+canonical UTC `readiness_observed_at`, and exact state/goal identity. A `409`
+body is also strict and capped: `idempotency_conflict` blocks;
+`state_changed` or `active_path_exists` re-resolves only the frozen state.
+Unknown or malformed `400`, `409`, and `422` errors are invalid responses and
+fail closed. Exact `invalid_student_id`, `invalid_idempotency_key`,
+`invalid_request`, and `not_ready` are rejected; `5xx` and timeouts retry the
+same command.
+
+## Durable recovery
+
+`teacher_onboarding_plan_handoff` is unique by Student and exact state-ref,
+independent of goal. It stores stable Planner and notification commands,
+request hash, bounded origin references, lease/retry checkpoints, accepted
+handoff ID, and `readiness_observed_at`. It stores no profile, model/prompt or
+message body, opaque graph payload, or content identity.
+
+Its identity fields (Student/Teacher/Dialog, source and command IDs, request
+hash, state-ref, goal, locale, and notification command) are database
+immutable. Lifecycle leases, retries and acknowledgement checkpoints may
+advance, but ledger evidence cannot be updated into another command or deleted
+or truncated. Planner acceptance and Dialog delivery acknowledgement tuples
+are independently write-once: retries can never erase or replace either
+remote acknowledgement.
+
+For an S5 accepted Student effect, enqueue, prompt transition to
+`handoff_pending`, and source-job lease release are atomic. The dense cursor
+does not advance. A worker checkpoints Planner `ACCEPTED` before appending the
+deterministic message. If either remote acknowledgement is lost, restart reuses
+the same idempotency key. Only verified Dialog delivery atomically completes
+the source job/turn/interaction, writes its outcome, advances the cursor, and
+marks the handoff delivered. `ACTIVE_PATH_EXISTS`, no-effect, tangent,
+clarification, and unsupported readiness never enqueue.
+
+Rollback is intentionally fail-closed. The down migration locks the handoff
+and interaction tables in `ACCESS EXCLUSIVE` mode, then refuses to proceed
+after any ledger row or `handoff_pending` evidence exists. This migration is
+reversible only for an unused, empty install. Operational rollback means turn
+off new admissions and let the worker drain while permanently retaining the
+table and receipts; no delete, truncate, or export-and-drop path exists.
+
+## Browser projection
+
+S8 ensure returns `teacher-onboarding-session.v3` and preserves v1/v2 replay:
+
+- `COLLECTING` has the existing phase, exact state ref, and current prompt;
+- `HANDOFF_PENDING` has `PREPARING_PATH` plus terminal kind, safe display name,
+  and `content_status=NOT_CREATED`;
+- `PLANNER_HANDOFF_ACCEPTED` has `READY_TO_START`, safe display name,
+  `execution_status=NOT_STARTED`, and `content_status=NOT_CREATED`;
+- `ACTIVE_PATH_EXISTS` has `READY_TO_START` and only its terminal kind.
+
+No Planner handoff, graph, course, path, or lesson ID is returned to the
+browser. The deterministic accepted message explicitly says preparation has
+not started and no course, path, or lessons were created.
+
+## S9 Planner outcome boundary
+
+The optional S9 consumer is enabled only with
+`TEACHER_ONBOARDING_PATH_OUTCOME_ENABLED=true` and migration `022`; it is
+otherwise absent so an S7/S8 database remains compatible. It consumes only
+the exact `planner.onboarding-path.outcome.v1` subject and strict v1 envelope:
+
+```json
+{
+  "event_id": "00000000-0000-4000-8000-000000000004",
+  "event_type": "planner.onboarding-path.outcome.v1",
+  "correlation_id": "00000000-0000-4000-8000-000000000005",
+  "causation_id": "00000000-0000-4000-8000-000000000003",
+  "student_id": "00000000-0000-4000-8000-000000000006",
+  "occurred_at": "2026-09-11T12:00:00Z",
+  "schema_version": 1,
+  "data": {
+    "schema": "planner-onboarding-path-outcome.v1",
+    "execution_id": "00000000-0000-4000-8000-000000000005",
+    "handoff_id": "00000000-0000-4000-8000-000000000003",
+    "student_id": "00000000-0000-4000-8000-000000000006",
+    "dialog_id": "00000000-0000-4000-8000-000000000007",
+    "teacher_job_id": "00000000-0000-4000-8000-000000000008",
+    "status": "PATH_READY",
+    "course_id": "00000000-0000-4000-8000-000000000009",
+    "learning_path_id": "00000000-0000-4000-8000-000000000010",
+    "first_lesson_id": "00000000-0000-4000-8000-000000000011"
+  }
+}
+```
+
+`correlation_id` equals `execution_id`, `causation_id` equals `handoff_id`,
+and all Student/Dialog/Teacher identities must match the immutable S8 handoff
+row. `PATH_READY` requires the three content IDs; `ACTIVE_PATH_EXISTS` and
+`STATE_CHANGED` forbid them. Teacher persists the event/execution inbox before
+appending exactly one localized personal-teacher message with `event_id` as
+the Dialog idempotency key. The event never carries profile, graph, provider,
+raw error, or browser/UI data. Ensure still re-reads Planner's authoritative
+Student state and exposes only the existing v3 `ACTIVE_PATH_EXISTS` terminal;
+the event itself never grants browser navigation.
+
+After the localized Dialog append is durably checkpointed, a fresh v3 Ensure
+may expose only `path_outcome={kind,status,dialog_message_id}`. The query joins
+the delivered inbox row back to the exact current S8 Student, PersonalTeacher,
+Dialog, Teacher job, and state reference. `kind` is
+`ONBOARDING_PATH_OUTCOME`; the exposed statuses are `PATH_READY` and
+`ACTIVE_PATH_EXISTS`. The marker omits all Planner and content identities and
+is only a reconciliation fence: Student and Course remain authoritative for
+the path and first lesson.

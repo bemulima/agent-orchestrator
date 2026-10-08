@@ -1,0 +1,95 @@
+package clickhouse
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/example/ms-go-statistic/internal/domain"
+	pkglog "github.com/example/ms-go-statistic/pkg/log"
+)
+
+type BufferedEventSink struct {
+	repo          domain.EventRepository
+	batchSize     int
+	flushInterval time.Duration
+	ch            chan domain.Event
+	logger        pkglog.Logger
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func NewBufferedEventSink(repo domain.EventRepository, batchSize int, flushInterval time.Duration, bufferSize int, logger pkglog.Logger) *BufferedEventSink {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &BufferedEventSink{
+		repo:          repo,
+		batchSize:     batchSize,
+		flushInterval: flushInterval,
+		ch:            make(chan domain.Event, bufferSize),
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
+	}
+	s.wg.Add(1)
+	go s.run()
+	return s
+}
+
+func (s *BufferedEventSink) Publish(ctx context.Context, ev domain.Event) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.ctx.Done():
+		return context.Canceled
+	case s.ch <- ev:
+		return nil
+	}
+}
+
+func (s *BufferedEventSink) Close() {
+	s.cancel()
+	s.wg.Wait()
+}
+
+func (s *BufferedEventSink) run() {
+	defer s.wg.Done()
+
+	var batch []domain.Event
+	ticker := time.NewTicker(s.flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := s.repo.InsertBatch(context.Background(), batch); err != nil {
+			s.logger.Error().Err(err).Msg("failed to flush events to clickhouse")
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			// drain the channel before exiting
+			for {
+				select {
+				case ev := <-s.ch:
+					batch = append(batch, ev)
+				default:
+					flush()
+					return
+				}
+			}
+		case ev := <-s.ch:
+			batch = append(batch, ev)
+			if len(batch) >= s.batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}

@@ -1,0 +1,160 @@
+package internalapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/go-chi/chi/v5"
+	"io"
+	"mime"
+	"net/http"
+	"reflect"
+	"strings"
+	"unicode/utf8"
+)
+
+type HybridApplicationService interface {
+	Apply(context.Context, string, string, domain.HybridConsequence) (domain.HybridApplicationReceipt, error)
+}
+
+func (h *Handler) ApplyHybridConsequence(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if h.HybridApplication == nil {
+		writePlanningSnapshotError(w, 503, "HYBRID_UNAVAILABLE")
+		return
+	}
+	typ, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || typ != "application/json" {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, domain.MaximumPlanningSnapshotRequestBytes))
+	if err != nil || !utf8.Valid(raw) {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	value, err := readPlanningSnapshotJSONValue(decoder, 0)
+	if err != nil || !hybridCanonicalJSONKeys(value) {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	var c domain.HybridConsequence
+	decoder = json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&c) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	if !hybridRequiredJSONShape(raw, reflect.TypeOf(c)) {
+		writePlanningSnapshotError(w, 400, "HYBRID_INVALID")
+		return
+	}
+	if err := domain.ValidateHybridConsequence(c); err != nil {
+		writeHybridApplicationError(w, err)
+		return
+	}
+	receipt, err := h.HybridApplication.Apply(r.Context(), chi.URLParam(r, "studentID"), chi.URLParam(r, "pathID"), c)
+	if err != nil {
+		writeHybridApplicationError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(receipt)
+}
+func hybridRequiredJSONShape(raw json.RawMessage, typ reflect.Type) bool {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.PkgPath() == "time" && typ.Name() == "Time" {
+		return true
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			return false
+		}
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			parts := strings.Split(f.Tag.Get("json"), ",")
+			if parts[0] == "-" {
+				continue
+			}
+			key := parts[0]
+			if key == "" {
+				key = f.Name
+			}
+			value, present := fields[key]
+			if !present {
+				if len(parts) > 1 && parts[1] == "omitempty" {
+					continue
+				}
+				return false
+			}
+			if !hybridRequiredJSONShape(value, f.Type) {
+				return false
+			}
+		}
+	case reflect.Slice:
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil || values == nil {
+			return false
+		}
+		for _, value := range values {
+			if !hybridRequiredJSONShape(value, typ.Elem()) {
+				return false
+			}
+		}
+	}
+	return true
+}
+func hybridCanonicalJSONKeys(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		for k, child := range v {
+			if k != strings.ToLower(k) || !hybridCanonicalJSONKeys(child) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if !hybridCanonicalJSONKeys(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+func writeHybridApplicationError(w http.ResponseWriter, err error) {
+	status, code := 500, "HYBRID_UNAVAILABLE"
+	switch {
+	case errors.Is(err, domain.ErrHybridStale):
+		status, code = 409, "HYBRID_STALE"
+	case errors.Is(err, domain.ErrHybridIntentRequired):
+		status, code = 409, "HYBRID_INTENT_REQUIRED"
+	case errors.Is(err, domain.ErrHybridUnsafe):
+		status, code = 409, "HYBRID_UNSAFE"
+	case errors.Is(err, domain.ErrHybridConflict), errors.Is(err, domain.ErrConflict):
+		status, code = 409, "HYBRID_CONFLICT"
+	case errors.Is(err, domain.ErrHybridUnsupported):
+		status, code = 422, "HYBRID_UNSUPPORTED"
+	case errors.Is(err, domain.ErrValidation):
+		status, code = 422, "HYBRID_INVALID"
+	case errors.Is(err, domain.ErrNotFound):
+		status, code = 404, "HYBRID_NOT_FOUND"
+	case errors.Is(err, domain.ErrForbidden):
+		status, code = 403, "HYBRID_FORBIDDEN"
+	}
+	writePlanningSnapshotError(w, status, code)
+}

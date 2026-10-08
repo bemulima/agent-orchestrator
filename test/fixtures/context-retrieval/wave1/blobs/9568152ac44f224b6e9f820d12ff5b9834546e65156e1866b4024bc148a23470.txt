@@ -1,0 +1,223 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherContextMutationRepository struct {
+	Pool *pgxpool.Pool
+}
+
+type storedTeacherContextMutation struct {
+	Mutation    domain.DialogTeacherContextMutation
+	Processed   time.Time
+	Advanced    bool
+	Invalidated bool
+}
+
+func (store TeacherContextMutationRepository) ApplyMutation(
+	ctx context.Context,
+	raw domain.DialogTeacherContextMutation,
+	processedAt time.Time,
+) (repository.TeacherContextMutationApplyResult, error) {
+	if store.Pool == nil || processedAt.IsZero() {
+		return repository.TeacherContextMutationApplyResult{}, errors.New("teacher context mutation repository dependencies are required")
+	}
+	mutation, err := domain.NewDialogTeacherContextMutation(raw)
+	if err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	processedAt = processedAt.UTC().Truncate(time.Microsecond)
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, summaryScopeLockKey(mutation.Scope())); err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	inserted := ""
+	err = tx.QueryRow(ctx, `
+INSERT INTO teacher_dialog_context_mutation_inbox (
+    event_id,event_type,schema_version,occurred_at,dialog_id,event_sequence,student_id,
+    personal_teacher_id,context_type,context_id,message_id,message_sequence,message_version,
+    last_event_sequence,mutation,processed_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id::text
+`, mutation.EventID, mutation.EventType, mutation.SchemaVersion, mutation.OccurredAt,
+		mutation.DialogID, mutation.EventSequence, mutation.StudentID, mutation.PersonalTeacherID,
+		mutation.ContextType, summaryContextID(mutation.Scope()), mutation.MessageID, mutation.MessageSequence,
+		mutation.MessageVersion, mutation.LastEventSequence, mutation.Mutation, processedAt).Scan(&inserted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		stored, loadErr := getTeacherContextMutation(ctx, tx, mutation.EventID)
+		if loadErr != nil {
+			return repository.TeacherContextMutationApplyResult{}, loadErr
+		}
+		if !sameTeacherContextMutation(stored.Mutation, mutation) {
+			return repository.TeacherContextMutationApplyResult{}, domain.ErrDialogTeacherContextMutationConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return repository.TeacherContextMutationApplyResult{}, err
+		}
+		return repository.TeacherContextMutationApplyResult{Processed: false, Advanced: stored.Advanced, Invalidated: stored.Invalidated}, nil
+	}
+	if err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+
+	advanced, err := advanceTeacherContextMutationFence(ctx, tx, mutation, processedAt)
+	if err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	invalidated := false
+	if advanced {
+		command, updateErr := tx.Exec(ctx, `
+UPDATE teacher_context_summary SET
+    invalidated_at=GREATEST($7,created_at,updated_at),
+    updated_at=GREATEST($7,created_at,updated_at),
+    revision=revision+1
+WHERE student_id=$1 AND personal_teacher_id=$2 AND dialog_id=$3 AND context_type=$4 AND context_id=$5
+  AND invalidation_epoch=2 AND invalidated_at IS NULL
+  AND covered_from_sequence<=$6 AND covered_through_sequence>=$6
+	`, mutation.StudentID, mutation.PersonalTeacherID, mutation.DialogID, mutation.ContextType,
+			summaryContextID(mutation.Scope()), mutation.MessageSequence, processedAt)
+		if updateErr != nil {
+			return repository.TeacherContextMutationApplyResult{}, updateErr
+		}
+		invalidated = command.RowsAffected() == 1
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_context_mutation_inbox
+SET advanced=$2,invalidated=$3
+WHERE event_id=$1
+`, mutation.EventID, advanced, invalidated); err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return repository.TeacherContextMutationApplyResult{}, err
+	}
+	return repository.TeacherContextMutationApplyResult{Processed: true, Advanced: advanced, Invalidated: invalidated}, nil
+}
+
+func advanceTeacherContextMutationFence(
+	ctx context.Context,
+	tx pgx.Tx,
+	mutation domain.DialogTeacherContextMutation,
+	processedAt time.Time,
+) (bool, error) {
+	stored, err := getTeacherContextMutationFence(ctx, tx, mutation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, insertErr := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_context_mutation_fence (
+    student_id,personal_teacher_id,dialog_id,context_type,context_id,message_id,message_sequence,
+    message_version,last_event_sequence,mutation,event_id,occurred_at,processed_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+`, mutation.StudentID, mutation.PersonalTeacherID, mutation.DialogID, mutation.ContextType,
+			summaryContextID(mutation.Scope()), mutation.MessageID, mutation.MessageSequence, mutation.MessageVersion,
+			mutation.LastEventSequence, mutation.Mutation, mutation.EventID, mutation.OccurredAt, processedAt)
+		return insertErr == nil, insertErr
+	}
+	if err != nil {
+		return false, err
+	}
+	advance, err := shouldAdvanceTeacherContextMutationFence(stored, mutation)
+	if err != nil || !advance {
+		return false, err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_context_mutation_fence SET
+    message_version=$8,last_event_sequence=$9,mutation=$10,event_id=$11,occurred_at=$12,processed_at=$13
+WHERE student_id=$1 AND personal_teacher_id=$2 AND dialog_id=$3 AND context_type=$4 AND context_id=$5 AND message_id=$6
+  AND message_sequence=$7
+	`, mutation.StudentID, mutation.PersonalTeacherID, mutation.DialogID, mutation.ContextType,
+		summaryContextID(mutation.Scope()), mutation.MessageID, mutation.MessageSequence, mutation.MessageVersion,
+		mutation.LastEventSequence, mutation.Mutation, mutation.EventID, mutation.OccurredAt, processedAt)
+	if err != nil {
+		return false, err
+	}
+	if command.RowsAffected() != 1 {
+		return false, domain.ErrDialogTeacherContextMutationConflict
+	}
+	return true, nil
+}
+
+func shouldAdvanceTeacherContextMutationFence(stored, incoming domain.DialogTeacherContextMutation) (bool, error) {
+	if stored.MessageSequence != incoming.MessageSequence {
+		return false, domain.ErrDialogTeacherContextMutationConflict
+	}
+	if stored.MessageVersion > incoming.MessageVersion {
+		return false, nil
+	}
+	if stored.MessageVersion == incoming.MessageVersion {
+		if stored.LastEventSequence != incoming.LastEventSequence || stored.Mutation != incoming.Mutation {
+			return false, domain.ErrDialogTeacherContextMutationConflict
+		}
+		return false, nil
+	}
+	if incoming.LastEventSequence <= stored.LastEventSequence {
+		return false, domain.ErrDialogTeacherContextMutationConflict
+	}
+	return true, nil
+}
+
+func getTeacherContextMutation(ctx context.Context, tx pgx.Tx, eventID string) (storedTeacherContextMutation, error) {
+	var stored storedTeacherContextMutation
+	var contextID string
+	err := tx.QueryRow(ctx, `
+SELECT schema_version,event_id::text,event_type,occurred_at,dialog_id::text,event_sequence,student_id,
+       personal_teacher_id::text,context_type,context_id::text,message_id::text,message_sequence,
+       message_version,last_event_sequence,mutation,processed_at,advanced,invalidated
+FROM teacher_dialog_context_mutation_inbox WHERE event_id=$1
+`, eventID).Scan(
+		&stored.Mutation.SchemaVersion, &stored.Mutation.EventID, &stored.Mutation.EventType, &stored.Mutation.OccurredAt,
+		&stored.Mutation.DialogID, &stored.Mutation.EventSequence, &stored.Mutation.StudentID,
+		&stored.Mutation.PersonalTeacherID, &stored.Mutation.ContextType, &contextID, &stored.Mutation.MessageID,
+		&stored.Mutation.MessageSequence, &stored.Mutation.MessageVersion, &stored.Mutation.LastEventSequence,
+		&stored.Mutation.Mutation, &stored.Processed, &stored.Advanced, &stored.Invalidated,
+	)
+	if err != nil {
+		return storedTeacherContextMutation{}, err
+	}
+	if contextID != zeroUUID {
+		stored.Mutation.ContextID = contextID
+	}
+	normalized, err := domain.NewDialogTeacherContextMutation(stored.Mutation)
+	stored.Mutation = normalized
+	return stored, err
+}
+
+func getTeacherContextMutationFence(ctx context.Context, tx pgx.Tx, mutation domain.DialogTeacherContextMutation) (domain.DialogTeacherContextMutation, error) {
+	var stored domain.DialogTeacherContextMutation
+	err := tx.QueryRow(ctx, `
+SELECT message_sequence,message_version,last_event_sequence,mutation,event_id::text,occurred_at
+FROM teacher_dialog_context_mutation_fence
+WHERE student_id=$1 AND personal_teacher_id=$2 AND dialog_id=$3 AND context_type=$4 AND context_id=$5 AND message_id=$6
+FOR UPDATE
+`, mutation.StudentID, mutation.PersonalTeacherID, mutation.DialogID, mutation.ContextType,
+		summaryContextID(mutation.Scope()), mutation.MessageID).Scan(
+		&stored.MessageSequence, &stored.MessageVersion, &stored.LastEventSequence,
+		&stored.Mutation, &stored.EventID, &stored.OccurredAt,
+	)
+	return stored, err
+}
+
+func sameTeacherContextMutation(left, right domain.DialogTeacherContextMutation) bool {
+	return left.SchemaVersion == right.SchemaVersion && left.EventID == right.EventID && left.EventType == right.EventType &&
+		left.OccurredAt.Equal(right.OccurredAt) && left.DialogID == right.DialogID && left.EventSequence == right.EventSequence &&
+		left.StudentID == right.StudentID && left.PersonalTeacherID == right.PersonalTeacherID &&
+		left.ContextType == right.ContextType && left.ContextID == right.ContextID && left.MessageID == right.MessageID &&
+		left.MessageSequence == right.MessageSequence && left.MessageVersion == right.MessageVersion &&
+		left.LastEventSequence == right.LastEventSequence && left.Mutation == right.Mutation
+}
+
+var _ repository.TeacherContextMutationStore = TeacherContextMutationRepository{}

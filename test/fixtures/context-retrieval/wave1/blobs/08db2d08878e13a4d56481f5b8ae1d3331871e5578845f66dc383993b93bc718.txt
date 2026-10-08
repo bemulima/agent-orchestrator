@@ -1,0 +1,103 @@
+package outbox_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/usecase/outbox"
+)
+
+type mutableClock struct{ now time.Time }
+
+func (clock *mutableClock) Now() time.Time { return clock.now }
+
+type outboxFake struct {
+	events         []domain.IntegrationEvent
+	claim          repository.OutboxClaim
+	published      []string
+	failed         []string
+	retryAt        time.Time
+	failureMessage string
+}
+
+func (fake *outboxFake) Claim(_ context.Context, claim repository.OutboxClaim) ([]domain.IntegrationEvent, error) {
+	fake.claim = claim
+	return fake.events, nil
+}
+
+func (fake *outboxFake) MarkPublished(_ context.Context, eventID, _ string, _ time.Time) error {
+	fake.published = append(fake.published, eventID)
+	return nil
+}
+
+func (fake *outboxFake) MarkFailed(_ context.Context, eventID, _ string, message string, retryAt time.Time) error {
+	fake.failed = append(fake.failed, eventID)
+	fake.failureMessage = message
+	fake.retryAt = retryAt
+	return nil
+}
+
+type publisherFake struct {
+	published []string
+	err       error
+}
+
+func (fake *publisherFake) Publish(_ context.Context, event domain.IntegrationEvent) error {
+	fake.published = append(fake.published, event.EventID)
+	return fake.err
+}
+
+func relayFixture(events []domain.IntegrationEvent) (outbox.Relay, *outboxFake, *publisherFake, *mutableClock) {
+	clock := &mutableClock{now: time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)}
+	storage := &outboxFake{events: events}
+	publisher := &publisherFake{}
+	return outbox.Relay{
+		Outbox:         storage,
+		Publisher:      publisher,
+		Clock:          clock,
+		WorkerID:       "student-worker-1",
+		BatchSize:      50,
+		LockTTL:        5 * time.Minute,
+		PublishTimeout: 5 * time.Second,
+		RetryBaseDelay: time.Second,
+		RetryMaxDelay:  5 * time.Minute,
+	}, storage, publisher, clock
+}
+
+func TestRelayMarksAcknowledgedEventPublished(t *testing.T) {
+	relay, storage, publisher, _ := relayFixture([]domain.IntegrationEvent{{EventID: "11111111-1111-4111-8111-111111111111", Attempts: 1}})
+	processed, err := relay.ProcessBatch(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessBatch returned error: %v", err)
+	}
+	if processed != 1 || len(publisher.published) != 1 || len(storage.published) != 1 || len(storage.failed) != 0 {
+		t.Fatalf("unexpected relay result: processed=%d published=%v marked=%v failed=%v", processed, publisher.published, storage.published, storage.failed)
+	}
+}
+
+func TestRelaySchedulesExponentialRetry(t *testing.T) {
+	relay, storage, publisher, clock := relayFixture([]domain.IntegrationEvent{{EventID: "11111111-1111-4111-8111-111111111111", Attempts: 3}})
+	publisher.err = errors.New("broker unavailable")
+	processed, err := relay.ProcessBatch(context.Background())
+	if err == nil || processed != 1 {
+		t.Fatalf("ProcessBatch error=%v processed=%d, want error and one event", err, processed)
+	}
+	if len(storage.failed) != 1 || storage.retryAt != clock.now.Add(4*time.Second) || storage.failureMessage != "broker unavailable" {
+		t.Fatalf("unexpected retry: failed=%v retry_at=%v message=%q", storage.failed, storage.retryAt, storage.failureMessage)
+	}
+}
+
+func TestRelayUsesLeaseLongerThanSequentialBatchTimeout(t *testing.T) {
+	relay, storage, _, clock := relayFixture(nil)
+	processed, err := relay.ProcessBatch(context.Background())
+	if err != nil || processed != 0 {
+		t.Fatalf("ProcessBatch error=%v processed=%d", err, processed)
+	}
+	if storage.claim.LockedUntil != clock.now.Add(5*time.Minute) {
+		t.Fatalf("locked_until=%v, want %v", storage.claim.LockedUntil, clock.now.Add(5*time.Minute))
+	}
+}

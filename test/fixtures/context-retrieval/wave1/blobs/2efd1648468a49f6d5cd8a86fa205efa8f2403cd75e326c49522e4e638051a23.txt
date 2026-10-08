@@ -1,0 +1,124 @@
+package nats
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	natsgo "github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+const (
+	LearningAnalyticsEventsStream = "LEARNING_ANALYTICS_EVENTS"
+	LearningActivityQueue         = "ms-teacher-learning-activity"
+	LearningActivityDurable       = "ms-teacher-learning-activity-v1"
+)
+
+type learningActivityEnvelope struct {
+	SchemaVersion int                  `json:"schema_version"`
+	EventID       string               `json:"event_id"`
+	EventType     string               `json:"event_type"`
+	CorrelationID string               `json:"correlation_id"`
+	StudentID     string               `json:"student_id"`
+	OccurredAt    time.Time            `json:"occurred_at"`
+	Data          learningActivityData `json:"data"`
+}
+
+type learningActivityData struct {
+	EventID             string    `json:"event_id"`
+	StudentID           string    `json:"student_id"`
+	AnalyticsSessionID  string    `json:"analytics_session_id"`
+	CourseID            string    `json:"course_id"`
+	LessonID            string    `json:"lesson_id"`
+	TaskID              string    `json:"task_id"`
+	SignalType          string    `json:"signal_type"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	SameErrorCount      int       `json:"same_error_count"`
+	ActiveSeconds       int       `json:"active_seconds"`
+	IdleSeconds         int       `json:"idle_seconds"`
+	Progressing         bool      `json:"progressing"`
+	ErrorFingerprint    string    `json:"error_fingerprint"`
+	OccurredAt          time.Time `json:"occurred_at"`
+}
+
+func DecodeLearningActivityInteresting(payload []byte) (domain.LearningActivitySignal, error) {
+	var envelope learningActivityEnvelope
+	if err := decodeStrictJSON(payload, &envelope); err != nil {
+		return domain.LearningActivitySignal{}, fmt.Errorf("decode interesting learning activity: %w", err)
+	}
+	if envelope.SchemaVersion != domain.LearningActivitySchemaVersion || envelope.EventType != domain.SubjectLearningActivityInteresting ||
+		envelope.EventID != envelope.Data.EventID || envelope.StudentID != envelope.Data.StudentID ||
+		envelope.CorrelationID != envelope.Data.AnalyticsSessionID || !envelope.OccurredAt.Equal(envelope.Data.OccurredAt) {
+		return domain.LearningActivitySignal{}, errors.New("inconsistent interesting learning activity envelope")
+	}
+	return domain.NewLearningActivitySignal(domain.LearningActivitySignal{
+		EventID: envelope.EventID, StudentID: envelope.StudentID, AnalyticsSessionID: envelope.CorrelationID,
+		CourseID: envelope.Data.CourseID, LessonID: envelope.Data.LessonID, TaskID: envelope.Data.TaskID,
+		SignalType: envelope.Data.SignalType, ConsecutiveFailures: envelope.Data.ConsecutiveFailures,
+		SameErrorCount: envelope.Data.SameErrorCount, ActiveSeconds: envelope.Data.ActiveSeconds,
+		IdleSeconds: envelope.Data.IdleSeconds, Progressing: envelope.Data.Progressing, OccurredAt: envelope.OccurredAt,
+	})
+}
+
+type LearningActivitySubscriber struct {
+	Conn       *natsgo.Conn
+	Handler    func(context.Context, domain.LearningActivitySignal) (bool, error)
+	Logger     *zap.Logger
+	AckWait    time.Duration
+	RetryDelay time.Duration
+}
+
+func (subscriber LearningActivitySubscriber) Subscribe(ctx context.Context) error {
+	if subscriber.Conn == nil || subscriber.Handler == nil {
+		return errors.New("learning activity subscriber connection and handler are required")
+	}
+	logger := subscriber.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	ackWait := subscriber.AckWait
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	retryDelay := subscriber.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 5 * time.Second
+	}
+	jetStream, err := subscriber.Conn.JetStream()
+	if err != nil {
+		return err
+	}
+	_, err = jetStream.QueueSubscribe(
+		domain.SubjectLearningActivityInteresting,
+		LearningActivityQueue,
+		func(message *natsgo.Msg) {
+			signal, decodeErr := DecodeLearningActivityInteresting(message.Data)
+			if decodeErr != nil {
+				logger.Warn("terminate invalid interesting learning activity", zap.Error(decodeErr))
+				_ = message.Term()
+				return
+			}
+			processed, handleErr := subscriber.Handler(ctx, signal)
+			if handleErr != nil {
+				logger.Warn("retry interesting learning activity", zap.String("event_id", signal.EventID), zap.Error(handleErr))
+				_ = message.NakWithDelay(retryDelay)
+				return
+			}
+			if ackErr := message.AckSync(); ackErr != nil {
+				logger.Warn("ack interesting learning activity", zap.String("event_id", signal.EventID), zap.Error(ackErr))
+				return
+			}
+			logger.Debug("interesting learning activity handled", zap.String("event_id", signal.EventID), zap.Bool("processed", processed))
+		},
+		natsgo.BindStream(LearningAnalyticsEventsStream), natsgo.Durable(LearningActivityDurable),
+		natsgo.ManualAck(), natsgo.AckExplicit(), natsgo.DeliverAll(), natsgo.AckWait(ackWait),
+	)
+	if err != nil {
+		return err
+	}
+	return subscriber.Conn.FlushTimeout(5 * time.Second)
+}

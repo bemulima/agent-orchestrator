@@ -1382,3 +1382,90 @@ All program writes remain inside CDO (plus disposable temporary verification out
 ## Context retrieval exact publication verification — 2026-10-06
 
 The standalone routing/catalog/contracts prerequisite layer and the complete R1–R4+Gold candidate both passed full secret-free verification on current origin/main. Original planner JSON/approval fingerprint compatibility, routing polarity and contract ownership passed. Final offline CLI/Prepare/Expand/determinism and Gold 71/71 passed; recall/precision 1.00 and all critical counters zero. Independent prerequisite/final reviews found P0=0 and P1=0. Original dirty source remains preserved; concurrent release documentation appends are retained and excluded from publication. Verification records and final Git publication proof are under ignored .cache/agent-context/publication-v2.
+
+## Go context retrieval Wave 1 remediation — 2026-10-08
+
+The owner explicitly authorized CDO ProjectSource.ConnectGit and
+TaskWorktree.Prepare. Both completed: clean managed main at
+`d15af3e9f80c8db3c60260c1fcb72c2495a8ebc8`, unchanged retrieval code relative to
+the trusted `3b74db9f5680a128ac9120ce79d3150521dbbeb6` baseline, with a managed task
+workspace/branch. The dirty original CDO and six service repositories remain
+untouched. Frozen change contracts permit only CDO remediation; one shared
+writer implements all changes and a separate writer owns fixture data.
+
+Five audited P1 have RED reproductions and fixes: aggregate scalar selectors,
+R1 envelope, saturated routing acquisition, exact-test sibling selection and
+missing generalized outbound HTTP root. Physical replay exposed a further
+manifestation of the same envelope P1: hundreds of COMPLETE named-file policy
+exclusion diagnostics displaced mandatory Course evidence. Its additional RED
+regression led to count/hash-bound compaction, preserving individual incomplete,
+secret, stale, facet-specific and authority diagnostics.
+
+Focused context tests and the unchanged 71 Gold passed. The native physical
+replay executed all 39 original tasks after remediation: strict original gates
+27/39, minimum Prepare/expanded precision .875; raw mandatory recall 165/166 and
+201/205 respectively. The remaining misses are explicit unsupported SQL bytes,
+missing official metric and the secret-excluded Auth assertion. Nine original
+owner/layer expectations also remain unresolved or mismatched; no task wording
+or label was replaced from observed output. Hence whole-wave full PASS and READY
+are not claimed. Detailed safe corpus provenance and unapplied label proposals
+are committed beside the integration fixtures.
+
+Independent review initially reported P0=0/P1=2 (outbound syntax verification and
+whole-wave diagnostic assertions); fixes and negative regressions are present.
+Final `make verify` passed after allowing localhost fixture listeners: policy,
+format, Go vet/unit/workflow tests, runner build/tests, 17 UI tests/build and
+secret-free Compose configuration. The native CLI retained Gold 71/71 PASS; ten
+additional focused and integration Gold variants pass. Independent re-review
+reports P0=0/P1=0; whole-wave publication certification remains withheld because
+the unchanged original acceptance gates are 27/39. Two separate lexical SQL
+Expand probes pass on both fixtures and physical Statistic sources while
+retaining semantic UNSUPPORTED diagnostics and all original 39 scores.
+No commit or push: the publication plan requires full acceptance PASS before
+publication. Candidate files remain in the approved managed task workspace.
+
+## Go Wave 1 final closure audit and implementation — 2026-10-08
+
+CDO upstream remains d15af3e; all six target revisions and 2034 admitted safe
+source hashes match the remediation freeze. Original39 and original71 Gold file
+hashes are frozen. Four independent read-only audits and a barrier matrix
+separate nine owner/layer mismatches, lexical SQL, Auth security exclusion,
+missing metric and Auth/User ownership. Root is the only shared code writer.
+
+Six generic routing regressions and one security diagnostic regression reproduced
+RED before fixes. The schema regression additionally exposed a synthetic Go
+import boundary to migration DDL; DDL remains inspected evidence. Focused routing
+and security tests now pass; full all 39 capability-aware acceptance and broader
+verification are still running. The v2 acceptance overlay retains original166/205
+and independently checks all required plan facets. No service code or excluded
+Auth assertion bytes were modified/read; no business contract was invented.
+Publication remains gated on exact-tree tests and final independent review.
+
+## Go Wave 1 closure verification — 2026-10-08
+
+Fixture and native read-only physical replay both accept all 39: 33 PASS,
+3 VALID_UNSUPPORTED and 3 VALID_PARTIAL. Supported original mandatory evidence
+is 165/165 Prepare and 201/201 Expand; every resulting supported required facet
+is selected (334/334 and 370/370). Original raw denominators remain 166/205;
+raw file matches are 166/166 and 202/205, including lexical migration bytes that
+never certify the separately unsupported semantic SQL facet. Minimum precision
+is .875. Native overlap duplicates are 9/520 in expanded evidence; distinct
+authority claims remain selected, and critical safety counters are zero. All71 unchanged
+serialized Gold pass, including 12 adversarial fixtures and 4/4 surfaced expected
+conflicts; ten remediation and two separate SQL probes remain passing.
+
+Reviewer found new closure scope and owner-gap proof issues; source-anchor
+adjacent/same-clause negatives and the missing owner proof reproduced RED.
+Fixes plus typed-owner-boundary and foreign-import/comment negatives pass.
+Actual Course/Student typed boundaries are retrieved from existing source;
+future freeze/type compatibility remains unverified. Twenty-five versioned
+closure Gold variants are additive. The owner gap is explicitly a separate
+hash-pinned independent ownership audit with current evidence predicates;
+it is not reported as an engine-emitted diagnostic.
+
+Full secret-free make verify passed (Go, workflow, runner 9 tests/build,
+UI 17 tests/build, Compose config with /dev/null). Native CLI 71 Gold also passed;
+all 39 native CLI/API equality and repeat digest checks passed.
+Code re-review reports P0=0/P1=0; exact publication-tree review and final full
+verification bind the already authorized normal origin/main publication.
+No service runtime/metadata changes, new per-service RAG, or vector storage.

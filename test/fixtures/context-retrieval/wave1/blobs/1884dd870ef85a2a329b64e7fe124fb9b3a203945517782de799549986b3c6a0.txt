@@ -1,0 +1,347 @@
+package domain
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	LessonMessageContextSchemaVersion   = "lesson-message-context.v1"
+	LessonMessageContextSchemaVersionV2 = "lesson-message-context.v2"
+	MaximumSelectedLessonTextRunes      = 12000
+	MaximumLessonOverviewTitleRunes     = 1000
+	MaximumLessonOverviewExcerptRunes   = 4000
+)
+
+var (
+	ErrInvalidLessonContext     = errors.New("invalid lesson context")
+	ErrLessonContextNotFound    = errors.New("lesson context not found")
+	ErrLessonContextUnavailable = errors.New("lesson context unavailable")
+)
+
+type LessonMessageMode string
+
+const (
+	LessonMessageModeOverview  LessonMessageMode = "lesson_overview"
+	LessonMessageModeSelection LessonMessageMode = "selection"
+)
+
+type LessonMessageContext struct {
+	Schema             string            `json:"schema,omitempty"`
+	Mode               LessonMessageMode `json:"mode,omitempty"`
+	CourseID           string            `json:"course_id,omitempty"`
+	LessonID           string            `json:"lesson_id,omitempty"`
+	ContentRevision    string            `json:"content_revision"`
+	SelectedText       string            `json:"selected_text,omitempty"`
+	LearningPathID     string            `json:"learning_path_id,omitempty"`
+	LearningPathItemID string            `json:"learning_path_item_id,omitempty"`
+	ContentDigest      string            `json:"content_digest,omitempty"`
+}
+
+// UnmarshalJSON keeps v2 exact and rejects cross-schema anchors rather than
+// silently dropping them into the legacy mutable lane.
+func (input *LessonMessageContext) UnmarshalJSON(data []byte) error {
+	type plain LessonMessageContext
+	var value plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return ErrInvalidLessonContext
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return ErrInvalidLessonContext
+	}
+	var fields map[string]json.RawMessage
+	if err := decodeLessonContextFields(data, &fields); err != nil || fields == nil {
+		return ErrInvalidLessonContext
+	}
+	if value.Schema == LessonMessageContextSchemaVersionV2 {
+		expectedFields := 8
+		if value.Mode == LessonMessageModeSelection {
+			expectedFields = 9
+		}
+		if len(fields) != expectedFields || !utf8.Valid(data) {
+			return ErrInvalidLessonContext
+		}
+		required := []string{"schema", "mode", "course_id", "lesson_id", "content_revision", "learning_path_id", "learning_path_item_id", "content_digest"}
+		for _, field := range required {
+			raw, ok := fields[field]
+			if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return ErrInvalidLessonContext
+			}
+		}
+		_, selectionPresent := fields["selected_text"]
+		if (value.Mode == LessonMessageModeSelection) != selectionPresent {
+			return ErrInvalidLessonContext
+		}
+	} else {
+		for field := range fields {
+			switch strings.ToLower(field) {
+			case "learning_path_id", "learning_path_item_id", "content_digest":
+				return ErrInvalidLessonContext
+			}
+		}
+	}
+	*input = LessonMessageContext(value)
+	return nil
+}
+
+func decodeLessonContextFields(data []byte, fields *map[string]json.RawMessage) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return ErrInvalidLessonContext
+	}
+	result := map[string]json.RawMessage{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return ErrInvalidLessonContext
+		}
+		name, ok := token.(string)
+		if !ok {
+			return ErrInvalidLessonContext
+		}
+		if _, present := result[name]; present {
+			return ErrInvalidLessonContext
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return ErrInvalidLessonContext
+		}
+		result[name] = raw
+	}
+	if _, err := decoder.Token(); err != nil {
+		return ErrInvalidLessonContext
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return ErrInvalidLessonContext
+	}
+	*fields = result
+	return nil
+}
+
+func NormalizeLessonMessageContext(input *LessonMessageContext) (*LessonMessageContext, error) {
+	if input == nil {
+		return nil, nil
+	}
+	if input.Schema == LessonMessageContextSchemaVersionV2 {
+		if !validAssignedUUID(input.CourseID) || !validAssignedUUID(input.LessonID) || !validAssignedUUID(input.ContentRevision) ||
+			!validAssignedUUID(input.LearningPathID) || !validAssignedUUID(input.LearningPathItemID) || !validAssignedContentDigest(input.ContentDigest) || !utf8.ValidString(input.SelectedText) {
+			return nil, ErrInvalidLessonContext
+		}
+		switch input.Mode {
+		case LessonMessageModeOverview:
+			if input.SelectedText != "" {
+				return nil, ErrInvalidLessonContext
+			}
+		case LessonMessageModeSelection:
+			if strings.TrimSpace(input.SelectedText) == "" || utf8.RuneCountInString(input.SelectedText) > MaximumSelectedLessonTextRunes {
+				return nil, ErrInvalidLessonContext
+			}
+		default:
+			return nil, ErrInvalidLessonContext
+		}
+		copy := *input
+		return &copy, nil
+	}
+	if input.LearningPathID != "" || input.LearningPathItemID != "" || input.ContentDigest != "" {
+		return nil, ErrInvalidLessonContext
+	}
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.Mode = LessonMessageMode(strings.ToLower(strings.TrimSpace(string(input.Mode))))
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.LessonID = strings.TrimSpace(input.LessonID)
+	revision, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(input.ContentRevision))
+	if err != nil || revision.IsZero() || !utf8.ValidString(input.SelectedText) {
+		return nil, ErrInvalidLessonContext
+	}
+	// Persisted pre-v1 selections remain valid as non-source history. New source
+	// messages are separately required to use the explicit current schema.
+	legacy := input.Schema == "" && input.Mode == "" && input.CourseID == "" && input.LessonID == ""
+	if legacy {
+		if strings.TrimSpace(input.SelectedText) == "" ||
+			utf8.RuneCountInString(input.SelectedText) > MaximumSelectedLessonTextRunes {
+			return nil, ErrInvalidLessonContext
+		}
+		return &LessonMessageContext{
+			ContentRevision: revision.UTC().Format(time.RFC3339Nano), SelectedText: input.SelectedText,
+		}, nil
+	}
+	if input.Schema != LessonMessageContextSchemaVersion || !validUUID(input.CourseID) || !validUUID(input.LessonID) {
+		return nil, ErrInvalidLessonContext
+	}
+	switch input.Mode {
+	case LessonMessageModeOverview:
+		if input.SelectedText != "" {
+			return nil, ErrInvalidLessonContext
+		}
+	case LessonMessageModeSelection:
+		if strings.TrimSpace(input.SelectedText) == "" ||
+			utf8.RuneCountInString(input.SelectedText) > MaximumSelectedLessonTextRunes {
+			return nil, ErrInvalidLessonContext
+		}
+	default:
+		return nil, ErrInvalidLessonContext
+	}
+	return &LessonMessageContext{
+		Schema: input.Schema, Mode: input.Mode, CourseID: input.CourseID, LessonID: input.LessonID,
+		ContentRevision: revision.UTC().Format(time.RFC3339Nano), SelectedText: input.SelectedText,
+	}, nil
+}
+
+func NormalizeCurrentLessonMessageContext(input *LessonMessageContext) (*LessonMessageContext, error) {
+	normalized, err := NormalizeLessonMessageContext(input)
+	if err != nil || normalized == nil || (normalized.Schema != LessonMessageContextSchemaVersion && normalized.Schema != LessonMessageContextSchemaVersionV2) {
+		return nil, ErrInvalidLessonContext
+	}
+	return normalized, nil
+}
+
+// CourseLessonContent is transient canonical Course data used only to verify a
+// source anchor. Full content must never be copied into model variables.
+type CourseLessonContent struct {
+	LessonID        string
+	CourseID        string
+	SectionID       string
+	Language        string
+	Title           string
+	Excerpt         string
+	Description     string
+	ContentRevision string
+}
+
+// LessonTeachingContext is the minimal verified fragment supplied to policy
+// and model orchestration.
+type LessonTeachingContext struct {
+	Schema             string            `json:"schema"`
+	Mode               LessonMessageMode `json:"mode"`
+	CourseID           string            `json:"course_id"`
+	LessonID           string            `json:"lesson_id"`
+	SectionID          string            `json:"section_id,omitempty"`
+	Language           string            `json:"language"`
+	ContentRevision    string            `json:"content_revision"`
+	Title              string            `json:"title,omitempty"`
+	Excerpt            string            `json:"excerpt,omitempty"`
+	SelectedText       string            `json:"selected_text,omitempty"`
+	LearningPathID     string            `json:"learning_path_id,omitempty"`
+	LearningPathItemID string            `json:"learning_path_item_id,omitempty"`
+	ContentDigest      string            `json:"content_digest,omitempty"`
+}
+
+func VerifyLessonContext(
+	lessonID string,
+	source *LessonMessageContext,
+	content CourseLessonContent,
+) (LessonTeachingContext, error) {
+	lessonID = strings.TrimSpace(lessonID)
+	content.LessonID = strings.TrimSpace(content.LessonID)
+	content.CourseID = strings.TrimSpace(content.CourseID)
+	content.SectionID = strings.TrimSpace(content.SectionID)
+	content.Language = strings.ToLower(strings.TrimSpace(content.Language))
+	content.ContentRevision = strings.TrimSpace(content.ContentRevision)
+	normalizedSource, err := NormalizeCurrentLessonMessageContext(source)
+	if err != nil || normalizedSource.Schema != LessonMessageContextSchemaVersion || !validUUID(lessonID) || content.LessonID != lessonID ||
+		normalizedSource.LessonID != lessonID || !validUUID(content.CourseID) ||
+		content.CourseID != normalizedSource.CourseID ||
+		(content.SectionID != "" && !validUUID(content.SectionID)) || !validValue(content.Language, 35) ||
+		normalizedSource.ContentRevision != content.ContentRevision || !utf8.ValidString(content.Title) ||
+		!utf8.ValidString(content.Excerpt) || !utf8.ValidString(content.Description) {
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	verified := LessonTeachingContext{
+		Schema: LessonMessageContextSchemaVersion, Mode: normalizedSource.Mode,
+		CourseID: normalizedSource.CourseID, LessonID: lessonID, SectionID: content.SectionID,
+		Language: content.Language, ContentRevision: content.ContentRevision,
+	}
+	switch normalizedSource.Mode {
+	case LessonMessageModeOverview:
+		verified.Title = strings.TrimSpace(content.Title)
+		verified.Excerpt = strings.TrimSpace(content.Excerpt)
+		if verified.Title == "" || utf8.RuneCountInString(verified.Title) > MaximumLessonOverviewTitleRunes ||
+			utf8.RuneCountInString(verified.Excerpt) > MaximumLessonOverviewExcerptRunes {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+	case LessonMessageModeSelection:
+		if !strings.Contains(content.Title, normalizedSource.SelectedText) &&
+			!strings.Contains(content.Excerpt, normalizedSource.SelectedText) &&
+			!strings.Contains(content.Description, normalizedSource.SelectedText) {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+		verified.SelectedText = normalizedSource.SelectedText
+	default:
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	return NormalizeLessonTeachingContext(verified)
+}
+
+func NormalizeLessonTeachingContext(input LessonTeachingContext) (LessonTeachingContext, error) {
+	if input.Schema == LessonMessageContextSchemaVersionV2 {
+		source, err := NormalizeCurrentLessonMessageContext(&LessonMessageContext{Schema: input.Schema, Mode: input.Mode, CourseID: input.CourseID, LessonID: input.LessonID, ContentRevision: input.ContentRevision, SelectedText: input.SelectedText, LearningPathID: input.LearningPathID, LearningPathItemID: input.LearningPathItemID, ContentDigest: input.ContentDigest})
+		if err != nil || source == nil || input.SectionID != "" || input.Language != "" || !utf8.ValidString(input.Title) || !utf8.ValidString(input.Excerpt) {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+		if input.Mode == LessonMessageModeOverview {
+			if utf8.RuneCountInString(input.Title) > MaximumLessonOverviewTitleRunes || utf8.RuneCountInString(input.Excerpt) > MaximumLessonOverviewExcerptRunes {
+				return LessonTeachingContext{}, ErrInvalidLessonContext
+			}
+		} else if input.Title != "" || input.Excerpt != "" {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+		return input, nil
+	}
+	if input.LearningPathID != "" || input.LearningPathItemID != "" || input.ContentDigest != "" {
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.Mode = LessonMessageMode(strings.ToLower(strings.TrimSpace(string(input.Mode))))
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.LessonID = strings.TrimSpace(input.LessonID)
+	input.SectionID = strings.TrimSpace(input.SectionID)
+	input.Language = strings.ToLower(strings.TrimSpace(input.Language))
+	input.ContentRevision = strings.TrimSpace(input.ContentRevision)
+	input.Title = strings.TrimSpace(input.Title)
+	input.Excerpt = strings.TrimSpace(input.Excerpt)
+	if input.Schema != LessonMessageContextSchemaVersion || !validUUID(input.CourseID) || !validUUID(input.LessonID) ||
+		(input.SectionID != "" && !validUUID(input.SectionID)) || !validValue(input.Language, 35) ||
+		!utf8.ValidString(input.Title) || !utf8.ValidString(input.Excerpt) || !utf8.ValidString(input.SelectedText) {
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	revision, err := time.Parse(time.RFC3339Nano, input.ContentRevision)
+	if err != nil || revision.IsZero() {
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	input.ContentRevision = revision.UTC().Format(time.RFC3339Nano)
+	switch input.Mode {
+	case LessonMessageModeOverview:
+		if input.Title == "" || utf8.RuneCountInString(input.Title) > MaximumLessonOverviewTitleRunes ||
+			utf8.RuneCountInString(input.Excerpt) > MaximumLessonOverviewExcerptRunes || input.SelectedText != "" {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+	case LessonMessageModeSelection:
+		if input.Title != "" || input.Excerpt != "" || strings.TrimSpace(input.SelectedText) == "" ||
+			utf8.RuneCountInString(input.SelectedText) > MaximumSelectedLessonTextRunes {
+			return LessonTeachingContext{}, ErrInvalidLessonContext
+		}
+	default:
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	return input, nil
+}
+
+func VerifyLessonSelection(
+	lessonID string,
+	source *LessonMessageContext,
+	content CourseLessonContent,
+) (LessonTeachingContext, error) {
+	verified, err := VerifyLessonContext(lessonID, source, content)
+	if err != nil || verified.Mode != LessonMessageModeSelection {
+		return LessonTeachingContext{}, ErrInvalidLessonContext
+	}
+	return verified, nil
+}

@@ -1,0 +1,96 @@
+package domain
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+func planningStateEventFixture(t *testing.T) IntegrationEvent {
+	t.Helper()
+	event, err := NewPlanningStateChangedEvent(planningSnapshotID(1), planningSnapshotID(2), 3, TriggerPlanningObjectiveEvidence, planningSnapshotID(3), []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.loops", Version: "v1"}, {Type: LearningTargetConcept, Key: "go.loops"}}, time.Date(2026, 10, 5, 0, 0, 0, 123456789, time.FixedZone("offset", 3600)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return event
+}
+func TestPlanningStateEventBoundedDeterministicFact(t *testing.T) {
+	event := planningStateEventFixture(t)
+	if err := ValidatePlanningStateChangedEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	again := planningStateEventFixture(t)
+	if event.EventID != again.EventID || string(event.Payload) != string(again.Payload) {
+		t.Fatal("same committed fact is not deterministic")
+	}
+	var envelope EventEnvelope
+	_ = json.Unmarshal(event.Payload, &envelope)
+	var data PlanningStateChangedData
+	_ = json.Unmarshal(envelope.Data, &data)
+	if data.Targets[0].Version != "" || data.Targets[1].Version != "v1" || envelope.CorrelationID != data.LearningPathID || envelope.CausationID != data.TriggerIdentity || envelope.OccurredAt.Nanosecond()%1000 != 0 {
+		t.Fatal("exact provenance/canonical commit timestamp lost")
+	}
+	for _, private := range []string{"mastery", "confidence", "correctness", "independence", "workspace", "solution", "prompt", "token"} {
+		if strings.Contains(string(event.Payload), private) {
+			t.Fatalf("private field: %s", private)
+		}
+	}
+	if PlanningStateChangedEventID(event.StudentID, data.LearningPathID, data.TriggerKind, data.TriggerIdentity) == PlanningStateChangedEventID(event.StudentID, planningSnapshotID(4), data.TriggerKind, data.TriggerIdentity) {
+		t.Fatal("fanout paths collide")
+	}
+}
+func TestPlanningStateEventRejectsTamperingAndUnsupportedTriggers(t *testing.T) {
+	original := planningStateEventFixture(t)
+	for name, change := range map[string]func(*IntegrationEvent){
+		"subject":   func(e *IntegrationEvent) { e.Subject = "student.mastery.changed" },
+		"id":        func(e *IntegrationEvent) { e.EventID = planningSnapshotID(90) },
+		"student":   func(e *IntegrationEvent) { e.StudentID = planningSnapshotID(90) },
+		"schema":    func(e *IntegrationEvent) { e.SchemaVersion = 2 },
+		"path":      func(e *IntegrationEvent) { e.CorrelationID = planningSnapshotID(90) },
+		"causation": func(e *IntegrationEvent) { e.CausationID = planningSnapshotID(90) },
+		"raw body": func(e *IntegrationEvent) {
+			e.Payload = json.RawMessage(strings.Replace(string(e.Payload), `"path_version":3`, `"path_version":3,"raw_evidence":"secret"`, 1))
+		},
+		"case alias": func(e *IntegrationEvent) {
+			e.Payload = json.RawMessage(strings.Replace(string(e.Payload), `"path_version":3`, `"Path_Version":3`, 1))
+		},
+		"duplicate": func(e *IntegrationEvent) {
+			e.Payload = json.RawMessage(strings.Replace(string(e.Payload), `"path_version":3`, `"path_version":3,"path_version":3`, 1))
+		},
+		"null": func(e *IntegrationEvent) {
+			e.Payload = json.RawMessage(strings.Replace(string(e.Payload), `"targets":[`, `"targets":[null,`, 1))
+		},
+		"trailing": func(e *IntegrationEvent) { e.Payload = append(e.Payload, []byte(`{}`)...) },
+		"oversize": func(e *IntegrationEvent) {
+			e.Payload = json.RawMessage(strings.Repeat(" ", MaximumPlanningStateEventBytes+1))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := original
+			change(&e)
+			if ValidatePlanningStateChangedEvent(e) == nil {
+				t.Fatal("accepted malformed or misbound event")
+			}
+		})
+	}
+	for _, kind := range []string{"TELEMETRY", "THEORY_ACKNOWLEDGED", "TEACHER_HINT", ""} {
+		if _, err := NewPlanningStateChangedEvent(planningSnapshotID(1), planningSnapshotID(2), 1, kind, planningSnapshotID(3), []LearningTargetRef{{Type: LearningTargetConcept, Key: "go.loops"}}, time.Now()); err == nil {
+			t.Fatal("non-authoritative trigger admitted")
+		}
+	}
+}
+func TestPlanningStateEventFullTargetEnvelope(t *testing.T) {
+	targets := []LearningTargetRef{}
+	for i := 0; i < 500; i++ {
+		targets = append(targets, LearningTargetRef{Type: LearningTargetConcept, Key: fmt.Sprintf("%03d-%s", i, strings.Repeat("k", 251)), Version: strings.Repeat("v", 128)})
+	}
+	if _, err := NewPlanningStateChangedEvent(planningSnapshotID(1), planningSnapshotID(2), 1, TriggerPlanningLearningIntent, planningSnapshotID(3), targets, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	targets = append(targets, LearningTargetRef{Type: LearningTargetConcept, Key: "overflow"})
+	if _, err := NewPlanningStateChangedEvent(planningSnapshotID(1), planningSnapshotID(2), 1, TriggerPlanningLearningIntent, planningSnapshotID(3), targets, time.Now()); err == nil {
+		t.Fatal("unbounded targets admitted")
+	}
+}

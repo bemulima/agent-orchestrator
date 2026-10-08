@@ -1,0 +1,144 @@
+package http
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/transport/http/api/v1/handlers"
+)
+
+const (
+	learningPathsStudentID = "11111111-1111-4111-8111-111111111111"
+	learningPathsPathID    = "22222222-2222-4222-8222-222222222222"
+)
+
+type legacyLearningPathGetterStub struct{ path domain.StudentLearningPath }
+
+func (stub legacyLearningPathGetterStub) Handle(context.Context, string) (domain.StudentLearningPath, error) {
+	return stub.path, nil
+}
+
+type learningPathCollectionHTTPStub struct {
+	expectedVersion int64
+	studentID       string
+	pathID          string
+}
+
+func (stub *learningPathCollectionHTTPStub) List(context.Context, string) (domain.StudentLearningPathList, error) {
+	return domain.StudentLearningPathList{
+		Schema: domain.LearningPathListSchemaVersion, StudentID: learningPathsStudentID, JourneyVersion: 4,
+		Items: []domain.StudentLearningPathSummary{},
+	}, nil
+}
+
+func (stub *learningPathCollectionHTTPStub) Get(
+	context.Context, string, string,
+) (domain.StudentLearningPathMutation, error) {
+	return domain.StudentLearningPathMutation{}, nil
+}
+
+func (stub *learningPathCollectionHTTPStub) GetContext(context.Context, string) (domain.StudentLearningContext, error) {
+	return domain.StudentLearningContext{
+		Schema: domain.LearningContextSchemaVersion, StudentID: learningPathsStudentID, Version: 4,
+	}, nil
+}
+
+func (stub *learningPathCollectionHTTPStub) Activate(
+	_ context.Context,
+	studentID string,
+	pathID string,
+	expectedVersion int64,
+	_ bool,
+) (domain.StudentLearningPathMutation, error) {
+	stub.studentID, stub.pathID, stub.expectedVersion = studentID, pathID, expectedVersion
+	return domain.StudentLearningPathMutation{
+		Path: domain.StudentLearningPath{ID: pathID, StudentID: studentID, Status: domain.LearningPathStatusActive, IsSelected: true},
+		Context: domain.StudentLearningContext{
+			Schema: domain.LearningContextSchemaVersion, StudentID: studentID,
+			SelectedLearningPathID: pathID, Version: expectedVersion + 1,
+		},
+	}, nil
+}
+
+func (stub *learningPathCollectionHTTPStub) Pause(
+	context.Context, string, string, int64,
+) (domain.StudentLearningPathMutation, error) {
+	return domain.StudentLearningPathMutation{}, nil
+}
+
+func (stub *learningPathCollectionHTTPStub) Resume(
+	context.Context, string, string, int64,
+) (domain.StudentLearningPathMutation, error) {
+	return domain.StudentLearningPathMutation{}, nil
+}
+
+func TestLegacyLearningPathResponseKeepsExactPreMultiPathShape(t *testing.T) {
+	createdAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	path := domain.StudentLearningPath{
+		ID: learningPathsPathID, StudentID: learningPathsStudentID,
+		CourseID: "33333333-3333-4333-8333-333333333333", GoalCode: "go.backend",
+		CurriculumRevision: "fingerprint-v1", CourseFingerprint: "fingerprint-v1",
+		PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "course-planner-v1",
+		ReasonCode: "initial_plan", ReasonSummary: "Build a Go API", Status: domain.LearningPathStatusActive,
+		IsPrimary: true, IsSelected: true, Version: 7, Items: []domain.LearningPathItem{},
+		CreatedAt: createdAt, UpdatedAt: createdAt.Add(time.Hour),
+	}
+	router := NewRouter(RouterDependencies{
+		AnswerHandler: &handlers.AnswerHandler{},
+		StudentLearningJourneyHandler: &handlers.StudentLearningJourneyHandler{
+			Paths: legacyLearningPathGetterStub{path: path},
+		},
+	})
+	request := authenticatedStudentRequest(http.MethodGet, "/api/v1/student/learning-path", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	want := `{"id":"22222222-2222-4222-8222-222222222222","student_id":"11111111-1111-4111-8111-111111111111","course_id":"33333333-3333-4333-8333-333333333333","goal_code":"go.backend","curriculum_revision":"fingerprint-v1","course_fingerprint":"fingerprint-v1","policy_version":"student-learning-path-v1","planner_policy_version":"course-planner-v1","reason_code":"initial_plan","reason_summary":"Build a Go API","version":7,"items":[],"created_at":"2026-09-04T10:00:00Z","updated_at":"2026-09-04T11:00:00Z"}` + "\n"
+	if response.Code != http.StatusOK || response.Body.String() != want {
+		t.Fatalf("status=%d\nbody=%s\nwant=%s", response.Code, response.Body.String(), want)
+	}
+}
+
+func TestLearningPathCollectionRoutesExposeJourneyVersionAndActivateAtomically(t *testing.T) {
+	collection := &learningPathCollectionHTTPStub{}
+	router := NewRouter(RouterDependencies{
+		AnswerHandler: &handlers.AnswerHandler{},
+		StudentLearningJourneyHandler: &handlers.StudentLearningJourneyHandler{
+			PathCollection: collection,
+		},
+	})
+	listRequest := authenticatedStudentRequest(http.MethodGet, "/api/v1/student/learning-paths", nil)
+	listResponse := httptest.NewRecorder()
+	router.ServeHTTP(listResponse, listRequest)
+	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), `"journey_version":4`) {
+		t.Fatalf("unexpected list response: status=%d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+
+	activateRequest := authenticatedStudentRequest(
+		http.MethodPost, "/api/v1/student/learning-paths/"+learningPathsPathID+"/activate",
+		strings.NewReader(`{"expected_version":4,"make_primary":true}`),
+	)
+	activateResponse := httptest.NewRecorder()
+	router.ServeHTTP(activateResponse, activateRequest)
+	if activateResponse.Code != http.StatusOK || collection.studentID != learningPathsStudentID ||
+		collection.pathID != learningPathsPathID || collection.expectedVersion != 4 {
+		t.Fatalf("activation was not scoped to the trusted learner/path/version: status=%d stub=%+v body=%s",
+			activateResponse.Code, collection, activateResponse.Body.String())
+	}
+}
+
+func authenticatedStudentRequest(method, target string, body *strings.Reader) *http.Request {
+	var request *http.Request
+	if body == nil {
+		request = httptest.NewRequest(method, target, nil)
+	} else {
+		request = httptest.NewRequest(method, target, body)
+	}
+	request.Header.Set("X-User-ID", learningPathsStudentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	return request
+}

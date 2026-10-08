@@ -1,0 +1,294 @@
+package teacherdialog
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+type PedagogyPlanner interface {
+	Plan(
+		teacher domain.PersonalTeacher,
+		request domain.DialogTeacherRequest,
+		student domain.StudentContext,
+		dialog domain.DialogRequestContext,
+		prior []domain.TeacherDecision,
+	) (domain.TeacherTeachingPlan, error)
+}
+
+// PedagogyMethodInput is the stable method boundary. New methodologies receive
+// the same validated context and cannot bypass the final plan invariants.
+type PedagogyMethodInput struct {
+	Teacher          domain.PersonalTeacher
+	Request          domain.DialogTeacherRequest
+	Student          domain.StudentContext
+	Dialog           domain.DialogRequestContext
+	Prior            []domain.TeacherDecision
+	SelectedFallback bool
+}
+
+// PedagogyMethod is a replaceable deterministic teaching method. A method is
+// selected by PersonalTeacher.PedagogyProfile and registered at composition.
+type PedagogyMethod interface {
+	Code() string
+	Version() string
+	Plan(input PedagogyMethodInput) (domain.TeacherTeachingPlan, error)
+}
+
+// PedagogyRegistry routes to registered methods without hard-coding method
+// switches into TeacherOrchestrator. Replacing a method is a composition change;
+// adding one requires only another implementation and registration.
+type PedagogyRegistry struct {
+	methods  map[string]PedagogyMethod
+	fallback string
+}
+
+func NewPedagogyRegistry(fallback string, methods ...PedagogyMethod) (PedagogyRegistry, error) {
+	fallback = normalizeMethodIdentity(fallback)
+	registry := PedagogyRegistry{methods: make(map[string]PedagogyMethod, len(methods)), fallback: fallback}
+	for _, method := range methods {
+		if method == nil {
+			return PedagogyRegistry{}, errors.New("pedagogy method is required")
+		}
+		code := normalizeMethodIdentity(method.Code())
+		version := normalizeMethodIdentity(method.Version())
+		if code == "" || len(code) > 64 || version == "" || len(version) > 64 {
+			return PedagogyRegistry{}, errors.New("invalid pedagogy method identity")
+		}
+		if _, exists := registry.methods[code]; exists {
+			return PedagogyRegistry{}, fmt.Errorf("duplicate pedagogy method %s", code)
+		}
+		registry.methods[code] = method
+	}
+	if _, exists := registry.methods[fallback]; !exists {
+		return PedagogyRegistry{}, errors.New("fallback pedagogy method is not registered")
+	}
+	return registry, nil
+}
+
+func (registry PedagogyRegistry) Plan(
+	teacher domain.PersonalTeacher,
+	request domain.DialogTeacherRequest,
+	student domain.StudentContext,
+	dialog domain.DialogRequestContext,
+	prior []domain.TeacherDecision,
+) (domain.TeacherTeachingPlan, error) {
+	normalizedRequest, err := validatePedagogyContext(teacher, request, student, dialog, prior)
+	if err != nil {
+		return domain.TeacherTeachingPlan{}, err
+	}
+	configured := normalizeMethodIdentity(teacher.PedagogyProfile)
+	method, found := registry.methods[configured]
+	if !found {
+		method = registry.methods[registry.fallback]
+	}
+	if method == nil {
+		return domain.TeacherTeachingPlan{}, errors.New("pedagogy registry is not configured")
+	}
+	plan, err := method.Plan(PedagogyMethodInput{
+		Teacher: teacher, Request: normalizedRequest, Student: student, Dialog: dialog,
+		Prior: append([]domain.TeacherDecision(nil), prior...), SelectedFallback: !found,
+	})
+	if err != nil {
+		return domain.TeacherTeachingPlan{}, err
+	}
+	plan, err = domain.NewTeacherTeachingPlan(plan)
+	if err != nil || plan.MethodCode != normalizeMethodIdentity(method.Code()) ||
+		plan.MethodVersion != normalizeMethodIdentity(method.Version()) {
+		return domain.TeacherTeachingPlan{}, domain.ErrInvalidTeacherDialogJob
+	}
+	return plan, nil
+}
+
+// ProgressiveHintMethod is the first replaceable deterministic method. It owns
+// the help ceiling; the model may formulate but cannot choose or raise it.
+type ProgressiveHintMethod struct{}
+
+func (ProgressiveHintMethod) Code() string    { return domain.DefaultPedagogyMethodCode }
+func (ProgressiveHintMethod) Version() string { return domain.ProgressiveHintMethodVersion }
+
+func (method ProgressiveHintMethod) Plan(input PedagogyMethodInput) (domain.TeacherTeachingPlan, error) {
+	if input.Request.ContextType == domain.LearningContextGeneral {
+		return domain.NewTeacherTeachingPlan(domain.TeacherTeachingPlan{
+			PolicyVersion: domain.TeacherDialogPolicyVersion,
+			MethodCode:    method.Code(), MethodVersion: method.Version(),
+			TeachingMode: domain.TeachingModeLesson, Strategy: "differentiated_instruction",
+			Stage: domain.AMCDOrient, Action: domain.TeacherActionRespond, HintLevel: 0,
+			Guidance: domain.TeacherGuidanceAdaptiveExplanation, AllowCompleteSolution: false,
+			ReasonCode:    "bounded_learner_overview",
+			ReasonSummary: "Answer the general teacher request using the bounded Student-owned learner overview and recent mastery projection.",
+		})
+	}
+	if input.Request.ContextType == domain.LearningContextLesson {
+		source := input.Dialog.Messages[len(input.Dialog.Messages)-1].LessonContext
+		if source == nil {
+			return domain.TeacherTeachingPlan{}, domain.ErrInvalidDialogContext
+		}
+		reasonCode := "verified_lesson_selection"
+		reasonSummary := "Explain only the selected fragment verified against the exact current Course revision."
+		if source.Mode == domain.LessonMessageModeOverview {
+			reasonCode = "verified_lesson_overview"
+			reasonSummary = "Answer using only the bounded lesson overview verified against the exact current Course revision."
+		}
+		if source.Schema == domain.LessonMessageContextSchemaVersionV2 {
+			reasonSummary = "Explain only the selected fragment verified against the exact frozen Student assignment."
+			if source.Mode == domain.LessonMessageModeOverview {
+				reasonSummary = "Answer using only the bounded overview verified against the exact frozen Student assignment."
+			}
+		}
+		return domain.NewTeacherTeachingPlan(domain.TeacherTeachingPlan{
+			PolicyVersion: domain.TeacherDialogPolicyVersion,
+			MethodCode:    method.Code(), MethodVersion: method.Version(),
+			TeachingMode: domain.TeachingModeLesson, Strategy: "conceptual_explanation",
+			Stage: domain.AMCDRealize, Action: domain.TeacherActionRespond, HintLevel: 0,
+			Guidance: domain.TeacherGuidanceAdaptiveExplanation, AllowCompleteSolution: false,
+			ReasonCode: reasonCode, ReasonSummary: reasonSummary,
+		})
+	}
+	maximumLevel := 0
+	priorHints := 0
+	for _, decision := range input.Prior {
+		if decision.Action != domain.TeacherActionGiveHint {
+			continue
+		}
+		priorHints++
+		if *decision.HintLevel > maximumLevel {
+			maximumLevel = *decision.HintLevel
+		}
+	}
+	level := maximumLevel + 1
+	limit := 7
+	if input.Student.PracticeTask != nil {
+		limit = input.Student.PracticeTask.AssistancePolicy.MaxHintLevel
+	}
+	if limit == 0 {
+		action := domain.TeacherActionAskQuestion
+		guidance := domain.TeacherGuidanceSocraticQuestion
+		strategy := "policy_bounded_question"
+		if input.Student.PracticeTask.AssistancePolicy.Teacher.MayExplain {
+			action = domain.TeacherActionRespond
+			guidance = domain.TeacherGuidanceAdaptiveExplanation
+			strategy = "policy_bounded_explanation"
+		}
+		return domain.NewTeacherTeachingPlan(domain.TeacherTeachingPlan{
+			PolicyVersion: domain.TeacherDialogPolicyVersion,
+			MethodCode:    method.Code(), MethodVersion: method.Version(), TeachingMode: domain.TeachingModePractice,
+			Strategy: strategy, Stage: domain.AMCDOrient, Action: action, HintLevel: 0,
+			Guidance: guidance, AllowCompleteSolution: false,
+			ReasonCode:    "practice_assistance_policy",
+			ReasonSummary: "The immutable task assistance policy forbids progressive hints; stay within its explanation/question boundary.",
+		})
+	}
+	if level > limit {
+		level = limit
+	}
+	guidance, strategy, stage := guidanceForLevel(level)
+	reasonCode := "progressive_hint"
+	if input.Student.PracticeTask != nil {
+		reasonCode = "practice_policy_bounded_hint"
+	}
+	if input.SelectedFallback || strings.ToLower(strings.TrimSpace(input.Teacher.HintPolicy)) != domain.DefaultHintPolicy {
+		reasonCode = "safe_progressive_fallback"
+	}
+	mode := domain.TeachingModePractice
+	if input.Request.ContextType == domain.LearningContextProject {
+		mode = domain.TeachingModeProject
+	}
+	return domain.NewTeacherTeachingPlan(domain.TeacherTeachingPlan{
+		PolicyVersion: domain.TeacherDialogPolicyVersion,
+		MethodCode:    method.Code(), MethodVersion: method.Version(),
+		TeachingMode: mode, Strategy: strategy, Stage: stage,
+		Action: domain.TeacherActionGiveHint, HintLevel: level, Guidance: guidance,
+		AllowCompleteSolution: false, ReasonCode: reasonCode,
+		ReasonSummary: fmt.Sprintf(
+			"Selected bounded hint level %d after %d prior hint decisions for this learning action.",
+			level, priorHints,
+		),
+	})
+}
+
+func validatePedagogyContext(
+	teacher domain.PersonalTeacher,
+	request domain.DialogTeacherRequest,
+	student domain.StudentContext,
+	dialog domain.DialogRequestContext,
+	prior []domain.TeacherDecision,
+) (domain.DialogTeacherRequest, error) {
+	normalizedRequest, err := domain.NewDialogTeacherRequest(request)
+	if err != nil || !domain.SupportsTeacherDialogRuntime(request.ContextType) {
+		return domain.DialogTeacherRequest{}, domain.ErrInvalidTeacherDialogJob
+	}
+	if _, err := domain.NewDialogRequestContext(dialog); err != nil {
+		return domain.DialogTeacherRequest{}, domain.ErrInvalidDialogContext
+	}
+	if !sameTeacherContext(teacher, normalizedRequest, student, dialog) {
+		return domain.DialogTeacherRequest{}, domain.ErrInvalidTeacherDialogJob
+	}
+	for _, decision := range prior {
+		if !requiresActionContext(normalizedRequest.ContextType) {
+			return domain.DialogTeacherRequest{}, domain.ErrInvalidTeacherDialogJob
+		}
+		if decision.StudentID != normalizedRequest.StudentID ||
+			decision.LearningActionID != normalizedRequest.LearningActionID {
+			return domain.DialogTeacherRequest{}, domain.ErrInvalidTeacherDialogJob
+		}
+		if decision.Action == domain.TeacherActionGiveHint &&
+			(decision.HintLevel == nil || *decision.HintLevel < 1 || *decision.HintLevel > 7) {
+			return domain.DialogTeacherRequest{}, domain.ErrInvalidTeacherDialogJob
+		}
+	}
+	return normalizedRequest, nil
+}
+
+func requiresActionContext(contextType domain.LearningContextType) bool {
+	return contextType == domain.LearningContextLessonTask ||
+		contextType == domain.LearningContextPracticeTask || contextType == domain.LearningContextProject
+}
+
+func sameTeacherContext(
+	teacher domain.PersonalTeacher,
+	request domain.DialogTeacherRequest,
+	student domain.StudentContext,
+	dialog domain.DialogRequestContext,
+) bool {
+	_, teacherIDErr := uuid.Parse(strings.TrimSpace(teacher.ID))
+	_, studentIDErr := uuid.Parse(strings.TrimSpace(teacher.StudentID))
+	return teacherIDErr == nil && studentIDErr == nil && teacher.ID == request.PersonalTeacherID &&
+		teacher.StudentID == request.StudentID && strings.TrimSpace(teacher.Language) != "" &&
+		student.StudentID == request.StudentID && student.LearningActionID == request.LearningActionID &&
+		student.ContextType == request.ContextType && student.ContextID == request.ContextID &&
+		dialog.DialogID == request.DialogID && dialog.StudentID == request.StudentID &&
+		dialog.PersonalTeacherID == request.PersonalTeacherID && dialog.ContextType == request.ContextType &&
+		dialog.ContextID == request.ContextID && dialog.SourceMessageID == request.SourceMessageID &&
+		dialog.LearningActionID == request.LearningActionID
+}
+
+func guidanceForLevel(level int) (domain.TeacherGuidance, string, domain.PedagogyStage) {
+	switch level {
+	case 1:
+		return domain.TeacherGuidanceSocraticQuestion, "socratic", domain.AMCDOrient
+	case 2:
+		return domain.TeacherGuidanceDirection, "scaffolding", domain.AMCDOrient
+	case 3:
+		return domain.TeacherGuidanceConceptReminder, "retrieval_practice", domain.AMCDOrient
+	case 4:
+		return domain.TeacherGuidanceAnalogousExample, "demonstration", domain.AMCDRealize
+	case 5:
+		return domain.TeacherGuidancePseudocode, "scaffolding", domain.AMCDExecute
+	case 6:
+		return domain.TeacherGuidancePartialStructure, "guided_practice", domain.AMCDExecute
+	default:
+		return domain.TeacherGuidanceGuidedBreakdown, "guided_practice", domain.AMCDExecute
+	}
+}
+
+func normalizeMethodIdentity(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+var _ PedagogyPlanner = PedagogyRegistry{}
+var _ PedagogyMethod = ProgressiveHintMethod{}

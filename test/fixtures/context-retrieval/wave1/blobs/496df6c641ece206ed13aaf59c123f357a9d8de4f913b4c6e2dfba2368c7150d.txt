@@ -1,0 +1,158 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+)
+
+func TestInitialDiagnosticPathRejectsStaleContextButReplaysCommittedPath(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_context WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path_request WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_onboarding WHERE student_id=$1`, studentID)
+	})
+	_, err := pool.Exec(ctx, `INSERT INTO student_onboarding(student_id,direction_code,self_assessed_experience,desired_stacks,goal_code,preferred_language,weekly_minutes,preferred_pace,profile_version,version,created_at,updated_at) VALUES($1,'backend','basic',ARRAY['go'],'go.backend','ru',60,'regular','student-onboarding-v1',2,now(),now())`, studentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	path := integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), time.Now().UTC())
+	request := repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("1", 64), ExpectedOnboardingVersion: 1, ExpectedDirectionCode: "backend"}
+	if _, _, err := repo.CreateLearningPathIdempotently(ctx, path, request); !errors.Is(err, domain.ErrDiagnosticContextStale) {
+		t.Fatalf("stale allocation: %v", err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path WHERE student_id=$1`, studentID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("stale side effects: count=%d err=%v", count, err)
+	}
+	request.ExpectedOnboardingVersion = 2
+	created, replayed, err := repo.CreateLearningPathIdempotently(ctx, path, request)
+	if err != nil || replayed {
+		t.Fatalf("create: replay=%v err=%v", replayed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE student_onboarding SET version=3,goal_code='distributed.systems',direction_code='systems' WHERE student_id=$1`, studentID); err != nil {
+		t.Fatal(err)
+	}
+	replayedPath, replayed, err := repo.CreateLearningPathIdempotently(ctx, path, request)
+	if err != nil || !replayed || replayedPath.ID != created.ID {
+		t.Fatalf("committed replay after context change: replay=%v err=%v", replayed, err)
+	}
+	request.IdempotencyKey, request.PlanningRequestID = uuid.NewString(), uuid.NewString()
+	if _, _, err := repo.CreateLearningPathIdempotently(ctx, path, request); !errors.Is(err, domain.ErrDiagnosticContextStale) {
+		t.Fatalf("fresh stale allocation after goal change: %v", err)
+	}
+}
+
+func TestLearningPathMultiPathLifecycleIsAtomicAndReplayStable(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	studentID := uuid.NewString()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_context WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path_request WHERE student_id=$1`, studentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM student_learning_path WHERE student_id=$1`, studentID)
+	})
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	now := time.Now().UTC()
+
+	firstRequest := repository.LearningPathCreationRequest{
+		IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("1", 64),
+	}
+	firstPath := integrationLearningPath(studentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), now)
+	first, replayed, err := repo.CreateLearningPathIdempotently(ctx, firstPath, firstRequest)
+	if err != nil || replayed || !first.IsPrimary || !first.IsSelected {
+		t.Fatalf("create first path: path=%+v replayed=%v err=%v", first, replayed, err)
+	}
+	contextValue, err := repo.GetLearningContext(ctx, studentID)
+	if err != nil || contextValue.Version != 1 || contextValue.SelectedLearningPathID != first.ID {
+		t.Fatalf("unexpected initial journey context: %+v err=%v", contextValue, err)
+	}
+	replay, replayed, err := repo.CreateLearningPathIdempotently(ctx, integrationLearningPath(
+		studentID, uuid.NewString(), first.CourseID, first.Items[0].ReferenceID, now.Add(time.Second),
+	), firstRequest)
+	if err != nil || !replayed || replay.ID != first.ID {
+		t.Fatalf("idempotent replay changed allocation: path=%+v replayed=%v err=%v", replay, replayed, err)
+	}
+	contextValue, _ = repo.GetLearningContext(ctx, studentID)
+	if contextValue.Version != 1 {
+		t.Fatalf("replay changed journey version: %+v", contextValue)
+	}
+
+	secondRequest := repository.LearningPathCreationRequest{
+		IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("2", 64),
+	}
+	second, replayed, err := repo.CreateLearningPathIdempotently(ctx, integrationLearningPath(
+		studentID, uuid.NewString(), uuid.NewString(), uuid.NewString(), now.Add(2*time.Second),
+	), secondRequest)
+	if err != nil || replayed || second.IsPrimary || second.IsSelected {
+		t.Fatalf("create second path: path=%+v replayed=%v err=%v", second, replayed, err)
+	}
+	contextValue, _ = repo.GetLearningContext(ctx, studentID)
+	if contextValue.Version != 2 || contextValue.SelectedLearningPathID != first.ID {
+		t.Fatalf("second path did not change exactly one journey version: %+v", contextValue)
+	}
+
+	noOp, err := repo.ActivateLearningPath(ctx, studentID, first.ID, 2, false, now.Add(3*time.Second))
+	if err != nil || noOp.Context.Version != 2 {
+		t.Fatalf("same-selection activation must be stable: %+v err=%v", noOp, err)
+	}
+	activated, err := repo.ActivateLearningPath(ctx, studentID, second.ID, 2, true, now.Add(4*time.Second))
+	if err != nil || activated.Context.Version != 3 || !activated.Path.IsPrimary || !activated.Path.IsSelected {
+		t.Fatalf("activate second path: %+v err=%v", activated, err)
+	}
+	paused, err := repo.PauseLearningPath(ctx, studentID, second.ID, 3, now.Add(5*time.Second))
+	if err != nil || paused.Context.Version != 4 || paused.Path.Status != domain.LearningPathStatusPaused ||
+		paused.Context.SelectedLearningPathID != first.ID {
+		t.Fatalf("pause primary path with fallback: %+v err=%v", paused, err)
+	}
+	var primaryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path WHERE student_id=$1 AND is_primary`, studentID).Scan(&primaryCount); err != nil || primaryCount != 1 {
+		t.Fatalf("primary invariant count=%d err=%v", primaryCount, err)
+	}
+
+	legacy, err := repo.GetLearningPath(ctx, studentID)
+	if err != nil {
+		t.Fatalf("get compatibility path: %v", err)
+	}
+	expectedPathVersion := legacy.Version
+	legacy.Version++
+	legacy.ReasonSummary = "Updated route"
+	legacy.UpdatedAt = now.Add(6 * time.Second)
+	if _, err := repo.ReplaceLearningPath(ctx, legacy, expectedPathVersion); err != nil {
+		t.Fatalf("replace compatibility path: %v", err)
+	}
+	contextValue, _ = repo.GetLearningContext(ctx, studentID)
+	if contextValue.Version != 5 {
+		t.Fatalf("path content mutation did not increment journey version once: %+v", contextValue)
+	}
+}
+
+func integrationLearningPath(studentID, pathID, courseID, lessonID string, now time.Time) domain.StudentLearningPath {
+	return domain.StudentLearningPath{
+		ID: pathID, StudentID: studentID, CourseID: courseID, GoalCode: "go.backend",
+		CurriculumRevision: "fingerprint-v1", PolicyVersion: domain.LearningPathPolicyVersion,
+		PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Build a Go API",
+		Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now,
+		Items: []domain.LearningPathItem{{
+			ReferenceType: "lesson", ReferenceID: lessonID, Position: 0,
+			Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap",
+		}},
+	}
+}

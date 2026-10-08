@@ -1,0 +1,233 @@
+package lessonexample
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+const maxExampleOrder = 32767
+
+var exampleSlugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// ReplaceLessonExamples atomically reconciles all examples owned by one lesson.
+type ReplaceLessonExamples struct {
+	Lessons  repository.LessonRepository
+	Examples repository.LessonExampleRepository
+	I18n     repository.I18nRepository
+	Tx       repository.TransactionManager
+}
+
+func (uc ReplaceLessonExamples) Handle(ctx context.Context, lessonID string, examples []domain.LessonExample) error {
+	lessonID, err := normalizeID(lessonID)
+	if err != nil || uc.Lessons == nil || uc.Examples == nil || uc.I18n == nil {
+		return domain.ErrValidation
+	}
+	normalized, err := normalizeExamples(lessonID, examples)
+	if err != nil {
+		return err
+	}
+	run := func(fn func(context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	return run(func(ctx context.Context) error {
+		if _, err := uc.Lessons.Get(ctx, lessonID); err != nil {
+			return err
+		}
+		if err := validateTranslationLanguages(ctx, uc.I18n, normalized); err != nil {
+			return err
+		}
+		return uc.Examples.ReplaceByLesson(ctx, lessonID, normalized)
+	})
+}
+
+// ListLessonExamples returns examples for one lesson.
+type ListLessonExamples struct {
+	Lessons  repository.LessonRepository
+	Examples repository.LessonExampleRepository
+}
+
+func (uc ListLessonExamples) Handle(ctx context.Context, lessonID string, activeOnly bool) ([]domain.LessonExample, error) {
+	lessonID, err := normalizeID(lessonID)
+	if err != nil || uc.Lessons == nil || uc.Examples == nil {
+		return nil, domain.ErrValidation
+	}
+	lesson, err := uc.Lessons.Get(ctx, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	if activeOnly && lesson.Status != domain.LessonStatusActive {
+		return nil, domain.ErrNotFound
+	}
+	return uc.Examples.ListByLesson(ctx, lessonID, activeOnly)
+}
+
+// DeleteLessonExample removes one example by ID.
+type DeleteLessonExample struct {
+	Examples repository.LessonExampleRepository
+}
+
+func (uc DeleteLessonExample) Handle(ctx context.Context, exampleID string) error {
+	exampleID, err := normalizeID(exampleID)
+	if err != nil || uc.Examples == nil {
+		return domain.ErrValidation
+	}
+	return uc.Examples.Delete(ctx, exampleID)
+}
+
+func normalizeExamples(lessonID string, examples []domain.LessonExample) ([]domain.LessonExample, error) {
+	result := make([]domain.LessonExample, 0, len(examples))
+	sourceKeys := make(map[string]struct{}, len(examples))
+	orders := make(map[int]struct{}, len(examples))
+	for _, example := range examples {
+		if example.ID == "" {
+			example.ID = uuid.NewString()
+		} else {
+			var err error
+			example.ID, err = normalizeID(example.ID)
+			if err != nil {
+				return nil, domain.ErrValidation
+			}
+		}
+		var err error
+		example.SourceKey, err = domain.NormalizeContentSourceKey(example.SourceKey)
+		if err != nil || example.SourceKey == "" {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := sourceKeys[example.SourceKey]; exists {
+			return nil, fmt.Errorf("%w: duplicate lesson example source_key", domain.ErrConflict)
+		}
+		sourceKeys[example.SourceKey] = struct{}{}
+		if example.Order < 1 || example.Order > maxExampleOrder {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := orders[example.Order]; exists {
+			return nil, fmt.Errorf("%w: duplicate lesson example order", domain.ErrConflict)
+		}
+		orders[example.Order] = struct{}{}
+		if example.Status != domain.LessonExampleStatusInactive && example.Status != domain.LessonExampleStatusActive {
+			return nil, domain.ErrValidation
+		}
+		example.Mode = strings.TrimSpace(example.Mode)
+		if len(example.Mode) > 128 || !exampleSlugPattern.MatchString(example.Mode) {
+			return nil, domain.ErrValidation
+		}
+		example.Stacks, err = normalizeSlugs(example.Stacks, true)
+		if err != nil {
+			return nil, err
+		}
+		example.TargetConcepts, err = normalizeSlugs(example.TargetConcepts, true)
+		if err != nil {
+			return nil, err
+		}
+		if example.PrimaryStack != nil {
+			primary := strings.TrimSpace(*example.PrimaryStack)
+			if !exampleSlugPattern.MatchString(primary) || !contains(example.Stacks, primary) {
+				return nil, domain.ErrValidation
+			}
+			example.PrimaryStack = &primary
+		}
+		example.Translations, err = normalizeTranslations(example.ID, example.Translations)
+		if err != nil {
+			return nil, err
+		}
+		example.LessonID = lessonID
+		result = append(result, example)
+	}
+	return result, nil
+}
+
+func normalizeTranslations(exampleID string, translations []domain.LessonExampleI18n) ([]domain.LessonExampleI18n, error) {
+	if len(translations) < 2 {
+		return nil, domain.ErrValidation
+	}
+	result := make([]domain.LessonExampleI18n, 0, len(translations))
+	ids := make(map[int]struct{}, len(translations))
+	for _, translation := range translations {
+		if translation.I18nID <= 0 {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := ids[translation.I18nID]; exists {
+			return nil, domain.ErrValidation
+		}
+		ids[translation.I18nID] = struct{}{}
+		if strings.TrimSpace(translation.Title) == "" || utf8.RuneCountInString(translation.Title) > 255 || strings.TrimSpace(translation.Description) == "" {
+			return nil, domain.ErrValidation
+		}
+		translation.ExampleID = exampleID
+		result = append(result, translation)
+	}
+	return result, nil
+}
+
+func validateTranslationLanguages(ctx context.Context, i18n repository.I18nRepository, examples []domain.LessonExample) error {
+	cache := make(map[int]string)
+	for _, example := range examples {
+		languages := make(map[string]struct{}, len(example.Translations))
+		for _, translation := range example.Translations {
+			language, ok := cache[translation.I18nID]
+			if !ok {
+				entry, err := i18n.GetByID(ctx, translation.I18nID)
+				if err != nil {
+					return err
+				}
+				language = strings.ToLower(strings.TrimSpace(entry.Language))
+				cache[translation.I18nID] = language
+			}
+			languages[language] = struct{}{}
+		}
+		if _, ok := languages["ru"]; !ok {
+			return domain.ErrValidation
+		}
+		if _, ok := languages["en"]; !ok {
+			return domain.ErrValidation
+		}
+	}
+	return nil
+}
+
+func normalizeSlugs(values []string, required bool) ([]string, error) {
+	if required && len(values) == 0 {
+		return nil, domain.ErrValidation
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if len(value) > 128 || !exampleSlugPattern.MatchString(value) {
+			return nil, domain.ErrValidation
+		}
+		if _, exists := seen[value]; exists {
+			return nil, domain.ErrValidation
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func normalizeID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if _, err := uuid.Parse(value); err != nil {
+		return "", domain.ErrValidation
+	}
+	return value, nil
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

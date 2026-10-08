@@ -1,0 +1,231 @@
+package postgres
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type CourseAssignmentRepoPG struct{ Pool *pgxpool.Pool }
+
+var _ repository.CourseAssignmentRepository = (*CourseAssignmentRepoPG)(nil)
+
+const courseAssignmentColumns = `id, student_id, course_id, status, assigned_by,
+initial_planning_request_id, assigned_at, started_at, completed_at, archived_at`
+
+func (repo *CourseAssignmentRepoPG) Assign(
+	ctx context.Context,
+	assignment domain.StudentCourseAssignment,
+	request domain.CourseAssignmentRequest,
+) (domain.StudentCourseAssignment, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentCourseAssignment{}, false, errors.New("course assignment repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentCourseAssignment(assignment)
+	if err != nil || !validCourseAssignmentRequest(request) || request.AssignmentID != normalized.ID {
+		return domain.StudentCourseAssignment{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentCourseAssignment{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, lockKey := range []string{
+		"course-assignment-request:" + request.IdempotencyKey,
+		"course-assignment-plan:" + request.PlanningRequestID,
+		"course-assignment:" + normalized.StudentID + ":" + normalized.CourseID,
+	} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+			return domain.StudentCourseAssignment{}, false, err
+		}
+	}
+
+	stored, storedHash, err := getAssignmentByRequest(ctx, tx, "idempotency_key", request.IdempotencyKey)
+	switch {
+	case err == nil:
+		if storedHash != request.RequestHash {
+			return domain.StudentCourseAssignment{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentCourseAssignment{}, false, err
+		}
+		return stored, true, nil
+	case !errors.Is(err, domain.ErrNotFound):
+		return domain.StudentCourseAssignment{}, false, err
+	}
+	if _, _, err := getAssignmentByRequest(ctx, tx, "planning_request_id", request.PlanningRequestID); err == nil {
+		return domain.StudentCourseAssignment{}, false, domain.ErrConflict
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentCourseAssignment{}, false, err
+	}
+
+	stored, err = getCourseAssignment(ctx, tx, normalized.StudentID, normalized.CourseID, true)
+	reused := false
+	switch {
+	case err == nil:
+		reused = true
+		if stored.Status == domain.CourseAssignmentArchived {
+			stored.Status = domain.CourseAssignmentAssigned
+			stored.ArchivedAt = nil
+			if _, err := tx.Exec(ctx, `UPDATE student_course_assignment
+SET status=$2, archived_at=NULL WHERE id=$1`, stored.ID, stored.Status); err != nil {
+				return domain.StudentCourseAssignment{}, false, err
+			}
+		}
+	case errors.Is(err, domain.ErrNotFound):
+		stored = normalized
+		if _, err := tx.Exec(ctx, `INSERT INTO student_course_assignment (`+courseAssignmentColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			stored.ID, stored.StudentID, stored.CourseID, stored.Status, stored.AssignedBy,
+			stored.InitialPlanningRequestID, stored.AssignedAt, stored.StartedAt, stored.CompletedAt, stored.ArchivedAt,
+		); err != nil {
+			return domain.StudentCourseAssignment{}, false, mapCourseAssignmentError(err)
+		}
+	default:
+		return domain.StudentCourseAssignment{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO student_course_assignment_request
+(idempotency_key, planning_request_id, request_hash, assignment_id)
+VALUES ($1,$2,$3,$4)`, request.IdempotencyKey, request.PlanningRequestID, request.RequestHash, stored.ID); err != nil {
+		return domain.StudentCourseAssignment{}, false, mapCourseAssignmentError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentCourseAssignment{}, false, err
+	}
+	return stored, reused, nil
+}
+
+func (repo *CourseAssignmentRepoPG) Get(
+	ctx context.Context,
+	studentID string,
+	courseID string,
+) (domain.StudentCourseAssignment, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentCourseAssignment{}, errors.New("course assignment repository pool is required")
+	}
+	return getCourseAssignment(ctx, repo.Pool, studentID, courseID, false)
+}
+
+func (repo *CourseAssignmentRepoPG) List(
+	ctx context.Context,
+	studentID string,
+) ([]domain.StudentCourseAssignment, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("course assignment repository pool is required")
+	}
+	rows, err := repo.Pool.Query(ctx, `SELECT `+courseAssignmentColumns+`
+FROM student_course_assignment
+WHERE student_id=$1 AND status <> 'ARCHIVED'
+ORDER BY assigned_at DESC, id DESC LIMIT 100`, studentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]domain.StudentCourseAssignment, 0)
+	for rows.Next() {
+		item, err := scanCourseAssignment(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+type courseAssignmentQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func getCourseAssignment(
+	ctx context.Context,
+	querier courseAssignmentQuerier,
+	studentID string,
+	courseID string,
+	forUpdate bool,
+) (domain.StudentCourseAssignment, error) {
+	query := `SELECT ` + courseAssignmentColumns + ` FROM student_course_assignment
+WHERE student_id=$1 AND course_id=$2`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	item, err := scanCourseAssignment(querier.QueryRow(ctx, query, studentID, courseID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentCourseAssignment{}, domain.ErrNotFound
+	}
+	return item, err
+}
+
+func getAssignmentByRequest(
+	ctx context.Context,
+	querier courseAssignmentQuerier,
+	column string,
+	value string,
+) (domain.StudentCourseAssignment, string, error) {
+	if column != "idempotency_key" && column != "planning_request_id" {
+		return domain.StudentCourseAssignment{}, "", domain.ErrValidation
+	}
+	var item domain.StudentCourseAssignment
+	var requestHash string
+	err := querier.QueryRow(ctx, `SELECT a.`+courseAssignmentColumnsWithAlias("a")+`, r.request_hash
+FROM student_course_assignment_request r
+JOIN student_course_assignment a ON a.id=r.assignment_id
+WHERE r.`+column+`=$1`, value).Scan(
+		&item.ID, &item.StudentID, &item.CourseID, &item.Status, &item.AssignedBy,
+		&item.InitialPlanningRequestID, &item.AssignedAt, &item.StartedAt, &item.CompletedAt, &item.ArchivedAt,
+		&requestHash,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentCourseAssignment{}, "", domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentCourseAssignment{}, "", err
+	}
+	item, err = domain.NormalizeStudentCourseAssignment(item)
+	return item, requestHash, err
+}
+
+func courseAssignmentColumnsWithAlias(alias string) string {
+	return `id, ` + alias + `.student_id, ` + alias + `.course_id, ` + alias + `.status, ` +
+		alias + `.assigned_by, ` + alias + `.initial_planning_request_id, ` + alias + `.assigned_at, ` +
+		alias + `.started_at, ` + alias + `.completed_at, ` + alias + `.archived_at`
+}
+
+type courseAssignmentScanner interface{ Scan(...any) error }
+
+func scanCourseAssignment(scanner courseAssignmentScanner) (domain.StudentCourseAssignment, error) {
+	var item domain.StudentCourseAssignment
+	if err := scanner.Scan(
+		&item.ID, &item.StudentID, &item.CourseID, &item.Status, &item.AssignedBy,
+		&item.InitialPlanningRequestID, &item.AssignedAt, &item.StartedAt, &item.CompletedAt, &item.ArchivedAt,
+	); err != nil {
+		return domain.StudentCourseAssignment{}, err
+	}
+	return domain.NormalizeStudentCourseAssignment(item)
+}
+
+func validCourseAssignmentRequest(request domain.CourseAssignmentRequest) bool {
+	decodedHash, hashError := hex.DecodeString(request.RequestHash)
+	return validStudentUUIDForAssignment(request.IdempotencyKey) &&
+		validStudentUUIDForAssignment(request.PlanningRequestID) &&
+		validStudentUUIDForAssignment(request.AssignmentID) && hashError == nil && len(decodedHash) == 32
+}
+
+func validStudentUUIDForAssignment(value string) bool {
+	_, err := uuid.Parse(value)
+	return err == nil
+}
+
+func mapCourseAssignmentError(err error) error {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+		return domain.ErrConflict
+	}
+	return err
+}

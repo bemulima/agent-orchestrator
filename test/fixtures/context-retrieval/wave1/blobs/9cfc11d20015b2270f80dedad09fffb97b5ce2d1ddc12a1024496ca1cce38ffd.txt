@@ -1,0 +1,190 @@
+package task
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+)
+
+type starterTaskRepo struct {
+	repository.TaskRepository
+	task   *domain.Task
+	err    error
+	events *[]string
+}
+
+func (repo starterTaskRepo) Get(context.Context, string) (*domain.Task, error) {
+	*repo.events = append(*repo.events, "task.get")
+	return repo.task, repo.err
+}
+
+type starterFilesRepo struct {
+	files         []domain.TaskFileStorage
+	replaceCalls  int
+	replaceErrors map[int]error
+	events        *[]string
+}
+
+func (repo *starterFilesRepo) ListByTask(context.Context, string) ([]domain.TaskFileStorage, error) {
+	*repo.events = append(*repo.events, "files.list")
+	return append([]domain.TaskFileStorage(nil), repo.files...), nil
+}
+
+func (repo *starterFilesRepo) ReplaceForTask(_ context.Context, _ string, files []domain.TaskFileStorage) error {
+	repo.replaceCalls++
+	*repo.events = append(*repo.events, "files.replace")
+	if err := repo.replaceErrors[repo.replaceCalls]; err != nil {
+		return err
+	}
+	repo.files = append([]domain.TaskFileStorage(nil), files...)
+	return nil
+}
+
+type starterStorage struct {
+	fileID      string
+	uploadErr   error
+	activateErr error
+	activations int
+	events      *[]string
+}
+
+func (storage *starterStorage) UploadStarterArchive(context.Context, string, string, []byte) (string, error) {
+	*storage.events = append(*storage.events, "storage.upload")
+	return storage.fileID, storage.uploadErr
+}
+
+func (storage *starterStorage) ActivateStarterArchive(context.Context, string) error {
+	storage.activations++
+	*storage.events = append(*storage.events, "storage.activate")
+	return storage.activateErr
+}
+
+type starterTx struct {
+	calls  int
+	events *[]string
+}
+
+func (tx *starterTx) WithTx(ctx repository.Context, fn func(repository.Context) error) error {
+	tx.calls++
+	*tx.events = append(*tx.events, "tx.begin")
+	if err := fn(ctx); err != nil {
+		*tx.events = append(*tx.events, "tx.rollback")
+		return err
+	}
+	*tx.events = append(*tx.events, "tx.commit")
+	return nil
+}
+
+func TestUploadStarterArchiveCommitsBindingBeforeActivation(t *testing.T) {
+	events := []string{}
+	oldFiles := []domain.TaskFileStorage{{TaskID: "task-id", Type: domain.TaskFileStorageTypeStarterArchive, FileStorageID: "old-file", Order: 1}}
+	files := &starterFilesRepo{files: oldFiles, events: &events}
+	storage := &starterStorage{fileID: "new-file", events: &events}
+	tx := &starterTx{events: &events}
+	useCase := UploadStarterArchive{
+		Tasks:     starterTaskRepo{task: &domain.Task{ID: "task-id"}, events: &events},
+		TaskFiles: files,
+		Uploader:  storage,
+		Activator: storage,
+		Tx:        tx,
+	}
+
+	result, err := useCase.Handle(context.Background(), UploadStarterArchiveInput{
+		TaskID:           "task-id",
+		OriginalFilename: "starter.zip",
+		ArchiveData:      []byte("archive"),
+	})
+
+	if err != nil {
+		t.Fatalf("upload failed: %v", err)
+	}
+	if len(result.StarterFiles) != 1 || result.StarterFiles[0].FileStorageID != "new-file" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(files.files) != 1 || files.files[0].FileStorageID != "new-file" || tx.calls != 1 || storage.activations != 1 {
+		t.Fatalf("unexpected state: files=%#v tx=%d activations=%d", files.files, tx.calls, storage.activations)
+	}
+	wantEvents := []string{"task.get", "storage.upload", "tx.begin", "files.list", "files.replace", "tx.commit", "storage.activate"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events=%v, want %v", events, wantEvents)
+	}
+}
+
+func TestUploadStarterArchiveRestoresPreviousBindingWhenActivationFails(t *testing.T) {
+	events := []string{}
+	activationErr := errors.New("filestorage unavailable")
+	oldFiles := []domain.TaskFileStorage{{TaskID: "task-id", Type: domain.TaskFileStorageTypeStarterArchive, FileStorageID: "old-file", Order: 1}}
+	files := &starterFilesRepo{files: oldFiles, events: &events}
+	storage := &starterStorage{fileID: "new-file", activateErr: activationErr, events: &events}
+	tx := &starterTx{events: &events}
+	useCase := UploadStarterArchive{
+		Tasks:     starterTaskRepo{task: &domain.Task{ID: "task-id"}, events: &events},
+		TaskFiles: files,
+		Uploader:  storage,
+		Activator: storage,
+		Tx:        tx,
+	}
+
+	result, err := useCase.Handle(context.Background(), UploadStarterArchiveInput{TaskID: "task-id", ArchiveData: []byte("archive")})
+
+	if result != nil || !errors.Is(err, activationErr) {
+		t.Fatalf("unexpected result=%#v err=%v", result, err)
+	}
+	if len(files.files) != 1 || files.files[0].FileStorageID != "old-file" || tx.calls != 2 {
+		t.Fatalf("previous binding was not restored: files=%#v tx=%d", files.files, tx.calls)
+	}
+	wantEvents := []string{
+		"task.get", "storage.upload",
+		"tx.begin", "files.list", "files.replace", "tx.commit",
+		"storage.activate",
+		"tx.begin", "files.replace", "tx.commit",
+	}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events=%v, want %v", events, wantEvents)
+	}
+}
+
+func TestUploadStarterArchiveLeavesTemporaryFileUnactivatedWhenBindingFails(t *testing.T) {
+	events := []string{}
+	replaceErr := errors.New("replace failed")
+	files := &starterFilesRepo{
+		files:         []domain.TaskFileStorage{{FileStorageID: "old-file"}},
+		replaceErrors: map[int]error{1: replaceErr},
+		events:        &events,
+	}
+	storage := &starterStorage{fileID: "new-file", events: &events}
+	useCase := UploadStarterArchive{
+		Tasks:     starterTaskRepo{task: &domain.Task{ID: "task-id"}, events: &events},
+		TaskFiles: files,
+		Uploader:  storage,
+		Activator: storage,
+		Tx:        &starterTx{events: &events},
+	}
+
+	_, err := useCase.Handle(context.Background(), UploadStarterArchiveInput{TaskID: "task-id", ArchiveData: []byte("archive")})
+
+	if !errors.Is(err, replaceErr) || storage.activations != 0 || files.files[0].FileStorageID != "old-file" {
+		t.Fatalf("unexpected failure state: err=%v activations=%d files=%#v", err, storage.activations, files.files)
+	}
+	if strings.Join(events, ",") != "task.get,storage.upload,tx.begin,files.list,files.replace,tx.rollback" {
+		t.Fatalf("unexpected events: %v", events)
+	}
+}
+
+func TestUploadStarterArchiveRequiresLifecycleDependencies(t *testing.T) {
+	events := []string{}
+	useCase := UploadStarterArchive{
+		Tasks:     starterTaskRepo{task: &domain.Task{ID: "task-id"}, events: &events},
+		TaskFiles: &starterFilesRepo{events: &events},
+		Uploader:  &starterStorage{fileID: "new-file", events: &events},
+	}
+
+	if _, err := useCase.Handle(context.Background(), UploadStarterArchiveInput{TaskID: "task-id", ArchiveData: []byte("archive")}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("missing lifecycle dependencies returned %v", err)
+	}
+}

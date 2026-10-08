@@ -1,0 +1,441 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+const (
+	marketplacePreviewRuntimeEnv  = "MARKETPLACE_PREVIEW_RUNTIME_JSON"
+	marketplacePreviewVariantsEnv = "MARKETPLACE_PREVIEW_VARIANTS_JSON"
+	marketplacePreviewSlug        = "marketplace-beginner-junior-pilot"
+	marketplacePreviewRevisionID  = "00000000-0000-4000-8000-000000000001"
+)
+
+type marketplacePreviewAdminVariantEnvelope struct {
+	Items []marketplacePreviewAdminVariant `json:"items"`
+}
+
+type marketplacePreviewAdminVariant struct {
+	ID                              string          `json:"id"`
+	Code                            string          `json:"code"`
+	ReviewPolicyJSON                json.RawMessage `json:"review_policy_json"`
+	AIReviewContractJSON            json.RawMessage `json:"ai_review_contract_json"`
+	MentorRubricJSON                json.RawMessage `json:"mentor_rubric_json"`
+	IntegrationTestSuiteRef         *string         `json:"integration_test_suite_ref"`
+	IntegrationReferenceSolutionRef *string         `json:"integration_reference_solution_ref"`
+	IntegrationNegativeFixtureRefs  []string        `json:"integration_negative_fixture_refs"`
+	VerificationRunnerRef           *string         `json:"verification_runner_ref"`
+}
+
+type marketplacePreviewStyleAssertion struct {
+	Selector    string   `json:"selector"`
+	Property    string   `json:"property"`
+	AnyOfValues []string `json:"anyOfValues"`
+	NonZero     bool     `json:"nonZero"`
+}
+
+type marketplacePreviewStyleAlternative struct {
+	Assertions []marketplacePreviewStyleAssertion `json:"assertions"`
+}
+
+type marketplacePreviewStyleAnyOf struct {
+	ID           string                               `json:"id"`
+	Alternatives []marketplacePreviewStyleAlternative `json:"alternatives"`
+}
+
+type marketplacePreviewValidationContract struct {
+	Stages []struct {
+		ID     string `json:"id"`
+		Engine string `json:"engine"`
+		Checks struct {
+			ComputedStyleAnyOf []marketplacePreviewStyleAnyOf `json:"computedStyleAnyOf"`
+		} `json:"checks"`
+	} `json:"stages"`
+}
+
+func TestMarketplaceV1PreviewLifecycleFromCatalog(t *testing.T) {
+	runtimePayload := []byte(os.Getenv(marketplacePreviewRuntimeEnv))
+	variantsPayload := []byte(os.Getenv(marketplacePreviewVariantsEnv))
+	if len(runtimePayload) == 0 || len(variantsPayload) == 0 {
+		t.Skipf("set %s and %s to run the read-only Marketplace preview E2E", marketplacePreviewRuntimeEnv, marketplacePreviewVariantsEnv)
+	}
+
+	assertMarketplaceRuntimeHidesPrivateEvaluation(t, runtimePayload)
+	runtimeContext := decodeMarketplacePreviewRuntime(t, runtimePayload)
+	adminVariants := decodeMarketplacePreviewAdminVariants(t, variantsPayload)
+	assertMarketplaceDraftIdentity(t, runtimeContext)
+	assertMarketplaceAdminEvaluation(t, runtimeContext, adminVariants)
+
+	previewRuntime := runtimeContext
+	previewRuntime.RevisionID = marketplacePreviewRevisionID
+	previewRuntime.RevisionNumber = 1
+	previewRuntime.PracticeTask.Status = domain.PracticeTaskStatusActive
+	previewRuntime.PracticeTask.Visibility = domain.PracticeTaskVisibilityPublic
+
+	expectedMilestones := map[string]int{
+		"html-beginner":      1,
+		"html-css-beginner":  2,
+		"html-css-js-junior": 3,
+	}
+	selectedByCode := make(map[string][]domain.PracticeTaskRuntimeMilestone, len(expectedMilestones))
+	lessonsByCode := make(map[string][]string, len(expectedMilestones))
+	for code, expectedCount := range expectedMilestones {
+		variant := marketplaceVariantByCode(t, previewRuntime.SolutionVariants, code)
+		selected := marketplaceSelectedMilestones(t, previewRuntime, variant)
+		if len(selected) != expectedCount {
+			t.Fatalf("variant %s selected %d milestones, want %d", code, len(selected), expectedCount)
+		}
+		assertMarketplaceMilestoneRuntime(t, code, selected)
+		selectedByCode[code] = selected
+		lessonsByCode[code] = marketplaceLessonRoute(selected)
+		assertMarketplaceMaterialization(t, previewRuntime, variant, expectedCount)
+	}
+
+	assertMarketplaceLessonReuse(t, lessonsByCode)
+	assertMarketplaceCSSSpacingContract(t, selectedByCode["html-css-beginner"])
+	assertMarketplaceFinalReviewFlow(
+		t,
+		previewRuntime,
+		marketplaceVariantByCode(t, previewRuntime.SolutionVariants, "html-css-js-junior"),
+		selectedByCode["html-css-js-junior"],
+		adminVariants,
+	)
+}
+
+func assertMarketplaceCSSSpacingContract(t *testing.T, milestones []domain.PracticeTaskRuntimeMilestone) {
+	t.Helper()
+	for _, milestone := range milestones {
+		var contract marketplacePreviewValidationContract
+		if err := json.Unmarshal(milestone.ValidationContractJSON, &contract); err != nil {
+			t.Fatalf("decode Marketplace validation contract for milestone %s: %v", milestone.ID, err)
+		}
+		for _, stage := range contract.Stages {
+			if stage.ID != "marketplace-card-spacing" {
+				continue
+			}
+			if stage.Engine != "browser.runtime" || len(stage.Checks.ComputedStyleAnyOf) != 1 {
+				t.Fatalf("Marketplace CSS spacing stage is incomplete: %#v", stage)
+			}
+			group := stage.Checks.ComputedStyleAnyOf[0]
+			if group.ID != "catalog-spacing" || len(group.Alternatives) < 3 {
+				t.Fatalf("Marketplace CSS alternatives are incomplete: %#v", group)
+			}
+			if !hasDisplayAndNonZeroGapAlternative(group.Alternatives) || !hasNonZeroCardMarginAlternative(group.Alternatives) {
+				t.Fatalf("Marketplace CSS contract must accept an effective grid/flex gap or card margin: %#v", group)
+			}
+			return
+		}
+	}
+	t.Fatal("Marketplace CSS runtime contract lacks marketplace-card-spacing")
+}
+
+func hasDisplayAndNonZeroGapAlternative(alternatives []marketplacePreviewStyleAlternative) bool {
+	for _, alternative := range alternatives {
+		hasDisplay := false
+		hasGap := false
+		for _, assertion := range alternative.Assertions {
+			if assertion.Selector == "main" && assertion.Property == "display" && len(assertion.AnyOfValues) >= 2 {
+				hasDisplay = true
+			}
+			if assertion.Selector == "main" && (assertion.Property == "row-gap" || assertion.Property == "column-gap") && assertion.NonZero {
+				hasGap = true
+			}
+		}
+		if hasDisplay && hasGap {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonZeroCardMarginAlternative(alternatives []marketplacePreviewStyleAlternative) bool {
+	for _, alternative := range alternatives {
+		for _, assertion := range alternative.Assertions {
+			if assertion.Selector == ".product-card" && len(assertion.Property) > len("margin-") && assertion.Property[:len("margin-")] == "margin-" && assertion.NonZero {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func decodeMarketplacePreviewRuntime(t *testing.T, payload []byte) domain.PracticeTaskRuntimeContext {
+	t.Helper()
+	var runtimeContext domain.PracticeTaskRuntimeContext
+	if err := json.Unmarshal(payload, &runtimeContext); err != nil {
+		t.Fatalf("decode Marketplace runtime context: %v", err)
+	}
+	return runtimeContext
+}
+
+func decodeMarketplacePreviewAdminVariants(t *testing.T, payload []byte) []marketplacePreviewAdminVariant {
+	t.Helper()
+	var envelope marketplacePreviewAdminVariantEnvelope
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		t.Fatalf("decode Marketplace admin variants: %v", err)
+	}
+	if len(envelope.Items) != 3 {
+		t.Fatalf("Marketplace admin catalog exposes %d variants, want 3", len(envelope.Items))
+	}
+	return envelope.Items
+}
+
+func assertMarketplaceDraftIdentity(t *testing.T, runtimeContext domain.PracticeTaskRuntimeContext) {
+	t.Helper()
+	if runtimeContext.PracticeTask.Slug != marketplacePreviewSlug {
+		t.Fatalf("runtime slug = %q, want %q", runtimeContext.PracticeTask.Slug, marketplacePreviewSlug)
+	}
+	if runtimeContext.RevisionID != "" || runtimeContext.RevisionNumber != 0 {
+		t.Fatalf("working catalog was unexpectedly published: revision=%q number=%d", runtimeContext.RevisionID, runtimeContext.RevisionNumber)
+	}
+	if runtimeContext.PracticeTask.Status != domain.PracticeTaskStatusDraft || runtimeContext.PracticeTask.Visibility != domain.PracticeTaskVisibilityPrivate {
+		t.Fatalf("working catalog must remain draft/private, got status=%d visibility=%d", runtimeContext.PracticeTask.Status, runtimeContext.PracticeTask.Visibility)
+	}
+	if len(runtimeContext.PracticeTaskParts) != 2 || len(runtimeContext.PracticeTaskMilestones) != 3 || len(runtimeContext.SolutionVariants) != 3 {
+		t.Fatalf("unexpected Marketplace shape: parts=%d milestones=%d variants=%d", len(runtimeContext.PracticeTaskParts), len(runtimeContext.PracticeTaskMilestones), len(runtimeContext.SolutionVariants))
+	}
+}
+
+func assertMarketplaceRuntimeHidesPrivateEvaluation(t *testing.T, payload []byte) {
+	t.Helper()
+	for _, forbidden := range [][]byte{
+		[]byte(`"ai_review_contract_json"`),
+		[]byte(`"mentor_rubric_json"`),
+		[]byte(`"integration_test_suite_ref"`),
+		[]byte(`"integration_reference_solution_ref"`),
+		[]byte(`"integration_negative_fixture_refs"`),
+		[]byte(`"verification_runner_ref"`),
+	} {
+		if bytes.Contains(payload, forbidden) {
+			t.Fatalf("student runtime leaked private field %s", forbidden)
+		}
+	}
+}
+
+func assertMarketplaceAdminEvaluation(t *testing.T, runtimeContext domain.PracticeTaskRuntimeContext, items []marketplacePreviewAdminVariant) {
+	t.Helper()
+	for _, runtimeVariant := range runtimeContext.SolutionVariants {
+		adminVariant := marketplaceAdminVariantByID(t, items, runtimeVariant.ID)
+		if adminVariant.Code != runtimeVariant.Code {
+			t.Fatalf("variant %s code mismatch: runtime=%q admin=%q", runtimeVariant.ID, runtimeVariant.Code, adminVariant.Code)
+		}
+		if !bytes.Equal(bytes.TrimSpace(adminVariant.ReviewPolicyJSON), bytes.TrimSpace(runtimeVariant.ReviewPolicyJSON)) {
+			t.Fatalf("variant %s public review policy differs from the authoring policy", runtimeVariant.Code)
+		}
+		var contract domain.PracticeTaskAIReviewContract
+		if err := json.Unmarshal(adminVariant.AIReviewContractJSON, &contract); err != nil {
+			t.Fatalf("variant %s AI review contract is invalid: %v", runtimeVariant.Code, err)
+		}
+		if contract.Version != 1 || contract.TemplateCode == "" || contract.ResponseSchemaCode == "" || len(contract.WhatToCheck) == 0 || len(contract.WhatNotToCheck) == 0 || len(contract.AllowedVariations) == 0 || len(contract.UncertainWhen) == 0 {
+			t.Fatalf("variant %s AI review contract is incomplete: %#v", runtimeVariant.Code, contract)
+		}
+		if !jsonObjectHasValues(adminVariant.MentorRubricJSON) || adminVariant.IntegrationTestSuiteRef == nil || adminVariant.IntegrationReferenceSolutionRef == nil || len(adminVariant.IntegrationNegativeFixtureRefs) == 0 || adminVariant.VerificationRunnerRef == nil {
+			t.Fatalf("variant %s private mentor/integration bundle is incomplete", runtimeVariant.Code)
+		}
+	}
+}
+
+func marketplaceVariantByCode(t *testing.T, items []domain.PracticeTaskRuntimeVariant, code string) domain.PracticeTaskRuntimeVariant {
+	t.Helper()
+	for _, item := range items {
+		if item.Code == code {
+			return item
+		}
+	}
+	t.Fatalf("Marketplace variant %q not found", code)
+	return domain.PracticeTaskRuntimeVariant{}
+}
+
+func marketplaceAdminVariantByID(t *testing.T, items []marketplacePreviewAdminVariant, id string) marketplacePreviewAdminVariant {
+	t.Helper()
+	for _, item := range items {
+		if item.ID == id {
+			return item
+		}
+	}
+	t.Fatalf("Marketplace admin variant %q not found", id)
+	return marketplacePreviewAdminVariant{}
+}
+
+func marketplaceSelectedMilestones(t *testing.T, runtimeContext domain.PracticeTaskRuntimeContext, variant domain.PracticeTaskRuntimeVariant) []domain.PracticeTaskRuntimeMilestone {
+	t.Helper()
+	selected, err := milestonesForSolutionVariant(runtimeContext.PracticeTaskMilestones, variant)
+	if err != nil {
+		t.Fatalf("select Marketplace variant %s milestones: %v", variant.Code, err)
+	}
+	return selected
+}
+
+func assertMarketplaceMilestoneRuntime(t *testing.T, variantCode string, items []domain.PracticeTaskRuntimeMilestone) {
+	t.Helper()
+	for _, item := range items {
+		if !item.IsActive || item.PracticeTaskMilestoneID == "" || item.PracticeTaskPartID == "" {
+			t.Fatalf("variant %s contains unusable milestone %#v", variantCode, item)
+		}
+		if !jsonObjectHasValues(item.ValidationContractJSON) || !jsonObjectHasValues(item.StarterWorkspaceJSON) || !jsonObjectHasValues(item.RuntimeProfileJSON) {
+			t.Fatalf("variant %s milestone %s lacks contract, starter, or runtime profile", variantCode, item.ID)
+		}
+		if len(item.LessonBindings) != 1 {
+			t.Fatalf("variant %s milestone %s has %d lesson bindings, want 1", variantCode, item.ID, len(item.LessonBindings))
+		}
+		lesson := item.LessonBindings[0]
+		if lesson.CourseID == "" || lesson.LessonID == "" || lesson.Requirement != domain.PracticeTaskLessonRequirementRequired || lesson.StepTitle == "" || lesson.StepInstructions == "" {
+			t.Fatalf("variant %s milestone %s has incomplete project lesson step: %#v", variantCode, item.ID, lesson)
+		}
+	}
+}
+
+func assertMarketplaceMaterialization(t *testing.T, runtimeContext domain.PracticeTaskRuntimeContext, variant domain.PracticeTaskRuntimeVariant, expected int) {
+	t.Helper()
+	repositoryStub := &materializationRepositoryStub{}
+	useCase := StudentUseCase{
+		Catalog:  materializationCatalogStub{runtimeContext: runtimeContext, revisionID: runtimeContext.RevisionID},
+		Students: repositoryStub,
+	}
+	created, err := useCase.CreateStudentPracticeTask(context.Background(), "marketplace-preview-student", runtimeContext.PracticeTask.ID, variant.ID)
+	if err != nil {
+		t.Fatalf("materialize Marketplace variant %s: %v", variant.Code, err)
+	}
+	if created.PracticeTaskRevisionID != marketplacePreviewRevisionID || created.PracticeTaskSolutionVariantID != variant.ID {
+		t.Fatalf("variant %s did not pin preview revision and selected route: %#v", variant.Code, created)
+	}
+	if len(repositoryStub.createdMilestones) != expected {
+		t.Fatalf("variant %s materialized %d milestones, want %d", variant.Code, len(repositoryStub.createdMilestones), expected)
+	}
+}
+
+func marketplaceLessonRoute(items []domain.PracticeTaskRuntimeMilestone) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		for _, lesson := range item.LessonBindings {
+			result = append(result, lesson.LessonID)
+		}
+	}
+	return result
+}
+
+func assertMarketplaceLessonReuse(t *testing.T, routes map[string][]string) {
+	t.Helper()
+	html := routes["html-beginner"]
+	css := routes["html-css-beginner"]
+	junior := routes["html-css-js-junior"]
+	if len(html) != 1 || len(css) != 2 || len(junior) != 3 {
+		t.Fatalf("unexpected Marketplace lesson routes: html=%v css=%v junior=%v", html, css, junior)
+	}
+	if html[0] != css[0] || html[0] != junior[0] || css[1] != junior[1] {
+		t.Fatalf("progressive variants do not reuse completed lessons: html=%v css=%v junior=%v", html, css, junior)
+	}
+}
+
+func assertMarketplaceFinalReviewFlow(
+	t *testing.T,
+	runtimeContext domain.PracticeTaskRuntimeContext,
+	variant domain.PracticeTaskRuntimeVariant,
+	selected []domain.PracticeTaskRuntimeMilestone,
+	adminVariants []marketplacePreviewAdminVariant,
+) {
+	t.Helper()
+	adminVariant := marketplaceAdminVariantByID(t, adminVariants, variant.ID)
+	evaluation := domain.PracticeTaskEvaluationContext{Variants: []domain.PracticeTaskVariantEvaluation{{
+		PracticeTaskSolutionVariantID:   variant.ID,
+		AIReviewContractJSON:            adminVariant.AIReviewContractJSON,
+		MentorRubricJSON:                adminVariant.MentorRubricJSON,
+		IntegrationTestSuiteRef:         adminVariant.IntegrationTestSuiteRef,
+		IntegrationReferenceSolutionRef: adminVariant.IntegrationReferenceSolutionRef,
+		IntegrationNegativeFixtureRefs:  append([]string(nil), adminVariant.IntegrationNegativeFixtureRefs...),
+		VerificationRunnerRef:           adminVariant.VerificationRunnerRef,
+	}}}
+
+	now := time.Now().UTC()
+	answerID := "marketplace-preview-final-answer"
+	sandboxID := "marketplace-preview-sandbox"
+	studentMilestones := make([]domain.StudentPracticeTaskMilestone, 0, len(selected))
+	for index, item := range selected {
+		studentMilestone := domain.StudentPracticeTaskMilestone{
+			ID:                          fmt.Sprintf("marketplace-preview-milestone-%d", index+1),
+			StudentPracticeTaskID:       "marketplace-preview-project",
+			PracticeTaskPartMilestoneID: item.ID,
+			PracticeTaskPartID:          item.PracticeTaskPartID,
+			PracticeTaskMilestoneID:     item.PracticeTaskMilestoneID,
+			Status:                      domain.StudentMilestoneStatusPassed,
+			BestResultJSON:              json.RawMessage(`{"passed":true}`),
+			PassedAt:                    &now,
+		}
+		if index == len(selected)-1 {
+			studentMilestone.TaskAnswerID = &answerID
+		}
+		studentMilestones = append(studentMilestones, studentMilestone)
+	}
+
+	repositoryStub := &finalReviewRepositoryStub{
+		project: domain.StudentPracticeTask{
+			ID:                            "marketplace-preview-project",
+			StudentID:                     "marketplace-preview-student",
+			PracticeTaskID:                runtimeContext.PracticeTask.ID,
+			PracticeTaskRevisionID:        runtimeContext.RevisionID,
+			PracticeTaskSolutionVariantID: variant.ID,
+			Status:                        domain.StudentPracticeTaskStatusReadyForReview,
+			ActiveSandboxID:               &sandboxID,
+		},
+		milestones: studentMilestones,
+		artifacts: []domain.StudentPracticeTaskArtifact{{
+			ID:                    "marketplace-preview-artifact",
+			StudentPracticeTaskID: "marketplace-preview-project",
+			StorageFileID:         "marketplace-preview-storage",
+			MetaJSON:              json.RawMessage(`{"task_answer_id":"marketplace-preview-final-answer"}`),
+			CreatedAt:             now,
+		}},
+	}
+	validation := &finalReviewValidationStub{passed: true}
+	useCase := StudentUseCase{
+		Catalog:  finalReviewCatalogStub{runtime: runtimeContext, evaluation: evaluation},
+		Students: repositoryStub,
+		Sandbox: finalReviewSandboxStub{files: []domain.WorkspaceFile{
+			{Path: "index.html", Content: `<main><article class="product-card"><button>Добавить в корзину</button></article></main>`},
+			{Path: "styles.css", Content: `main{display:grid;gap:1rem}.product-card{border:1px solid;padding:1rem}`},
+			{Path: "script.js", Content: `document.querySelector("button").addEventListener("click", updateCart)`},
+		}},
+		Validation: validation,
+		AIReview:   nil,
+	}
+
+	review, err := useCase.SubmitPracticeTaskFinalReview(context.Background(), repositoryStub.project.StudentID, repositoryStub.project.ID)
+	if err != nil {
+		t.Fatalf("submit Marketplace final review: %v", err)
+	}
+	if validation.calls != len(selected) {
+		t.Fatalf("final review revalidated %d milestones, want %d", validation.calls, len(selected))
+	}
+	if review.Status != domain.PracticeTaskFinalReviewStatusPendingMentor || review.AIStatus != domain.PracticeTaskAIReviewStatusUnavailable {
+		t.Fatalf("optional AI outage did not fall back to mentor: %#v", review)
+	}
+	queue, err := useCase.ListPendingPracticeTaskFinalReviews(context.Background(), 10, 0)
+	if err != nil {
+		t.Fatalf("load Marketplace mentor queue: %v", err)
+	}
+	if len(queue) != 1 || !bytes.Equal(bytes.TrimSpace(queue[0].MentorRubricJSON), bytes.TrimSpace(adminVariant.MentorRubricJSON)) {
+		t.Fatalf("mentor queue did not preserve the Marketplace rubric: %#v", queue)
+	}
+
+	score := 100.0
+	approved, err := useCase.ReviewPracticeTaskFinalSubmission(context.Background(), "marketplace-preview-mentor", repositoryStub.project.ID, review.ID, PracticeTaskMentorDecision{Passed: true, Score: &score})
+	if err != nil {
+		t.Fatalf("approve Marketplace final review: %v", err)
+	}
+	if approved.Status != domain.PracticeTaskFinalReviewStatusPassed || approved.MentorStatus != domain.PracticeTaskMentorReviewStatusPassed || repositoryStub.project.Status != domain.StudentPracticeTaskStatusCompleted || repositoryStub.project.CompletedAt == nil {
+		t.Fatalf("mentor approval did not complete Marketplace: review=%#v project=%#v", approved, repositoryStub.project)
+	}
+}
+
+func jsonObjectHasValues(value json.RawMessage) bool {
+	var object map[string]any
+	return json.Unmarshal(value, &object) == nil && len(object) > 0
+}

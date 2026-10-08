@@ -1,0 +1,592 @@
+package courseclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+// Client implements answer.TaskProvider using ms-course-service HTTP API.
+type Client struct {
+	BaseURL          string
+	InternalToken    string
+	HTTPClient       *http.Client
+	AssignmentAccess answer.AssignedCourseAccess
+}
+
+func (c Client) GetLesson(ctx context.Context, lessonID string) (*answer.LessonMetadata, error) {
+	if c.BaseURL == "" {
+		return nil, fmt.Errorf("course service base url is empty")
+	}
+	publicAccessErr := c.requirePublicAccess(ctx, "lesson", lessonID)
+	if publicAccessErr != nil && !c.canTryAssignedAccess(ctx, publicAccessErr) {
+		return nil, publicAccessErr
+	}
+	endpoint := fmt.Sprintf(
+		"%s/internal/lesson/get-internal-lesson/%s",
+		strings.TrimRight(c.BaseURL, "/"),
+		lessonID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", c.InternalToken)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return nil, domain.ErrNotFound
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return nil, domain.ErrForbidden
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("course service error: %s", resp.Status)
+	}
+
+	var payload struct {
+		ID          string `json:"id"`
+		CourseID    string `json:"course_id"`
+		Title       string `json:"title"`
+		Excerpt     string `json:"excerpt"`
+		Description string `json:"description"`
+		Order       int    `json:"order"`
+		Status      int    `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.ID == "" {
+		return nil, domain.ErrNotFound
+	}
+	result := &answer.LessonMetadata{
+		ID:          payload.ID,
+		CourseID:    payload.CourseID,
+		Title:       payload.Title,
+		Excerpt:     payload.Excerpt,
+		Description: payload.Description,
+		Order:       payload.Order,
+		Status:      payload.Status,
+	}
+	if publicAccessErr != nil {
+		if err := c.requireAssignedAccess(ctx, result.CourseID, publicAccessErr); err != nil {
+			return nil, err
+		}
+		answer.MarkPublicContentAccessVerified(ctx, "lesson", lessonID)
+	}
+	if relationID, publicRequest := answer.PublicContentAccessFromContext(ctx); publicRequest && relationID == "" && result.CourseID != "" {
+		answer.MarkPublicContentAccessVerified(ctx, "course", result.CourseID)
+	}
+	return result, nil
+}
+
+// GetTask fetches task metadata via internal endpoint.
+func (c Client) GetTask(ctx context.Context, taskID string) (*answer.TaskMetadata, error) {
+	return c.getTask(ctx, taskID, true, false)
+}
+
+// GetDiagnosticTask is a deliberately narrow trusted read used only after the
+// Student diagnostic aggregate has proved owner and frozen-task membership.
+// Unlike GetTask it performs no public/assignment gate, so an intentionally
+// catalog-hidden curated diagnostic can still be rendered and scored.
+func (c Client) GetDiagnosticTask(ctx context.Context, taskID string) (*answer.TaskMetadata, error) {
+	return c.getTask(ctx, taskID, false, true)
+}
+
+func (c Client) getTask(ctx context.Context, taskID string, enforceAccess, strictDiagnostic bool) (*answer.TaskMetadata, error) {
+	if c.BaseURL == "" || (strictDiagnostic && (strings.TrimSpace(c.InternalToken) == "" || !canonicalCatalogUUID(taskID))) {
+		return nil, fmt.Errorf("course service base url is empty")
+	}
+	var publicAccessErr error
+	if enforceAccess {
+		publicAccessErr = c.requirePublicAccess(ctx, "task", taskID)
+		if publicAccessErr != nil && !c.canTryAssignedAccess(ctx, publicAccessErr) {
+			return nil, publicAccessErr
+		}
+	}
+	endpoint := fmt.Sprintf(
+		"%s/internal/task/get-internal-task/%s",
+		strings.TrimRight(c.BaseURL, "/"),
+		taskID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", c.InternalToken)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return nil, domain.ErrNotFound
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return nil, domain.ErrForbidden
+	}
+	if (strictDiagnostic && resp.StatusCode != http.StatusOK) || resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("course service error: %s", resp.Status)
+	}
+
+	var payload struct {
+		ID                  string                     `json:"id"`
+		LessonID            string                     `json:"lesson_id"`
+		CourseID            string                     `json:"course_id"`
+		Title               string                     `json:"title"`
+		Description         string                     `json:"description"`
+		Translations        json.RawMessage            `json:"translations"`
+		Status              int                        `json:"status"`
+		LearningTargets     []domain.LearningTargetRef `json:"learning_targets"`
+		Type                any                        `json:"type"`
+		TaskKind            string                     `json:"task_kind"`
+		CodeStructureTypeID string                     `json:"code_structure_type_id"`
+		CodeStructureType   string                     `json:"code_structure_type_code"`
+		CodeStructure       json.RawMessage            `json:"code_structure"`
+		ComposeConfig       json.RawMessage            `json:"compose_config"`
+		AllowedErrorsCount  int                        `json:"allowed_errors_count"`
+		StarterFiles        []struct {
+			Type          int16  `json:"type"`
+			FileStorageID string `json:"filestorage_id"`
+			Order         int    `json:"order"`
+		} `json:"starter_files"`
+		Tests []struct {
+			ID           string          `json:"id"`
+			SourceKey    string          `json:"source_key"`
+			TaskID       string          `json:"task_id"`
+			Kind         string          `json:"kind"`
+			Title        string          `json:"title"`
+			Description  string          `json:"description"`
+			Translations json.RawMessage `json:"translations"`
+			Order        int             `json:"order"`
+			Groups       []struct {
+				ID           string          `json:"id"`
+				TaskTestID   string          `json:"task_test_id"`
+				Title        string          `json:"title"`
+				Translations json.RawMessage `json:"translations"`
+				Order        int             `json:"order"`
+			} `json:"groups"`
+			Variants []struct {
+				ID             string          `json:"id"`
+				SourceKey      string          `json:"source_key"`
+				TaskTestID     string          `json:"task_test_id"`
+				Text           string          `json:"text"`
+				IsCorrect      bool            `json:"is_correct"`
+				CorrectOrder   *int            `json:"correct_order"`
+				GroupID        string          `json:"group_id"`
+				GroupSourceKey string          `json:"group_source_key"`
+				Translations   json.RawMessage `json:"translations"`
+				Order          int             `json:"order"`
+			} `json:"variants"`
+		} `json:"tests"`
+		ExecutionMode          string     `json:"execution_mode"`
+		EvaluationMode         string     `json:"evaluation_mode"`
+		UIMode                 string     `json:"ui_mode"`
+		SubmissionMode         string     `json:"submission_mode"`
+		RequiresSandbox        bool       `json:"requires_sandbox"`
+		ExposesPreview         bool       `json:"exposes_preview"`
+		ExposesTerminal        bool       `json:"exposes_terminal"`
+		SupportsLiveValidation bool       `json:"supports_live_validation"`
+		Order                  int        `json:"order"`
+		MaxAttempts            *int       `json:"max_attempts"`
+		DeadlineAt             *time.Time `json:"deadline_at"`
+		Version                int64      `json:"version"`
+		CreatedAt              time.Time  `json:"created_at"`
+		UpdatedAt              time.Time  `json:"updated_at"`
+		AssessmentPurpose      string     `json:"assessment_purpose"`
+	}
+	var decoder *json.Decoder
+	if strictDiagnostic {
+		media, _, mediaErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if mediaErr != nil || media != "application/json" {
+			return nil, domain.ErrValidation
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+		if readErr != nil || len(body) > 1<<20 {
+			return nil, domain.ErrValidation
+		}
+		decoder = json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+	} else {
+		decoder = json.NewDecoder(resp.Body)
+	}
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
+	}
+	if strictDiagnostic {
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			return nil, domain.ErrValidation
+		}
+	}
+	if payload.ID == "" {
+		return nil, domain.ErrNotFound
+	}
+	learningTargets, err := domain.NormalizeLearningTargetRefs(payload.LearningTargets)
+	if err != nil {
+		return nil, fmt.Errorf("invalid course learning targets: %w", err)
+	}
+	if strictDiagnostic {
+		diagnosticTargets, targetErr := domain.NormalizeDiagnosticLearningTargets(payload.LearningTargets)
+		if targetErr != nil || len(diagnosticTargets) == 0 || payload.EvaluationMode != "AUTO" || payload.AssessmentPurpose != "diagnostic" || !validDiagnosticTaskType(parseInt16(payload.Type)) || payload.Version < 1 || payload.UpdatedAt.IsZero() || !canonicalCatalogUUID(payload.ID) || !canonicalCatalogUUID(payload.LessonID) {
+			return nil, domain.ErrValidation
+		}
+		learningTargets = diagnosticTargets
+	}
+	courseID := strings.TrimSpace(payload.CourseID)
+	if courseID == "" && strings.TrimSpace(payload.LessonID) != "" {
+		if lesson, lessonErr := c.GetLesson(ctx, payload.LessonID); lessonErr == nil && lesson != nil {
+			courseID = lesson.CourseID
+		} else if publicAccessErr != nil {
+			return nil, publicAccessErr
+		}
+	}
+	if strictDiagnostic && !canonicalCatalogUUID(courseID) {
+		return nil, domain.ErrValidation
+	}
+	tests := make([]answer.TaskTestMetadata, 0, len(payload.Tests))
+	starterFiles := make([]answer.TaskStarterFileMetadata, 0, len(payload.StarterFiles))
+	for _, item := range payload.StarterFiles {
+		starterFiles = append(starterFiles, answer.TaskStarterFileMetadata{
+			Type:          item.Type,
+			FileStorageID: item.FileStorageID,
+			Order:         item.Order,
+		})
+	}
+	for _, test := range payload.Tests {
+		groups := make([]answer.TaskTestGroupMetadata, 0, len(test.Groups))
+		for _, group := range test.Groups {
+			groups = append(groups, answer.TaskTestGroupMetadata{
+				ID:    group.ID,
+				Title: group.Title,
+				Order: group.Order,
+			})
+		}
+		variants := make([]answer.TaskTestVariantMetadata, 0, len(test.Variants))
+		for _, variant := range test.Variants {
+			variants = append(variants, answer.TaskTestVariantMetadata{
+				ID:             variant.ID,
+				Text:           variant.Text,
+				IsCorrect:      variant.IsCorrect,
+				CorrectOrder:   variant.CorrectOrder,
+				GroupID:        variant.GroupID,
+				GroupSourceKey: variant.GroupSourceKey,
+				Order:          variant.Order,
+			})
+		}
+		tests = append(tests, answer.TaskTestMetadata{
+			ID:          test.ID,
+			Kind:        test.Kind,
+			Title:       test.Title,
+			Description: test.Description,
+			Order:       test.Order,
+			Groups:      groups,
+			Variants:    variants,
+		})
+	}
+	result := answer.NormalizeTaskMetadata(&answer.TaskMetadata{
+		ID:                     payload.ID,
+		LessonID:               payload.LessonID,
+		CourseID:               courseID,
+		Title:                  payload.Title,
+		Description:            payload.Description,
+		Status:                 payload.Status,
+		LearningTargets:        learningTargets,
+		Type:                   parseInt16(payload.Type),
+		TaskKind:               payload.TaskKind,
+		CodeStructureType:      payload.CodeStructureType,
+		CodeStructure:          payload.CodeStructure,
+		ComposeConfig:          payload.ComposeConfig,
+		AllowedErrorsCount:     payload.AllowedErrorsCount,
+		StarterFiles:           starterFiles,
+		Tests:                  tests,
+		ExecutionMode:          payload.ExecutionMode,
+		EvaluationMode:         payload.EvaluationMode,
+		UIMode:                 payload.UIMode,
+		SubmissionMode:         payload.SubmissionMode,
+		RequiresSandbox:        payload.RequiresSandbox,
+		ExposesPreview:         payload.ExposesPreview,
+		ExposesTerminal:        payload.ExposesTerminal,
+		SupportsLiveValidation: payload.SupportsLiveValidation,
+		MaxAttempts:            payload.MaxAttempts,
+		DeadlineAt:             payload.DeadlineAt,
+		Version:                payload.Version,
+		UpdatedAt:              payload.UpdatedAt.UTC(),
+		AssessmentPurpose:      strings.TrimSpace(payload.AssessmentPurpose),
+	})
+	if enforceAccess && publicAccessErr != nil {
+		if err := c.requireAssignedAccess(ctx, result.CourseID, publicAccessErr); err != nil {
+			return nil, err
+		}
+		answer.MarkPublicContentAccessVerified(ctx, "task", taskID)
+	}
+	if enforceAccess {
+		if relationID, publicRequest := answer.PublicContentAccessFromContext(ctx); publicRequest && relationID == "" && result.CourseID != "" {
+			answer.MarkPublicContentAccessVerified(ctx, "course", result.CourseID)
+		}
+	}
+	return result, nil
+}
+
+// GetCourseStructure fetches ordered lessons/tasks for one course.
+func (c Client) GetCourseStructure(ctx context.Context, courseID string) (*answer.CourseStructure, error) {
+	if c.BaseURL == "" {
+		return nil, fmt.Errorf("course service base url is empty")
+	}
+	publicAccessErr := c.requirePublicAccess(ctx, "course", courseID)
+	if publicAccessErr != nil {
+		if !c.canTryAssignedAccess(ctx, publicAccessErr) {
+			return nil, publicAccessErr
+		}
+		if err := c.requireAssignedAccess(ctx, courseID, publicAccessErr); err != nil {
+			return nil, err
+		}
+		answer.MarkPublicContentAccessVerified(ctx, "course", courseID)
+	}
+	endpoint := fmt.Sprintf(
+		"%s/internal/course/get-internal-course-structure/%s",
+		strings.TrimRight(c.BaseURL, "/"),
+		courseID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", c.InternalToken)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return nil, domain.ErrNotFound
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return nil, domain.ErrForbidden
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("course service error: %s", resp.Status)
+	}
+
+	var payload struct {
+		CourseID        string `json:"course_id"`
+		CourseVersionID string `json:"course_version_id"`
+		Lessons         []struct {
+			ID          string `json:"id"`
+			CourseID    string `json:"course_id"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Order       int    `json:"order"`
+			Status      int    `json:"status"`
+			Tasks       []struct {
+				ID             string `json:"id"`
+				LessonID       string `json:"lesson_id"`
+				CourseID       string `json:"course_id"`
+				Title          string `json:"title"`
+				Description    string `json:"description"`
+				Type           any    `json:"type"`
+				EvaluationMode string `json:"evaluation_mode"`
+				Order          int    `json:"order"`
+				Status         int    `json:"status"`
+			} `json:"tasks"`
+		} `json:"lessons"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+
+	if payload.CourseID == "" {
+		payload.CourseID = payload.CourseVersionID
+	}
+	if payload.CourseID == "" {
+		payload.CourseID = courseID
+	}
+
+	result := &answer.CourseStructure{
+		CourseID: payload.CourseID,
+		Lessons:  make([]answer.CourseStructureLesson, 0, len(payload.Lessons)),
+	}
+	for _, lesson := range payload.Lessons {
+		lessonCourseID := lesson.CourseID
+		if lessonCourseID == "" {
+			lessonCourseID = payload.CourseID
+		}
+		item := answer.CourseStructureLesson{
+			ID:          lesson.ID,
+			CourseID:    lessonCourseID,
+			Title:       lesson.Title,
+			Description: lesson.Description,
+			Order:       lesson.Order,
+			Status:      lesson.Status,
+			Tasks:       make([]answer.CourseStructureTask, 0, len(lesson.Tasks)),
+		}
+		for _, task := range lesson.Tasks {
+			taskCourseID := task.CourseID
+			if taskCourseID == "" {
+				taskCourseID = lessonCourseID
+			}
+			item.Tasks = append(item.Tasks, answer.CourseStructureTask{
+				ID:             task.ID,
+				LessonID:       task.LessonID,
+				CourseID:       taskCourseID,
+				Title:          task.Title,
+				Description:    task.Description,
+				Type:           parseInt16(task.Type),
+				EvaluationMode: task.EvaluationMode,
+				Order:          task.Order,
+				Status:         task.Status,
+			})
+		}
+		result.Lessons = append(result.Lessons, item)
+	}
+
+	return result, nil
+}
+
+func (c Client) requirePublicAccess(ctx context.Context, kind, id string) error {
+	relationID, required := answer.PublicContentAccessFromContext(ctx)
+	if !required || answer.PublicContentAccessVerified(ctx, kind, id) {
+		return nil
+	}
+
+	var resourcePath string
+	switch kind {
+	case "course":
+		resourcePath = "/api/v1/course/get/" + url.PathEscape(id)
+	case "lesson":
+		resourcePath = "/api/v1/lesson/get/" + url.PathEscape(id)
+	case "task":
+		resourcePath = "/api/v1/task/get/" + url.PathEscape(id)
+	default:
+		return fmt.Errorf("unsupported public course resource: %s", kind)
+	}
+
+	query := url.Values{"fields": []string{"id"}}
+	if relationID != "" && kind != "course" {
+		query.Set("via_relation_id", relationID)
+	}
+	endpoint := strings.TrimRight(c.BaseURL, "/") + resourcePath + "?" + query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if userID, role, ok := answer.PublicContentAudienceFromContext(ctx); ok {
+		req.Header.Set("X-User-ID", userID)
+		req.Header.Set("X-User-Role", role)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return domain.ErrNotFound
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return domain.ErrForbidden
+	case http.StatusBadRequest:
+		return domain.ErrValidation
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("course service public access error: %s", resp.Status)
+	}
+
+	answer.MarkPublicContentAccessVerified(ctx, kind, id)
+	return nil
+}
+
+func (c Client) canTryAssignedAccess(ctx context.Context, publicAccessErr error) bool {
+	if c.AssignmentAccess == nil ||
+		(!errors.Is(publicAccessErr, domain.ErrNotFound) && !errors.Is(publicAccessErr, domain.ErrForbidden)) {
+		return false
+	}
+	studentID, role, ok := answer.PublicContentAudienceFromContext(ctx)
+	if !ok || strings.TrimSpace(studentID) == "" {
+		return false
+	}
+	role = strings.ToUpper(strings.TrimSpace(role))
+	return role == "STUDENT" || role == "STUDENT_PRO"
+}
+
+func (c Client) requireAssignedAccess(ctx context.Context, courseID string, publicAccessErr error) error {
+	if !c.canTryAssignedAccess(ctx, publicAccessErr) || strings.TrimSpace(courseID) == "" {
+		return publicAccessErr
+	}
+	studentID, _, _ := answer.PublicContentAudienceFromContext(ctx)
+	allowed, err := c.AssignmentAccess.CanAccessCourse(ctx, studentID, courseID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return publicAccessErr
+	}
+	answer.MarkPublicContentAccessVerified(ctx, "course", courseID)
+	return nil
+}
+
+func parseInt16(value any) int16 {
+	switch v := value.(type) {
+	case int:
+		return int16(v)
+	case int16:
+		return v
+	case int32:
+		return int16(v)
+	case int64:
+		return int16(v)
+	case float64:
+		return int16(v)
+	case json.Number:
+		if parsed, err := v.Int64(); err == nil {
+			return int16(parsed)
+		}
+	case string:
+		if parsed, err := json.Number(v).Int64(); err == nil {
+			return int16(parsed)
+		}
+	}
+	return 0
+}

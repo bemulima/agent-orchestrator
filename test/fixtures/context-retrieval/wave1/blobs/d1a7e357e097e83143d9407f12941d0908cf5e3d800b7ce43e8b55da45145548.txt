@@ -1,0 +1,1251 @@
+package onboarding
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testStudentID = "11111111-1111-4111-8111-111111111111"
+	testTeacherID = "22222222-2222-4222-8222-222222222222"
+	testDialogID  = "33333333-3333-4333-8333-333333333333"
+)
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *testClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	clock.now = clock.now.Add(time.Second)
+	return clock.now
+}
+
+type testIDs struct {
+	mu   sync.Mutex
+	next int
+}
+
+func (ids *testIDs) NewID() string {
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	ids.next++
+	return domain.DeterministicOnboardingUUID("claim", ids.next)
+}
+
+type testTeacher struct{}
+
+func (testTeacher) Execute(context.Context, string) (domain.PersonalTeacher, error) {
+	return domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID}, nil
+}
+
+type testDialog struct {
+	mu               sync.Mutex
+	sources          map[string]domain.DialogAssistantUISource
+	messages         map[string]domain.DialogMessage
+	appendCalls      int
+	mutations        int
+	materializeCalls int
+	appendErrOnce    bool
+}
+
+type testInteractions struct {
+	items   map[string]domain.TeacherOnboardingInteraction
+	current string
+}
+
+func (store *testInteractions) EnsureActiveInteraction(_ context.Context, candidate domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingInteraction, bool, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingInteraction(candidate)
+	if err != nil {
+		return domain.TeacherOnboardingInteraction{}, false, err
+	}
+	if store.current != "" {
+		current := store.items[store.current]
+		if current.ID == normalized.ID {
+			return current, false, nil
+		}
+		if current.State == domain.TeacherOnboardingInteractionReserved {
+			return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		current.State = domain.TeacherOnboardingInteractionSuperseded
+		current.SupersededByID = normalized.ID
+		current.UpdatedAt = normalized.CreatedAt
+		store.items[current.ID] = current
+	}
+	store.items[normalized.ID] = normalized
+	store.current = normalized.ID
+	return normalized, true, nil
+}
+
+func (store *testInteractions) GetActiveInteraction(_ context.Context, dialogID, promptID, teacherID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	current := store.items[store.current]
+	found := (current.State == domain.TeacherOnboardingInteractionActive || current.State == domain.TeacherOnboardingInteractionReserved) &&
+		current.DialogID == dialogID && current.PromptMessageID == promptID && current.PersonalTeacherID == teacherID
+	return current, found, nil
+}
+
+func (store *testInteractions) FindRecoverableInteractionForStudent(_ context.Context, studentID string) (domain.TeacherOnboardingInteraction, bool, error) {
+	var current domain.TeacherOnboardingInteraction
+	count := 0
+	for _, interaction := range store.items {
+		if interaction.StudentID == studentID && (interaction.State == domain.TeacherOnboardingInteractionActive || interaction.State == domain.TeacherOnboardingInteractionReserved || interaction.State == domain.TeacherOnboardingInteractionHandoffPending) {
+			current = interaction
+			count++
+		}
+	}
+	if count > 1 {
+		return domain.TeacherOnboardingInteraction{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	return current, count == 1, nil
+}
+
+func (store *testInteractions) HasInteractionHistory(_ context.Context, studentID string) (bool, error) {
+	for _, interaction := range store.items {
+		if interaction.StudentID == studentID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (store *testInteractions) CloseActiveInteractionForTerminal(_ context.Context, dialogID, teacherID string, reason domain.TeacherOnboardingInteractionClosedReason, now time.Time) (domain.TeacherOnboardingInteraction, bool, error) {
+	current := store.items[store.current]
+	if current.DialogID != dialogID || current.PersonalTeacherID != teacherID ||
+		(current.State != domain.TeacherOnboardingInteractionActive && current.State != domain.TeacherOnboardingInteractionReserved) {
+		return domain.TeacherOnboardingInteraction{}, false, nil
+	}
+	if current.State == domain.TeacherOnboardingInteractionReserved {
+		return current, true, nil
+	}
+	current.State = domain.TeacherOnboardingInteractionClosed
+	current.ClosedReason = reason
+	current.ClosedAt = now
+	current.UpdatedAt = now
+	store.items[current.ID] = current
+	store.current = ""
+	return current, true, nil
+}
+
+func (dialog *testDialog) EnsureTeacherDialog(context.Context, string, string, domain.LearningContextType, string) (domain.TeacherDialogBinding, error) {
+	return domain.TeacherDialogBinding{ID: testDialogID, StudentID: testStudentID, PersonalTeacherID: testTeacherID, ContextType: domain.LearningContextGeneral}, nil
+}
+func (dialog *testDialog) AppendTeacherStructuredProactive(_ context.Context, binding domain.TeacherDialogBinding, key, body string, ui json.RawMessage) (domain.DialogMessage, error) {
+	return dialog.append(binding, key, body, ui)
+}
+func (dialog *testDialog) AppendTeacherProactive(_ context.Context, binding domain.TeacherDialogBinding, key, body string) (domain.DialogMessage, error) {
+	return dialog.append(binding, key, body, nil)
+}
+func (dialog *testDialog) append(binding domain.TeacherDialogBinding, key, body string, ui json.RawMessage) (domain.DialogMessage, error) {
+	dialog.mu.Lock()
+	defer dialog.mu.Unlock()
+	dialog.appendCalls++
+	if dialog.appendErrOnce {
+		dialog.appendErrOnce = false
+		return domain.DialogMessage{}, errors.New("dialog unavailable")
+	}
+	if item, ok := dialog.messages[key]; ok {
+		return item, nil
+	}
+	dialog.mutations++
+	id := domain.DeterministicOnboardingUUID("message", key)
+	message := domain.DialogMessage{ID: id, DialogID: binding.ID, AuthorType: domain.DialogMessageAuthorPersonalTeacher, Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: binding.PersonalTeacherID, Body: body, AssistantUI: ui, Status: 1, Version: 1, MessageSequence: int64(dialog.mutations), LastEventSequence: int64(dialog.mutations), CreatedAt: time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)}
+	dialog.messages[key] = message
+	if len(ui) > 0 {
+		dialog.sources[id] = domain.DialogAssistantUISource{Schema: domain.DialogAssistantUISourceSchema, DialogID: binding.ID, StudentID: binding.StudentID, PersonalTeacherID: binding.PersonalTeacherID, ContextType: "general_teacher", MessageID: id, MessageSequence: message.MessageSequence, MessageVersion: 1, AssistantUI: ui}
+	}
+	return message, nil
+}
+func (dialog *testDialog) GetAssistantUISource(_ context.Context, _ domain.TeacherDialogBinding, messageID string) (domain.DialogAssistantUISource, error) {
+	dialog.mu.Lock()
+	defer dialog.mu.Unlock()
+	source, ok := dialog.sources[messageID]
+	if !ok {
+		return source, domain.ErrDialogRequestNotFound
+	}
+	return source, nil
+}
+
+type testStudent struct {
+	state        domain.TeacherStudentOnboardingState
+	commands     map[string]domain.StudentOnboardingDraft
+	replaceCalls int
+	mutations    int
+}
+
+type testReadiness struct {
+	result domain.TeacherLearningReadiness
+	calls  int
+	ref    domain.TeacherStudentReadinessStateRef
+}
+
+type testHandoffs struct {
+	intent       domain.TeacherOnboardingHandoffIntent
+	interactions *testInteractions
+	calls        int
+	reads        int
+	err          error
+}
+
+type testPathOutcomeProjection struct {
+	marker            domain.TeacherOnboardingPathOutcomeMarker
+	found             bool
+	err               error
+	studentID         string
+	personalTeacherID string
+	dialogID          string
+	stateRef          domain.TeacherStudentReadinessStateRef
+	calls             int
+}
+
+type testTerminalSessions struct {
+	record       domain.TeacherOnboardingTerminalSession
+	failMarkOnce bool
+}
+
+func (store *testTerminalSessions) EnsurePending(_ context.Context, candidate domain.TeacherOnboardingTerminalSession) (domain.TeacherOnboardingTerminalSession, bool, error) {
+	if store.record.ID != "" {
+		return store.record, false, nil
+	}
+	store.record = candidate
+	return candidate, true, nil
+}
+
+func (store *testTerminalSessions) FindOnlyRecoverableForStudent(_ context.Context, studentID string) (domain.TeacherOnboardingTerminalSession, bool, error) {
+	return store.record, store.record.ID != "" && store.record.StudentID == studentID, nil
+}
+
+func (store *testTerminalSessions) MarkDelivered(_ context.Context, id, messageID string, now time.Time) (domain.TeacherOnboardingTerminalSession, error) {
+	if store.failMarkOnce {
+		store.failMarkOnce = false
+		return store.record, errors.New("postgres unavailable")
+	}
+	if store.record.ID != id {
+		return domain.TeacherOnboardingTerminalSession{}, domain.ErrTeacherOnboardingConflict
+	}
+	store.record.Status = domain.TeacherOnboardingTerminalDelivered
+	store.record.DialogMessageID = messageID
+	store.record.DeliveredAt = now
+	store.record.UpdatedAt = now
+	return store.record, nil
+}
+
+func (stub *testPathOutcomeProjection) FindDeliveredForSession(_ context.Context, studentID, personalTeacherID, dialogID string, stateRef domain.TeacherStudentReadinessStateRef) (domain.TeacherOnboardingPathOutcomeMarker, bool, error) {
+	stub.calls++
+	stub.studentID, stub.personalTeacherID, stub.dialogID, stub.stateRef = studentID, personalTeacherID, dialogID, stateRef
+	return stub.marker, stub.found, stub.err
+}
+
+func (stub *testHandoffs) Enqueue(_ context.Context, input repository.TeacherOnboardingHandoffEnqueue, _ time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	stub.calls++
+	if stub.err != nil {
+		return domain.TeacherOnboardingHandoffIntent{}, false, stub.err
+	}
+	if stub.intent.ID != "" {
+		return stub.intent, false, nil
+	}
+	if input.Intent.SourceInteractionID == "" && stub.interactions != nil && stub.interactions.current != "" {
+		interaction := stub.interactions.items[stub.interactions.current]
+		if interaction.State == domain.TeacherOnboardingInteractionReserved {
+			return domain.TeacherOnboardingHandoffIntent{}, false, domain.ErrTeacherOnboardingBusy
+		}
+		interaction.State = domain.TeacherOnboardingInteractionClosed
+		interaction.ClosedReason = domain.TeacherOnboardingClosedPlanningReady
+		interaction.ClosedAt = input.Intent.CreatedAt
+		interaction.UpdatedAt = input.Intent.CreatedAt
+		stub.interactions.items[interaction.ID] = interaction
+		stub.interactions.current = ""
+	}
+	stub.intent = input.Intent
+	return stub.intent, true, nil
+}
+func (stub *testHandoffs) GetByStudentState(_ context.Context, _ string, _ domain.TeacherStudentReadinessStateRef, _ domain.TeacherLearningReadinessGoal) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	stub.reads++
+	return stub.intent, stub.intent.ID != "", stub.err
+}
+func (stub *testHandoffs) FindOnlyRecoverableHandoffForStudent(_ context.Context, studentID string) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	stub.reads++
+	validOrigin := (stub.intent.SourceInteractionID == "" && stub.intent.SourceTeacherJobID == "") || (stub.intent.SourceInteractionID != "" && stub.intent.SourceTeacherJobID != "")
+	return stub.intent, stub.intent.ID != "" && stub.intent.StudentID == studentID && stub.intent.Status != domain.TeacherOnboardingHandoffBlocked && validOrigin, stub.err
+}
+func (stub *testHandoffs) GetBySourceSession(_ context.Context, studentID, interactionID, teacherJobID string) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	stub.reads++
+	found := stub.intent.ID != "" && stub.intent.StudentID == studentID && stub.intent.SourceInteractionID == interactionID && stub.intent.SourceTeacherJobID == teacherJobID
+	return stub.intent, found, stub.err
+}
+func (stub *testHandoffs) HasHandoffHistory(_ context.Context, studentID string) (bool, error) {
+	stub.reads++
+	return stub.intent.ID != "" && stub.intent.StudentID == studentID, stub.err
+}
+func (*testHandoffs) ClaimDispatch(context.Context, string, string, time.Time, time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*testHandoffs) RetryDispatch(context.Context, string, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (*testHandoffs) MarkAccepted(context.Context, string, string, domain.TeacherOnboardingPlanHandoff, time.Time) error {
+	return nil
+}
+func (*testHandoffs) ClaimNotification(context.Context, string, string, time.Time, time.Time) (domain.TeacherOnboardingHandoffIntent, bool, error) {
+	return domain.TeacherOnboardingHandoffIntent{}, false, nil
+}
+func (*testHandoffs) RetryNotification(context.Context, string, string, string, time.Time, time.Time) error {
+	return nil
+}
+func (*testHandoffs) MarkDelivered(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+func (*testHandoffs) MarkActivePath(context.Context, string, string, time.Time) error { return nil }
+func (*testHandoffs) Block(context.Context, string, string, string, time.Time) error  { return nil }
+
+func (stub *testReadiness) ResolveLearningReadiness(_ context.Context, _ string, ref domain.TeacherStudentReadinessStateRef) (domain.TeacherLearningReadiness, error) {
+	stub.calls++
+	stub.ref = ref
+	return stub.result, nil
+}
+
+func (student *testStudent) GetTeacherOnboardingState(context.Context, string) (domain.TeacherStudentOnboardingState, error) {
+	return student.state, nil
+}
+func (student *testStudent) ReplaceTeacherOnboardingDraft(_ context.Context, _ string, key string, expected int64, answers domain.StudentOnboardingAnswers) (domain.StudentOnboardingDraft, error) {
+	student.replaceCalls++
+	if value, ok := student.commands[key]; ok {
+		return value, nil
+	}
+	if student.state.Draft.Version != expected {
+		return domain.StudentOnboardingDraft{}, domain.ErrTeacherOnboardingConflict
+	}
+	student.mutations++
+	student.state.Draft.StudentOnboardingAnswers = answers
+	student.state.Draft.Version++
+	student.commands[key] = student.state.Draft
+	return student.state.Draft, nil
+}
+func (student *testStudent) FinalizeTeacherOnboardingDraft(_ context.Context, _ string, key string, expectedDraft, expectedProfile int64) (domain.StudentOnboardingFinalizeResponse, error) {
+	if value, ok := student.commands[key]; ok {
+		return domain.StudentOnboardingFinalizeResponse{Schema: domain.StudentOnboardingFinalizeResult, Draft: value, Profile: domain.StudentOnboardingProfile{StudentID: testStudentID, ProfileVersion: "student-onboarding-v1", Version: *value.CompletedProfileVersion}}, nil
+	}
+	if student.state.Draft.Version != expectedDraft || student.state.ProfileVersion != expectedProfile {
+		return domain.StudentOnboardingFinalizeResponse{}, domain.ErrTeacherOnboardingConflict
+	}
+	student.mutations++
+	profileVersion := expectedProfile + 1
+	student.state.Draft.Status = domain.StudentOnboardingDraftCompleted
+	student.state.Draft.Version++
+	student.state.Draft.StudentOnboardingAnswers = domain.StudentOnboardingAnswers{}
+	student.state.Draft.CompletedProfileVersion = &profileVersion
+	student.state.ProfileVersion = profileVersion
+	student.commands[key] = student.state.Draft
+	return domain.StudentOnboardingFinalizeResponse{Schema: domain.StudentOnboardingFinalizeResult, Draft: student.state.Draft, Profile: domain.StudentOnboardingProfile{StudentID: testStudentID, ProfileVersion: "student-onboarding-v1", Version: profileVersion}}, nil
+}
+
+type testReceiptStore struct {
+	mu               sync.Mutex
+	items            map[string]domain.OnboardingActionReceipt
+	active           map[string]string
+	failMarkOnce     bool
+	failCompleteOnce bool
+	completeStarted  chan<- struct{}
+	completeRelease  <-chan struct{}
+}
+
+func (store *testReceiptStore) Get(_ context.Context, key string) (domain.OnboardingActionReceipt, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item, ok := store.items[key]
+	return item, ok, nil
+}
+
+func (store *testReceiptStore) Claim(_ context.Context, candidate domain.OnboardingActionReceipt) (domain.OnboardingActionReceipt, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if existing, ok := store.items[candidate.IdempotencyKey]; ok {
+		if !domain.ReceiptMatches(existing, candidate) && !domain.ReceiptReplayMatches(existing, candidate) {
+			return existing, false, domain.ErrTeacherOnboardingConflict
+		}
+		if existing.Status == domain.OnboardingReceiptCompleted || existing.Status == domain.OnboardingReceiptMaterialized || existing.Status == domain.OnboardingReceiptRejected {
+			return existing, false, nil
+		}
+		if existing.ClaimToken != "" {
+			return existing, false, domain.ErrTeacherOnboardingBusy
+		}
+		existing.ClaimToken = candidate.ClaimToken
+		existing.LockedUntil = candidate.LockedUntil
+		store.items[candidate.IdempotencyKey] = existing
+		return existing, false, nil
+	}
+	for _, existing := range store.items {
+		if existing.IdempotencyKey != candidate.IdempotencyKey && existing.ExecutionMode == domain.OnboardingActionExecutionCanonical &&
+			(existing.Status == domain.OnboardingReceiptClaimed || existing.Status == domain.OnboardingReceiptApplied || existing.Status == domain.OnboardingReceiptMaterialized) &&
+			existing.DialogID == candidate.DialogID && existing.SourceMessageID == candidate.SourceMessageID && existing.SourceMessageVersion == candidate.SourceMessageVersion {
+			return candidate, false, domain.ErrTeacherOnboardingConflict
+		}
+	}
+	scope := candidate.StudentID + candidate.DialogID
+	if _, ok := store.active[scope]; ok {
+		return candidate, false, domain.ErrTeacherOnboardingBusy
+	}
+	store.items[candidate.IdempotencyKey] = candidate
+	store.active[scope] = candidate.IdempotencyKey
+	return candidate, true, nil
+}
+func (store *testReceiptStore) Resolve(_ context.Context, key, claim string, draft, profile int64, _ time.Time) (domain.OnboardingActionReceipt, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if item.ClaimToken != claim {
+		return item, domain.ErrTeacherOnboardingConflict
+	}
+	item.ExpectedDraftVersion = &draft
+	item.ExpectedProfileVersion = &profile
+	store.items[key] = item
+	return item, nil
+}
+func (store *testReceiptStore) MarkApplied(_ context.Context, key, claim string, draft, profile int64, status domain.StudentOnboardingDraftStatus, _ time.Time) (domain.OnboardingActionReceipt, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if store.failMarkOnce {
+		store.failMarkOnce = false
+		return item, errors.New("postgres unavailable")
+	}
+	if item.ClaimToken != claim {
+		return item, domain.ErrTeacherOnboardingConflict
+	}
+	item.Status = domain.OnboardingReceiptApplied
+	item.ResultDraftVersion = &draft
+	item.ResultProfileVersion = &profile
+	item.ResultStatus = status
+	store.items[key] = item
+	return item, nil
+}
+func (store *testReceiptStore) Complete(_ context.Context, key, claim, message string, now time.Time) (domain.OnboardingActionReceipt, error) {
+	store.mu.Lock()
+	if store.completeStarted != nil {
+		select {
+		case store.completeStarted <- struct{}{}:
+		default:
+		}
+		release := store.completeRelease
+		store.mu.Unlock()
+		if release != nil {
+			<-release
+		}
+		store.mu.Lock()
+	}
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if store.failCompleteOnce {
+		store.failCompleteOnce = false
+		return item, errors.New("postgres unavailable")
+	}
+	if item.ClaimToken != claim {
+		return item, domain.ErrTeacherOnboardingConflict
+	}
+	item.Status = domain.OnboardingReceiptCompleted
+	item.NextMessageID = message
+	item.CompletedAt = &now
+	item.ClaimToken = ""
+	item.LockedUntil = nil
+	store.items[key] = item
+	delete(store.active, item.StudentID+item.DialogID)
+	return item, nil
+}
+func (store *testReceiptStore) CompleteCanonical(_ context.Context, key, claim, message string, now time.Time) (domain.OnboardingActionReceipt, error) {
+	store.mu.Lock()
+	if store.completeStarted != nil {
+		select {
+		case store.completeStarted <- struct{}{}:
+		default:
+		}
+		release := store.completeRelease
+		store.mu.Unlock()
+		if release != nil {
+			<-release
+		}
+		store.mu.Lock()
+	}
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if store.failCompleteOnce {
+		store.failCompleteOnce = false
+		return item, errors.New("postgres unavailable")
+	}
+	if item.ClaimToken != claim || item.ExecutionMode != domain.OnboardingActionExecutionCanonical {
+		return item, domain.ErrTeacherOnboardingConflict
+	}
+	item.Status = domain.OnboardingReceiptMaterialized
+	item.CanonicalStudentMessageID = message
+	item.CompletedAt = &now
+	item.ClaimToken = ""
+	item.LockedUntil = nil
+	store.items[key] = item
+	delete(store.active, item.StudentID+item.DialogID)
+	return item, nil
+}
+func (store *testReceiptStore) Reject(_ context.Context, key, claim string, _ time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if item.ClaimToken != claim {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	item.Status = domain.OnboardingReceiptRejected
+	item.ClaimToken = ""
+	item.LockedUntil = nil
+	store.items[key] = item
+	delete(store.active, item.StudentID+item.DialogID)
+	return nil
+}
+func (store *testReceiptStore) Release(_ context.Context, key, claim string, _ time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.items[key]
+	if item.ClaimToken == claim {
+		item.ClaimToken = ""
+		item.LockedUntil = nil
+		store.items[key] = item
+	}
+	return nil
+}
+
+func TestS11NewEnsureAndActionUseCanonicalCoordinatorAdmissionOnly(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	messageID, messageVersion := sessionPrompt(t, session)
+
+	request := actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "55555555-5555-4555-8555-555555555555")
+	first, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.NotNil(t, first.V2)
+	require.Equal(t, domain.OnboardingActionExecutionCanonical, domain.OnboardingActionExecutionMode(first.V2.Mode))
+	require.True(t, first.V2.Materialized)
+	require.False(t, first.V2.Replayed)
+	require.Zero(t, student.replaceCalls)
+	require.Zero(t, student.mutations)
+	require.Equal(t, 1, dialog.materializeCalls)
+	require.Equal(t, domain.OnboardingActionExecutionCanonical, receipts.items[request.IdempotencyKey].ExecutionMode)
+
+	replayed, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.NotNil(t, replayed.V2)
+	require.True(t, replayed.V2.Replayed)
+	require.Equal(t, first.V2.CanonicalStudentMessageID, replayed.V2.CanonicalStudentMessageID)
+	require.Equal(t, 1, dialog.materializeCalls)
+}
+
+func TestS11FlagsOffFailClosedBeforeStudentOrDialogSideEffects(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+
+	_, err := service.Ensure(context.Background(), testStudentID)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	require.Zero(t, student.replaceCalls)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+	require.Zero(t, dialog.materializeCalls)
+
+	request := actionRequest(testDialogID, 1, "onboarding.direction.d0.v1", "direction.backend", "56565656-5656-4656-8656-565656565656")
+	_, err = service.ApplyAction(context.Background(), testStudentID, request)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	require.Empty(t, receipts.items)
+	require.Zero(t, student.replaceCalls)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+	require.Zero(t, dialog.materializeCalls)
+}
+
+func TestS11FlagsOffReadExistingV1SessionWithoutMutation(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	interaction := installCollectingInteraction(t, service, 1)
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+	service.ProductAwareEnabled = false
+	service.PlannerHandoffEnabled = false
+	service.Teachers = nil
+	service.Dialogs = nil
+	service.Students = nil
+	service.StructuredMessages = nil
+	service.CanonicalMessages = nil
+
+	got, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherOnboardingSessionSchema, got.Schema)
+	require.Equal(t, interaction.PromptMessageID, *got.MessageID)
+	require.Equal(t, int(interaction.PromptMessageVersion), *got.MessageVersion)
+	require.Zero(t, dialog.appendCalls)
+	require.Zero(t, student.mutations)
+}
+
+func TestS11FlagsOffReadExistingV2AndV3CollectingSessions(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			service, student, dialog, _ := newTestService()
+			interaction := installCollectingInteraction(t, service, version)
+			service.CanonicalActionsEnabled = false
+			service.UnifiedCoordinatorEnabled = false
+			service.ProductAwareEnabled = false
+			service.PlannerHandoffEnabled = false
+			service.Teachers = nil
+			service.Dialogs = nil
+			service.Students = nil
+			service.StructuredMessages = nil
+			service.CanonicalMessages = nil
+			service.Readiness = nil
+
+			got, err := service.Ensure(context.Background(), testStudentID)
+			require.NoError(t, err)
+			if version == 2 {
+				require.NotNil(t, got.V2)
+				require.Equal(t, interaction.PromptMessageID, got.V2.CurrentPrompt.MessageID)
+			} else {
+				require.NotNil(t, got.V3)
+				require.Equal(t, interaction.PromptMessageID, got.V3.CurrentPrompt.MessageID)
+			}
+			require.Zero(t, dialog.appendCalls)
+			require.Zero(t, student.mutations)
+		})
+	}
+}
+
+func TestS11TerminalLegacyReceiptReplaysExactlyWithFlagsOff(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+	request := actionRequest("57575757-5757-4757-8757-575757575757", 3, "onboarding.direction.d0.v1", "direction.backend", "58585858-5858-4858-8858-585858585858")
+	now := service.Clock.Now().UTC()
+	receipt, err := domain.NewOnboardingActionReceipt(request, testStudentID, testTeacherID, service.IDs.NewID(), now, now.Add(time.Minute))
+	require.NoError(t, err)
+	expectedDraft, expectedProfile := int64(0), int64(0)
+	resultDraft, resultProfile := int64(1), int64(0)
+	completedAt := now.Add(time.Second)
+	receipt.Status = domain.OnboardingReceiptCompleted
+	receipt.ExpectedDraftVersion, receipt.ExpectedProfileVersion = &expectedDraft, &expectedProfile
+	receipt.ResultDraftVersion, receipt.ResultProfileVersion = &resultDraft, &resultProfile
+	receipt.ResultStatus = domain.StudentOnboardingDraftDraft
+	receipt.NextMessageID = "59595959-5959-4959-8959-595959595959"
+	receipt.ClaimToken, receipt.LockedUntil = "", nil
+	receipt.UpdatedAt, receipt.CompletedAt = completedAt, &completedAt
+	receipts.items[request.IdempotencyKey] = receipt
+
+	result, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.Nil(t, result.V2)
+	require.True(t, result.Applied)
+	require.True(t, result.Replayed)
+	require.Equal(t, resultDraft, result.DraftVersion)
+	require.Equal(t, receipt.NextMessageID, *result.NextMessageID)
+	changed := request
+	changed.ActionID = "direction.frontend"
+	_, err = service.ApplyAction(context.Background(), testStudentID, changed)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingConflict)
+	_, err = service.ApplyAction(context.Background(), "99999999-9999-4999-8999-999999999999", request)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingConflict)
+	require.Zero(t, student.replaceCalls)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+	require.Zero(t, dialog.materializeCalls)
+}
+
+func TestS11IncompleteLegacyReceiptNeverResumesWholeDraftMutation(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	request := actionRequest("60606060-6060-4060-8060-606060606060", 1, "onboarding.direction.d0.v1", "direction.backend", "61616161-6161-4161-8161-616161616161")
+	now := service.Clock.Now().UTC()
+	receipt, err := domain.NewOnboardingActionReceipt(request, testStudentID, testTeacherID, service.IDs.NewID(), now, now.Add(time.Minute))
+	require.NoError(t, err)
+	receipts.items[request.IdempotencyKey] = receipt
+
+	_, err = service.ApplyAction(context.Background(), testStudentID, request)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	require.Equal(t, domain.OnboardingReceiptClaimed, receipts.items[request.IdempotencyKey].Status)
+	require.Zero(t, student.replaceCalls)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+	require.Zero(t, dialog.materializeCalls)
+}
+
+func TestS11EnsureReusesPersistedV3PromptWithoutDuplicateDialogMutation(t *testing.T) {
+	service, _, dialog, _ := newTestService()
+	first, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	firstMessageID, firstMessageVersion := sessionPrompt(t, first)
+
+	second, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	secondMessageID, secondMessageVersion := sessionPrompt(t, second)
+	require.Equal(t, firstMessageID, secondMessageID)
+	require.Equal(t, firstMessageVersion, secondMessageVersion)
+	require.Equal(t, 1, dialog.mutations)
+}
+
+func TestS11ConcurrentEnsureAndCanonicalActionKeepPersistedPromptIdentity(t *testing.T) {
+	service, _, dialog, receipts := newTestService()
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	messageID, messageVersion := sessionPrompt(t, session)
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	receipts.completeStarted, receipts.completeRelease = started, release
+	type actionOutcome struct {
+		result domain.AssistantUIActionResult
+		err    error
+	}
+	outcome := make(chan actionOutcome, 1)
+	go func() {
+		result, actionErr := service.ApplyAction(context.Background(), testStudentID,
+			actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "93939393-9393-4939-8939-939393939393"))
+		outcome <- actionOutcome{result: result, err: actionErr}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canonical action did not reach durable receipt completion")
+	}
+	refreshed, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	refreshedMessageID, refreshedMessageVersion := sessionPrompt(t, refreshed)
+	require.Equal(t, messageID, refreshedMessageID)
+	require.Equal(t, messageVersion, refreshedMessageVersion)
+	close(release)
+	completed := <-outcome
+	require.NoError(t, completed.err)
+	require.NotNil(t, completed.result.V2)
+	require.Equal(t, 1, dialog.mutations, "Ensure never invents the coordinator's next prompt")
+	require.Equal(t, 1, dialog.materializeCalls)
+}
+
+func TestS11ClaimedCanonicalReceiptRecoversWithAllAdmissionFlagsOff(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	messageID, messageVersion := sessionPrompt(t, session)
+	request := actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "92929292-9292-4292-8292-929292929292")
+	now := service.Clock.Now()
+	candidate, err := domain.NewOnboardingActionReceiptForMode(request, testStudentID, testTeacherID, service.IDs.NewID(), now, now.Add(time.Minute), domain.OnboardingActionExecutionCanonical)
+	require.NoError(t, err)
+	claimed, _, err := receipts.Claim(context.Background(), candidate)
+	require.NoError(t, err)
+	claimed.ClaimToken = ""
+	claimed.LockedUntil = nil
+	receipts.items[request.IdempotencyKey] = claimed
+
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+	service.ProductAwareEnabled = false
+	service.PlannerHandoffEnabled = false
+	result, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.NotNil(t, result.V2)
+	require.True(t, result.V2.Materialized)
+	require.Zero(t, student.mutations)
+	require.Equal(t, 1, dialog.materializeCalls)
+}
+
+func TestS11CanonicalActionRecoversCrashAfterDialogMaterialization(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	messageID, messageVersion := sessionPrompt(t, session)
+	request := actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "94949494-9494-4949-8949-949494949494")
+	receipts.failCompleteOnce = true
+
+	_, err = service.ApplyAction(context.Background(), testStudentID, request)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	recovered, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.NotNil(t, recovered.V2)
+	require.True(t, recovered.V2.Materialized)
+	replayed, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.True(t, replayed.V2.Replayed)
+	require.Equal(t, recovered.V2.CanonicalStudentMessageID, replayed.V2.CanonicalStudentMessageID)
+	require.Equal(t, 2, dialog.materializeCalls, "the retry uses the same deterministic Dialog command")
+	require.Zero(t, student.mutations)
+}
+
+func TestS11TerminalV1V2WithoutImmutableProjectionIsUnavailable(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			service, student, dialog, _ := newTestService()
+			interaction := installCollectingInteraction(t, service, version)
+			registry := service.Interactions.(*testInteractions)
+			closedAt := service.Clock.Now()
+			interaction.State = domain.TeacherOnboardingInteractionClosed
+			interaction.ClosedReason = domain.TeacherOnboardingClosedPlanningReady
+			interaction.ClosedAt = closedAt
+			interaction.UpdatedAt = closedAt
+			registry.items[interaction.ID] = interaction
+			registry.current = ""
+			service.CanonicalActionsEnabled = false
+			service.UnifiedCoordinatorEnabled = false
+			service.ProductAwareEnabled = false
+			service.PlannerHandoffEnabled = false
+
+			_, err := service.Ensure(context.Background(), testStudentID)
+			require.ErrorIs(t, err, domain.ErrTeacherOnboardingHistoricalSessionUnavailable)
+			require.Zero(t, student.mutations)
+			require.Zero(t, dialog.appendCalls)
+		})
+	}
+}
+
+func TestS11TerminalV3UsesOnlyExactLinkedHandoffWithFlagsOff(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	interaction := installCollectingInteraction(t, service, 3)
+	registry := service.Interactions.(*testInteractions)
+	now := service.Clock.Now()
+	interaction.State = domain.TeacherOnboardingInteractionHandoffPending
+	interaction.ReservedTeacherJobID = "77777777-7777-4777-8777-777777777777"
+	interaction.ReservedActionReceiptID = "88888888-8888-4888-8888-888888888888"
+	interaction.ReservationMode = domain.TeacherOnboardingCoordinatorAction
+	interaction.ClosedReason = domain.TeacherOnboardingClosedPlanningReady
+	interaction.ClosedAt = now
+	interaction.UpdatedAt = now
+	registry.items[interaction.ID] = interaction
+
+	readiness := domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef:       domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated,
+		Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion},
+	}
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(
+		domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID},
+		domain.TeacherDialogBinding{ID: testDialogID, StudentID: testStudentID, PersonalTeacherID: testTeacherID, ContextType: domain.LearningContextGeneral},
+		readiness, "ru", interaction.ReservedTeacherJobID, interaction.ID, now,
+	)
+	require.NoError(t, err)
+	service.Handoffs = &testHandoffs{intent: intent}
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+	service.ProductAwareEnabled = false
+	service.PlannerHandoffEnabled = false
+	service.Teachers = nil
+	service.Dialogs = nil
+	service.Students = nil
+	service.Readiness = nil
+
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.NotNil(t, session.V3)
+	require.Equal(t, domain.TeacherOnboardingSessionHandoffPending, session.V3.Status)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+}
+
+func TestS11HistoricalAcceptedHandoffReadsDeliveredOutcomeWithAllFlagsOff(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	now := service.Clock.Now().UTC()
+	readiness := domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef:       domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated,
+		Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion},
+	}
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(
+		domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID},
+		domain.TeacherDialogBinding{ID: testDialogID, StudentID: testStudentID, PersonalTeacherID: testTeacherID, ContextType: domain.LearningContextGeneral},
+		readiness, "en", "", "", now,
+	)
+	require.NoError(t, err)
+	intent.Status = domain.TeacherOnboardingHandoffAcceptedStatus
+	intent.PlannerHandoffID = "abababab-abab-4bab-8bab-abababababab"
+	intent.ReadinessObservedAt = now
+	intent.AcceptedAt = now.Add(time.Second)
+	marker := domain.TeacherOnboardingPathOutcomeMarker{Kind: domain.TeacherOnboardingPathOutcomeMarkerKind,
+		Status: domain.TeacherOnboardingPathOutcomeMarkerReady, DialogMessageID: "99999999-9999-4999-8999-999999999999"}
+	projection := &testPathOutcomeProjection{marker: marker, found: true}
+	service.Handoffs = &testHandoffs{intent: intent}
+	service.PathOutcomes = projection
+	service.CanonicalActionsEnabled = false
+	service.UnifiedCoordinatorEnabled = false
+	service.ProductAwareEnabled = false
+	service.PlannerHandoffEnabled = false
+	service.PathOutcomeEnabled = false
+	service.Teachers, service.Dialogs, service.Students, service.Readiness = nil, nil, nil, nil
+
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.NotNil(t, session.V3)
+	require.Equal(t, marker, *session.V3.PathOutcome)
+	require.Equal(t, 1, projection.calls)
+	require.Zero(t, student.mutations)
+	require.Zero(t, dialog.appendCalls)
+}
+
+func TestS11NoEvidenceRequiresEveryAdmissionFlagBeforeDownstreamEffects(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		disable func(*Service)
+	}{
+		{name: "canonical", disable: func(service *Service) { service.CanonicalActionsEnabled = false }},
+		{name: "unified", disable: func(service *Service) { service.UnifiedCoordinatorEnabled = false }},
+		{name: "product", disable: func(service *Service) { service.ProductAwareEnabled = false }},
+		{name: "handoff", disable: func(service *Service) { service.PlannerHandoffEnabled = false }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			service, student, dialog, _ := newTestService()
+			readiness := &testReadiness{}
+			handoffs := &testHandoffs{}
+			service.Readiness, service.Handoffs = readiness, handoffs
+			testCase.disable(service)
+			_, err := service.Ensure(context.Background(), testStudentID)
+			require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+			require.Zero(t, readiness.calls)
+			require.Zero(t, handoffs.calls)
+			require.Zero(t, student.mutations)
+			require.Zero(t, dialog.appendCalls)
+			require.Zero(t, dialog.materializeCalls)
+		})
+	}
+}
+
+func TestDurableHandoffEnsureReturnsV3PendingThenAcceptedWithoutS7TerminalMessage(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	goal, experience, direction, language := "learn_programming", "beginner", "undecided", "ru"
+	student.state.Draft.Version = 4
+	student.state.Draft.GoalCode, student.state.Draft.SelfAssessedExperience, student.state.Draft.DirectionCode, student.state.Draft.PreferredLanguage = &goal, &experience, &direction, &language
+	now := time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC)
+	student.state.Draft.CreatedAt, student.state.Draft.UpdatedAt = &now, &now
+	readiness := &testReadiness{result: domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion},
+	}}
+	handoffs := &testHandoffs{}
+	service.Readiness, service.Handoffs = readiness, handoffs
+	service.ProductAwareEnabled, service.PlannerHandoffEnabled, service.UnifiedCoordinatorEnabled = true, true, true
+	pending, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.Nil(t, pending.V2)
+	require.NotNil(t, pending.V3)
+	require.Equal(t, domain.TeacherOnboardingSessionHandoffPending, pending.V3.Status)
+	require.Equal(t, domain.TeacherLearningContentNotCreated, pending.V3.Terminal.ContentStatus)
+	require.Zero(t, dialog.mutations, "READY no longer emits the S7 planning-ready terminal")
+
+	handoffs.intent.Status = domain.TeacherOnboardingHandoffAcceptedStatus
+	handoffs.intent.SourceTeacherJobID = "77777777-7777-4777-8777-777777777777"
+	handoffs.intent.SourceInteractionID = "88888888-8888-4888-8888-888888888888"
+	handoffs.intent.PlannerHandoffID = "66666666-6666-4666-8666-666666666666"
+	handoffs.intent.AcceptedAt = now.Add(time.Minute)
+	handoffs.intent.ReadinessObservedAt = now
+	accepted, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherOnboardingSessionHandoffAccepted, accepted.V3.Status)
+	require.Equal(t, domain.TeacherOnboardingExecutionNotStarted, accepted.V3.Terminal.ExecutionStatus)
+	encoded, err := json.Marshal(accepted)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), handoffs.intent.PlannerHandoffID)
+	require.NotContains(t, string(encoded), handoffs.intent.ID)
+	require.Equal(t, 1, handoffs.calls, "source-bound refresh reads the existing ledger instead of originless re-enqueue")
+	require.GreaterOrEqual(t, handoffs.reads, 2)
+
+}
+
+func TestAttachDeliveredPathOutcomeExposesOnlyExactDialogDeliveryMarker(t *testing.T) {
+	stateRef := domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}
+	session, err := domain.DurableHandoffTeacherOnboardingSession(domain.TeacherOnboardingSessionV3{
+		Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: testDialogID,
+		Status: domain.TeacherOnboardingSessionHandoffAccepted, Phase: domain.TeacherOnboardingPhaseReadyToStart, StateRef: stateRef,
+		Terminal: &domain.TeacherOnboardingTerminalV3{Kind: domain.TeacherOnboardingSessionHandoffAccepted, DisplayName: domain.TeacherGoBackendGoalDisplayName, ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated},
+	})
+	require.NoError(t, err)
+	marker := domain.TeacherOnboardingPathOutcomeMarker{
+		Kind: domain.TeacherOnboardingPathOutcomeMarkerKind, Status: domain.TeacherOnboardingPathOutcomeMarkerReady,
+		DialogMessageID: "99999999-9999-4999-8999-999999999999",
+	}
+	projection := &testPathOutcomeProjection{marker: marker, found: true}
+	service := Service{PathOutcomeEnabled: true, PathOutcomes: projection}
+
+	result, err := service.attachDeliveredPathOutcome(context.Background(), domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID}, session)
+	require.NoError(t, err)
+	require.Equal(t, marker, *result.V3.PathOutcome)
+	require.Equal(t, testStudentID, projection.studentID)
+	require.Equal(t, testTeacherID, projection.personalTeacherID)
+	require.Equal(t, testDialogID, projection.dialogID)
+	require.Equal(t, stateRef, projection.stateRef)
+
+	encoded, err := json.Marshal(result)
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"schema":"teacher-onboarding-session.v3",
+		"dialog_id":"33333333-3333-4333-8333-333333333333",
+		"status":"PLANNER_HANDOFF_ACCEPTED",
+		"phase":"READY_TO_START",
+		"state_ref":{"kind":"accepted_draft","version":4},
+		"terminal":{"kind":"PLANNER_HANDOFF_ACCEPTED","display_name":"Go backend","execution_status":"NOT_STARTED","content_status":"NOT_CREATED"},
+		"path_outcome":{"kind":"ONBOARDING_PATH_OUTCOME","status":"PATH_READY","dialog_message_id":"99999999-9999-4999-8999-999999999999"}
+	}`, string(encoded))
+}
+
+func TestAttachDeliveredPathOutcomeKeepsMarkerAbsentUntilRepositoryReportsDelivery(t *testing.T) {
+	session, err := domain.DurableHandoffTeacherOnboardingSession(domain.TeacherOnboardingSessionV3{
+		Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: testDialogID,
+		Status: domain.TeacherOnboardingSessionHandoffAccepted, Phase: domain.TeacherOnboardingPhaseReadyToStart,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		Terminal: &domain.TeacherOnboardingTerminalV3{Kind: domain.TeacherOnboardingSessionHandoffAccepted, DisplayName: domain.TeacherGoBackendGoalDisplayName, ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated},
+	})
+	require.NoError(t, err)
+	projection := &testPathOutcomeProjection{}
+	result, err := (Service{PathOutcomeEnabled: true, PathOutcomes: projection}).attachDeliveredPathOutcome(
+		context.Background(), domain.PersonalTeacher{ID: testTeacherID, StudentID: testStudentID}, session,
+	)
+	require.NoError(t, err)
+	require.Nil(t, result.V3.PathOutcome)
+	require.Equal(t, 1, projection.calls)
+}
+
+func TestS11ReadyAdmissionCreatesDurableV3HandoffWithoutTerminalCopy(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	goal, experience, direction, language := "learn_programming", "beginner", "undecided", "ru"
+	student.state.Draft.Version = 4
+	student.state.Draft.GoalCode, student.state.Draft.SelfAssessedExperience, student.state.Draft.DirectionCode, student.state.Draft.PreferredLanguage = &goal, &experience, &direction, &language
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	student.state.Draft.CreatedAt, student.state.Draft.UpdatedAt = &now, &now
+	readiness := &testReadiness{result: domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion},
+	}}
+	service.Readiness, service.ProductAwareEnabled, service.UnifiedCoordinatorEnabled = readiness, true, true
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.NotNil(t, session.V3)
+	require.Equal(t, domain.TeacherOnboardingSessionHandoffPending, session.V3.Status)
+	require.Nil(t, session.V3.CurrentPrompt)
+	require.Equal(t, domain.TeacherFoundationGoalDisplayName, session.V3.Terminal.DisplayName)
+	require.Equal(t, 1, readiness.calls)
+	require.Equal(t, domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, readiness.ref)
+	require.Zero(t, dialog.mutations)
+}
+
+func TestS11V3EnsureSupersedesPromptAndTerminalHandoffClosesCurrentPrompt(t *testing.T) {
+	service, student, _, _ := newTestService()
+	service.UnifiedCoordinatorEnabled = true
+	initial, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	initialMessageID, _ := sessionPrompt(t, initial)
+	registry := service.Interactions.(*testInteractions)
+	legacyInteraction := registry.items[registry.current]
+
+	readiness := &testReadiness{result: domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessNeedsClarification,
+		ReasonCodes: []string{domain.TeacherReadinessReasonLearningIntentMissing}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateNone, Version: 0}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated,
+	}}
+	service.Readiness, service.ProductAwareEnabled = readiness, true
+	v3, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherOnboardingSessionV3Collecting, v3.V3.Status)
+	require.Equal(t, initialMessageID, v3.V3.CurrentPrompt.MessageID)
+	require.Equal(t, domain.TeacherOnboardingInteractionActive, registry.items[legacyInteraction.ID].State)
+
+	goal, experience, direction, language := "learn_programming", "beginner", "undecided", "ru"
+	student.state.Draft.Version = 4
+	student.state.Draft.GoalCode, student.state.Draft.SelfAssessedExperience, student.state.Draft.DirectionCode, student.state.Draft.PreferredLanguage = &goal, &experience, &direction, &language
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	student.state.Draft.CreatedAt, student.state.Draft.UpdatedAt = &now, &now
+	readiness.result = domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion}}
+	_, err = service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	for _, interaction := range registry.items {
+		require.NotEqual(t, domain.TeacherOnboardingInteractionActive, interaction.State)
+		require.NotEqual(t, domain.TeacherOnboardingInteractionReserved, interaction.State)
+	}
+}
+
+func TestActionAfterV3TerminalRejectsBeforeDialogOrStudentAndMaterializedReplaySurvives(t *testing.T) {
+	service, student, dialog, receipts := newTestService()
+	service.UnifiedCoordinatorEnabled = true
+	service.CanonicalActionsEnabled = true
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	service.CanonicalMessages = dialog
+	messageID, messageVersion := sessionPrompt(t, session)
+
+	request := actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "93939393-9393-4939-8939-939393939393")
+	materialized, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.NotNil(t, materialized.V2)
+	registry := service.Interactions.(*testInteractions)
+	current := registry.items[registry.current]
+	current.State = domain.TeacherOnboardingInteractionClosed
+	current.ClosedReason = domain.TeacherOnboardingClosedPlanningReady
+	current.ClosedAt = service.Clock.Now()
+	current.UpdatedAt = current.ClosedAt
+	registry.items[current.ID] = current
+	registry.current = ""
+
+	replayed, err := service.ApplyAction(context.Background(), testStudentID, request)
+	require.NoError(t, err)
+	require.True(t, replayed.V2.Replayed)
+	require.Equal(t, materialized.V2.CanonicalStudentMessageID, replayed.V2.CanonicalStudentMessageID)
+	require.Equal(t, 1, dialog.materializeCalls)
+
+	stale := request
+	stale.IdempotencyKey = "94949494-9494-4949-8949-949494949494"
+	stale.ActionID = "goal.unsupported"
+	beforeStudent := student.replaceCalls
+	_, err = service.ApplyAction(context.Background(), testStudentID, stale)
+	require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+	require.Equal(t, 1, dialog.materializeCalls)
+	require.Equal(t, beforeStudent, student.replaceCalls)
+	_, staleReceiptExists := receipts.items[stale.IdempotencyKey]
+	require.False(t, staleReceiptExists, "prompt-level receipt fence rejects before a second claim is stored")
+}
+
+func TestS11TerminalEnsureDoesNotStealReservedV3Prompt(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	service.UnifiedCoordinatorEnabled = true
+	initial, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	initialMessageID, _ := sessionPrompt(t, initial)
+	registry := service.Interactions.(*testInteractions)
+	interaction := registry.items[registry.current]
+	interaction.State = domain.TeacherOnboardingInteractionReserved
+	interaction.ReservedTeacherJobID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	interaction.ReservationMode = domain.TeacherOnboardingCoordinatorText
+	registry.items[interaction.ID] = interaction
+
+	goal, experience, direction, language := "learn_programming", "beginner", "undecided", "ru"
+	student.state.Draft.Version = 4
+	student.state.Draft.GoalCode, student.state.Draft.SelfAssessedExperience, student.state.Draft.DirectionCode, student.state.Draft.PreferredLanguage = &goal, &experience, &direction, &language
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	student.state.Draft.CreatedAt, student.state.Draft.UpdatedAt = &now, &now
+	service.Readiness = &testReadiness{result: domain.TeacherLearningReadiness{Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{domain.TeacherReadinessReasonFoundationGraphResolved}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4}, ReadinessScope: domain.TeacherLearningReadinessScope,
+		ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion}}}
+	service.ProductAwareEnabled = true
+	session, err := service.Ensure(context.Background(), testStudentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.TeacherOnboardingSessionV3Collecting, session.V3.Status)
+	require.Equal(t, initialMessageID, session.V3.CurrentPrompt.MessageID)
+	require.Equal(t, 1, dialog.mutations, "terminal copy is not appended while a real turn owns the prompt")
+	require.Equal(t, domain.TeacherOnboardingInteractionReserved, registry.items[interaction.ID].State)
+}
+
+func TestS11ActivePathTerminalRecoversPendingAndAppendCrashExactlyOnceWithFlagsOff(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		failAppendOnce bool
+		failAckOnce    bool
+	}{{name: "crash after pending", failAppendOnce: true}, {name: "crash after append", failAckOnce: true}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			service, student, dialog, _ := newTestService()
+			goal, experience, direction, language := "learn_programming", "beginner", "undecided", "en"
+			student.state.Draft.Version = 4
+			student.state.Draft.GoalCode, student.state.Draft.SelfAssessedExperience = &goal, &experience
+			student.state.Draft.DirectionCode, student.state.Draft.PreferredLanguage = &direction, &language
+			now := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+			student.state.Draft.CreatedAt, student.state.Draft.UpdatedAt = &now, &now
+			service.Readiness = &testReadiness{result: domain.TeacherLearningReadiness{
+				Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessNotReady,
+				ReasonCodes: []string{domain.TeacherReadinessReasonActivePathExists}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+				StateRef:       domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+				ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated,
+				ActivePath: &domain.TeacherLearningReadinessActivePath{LearningPathID: "12121212-1212-4212-8212-121212121212", Version: 3, CourseID: "13131313-1313-4313-8313-131313131313", GoalCode: "learn_programming", Status: "ACTIVE"},
+			}}
+			terminalStore := service.TerminalSessions.(*testTerminalSessions)
+			terminalStore.failMarkOnce = testCase.failAckOnce
+			dialog.appendErrOnce = testCase.failAppendOnce
+
+			_, err := service.Ensure(context.Background(), testStudentID)
+			require.ErrorIs(t, err, domain.ErrTeacherOnboardingUnavailable)
+			require.Equal(t, domain.TeacherOnboardingTerminalMessagePending, terminalStore.record.Status)
+			service.CanonicalActionsEnabled = false
+			service.UnifiedCoordinatorEnabled = false
+			service.ProductAwareEnabled = false
+			service.PlannerHandoffEnabled = false
+
+			session, err := service.Ensure(context.Background(), testStudentID)
+			require.NoError(t, err)
+			require.Equal(t, domain.TeacherOnboardingSessionV3ActivePathExists, session.V3.Status)
+			require.Equal(t, domain.TeacherOnboardingTerminalDelivered, terminalStore.record.Status)
+			require.Equal(t, 1, dialog.mutations, "the stable terminal message command prevents duplicate Dialog messages")
+			beforeCalls := dialog.appendCalls
+			service.Students = nil
+			service.PlainMessages = nil
+			replayed, err := service.Ensure(context.Background(), testStudentID)
+			require.NoError(t, err)
+			require.Equal(t, session, replayed)
+			require.Equal(t, beforeCalls, dialog.appendCalls, "delivered terminal evidence needs no downstream call")
+		})
+	}
+}
+
+func newTestService() (*Service, *testStudent, *testDialog, *testReceiptStore) {
+	clock := &testClock{now: time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)}
+	student := &testStudent{state: domain.TeacherStudentOnboardingState{Schema: domain.TeacherStudentOnboardingStateSchema, Draft: domain.StudentOnboardingDraft{Schema: domain.StudentOnboardingDraftSchema, StudentID: testStudentID, Status: domain.StudentOnboardingDraftDraft}, ProfileVersion: 0}, commands: map[string]domain.StudentOnboardingDraft{}}
+	dialog := &testDialog{sources: map[string]domain.DialogAssistantUISource{}, messages: map[string]domain.DialogMessage{}}
+	store := &testReceiptStore{items: map[string]domain.OnboardingActionReceipt{}, active: map[string]string{}}
+	ids := &testIDs{}
+	interactions := &testInteractions{items: map[string]domain.TeacherOnboardingInteraction{}}
+	readiness := &testReadiness{result: domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessNeedsClarification,
+		ReasonCodes: []string{domain.TeacherReadinessReasonLearningIntentMissing}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef:       domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateNone, Version: 0},
+		ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated,
+	}}
+	return &Service{
+		Teachers: testTeacher{}, Dialogs: dialog, Sources: dialog, StructuredMessages: dialog, PlainMessages: dialog, CanonicalMessages: dialog,
+		Students: student, Receipts: store, Interactions: interactions, Readiness: readiness, Handoffs: &testHandoffs{interactions: interactions}, TerminalSessions: &testTerminalSessions{}, IDs: ids, Clock: clock, LeaseTTL: time.Minute,
+		CanonicalActionsEnabled: true, UnifiedCoordinatorEnabled: true, ProductAwareEnabled: true, PlannerHandoffEnabled: true,
+	}, student, dialog, store
+}
+
+func installCollectingInteraction(t *testing.T, service *Service, sessionSchemaVersion int) domain.TeacherOnboardingInteraction {
+	t.Helper()
+	binding := domain.TeacherDialogBinding{ID: testDialogID, StudentID: testStudentID, PersonalTeacherID: testTeacherID, ContextType: domain.LearningContextGeneral}
+	step := domain.OnboardingStepDirection
+	var assistantUI json.RawMessage
+	var err error
+	if sessionSchemaVersion > 1 {
+		step = domain.OnboardingStepGoal
+		_, assistantUI, err = domain.BuildProductAwareTeacherOnboardingPrompt(step, "ru", 0)
+	} else {
+		_, assistantUI, err = domain.BuildTeacherOnboardingPrompt(step, "ru", 0)
+	}
+	require.NoError(t, err)
+	interaction, err := domain.NewS5OnboardingInteractionFromPrompt(binding, domain.DeterministicOnboardingUUID("historical-prompt", sessionSchemaVersion), 1, assistantUI, step, 0, 0, sessionSchemaVersion, service.Clock.Now())
+	require.NoError(t, err)
+	_, _, err = service.Interactions.EnsureActiveInteraction(context.Background(), interaction)
+	require.NoError(t, err)
+	return interaction
+}
+
+func actionRequest(message string, version int, block, action, key string) domain.AssistantUIActionRequest {
+	return domain.AssistantUIActionRequest{Schema: domain.AssistantUIActionSchema, DialogID: testDialogID, MessageID: message, MessageVersion: version, BlockID: block, ActionID: action, IdempotencyKey: key}
+}
+
+func sessionPrompt(t *testing.T, session domain.TeacherOnboardingSession) (string, int) {
+	t.Helper()
+	if session.V3 != nil && session.V3.CurrentPrompt != nil {
+		return session.V3.CurrentPrompt.MessageID, session.V3.CurrentPrompt.MessageVersion
+	}
+	if session.V2 != nil && session.V2.CurrentPrompt != nil {
+		return session.V2.CurrentPrompt.MessageID, session.V2.CurrentPrompt.MessageVersion
+	}
+	require.NotNil(t, session.MessageID)
+	require.NotNil(t, session.MessageVersion)
+	return *session.MessageID, *session.MessageVersion
+}

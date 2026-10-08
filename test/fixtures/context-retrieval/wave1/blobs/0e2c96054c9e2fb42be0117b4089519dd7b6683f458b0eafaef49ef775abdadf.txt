@@ -1,0 +1,585 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var _ repository.PracticeLearningActionRepository = (*LearningActionLifecycleRepoPG)(nil)
+var _ repository.PracticeLearningActionEvidenceRepository = (*LearningActionLifecycleRepoPG)(nil)
+
+// ApplyPracticeLearningActionEvidence closes an OPEN Practice binding and its
+// exact path item in the same transaction as immutable evidence and mastery.
+// Unlike Course closure it deliberately emits no legacy outbox event.
+func (repo LearningActionLifecycleRepoPG) ApplyPracticeLearningActionEvidence(ctx context.Context, evidence domain.PracticeCompetencyEvidenceBundleV2, closedAt time.Time) (bool, error) {
+	if repo.Pool == nil {
+		return false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "practice-learning-action-instance:"+evidence.TaskInstanceID); err != nil {
+		return false, err
+	}
+	binding, err := getPracticeLearningAction(ctx, tx, "student_instance", evidence.StudentID+"\x00"+evidence.TaskInstanceID, true)
+	if err != nil {
+		return false, err
+	}
+	if binding.LearningActionID != evidence.LearningActionID ||
+		binding.LearningPathItemID != evidence.LearningPathItemID || binding.RequirementID != evidence.RequirementID || binding.TaskRevisionID != evidence.TaskRevisionID || binding.TaskRevisionDigest != evidence.TaskRevisionDigest ||
+		!domain.PracticeLearningTargetsOrderedEqual(binding.LearningTargets, practiceEvidenceTargetsV2(evidence)) {
+		return false, domain.ErrConflict
+	}
+	if binding.LearningPathID != "" {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "learning-path:"+binding.StudentID); err != nil {
+			return false, err
+		}
+	}
+	if binding.LifecycleStatus == domain.PracticeLearningActionClosed {
+		if err := validateDuplicatePracticeEvidenceReceiptV2(ctx, tx, evidence); err != nil {
+			return false, err
+		}
+		if err := validatePracticeEvidenceV2Committed(ctx, tx, binding, evidence); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if binding.LifecycleStatus != domain.PracticeLearningActionOpen {
+		return false, domain.ErrConflict
+	}
+	inserted, err := insertPracticeEvidenceReceiptV2(ctx, tx, evidence)
+	if err != nil {
+		return false, mapPracticeLearningActionError(err)
+	}
+	if !inserted {
+		if err := validateDuplicatePracticeEvidenceReceiptV2(ctx, tx, evidence); err != nil {
+			return false, err
+		}
+		if err := validatePracticeEvidenceV2Committed(ctx, tx, binding, evidence); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	reducerInputs, err := domain.PracticeEvidenceReducerInputsV2(evidence)
+	if err != nil {
+		return false, evidenceContractError("invalid practice evidence v2 reducer input", err)
+	}
+	if err := applyPracticeTargetEvidenceV2(ctx, tx, evidence, reducerInputs); err != nil {
+		return false, err
+	}
+	if binding.LearningPathID != "" {
+		if err := completePracticePath(ctx, tx, binding, closedAt); err != nil {
+			return false, err
+		}
+	}
+	command, err := tx.Exec(ctx, `UPDATE student_learning_action
+SET lifecycle_status='CLOSED', closed_at=$2, evidence_class='application', outcome='passed', outcome_policy_version='student-mastery-v1'
+WHERE id=$1 AND source_kind='practice_v2' AND lifecycle_status='OPEN'`, binding.LearningActionID, closedAt)
+	if err != nil {
+		return false, err
+	}
+	if command.RowsAffected() != 1 {
+		return false, domain.ErrConflict
+	}
+	if err := enqueueObjectivePlanningState(ctx, tx, evidence.StudentID, evidence.EvidenceID, objectivePlanningTargets(reducerInputs), evidence.OccurredAt); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func practiceEvidenceTargetsV2(evidence domain.PracticeCompetencyEvidenceBundleV2) []domain.LearningTargetRef {
+	targets := make([]domain.LearningTargetRef, 0, len(evidence.Evidence))
+	for _, item := range evidence.Evidence {
+		targets = append(targets, item.Target)
+	}
+	return targets
+}
+
+func completePracticePath(ctx context.Context, tx pgx.Tx, binding domain.PracticeLearningActionBinding, now time.Time) error {
+	if binding.LearningPathItemID != "" {
+		_, _, err := applyLessonFactTx(ctx, tx, domain.LessonActivityFact{StudentID: binding.StudentID, ItemID: binding.LearningPathItemID, RequirementID: binding.RequirementID, Type: "practice_completed", SourceID: binding.TaskRevisionID, SourceRevisionID: binding.TaskRevisionID, FactID: binding.TaskInstanceID, OccurredAt: now})
+		return err
+	}
+	path, err := getLearningPathByID(ctx, tx, binding.StudentID, binding.LearningPathID, true)
+	if err != nil {
+		return err
+	}
+	journey, err := getLearningContext(ctx, tx, binding.StudentID, true)
+	if err != nil {
+		return err
+	}
+	item, ok := practicePathItem(path, binding)
+	if !ok || item.Status != domain.LearningPathItemInProgress || !domain.PracticeLearningTargetIdentitySetEqual(item.Targets, binding.LearningTargets) {
+		return domain.ErrConflict
+	}
+	item.Status, item.ReasonCode = domain.LearningPathItemCompleted, "practice_completed"
+	for index := range path.Items {
+		if path.Items[index].Position == item.Position {
+			path.Items[index] = item
+			break
+		}
+	}
+	expected := path.Version
+	path.Version++
+	path.UpdatedAt = now
+	path, err = domain.NormalizeStudentLearningPath(path)
+	if err != nil {
+		return domain.ErrValidation
+	}
+	command, err := tx.Exec(ctx, `UPDATE student_learning_path SET version=$3, updated_at=$4 WHERE id=$1 AND student_id=$2 AND version=$5`, path.ID, path.StudentID, path.Version, path.UpdatedAt, expected)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	itemCommand, err := tx.Exec(ctx, `UPDATE student_learning_path_item SET status=$4, reason_code=$5
+WHERE student_learning_path_id=$1 AND reference_type='practice' AND reference_id=$2 AND position=$3 AND status='IN_PROGRESS'`, path.ID, binding.TaskRevisionID, item.Position, item.Status, item.ReasonCode)
+	if err != nil {
+		return err
+	}
+	if itemCommand.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	if _, err = incrementLearningJourneyVersion(ctx, tx, journey, now, journey.SelectedLearningPathID); err != nil {
+		return err
+	}
+	return insertLearningPathRevision(ctx, tx, path)
+}
+
+func validatePracticeEvidenceV2Committed(ctx context.Context, tx pgx.Tx, binding domain.PracticeLearningActionBinding, evidence domain.PracticeCompetencyEvidenceBundleV2) error {
+	if binding.LearningPathItemID != "" {
+		if binding.LifecycleStatus != domain.PracticeLearningActionClosed {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	if binding.LifecycleStatus != domain.PracticeLearningActionClosed || binding.LearningActionID != evidence.LearningActionID {
+		return domain.ErrConflict
+	}
+	var evidenceClass, outcome, outcomePolicy string
+	if err := tx.QueryRow(ctx, `SELECT evidence_class, outcome, outcome_policy_version FROM student_learning_action WHERE id=$1`, binding.LearningActionID).Scan(&evidenceClass, &outcome, &outcomePolicy); err != nil {
+		return err
+	}
+	if evidenceClass != "application" || outcome != "passed" || outcomePolicy != domain.MasteryPolicyVersion {
+		return domain.ErrConflict
+	}
+	if binding.LearningPathID == "" {
+		return nil
+	}
+	path, err := getLearningPathByID(ctx, tx, binding.StudentID, binding.LearningPathID, true)
+	if err != nil {
+		return err
+	}
+	item, ok := practicePathItem(path, binding)
+	if !ok || item.Status != domain.LearningPathItemCompleted || !domain.PracticeLearningTargetIdentitySetEqual(item.Targets, binding.LearningTargets) {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (repo LearningActionLifecycleRepoPG) ReservePracticeLearningAction(ctx context.Context, input domain.PracticeLearningActionReserve) (domain.PracticeLearningActionBinding, bool, error) {
+	if repo.Pool == nil {
+		return domain.PracticeLearningActionBinding{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, key := range []string{"practice-learning-action-instance:" + input.TaskInstanceID, "learning-path:" + input.StudentID} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+	}
+	stored, err := getPracticeLearningAction(ctx, tx, "practice_task_instance_id", input.TaskInstanceID, false)
+	if err == nil {
+		if stored.StudentID != input.StudentID || stored.EnsureRequestHash != input.EnsureRequestHash {
+			return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+		return stored, true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+
+	binding := domain.PracticeLearningActionBinding{
+		Schema: domain.StudentPracticeLearningActionBindingSchema, LearningActionID: input.LearningActionID,
+		StudentID: input.StudentID, TaskInstanceID: input.TaskInstanceID, TaskRevisionID: input.TaskRevisionID,
+		TaskRevisionDigest: input.TaskRevisionDigest, SurfaceClassification: input.SurfaceClassification,
+		LearningTargets: input.LearningTargets, LifecycleStatus: domain.PracticeLearningActionReserved,
+		LearningPathItemID: input.LearningPathItemID, RequirementID: input.RequirementID, LearningPathID: input.LearningPathID, EnsureRequestHash: input.EnsureRequestHash,
+	}
+	if binding.LearningPathID != "" {
+		path, err := getLearningPathByID(ctx, tx, input.StudentID, input.LearningPathID, true)
+		if err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+		journey, err := getLearningContext(ctx, tx, input.StudentID, true)
+		if err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+		if path.Status != domain.LearningPathStatusActive || journey.SelectedLearningPathID != path.ID {
+			return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+		}
+		item, ok := practicePathItem(path, binding)
+		if !ok || (binding.LearningPathItemID == "" && (!practiceProgressionStartAllowed(path.Items, item.Position) || !domain.PracticeLearningTargetIdentitySetEqual(item.Targets, binding.LearningTargets))) || (binding.LearningPathItemID != "" && (item.Status == domain.LearningPathItemCompleted || item.Status == domain.LearningPathItemSkippedMastered)) {
+			return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+		}
+		if binding.LearningPathItemID != "" {
+			if _, err := validateLessonCommandAdmissionTx(ctx, tx, binding.StudentID, binding.LearningPathItemID, binding.RequirementID); err != nil {
+				return domain.PracticeLearningActionBinding{}, false, err
+			}
+		}
+		binding.LearningPathVersionReservation, binding.LearningPathPositionReservation = path.Version, item.Position
+	}
+	targets, err := json.Marshal(binding.LearningTargets)
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	contextType := domain.LearningContextPracticeTask
+	if binding.SurfaceClassification == "project" {
+		contextType = domain.LearningContextProject
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO student_learning_action (
+id, student_task_answer_id, student_id, task_id, cycle, context_type, context_id, learning_targets,
+opened_at, closed_at, source_kind, lifecycle_status, practice_task_instance_id, practice_task_revision_id,
+practice_task_revision_digest, surface_classification, learning_path_id, learning_path_version_at_reservation,
+learning_path_position_at_reservation, ensure_request_hash, cancel_reason, created_at,learning_path_item_id,requirement_id)
+VALUES ($1,NULL,$2,NULL,0,$3,$4,$5::jsonb,NULL,NULL,'practice_v2','RESERVED',$6,$7,$8,$9,
+NULLIF($10,'')::uuid,NULLIF($11,0),NULLIF($12,-1),$13,NULL,$14,NULLIF($15,'')::uuid,NULLIF($16,'')::uuid)`,
+		binding.LearningActionID, binding.StudentID, contextType, binding.TaskInstanceID, string(targets),
+		binding.TaskInstanceID, binding.TaskRevisionID, binding.TaskRevisionDigest, binding.SurfaceClassification,
+		binding.LearningPathID, binding.LearningPathVersionReservation, nullablePracticePosition(binding), binding.EnsureRequestHash, input.OccurredAt, binding.LearningPathItemID, binding.RequirementID)
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, mapPracticeLearningActionError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	return binding, false, nil
+}
+
+func (repo LearningActionLifecycleRepoPG) GetPracticeLearningAction(ctx context.Context, studentID, taskInstanceID string) (domain.PracticeLearningActionBinding, error) {
+	if repo.Pool == nil {
+		return domain.PracticeLearningActionBinding{}, domain.ErrValidation
+	}
+	return getPracticeLearningAction(ctx, repo.Pool, "student_instance", studentID+"\x00"+taskInstanceID, false)
+}
+
+func (repo LearningActionLifecycleRepoPG) OpenPracticeLearningAction(ctx context.Context, studentID, taskInstanceID, actionID string, now time.Time) (domain.PracticeLearningActionBinding, bool, error) {
+	return repo.transitionPracticeLearningAction(ctx, studentID, taskInstanceID, actionID, "", now, true)
+}
+
+func (repo LearningActionLifecycleRepoPG) CancelPracticeLearningAction(ctx context.Context, studentID, taskInstanceID, actionID, reason string, now time.Time) (domain.PracticeLearningActionBinding, bool, error) {
+	return repo.transitionPracticeLearningAction(ctx, studentID, taskInstanceID, actionID, reason, now, false)
+}
+
+func (repo LearningActionLifecycleRepoPG) transitionPracticeLearningAction(ctx context.Context, studentID, taskInstanceID, actionID, cancelReason string, now time.Time, opening bool) (domain.PracticeLearningActionBinding, bool, error) {
+	if repo.Pool == nil || !opening && !domain.IsPracticeLearningActionCancelReason(cancelReason) {
+		return domain.PracticeLearningActionBinding{}, false, domain.ErrValidation
+	}
+	now = now.UTC()
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, key := range []string{"practice-learning-action-instance:" + taskInstanceID, "learning-path:" + studentID} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+	}
+	binding, err := getPracticeLearningAction(ctx, tx, "student_instance", studentID+"\x00"+taskInstanceID, true)
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	if binding.LearningActionID != actionID {
+		return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+	}
+	if opening && binding.LifecycleStatus == domain.PracticeLearningActionOpen {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+		return binding, true, nil
+	}
+	if !opening && binding.LifecycleStatus == domain.PracticeLearningActionCancelled {
+		if binding.CancelReason != cancelReason {
+			return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+		return binding, true, nil
+	}
+	if opening && binding.LifecycleStatus != domain.PracticeLearningActionReserved ||
+		!opening && !domain.CanCancelPracticeLearningAction(binding.LifecycleStatus, cancelReason) {
+		return domain.PracticeLearningActionBinding{}, false, domain.ErrConflict
+	}
+	// Cancelling a reservation is a pure binding transition.  It must not
+	// consume or revise the selected READY path item that was merely reserved.
+	if shouldMutatePracticePath(binding, opening) {
+		if err := mutatePracticePath(ctx, tx, binding, now, opening); err != nil {
+			return domain.PracticeLearningActionBinding{}, false, err
+		}
+	}
+	if opening {
+		command, updateErr := tx.Exec(ctx, `UPDATE student_learning_action SET lifecycle_status='OPEN', opened_at=$2
+WHERE id=$1 AND source_kind='practice_v2' AND lifecycle_status='RESERVED'`, binding.LearningActionID, now)
+		err = updateErr
+		if err == nil && command.RowsAffected() != 1 {
+			err = domain.ErrConflict
+		}
+		binding.LifecycleStatus, binding.OpenedAt = domain.PracticeLearningActionOpen, &now
+	} else {
+		command, updateErr := tx.Exec(ctx, `UPDATE student_learning_action SET lifecycle_status='CANCELLED', closed_at=$2, cancel_reason=$3
+WHERE id=$1 AND source_kind='practice_v2' AND lifecycle_status IN ('RESERVED','OPEN')`, binding.LearningActionID, now, cancelReason)
+		err = updateErr
+		if err == nil && command.RowsAffected() != 1 {
+			err = domain.ErrConflict
+		}
+		binding.LifecycleStatus, binding.ClosedAt, binding.CancelReason = domain.PracticeLearningActionCancelled, &now, cancelReason
+	}
+	if err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PracticeLearningActionBinding{}, false, err
+	}
+	return binding, false, nil
+}
+
+func shouldMutatePracticePath(binding domain.PracticeLearningActionBinding, opening bool) bool {
+	return binding.LearningPathID != "" && (opening || binding.LifecycleStatus == domain.PracticeLearningActionOpen)
+}
+
+func mutatePracticePath(ctx context.Context, tx pgx.Tx, binding domain.PracticeLearningActionBinding, now time.Time, opening bool) error {
+	if binding.LearningPathItemID != "" {
+		if err := validateBoundPracticeRequirement(ctx, tx, binding); err != nil {
+			return err
+		}
+		if opening {
+			// RESERVED is not yet activated. Recheck new-start eligibility;
+			// exact OPEN replay returns earlier and late completion is separate.
+			if _, err := validateLessonCommandAdmissionTx(ctx, tx, binding.StudentID, binding.LearningPathItemID, binding.RequirementID); err != nil {
+				return err
+			}
+			return activateLessonItemTx(ctx, tx, binding.StudentID, binding.LearningPathItemID, now)
+		}
+		return nil
+	}
+	path, err := getLearningPathByID(ctx, tx, binding.StudentID, binding.LearningPathID, true)
+	if err != nil {
+		return err
+	}
+	journey, err := getLearningContext(ctx, tx, binding.StudentID, true)
+	if err != nil {
+		return err
+	}
+	item, ok := practicePathItem(path, binding)
+	if !ok || !domain.PracticeLearningTargetIdentitySetEqual(item.Targets, binding.LearningTargets) {
+		return domain.ErrConflict
+	}
+	if opening {
+		if path.Status != domain.LearningPathStatusActive || journey.SelectedLearningPathID != path.ID ||
+			path.Version != binding.LearningPathVersionReservation || !practiceProgressionStartAllowed(path.Items, item.Position) {
+			return domain.ErrConflict
+		}
+		item.Status, item.ReasonCode = domain.LearningPathItemInProgress, "practice_started"
+	} else {
+		if item.Status != domain.LearningPathItemInProgress {
+			return domain.ErrConflict
+		}
+		status, ok := practiceCancelledPathItemStatus(path.Status, path.Items, item.Position)
+		if !ok {
+			return domain.ErrConflict
+		}
+		item.Status, item.ReasonCode = status, "practice_cancelled"
+	}
+	for index := range path.Items {
+		if path.Items[index].Position == item.Position {
+			path.Items[index] = item
+			break
+		}
+	}
+	expected := path.Version
+	path.Version++
+	path.UpdatedAt = now
+	path, err = domain.NormalizeStudentLearningPath(path)
+	if err != nil {
+		return domain.ErrValidation
+	}
+	command, err := tx.Exec(ctx, `UPDATE student_learning_path SET version=$3, updated_at=$4 WHERE id=$1 AND student_id=$2 AND version=$5`, path.ID, path.StudentID, path.Version, path.UpdatedAt, expected)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	itemCommand, err := tx.Exec(ctx, `UPDATE student_learning_path_item SET status=$4, reason_code=$5
+WHERE student_learning_path_id=$1 AND reference_type='practice' AND reference_id=$2 AND position=$3`, path.ID, binding.TaskRevisionID, item.Position, item.Status, item.ReasonCode)
+	if err != nil {
+		return err
+	}
+	if itemCommand.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	journey, err = incrementLearningJourneyVersion(ctx, tx, journey, now, journey.SelectedLearningPathID)
+	if err != nil {
+		return err
+	}
+	_ = journey
+	return insertLearningPathRevision(ctx, tx, path)
+}
+
+// practiceProgressionStartAllowed rechecks route eligibility at command time.
+// Completed items do not promote the next stored item; the first unfinished
+// PLANNED item can therefore be started without a separate mutable NBA receipt.
+func practiceProgressionStartAllowed(items []domain.LearningPathItem, position int) bool {
+	found := false
+	for _, item := range items {
+		if item.Position == position {
+			found = item.Status == domain.LearningPathItemReady || item.Status == domain.LearningPathItemPlanned
+			continue
+		}
+		if item.Status == domain.LearningPathItemInProgress || (item.Position < position && item.Status != domain.LearningPathItemCompleted && item.Status != domain.LearningPathItemSkippedMastered) {
+			return false
+		}
+	}
+	return found
+}
+
+func practiceCancelledPathItemStatus(pathStatus domain.LearningPathStatus, items []domain.LearningPathItem, position int) (domain.LearningPathItemStatus, bool) {
+	switch pathStatus {
+	case domain.LearningPathStatusPaused:
+		return domain.LearningPathItemPlanned, true
+	case domain.LearningPathStatusActive:
+		for _, item := range items {
+			if item.Position != position && item.Status == domain.LearningPathItemReady {
+				return domain.LearningPathItemPlanned, true
+			}
+		}
+		return domain.LearningPathItemReady, true
+	default:
+		return "", false
+	}
+}
+
+func practicePathItem(path domain.StudentLearningPath, binding domain.PracticeLearningActionBinding) (domain.LearningPathItem, bool) {
+	if binding.LearningPathItemID != "" {
+		for _, i := range path.Items {
+			if i.ID == binding.LearningPathItemID && i.Status != domain.LearningPathItemSkippedMastered {
+				for _, r := range i.FrozenRequirements {
+					if r.ID == binding.RequirementID && r.Type == "practice_completed" && r.SourceReference.ID == binding.TaskRevisionID && r.SourceReference.RevisionID == binding.TaskRevisionID && !r.Satisfied {
+						return i, true
+					}
+				}
+			}
+		}
+		return domain.LearningPathItem{}, false
+	}
+	for _, item := range path.Items {
+		if item.ReferenceType == "practice" && item.ReferenceID == binding.TaskRevisionID &&
+			(binding.LearningPathPositionReservation == 0 && binding.LearningPathVersionReservation == 0 || item.Position == binding.LearningPathPositionReservation) {
+			return item, true
+		}
+	}
+	return domain.LearningPathItem{}, false
+}
+
+func nullablePracticePosition(binding domain.PracticeLearningActionBinding) int {
+	if binding.LearningPathID == "" {
+		return -1
+	}
+	return binding.LearningPathPositionReservation
+}
+
+func getPracticeLearningAction(ctx context.Context, querier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, selector, value string, forUpdate bool) (domain.PracticeLearningActionBinding, error) {
+	var query string
+	var args []any
+	switch selector {
+	case "practice_task_instance_id":
+		query, args = `SELECT id, student_id, practice_task_instance_id, practice_task_revision_id, practice_task_revision_digest,
+surface_classification, learning_targets, lifecycle_status, COALESCE(learning_path_id::text,''),
+COALESCE(learning_path_version_at_reservation,0), COALESCE(learning_path_position_at_reservation,0),
+opened_at, closed_at, COALESCE(cancel_reason,''), ensure_request_hash,COALESCE(learning_path_item_id::text,''),COALESCE(requirement_id::text,'')
+FROM student_learning_action WHERE source_kind='practice_v2' AND practice_task_instance_id=$1`, []any{value}
+	case "student_instance":
+		parts := strings.Split(value, "\x00")
+		if len(parts) != 2 {
+			return domain.PracticeLearningActionBinding{}, domain.ErrValidation
+		}
+		query, args = `SELECT id, student_id, practice_task_instance_id, practice_task_revision_id, practice_task_revision_digest,
+surface_classification, learning_targets, lifecycle_status, COALESCE(learning_path_id::text,''),
+COALESCE(learning_path_version_at_reservation,0), COALESCE(learning_path_position_at_reservation,0),
+opened_at, closed_at, COALESCE(cancel_reason,''), ensure_request_hash,COALESCE(learning_path_item_id::text,''),COALESCE(requirement_id::text,'')
+FROM student_learning_action WHERE source_kind='practice_v2' AND student_id=$1 AND practice_task_instance_id=$2`, []any{parts[0], parts[1]}
+	default:
+		return domain.PracticeLearningActionBinding{}, domain.ErrValidation
+	}
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	var binding domain.PracticeLearningActionBinding
+	var targets []byte
+	if err := querier.QueryRow(ctx, query, args...).Scan(&binding.LearningActionID, &binding.StudentID, &binding.TaskInstanceID,
+		&binding.TaskRevisionID, &binding.TaskRevisionDigest, &binding.SurfaceClassification, &targets, &binding.LifecycleStatus,
+		&binding.LearningPathID, &binding.LearningPathVersionReservation, &binding.LearningPathPositionReservation,
+		&binding.OpenedAt, &binding.ClosedAt, &binding.CancelReason, &binding.EnsureRequestHash, &binding.LearningPathItemID, &binding.RequirementID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.PracticeLearningActionBinding{}, domain.ErrNotFound
+		}
+		return domain.PracticeLearningActionBinding{}, err
+	}
+	if err := json.Unmarshal(targets, &binding.LearningTargets); err != nil {
+		return domain.PracticeLearningActionBinding{}, err
+	}
+	binding.Schema = domain.StudentPracticeLearningActionBindingSchema
+	return domain.NormalizePracticeLearningActionBinding(binding)
+}
+
+func mapPracticeLearningActionError(err error) error {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) && (databaseError.Code == "23505" || databaseError.Code == "23514") {
+		return domain.ErrConflict
+	}
+	return err
+}
+
+func validateBoundPracticeRequirement(ctx context.Context, tx pgx.Tx, binding domain.PracticeLearningActionBinding) error {
+	p, err := getLearningPathByID(ctx, tx, binding.StudentID, binding.LearningPathID, true)
+	if err != nil {
+		return err
+	}
+	if p.Status != domain.LearningPathStatusActive && p.Status != domain.LearningPathStatusPaused {
+		return domain.ErrConflict
+	}
+	if _, ok := practicePathItem(p, binding); !ok {
+		return domain.ErrConflict
+	}
+	return nil
+}

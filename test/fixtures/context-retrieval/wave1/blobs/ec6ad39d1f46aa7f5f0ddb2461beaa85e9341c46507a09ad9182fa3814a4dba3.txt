@@ -1,0 +1,96 @@
+package outbox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const maximumStoredErrorLength = 2000
+
+// Clock makes claim, publication and retry time deterministic.
+type Clock interface {
+	Now() time.Time
+}
+
+// Relay publishes one claimed outbox batch.
+type Relay struct {
+	Outbox         repository.Outbox
+	Publisher      domain.EventPublisher
+	Clock          Clock
+	WorkerID       string
+	BatchSize      int
+	LockTTL        time.Duration
+	PublishTimeout time.Duration
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+}
+
+// ProcessBatch claims and publishes a bounded batch. Delivery is at least once.
+func (relay Relay) ProcessBatch(ctx context.Context) (int, error) {
+	if relay.Outbox == nil || relay.Publisher == nil || relay.Clock == nil ||
+		strings.TrimSpace(relay.WorkerID) == "" || relay.BatchSize <= 0 || relay.LockTTL <= 0 ||
+		relay.PublishTimeout <= 0 || relay.LockTTL <= time.Duration(relay.BatchSize)*relay.PublishTimeout ||
+		relay.RetryBaseDelay <= 0 || relay.RetryMaxDelay < relay.RetryBaseDelay {
+		return 0, errors.New("invalid outbox relay configuration")
+	}
+	now := relay.Clock.Now().UTC()
+	events, err := relay.Outbox.Claim(ctx, repository.OutboxClaim{
+		WorkerID:    relay.WorkerID,
+		Limit:       relay.BatchSize,
+		Now:         now,
+		LockedUntil: now.Add(relay.LockTTL),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var failures []error
+	for _, event := range events {
+		publishContext, cancel := context.WithTimeout(ctx, relay.PublishTimeout)
+		publishErr := relay.Publisher.Publish(publishContext, event)
+		cancel()
+		if publishErr != nil {
+			retryAt := relay.Clock.Now().UTC().Add(relay.retryDelay(event.Attempts))
+			message := truncateError(publishErr.Error())
+			if markErr := relay.Outbox.MarkFailed(ctx, event.EventID, relay.WorkerID, message, retryAt); markErr != nil {
+				failures = append(failures, fmt.Errorf("publish %s: %w; mark failed: %v", event.EventID, publishErr, markErr))
+			} else {
+				failures = append(failures, fmt.Errorf("publish %s: %w", event.EventID, publishErr))
+			}
+			continue
+		}
+		if err := relay.Outbox.MarkPublished(ctx, event.EventID, relay.WorkerID, relay.Clock.Now().UTC()); err != nil {
+			failures = append(failures, fmt.Errorf("mark published %s: %w", event.EventID, err))
+		}
+	}
+	return len(events), errors.Join(failures...)
+}
+
+func (relay Relay) retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := relay.RetryBaseDelay
+	for current := 1; current < attempt && delay < relay.RetryMaxDelay; current++ {
+		if delay > relay.RetryMaxDelay/2 {
+			return relay.RetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > relay.RetryMaxDelay {
+		return relay.RetryMaxDelay
+	}
+	return delay
+}
+
+func truncateError(message string) string {
+	if len(message) <= maximumStoredErrorLength {
+		return message
+	}
+	return message[:maximumStoredErrorLength]
+}

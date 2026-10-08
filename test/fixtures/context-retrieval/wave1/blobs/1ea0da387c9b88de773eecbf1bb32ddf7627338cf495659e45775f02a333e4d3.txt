@@ -1,0 +1,211 @@
+package handlers
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	pathpkg "path"
+	"strings"
+)
+
+type starterUploadFile struct {
+	name string
+	path string
+	data []byte
+}
+
+func collectStarterUploadFiles(request *http.Request) ([]starterUploadFile, error) {
+	if err := request.ParseMultipartForm(128 << 20); err != nil {
+		return nil, fmt.Errorf("parse multipart form: %w", err)
+	}
+	if request.MultipartForm == nil {
+		return nil, fmt.Errorf("multipart form is empty")
+	}
+
+	fileHeaders := request.MultipartForm.File["files"]
+	if len(fileHeaders) == 0 {
+		fileHeaders = request.MultipartForm.File["file"]
+	}
+	if len(fileHeaders) == 0 {
+		return nil, fmt.Errorf("at least one file is required")
+	}
+
+	rawPaths := request.MultipartForm.Value["paths"]
+	items := make([]starterUploadFile, 0, len(fileHeaders))
+	for index, header := range fileHeaders {
+		pathValue := header.Filename
+		if len(rawPaths) == len(fileHeaders) && strings.TrimSpace(rawPaths[index]) != "" {
+			pathValue = rawPaths[index]
+		}
+		safePath, err := sanitizeStarterPath(pathValue, header.Filename)
+		if err != nil {
+			return nil, err
+		}
+		content, err := readMultipartFile(header)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, starterUploadFile{
+			name: header.Filename,
+			path: safePath,
+			data: content,
+		})
+	}
+	return items, nil
+}
+
+func readMultipartFile(header *multipart.FileHeader) ([]byte, error) {
+	file, err := header.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open uploaded file %q: %w", header.Filename, err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read uploaded file %q: %w", header.Filename, err)
+	}
+	return content, nil
+}
+
+func sanitizeStarterPath(raw string, fallback string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		value = fallback
+	}
+	value = strings.ReplaceAll(value, "\\", "/")
+	value = strings.TrimPrefix(value, "/")
+	value = pathpkg.Clean(value)
+	if value == "." || value == "" {
+		value = fallback
+	}
+	if strings.HasPrefix(value, "../") || value == ".." {
+		return "", fmt.Errorf("invalid starter path %q", raw)
+	}
+	return value, nil
+}
+
+func buildStarterArchive(files []starterUploadFile) ([]byte, string, error) {
+	if len(files) == 1 {
+		switch detectStarterArchiveFormat(files[0].name) {
+		case "zip":
+			return files[0].data, archiveFilename(files[0].name), nil
+		case "tar":
+			archiveData, err := tarArchiveToZip(files[0].data, false)
+			return archiveData, archiveFilename(files[0].name), err
+		case "tar.gz":
+			archiveData, err := tarArchiveToZip(files[0].data, true)
+			return archiveData, archiveFilename(files[0].name), err
+		}
+	}
+	archiveData, err := packFilesToZip(files)
+	if err != nil {
+		return nil, "", err
+	}
+	return archiveData, "starter-files.zip", nil
+}
+
+func detectStarterArchiveFormat(filename string) string {
+	lower := strings.ToLower(strings.TrimSpace(filename))
+	switch {
+	case strings.HasSuffix(lower, ".zip"):
+		return "zip"
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
+		return "tar.gz"
+	case strings.HasSuffix(lower, ".tar"):
+		return "tar"
+	default:
+		return ""
+	}
+}
+
+func archiveFilename(filename string) string {
+	base := strings.TrimSpace(filename)
+	if base == "" {
+		return "starter-files.zip"
+	}
+	lower := strings.ToLower(base)
+	switch {
+	case strings.HasSuffix(lower, ".tar.gz"):
+		return strings.TrimSuffix(base, ".tar.gz") + ".zip"
+	case strings.HasSuffix(lower, ".tgz"):
+		return strings.TrimSuffix(base, ".tgz") + ".zip"
+	case strings.HasSuffix(lower, ".tar"):
+		return strings.TrimSuffix(base, ".tar") + ".zip"
+	default:
+		return base
+	}
+}
+
+func packFilesToZip(files []starterUploadFile) ([]byte, error) {
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	for _, file := range files {
+		entry, err := writer.Create(file.path)
+		if err != nil {
+			_ = writer.Close()
+			return nil, fmt.Errorf("create zip entry %q: %w", file.path, err)
+		}
+		if _, err := entry.Write(file.data); err != nil {
+			_ = writer.Close()
+			return nil, fmt.Errorf("write zip entry %q: %w", file.path, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close zip archive: %w", err)
+	}
+	return buffer.Bytes(), nil
+}
+
+func tarArchiveToZip(archiveData []byte, gzipped bool) ([]byte, error) {
+	reader := bytes.NewReader(archiveData)
+	var tarSource io.Reader = reader
+	if gzipped {
+		gzipReader, err := gzip.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("open gzip archive: %w", err)
+		}
+		defer func() {
+			_ = gzipReader.Close()
+		}()
+		tarSource = gzipReader
+	}
+
+	tarReader := tar.NewReader(tarSource)
+	files := make([]starterUploadFile, 0)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar archive: %w", err)
+		}
+		if header.FileInfo().IsDir() {
+			continue
+		}
+		safePath, err := sanitizeStarterPath(header.Name, header.Name)
+		if err != nil {
+			return nil, err
+		}
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			return nil, fmt.Errorf("read tar entry %q: %w", header.Name, err)
+		}
+		files = append(files, starterUploadFile{
+			name: pathpkg.Base(safePath),
+			path: safePath,
+			data: content,
+		})
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("archive does not contain files")
+	}
+	return packFilesToZip(files)
+}

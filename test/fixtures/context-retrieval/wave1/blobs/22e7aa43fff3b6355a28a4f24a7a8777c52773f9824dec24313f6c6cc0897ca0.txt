@@ -1,0 +1,425 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	dialoghttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/dialog"
+	learningplannerhttp "github.com/bemulima/ms-go-teacher-agent/internal/infrastructure/http/learningplanner"
+	"github.com/bemulima/ms-go-teacher-agent/internal/usecase/onboarding"
+)
+
+// TestTeacherOnboardingHandoffExactStateFenceConcurrent proves the S8 fence in
+// PostgreSQL rather than relying on an in-memory fake. Distinct goal commands
+// for the same authoritative Student snapshot race through independent pool
+// connections; exactly one durable intent wins.
+func TestTeacherOnboardingHandoffExactStateFenceConcurrent(t *testing.T) {
+	basePool := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	schema := "teacher_s8_handoff_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err := basePool.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = basePool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE") })
+
+	conn, err := basePool.Acquire(ctx)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "SET search_path TO "+quotedSchema)
+	require.NoError(t, err)
+	root := migration019RepositoryRoot(t)
+	upPaths, err := migration019UpPaths(root)
+	require.NoError(t, err)
+	for _, path := range upPaths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := conn.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+	conn.Release()
+
+	config := basePool.Config().Copy()
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	studentID, teacherID, dialogID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, err = pool.Exec(ctx, `
+INSERT INTO personal_teacher (
+ id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,created_at,updated_at
+) VALUES ($1,$2,'default','ru','supportive','progressive','progressive','balanced',$3,$3)
+`, teacherID, studentID, now)
+	require.NoError(t, err)
+
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{
+		ID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral,
+	})
+	require.NoError(t, err)
+	foundation := readyHandoffFixture(domain.TeacherLearningReadinessGoal{
+		Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion,
+	})
+	goBackend := readyHandoffFixture(domain.TeacherLearningReadinessGoal{
+		Code: domain.TeacherGoBackendGoalCode, Version: domain.TeacherGoBackendGoalVersion, GraphVersion: domain.TeacherGoBackendGraphVersion,
+	})
+	teacher := domain.PersonalTeacher{ID: teacherID, StudentID: studentID}
+	first, err := domain.BuildTeacherOnboardingHandoffIntent(teacher, binding, foundation, "ru", "", "", now)
+	require.NoError(t, err)
+	second, err := domain.BuildTeacherOnboardingHandoffIntent(teacher, binding, goBackend, "ru", "", "", now)
+	require.NoError(t, err)
+	second.ID, second.CommandID = uuid.NewString(), uuid.NewString()
+	second.CommandTeacherJobID, second.NotificationCommandID = uuid.NewString(), uuid.NewString()
+	request, err := domain.NewTeacherOnboardingPlanHandoffRequest(second)
+	require.NoError(t, err)
+	second.RequestHash, err = domain.TeacherOnboardingPlanHandoffRequestHash(second.StudentID, request)
+	require.NoError(t, err)
+	second, err = domain.NewTeacherOnboardingHandoffIntent(second)
+	require.NoError(t, err)
+
+	store := TeacherOnboardingHandoffRepository{Pool: pool}
+	start := make(chan struct{})
+	errorsByCall := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, intent := range []domain.TeacherOnboardingHandoffIntent{first, second} {
+		intent := intent
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, _, enqueueErr := store.Enqueue(ctx, repository.TeacherOnboardingHandoffEnqueue{Intent: intent}, now)
+			errorsByCall <- enqueueErr
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsByCall)
+	winners, conflicts := 0, 0
+	for enqueueErr := range errorsByCall {
+		switch {
+		case enqueueErr == nil:
+			winners++
+		case errors.Is(enqueueErr, domain.ErrTeacherOnboardingHandoffConflict):
+			conflicts++
+		default:
+			require.NoError(t, enqueueErr)
+		}
+	}
+	require.Equal(t, 1, winners)
+	require.Equal(t, 1, conflicts)
+	var rows int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM teacher_onboarding_plan_handoff WHERE student_id=$1`, studentID).Scan(&rows))
+	require.Equal(t, 1, rows)
+	var handoffID string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT handoff_intent_id::text FROM teacher_onboarding_plan_handoff WHERE student_id=$1`, studentID).Scan(&handoffID))
+	// Retries remain mutable while a command is still queued.
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET attempts=attempts+1,next_attempt_at=$2,updated_at=$2 WHERE handoff_intent_id=$1`, handoffID, now.Add(time.Minute))
+	require.NoError(t, err)
+	claimToken := uuid.NewString()
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET status='dispatching',claim_token=$2,locked_by='integration-worker',locked_until=$3,updated_at=$4 WHERE handoff_intent_id=$1`, handoffID, claimToken, now.Add(2*time.Minute), now.Add(time.Minute))
+	require.NoError(t, err)
+	plannerHandoffID := uuid.NewString()
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET status='accepted',claim_token=NULL,locked_by=NULL,locked_until=NULL,planner_handoff_id=$2,accepted_at=$3,readiness_observed_at=$3,updated_at=$3 WHERE handoff_intent_id=$1`, handoffID, plannerHandoffID, now.Add(2*time.Minute))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET planner_handoff_id=$2 WHERE handoff_intent_id=$1`, handoffID, uuid.NewString())
+	require.ErrorContains(t, err, "Planner acknowledgement is immutable")
+	claimToken = uuid.NewString()
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET status='message_pending',claim_token=$2,locked_by='integration-worker',locked_until=$3,updated_at=$4 WHERE handoff_intent_id=$1`, handoffID, claimToken, now.Add(3*time.Minute), now.Add(2*time.Minute))
+	require.NoError(t, err)
+	notificationMessageID := uuid.NewString()
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET status='delivered',claim_token=NULL,locked_by=NULL,locked_until=NULL,notification_message_id=$2,delivered_at=$3,updated_at=$3 WHERE handoff_intent_id=$1`, handoffID, notificationMessageID, now.Add(3*time.Minute))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET notification_message_id=$2 WHERE handoff_intent_id=$1`, handoffID, uuid.NewString())
+	require.ErrorContains(t, err, "Dialog delivery acknowledgement is immutable")
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET status='queued' WHERE handoff_intent_id=$1`, handoffID)
+	require.ErrorContains(t, err, "status transition is invalid")
+	_, err = pool.Exec(ctx, `UPDATE teacher_onboarding_plan_handoff SET locale='en' WHERE student_id=$1`, studentID)
+	require.ErrorContains(t, err, "teacher onboarding handoff identity is immutable")
+	_, err = pool.Exec(ctx, `DELETE FROM teacher_onboarding_plan_handoff WHERE student_id=$1`, studentID)
+	require.ErrorContains(t, err, "teacher onboarding handoff evidence cannot be deleted")
+	_, err = pool.Exec(ctx, `TRUNCATE teacher_onboarding_plan_handoff CASCADE`)
+	require.ErrorContains(t, err, "teacher onboarding handoff evidence cannot be truncated")
+
+	down, err := os.ReadFile(filepath.Join(root, "db", "migrations", "021_teacher_onboarding_planner_handoff.down.sql"))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, string(down))
+	require.ErrorContains(t, err, "immutable onboarding handoff evidence is retained permanently")
+	var tableStillPresent bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT to_regclass('teacher_onboarding_plan_handoff') IS NOT NULL`).Scan(&tableStillPresent))
+	require.True(t, tableStillPresent)
+}
+
+func TestMigration021EmptyLedgerRollsBackAtomically(t *testing.T) {
+	basePool := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	schema := "teacher_s8_rollback_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err := basePool.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = basePool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE") })
+
+	conn, err := basePool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+	_, err = conn.Exec(ctx, "SET search_path TO "+quotedSchema)
+	require.NoError(t, err)
+	root := migration019RepositoryRoot(t)
+	upPaths, err := migrationUpPathsThrough(root, 21)
+	require.NoError(t, err)
+	for _, path := range upPaths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := conn.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+	down, err := os.ReadFile(filepath.Join(root, "db", "migrations", "021_teacher_onboarding_planner_handoff.down.sql"))
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, string(down))
+	require.NoError(t, err)
+	var handoffTablePresent bool
+	require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass('teacher_onboarding_plan_handoff') IS NOT NULL`).Scan(&handoffTablePresent))
+	require.False(t, handoffTablePresent)
+	var handoffPendingAllowed bool
+	require.NoError(t, conn.QueryRow(ctx, `
+SELECT pg_get_constraintdef(oid) LIKE '%handoff_pending%'
+FROM pg_constraint
+WHERE connamespace=current_schema()::regnamespace AND conname='teacher_onboarding_interaction_state_check'
+`).Scan(&handoffPendingAllowed))
+	require.False(t, handoffPendingAllowed)
+}
+
+// TestS8HandoffRealPostgresWithFakePlannerAndDialog proves the cross-boundary
+// S8 sequence without contacting a live dependency: 021's real ledger owns
+// claim/accept/delivery transitions while deterministic Planner and Dialog
+// fakes exercise the same worker contracts used in production. It is opt-in
+// with the rest of the PostgreSQL suite and never starts a container itself.
+func TestS8HandoffRealPostgresWithFakePlannerAndDialog(t *testing.T) {
+	basePool := teacherDecisionIntegrationPool(t)
+	ctx := context.Background()
+	schema := "teacher_s8_e2e_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err := basePool.Exec(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = basePool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE") })
+
+	conn, err := basePool.Acquire(ctx)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "SET search_path TO "+quotedSchema)
+	require.NoError(t, err)
+	root := migration019RepositoryRoot(t)
+	upPaths, err := migration019UpPaths(root)
+	require.NoError(t, err)
+	for _, path := range upPaths {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, path)
+		_, execErr := conn.Exec(ctx, string(sql))
+		require.NoError(t, execErr, path)
+	}
+	conn.Release()
+
+	config := basePool.Config().Copy()
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	studentID, teacherID, dialogID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, err = pool.Exec(ctx, `
+INSERT INTO personal_teacher (
+ id,student_id,teacher_profile_id,language,communication_style,pedagogy_profile,hint_policy,intervention_mode,created_at,updated_at
+) VALUES ($1,$2,'default','ru','supportive','progressive','progressive','balanced',$3,$3)
+`, teacherID, studentID, now)
+	require.NoError(t, err)
+	binding, err := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: dialogID, StudentID: studentID, PersonalTeacherID: teacherID, ContextType: domain.LearningContextGeneral})
+	require.NoError(t, err)
+	readiness := readyHandoffFixture(domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion})
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(domain.PersonalTeacher{ID: teacherID, StudentID: studentID}, binding, readiness, "ru", "", "", now)
+	require.NoError(t, err)
+	store := TeacherOnboardingHandoffRepository{Pool: pool}
+	_, created, err := store.Enqueue(ctx, repository.TeacherOnboardingHandoffEnqueue{Intent: intent}, now)
+	require.NoError(t, err)
+	require.True(t, created)
+	planner := &s8HandoffPlannerHTTP{studentID: studentID, observedAt: "2026-09-11T12:00:00Z", receipts: map[string][]byte{}}
+	plannerServer := httptest.NewServer(http.HandlerFunc(planner.serve))
+	defer plannerServer.Close()
+	plannerClient := learningplannerhttp.Client{BaseURL: plannerServer.URL, HandoffToken: "handoff-token", HTTPClient: plannerServer.Client()}
+	dialog := &s8HandoffDialogHTTP{binding: binding, messages: map[string]domain.DialogMessage{}}
+	dialogServer := httptest.NewServer(http.HandlerFunc(dialog.serve))
+	defer dialogServer.Close()
+	worker := onboarding.HandoffWorker{
+		Store: store, Planner: plannerClient,
+		Readiness: s8HandoffFakeReadiness{}, Responses: dialoghttp.Client{BaseURL: dialogServer.URL, InternalToken: "dialog-token", HTTPClient: dialogServer.Client()},
+		Proactive: dialoghttp.Client{BaseURL: dialogServer.URL, InternalToken: "dialog-token", HTTPClient: dialogServer.Client()},
+		IDs:       s8HandoffIDs{}, Clock: s8HandoffClock{now: now}, WorkerID: "s8-e2e-worker", LeaseTTL: time.Minute,
+		RetryBaseDelay: time.Second, RetryMaxDelay: time.Minute, MaxAttempts: 3,
+	}
+	claimed, err := worker.ProcessNext(ctx)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 1, planner.calls)
+	// Simulate an ambiguous acknowledgement after Planner has persisted the
+	// command. The strict adapter must receive an exact 200/replayed=true
+	// response for the same stable key and body.
+	replayIntent := intent
+	replayIntent.Status = domain.TeacherOnboardingHandoffDispatching
+	replayIntent.ClaimToken, replayIntent.LockedBy, replayIntent.LockedUntil = uuid.NewString(), "s8-e2e-replay", now.Add(time.Minute)
+	replayIntent.Attempts = 2
+	replayIntent, err = domain.NewTeacherOnboardingHandoffIntent(replayIntent)
+	require.NoError(t, err)
+	replay, err := plannerClient.CreateOnboardingPlanHandoff(ctx, replayIntent)
+	require.NoError(t, err)
+	require.True(t, replay.Replayed)
+	require.Equal(t, 2, planner.calls)
+	require.Equal(t, 1, planner.receiptCount)
+	claimed, err = worker.ProcessNext(ctx)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, 2, planner.calls)
+	require.Equal(t, 1, dialog.mutations)
+	stored, found, err := store.GetByStudentState(ctx, studentID, readiness.StateRef, *readiness.Goal)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, domain.TeacherOnboardingHandoffDelivered, stored.Status)
+	require.NotEmpty(t, stored.PlannerHandoffID)
+	require.NotEmpty(t, stored.NotificationMessageID)
+	_, err = worker.ProcessNext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, planner.calls)
+	require.Equal(t, 1, dialog.mutations, "delivered ledger never appends a second proactive Dialog message")
+}
+
+type s8HandoffPlannerHTTP struct {
+	calls        int
+	receiptCount int
+	studentID    string
+	observedAt   string
+	receipts     map[string][]byte
+}
+
+func (fake *s8HandoffPlannerHTTP) serve(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost || request.Header.Get("X-Internal-Token") != "handoff-token" || request.Header.Get("Idempotency-Key") == "" || request.URL.Path != "/internal/students/"+fake.studentID+"/onboarding-plan-handoffs" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var payload domain.TeacherOnboardingPlanHandoffRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&payload) != nil || payload.Schema != domain.TeacherOnboardingPlanHandoffRequestSchema || decoder.Decode(&struct{}{}) == nil {
+		writer.WriteHeader(http.StatusUnprocessableEntity)
+		return
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	key := request.Header.Get("Idempotency-Key")
+	stored, replayed := fake.receipts[key]
+	if replayed && string(stored) != string(encoded) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(writer).Encode(map[string]any{"error": map[string]string{"code": "idempotency_conflict"}})
+		return
+	}
+	fake.calls++
+	if !replayed {
+		fake.receipts[key] = encoded
+		fake.receiptCount++
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	if replayed {
+		writer.WriteHeader(http.StatusOK)
+	} else {
+		writer.WriteHeader(http.StatusCreated)
+	}
+	_ = json.NewEncoder(writer).Encode(domain.TeacherOnboardingPlanHandoff{Schema: domain.TeacherOnboardingPlanHandoffSchema, HandoffID: "66666666-6666-4666-8666-666666666666",
+		Status: domain.TeacherOnboardingHandoffAccepted, StateRef: payload.ExpectedStateRef,
+		Goal:            domain.TeacherLearningReadinessGoal{Code: domain.TeacherFoundationGoalCode, Version: domain.TeacherFoundationGoalVersion, GraphVersion: domain.TeacherFoundationGraphVersion},
+		ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated, ReadinessObservedAt: fake.observedAt, Replayed: replayed})
+}
+
+type s8HandoffFakeReadiness struct{}
+
+func (s8HandoffFakeReadiness) ResolveLearningReadiness(context.Context, string, domain.TeacherStudentReadinessStateRef) (domain.TeacherLearningReadiness, error) {
+	return domain.TeacherLearningReadiness{}, domain.ErrTeacherLearningReadinessUnavailable
+}
+
+type s8HandoffDialogHTTP struct {
+	binding   domain.TeacherDialogBinding
+	messages  map[string]domain.DialogMessage
+	mutations int
+}
+
+func (fake *s8HandoffDialogHTTP) serve(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost || request.Header.Get("X-Internal-Token") != "dialog-token" || request.URL.Path != "/internal/v1/teacher-dialog/"+fake.binding.ID+"/proactive-message" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var payload struct {
+		PersonalTeacherID string `json:"personal_teacher_id"`
+		IdempotencyKey    string `json:"idempotency_key"`
+		Body              string `json:"body"`
+	}
+	if json.NewDecoder(request.Body).Decode(&payload) != nil || payload.PersonalTeacherID != fake.binding.PersonalTeacherID || payload.IdempotencyKey == "" || payload.Body == "" {
+		writer.WriteHeader(http.StatusUnprocessableEntity)
+		return
+	}
+	message, replayed := fake.messages[payload.IdempotencyKey]
+	if !replayed {
+		fake.mutations++
+		message = domain.DialogMessage{ID: uuid.NewString(), DialogID: fake.binding.ID, AuthorType: domain.DialogMessageAuthorPersonalTeacher,
+			Channel: domain.DialogMessageChannelWeb, PersonalTeacherID: fake.binding.PersonalTeacherID, Body: payload.Body, Status: 1, Version: 1,
+			MessageSequence: int64(fake.mutations), LastEventSequence: int64(fake.mutations), CreatedAt: time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)}
+		fake.messages[payload.IdempotencyKey] = message
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	if replayed {
+		writer.WriteHeader(http.StatusOK)
+	} else {
+		writer.WriteHeader(http.StatusCreated)
+	}
+	_ = json.NewEncoder(writer).Encode(s5DialogMessageJSON(message))
+}
+
+type s8HandoffIDs struct{}
+
+func (s8HandoffIDs) NewID() string { return uuid.NewString() }
+
+type s8HandoffClock struct{ now time.Time }
+
+func (clock s8HandoffClock) Now() time.Time { return clock.now }
+
+func readyHandoffFixture(goal domain.TeacherLearningReadinessGoal) domain.TeacherLearningReadiness {
+	reason := domain.TeacherReadinessReasonFoundationGraphResolved
+	if goal.Code == domain.TeacherGoBackendGoalCode {
+		reason = domain.TeacherReadinessReasonGoBackendGraphResolved
+	}
+	return domain.TeacherLearningReadiness{
+		Schema: domain.TeacherLearningReadinessSchema, Result: domain.TeacherLearningReadinessReady,
+		ReasonCodes: []string{reason}, ResolverVersion: domain.TeacherLearningReadinessResolver,
+		StateRef:       domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		ReadinessScope: domain.TeacherLearningReadinessScope, ContentStatus: domain.TeacherLearningContentNotCreated, Goal: &goal,
+	}
+}

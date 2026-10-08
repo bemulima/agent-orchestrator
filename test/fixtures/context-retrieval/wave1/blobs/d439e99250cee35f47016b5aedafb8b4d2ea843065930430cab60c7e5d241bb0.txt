@@ -1,0 +1,91 @@
+schema_version: 1
+jetstream_events_published:
+  - subject: taskAnswer.started
+    when: attempt row is created
+  - subject: taskAnswer.autoReview.applied
+    when: consumed auto-review updates the answer
+  - subject: taskAnswer.reviewed
+    when: manual review updates the answer
+  - subject: learning_action.closed
+    stream: TASKANSWER_EVENTS
+    when: a distinct learning-action cycle reaches FAILED or PASSED
+    schema_version: 1
+    semantics: trigger-only context and frozen ordered learning_targets; no outcome, score, confidence, or mastery
+    delivery: PostgreSQL transactional outbox with stable event_id and JetStream acknowledgement
+  - subject: student.diagnostic-result.committed.v1
+    stream: STUDENT_DIAGNOSTIC_EVENTS
+    when: an official placement-only diagnostic result commits
+    schema_version: 1
+    semantics: exact reference-only data {plan_id, plan_revision, plan_digest, result_digest}; no score, band, answer, evidence, mastery, profile, or path command
+    identity: UUID SHA1 URL namespace over subject + colon + plan_id; correlation_id equals plan_id equals attempt_id; causation_id equals completion request UUID
+    occurred_at: canonical microsecond UTC immutable result completed_at
+    delivery: result, completion receipt, and existing student_outbox insert commit atomically; exact receipt replay never inserts a second trigger; JetStream acknowledgement precedes published_at
+    relay_admission: learning_action.closed, student.diagnostic-result.committed.v1 and student.planning-state.changed.v1 with subject-specific strict validation; diagnostic stored envelopes are bounded to 8KiB and reject unknown/duplicate/null fields and identity mismatches
+    retention: dedicated workqueue file stream; max_age zero, unlimited messages, max_bytes 1GiB, discard new, duplicate window 10min, replicas one; no expiry before consumer ACK
+    consumer: Planner durable ms-learning-planner-diagnostic-placement-v1 reads its frozen plan and authoritative Student result before existing fixed placement; invalid mismatch Term, transient failure NAK without delivery limit
+    compatibility: existing browser/Teacher placement remains recovery; historical completed results are not backfilled
+  - subject: student.planning-state.changed.v1
+    stream: STUDENT_PLANNING_STATE_EVENTS
+    schema_version: 1
+    when: official objective Evidence and Mastery commit; explicit learner LearningIntent commit when implemented
+    semantics: bounded fact identities only; no replan command, raw evidence, mastery body, score or permission
+    data: [learning_path_id, path_version, trigger_kind, trigger_identity, targets]
+    targets: 1..500 exact trigger-relevant target identities; existing optional opaque version retained
+    trigger_kinds: [OBJECTIVE_EVIDENCE, LEARNING_INTENT]
+    correlation_id: learning_path_id
+    causation_id: trigger_identity
+    commit: same PostgreSQL transaction as immutable evidence, reducer/mastery/audit and existing student_outbox insert
+    fanout: all relevant ACTIVE owned paths matching exact targets; never selected-only
+    replay: exact producer receipt replay creates no new event
+    consumer: Planner immutable inbox plus coalesced work; ACK only after durable queue commit
+    forbidden: telemetry-only triggers; learning_action.closed reinterpretation; event-caused path mutation
+core_nats_commands_consumed:
+  queue: ms-student-service
+  subjects:
+    - taskAnswer.autoChecked
+    - taskAnswer.inprocess
+    - taskAnswer.activity
+jetstream_events_consumed:
+  - subject: teacher.assistance.observed
+    stream: TEACHER_EVENTS
+    durable: ms-student-teacher-assistance-v1
+    schema_version: 1
+    semantics: one teacher-owned assistance summary per learning_action_id
+    acknowledgement: after inbox, action assistance, teacher observations, normalized objective evidence, mastery projection, and audit commit
+    poison_message: terminate invalid subject, version, envelope, or bounded data
+    action_contract_poison: terminate mismatched closure causation, student, context, action, or frozen target set without an inbox marker
+    transient_failure: negative acknowledgement with delay and no terminal delivery limit
+core_nats_rpc_produced:
+  - subject: sandbox.archiveAndUpload
+    fallback: POST sandbox /internal/sandboxes/{sandboxID}/archive-and-upload
+legacy_validator_rpc:
+  - subject_env: HTML_VALIDATOR_SUBJECT
+    default: validator.html.validate
+  - subject_env: CSS_VALIDATOR_SUBJECT
+    default: styles.validate.request
+delivery_semantics:
+  command_transport: plain Core NATS queue subscription
+  durable_command_acknowledgement: false
+  event_transport: JetStream publish
+  transactional_outbox: [learning_action.closed, student.diagnostic-result.committed.v1, student.planning-state.changed.v1]
+  publish_after_database_write: true
+  ignored_publish_errors: [taskAnswer.started, taskAnswer.autoReview.applied, taskAnswer.reviewed, final-validation taskAnswer.autoChecked]
+  teacher_assistance_consumer: durable JetStream explicit ack with transactional inbox, objective evidence join, mastery projection, and reducer audit
+  learning_action_closed_producer: answer closure, action closure, and outbox insert are one transaction
+  diagnostic_result_producer: immutable diagnostic result, completion receipt, and reference-only outbox insert are one transaction; insertion failure rolls all three back
+idempotency:
+  auto_checked: skips an existing auto or manual review and terminal answers
+  inprocess: no-op for PASSED or the same active filestorage pointer
+  activity: can reopen FAILED or REJECTED when attempt limit permits
+  learning_action: one active cycle per answer; reopening creates the next cycle
+  teacher_assistance: duplicate event_id is a no-op; student_id plus learning_action_id accepts one summary
+sources:
+  - internal/domain/subjects.go
+  - internal/domain/student_learning_action.go
+  - internal/adapters/nats
+  - internal/usecase/outbox
+  - cmd/ms-student-service/main.go
+
+correlation:
+  learning_action_closed: correlation_id equals learning_action_id; causation_id equals student_task_answer_id
+  teacher_assistance: correlation_id equals learning_action_id; causation_id identifies the closure event

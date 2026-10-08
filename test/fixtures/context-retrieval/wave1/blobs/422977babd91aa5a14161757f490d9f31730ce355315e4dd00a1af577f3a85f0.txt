@@ -1,0 +1,561 @@
+package student
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/example/ms-student-service/internal/domain"
+	answeruc "github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+type practiceTaskLessonPlan struct {
+	current            *partRuntimeContext
+	milestone          domain.PracticeTaskRuntimeMilestone
+	lesson             *answeruc.LessonMetadata
+	orderedLessons     []answeruc.LessonMetadata
+	lessonIndexByID    map[string]int
+	currentLessonID    string
+	milestoneBlock     string
+	milestoneRedirect  string
+	prerequisites      domain.MilestonePrerequisites
+	completedLessonIDs map[string]struct{}
+}
+
+const (
+	practiceTaskBlockingReasonCompletePrevTask = "COMPLETE_PREVIOUS_TASK"
+	practiceTaskCourseContentStatusActive      = 1
+)
+
+func (useCase StudentUseCase) ResolvePracticeTaskLessonAccess(ctx context.Context, studentID, lessonID string) (*answeruc.LessonAccess, error) {
+	plan, err := useCase.loadPracticeTaskLessonPlan(ctx, studentID, lessonID)
+	if err != nil {
+		return nil, err
+	}
+
+	index, ok := plan.lessonIndexByID[lessonID]
+	if !ok || plan.lesson == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	completed := practiceTaskLessonCompleted(plan.completedLessonIDs, lessonID)
+	current := !completed && plan.currentLessonID == lessonID && plan.milestoneBlock == ""
+
+	for _, previousLesson := range plan.orderedLessons[:index] {
+		if practiceTaskLessonsSharePrerequisiteGroup(plan.current.partMilestones, previousLesson.ID, lessonID) {
+			continue
+		}
+		if practiceTaskRouteRequirementSatisfied(plan.current.partMilestones, previousLesson.ID, plan.completedLessonIDs) {
+			continue
+		}
+		return &answeruc.LessonAccess{
+			LessonID:         lessonID,
+			CourseID:         plan.lesson.CourseID,
+			Locked:           true,
+			Completed:        completed,
+			Current:          false,
+			BlockingReason:   blockingReasonStrictOrderRequired,
+			RedirectLessonID: previousLesson.ID,
+		}, nil
+	}
+
+	if plan.milestoneBlock != "" && !completed {
+		redirectLessonID := plan.milestoneRedirect
+		if redirectLessonID == "" && plan.currentLessonID != lessonID {
+			redirectLessonID = plan.currentLessonID
+		}
+		return &answeruc.LessonAccess{
+			LessonID:         lessonID,
+			CourseID:         plan.lesson.CourseID,
+			Locked:           true,
+			Completed:        completed,
+			Current:          false,
+			BlockingReason:   plan.milestoneBlock,
+			RedirectLessonID: redirectLessonID,
+		}, nil
+	}
+
+	return &answeruc.LessonAccess{
+		LessonID:  lessonID,
+		CourseID:  plan.lesson.CourseID,
+		Locked:    false,
+		Completed: completed,
+		Current:   current,
+	}, nil
+}
+
+func (useCase StudentUseCase) ResolvePracticeTaskTaskAccess(ctx context.Context, studentID, taskID string) (*answeruc.TaskAccess, error) {
+	scope, ok := answeruc.PracticeTaskScopeFromContext(ctx)
+	if !ok {
+		return nil, domain.ErrValidation
+	}
+	lessonAccess, err := useCase.ResolvePracticeTaskLessonAccess(ctx, studentID, scope.LessonID)
+	if err != nil {
+		return nil, err
+	}
+	if useCase.CourseContent == nil || useCase.Answers == nil {
+		return nil, domain.ErrValidation
+	}
+	lesson, err := useCase.CourseContent.GetLesson(ctx, scope.LessonID)
+	if err != nil {
+		return nil, err
+	}
+	structure, err := useCase.CourseContent.GetCourseStructure(ctx, lesson.CourseID)
+	if err != nil {
+		return nil, err
+	}
+
+	activeTasks := practiceTaskLessonTasks(structure, scope.LessonID)
+	progressMap, err := useCase.Answers.GetProgressByTaskIDs(ctx, studentID, practiceTaskTaskIDs(activeTasks))
+	if err != nil {
+		return nil, err
+	}
+
+	var currentTaskID string
+	for _, item := range activeTasks {
+		if practiceTaskTaskCompleted(item, progressMap[item.ID]) {
+			continue
+		}
+		currentTaskID = item.ID
+		break
+	}
+
+	var selectedTask *answeruc.CourseStructureTask
+	for index := range activeTasks {
+		if activeTasks[index].ID != taskID {
+			continue
+		}
+		item := activeTasks[index]
+		selectedTask = &item
+		break
+	}
+	if selectedTask == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	completed := practiceTaskTaskCompleted(*selectedTask, progressMap[selectedTask.ID])
+	if lessonAccess.Locked {
+		return &answeruc.TaskAccess{
+			TaskID:           taskID,
+			LessonID:         scope.LessonID,
+			CourseID:         lesson.CourseID,
+			Locked:           true,
+			Completed:        completed,
+			Current:          false,
+			Readonly:         completed,
+			BlockingReason:   lessonAccess.BlockingReason,
+			RedirectLessonID: lessonAccess.RedirectLessonID,
+		}, nil
+	}
+	if completed {
+		return &answeruc.TaskAccess{
+			TaskID:    taskID,
+			LessonID:  scope.LessonID,
+			CourseID:  lesson.CourseID,
+			Locked:    false,
+			Completed: true,
+			Current:   false,
+			Readonly:  true,
+		}, nil
+	}
+	if currentTaskID != "" && currentTaskID != taskID {
+		return &answeruc.TaskAccess{
+			TaskID:           taskID,
+			LessonID:         scope.LessonID,
+			CourseID:         lesson.CourseID,
+			Locked:           true,
+			Completed:        false,
+			Current:          false,
+			Readonly:         false,
+			BlockingReason:   practiceTaskBlockingReasonCompletePrevTask,
+			RedirectLessonID: scope.LessonID,
+			RedirectTaskID:   currentTaskID,
+		}, nil
+	}
+
+	return &answeruc.TaskAccess{
+		TaskID:    taskID,
+		LessonID:  scope.LessonID,
+		CourseID:  lesson.CourseID,
+		Locked:    false,
+		Completed: false,
+		Current:   true,
+		Readonly:  false,
+	}, nil
+}
+
+func (useCase StudentUseCase) loadPracticeTaskLessonPlan(ctx context.Context, studentID, lessonID string) (*practiceTaskLessonPlan, error) {
+	scope, ok := answeruc.PracticeTaskScopeFromContext(ctx)
+	if !ok {
+		return nil, domain.ErrValidation
+	}
+	if useCase.CourseContent == nil {
+		return nil, domain.ErrValidation
+	}
+
+	current, err := useCase.loadPartRuntimeContext(ctx, studentID, scope.StudentPracticeTaskID, scope.PartID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var milestone *domain.PracticeTaskRuntimeMilestone
+	for index := range current.partMilestones {
+		if current.partMilestones[index].ID != scope.MilestoneID {
+			continue
+		}
+		item := current.partMilestones[index]
+		milestone = &item
+		break
+	}
+	if milestone == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	prerequisites := resolvePartMilestonePrerequisites(current.runtimeContext, *milestone, current.completedLessonIDs)
+	milestoneLessons, err := useCase.orderPracticeTaskMilestoneLessons(ctx, *milestone, prerequisites)
+	if err != nil {
+		return nil, err
+	}
+	if !practiceTaskLessonInList(milestoneLessons, lessonID) {
+		return nil, domain.ErrNotFound
+	}
+	orderedLessons, err := useCase.orderPracticeTaskPartLessons(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	lessonIndexByID := make(map[string]int, len(orderedLessons))
+	var lessonMeta *answeruc.LessonMetadata
+	currentRequiredLessonID := ""
+	currentRecommendedLessonID := ""
+	currentOptionalLessonID := ""
+	for index := range orderedLessons {
+		item := orderedLessons[index]
+		lessonIndexByID[item.ID] = index
+		if !practiceTaskLessonCompleted(current.completedLessonIDs, item.ID) {
+			switch practiceTaskRouteLessonRequirement(current.partMilestones, item.ID) {
+			case domain.PracticeTaskLessonRequirementRecommended:
+				if currentRecommendedLessonID == "" {
+					currentRecommendedLessonID = item.ID
+				}
+			case domain.PracticeTaskLessonRequirementOptional:
+				if currentOptionalLessonID == "" {
+					currentOptionalLessonID = item.ID
+				}
+			default:
+				if currentRequiredLessonID == "" && !practiceTaskRouteRequirementSatisfied(current.partMilestones, item.ID, current.completedLessonIDs) {
+					currentRequiredLessonID = item.ID
+				}
+			}
+		}
+		if item.ID == lessonID {
+			copy := item
+			lessonMeta = &copy
+		}
+	}
+	if lessonMeta == nil {
+		return nil, domain.ErrNotFound
+	}
+	currentLessonID := currentRequiredLessonID
+	if currentLessonID == "" {
+		currentLessonID = currentRecommendedLessonID
+	}
+	if currentLessonID == "" {
+		currentLessonID = currentOptionalLessonID
+	}
+
+	milestoneBlock := practiceTaskMilestoneLessonBlock(current, *milestone, prerequisites)
+	return &practiceTaskLessonPlan{
+		current:            current,
+		milestone:          *milestone,
+		lesson:             lessonMeta,
+		orderedLessons:     orderedLessons,
+		lessonIndexByID:    lessonIndexByID,
+		currentLessonID:    currentLessonID,
+		milestoneBlock:     milestoneBlock,
+		milestoneRedirect:  practiceTaskMilestoneLessonRedirect(current, *milestone, milestoneBlock),
+		prerequisites:      prerequisites,
+		completedLessonIDs: current.completedLessonIDs,
+	}, nil
+}
+
+func practiceTaskMilestoneLessonRedirect(current *partRuntimeContext, milestone domain.PracticeTaskRuntimeMilestone, block string) string {
+	if current == nil || current.runtimeContext == nil || block == "" {
+		return ""
+	}
+
+	var blockerID string
+	switch block {
+	case blockingReasonParentMilestoneRequired:
+		blockerID = parentPartMilestoneID(milestone)
+	case blockingReasonPreviousMilestone:
+		blockerID = previousRouteMilestoneID(current.runtimeContext.PracticeTaskMilestones, milestone)
+	case blockingReasonStrictOrderRequired:
+		blockerID = previousSiblingMilestoneID(current.partMilestones, milestone)
+	}
+	if blockerID == "" {
+		return ""
+	}
+
+	for _, candidate := range current.runtimeContext.PracticeTaskMilestones {
+		if candidate.ID != blockerID {
+			continue
+		}
+		bindings := sortedRuntimeLessonBindings(candidate.LessonBindings)
+		for _, binding := range bindings {
+			if !practiceTaskLessonCompleted(current.completedLessonIDs, binding.LessonID) {
+				return binding.LessonID
+			}
+		}
+		if len(bindings) > 0 {
+			return bindings[0].LessonID
+		}
+		return ""
+	}
+	return ""
+}
+
+func (useCase StudentUseCase) orderPracticeTaskLessons(ctx context.Context, lessonIDs []string) ([]answeruc.LessonMetadata, error) {
+	result := make([]answeruc.LessonMetadata, 0, len(lessonIDs))
+	for _, lessonID := range lessonIDs {
+		item, err := useCase.CourseContent.GetLesson(ctx, lessonID)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *item)
+	}
+	sort.SliceStable(result, func(left, right int) bool {
+		if result[left].CourseID != result[right].CourseID {
+			return result[left].CourseID < result[right].CourseID
+		}
+		if result[left].Order != result[right].Order {
+			return result[left].Order < result[right].Order
+		}
+		return result[left].ID < result[right].ID
+	})
+	return result, nil
+}
+
+func (useCase StudentUseCase) orderPracticeTaskMilestoneLessons(ctx context.Context, milestone domain.PracticeTaskRuntimeMilestone, prerequisites domain.MilestonePrerequisites) ([]answeruc.LessonMetadata, error) {
+	if len(milestone.LessonBindings) == 0 {
+		return useCase.orderPracticeTaskLessons(ctx, prerequisites.MatchedLessonIDs)
+	}
+	return useCase.loadPracticeTaskBoundLessonsInOrder(ctx, sortedRuntimeLessonBindings(milestone.LessonBindings))
+}
+
+func (useCase StudentUseCase) loadPracticeTaskBoundLessonsInOrder(ctx context.Context, bindings []domain.PracticeTaskRuntimeLessonBinding) ([]answeruc.LessonMetadata, error) {
+	result := make([]answeruc.LessonMetadata, 0, len(bindings))
+	for _, binding := range bindings {
+		item, err := useCase.CourseContent.GetLesson(ctx, binding.LessonID)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(binding.CourseID) != "" && item.CourseID != binding.CourseID {
+			return nil, fmt.Errorf("%w: lesson %s belongs to course %s, not %s", domain.ErrValidation, binding.LessonID, item.CourseID, binding.CourseID)
+		}
+		result = append(result, *item)
+	}
+	return result, nil
+}
+
+func (useCase StudentUseCase) loadPracticeTaskLessonsInOrder(ctx context.Context, lessonIDs []string) ([]answeruc.LessonMetadata, error) {
+	result := make([]answeruc.LessonMetadata, 0, len(lessonIDs))
+	for _, lessonID := range lessonIDs {
+		item, err := useCase.CourseContent.GetLesson(ctx, lessonID)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *item)
+	}
+	return result, nil
+}
+
+func (useCase StudentUseCase) orderPracticeTaskPartLessons(ctx context.Context, current *partRuntimeContext) ([]answeruc.LessonMetadata, error) {
+	if current == nil {
+		return nil, domain.ErrValidation
+	}
+
+	lessonIDs := make([]string, 0)
+	seen := make(map[string]struct{})
+	hasExplicitRoute := false
+	for _, milestone := range current.partMilestones {
+		prerequisites := resolvePartMilestonePrerequisites(current.runtimeContext, milestone, current.completedLessonIDs)
+		milestoneLessonIDs := prerequisites.MatchedLessonIDs
+		if len(milestone.LessonBindings) > 0 {
+			hasExplicitRoute = true
+			milestoneLessonIDs = make([]string, 0, len(milestone.LessonBindings))
+			for _, binding := range sortedRuntimeLessonBindings(milestone.LessonBindings) {
+				milestoneLessonIDs = append(milestoneLessonIDs, binding.LessonID)
+			}
+		}
+		for _, lessonID := range milestoneLessonIDs {
+			if _, ok := seen[lessonID]; ok {
+				continue
+			}
+			seen[lessonID] = struct{}{}
+			lessonIDs = append(lessonIDs, lessonID)
+		}
+	}
+	if !hasExplicitRoute {
+		return useCase.orderPracticeTaskLessons(ctx, lessonIDs)
+	}
+	return useCase.loadPracticeTaskLessonsInOrder(ctx, lessonIDs)
+}
+
+func practiceTaskRouteRequirementSatisfied(milestones []domain.PracticeTaskRuntimeMilestone, lessonID string, completedLessonIDs map[string]struct{}) bool {
+	if practiceTaskLessonCompleted(completedLessonIDs, lessonID) {
+		return true
+	}
+	for _, milestone := range milestones {
+		for _, binding := range milestone.LessonBindings {
+			if binding.LessonID != lessonID {
+				continue
+			}
+			if binding.Requirement != domain.PracticeTaskLessonRequirementRequired {
+				return true
+			}
+			if binding.AlternativeGroup == nil || strings.TrimSpace(*binding.AlternativeGroup) == "" {
+				return false
+			}
+			group := strings.TrimSpace(*binding.AlternativeGroup)
+			for _, alternative := range milestone.LessonBindings {
+				if alternative.AlternativeGroup == nil || strings.TrimSpace(*alternative.AlternativeGroup) != group {
+					continue
+				}
+				if practiceTaskLessonCompleted(completedLessonIDs, alternative.LessonID) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	// Skill-tag fallback has no requirement metadata, so it remains required.
+	return false
+}
+
+func practiceTaskRouteLessonRequirement(milestones []domain.PracticeTaskRuntimeMilestone, lessonID string) string {
+	for _, milestone := range milestones {
+		for _, binding := range milestone.LessonBindings {
+			if binding.LessonID == lessonID {
+				return binding.Requirement
+			}
+		}
+	}
+	return domain.PracticeTaskLessonRequirementRequired
+}
+
+func practiceTaskLessonsSharePrerequisiteGroup(milestones []domain.PracticeTaskRuntimeMilestone, leftLessonID, rightLessonID string) bool {
+	for _, milestone := range milestones {
+		var leftGroup, rightGroup string
+		for _, binding := range milestone.LessonBindings {
+			switch binding.LessonID {
+			case leftLessonID:
+				if binding.PrerequisiteGroup != nil {
+					leftGroup = strings.TrimSpace(*binding.PrerequisiteGroup)
+				}
+			case rightLessonID:
+				if binding.PrerequisiteGroup != nil {
+					rightGroup = strings.TrimSpace(*binding.PrerequisiteGroup)
+				}
+			}
+		}
+		if leftGroup != "" && leftGroup == rightGroup {
+			return true
+		}
+	}
+	return false
+}
+
+func practiceTaskLessonInList(items []answeruc.LessonMetadata, lessonID string) bool {
+	for _, item := range items {
+		if item.ID == lessonID {
+			return true
+		}
+	}
+	return false
+}
+
+func practiceTaskMilestoneLessonBlock(
+	current *partRuntimeContext,
+	milestone domain.PracticeTaskRuntimeMilestone,
+	prerequisites domain.MilestonePrerequisites,
+) string {
+	if len(prerequisites.UnmatchedSkillTags) > 0 {
+		return blockingReasonMilestonePrerequisites
+	}
+	if parentID := parentPartMilestoneID(milestone); parentID != "" {
+		parent, ok := current.studentMilestonesByPartMilestoneID[parentID]
+		if !ok || !isMilestoneCompleted(parent.Status) {
+			return blockingReasonParentMilestoneRequired
+		}
+	}
+	if previousID := previousRouteMilestoneID(current.runtimeContext.PracticeTaskMilestones, milestone); previousID != "" {
+		previous, ok := current.studentMilestonesByPartMilestoneID[previousID]
+		if !ok || !isMilestoneCompleted(previous.Status) {
+			return blockingReasonPreviousMilestone
+		}
+	}
+	if current.part.IsStrictOrder {
+		if previousID := previousSiblingMilestoneID(current.partMilestones, milestone); previousID != "" {
+			previousMilestone, ok := current.studentMilestonesByPartMilestoneID[previousID]
+			if ok && !isMilestoneCompleted(previousMilestone.Status) {
+				return blockingReasonStrictOrderRequired
+			}
+		}
+	}
+	return ""
+}
+
+func practiceTaskLessonCompleted(completedLessonIDs map[string]struct{}, lessonID string) bool {
+	_, ok := completedLessonIDs[lessonID]
+	return ok
+}
+
+func practiceTaskLessonTasks(structure *answeruc.CourseStructure, lessonID string) []answeruc.CourseStructureTask {
+	if structure == nil {
+		return nil
+	}
+	for _, lesson := range structure.Lessons {
+		if lesson.ID != lessonID {
+			continue
+		}
+		result := make([]answeruc.CourseStructureTask, 0, len(lesson.Tasks))
+		for _, task := range lesson.Tasks {
+			if task.Status != practiceTaskCourseContentStatusActive {
+				continue
+			}
+			result = append(result, task)
+		}
+		sort.SliceStable(result, func(left, right int) bool {
+			if result[left].Order == result[right].Order {
+				return result[left].ID < result[right].ID
+			}
+			return result[left].Order < result[right].Order
+		})
+		return result
+	}
+	return nil
+}
+
+func practiceTaskTaskIDs(items []answeruc.CourseStructureTask) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.ID)
+	}
+	return result
+}
+
+func practiceTaskTaskCompleted(task answeruc.CourseStructureTask, progress domain.StudentTaskProgress) bool {
+	if progress.HasPassed {
+		return true
+	}
+	switch task.EvaluationMode {
+	case "MANUAL", "HYBRID":
+		return progress.HasUnderReview
+	default:
+		return false
+	}
+}

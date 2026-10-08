@@ -1,0 +1,177 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	privatehttp "github.com/example/mc-course-service/internal/transport/http/private"
+	privatehandlers "github.com/example/mc-course-service/internal/transport/http/private/handlers"
+	"github.com/example/mc-course-service/internal/usecase/generatedcourse"
+	"github.com/example/mc-course-service/internal/usecase/lesson"
+	"github.com/example/mc-course-service/internal/usecase/lessonrevision"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root prepares and launches this finite helper. No Course is precreated:
+// Planner must call the registered generated-course handler and actual Ensure.
+// The fixture authored document belongs to the composer, not this provider.
+func TestT19ServePlanningCourseHTTP(t *testing.T) {
+	if os.Getenv("T19_SERVE_COURSE") != "true" {
+		t.Skip("owned T19 Course provider gate absent")
+	}
+	ready, stop, result := os.Getenv("T19_COURSE_READY_FILE"), os.Getenv("T19_COURSE_STOP_FILE"), os.Getenv("T19_COURSE_RESULT_FILE")
+	token := os.Getenv("T19_COURSE_TOKEN")
+	cfg, err := pgxpool.ParseConfig(os.Getenv("T19_COURSE_TEST_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Database != "remediation_t19_course_test" || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998 || token == "" || ready == "" || stop == "" || result == "" || ready == stop || ready == result || stop == result {
+		t.Fatal("SETUP: exact owned Course configuration required")
+	}
+	for _, path := range []string{ready, stop, result} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatal("SETUP: metadata and stop paths must be absent")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: Course pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact Course database unavailable")
+	}
+	var count int
+	if pool.QueryRow(ctx, `SELECT count(*) FROM code_structure_type WHERE code='QUIZ_TEXT_BASIC'`).Scan(&count) != nil || count != 1 {
+		t.Fatal("SETUP: Course quiz reference missing")
+	}
+	for _, language := range []string{"ru", "en"} {
+		if pool.QueryRow(ctx, `SELECT count(*) FROM i18n WHERE language=$1`, language).Scan(&count) != nil || count != 1 {
+			t.Fatal("SETUP: Course language reference missing")
+		}
+	}
+	// Refuse a prior provider run rather than adopting its authored state.
+	if pool.QueryRow(ctx, `SELECT count(*) FROM generated_course`).Scan(&count) != nil || count != 0 {
+		t.Fatal("SETUP: generated Course fixture namespace must be empty")
+	}
+	lessons, translations, tasks, examples := LessonRepoPG{Pool: pool}, LessonI18nRepoPG{Pool: pool}, TaskRepoPG{Pool: pool}, LessonExampleRepoPG{Pool: pool}
+	revisions := lessonrevision.Definitions{Revisions: LessonRevisionRepoPG{Pool: pool}, Lessons: lessons, Translations: translations, Tasks: tasks, Tests: TaskTestRepoPG{Pool: pool}, Files: TaskFileStorageRepoPG{Pool: pool}, Examples: examples, Tx: LessonRevisionTxPG{Pool: pool}}
+	ensure := generatedcourse.Ensure{
+		Revisions: revisions, Generated: GeneratedCourseRepoPG{Pool: pool}, Courses: CourseRepoPG{Pool: pool}, CourseI18n: CourseI18nRepoPG{Pool: pool},
+		Modules: ModuleRepoPG{Pool: pool}, ModuleI18n: ModuleI18nRepoPG{Pool: pool}, CourseModules: CourseModuleRepoPG{Pool: pool},
+		Sections: SectionRepoPG{Pool: pool}, SectionI18n: SectionI18nRepoPG{Pool: pool}, ModuleSections: ModuleSectionRepoPG{Pool: pool},
+		Lessons: lessons, LessonI18n: translations, SectionLessons: SectionLessonRepoPG{Pool: pool}, Examples: examples,
+		Tasks: tasks, TaskI18n: TaskI18nRepoPG{Pool: pool}, TaskTargets: TaskLearningTargetRepoPG{Pool: pool},
+		StructureTypes: CodeStructureTypeRepoPG{Pool: pool}, I18n: I18nRepoPG{Pool: pool}, Tx: TxManagerPG{Pool: pool}, IDs: t19CourseIDs{}, Clock: t19CourseClock{},
+	}
+	registered := chi.NewRouter()
+	registered.Mount("/internal", privatehttp.NewRouter(
+		&privatehandlers.TaskHandler{GetInternalCourseStructureUC: task.GetInternalCourseStructure{Lessons: lessons, Tasks: tasks}, GetDetailsUC: task.GetTaskDetails{Tasks: tasks, TaskTests: TaskTestRepoPG{Pool: pool}, TaskFiles: TaskFileStorageRepoPG{Pool: pool}, LearningTargets: TaskLearningTargetRepoPG{Pool: pool}, Structures: CodeStructureTypeRepoPG{Pool: pool}}},
+		&privatehandlers.LessonHandler{GetUC: lesson.GetLesson{Lessons: lessons}, RevisionsUC: revisions}, nil, &privatehandlers.GeneratedCourseHandler{Ensure: ensure}, token, token, ""))
+	state := func(readCtx context.Context) (map[string]any, error) {
+		value := map[string]any{"database": database, "classification": "actual registered Course Ensure, hierarchy, revisions and PostgreSQL; composer supplies synthetic authored fixture; no LLM or NATS"}
+		counts := map[string]int64{}
+		for _, table := range []string{"generated_course", "generated_course_request", "generated_lesson", "generated_course_revision_receipt", "lesson_revision"} {
+			var n int64
+			if err := pool.QueryRow(readCtx, `SELECT count(*) FROM `+table).Scan(&n); err != nil {
+				return nil, err
+			}
+			counts[table] = n
+		}
+		value["counts"] = counts
+		for key, query := range map[string]string{
+			"generated_courses":  `SELECT coalesce(jsonb_agg(jsonb_build_object('course_id',course_id,'fingerprint',course_fingerprint,'fingerprint_version',fingerprint_version,'plan',plan_json) ORDER BY course_id),'[]'::jsonb) FROM generated_course`,
+			"generated_requests": `SELECT coalesce(jsonb_agg(jsonb_build_object('idempotency_key',idempotency_key,'request_hash',request_hash,'course_id',course_id,'reused',reused) ORDER BY idempotency_key),'[]'::jsonb) FROM generated_course_request`,
+		} {
+			var raw json.RawMessage
+			if err := pool.QueryRow(readCtx, query).Scan(&raw); err != nil {
+				return nil, err
+			}
+			value[key] = raw
+		}
+		return value, nil
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__t19/state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		readCtx, finish := context.WithTimeout(r.Context(), 5*time.Second)
+		defer finish()
+		value, err := state(readCtx)
+		if err != nil {
+			http.Error(w, "state unavailable", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(value)
+	})
+	mux.Handle("/", registered)
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.ReadHeaderTimeout, server.Config.ReadTimeout, server.Config.WriteTimeout, server.Config.IdleTimeout = 5*time.Second, 40*time.Second, 40*time.Second, 5*time.Second
+	server.Start()
+	defer server.Close()
+	defer server.CloseClientConnections()
+	value, err := state(ctx)
+	if err != nil {
+		t.Fatal("SETUP: initial Course state unavailable")
+	}
+	value["url"] = server.URL
+	t19CourseWriteExclusive(t, ready, value)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("owned Course 20-minute deadline exceeded")
+		case <-ticker.C:
+			if _, err := os.Stat(stop); err == nil {
+				value, err := state(ctx)
+				if err != nil {
+					t.Fatal("owned final Course state unavailable")
+				}
+				value["url"] = server.URL
+				t19CourseWriteExclusive(t, result, value)
+				return
+			} else if !os.IsNotExist(err) {
+				t.Fatal("owned Course stop read failed")
+			}
+		}
+	}
+}
+
+func t19CourseWriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe Course metadata encoding failed")
+	}
+	file, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal("exclusive Course metadata creation failed")
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil || os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic Course metadata publication failed")
+	}
+}
+
+type t19CourseIDs struct{}
+
+func (t19CourseIDs) NewID() string { return uuid.NewString() }
+
+type t19CourseClock struct{}
+
+func (t19CourseClock) Now() time.Time { return time.Now().UTC() }

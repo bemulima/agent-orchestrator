@@ -1,0 +1,256 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TelegramRepository struct{ Pool *pgxpool.Pool }
+
+func (repository TelegramRepository) IssueLinkCode(ctx context.Context, digest [32]byte, record domain.TelegramLinkRecord) error {
+	if repository.Pool == nil || !validUUIDString(record.StudentID) || !validUUIDString(record.PersonalTeacherID) ||
+		!validUUIDString(record.DialogID) || record.CreatedAt.IsZero() || !record.ExpiresAt.After(record.CreatedAt) {
+		return domain.ErrTelegramUnavailable
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM teacher_telegram_link_code WHERE student_id=$1 AND consumed_at IS NULL`, record.StudentID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO teacher_telegram_link_code
+(code_hash, student_id, personal_teacher_id, dialog_id, expires_at, created_at)
+VALUES ($1,$2,$3,$4,$5,$6)`, digest[:], record.StudentID, record.PersonalTeacherID, record.DialogID,
+		record.ExpiresAt.UTC(), record.CreatedAt.UTC())
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (repository TelegramRepository) ConsumeLinkCode(
+	ctx context.Context,
+	digest [32]byte,
+	telegramUserID, chatID int64,
+	now time.Time,
+) (domain.TelegramBinding, error) {
+	if repository.Pool == nil || telegramUserID <= 0 || chatID <= 0 || now.IsZero() {
+		return domain.TelegramBinding{}, domain.ErrInvalidTelegramUpdate
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TelegramBinding{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var record domain.TelegramLinkRecord
+	var consumedAt *time.Time
+	var consumedUserID, consumedChatID *int64
+	err = tx.QueryRow(ctx, `
+SELECT student_id, personal_teacher_id::text, dialog_id::text, expires_at, created_at,
+       consumed_at, consumed_telegram_user_id, consumed_chat_id
+FROM teacher_telegram_link_code WHERE code_hash=$1 FOR UPDATE`, digest[:]).Scan(
+		&record.StudentID, &record.PersonalTeacherID, &record.DialogID, &record.ExpiresAt, &record.CreatedAt,
+		&consumedAt, &consumedUserID, &consumedChatID,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TelegramBinding{}, domain.ErrTelegramLinkInvalid
+	}
+	if err != nil {
+		return domain.TelegramBinding{}, err
+	}
+	if consumedAt != nil {
+		if consumedUserID == nil || consumedChatID == nil || *consumedUserID != telegramUserID || *consumedChatID != chatID {
+			return domain.TelegramBinding{}, domain.ErrTelegramLinkInvalid
+		}
+		binding, readErr := getTelegramBindingByStudent(ctx, tx, record.StudentID)
+		if readErr != nil || binding.TelegramUserID != telegramUserID || binding.ChatID != chatID {
+			return domain.TelegramBinding{}, domain.ErrTelegramLinkInvalid
+		}
+		return binding, tx.Commit(ctx)
+	}
+	if !record.ExpiresAt.After(now) {
+		return domain.TelegramBinding{}, domain.ErrTelegramLinkInvalid
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO teacher_telegram_binding
+(student_id, personal_teacher_id, dialog_id, telegram_user_id, chat_id, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$6)
+ON CONFLICT (student_id) DO UPDATE SET
+personal_teacher_id=EXCLUDED.personal_teacher_id, dialog_id=EXCLUDED.dialog_id,
+telegram_user_id=EXCLUDED.telegram_user_id, chat_id=EXCLUDED.chat_id, updated_at=EXCLUDED.updated_at`,
+		record.StudentID, record.PersonalTeacherID, record.DialogID, telegramUserID, chatID, now.UTC())
+	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return domain.TelegramBinding{}, domain.ErrTelegramLinkConflict
+		}
+		return domain.TelegramBinding{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE teacher_telegram_link_code
+SET consumed_at=$2, consumed_telegram_user_id=$3, consumed_chat_id=$4
+WHERE code_hash=$1`, digest[:], now.UTC(), telegramUserID, chatID); err != nil {
+		return domain.TelegramBinding{}, err
+	}
+	binding, err := getTelegramBindingByStudent(ctx, tx, record.StudentID)
+	if err != nil {
+		return domain.TelegramBinding{}, err
+	}
+	return binding, tx.Commit(ctx)
+}
+
+func (repository TelegramRepository) GetBindingByChat(ctx context.Context, telegramUserID, chatID int64) (domain.TelegramBinding, error) {
+	if repository.Pool == nil || telegramUserID <= 0 || chatID <= 0 {
+		return domain.TelegramBinding{}, domain.ErrInvalidTelegramUpdate
+	}
+	binding, err := scanTelegramBinding(repository.Pool.QueryRow(ctx, `
+SELECT student_id, personal_teacher_id::text, dialog_id::text, telegram_user_id, chat_id, created_at, updated_at
+FROM teacher_telegram_binding WHERE telegram_user_id=$1 AND chat_id=$2`, telegramUserID, chatID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TelegramBinding{}, domain.ErrTelegramBindingNotFound
+	}
+	return binding, err
+}
+
+func (repository TelegramRepository) EnqueueDelivery(ctx context.Context, sourceMessageID, studentID, body string, now time.Time) error {
+	if repository.Pool == nil || !validUUIDString(sourceMessageID) || !validUUIDString(studentID) ||
+		strings.TrimSpace(body) == "" || len(body) > 48000 || now.IsZero() {
+		return domain.ErrTelegramUnavailable
+	}
+	command, err := repository.Pool.Exec(ctx, `
+INSERT INTO teacher_telegram_delivery
+(source_message_id, student_id, chat_id, body, status, next_attempt_at, created_at, updated_at)
+SELECT $1, student_id, chat_id, $3, 'pending', $4, $4, $4
+FROM teacher_telegram_binding WHERE student_id=$2
+ON CONFLICT (source_message_id) DO NOTHING`, sourceMessageID, studentID, body, now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 1 {
+		return nil
+	}
+	var existingStudentID, existingBody string
+	err = repository.Pool.QueryRow(ctx, `
+SELECT student_id, body FROM teacher_telegram_delivery WHERE source_message_id=$1`, sourceMessageID).Scan(&existingStudentID, &existingBody)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrTelegramBindingNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if existingStudentID != studentID || existingBody != body {
+		return domain.ErrTelegramLinkConflict
+	}
+	return nil
+}
+
+func (repository TelegramRepository) ClaimDelivery(ctx context.Context, claimToken string, now, lockedUntil time.Time) (domain.TelegramDelivery, bool, error) {
+	if repository.Pool == nil || !validUUIDString(claimToken) || now.IsZero() || !lockedUntil.After(now) {
+		return domain.TelegramDelivery{}, false, domain.ErrTelegramUnavailable
+	}
+	delivery, err := scanTelegramDelivery(repository.Pool.QueryRow(ctx, `
+WITH candidate AS (
+    SELECT source_message_id FROM teacher_telegram_delivery
+    WHERE ((status='pending' AND next_attempt_at <= $1) OR (status='processing' AND locked_until <= $1))
+    ORDER BY next_attempt_at, created_at, source_message_id
+    FOR UPDATE SKIP LOCKED LIMIT 1
+)
+UPDATE teacher_telegram_delivery delivery
+SET status='processing', claim_token=$2, locked_until=$3, attempts=attempts+1, updated_at=$1
+FROM candidate WHERE delivery.source_message_id=candidate.source_message_id
+RETURNING delivery.source_message_id::text, delivery.student_id, delivery.chat_id, delivery.body,
+          delivery.status, delivery.claim_token::text, delivery.attempts, delivery.created_at`,
+		now.UTC(), claimToken, lockedUntil.UTC()))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TelegramDelivery{}, false, nil
+	}
+	return delivery, err == nil, err
+}
+
+func (repository TelegramRepository) MarkDeliverySent(ctx context.Context, sourceMessageID, claimToken string, remoteMessageID int64, now time.Time) error {
+	if remoteMessageID <= 0 {
+		return domain.ErrTelegramUnavailable
+	}
+	return repository.finishDelivery(ctx, sourceMessageID, claimToken, `
+UPDATE teacher_telegram_delivery SET status='sent', claim_token=NULL, locked_until=NULL,
+remote_message_id=$3, sent_at=$4, last_error_code=NULL, updated_at=$4
+WHERE source_message_id=$1 AND status='processing' AND claim_token=$2`, remoteMessageID, now)
+}
+
+func (repository TelegramRepository) RetryDelivery(ctx context.Context, sourceMessageID, claimToken, code string, retryAt, now time.Time) error {
+	if !retryAt.After(now) || !validErrorCode(code) {
+		return domain.ErrTelegramUnavailable
+	}
+	return repository.finishDelivery(ctx, sourceMessageID, claimToken, `
+UPDATE teacher_telegram_delivery SET status='pending', claim_token=NULL, locked_until=NULL,
+next_attempt_at=$3, last_error_code=$4, updated_at=$5
+WHERE source_message_id=$1 AND status='processing' AND claim_token=$2`, retryAt.UTC(), code, now)
+}
+
+func (repository TelegramRepository) BlockDelivery(ctx context.Context, sourceMessageID, claimToken, code string, now time.Time) error {
+	if !validErrorCode(code) {
+		return domain.ErrTelegramUnavailable
+	}
+	return repository.finishDelivery(ctx, sourceMessageID, claimToken, `
+UPDATE teacher_telegram_delivery SET status='blocked', claim_token=NULL, locked_until=NULL,
+last_error_code=$3, updated_at=$4
+WHERE source_message_id=$1 AND status='processing' AND claim_token=$2`, code, now)
+}
+
+func (repository TelegramRepository) finishDelivery(ctx context.Context, sourceMessageID, claimToken, query string, args ...any) error {
+	if repository.Pool == nil || !validUUIDString(sourceMessageID) || !validUUIDString(claimToken) {
+		return domain.ErrTelegramUnavailable
+	}
+	command, err := repository.Pool.Exec(ctx, query, append([]any{sourceMessageID, claimToken}, args...)...)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTelegramUnavailable
+	}
+	return nil
+}
+
+type telegramRow interface{ Scan(...any) error }
+
+func getTelegramBindingByStudent(ctx context.Context, tx pgx.Tx, studentID string) (domain.TelegramBinding, error) {
+	return scanTelegramBinding(tx.QueryRow(ctx, `
+SELECT student_id, personal_teacher_id::text, dialog_id::text, telegram_user_id, chat_id, created_at, updated_at
+FROM teacher_telegram_binding WHERE student_id=$1`, studentID))
+}
+
+func scanTelegramBinding(row telegramRow) (domain.TelegramBinding, error) {
+	var binding domain.TelegramBinding
+	err := row.Scan(&binding.StudentID, &binding.PersonalTeacherID, &binding.DialogID, &binding.TelegramUserID,
+		&binding.ChatID, &binding.CreatedAt, &binding.UpdatedAt)
+	if err != nil {
+		return domain.TelegramBinding{}, err
+	}
+	return domain.NormalizeTelegramBinding(binding)
+}
+
+func scanTelegramDelivery(row telegramRow) (domain.TelegramDelivery, error) {
+	var delivery domain.TelegramDelivery
+	err := row.Scan(&delivery.SourceMessageID, &delivery.StudentID, &delivery.ChatID, &delivery.Body,
+		&delivery.Status, &delivery.ClaimToken, &delivery.Attempts, &delivery.CreatedAt)
+	return delivery, err
+}
+
+func validErrorCode(code string) bool {
+	code = strings.TrimSpace(code)
+	return code != "" && len(code) <= 64
+}
+
+var _ repository.TelegramStore = TelegramRepository{}

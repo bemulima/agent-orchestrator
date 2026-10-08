@@ -1,0 +1,419 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LessonRepoPG implements LessonRepository.
+type LessonRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+const lessonContentJoins = `
+LEFT JOIN compose_config lc ON lc.id = l.compose_config_id
+LEFT JOIN LATERAL (
+    SELECT cm.course_id
+    FROM module_section ms
+    JOIN course_module cm ON cm.module_id = ms.module_id
+    WHERE ms.section_id = lesson_context.section_id
+      AND (lesson_context.module_id IS NULL OR ms.module_id = lesson_context.module_id)
+    ORDER BY cm."order", ms."order"
+    LIMIT 1
+) course_scope ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'lesson_id', lv.lesson_id,
+                'tech_version_id', lv.tech_version_id,
+                'status', lv.status,
+                'created_at', lv.created_at
+            )
+            ORDER BY lv.tech_version_id
+        ),
+        '[]'::jsonb
+    ) AS versions
+    FROM lesson_version lv
+    WHERE lv.lesson_id = l.id
+) lesson_versions ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'lesson_id', li.lesson_id,
+                'i18n_id', li.i18n_id,
+                'lang', i.language,
+                'title', li.title,
+                'excerpt', li.excerpt,
+                'description', li.description
+            )
+            ORDER BY i.language
+        ),
+        '[]'::jsonb
+    ) AS translations
+    FROM lesson_i18n li
+    JOIN i18n i ON i.id = li.i18n_id
+    WHERE li.lesson_id = l.id
+) lesson_i18n ON TRUE
+`
+
+const lessonGetPlacementJoin = `
+LEFT JOIN LATERAL (
+    SELECT sl.section_id, ms.module_id, NULL::uuid AS course_id, sl."order", sl.status
+    FROM section_lesson sl
+    LEFT JOIN module_section ms ON ms.section_id = sl.section_id
+    WHERE sl.lesson_id = l.id
+    ORDER BY ms."order", sl."order", sl.created_at, sl.id
+    LIMIT 1
+) lesson_context ON TRUE
+`
+
+// Create inserts lesson.
+func (r LessonRepoPG) Create(ctx context.Context, lesson domain.Lesson) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `INSERT INTO lesson (id, source_key, title, excerpt, description, compose_config_id, status, lesson_read_access, created_at, updated_at) VALUES ($1,NULLIF($2,''),$3,$4,$5,$6,$7,$8,$9,$10)`,
+		lesson.ID, lesson.SourceKey, lesson.Title, lesson.Excerpt, lesson.Description, lesson.ComposeConfigID, lesson.Status, lesson.LessonReadAccess, lesson.CreatedAt, lesson.UpdatedAt)
+	return mapPgError(err)
+}
+
+// Get fetches lesson.
+func (r LessonRepoPG) Get(ctx context.Context, id string) (*domain.Lesson, error) {
+	runner := getRunner(ctx, r.Pool)
+	row := runner.QueryRow(ctx, `
+SELECT l.id, COALESCE(lesson_context.section_id::text, ''), COALESCE(lesson_context.course_id::text, course_scope.course_id::text, ''), l.title, l.excerpt, l.description, l.compose_config_id, lc.config, COALESCE(lesson_context."order", 0), l.status, l.lesson_read_access, l.created_at, l.updated_at
+FROM lesson l
+`+lessonGetPlacementJoin+lessonContentJoins+`
+WHERE l.id=$1`, id)
+	var l domain.Lesson
+	if err := row.Scan(&l.ID, &l.SectionID, &l.CourseID, &l.Title, &l.Excerpt, &l.Description, &l.ComposeConfigID, &l.ComposeConfig, &l.Order, &l.Status, &l.LessonReadAccess, &l.CreatedAt, &l.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	return &l, nil
+}
+
+// GetWithFields fetches lesson with selected fields.
+func (r LessonRepoPG) GetWithFields(ctx context.Context, id string, f queryfields.Set) (map[string]any, error) {
+	cols := columnsWithAliases(f, lessonFieldSQL)
+	if len(cols) == 0 {
+		cols = r.defaultLessonColumns()
+	}
+	selectCols := strings.Join(cols, ", ")
+	query := fmt.Sprintf(`SELECT %s FROM lesson l %s %s WHERE l.id=$1`, selectCols, lessonGetPlacementJoin, lessonContentJoins)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, domain.ErrNotFound
+	}
+
+	return ScanRowToMap(rows)
+}
+
+// Update updates lesson.
+func (r LessonRepoPG) Update(ctx context.Context, lesson domain.Lesson) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `
+	UPDATE lesson
+	SET title=$1, excerpt=$2, description=$3, compose_config_id=$4, status=$5, lesson_read_access=$6, updated_at=now()
+	WHERE id=$7`,
+		lesson.Title,
+		lesson.Excerpt,
+		lesson.Description,
+		lesson.ComposeConfigID,
+		lesson.Status,
+		lesson.LessonReadAccess,
+		lesson.ID,
+	)
+	return mapPgError(err)
+}
+
+// Delete removes lesson by id (cascades to tasks via foreign keys).
+func (r LessonRepoPG) Delete(ctx context.Context, lessonID string) error {
+	runner := getRunner(ctx, r.Pool)
+	_, err := runner.Exec(ctx, `DELETE FROM lesson WHERE id=$1`, lessonID)
+	return err
+}
+
+// ListByCourse lists lessons reachable from a course.
+func (r LessonRepoPG) ListByCourse(ctx context.Context, courseID string) ([]domain.Lesson, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT l.id, sl.section_id, cm.course_id, l.title, l.excerpt, l.description, l.compose_config_id, lc.config, sl."order", l.status, l.lesson_read_access, l.created_at, l.updated_at
+FROM course_module cm
+JOIN module_section ms ON ms.module_id = cm.module_id
+JOIN section_lesson sl ON sl.section_id = ms.section_id
+JOIN lesson l ON l.id = sl.lesson_id
+LEFT JOIN compose_config lc ON lc.id = l.compose_config_id
+WHERE cm.course_id=$1
+ORDER BY cm."order" ASC, ms."order" ASC, sl."order" ASC, l.id ASC`, courseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []domain.Lesson
+	for rows.Next() {
+		var l domain.Lesson
+		if err := rows.Scan(&l.ID, &l.SectionID, &l.CourseID, &l.Title, &l.Excerpt, &l.Description, &l.ComposeConfigID, &l.ComposeConfig, &l.Order, &l.Status, &l.LessonReadAccess, &l.CreatedAt, &l.UpdatedAt); err != nil {
+			return nil, err
+		}
+		res = append(res, l)
+	}
+	return res, rows.Err()
+}
+
+// ListBySection lists lessons in a section.
+func (r LessonRepoPG) ListBySection(ctx context.Context, sectionID string) ([]domain.Lesson, error) {
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, `
+SELECT l.id, sl.section_id, course_scope.course_id, l.title, l.excerpt, l.description, l.compose_config_id, lc.config, sl."order", l.status, l.lesson_read_access, l.created_at, l.updated_at
+FROM section_lesson sl
+JOIN lesson l ON l.id = sl.lesson_id
+LEFT JOIN LATERAL (
+    SELECT ms.module_id
+    FROM module_section ms
+    WHERE ms.section_id = sl.section_id
+    ORDER BY ms."order"
+    LIMIT 1
+) section_module ON TRUE
+JOIN LATERAL (
+    SELECT sl.section_id, section_module.module_id, NULL::uuid AS course_id, sl."order", sl.status
+) lesson_context ON TRUE
+`+lessonContentJoins+`
+WHERE sl.section_id=$1
+ORDER BY sl."order"`, sectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []domain.Lesson
+	for rows.Next() {
+		var l domain.Lesson
+		if err := rows.Scan(&l.ID, &l.SectionID, &l.CourseID, &l.Title, &l.Excerpt, &l.Description, &l.ComposeConfigID, &l.ComposeConfig, &l.Order, &l.Status, &l.LessonReadAccess, &l.CreatedAt, &l.UpdatedAt); err != nil {
+			return nil, err
+		}
+		res = append(res, l)
+	}
+	return res, rows.Err()
+}
+
+// ListByCourseFields lists lessons for a course with selected fields.
+func (r LessonRepoPG) ListByCourseFields(ctx context.Context, courseID string, f queryfields.Set, lessonFilters filters.LessonFilters, sort *filters.SortOptions) ([]map[string]any, int, error) {
+	query, args := r.buildListQuery(courseID, f, lessonFilters, sort)
+
+	runner := getRunner(ctx, r.Pool)
+	rows, err := runner.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var res []map[string]any
+	for rows.Next() {
+		row, err := ScanRowToMap(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		res = append(res, row)
+	}
+
+	total, err := r.countListTotal(ctx, courseID, lessonFilters)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return res, total, nil
+}
+
+func (r LessonRepoPG) countListTotal(ctx context.Context, courseID string, lessonFilters filters.LessonFilters) (int, error) {
+	query, args, _ := r.buildListBaseQuery(courseID, "COUNT(*)", lessonFilters)
+	var total int
+	runner := getRunner(ctx, r.Pool)
+	if err := runner.QueryRow(ctx, query, args...).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (r LessonRepoPG) buildListQuery(courseID string, f queryfields.Set, lessonFilters filters.LessonFilters, sort *filters.SortOptions) (string, []interface{}) {
+	selectCols := r.selectLessonColumns(f)
+	query, args, argIdx := r.buildListBaseQuery(courseID, selectCols, lessonFilters)
+
+	hasCourseContext := strings.TrimSpace(courseID) != "" || lessonFilters.CourseID != nil
+	hasModuleContext := lessonFilters.ModuleID != nil
+	orderBy := `lesson_context."order" ASC, l.id ASC`
+	if hasCourseContext {
+		orderBy = `cm."order" ASC, ms."order" ASC, lesson_context."order" ASC, l.id ASC`
+	} else if hasModuleContext {
+		orderBy = `ms."order" ASC, lesson_context."order" ASC, l.id ASC`
+	}
+	if sort != nil {
+		switch sort.Field {
+		case filters.SortFieldCreatedAt:
+			orderBy = fmt.Sprintf("l.created_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldUpdatedAt:
+			orderBy = fmt.Sprintf("l.updated_at %s", strings.ToUpper(string(sort.Order)))
+		case filters.SortFieldTitle:
+			orderBy = fmt.Sprintf("l.title %s", strings.ToUpper(string(sort.Order)))
+		}
+	}
+	query += " ORDER BY " + orderBy
+
+	_, limit, offset := filters.NormalizePagination(lessonFilters.Page, lessonFilters.Limit)
+	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	return query, args
+}
+
+func (r LessonRepoPG) buildListBaseQuery(courseID string, selectCols string, lessonFilters filters.LessonFilters) (string, []interface{}, int) {
+	var args []interface{}
+	argIdx := 1
+
+	if selectCols == "" {
+		selectCols = r.selectLessonColumns(queryfields.Set{})
+	}
+
+	resolvedCourseID := strings.TrimSpace(courseID)
+	if resolvedCourseID == "" && lessonFilters.CourseID != nil {
+		resolvedCourseID = strings.TrimSpace(*lessonFilters.CourseID)
+	}
+	resolvedModuleID := ""
+	if lessonFilters.ModuleID != nil {
+		resolvedModuleID = strings.TrimSpace(*lessonFilters.ModuleID)
+	}
+
+	var fromSQL string
+	moduleFilterApplied := false
+	if resolvedCourseID != "" {
+		fromSQL = fmt.Sprintf(`
+	FROM course_module cm
+	JOIN module_section ms ON ms.module_id = cm.module_id
+	JOIN section_lesson sl ON sl.section_id = ms.section_id
+	JOIN lesson l ON l.id = sl.lesson_id
+	JOIN LATERAL (
+	    SELECT sl.section_id, ms.module_id, cm.course_id, sl."order", sl.status
+	) lesson_context ON TRUE
+	%s
+	WHERE cm.course_id = $%d`, lessonContentJoins, argIdx)
+		args = append(args, resolvedCourseID)
+		argIdx++
+	} else if resolvedModuleID != "" {
+		fromSQL = fmt.Sprintf(`
+	FROM module_section ms
+	JOIN section_lesson sl ON sl.section_id = ms.section_id
+	JOIN lesson l ON l.id = sl.lesson_id
+	JOIN LATERAL (
+	    SELECT sl.section_id, ms.module_id, NULL::uuid AS course_id, sl."order", sl.status
+	) lesson_context ON TRUE
+	%s
+	WHERE ms.module_id = $%d`, lessonContentJoins, argIdx)
+		args = append(args, resolvedModuleID)
+		argIdx++
+		moduleFilterApplied = true
+	} else {
+		fromSQL = fmt.Sprintf(`
+	FROM section_lesson sl
+	JOIN lesson l ON l.id = sl.lesson_id
+	LEFT JOIN LATERAL (
+	    SELECT ms.module_id
+	    FROM module_section ms
+	    WHERE ms.section_id = sl.section_id
+	    ORDER BY ms."order"
+	    LIMIT 1
+	) section_module ON TRUE
+	JOIN LATERAL (
+	    SELECT sl.section_id, section_module.module_id, NULL::uuid AS course_id, sl."order", sl.status
+	) lesson_context ON TRUE
+	%s
+	WHERE TRUE`, lessonContentJoins)
+	}
+
+	query := fmt.Sprintf(`
+	SELECT %s
+	%s`, selectCols, fromSQL)
+
+	var whereConditions []string
+	if lessonFilters.ID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("l.id = $%d", argIdx))
+		args = append(args, *lessonFilters.ID)
+		argIdx++
+	}
+	if lessonFilters.CourseID != nil && resolvedCourseID == "" {
+		whereConditions = append(whereConditions, fmt.Sprintf("cm.course_id = $%d", argIdx))
+		args = append(args, *lessonFilters.CourseID)
+		argIdx++
+	}
+	if lessonFilters.SectionID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("lesson_context.section_id = $%d", argIdx))
+		args = append(args, *lessonFilters.SectionID)
+		argIdx++
+	}
+	if resolvedModuleID != "" && !moduleFilterApplied {
+		whereConditions = append(whereConditions, fmt.Sprintf("lesson_context.module_id = $%d", argIdx))
+		args = append(args, resolvedModuleID)
+		argIdx++
+	}
+	if lessonFilters.Title != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("l.title ILIKE $%d", argIdx))
+		args = append(args, "%"+*lessonFilters.Title+"%")
+		argIdx++
+	}
+	if lessonFilters.Status != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("l.status = $%d", argIdx))
+		args = append(args, *lessonFilters.Status)
+		argIdx++
+	}
+
+	if len(whereConditions) > 0 {
+		query += " AND " + strings.Join(whereConditions, " AND ")
+	}
+
+	return query, args, argIdx
+}
+
+func (r LessonRepoPG) selectLessonColumns(f queryfields.Set) string {
+	cols := columnsWithAliases(f, lessonFieldSQL)
+	if len(cols) == 0 {
+		cols = r.defaultLessonColumns()
+	}
+	return strings.Join(cols, ", ")
+}
+
+func (r LessonRepoPG) defaultLessonColumns() []string {
+	return []string{
+		"l.id",
+		"lesson_context.section_id",
+		"lesson_context.module_id",
+		"COALESCE(lesson_context.course_id, course_scope.course_id) AS course_id",
+		"COALESCE(lesson_versions.versions, '[]'::jsonb) AS versions",
+		"l.title",
+		"l.excerpt",
+		"l.description",
+		"COALESCE(lesson_i18n.translations, '[]'::jsonb) AS translations",
+		"lc.config AS compose_config",
+		`lesson_context."order"`,
+		"l.status",
+		"l.lesson_read_access",
+		"l.created_at",
+		"l.updated_at",
+	}
+}
+
+var _ repository.LessonRepository = (*LessonRepoPG)(nil)

@@ -1,0 +1,107 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type LessonRevisionRepoPG struct{ Pool *pgxpool.Pool }
+
+func (r LessonRevisionRepoPG) GetRevision(ctx context.Context, id string) (*domain.LessonRevision, error) {
+	var raw []byte
+	if err := getRunner(ctx, r.Pool).QueryRow(ctx, `SELECT definition FROM lesson_revision WHERE id=$1`, id).Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+	var value domain.LessonRevision
+	err := json.Unmarshal(raw, &value)
+	return &value, err
+}
+func (r LessonRevisionRepoPG) GetPolicy(ctx context.Context, id string) ([]domain.LessonActivity, error) {
+	var raw []byte
+	err := getRunner(ctx, r.Pool).QueryRow(ctx, `SELECT activities FROM lesson_completion_policy WHERE lesson_id=$1`, id).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var value []domain.LessonActivity
+	err = json.Unmarshal(raw, &value)
+	return value, err
+}
+func (r LessonRevisionRepoPG) SetPolicy(ctx context.Context, id string, a []domain.LessonActivity) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	_, err = getRunner(ctx, r.Pool).Exec(ctx, `INSERT INTO lesson_completion_policy(lesson_id,activities) VALUES($1,$2) ON CONFLICT(lesson_id) DO UPDATE SET activities=EXCLUDED.activities,updated_at=now()`, id, raw)
+	return mapPgError(err)
+}
+func (r LessonRevisionRepoPG) StoreRevision(ctx context.Context, hash string, v domain.LessonRevision) (*domain.LessonRevision, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	_, err = getRunner(ctx, r.Pool).Exec(ctx, `INSERT INTO lesson_revision(id,lesson_id,content_hash,definition,created_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(lesson_id,content_hash) DO NOTHING`, v.LessonRevisionID, v.LessonID, hash, raw, v.CreatedAt)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	var stored []byte
+	err = getRunner(ctx, r.Pool).QueryRow(ctx, `SELECT definition FROM lesson_revision WHERE lesson_id=$1 AND content_hash=$2`, v.LessonID, hash).Scan(&stored)
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(stored, &v)
+	return &v, err
+}
+
+// Repeatable-read snapshots prevent mixed content when authors edit concurrently.
+type LessonRevisionTxPG struct{ Pool *pgxpool.Pool }
+
+func (r LessonRevisionTxPG) WithTx(ctx repository.Context, fn func(repository.Context) error) error {
+	tx, err := r.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	ctx = context.WithValue(ctx, txKey{}, tx)
+	if err = fn(ctx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+var _ repository.LessonRevisionRepository = LessonRevisionRepoPG{}
+
+func (r LessonRevisionRepoPG) GetGeneratedReceipt(ctx context.Context, key string) ([]domain.GeneratedLessonBinding, error) {
+	var raw []byte
+	err := getRunner(ctx, r.Pool).QueryRow(ctx, `SELECT lessons FROM generated_course_revision_receipt WHERE idempotency_key=$1`, key).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var value []domain.GeneratedLessonBinding
+	err = json.Unmarshal(raw, &value)
+	return value, err
+}
+func (r LessonRevisionRepoPG) StoreGeneratedReceipt(ctx context.Context, key string, bindings []domain.GeneratedLessonBinding) ([]domain.GeneratedLessonBinding, error) {
+	raw, err := json.Marshal(bindings)
+	if err != nil {
+		return nil, err
+	}
+	_, err = getRunner(ctx, r.Pool).Exec(ctx, `INSERT INTO generated_course_revision_receipt(idempotency_key,lessons) VALUES($1,$2) ON CONFLICT(idempotency_key) DO NOTHING`, key, raw)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetGeneratedReceipt(ctx, key)
+}

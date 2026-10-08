@@ -1,0 +1,205 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type OnboardingActionRepository struct{ Pool *pgxpool.Pool }
+
+func (store OnboardingActionRepository) Get(ctx context.Context, idempotencyKey string) (domain.OnboardingActionReceipt, bool, error) {
+	if store.Pool == nil || !validUUIDString(idempotencyKey) {
+		return domain.OnboardingActionReceipt{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	receipt, err := scanOnboardingActionReceipt(store.Pool.QueryRow(ctx, onboardingActionReceiptSelect+` WHERE idempotency_key=$1`, idempotencyKey))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OnboardingActionReceipt{}, false, nil
+	}
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
+func (store OnboardingActionRepository) Claim(ctx context.Context, candidate domain.OnboardingActionReceipt) (domain.OnboardingActionReceipt, bool, error) {
+	if store.Pool == nil || candidate.Status != domain.OnboardingReceiptClaimed || candidate.LockedUntil == nil {
+		return domain.OnboardingActionReceipt{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOnboardingDialog(ctx, tx, candidate.DialogID); err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	stored, storedErr := scanOnboardingActionReceipt(tx.QueryRow(ctx, onboardingActionReceiptSelect+` WHERE idempotency_key=$1 FOR UPDATE`, candidate.IdempotencyKey))
+	if storedErr == nil {
+		if !domain.ReceiptMatches(stored, candidate) && !domain.ReceiptReplayMatches(stored, candidate) {
+			return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		if stored.Status == domain.OnboardingReceiptClaimed || stored.Status == domain.OnboardingReceiptApplied {
+			if stored.LockedUntil != nil && stored.LockedUntil.After(candidate.CreatedAt) {
+				return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingBusy
+			}
+			command, err := tx.Exec(ctx, `UPDATE teacher_onboarding_action_receipt SET claim_token=$2,locked_until=$3,updated_at=$4 WHERE idempotency_key=$1 AND status IN ('claimed','applied') AND (locked_until IS NULL OR locked_until <= $4)`, candidate.IdempotencyKey, candidate.ClaimToken, *candidate.LockedUntil, candidate.CreatedAt)
+			if err != nil {
+				return domain.OnboardingActionReceipt{}, false, err
+			}
+			if command.RowsAffected() != 1 {
+				return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingBusy
+			}
+			stored.ClaimToken = candidate.ClaimToken
+			stored.LockedUntil = candidate.LockedUntil
+			stored.UpdatedAt = candidate.CreatedAt
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return domain.OnboardingActionReceipt{}, false, err
+		}
+		return stored, false, nil
+	}
+	if !errors.Is(storedErr, pgx.ErrNoRows) {
+		return domain.OnboardingActionReceipt{}, false, storedErr
+	}
+	if candidate.ExecutionMode == domain.OnboardingActionExecutionCanonical {
+		var interactionID string
+		interactionErr := tx.QueryRow(ctx, `
+SELECT interaction_id::text
+FROM teacher_onboarding_interaction
+WHERE dialog_id=$1 AND student_id=$2 AND personal_teacher_id=$3
+  AND prompt_message_id=$4 AND prompt_message_version=$5 AND state='active'
+FOR UPDATE
+`, candidate.DialogID, candidate.StudentID, candidate.PersonalTeacherID, candidate.SourceMessageID, candidate.SourceMessageVersion).Scan(&interactionID)
+		if errors.Is(interactionErr, pgx.ErrNoRows) {
+			return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingConflict
+		}
+		if interactionErr != nil {
+			return domain.OnboardingActionReceipt{}, false, interactionErr
+		}
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_action_receipt (
+ idempotency_key,request_hash,student_id,personal_teacher_id,dialog_id,source_message_id,
+ source_message_version,block_id,action_id,step_id,status,claim_token,locked_until,
+ student_command_id,dialog_message_command_id,execution_mode,canonical_message_command_id,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'claimed',$11,$12,$13,$14,$15,$16,$17,$17)
+ON CONFLICT DO NOTHING`, candidate.IdempotencyKey, candidate.RequestHash, candidate.StudentID, candidate.PersonalTeacherID,
+		candidate.DialogID, candidate.SourceMessageID, candidate.SourceMessageVersion, candidate.BlockID, candidate.ActionID,
+		candidate.Step, candidate.ClaimToken, *candidate.LockedUntil, candidate.StudentCommandID, candidate.DialogMessageCommandID, candidate.ExecutionMode, nullableUUID(candidate.CanonicalMessageCommandID), candidate.CreatedAt)
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	created := command.RowsAffected() == 1
+	stored, err = scanOnboardingActionReceipt(tx.QueryRow(ctx, onboardingActionReceiptSelect+` WHERE idempotency_key=$1 FOR UPDATE`, candidate.IdempotencyKey))
+	if errors.Is(err, pgx.ErrNoRows) {
+		var active bool
+		if queryErr := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM teacher_onboarding_action_receipt WHERE student_id=$1 AND dialog_id=$2 AND status IN ('claimed','applied'))`, candidate.StudentID, candidate.DialogID).Scan(&active); queryErr != nil {
+			return domain.OnboardingActionReceipt{}, false, queryErr
+		}
+		if active {
+			return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingBusy
+		}
+		return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	if !created || !domain.ReceiptMatches(stored, candidate) {
+		return domain.OnboardingActionReceipt{}, false, domain.ErrTeacherOnboardingConflict
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.OnboardingActionReceipt{}, false, err
+	}
+	return stored, created, nil
+}
+
+func (store OnboardingActionRepository) Resolve(ctx context.Context, key, claim string, draftVersion, profileVersion int64, now time.Time) (domain.OnboardingActionReceipt, error) {
+	if draftVersion < 0 || profileVersion < 0 {
+		return domain.OnboardingActionReceipt{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return store.transition(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET expected_draft_version=$3,expected_profile_version=$4,updated_at=$5 WHERE idempotency_key=$1 AND claim_token=$2 AND status='claimed' AND (expected_draft_version IS NULL OR (expected_draft_version=$3 AND expected_profile_version=$4))`, draftVersion, profileVersion, now)
+}
+
+func (store OnboardingActionRepository) MarkApplied(ctx context.Context, key, claim string, draftVersion, profileVersion int64, status domain.StudentOnboardingDraftStatus, now time.Time) (domain.OnboardingActionReceipt, error) {
+	if draftVersion < 1 || profileVersion < 0 || (status != domain.StudentOnboardingDraftDraft && status != domain.StudentOnboardingDraftCompleted) {
+		return domain.OnboardingActionReceipt{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return store.transition(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET status='applied',result_draft_version=$3,result_profile_version=$4,result_status=$5,updated_at=$6 WHERE idempotency_key=$1 AND claim_token=$2 AND status IN ('claimed','applied') AND expected_draft_version IS NOT NULL AND (result_draft_version IS NULL OR (result_draft_version=$3 AND result_profile_version=$4 AND result_status=$5))`, draftVersion, profileVersion, status, now)
+}
+
+func (store OnboardingActionRepository) Complete(ctx context.Context, key, claim, messageID string, now time.Time) (domain.OnboardingActionReceipt, error) {
+	return store.transition(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET status='completed',next_message_id=$3,claim_token=NULL,locked_until=NULL,completed_at=$4,updated_at=$4 WHERE idempotency_key=$1 AND claim_token=$2 AND status='applied' AND (next_message_id IS NULL OR next_message_id=$3)`, messageID, now)
+}
+
+func (store OnboardingActionRepository) CompleteCanonical(ctx context.Context, key, claim, messageID string, now time.Time) (domain.OnboardingActionReceipt, error) {
+	if !validUUIDString(messageID) {
+		return domain.OnboardingActionReceipt{}, domain.ErrInvalidTeacherOnboarding
+	}
+	return store.transition(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET status='materialized',canonical_student_message_id=$3,claim_token=NULL,locked_until=NULL,completed_at=$4,updated_at=$4 WHERE idempotency_key=$1 AND claim_token=$2 AND execution_mode='canonical' AND status='claimed' AND (canonical_student_message_id IS NULL OR canonical_student_message_id=$3)`, messageID, now)
+}
+
+func (store OnboardingActionRepository) Reject(ctx context.Context, key, claim string, now time.Time) error {
+	return store.finish(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET status='rejected',claim_token=NULL,locked_until=NULL,updated_at=$3 WHERE idempotency_key=$1 AND claim_token=$2 AND status='claimed'`, now)
+}
+func (store OnboardingActionRepository) Release(ctx context.Context, key, claim string, now time.Time) error {
+	return store.finish(ctx, key, claim, `UPDATE teacher_onboarding_action_receipt SET claim_token=NULL,locked_until=NULL,updated_at=$3 WHERE idempotency_key=$1 AND claim_token=$2 AND status IN ('claimed','applied')`, now)
+}
+
+func (store OnboardingActionRepository) transition(ctx context.Context, key, claim, query string, args ...any) (domain.OnboardingActionReceipt, error) {
+	if store.Pool == nil || !validUUIDString(key) || !validUUIDString(claim) {
+		return domain.OnboardingActionReceipt{}, domain.ErrInvalidTeacherOnboarding
+	}
+	command, err := store.Pool.Exec(ctx, query, append([]any{key, claim}, args...)...)
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.OnboardingActionReceipt{}, domain.ErrTeacherOnboardingConflict
+	}
+	return scanOnboardingActionReceipt(store.Pool.QueryRow(ctx, onboardingActionReceiptSelect+` WHERE idempotency_key=$1`, key))
+}
+func (store OnboardingActionRepository) finish(ctx context.Context, key, claim, query string, now time.Time) error {
+	if store.Pool == nil || !validUUIDString(key) || !validUUIDString(claim) || now.IsZero() {
+		return domain.ErrInvalidTeacherOnboarding
+	}
+	command, err := store.Pool.Exec(ctx, query, key, claim, now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	return nil
+}
+
+const onboardingActionReceiptSelect = `SELECT idempotency_key::text,request_hash,student_id,personal_teacher_id::text,dialog_id::text,source_message_id::text,source_message_version,block_id,action_id,step_id,status,COALESCE(claim_token::text,''),locked_until,expected_draft_version,expected_profile_version,result_draft_version,result_profile_version,COALESCE(result_status,''),student_command_id::text,dialog_message_command_id::text,execution_mode,COALESCE(canonical_message_command_id::text,''),COALESCE(canonical_student_message_id::text,''),COALESCE(next_message_id::text,''),created_at,updated_at,completed_at FROM teacher_onboarding_action_receipt`
+
+type onboardingActionRow interface{ Scan(...any) error }
+
+func scanOnboardingActionReceipt(row onboardingActionRow) (domain.OnboardingActionReceipt, error) {
+	var item domain.OnboardingActionReceipt
+	var claim string
+	err := row.Scan(&item.IdempotencyKey, &item.RequestHash, &item.StudentID, &item.PersonalTeacherID, &item.DialogID, &item.SourceMessageID, &item.SourceMessageVersion, &item.BlockID, &item.ActionID, &item.Step, &item.Status, &claim, &item.LockedUntil, &item.ExpectedDraftVersion, &item.ExpectedProfileVersion, &item.ResultDraftVersion, &item.ResultProfileVersion, &item.ResultStatus, &item.StudentCommandID, &item.DialogMessageCommandID, &item.ExecutionMode, &item.CanonicalMessageCommandID, &item.CanonicalStudentMessageID, &item.NextMessageID, &item.CreatedAt, &item.UpdatedAt, &item.CompletedAt)
+	if err != nil {
+		return domain.OnboardingActionReceipt{}, err
+	}
+	item.ClaimToken = strings.TrimSpace(claim)
+	return domain.NormalizeOnboardingActionReceipt(item)
+}
+
+func nullableUUID(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
+}
+
+var _ repository.OnboardingActionReceiptStore = OnboardingActionRepository{}
+var _ repository.OnboardingActionReceiptLookup = OnboardingActionRepository{}

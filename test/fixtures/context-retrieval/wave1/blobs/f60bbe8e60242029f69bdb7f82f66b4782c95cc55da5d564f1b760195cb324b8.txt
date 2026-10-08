@@ -1,0 +1,285 @@
+package handlers
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/filters"
+	"github.com/example/mc-course-service/internal/queryfields"
+	"github.com/example/mc-course-service/internal/transport/http/api/v1/middleware"
+	"github.com/example/mc-course-service/internal/usecase/catalog"
+	courseuc "github.com/example/mc-course-service/internal/usecase/course"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"go.uber.org/zap"
+)
+
+const catalogHandlerTestTrackID = "9cdd012b-44ce-4f26-872e-1a0c214e2316"
+
+type catalogHandlerTrackRepo struct {
+	item domain.Track
+}
+
+func TestTrackGetIncludesGlobalOrder(t *testing.T) {
+	order := 3
+	handler := TrackHandler{GetUC: catalog.GetTrack{
+		Tracks: catalogHandlerTrackRepo{item: domain.Track{
+			ID: catalogHandlerTestTrackID, Slug: "backend", SourceKey: "catalog.track.backend", Order: &order, Status: domain.CatalogStatusActive,
+		}},
+		TrackI18n: catalogHandlerTrackI18nRepo{},
+	}}
+	router := chi.NewRouter()
+	router.Get("/track/get/{trackID}", handler.Get)
+
+	req := httptest.NewRequest(http.MethodGet, "/track/get/"+catalogHandlerTestTrackID+"?fields=id,order", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"order":3`) {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func (r catalogHandlerTrackRepo) Create(context.Context, domain.Track) error { return nil }
+func (r catalogHandlerTrackRepo) Get(_ context.Context, id string) (*domain.Track, error) {
+	if id != r.item.ID {
+		return nil, domain.ErrNotFound
+	}
+	item := r.item
+	return &item, nil
+}
+func (r catalogHandlerTrackRepo) GetBySourceKey(context.Context, string) (*domain.Track, error) {
+	return nil, domain.ErrNotFound
+}
+func (r catalogHandlerTrackRepo) Update(context.Context, domain.Track) error { return nil }
+func (r catalogHandlerTrackRepo) Delete(context.Context, string) error       { return nil }
+func (r catalogHandlerTrackRepo) List(context.Context, filters.TrackFilters) ([]domain.Track, error) {
+	return []domain.Track{r.item}, nil
+}
+
+type catalogHandlerTrackI18nRepo struct{}
+
+func (catalogHandlerTrackI18nRepo) Upsert(context.Context, domain.TrackI18n) error { return nil }
+func (catalogHandlerTrackI18nRepo) ListByTrack(context.Context, string) ([]domain.TrackI18n, error) {
+	return []domain.TrackI18n{{TrackID: catalogHandlerTestTrackID, I18nID: 1, Language: "ru", Title: "Трек", Description: "Описание"}}, nil
+}
+func (catalogHandlerTrackI18nRepo) Delete(context.Context, string, int) error { return nil }
+
+func TestTrackGetPublicVisibility(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantStatus int
+	}{
+		{name: "inactive track is hidden", status: domain.CatalogStatusNoActive, wantStatus: http.StatusNotFound},
+		{name: "active track is visible", status: domain.CatalogStatusActive, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := TrackHandler{GetUC: catalog.GetTrack{
+				Tracks:    catalogHandlerTrackRepo{item: domain.Track{ID: catalogHandlerTestTrackID, Slug: "backend", SourceKey: "catalog.track.backend", Status: tt.status}},
+				TrackI18n: catalogHandlerTrackI18nRepo{},
+			}}
+			router := chi.NewRouter()
+			router.Get("/track/get/{trackID}", handler.Get)
+
+			req := httptest.NewRequest(http.MethodGet, "/track/get/"+catalogHandlerTestTrackID, nil)
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, tt.wantStatus, resp.Body.String())
+			}
+		})
+	}
+}
+
+type catalogVisibilityCourseRepo struct {
+	filter filters.CourseFilters
+	sort   *filters.SortOptions
+}
+
+type catalogScopeRepo struct {
+	lang   string
+	scopes []domain.CatalogScope
+}
+
+func (r *catalogScopeRepo) ListPublic(_ context.Context, lang string) ([]domain.CatalogScope, error) {
+	r.lang = lang
+	return r.scopes, nil
+}
+
+func (*catalogVisibilityCourseRepo) Create(context.Context, domain.Course) error { return nil }
+func (*catalogVisibilityCourseRepo) GetBySlug(context.Context, string) (*domain.Course, error) {
+	return nil, domain.ErrNotFound
+}
+func (*catalogVisibilityCourseRepo) GetByID(context.Context, string) (*domain.Course, error) {
+	return nil, domain.ErrNotFound
+}
+func (*catalogVisibilityCourseRepo) GetByIDWithFields(context.Context, string, queryfields.Set) (map[string]any, error) {
+	return nil, domain.ErrNotFound
+}
+func (*catalogVisibilityCourseRepo) Update(context.Context, domain.Course) error { return nil }
+func (*catalogVisibilityCourseRepo) Delete(context.Context, string) error        { return nil }
+func (*catalogVisibilityCourseRepo) List(context.Context, string, filters.CourseFilters, *filters.SortOptions) ([]domain.CoursePreview, error) {
+	return nil, nil
+}
+func (r *catalogVisibilityCourseRepo) ListFields(_ context.Context, _ string, _ queryfields.Set, filter filters.CourseFilters, sort *filters.SortOptions) ([]map[string]any, int, error) {
+	r.filter = filter
+	r.sort = sort
+	return nil, 0, nil
+}
+
+func TestCourseListAppliesCatalogVisibilityByRole(t *testing.T) {
+	tests := []struct {
+		name           string
+		role           string
+		wantActiveOnly bool
+	}{
+		{name: "anonymous public request", wantActiveOnly: true},
+		{name: "student request", role: "STUDENT", wantActiveOnly: true},
+		{name: "admin request", role: "ADMIN", wantActiveOnly: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &catalogVisibilityCourseRepo{}
+			handler := CourseHandler{
+				Validator: validator.New(),
+				Logger:    zap.NewNop(),
+				ListUC:    courseuc.ListCourses{Courses: repo},
+			}
+			router := chi.NewRouter()
+			router.Use(middleware.AuthMiddleware)
+			router.Get("/course/list", handler.List)
+
+			req := httptest.NewRequest(http.MethodGet, "/course/list", nil)
+			if tt.role != "" {
+				req.Header.Set("X-User-ID", catalogHandlerTestTrackID)
+				req.Header.Set("X-User-Role", tt.role)
+			}
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+			}
+			if repo.filter.CatalogActiveOnly != tt.wantActiveOnly {
+				t.Fatalf("CatalogActiveOnly = %v, want %v", repo.filter.CatalogActiveOnly, tt.wantActiveOnly)
+			}
+			if tt.wantActiveOnly && (repo.filter.Status == nil || *repo.filter.Status != domain.CourseStatusActive) {
+				t.Fatalf("public course status = %v, want active", repo.filter.Status)
+			}
+			if tt.wantActiveOnly && (repo.filter.CatalogVisible == nil || !*repo.filter.CatalogVisible) {
+				t.Fatalf("public catalog visibility = %v, want true", repo.filter.CatalogVisible)
+			}
+			if !tt.wantActiveOnly && repo.filter.Status != nil {
+				t.Fatalf("admin status was overridden: %v", *repo.filter.Status)
+			}
+			if !tt.wantActiveOnly && repo.filter.CatalogVisible != nil {
+				t.Fatalf("admin catalog visibility was overridden: %v", *repo.filter.CatalogVisible)
+			}
+		})
+	}
+}
+
+func TestCourseCatalogListForcesPublicVisibilityAndAuthoredOrder(t *testing.T) {
+	repo := &catalogVisibilityCourseRepo{}
+	handler := CourseHandler{
+		Validator: validator.New(),
+		Logger:    zap.NewNop(),
+		ListUC:    courseuc.ListCourses{Courses: repo},
+	}
+	router := chi.NewRouter()
+	router.Get("/catalog/course/list", handler.ListCatalog)
+
+	req := httptest.NewRequest(http.MethodGet, "/catalog/course/list?sort=title&order=desc", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+	if repo.filter.Status == nil || *repo.filter.Status != domain.CourseStatusActive {
+		t.Fatalf("catalog status = %v, want active", repo.filter.Status)
+	}
+	if repo.filter.CatalogVisible == nil || !*repo.filter.CatalogVisible {
+		t.Fatalf("catalog visibility = %v, want true", repo.filter.CatalogVisible)
+	}
+	if !repo.filter.CatalogActiveOnly || !repo.filter.CatalogOrdered {
+		t.Fatalf("catalog flags = active:%v ordered:%v, want true/true", repo.filter.CatalogActiveOnly, repo.filter.CatalogOrdered)
+	}
+	if repo.sort != nil {
+		t.Fatalf("catalog sort = %#v, want authored hierarchy order", repo.sort)
+	}
+}
+
+func TestCourseCatalogListUsesCompleteSlugPath(t *testing.T) {
+	repo := &catalogVisibilityCourseRepo{}
+	handler := CourseHandler{
+		Validator: validator.New(),
+		Logger:    zap.NewNop(),
+		ListUC:    courseuc.ListCourses{Courses: repo},
+	}
+	router := chi.NewRouter()
+	router.Get("/catalog/course/list", handler.ListCatalog)
+
+	req := httptest.NewRequest(http.MethodGet, "/catalog/course/list?track_slug=foundation&level_slug=beginner", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+	if repo.filter.TrackSlug == nil || *repo.filter.TrackSlug != "foundation" {
+		t.Fatalf("track slug = %#v", repo.filter.TrackSlug)
+	}
+	if repo.filter.LevelSlug == nil || *repo.filter.LevelSlug != "beginner" {
+		t.Fatalf("level slug = %#v", repo.filter.LevelSlug)
+	}
+}
+
+func TestCourseCatalogListRejectsPartialSlugPath(t *testing.T) {
+	handler := CourseHandler{
+		Validator: validator.New(),
+		Logger:    zap.NewNop(),
+		ListUC:    courseuc.ListCourses{Courses: &catalogVisibilityCourseRepo{}},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/catalog/course/list?level_slug=beginner", nil)
+	resp := httptest.NewRecorder()
+	handler.ListCatalog(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestListCatalogScopesReturnsOnlyRepositoryScopes(t *testing.T) {
+	order := 1
+	repo := &catalogScopeRepo{scopes: []domain.CatalogScope{{
+		TrackID: catalogHandlerTestTrackID, TrackSlug: "foundation", TrackTitle: "Фундамент разработчика", TrackOrder: &order,
+		LevelID: "b0502515-792e-4dc0-99be-590e70fa4722", LevelSlug: "beginner", LevelTitle: "Начинающий", LevelOrder: 1, CourseCount: 6,
+	}}}
+	handler := CourseHandler{ScopeListUC: catalog.ListPublicScopes{Scopes: repo}}
+	req := httptest.NewRequest(http.MethodGet, "/catalog/scope/list", nil)
+	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
+	resp := httptest.NewRecorder()
+	handler.ListCatalogScopes(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+	if repo.lang != "ru" {
+		t.Fatalf("lang = %q, want ru", repo.lang)
+	}
+	for _, fragment := range []string{`"track_slug":"foundation"`, `"level_slug":"beginner"`, `"course_count":6`} {
+		if !strings.Contains(resp.Body.String(), fragment) {
+			t.Fatalf("response does not contain %s: %s", fragment, resp.Body.String())
+		}
+	}
+}

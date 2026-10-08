@@ -1,0 +1,175 @@
+package domain
+
+import (
+	"encoding/json"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+const (
+	PracticeTeacherValidationContextSchemaV1 = "practice-task-teacher-validation-context.v1"
+	TeacherValidationExplanationSchemaV1     = "teacher-validation-explanation.v1"
+	maximumTeacherValidationIssues           = 5
+	maximumTeacherValidationBytes            = 16 << 10
+	maximumTeacherValidationIdentityRunes    = 128
+	maximumTeacherValidationMessageRunes     = 1000
+	maximumTeacherValidationHintRunes        = 500
+	maximumTeacherValidationFileRunes        = 512
+	maximumTeacherValidationLocation         = 1_000_000
+)
+
+var practiceValidationDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var practiceValidationAbsolutePathPattern = regexp.MustCompile(`(?i)(^|[[:space:]"'(:=])(/[[:graph:]]+|[a-z]:[\\/][[:graph:]]+|\\\\[[:graph:]]+|//[[:graph:]]+)`)
+
+type PracticeTeacherValidationContext struct {
+	Schema             string                        `json:"schema"`
+	Available          bool                          `json:"available"`
+	TaskInstanceID     string                        `json:"task_instance_id"`
+	StudentID          string                        `json:"student_id"`
+	TaskRevisionID     string                        `json:"task_revision_id"`
+	LearningActionID   string                        `json:"learning_action_id"`
+	SubmissionID       *string                       `json:"submission_id"`
+	WorkspaceDigest    *string                       `json:"workspace_digest"`
+	UpdatedAt          *time.Time                    `json:"updated_at"`
+	Passed             *bool                         `json:"passed"`
+	TeacherExplanation *TeacherValidationExplanation `json:"teacher_explanation"`
+}
+
+type TeacherValidationExplanation struct {
+	Schema         string                   `json:"schema"`
+	Passed         bool                     `json:"passed"`
+	BlockingIssues []TeacherValidationIssue `json:"blocking_issues"`
+	Truncated      bool                     `json:"truncated"`
+	SourceDigest   string                   `json:"source_digest"`
+}
+
+type TeacherValidationIssue struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Hint     string `json:"hint,omitempty"`
+	File     string `json:"file,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Column   int    `json:"column,omitempty"`
+	StageID  string `json:"stage_id,omitempty"`
+	Engine   string `json:"engine,omitempty"`
+	Severity string `json:"severity,omitempty"`
+}
+
+func NormalizePracticeTeacherValidationContext(
+	input PracticeTeacherValidationContext,
+	practice PracticeTaskContext,
+	learningActionID string,
+) (PracticeTeacherValidationContext, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.TaskInstanceID = strings.TrimSpace(input.TaskInstanceID)
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.TaskRevisionID = strings.TrimSpace(input.TaskRevisionID)
+	input.LearningActionID = strings.TrimSpace(input.LearningActionID)
+	learningActionID = strings.TrimSpace(learningActionID)
+	if input.Schema != PracticeTeacherValidationContextSchemaV1 ||
+		input.TaskInstanceID != practice.TaskInstanceID || input.StudentID != practice.StudentID ||
+		input.TaskRevisionID != practice.TaskRevisionID || input.LearningActionID != practice.LearningActionID ||
+		input.LearningActionID != learningActionID || !canonicalPracticeValidationUUID(input.TaskInstanceID) ||
+		!canonicalPracticeValidationUUID(input.StudentID) || !canonicalPracticeValidationUUID(input.TaskRevisionID) ||
+		!canonicalPracticeValidationUUID(input.LearningActionID) {
+		return PracticeTeacherValidationContext{}, ErrInvalidStudentContext
+	}
+	hasSubmission := input.SubmissionID != nil || input.WorkspaceDigest != nil || input.UpdatedAt != nil
+	if hasSubmission && (input.SubmissionID == nil || input.WorkspaceDigest == nil || input.UpdatedAt == nil) {
+		return PracticeTeacherValidationContext{}, ErrInvalidStudentContext
+	}
+	if hasSubmission {
+		*input.SubmissionID = strings.TrimSpace(*input.SubmissionID)
+		*input.WorkspaceDigest = strings.TrimSpace(*input.WorkspaceDigest)
+		if !canonicalPracticeValidationUUID(*input.SubmissionID) || !practiceValidationDigestPattern.MatchString(*input.WorkspaceDigest) || input.UpdatedAt.IsZero() {
+			return PracticeTeacherValidationContext{}, ErrInvalidStudentContext
+		}
+		updatedAt := input.UpdatedAt.UTC()
+		input.UpdatedAt = &updatedAt
+	}
+	if !input.Available {
+		if input.Passed != nil || input.TeacherExplanation != nil {
+			return PracticeTeacherValidationContext{}, ErrInvalidStudentContext
+		}
+		return input, nil
+	}
+	if !hasSubmission || input.Passed == nil || input.TeacherExplanation == nil {
+		return PracticeTeacherValidationContext{}, ErrInvalidStudentContext
+	}
+	explanation, err := normalizeTeacherValidationExplanation(*input.TeacherExplanation, *input.Passed)
+	if err != nil {
+		return PracticeTeacherValidationContext{}, err
+	}
+	input.TeacherExplanation = &explanation
+	return input, nil
+}
+
+func normalizeTeacherValidationExplanation(input TeacherValidationExplanation, passed bool) (TeacherValidationExplanation, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.SourceDigest = strings.TrimSpace(input.SourceDigest)
+	if input.Schema != TeacherValidationExplanationSchemaV1 || input.Passed != passed || input.BlockingIssues == nil ||
+		len(input.BlockingIssues) > maximumTeacherValidationIssues || !practiceValidationDigestPattern.MatchString(input.SourceDigest) ||
+		input.Passed && (len(input.BlockingIssues) != 0 || input.Truncated) {
+		return TeacherValidationExplanation{}, ErrInvalidStudentContext
+	}
+	seen := make(map[TeacherValidationIssue]struct{}, len(input.BlockingIssues))
+	for _, issue := range input.BlockingIssues {
+		if _, duplicate := seen[issue]; duplicate || !validTeacherValidationIssue(issue) {
+			return TeacherValidationExplanation{}, ErrInvalidStudentContext
+		}
+		seen[issue] = struct{}{}
+	}
+	payload, err := json.Marshal(input)
+	if err != nil || len(payload) > maximumTeacherValidationBytes {
+		return TeacherValidationExplanation{}, ErrInvalidStudentContext
+	}
+	return input, nil
+}
+
+func validTeacherValidationIssue(issue TeacherValidationIssue) bool {
+	if !validTeacherValidationText(issue.Code, maximumTeacherValidationIdentityRunes, true) ||
+		!validTeacherValidationText(issue.Message, maximumTeacherValidationMessageRunes, true) ||
+		issue.Hint != "" && !validTeacherValidationText(issue.Hint, maximumTeacherValidationHintRunes, true) ||
+		issue.StageID != "" && !validTeacherValidationText(issue.StageID, maximumTeacherValidationIdentityRunes, true) ||
+		issue.Engine != "" && !validTeacherValidationText(issue.Engine, maximumTeacherValidationIdentityRunes, true) ||
+		practiceValidationAbsolutePathPattern.MatchString(issue.Message) ||
+		issue.Hint != "" && practiceValidationAbsolutePathPattern.MatchString(issue.Hint) {
+		return false
+	}
+	if issue.Severity != "" && issue.Severity != "error" && issue.Severity != "fatal" && issue.Severity != "critical" {
+		return false
+	}
+	if issue.File != "" && (!validTeacherValidationText(issue.File, maximumTeacherValidationFileRunes, true) ||
+		strings.Contains(issue.File, ":") || strings.HasPrefix(issue.File, "~") || strings.Contains(issue.File, "\\") ||
+		path.IsAbs(issue.File) || path.Clean(issue.File) != issue.File || issue.File == "." || strings.HasPrefix(issue.File, "../")) {
+		return false
+	}
+	return validTeacherValidationLocation(issue.Line) && validTeacherValidationLocation(issue.Column)
+}
+
+func validTeacherValidationText(value string, maximumRunes int, required bool) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value || utf8.RuneCountInString(value) > maximumRunes || required && value == "" {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.Is(unicode.Cf, character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validTeacherValidationLocation(value int) bool {
+	return value == 0 || value > 0 && value <= maximumTeacherValidationLocation
+}
+
+func canonicalPracticeValidationUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}

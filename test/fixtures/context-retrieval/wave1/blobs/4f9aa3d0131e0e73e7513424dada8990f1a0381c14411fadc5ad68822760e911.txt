@@ -1,0 +1,297 @@
+package practice
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+func TestClientReadsOnlySafePracticeContextAndRecordsAssistance(t *testing.T) {
+	studentID := "11111111-1111-4111-8111-111111111111"
+	instanceID := "22222222-2222-4222-8222-222222222222"
+	usageID := "33333333-3333-4333-8333-333333333333"
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Internal-Token") != "token" {
+			t.Fatalf("missing internal token")
+		}
+		response.Header().Set("Content-Type", "application/json")
+		if request.Method == http.MethodGet {
+			if request.URL.Path != "/internal/task-instances/"+instanceID+"/teacher-context" || request.URL.Query().Get("student_id") != studentID {
+				t.Fatalf("unexpected context request: %s %s", request.Method, request.URL.String())
+			}
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"schema": domain.PracticeTaskContextSchemaV1, "task_instance_id": instanceID,
+				"student_id": studentID, "task_revision_id": "44444444-4444-4444-8444-444444444444",
+				"learning_action_id": "55555555-5555-4555-8555-555555555555", "surface_classification": "practice",
+				"learning_path_id":        "66666666-6666-4666-8666-666666666666",
+				"learning_path_reference": map[string]any{"reference_type": "practice", "reference_id": "77777777-7777-4777-8777-777777777777"},
+				"locale":                  "ru-ru", "status": "ACTIVE",
+				"step":              map[string]any{"id": "implement", "title": "Implement", "objective": "Build", "deliverables": []string{"main.go"}, "acceptance": []any{}, "status": "AVAILABLE"},
+				"assistance_policy": map[string]any{"version": 1, "max_hint_level": 2, "teacher": map[string]any{"may_explain": true, "may_write_complete_solution": false}, "debugging": map[string]any{"may_point_to_area": true, "may_name_likely_cause": false, "may_suggest_patch": false}},
+				"learning_targets":  []any{map[string]any{"type": "capability", "key": "go.errors.wrap", "version": "v1"}},
+				"workspace":         map[string]any{"available": false, "files": []any{}, "omitted_file_count": 0, "truncated": false},
+				"validation":        map[string]any{"available": false, "passed": false, "stage_count": 0, "error_count": 0},
+			})
+			return
+		}
+		if request.Method != http.MethodPost || request.URL.Path != "/internal/task-instances/"+instanceID+"/teacher-assistance" {
+			t.Fatalf("unexpected assistance request: %s %s", request.Method, request.URL.String())
+		}
+		var body struct {
+			UsageID    string `json:"usage_id"`
+			Assistance struct {
+				Schema    string `json:"schema"`
+				StepID    string `json:"step_id"`
+				Kind      string `json:"kind"`
+				HintLevel *int   `json:"hint_level"`
+			} `json:"assistance"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.UsageID != usageID || body.Assistance.Schema != "practice-task-assistance-usage.v1" || body.Assistance.StepID != "implement" || body.Assistance.Kind != "HINT" || body.Assistance.HintLevel == nil || *body.Assistance.HintLevel != 2 {
+			t.Fatalf("unexpected assistance body: %+v err=%v", body, err)
+		}
+		_ = json.NewEncoder(response).Encode(map[string]any{"id": usageID, "task_instance_id": instanceID, "student_id": studentID, "step_id": "implement", "kind": "HINT", "hint_level": 2, "policy_version": "practice-task-assistance-policy.v1", "created_at": "2026-09-02T00:00:00Z"})
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}
+	contextValue, err := client.GetPracticeTaskContext(context.Background(), studentID, instanceID)
+	if err != nil || contextValue.AssistancePolicy.MaxHintLevel != 2 {
+		t.Fatalf("context=%+v err=%v", contextValue, err)
+	}
+	level := 2
+	if err := client.RecordPracticeTaskAssistance(context.Background(), instanceID, studentID, "implement", usageID, domain.TeacherActionGiveHint, &level); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientDoesNotForwardInternalTokenAcrossForeignOriginRedirect(t *testing.T) {
+	foreignRequests := make(chan string, 1)
+	foreign := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		foreignRequests <- request.Header.Get("X-Internal-Token")
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer foreign.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Location", foreign.URL+"/internal/task-instances/instance/teacher-context")
+		response.WriteHeader(http.StatusFound)
+	}))
+	defer origin.Close()
+
+	_, err := (Client{BaseURL: origin.URL, InternalToken: "secret", HTTPClient: origin.Client()}).
+		GetPracticeTaskContext(context.Background(), "student", "instance")
+	if err != domain.ErrStudentStateUnavailable {
+		t.Fatalf("error=%v, want unavailable practice context", err)
+	}
+	select {
+	case token := <-foreignRequests:
+		t.Fatalf("foreign origin received internal token %q", token)
+	default:
+	}
+}
+
+func TestClientReadsStrictTeacherValidationExplanationWithExactBinding(t *testing.T) {
+	practice := practiceContextForValidationClient()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/internal/task-instances/22222222-2222-4222-8222-222222222222/teacher-validation-explanation" ||
+			request.URL.Query().Get("student_id") != practice.StudentID || request.Header.Get("X-Internal-Token") != "teacher-practice-token" {
+			t.Fatalf("unexpected request: method=%s url=%s headers=%v", request.Method, request.URL.String(), request.Header)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(validTeacherValidationJSON()))
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, InternalToken: "teacher-practice-token", HTTPClient: server.Client()}
+	got, err := client.GetPracticeTeacherValidationContext(context.Background(), practice, practice.LearningActionID)
+	if err != nil || !got.Available || got.TeacherExplanation == nil || len(got.TeacherExplanation.BlockingIssues) != 1 {
+		t.Fatalf("context=%+v err=%v", got, err)
+	}
+}
+
+func TestClientAcceptsUnavailableTeacherValidationExplanation(t *testing.T) {
+	practice := practiceContextForValidationClient()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte(`{
+			"schema":"practice-task-teacher-validation-context.v1","available":false,
+			"task_instance_id":"22222222-2222-4222-8222-222222222222",
+			"student_id":"11111111-1111-4111-8111-111111111111",
+			"task_revision_id":"33333333-3333-4333-8333-333333333333",
+			"learning_action_id":"44444444-4444-4444-8444-444444444444",
+			"submission_id":null,"workspace_digest":null,"updated_at":null,"passed":null,"teacher_explanation":null
+		}`))
+	}))
+	defer server.Close()
+
+	got, err := (Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}).
+		GetPracticeTeacherValidationContext(context.Background(), practice, practice.LearningActionID)
+	if err != nil || got.Available || got.TeacherExplanation != nil {
+		t.Fatalf("context=%+v err=%v", got, err)
+	}
+}
+
+func TestClientRejectsTeacherValidationIdentityDriftUnknownPrivateFieldsAndOversize(t *testing.T) {
+	practice := practiceContextForValidationClient()
+	tests := map[string]string{
+		"student drift":     strings.Replace(validTeacherValidationJSON(), practice.StudentID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1),
+		"revision drift":    strings.Replace(validTeacherValidationJSON(), practice.TaskRevisionID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1),
+		"action drift":      strings.Replace(validTeacherValidationJSON(), practice.LearningActionID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1),
+		"unknown top-level": strings.Replace(validTeacherValidationJSON(), `"available":true`, `"available":true,"raw_stages":[]`, 1),
+		"private selector":  strings.Replace(validTeacherValidationJSON(), `"message":"Fix the loop."`, `"message":"Fix the loop.","selector":"#private"`, 1),
+		"oversized":         validTeacherValidationJSON() + strings.Repeat(" ", int(maximumTeacherValidationResponseBytes)),
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				_, _ = response.Write([]byte(payload))
+			}))
+			defer server.Close()
+			_, err := (Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}).
+				GetPracticeTeacherValidationContext(context.Background(), practice, practice.LearningActionID)
+			if err != domain.ErrInvalidStudentContext {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestClientTreatsTeacherValidationDependencyFailureAsUnavailable(t *testing.T) {
+	practice := practiceContextForValidationClient()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = response.Write([]byte("private upstream details"))
+	}))
+	defer server.Close()
+	_, err := (Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}).
+		GetPracticeTeacherValidationContext(context.Background(), practice, practice.LearningActionID)
+	if err != domain.ErrStudentStateUnavailable || strings.Contains(err.Error(), "private upstream") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestClientTreatsOwnerReportedProjectionCorruptionAsInvalid(t *testing.T) {
+	practice := practiceContextForValidationClient()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusBadGateway)
+		_, _ = response.Write([]byte("private persisted validation details"))
+	}))
+	defer server.Close()
+	_, err := (Client{BaseURL: server.URL, InternalToken: "token", HTTPClient: server.Client()}).
+		GetPracticeTeacherValidationContext(context.Background(), practice, practice.LearningActionID)
+	if err != domain.ErrInvalidStudentContext || strings.Contains(err.Error(), "private persisted") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func practiceContextForValidationClient() domain.PracticeTaskContext {
+	return domain.PracticeTaskContext{
+		Schema: domain.PracticeTaskContextSchemaV1, TaskInstanceID: "22222222-2222-4222-8222-222222222222",
+		StudentID: "11111111-1111-4111-8111-111111111111", TaskRevisionID: "33333333-3333-4333-8333-333333333333",
+		LearningActionID: "44444444-4444-4444-8444-444444444444", Surface: "practice",
+	}
+}
+
+func validTeacherValidationJSON() string {
+	return `{
+		"schema":"practice-task-teacher-validation-context.v1","available":true,
+		"task_instance_id":"22222222-2222-4222-8222-222222222222",
+		"student_id":"11111111-1111-4111-8111-111111111111",
+		"task_revision_id":"33333333-3333-4333-8333-333333333333",
+		"learning_action_id":"44444444-4444-4444-8444-444444444444",
+		"submission_id":"55555555-5555-4555-8555-555555555555",
+		"workspace_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"updated_at":"2026-09-05T10:00:00.123456789Z","passed":false,
+		"teacher_explanation":{"schema":"teacher-validation-explanation.v1","passed":false,
+			"blocking_issues":[{"code":"FAILED","message":"Fix the loop.","hint":"Check the bound.","file":"main.go","line":4,"column":2,"stage_id":"tests","engine":"go.core","severity":"error"}],
+			"truncated":false,"source_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	}`
+}
+
+func TestT13ClientRequiresExactAssistanceReceipt(t *testing.T) {
+	const studentID = "11111111-1111-4111-8111-111111111111"
+	const instanceID = "22222222-2222-4222-8222-222222222222"
+	const usageID = "33333333-3333-4333-8333-333333333333"
+	for _, action := range []domain.TeacherAction{domain.TeacherActionGiveHint, domain.TeacherActionAskQuestion, domain.TeacherActionRespond} {
+		kind := "TEACHER_EXPLANATION"
+		var level *int
+		if action == domain.TeacherActionGiveHint {
+			kind = "HINT"
+			value := 2
+			level = &value
+		}
+		if action == domain.TeacherActionAskQuestion {
+			kind = "TEACHER_QUESTION"
+		}
+		for _, name := range []string{"exact", "usage", "instance", "student", "step", "kind", "hint", "different hint value", "policy", "missing time", "zero time", "non UTC time", "unknown field"} {
+			t.Run(string(action)+"/"+name, func(t *testing.T) {
+				receipt := map[string]any{"id": usageID, "task_instance_id": instanceID, "student_id": studentID, "step_id": "implement", "kind": kind, "hint_level": level, "policy_version": "practice-task-assistance-policy.v1", "created_at": "2026-09-02T00:00:00Z"}
+				switch name {
+				case "usage":
+					receipt["id"] = instanceID
+				case "instance":
+					receipt["task_instance_id"] = usageID
+				case "student":
+					receipt["student_id"] = usageID
+				case "step":
+					receipt["step_id"] = "different-step"
+				case "kind":
+					receipt["kind"] = "different-kind"
+				case "hint":
+					if level == nil {
+						receipt["hint_level"] = 2
+					} else {
+						delete(receipt, "hint_level")
+					}
+				case "different hint value":
+					receipt["hint_level"] = 1
+				case "zero time":
+					receipt["created_at"] = "0001-01-01T00:00:00Z"
+				case "policy":
+					receipt["policy_version"] = "other-policy"
+				case "missing time":
+					delete(receipt, "created_at")
+				case "non UTC time":
+					receipt["created_at"] = "2026-09-02T00:00:00+03:00"
+				case "unknown field":
+					receipt["private_output"] = true
+				}
+				httpClient := &http.Client{Transport: t13ReceiptTransport(func(request *http.Request) (*http.Response, error) {
+					var payload map[string]any
+					if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					if _, supplied := payload["created_at"]; supplied {
+						t.Fatal("caller supplied server timestamp")
+					}
+					if _, supplied := payload["occurred_at"]; supplied {
+						t.Fatal("caller supplied server timestamp")
+					}
+					encoded, err := json.Marshal(receipt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(encoded)))}, nil
+				})}
+				err := (Client{BaseURL: "http://runtime.invalid", InternalToken: "token", HTTPClient: httpClient}).RecordPracticeTaskAssistance(context.Background(), instanceID, studentID, "implement", usageID, action, level)
+				if name == "exact" {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err != domain.ErrStudentStateUnavailable {
+					t.Fatalf("receipt mismatch accepted: %v", err)
+				}
+			})
+		}
+	}
+}
+
+type t13ReceiptTransport func(*http.Request) (*http.Response, error)
+
+func (transport t13ReceiptTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}

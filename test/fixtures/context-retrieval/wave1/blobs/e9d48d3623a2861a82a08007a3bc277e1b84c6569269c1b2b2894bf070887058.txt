@@ -1,0 +1,361 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Requires an already migrated disposable loopback database. It starts no
+// services, applies no migrations and never resets/deletes existing rows.
+func TestReplanProtectionPostgres(t *testing.T) {
+	dsn := os.Getenv("REPLAN_PROTECTION_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set REPLAN_PROTECTION_TEST_DATABASE_URL to loopback *_integration_proof")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (cfg.ConnConfig.Host != "127.0.0.1" && cfg.ConnConfig.Host != "localhost" && cfg.ConnConfig.Host != "::1") || !strings.HasSuffix(cfg.ConnConfig.Database, "_integration_proof") {
+		t.Fatal("requires isolated loopback *_integration_proof database")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := &postgres.LearningJourneyRepoPG{Pool: pool}
+	newPath := func(t *testing.T, status domain.LearningPathItemStatus, kind string) domain.StudentLearningPath {
+		t.Helper()
+		now := time.Now().UTC()
+		item := domain.LearningPathItem{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), LessonRevisionID: uuid.NewString(), Position: 0, Status: status, ReasonCode: "fixture", LessonContent: json.RawMessage(`{"title":"frozen"}`), Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.syntax", Version: "v1"}}}
+		item.FrozenRequirements = []domain.LessonRequirement{{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: kind, Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString(), RevisionID: uuid.NewString()}, Satisfied: status == domain.LearningPathItemCompleted}}
+		p := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: uuid.NewString(), CourseID: uuid.NewString(), GoalCode: "go.backend", CurriculumRevision: "r1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Protection fixture", Status: domain.LearningPathStatusActive, Version: 1, Items: []domain.LearningPathItem{item}, CreatedAt: now, UpdatedAt: now}
+		p, _, e := repo.CreateLearningPathIdempotently(ctx, p, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+		if e != nil {
+			t.Fatal(e)
+		}
+		p, e = repo.GetLearningPathByID(ctx, p.StudentID, p.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return p
+	}
+	command := func(p domain.StudentLearningPath, kind domain.LearningPathPlanningCommandKind) domain.LearningPathPlanningCommand {
+		c := domain.LearningPathPlanningCommand{Schema: domain.LearningPathReplanRequestSchema, Kind: kind, StudentID: p.StudentID, LearningPathID: p.ID, PlanningRequestID: uuid.NewString(), IdempotencyKey: uuid.NewString(), CourseID: p.CourseID, GoalCode: p.GoalCode, CourseFingerprint: p.CourseFingerprint, PlannerPolicyVersion: p.PlannerPolicyVersion, ReasonCode: p.ReasonCode, ReasonSummary: p.ReasonSummary, ExpectedPathVersion: p.Version, DesiredItems: append([]domain.LearningPathItem(nil), p.Items...), RequestHash: strings.Repeat("b", 64), OccurredAt: time.Now().UTC()}
+		for i := range c.DesiredItems {
+			c.DesiredItems[i].Status = domain.LearningPathItemPlanned
+		}
+		if kind == domain.LearningPathPlanningCommandNoGap {
+			c.Schema = domain.LearningPathNoGapRequestSchema
+			c.ReasonCode = "mastery_no_gap"
+			c.ReasonSummary = "No gap"
+			c.DesiredItems = nil
+		}
+		return c
+	}
+	appendFuture := func(c domain.LearningPathPlanningCommand) domain.LearningPathPlanningCommand {
+		c.DesiredItems = append(c.DesiredItems, domain.LearningPathItem{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: len(c.DesiredItems), Status: domain.LearningPathItemPlanned, ReasonCode: "future"})
+		return c
+	}
+	deny := func(t *testing.T, p domain.StudentLearningPath, c domain.LearningPathPlanningCommand) {
+		t.Helper()
+		before, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		var revisions int
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path_revision WHERE student_learning_path_id=$1`, p.ID).Scan(&revisions); e != nil {
+			t.Fatal(e)
+		}
+		var receipts int
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path_command WHERE student_id=$1`, p.StudentID).Scan(&receipts); e != nil {
+			t.Fatal(e)
+		}
+		if _, _, e = repo.ApplyLearningPathPlanningCommand(ctx, c); !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("protected command accepted or wrong error: %v", e)
+		}
+		after, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("denial mutated state: before=%+v after=%+v", before, after)
+		}
+		var afterReceipts int
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path_command WHERE student_id=$1`, p.StudentID).Scan(&afterReceipts); e != nil {
+			t.Fatal(e)
+		}
+		if afterReceipts != receipts {
+			t.Fatal("denial persisted receipt")
+		}
+		var afterRevisions int
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path_revision WHERE student_learning_path_id=$1`, p.ID).Scan(&afterRevisions); e != nil {
+			t.Fatal(e)
+		}
+		if afterRevisions != revisions {
+			t.Fatal("denial created revision")
+		}
+	}
+	t.Run("active_replan_no_gap_and_late_success", func(t *testing.T) {
+		p := newPath(t, domain.LearningPathItemInProgress, "theory_acknowledged")
+		deny(t, p, appendFuture(command(p, domain.LearningPathPlanningCommandReplan)))
+		deny(t, p, command(p, domain.LearningPathPlanningCommandNoGap))
+		result, _, e := repo.ApplyLearningPathPlanningCommand(ctx, command(p, domain.LearningPathPlanningCommandReplan))
+		if e != nil || result.Changed {
+			t.Fatalf("active exact no-op: changed=%v err=%v", result.Changed, e)
+		}
+		i := p.Items[0]
+		r := i.FrozenRequirements[0]
+		_, changed, e := repo.ApplyLessonFact(ctx, domain.LessonActivityFact{StudentID: p.StudentID, ItemID: i.ID, RequirementID: r.ID, Type: r.Type, SourceID: r.SourceReference.ID, SourceRevisionID: r.SourceReference.RevisionID, FactID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil || !changed {
+			t.Fatalf("late success rejected: changed=%v err=%v", changed, e)
+		}
+	})
+	t.Run("completed_history_and_future_boundary", func(t *testing.T) {
+		p := newPath(t, domain.LearningPathItemCompleted, "theory_acknowledged")
+		omit := command(p, domain.LearningPathPlanningCommandReplan)
+		omit.DesiredItems = []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemPlanned, ReasonCode: "replacement"}}
+		deny(t, p, omit)
+		revision := command(p, domain.LearningPathPlanningCommandReplan)
+		revision.DesiredItems[0].LessonRevisionID = uuid.NewString()
+		deny(t, p, revision)
+		c := appendFuture(command(p, domain.LearningPathPlanningCommandReplan))
+		c.DesiredItems[0].ReasonCode = "rewrite"
+		c.DesiredItems[0].Targets = nil
+		result, replayed, e := repo.ApplyLearningPathPlanningCommand(ctx, c)
+		if e != nil || replayed || !result.Changed || !reflect.DeepEqual(result.State.Items[0], p.Items[0]) {
+			t.Fatalf("boundary/history: result=%+v replay=%v err=%v", result, replayed, e)
+		}
+		// A later activation must not invalidate a committed command receipt.
+		if _, e = pool.Exec(ctx, `UPDATE student_learning_path_item SET status='IN_PROGRESS' WHERE student_learning_path_id=$1 AND position=1`, p.ID); e != nil {
+			t.Fatal(e)
+		}
+		again, replayed, e := repo.ApplyLearningPathPlanningCommand(ctx, c)
+		if e != nil || !replayed || !replanProtectionJSONEqual(again, result) {
+			t.Fatalf("receipt replay blocked: replay=%v err=%v", replayed, e)
+		}
+	})
+	t.Run("open_course_action_with_lagging_ready_item", func(t *testing.T) {
+		p := newPath(t, domain.LearningPathItemReady, "task_passed")
+		i := p.Items[0]
+		r := i.FrozenRequirements[0]
+		now := time.Now().UTC()
+		answerID, actionID := uuid.NewString(), uuid.NewString()
+		frozen, _ := json.Marshal(map[string]string{"id": r.SourceReference.ID, "_completion_fact_type": r.Type, "_completion_source_revision_id": r.SourceReference.RevisionID})
+		if _, e := pool.Exec(ctx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt,created_at,updated_at,learning_path_item_id,requirement_id,frozen_task_json) VALUES($1,$2,$3,$4,1,1,$4,$4,$5,$6,$7)`, answerID, p.StudentID, r.SourceReference.ID, now, i.ID, r.ID, frozen); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := pool.Exec(ctx, `INSERT INTO student_learning_action(id,student_task_answer_id,student_id,task_id,cycle,context_type,context_id,learning_targets,evidence_class,opened_at,created_at,learning_path_item_id,requirement_id) VALUES($1,$2,$3,$4::uuid,1,'lesson_task',$4::text,'[]','application',$5,$5,$6,$7)`, actionID, answerID, p.StudentID, r.SourceReference.ID, now, i.ID, r.ID); e != nil {
+			t.Fatal(e)
+		}
+		deny(t, p, appendFuture(command(p, domain.LearningPathPlanningCommandReplan)))
+		deny(t, p, command(p, domain.LearningPathPlanningCommandNoGap))
+		result, _, e := repo.ApplyLearningPathPlanningCommand(ctx, command(p, domain.LearningPathPlanningCommandReplan))
+		if e != nil || result.Changed {
+			t.Fatalf("open action no-op: changed=%v err=%v", result.Changed, e)
+		}
+		closed := now.Add(time.Second)
+		action := domain.StudentLearningAction{ID: actionID, StudentTaskAnswerID: answerID, StudentID: p.StudentID, TaskID: r.SourceReference.ID, Cycle: 1, ContextType: domain.LearningContextLessonTask, ContextID: r.SourceReference.ID, EvidenceClass: domain.LearningEvidenceApplication, Outcome: domain.LearningActionPassed, OutcomePolicyVersion: domain.MasteryPolicyVersion, OpenedAt: now, ClosedAt: &closed}
+		openAction := action
+		openAction.Outcome = ""
+		openAction.OutcomePolicyVersion = ""
+		openAction.ClosedAt = nil
+		event, e := domain.NewLearningActionClosedEvent(uuid.NewString(), openAction, closed)
+		if e != nil {
+			t.Fatal(e)
+		}
+		answer := domain.StudentTaskAnswer{ID: answerID, StudentID: p.StudentID, TaskID: r.SourceReference.ID, Status: domain.StudentTaskAnswerStatusPassed, StartedAt: now, EndedAt: &closed, CreatedAt: now, UpdatedAt: closed, Attempt: 1}
+		if e = (postgres.LearningActionLifecycleRepoPG{Pool: pool}).CloseAnswer(ctx, answer, action, event); e != nil {
+			t.Fatalf("late real Course success lost: %v", e)
+		}
+		state, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+		if e != nil || state.Items[0].Status != domain.LearningPathItemCompleted || !state.Items[0].FrozenRequirements[0].Satisfied {
+			t.Fatalf("late result not committed: %+v err=%v", state, e)
+		}
+	})
+	t.Run("late_reopen_cannot_orphan_removed_assignment", func(t *testing.T) {
+		p := newPath(t, domain.LearningPathItemReady, "task_passed")
+		i, r := p.Items[0], p.Items[0].FrozenRequirements[0]
+		now := time.Now().UTC()
+		frozen, _ := json.Marshal(map[string]string{"id": r.SourceReference.ID, "_completion_fact_type": r.Type, "_completion_source_revision_id": r.SourceReference.RevisionID})
+		answer := domain.StudentTaskAnswer{ID: uuid.NewString(), StudentID: p.StudentID, TaskID: r.SourceReference.ID, LearningPathItemID: i.ID, RequirementID: r.ID, FrozenTaskJSON: frozen, Status: domain.StudentTaskAnswerStatusFailed, StartedAt: now, CreatedAt: now, UpdatedAt: now, Attempt: 1}
+		if _, e := pool.Exec(ctx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt,created_at,updated_at,learning_path_item_id,requirement_id,frozen_task_json) VALUES($1,$2,$3,$4,3,1,$4,$4,$5,$6,$7)`, answer.ID, p.StudentID, answer.TaskID, now, i.ID, r.ID, frozen); e != nil {
+			t.Fatal(e)
+		}
+		c := command(p, domain.LearningPathPlanningCommandReplan)
+		c.DesiredItems = []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "future_replacement"}}
+		if _, _, e := repo.ApplyLearningPathPlanningCommand(ctx, c); e != nil {
+			t.Fatal(e)
+		}
+		answer.Status = domain.StudentTaskAnswerStatusInProgress
+		action := domain.StudentLearningAction{ID: uuid.NewString(), LearningTargets: i.Targets, StudentTaskAnswerID: answer.ID, StudentID: p.StudentID, TaskID: answer.TaskID, ContextType: domain.LearningContextLessonTask, ContextID: answer.TaskID, EvidenceClass: domain.LearningEvidenceApplication, OpenedAt: now}
+		_, e := (postgres.LearningActionLifecycleRepoPG{Pool: pool}).ReopenAnswer(ctx, answer, action)
+		if !errors.Is(e, domain.ErrNotFound) && !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("late reopen orphaned removed assignment: %v", e)
+		}
+		var status, opened int
+		if e = pool.QueryRow(ctx, `SELECT status FROM student_task_answer WHERE id=$1`, answer.ID).Scan(&status); e != nil {
+			t.Fatal(e)
+		}
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_action WHERE student_task_answer_id=$1 AND lifecycle_status='OPEN'`, answer.ID).Scan(&opened); e != nil {
+			t.Fatal(e)
+		}
+		if status != domain.StudentTaskAnswerStatusFailed || opened != 0 {
+			t.Fatal("reopen denial wrote answer/action")
+		}
+	})
+	t.Run("new_course_action_waits_for_planning_fence", func(t *testing.T) {
+		for _, operation := range []string{"reopen", "ensure", "close"} {
+			t.Run(operation, func(t *testing.T) {
+				p := newPath(t, domain.LearningPathItemReady, "task_passed")
+				i, r := p.Items[0], p.Items[0].FrozenRequirements[0]
+				now := time.Now().UTC()
+				frozen, _ := json.Marshal(map[string]string{"id": r.SourceReference.ID, "_completion_fact_type": r.Type, "_completion_source_revision_id": r.SourceReference.RevisionID})
+				answer := domain.StudentTaskAnswer{ID: uuid.NewString(), StudentID: p.StudentID, TaskID: r.SourceReference.ID, Status: domain.StudentTaskAnswerStatusInProgress, StartedAt: now, CreatedAt: now, UpdatedAt: now, Attempt: 1}
+				if _, e := pool.Exec(ctx, `INSERT INTO student_task_answer(id,student_id,task_id,started_at,status,attempt,created_at,updated_at,learning_path_item_id,requirement_id,frozen_task_json) VALUES($1,$2,$3,$4,3,1,$4,$4,$5,$6,$7)`, answer.ID, p.StudentID, answer.TaskID, now, i.ID, r.ID, frozen); e != nil {
+					t.Fatal(e)
+				}
+				if operation == "close" {
+					if _, e := pool.Exec(ctx, `UPDATE student_task_answer SET status=1 WHERE id=$1`, answer.ID); e != nil {
+						t.Fatal(e)
+					}
+					seed := domain.StudentLearningAction{ID: uuid.NewString(), StudentTaskAnswerID: answer.ID, StudentID: p.StudentID, TaskID: answer.TaskID, ContextType: domain.LearningContextLessonTask, ContextID: answer.TaskID, LearningTargets: i.Targets, EvidenceClass: domain.LearningEvidenceApplication, OpenedAt: now}
+					if _, e := (postgres.LearningActionLifecycleRepoPG{Pool: pool}).EnsureActive(ctx, seed); e != nil {
+						t.Fatal(e)
+					}
+				}
+				tx, e := pool.Begin(ctx)
+				if e != nil {
+					t.Fatal(e)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				var pid int
+				if e = tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); e != nil {
+					t.Fatal(e)
+				}
+				if _, e = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "learning-path:"+p.StudentID); e != nil {
+					t.Fatal(e)
+				}
+				openingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				done := make(chan error, 1)
+				action := domain.StudentLearningAction{ID: uuid.NewString(), StudentTaskAnswerID: answer.ID, StudentID: p.StudentID, TaskID: answer.TaskID, ContextType: domain.LearningContextLessonTask, ContextID: answer.TaskID, LearningTargets: i.Targets, EvidenceClass: domain.LearningEvidenceApplication, OpenedAt: now}
+				go func() {
+					a := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+					var e error
+					if operation == "reopen" {
+						_, e = a.ReopenAnswer(openingCtx, answer, action)
+					} else if operation == "ensure" {
+						_, e = a.EnsureActive(openingCtx, action)
+					} else {
+						active, readErr := a.GetActiveByAnswer(openingCtx, answer.ID)
+						if readErr != nil {
+							done <- readErr
+							return
+						}
+						closed := now.Add(time.Second)
+						event, eventErr := domain.NewLearningActionClosedEvent(uuid.NewString(), active, closed)
+						if eventErr != nil {
+							done <- eventErr
+							return
+						}
+						active.Outcome = domain.LearningActionPassed
+						active.OutcomePolicyVersion = domain.MasteryPolicyVersion
+						answer.Status = domain.StudentTaskAnswerStatusPassed
+						answer.EndedAt = &closed
+						answer.UpdatedAt = closed
+						e = a.CloseAnswer(openingCtx, answer, active, event)
+					}
+					done <- e
+				}()
+				waiting := false
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					if e = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks w JOIN pg_locks h ON w.locktype=h.locktype AND w.database IS NOT DISTINCT FROM h.database AND w.classid=h.classid AND w.objid=h.objid AND w.objsubid=h.objsubid WHERE w.locktype='advisory' AND NOT w.granted AND h.granted AND h.pid=$1)`, pid).Scan(&waiting); e != nil {
+						t.Fatal(e)
+					}
+					if waiting {
+						break
+					}
+					select {
+					case e := <-done:
+						t.Fatalf("opening bypassed planning fence: %v", e)
+					default:
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !waiting {
+					t.Fatal("opening did not wait on same PostgreSQL planning fence")
+				}
+				if e = tx.Rollback(ctx); e != nil {
+					t.Fatal(e)
+				}
+				select {
+				case e := <-done:
+					if e != nil {
+						t.Fatal(e)
+					}
+				case <-openingCtx.Done():
+					t.Fatal("opening did not finish after fence release")
+				}
+				state, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+				wantStatus := domain.LearningPathItemInProgress
+				if operation == "close" {
+					wantStatus = domain.LearningPathItemCompleted
+				}
+				if e != nil || state.Items[0].Status != wantStatus {
+					t.Fatalf("opening not bound/activated: %+v err=%v", state, e)
+				}
+			})
+		}
+	})
+	t.Run("legacy_replacement_cannot_bypass", func(t *testing.T) {
+		for _, status := range []domain.LearningPathItemStatus{domain.LearningPathItemInProgress, domain.LearningPathItemCompleted} {
+			p := newPath(t, status, "theory_acknowledged")
+			before, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+			if e != nil {
+				t.Fatal(e)
+			}
+			replacement := p
+			replacement.Version++
+			replacement.UpdatedAt = time.Now().UTC()
+			replacement.Items = []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "replacement"}}
+			if _, e = repo.ReplaceLearningPath(ctx, replacement, p.Version); !errors.Is(e, domain.ErrConflict) {
+				t.Fatalf("legacy bypass status=%s err=%v", status, e)
+			}
+			after, e := repo.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+			if e != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("legacy denial mutated path")
+			}
+		}
+	})
+}
+
+func replanProtectionJSONEqual(a, b any) bool {
+	left, e := json.Marshal(a)
+	if e != nil {
+		return false
+	}
+	right, e := json.Marshal(b)
+	return e == nil && string(left) == string(right)
+}

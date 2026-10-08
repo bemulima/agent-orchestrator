@@ -1,0 +1,646 @@
+package onboarding
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherEnsurer interface {
+	Execute(context.Context, string) (domain.PersonalTeacher, error)
+}
+type IDGenerator interface{ NewID() string }
+type Clock interface{ Now() time.Time }
+
+type Service struct {
+	Teachers                  TeacherEnsurer
+	Dialogs                   repository.TeacherDialogProvisioner
+	Sources                   repository.DialogAssistantUISourceReader
+	StructuredMessages        repository.DialogTeacherStructuredProactiveAppender
+	PlainMessages             repository.DialogTeacherProactiveAppender
+	CanonicalMessages         repository.DialogCanonicalStudentTurnMaterializer
+	Students                  repository.StudentOnboardingGateway
+	Receipts                  repository.OnboardingActionReceiptStore
+	Interactions              repository.TeacherOnboardingInteractionRegistry
+	Readiness                 repository.TeacherLearningReadinessResolver
+	Handoffs                  repository.TeacherOnboardingHandoffStore
+	PathOutcomes              repository.TeacherOnboardingPathOutcomeProjectionReader
+	TerminalSessions          repository.TeacherOnboardingTerminalSessionStore
+	IDs                       IDGenerator
+	Clock                     Clock
+	LeaseTTL                  time.Duration
+	CanonicalActionsEnabled   bool
+	UnifiedCoordinatorEnabled bool
+	ProductAwareEnabled       bool
+	PlannerHandoffEnabled     bool
+	PathOutcomeEnabled        bool
+}
+
+func (service Service) Ensure(ctx context.Context, studentID string) (domain.TeacherOnboardingSession, error) {
+	session, found, err := service.readHistoricalSession(ctx, studentID)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	if found {
+		if session.V3 == nil || session.V3.Status != domain.TeacherOnboardingSessionV3Collecting || !service.fullCutoverAdmissionEnabled() {
+			return session, nil
+		}
+	}
+	if err := service.requireCanonicalEnsureAdmission(); err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	teacher, binding, state, err := service.loadSession(ctx, studentID)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	session, ensureErr := service.ensureCanonicalV3(ctx, teacher, binding, state)
+	if ensureErr != nil {
+		return domain.TeacherOnboardingSession{}, ensureErr
+	}
+	return service.attachDeliveredPathOutcome(ctx, teacher, session)
+}
+
+func (service Service) readHistoricalSession(ctx context.Context, studentID string) (domain.TeacherOnboardingSession, bool, error) {
+	if service.TerminalSessions != nil {
+		terminal, found, err := service.TerminalSessions.FindOnlyRecoverableForStudent(ctx, studentID)
+		if err != nil {
+			if historicalEvidenceUnavailable(err) {
+				return domain.TeacherOnboardingSession{}, false, err
+			}
+			return domain.TeacherOnboardingSession{}, false, onboardingDependency(err)
+		}
+		if found {
+			session, recoverErr := service.recoverActivePathTerminal(ctx, terminal)
+			return session, recoverErr == nil, recoverErr
+		}
+	}
+	reader, ok := service.Interactions.(repository.TeacherOnboardingSessionInteractionReader)
+	if !ok || reader == nil {
+		return domain.TeacherOnboardingSession{}, false, nil
+	}
+	interaction, found, err := reader.FindRecoverableInteractionForStudent(ctx, studentID)
+	if err != nil {
+		if historicalEvidenceUnavailable(err) {
+			return domain.TeacherOnboardingSession{}, false, err
+		}
+		return domain.TeacherOnboardingSession{}, false, onboardingDependency(err)
+	}
+	if found {
+		if interaction.StudentID != studentID {
+			return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		if interaction.State == domain.TeacherOnboardingInteractionHandoffPending {
+			return service.readLinkedHandoffSession(ctx, studentID, interaction)
+		}
+		if interaction.State != domain.TeacherOnboardingInteractionActive && interaction.State != domain.TeacherOnboardingInteractionReserved {
+			return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		return collectingSessionFromInteraction(interaction)
+	}
+
+	handoffReader, handoffsReadable := service.Handoffs.(repository.TeacherOnboardingSessionHandoffReader)
+	if handoffsReadable && handoffReader != nil {
+		intent, handoffFound, handoffErr := handoffReader.FindOnlyRecoverableHandoffForStudent(ctx, studentID)
+		if handoffErr != nil {
+			if historicalEvidenceUnavailable(handoffErr) {
+				return domain.TeacherOnboardingSession{}, false, handoffErr
+			}
+			return domain.TeacherOnboardingSession{}, false, onboardingDependency(handoffErr)
+		}
+		if handoffFound {
+			return service.historicalHandoffSession(ctx, intent)
+		}
+	}
+	hasInteractionHistory, historyErr := reader.HasInteractionHistory(ctx, studentID)
+	if historyErr != nil {
+		return domain.TeacherOnboardingSession{}, false, onboardingDependency(historyErr)
+	}
+	if hasInteractionHistory {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if handoffsReadable && handoffReader != nil {
+		hasHandoffHistory, handoffHistoryErr := handoffReader.HasHandoffHistory(ctx, studentID)
+		if handoffHistoryErr != nil {
+			return domain.TeacherOnboardingSession{}, false, onboardingDependency(handoffHistoryErr)
+		}
+		if hasHandoffHistory {
+			return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+	}
+	return domain.TeacherOnboardingSession{}, false, nil
+}
+
+func (service Service) recoverActivePathTerminal(ctx context.Context, terminal domain.TeacherOnboardingTerminalSession) (domain.TeacherOnboardingSession, error) {
+	terminal, err := domain.NormalizeTeacherOnboardingTerminalSession(terminal)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if terminal.Status == domain.TeacherOnboardingTerminalMessagePending {
+		if service.Students == nil || service.PlainMessages == nil || service.TerminalSessions == nil || service.Clock == nil {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+		}
+		state, stateErr := service.Students.GetTeacherOnboardingState(ctx, terminal.StudentID)
+		if stateErr != nil {
+			return domain.TeacherOnboardingSession{}, onboardingDependency(stateErr)
+		}
+		stateRef, stateErr := domain.TeacherReadinessStateRefFromOnboarding(state, terminal.StudentID)
+		if stateErr != nil || stateRef != terminal.StateRef {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		binding, bindingErr := domain.NewTeacherDialogBinding(domain.TeacherDialogBinding{ID: terminal.DialogID, StudentID: terminal.StudentID, PersonalTeacherID: terminal.PersonalTeacherID, ContextType: domain.LearningContextGeneral})
+		if bindingErr != nil {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		message, appendErr := service.PlainMessages.AppendTeacherProactive(ctx, binding, terminal.TerminalMessageCommandID, domain.TeacherOnboardingPathOutcomeBody(domain.OnboardingLocale(state.Draft), domain.TeacherOnboardingPathActiveExists))
+		if appendErr != nil {
+			return domain.TeacherOnboardingSession{}, onboardingDependency(appendErr)
+		}
+		if message.ID == "" || message.DialogID != terminal.DialogID || message.PersonalTeacherID != terminal.PersonalTeacherID {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+		}
+		terminal, err = service.TerminalSessions.MarkDelivered(ctx, terminal.ID, message.ID, service.Clock.Now().UTC())
+		if err != nil {
+			return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+		}
+	}
+	return domain.DurableHandoffTeacherOnboardingSession(domain.TeacherOnboardingSessionV3{
+		Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: terminal.DialogID,
+		Status: domain.TeacherOnboardingSessionV3ActivePathExists, Phase: domain.TeacherOnboardingPhaseReadyToStart,
+		StateRef: terminal.StateRef, Terminal: &domain.TeacherOnboardingTerminalV3{Kind: domain.TeacherOnboardingSessionV3ActivePathExists},
+	})
+}
+
+func (service Service) readLinkedHandoffSession(ctx context.Context, studentID string, interaction domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingSession, bool, error) {
+	if interaction.SessionSchemaVersion != 3 || interaction.ReservedTeacherJobID == "" {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	reader, ok := service.Handoffs.(repository.TeacherOnboardingSessionHandoffReader)
+	if !ok || reader == nil {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	intent, found, err := reader.GetBySourceSession(ctx, studentID, interaction.ID, interaction.ReservedTeacherJobID)
+	if err != nil {
+		if historicalEvidenceUnavailable(err) {
+			return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		return domain.TeacherOnboardingSession{}, false, onboardingDependency(err)
+	}
+	if !found || intent.SourceInteractionID != interaction.ID || intent.SourceTeacherJobID != interaction.ReservedTeacherJobID {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	return service.historicalHandoffSession(ctx, intent)
+}
+
+func (service Service) historicalHandoffSession(ctx context.Context, intent domain.TeacherOnboardingHandoffIntent) (domain.TeacherOnboardingSession, bool, error) {
+	intent, err := domain.NewTeacherOnboardingHandoffIntent(intent)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	session, err := durableHandoffSession(intent.DialogID, intent)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if service.PathOutcomes != nil {
+		session, err = service.attachPersistedPathOutcome(ctx, domain.PersonalTeacher{ID: intent.PersonalTeacherID, StudentID: intent.StudentID}, session)
+		if err != nil {
+			return domain.TeacherOnboardingSession{}, false, err
+		}
+	}
+	return session, true, nil
+}
+
+func collectingSessionFromInteraction(interaction domain.TeacherOnboardingInteraction) (domain.TeacherOnboardingSession, bool, error) {
+	messageVersion := int(interaction.PromptMessageVersion)
+	switch interaction.SessionSchemaVersion {
+	case 1:
+		messageID := interaction.PromptMessageID
+		return domain.TeacherOnboardingSession{
+			Schema: domain.TeacherOnboardingSessionSchema, DialogID: interaction.DialogID, MessageID: &messageID, MessageVersion: &messageVersion,
+			Status: domain.StudentOnboardingDraftDraft, DraftVersion: interaction.ExpectedDraftVersion, ProfileVersion: interaction.ExpectedProfileVersion,
+		}, true, nil
+	case 2, 3:
+	default:
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	phase, err := onboardingPhaseForSlot(interaction.SlotCode)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	stateRef := domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateNone, Version: 0}
+	if interaction.ExpectedDraftVersion > 0 {
+		stateRef = domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: interaction.ExpectedDraftVersion}
+	}
+	current := &domain.TeacherOnboardingCurrentPrompt{MessageID: interaction.PromptMessageID, MessageVersion: messageVersion}
+	if interaction.SessionSchemaVersion == 3 {
+		session, sessionErr := domain.DurableHandoffTeacherOnboardingSession(domain.TeacherOnboardingSessionV3{
+			Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: interaction.DialogID, Status: domain.TeacherOnboardingSessionV3Collecting,
+			Phase: phase, StateRef: stateRef, CurrentPrompt: current,
+		})
+		return session, sessionErr == nil, sessionErr
+	}
+	session, sessionErr := domain.ProductAwareTeacherOnboardingSession(domain.TeacherOnboardingSessionV2{
+		Schema: domain.TeacherOnboardingSessionV2Schema, DialogID: interaction.DialogID, Status: domain.TeacherOnboardingSessionCollecting,
+		Phase: phase, StateRef: stateRef, CurrentPrompt: current,
+	})
+	return session, sessionErr == nil, sessionErr
+}
+
+func (service Service) attachDeliveredPathOutcome(ctx context.Context, teacher domain.PersonalTeacher, session domain.TeacherOnboardingSession) (domain.TeacherOnboardingSession, error) {
+	if !service.PathOutcomeEnabled || session.V3 == nil {
+		return session, nil
+	}
+	return service.attachPersistedPathOutcome(ctx, teacher, session)
+}
+
+func (service Service) attachPersistedPathOutcome(ctx context.Context, teacher domain.PersonalTeacher, session domain.TeacherOnboardingSession) (domain.TeacherOnboardingSession, error) {
+	if session.V3 == nil {
+		return session, nil
+	}
+	if session.V3.Status != domain.TeacherOnboardingSessionHandoffAccepted && session.V3.Status != domain.TeacherOnboardingSessionV3ActivePathExists {
+		return session, nil
+	}
+	if service.PathOutcomes == nil {
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	marker, found, err := service.PathOutcomes.FindDeliveredForSession(ctx, teacher.StudentID, teacher.ID, session.V3.DialogID, session.V3.StateRef)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+	}
+	if !found {
+		return session, nil
+	}
+	payload := *session.V3
+	payload.PathOutcome = &marker
+	return domain.DurableHandoffTeacherOnboardingSession(payload)
+}
+
+func (service Service) ensureCanonicalV3(ctx context.Context, teacher domain.PersonalTeacher, binding domain.TeacherDialogBinding, state domain.TeacherStudentOnboardingState) (domain.TeacherOnboardingSession, error) {
+	if service.Readiness == nil || service.PlainMessages == nil || service.Interactions == nil || !service.UnifiedCoordinatorEnabled {
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	stateRef, err := domain.TeacherReadinessStateRefFromOnboarding(state, teacher.StudentID)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	readiness, err := service.Readiness.ResolveLearningReadiness(ctx, teacher.StudentID, stateRef)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+	}
+	plan, err := domain.BuildTeacherProductAwareOnboardingPlan(readiness, state, teacher.StudentID, domain.OnboardingLocale(state.Draft))
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+	}
+	return service.ensureDurableHandoff(ctx, teacher, binding, state, readiness, plan)
+}
+
+func (service Service) ensureDurableHandoff(ctx context.Context, teacher domain.PersonalTeacher, binding domain.TeacherDialogBinding, state domain.TeacherStudentOnboardingState, readiness domain.TeacherLearningReadiness, plan domain.TeacherProductAwareOnboardingPlan) (domain.TeacherOnboardingSession, error) {
+	if service.Handoffs == nil {
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	payload := domain.TeacherOnboardingSessionV3{
+		Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: binding.ID, Phase: plan.Phase, StateRef: plan.StateRef,
+	}
+	if plan.Status == domain.TeacherOnboardingSessionCollecting {
+		commandID, err := domain.CurrentOnboardingPromptCommandID(binding, state.Draft.Version, state.ProfileVersion, plan.Step, domain.TeacherOnboardingPromptPolicyV2)
+		if err != nil {
+			return domain.TeacherOnboardingSession{}, err
+		}
+		message, err := service.StructuredMessages.AppendTeacherStructuredProactive(ctx, binding, commandID, plan.Body, plan.AssistantUI)
+		if err != nil {
+			return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+		}
+		if message.DialogID != binding.ID || message.PersonalTeacherID != teacher.ID || message.Version < 1 {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+		}
+		if err := service.ensureS5Interaction(ctx, binding, message.ID, message.Version, message.AssistantUI, plan.Step, state, 3); err != nil {
+			return domain.TeacherOnboardingSession{}, err
+		}
+		payload.Status = domain.TeacherOnboardingSessionV3Collecting
+		payload.CurrentPrompt = &domain.TeacherOnboardingCurrentPrompt{MessageID: message.ID, MessageVersion: message.Version}
+		return domain.DurableHandoffTeacherOnboardingSession(payload)
+	}
+	if plan.Status == domain.TeacherOnboardingSessionActivePathExists {
+		if service.TerminalSessions == nil {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+		}
+		terminal, terminalErr := domain.NewTeacherOnboardingActivePathTerminalSession(teacher, binding, plan.StateRef, service.Clock.Now().UTC())
+		if terminalErr != nil {
+			return domain.TeacherOnboardingSession{}, terminalErr
+		}
+		terminal, _, terminalErr = service.TerminalSessions.EnsurePending(ctx, terminal)
+		if terminalErr != nil {
+			return domain.TeacherOnboardingSession{}, onboardingDependencyOrConflict(terminalErr)
+		}
+		return service.recoverActivePathTerminal(ctx, terminal)
+	}
+	if plan.Status != domain.TeacherOnboardingSessionPlanningReady || readiness.Goal == nil {
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	intent, err := domain.BuildTeacherOnboardingHandoffIntent(teacher, binding, readiness, domain.OnboardingLocale(state.Draft), "", "", service.Clock.Now().UTC())
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	stored, found, err := service.Handoffs.GetByStudentState(ctx, teacher.StudentID, readiness.StateRef, *readiness.Goal)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+	}
+	if found {
+		if !sameEnsureHandoffIdentity(stored, intent) {
+			return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+		}
+		return durableHandoffSession(binding.ID, stored)
+	}
+	stored, _, err = service.Handoffs.Enqueue(ctx, repository.TeacherOnboardingHandoffEnqueue{Intent: intent}, service.Clock.Now().UTC())
+	if errors.Is(err, domain.ErrTeacherOnboardingBusy) {
+		interaction, found, closeErr := service.Interactions.CloseActiveInteractionForTerminal(ctx, binding.ID, teacher.ID, domain.TeacherOnboardingClosedPlanningReady, service.Clock.Now().UTC())
+		if closeErr != nil || !found {
+			return domain.TeacherOnboardingSession{}, onboardingDependency(errors.Join(err, closeErr))
+		}
+		phase, phaseErr := onboardingPhaseForSlot(interaction.SlotCode)
+		if phaseErr != nil {
+			return domain.TeacherOnboardingSession{}, phaseErr
+		}
+		payload.Status, payload.Phase = domain.TeacherOnboardingSessionV3Collecting, phase
+		payload.CurrentPrompt = &domain.TeacherOnboardingCurrentPrompt{MessageID: interaction.PromptMessageID, MessageVersion: int(interaction.PromptMessageVersion)}
+		return domain.DurableHandoffTeacherOnboardingSession(payload)
+	}
+	if errors.Is(err, domain.ErrTeacherOnboardingHandoffConflict) {
+		stored, found, readErr := service.Handoffs.GetByStudentState(ctx, teacher.StudentID, readiness.StateRef, *readiness.Goal)
+		if readErr == nil && found && sameEnsureHandoffIdentity(stored, intent) {
+			return durableHandoffSession(binding.ID, stored)
+		}
+		return domain.TeacherOnboardingSession{}, onboardingDependency(errors.Join(err, readErr))
+	}
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, onboardingDependency(err)
+	}
+	return durableHandoffSession(binding.ID, stored)
+}
+
+func sameEnsureHandoffIdentity(stored, expected domain.TeacherOnboardingHandoffIntent) bool {
+	stored, storedErr := domain.NewTeacherOnboardingHandoffIntent(stored)
+	expected, expectedErr := domain.NewTeacherOnboardingHandoffIntent(expected)
+	return storedErr == nil && expectedErr == nil &&
+		stored.ID == expected.ID && stored.StudentID == expected.StudentID && stored.PersonalTeacherID == expected.PersonalTeacherID && stored.DialogID == expected.DialogID &&
+		stored.CommandID == expected.CommandID && stored.CommandTeacherJobID == expected.CommandTeacherJobID && stored.RequestHash == expected.RequestHash &&
+		stored.StateRef == expected.StateRef && stored.Goal == expected.Goal && stored.Locale == expected.Locale && stored.NotificationCommandID == expected.NotificationCommandID
+}
+
+func durableHandoffSession(dialogID string, intent domain.TeacherOnboardingHandoffIntent) (domain.TeacherOnboardingSession, error) {
+	displayName, err := domain.TeacherOnboardingHandoffDisplayName(intent.Goal)
+	if err != nil {
+		return domain.TeacherOnboardingSession{}, err
+	}
+	payload := domain.TeacherOnboardingSessionV3{Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: dialogID, StateRef: intent.StateRef}
+	switch intent.Status {
+	case domain.TeacherOnboardingHandoffQueued, domain.TeacherOnboardingHandoffDispatching:
+		payload.Status, payload.Phase = domain.TeacherOnboardingSessionHandoffPending, domain.TeacherOnboardingPhasePreparingPath
+		payload.Terminal = &domain.TeacherOnboardingTerminalV3{Kind: payload.Status, DisplayName: displayName, ContentStatus: domain.TeacherLearningContentNotCreated}
+	case domain.TeacherOnboardingHandoffAcceptedStatus, domain.TeacherOnboardingHandoffMessagePending, domain.TeacherOnboardingHandoffDelivered:
+		if intent.PlannerHandoffID == "" {
+			payload.Status, payload.Phase = domain.TeacherOnboardingSessionV3ActivePathExists, domain.TeacherOnboardingPhaseReadyToStart
+			payload.Terminal = &domain.TeacherOnboardingTerminalV3{Kind: payload.Status}
+			break
+		}
+		payload.Status, payload.Phase = domain.TeacherOnboardingSessionHandoffAccepted, domain.TeacherOnboardingPhaseReadyToStart
+		payload.Terminal = &domain.TeacherOnboardingTerminalV3{Kind: payload.Status, DisplayName: displayName, ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated}
+	case domain.TeacherOnboardingHandoffActivePath:
+		payload.Status, payload.Phase = domain.TeacherOnboardingSessionV3ActivePathExists, domain.TeacherOnboardingPhaseReadyToStart
+		payload.Terminal = &domain.TeacherOnboardingTerminalV3{Kind: payload.Status}
+	default:
+		return domain.TeacherOnboardingSession{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	return domain.DurableHandoffTeacherOnboardingSession(payload)
+}
+
+func (service Service) ensureS5Interaction(ctx context.Context, binding domain.TeacherDialogBinding, messageID string, messageVersion int, assistantUI []byte, step domain.TeacherOnboardingStep, state domain.TeacherStudentOnboardingState, sessionSchemaVersion int) error {
+	if service.Interactions == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	interaction, err := domain.NewS5OnboardingInteractionFromPrompt(binding, messageID, messageVersion, assistantUI, step, state.Draft.Version, state.ProfileVersion, sessionSchemaVersion, service.Clock.Now().UTC())
+	if err != nil {
+		return err
+	}
+	_, _, err = service.Interactions.EnsureActiveInteraction(ctx, interaction)
+	if errors.Is(err, domain.ErrTeacherOnboardingConflict) {
+		// A reserved interaction for the same prompt is an in-flight canonical
+		// action; Ensure must reuse it rather than manufacture a duplicate.
+		return nil
+	}
+	return err
+}
+
+func (service Service) ApplyAction(ctx context.Context, studentID string, request domain.AssistantUIActionRequest) (result domain.AssistantUIActionResult, err error) {
+	request, err = domain.NormalizeAssistantUIActionRequest(request)
+	if err != nil {
+		return result, err
+	}
+	if service.Receipts == nil {
+		return result, domain.ErrTeacherOnboardingUnavailable
+	}
+	stored, found, lookupErr := service.Receipts.Get(ctx, request.IdempotencyKey)
+	if lookupErr != nil {
+		return result, onboardingDependency(lookupErr)
+	}
+	if found {
+		replayed, terminal, replayErr := domain.ReplayTerminalOnboardingAction(stored, request, studentID)
+		if replayErr != nil || terminal {
+			return replayed, replayErr
+		}
+		if stored.ExecutionMode == domain.OnboardingActionExecutionLegacy {
+			return result, domain.ErrTeacherOnboardingUnavailable
+		}
+	} else if !service.CanonicalActionsEnabled || !service.UnifiedCoordinatorEnabled || !service.ProductAwareEnabled || !service.PlannerHandoffEnabled {
+		return result, domain.ErrTeacherOnboardingUnavailable
+	}
+	if err = service.requireCanonicalActionRuntime(); err != nil {
+		return result, domain.ErrTeacherOnboardingUnavailable
+	}
+	teacher, binding, err := service.ensureBinding(ctx, studentID)
+	if err != nil {
+		return result, err
+	}
+	if binding.ID != request.DialogID {
+		return result, domain.ErrTeacherOnboardingConflict
+	}
+	interaction, active, interactionErr := service.Interactions.GetActiveInteraction(ctx, binding.ID, request.MessageID, teacher.ID)
+	if interactionErr != nil {
+		return result, onboardingDependency(interactionErr)
+	}
+	if !active || interaction.PromptMessageVersion != int64(request.MessageVersion) {
+		return result, domain.ErrTeacherOnboardingUnavailable
+	}
+	now := service.Clock.Now().UTC()
+	lease := service.LeaseTTL
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	candidate, err := domain.NewOnboardingActionReceiptForMode(request, studentID, teacher.ID, service.IDs.NewID(), now, now.Add(lease), domain.OnboardingActionExecutionCanonical)
+	if err != nil {
+		return result, err
+	}
+	receipt, _, err := service.Receipts.Claim(ctx, candidate)
+	if err != nil {
+		return result, receiptError(err)
+	}
+	if receipt.Status == domain.OnboardingReceiptCompleted {
+		replayed, _, replayErr := domain.ReplayTerminalOnboardingAction(receipt, request, studentID)
+		return replayed, replayErr
+	}
+	if receipt.Status == domain.OnboardingReceiptMaterialized {
+		return receipt.CanonicalResult(true)
+	}
+	if receipt.Status == domain.OnboardingReceiptRejected {
+		return result, domain.ErrTeacherOnboardingConflict
+	}
+	if receipt.ExecutionMode != domain.OnboardingActionExecutionCanonical {
+		return result, domain.ErrTeacherOnboardingUnavailable
+	}
+	if interaction.SessionSchemaVersion < 1 || interaction.SessionSchemaVersion > 3 {
+		_ = service.Receipts.Reject(context.WithoutCancel(ctx), receipt.IdempotencyKey, receipt.ClaimToken, service.Clock.Now())
+		return result, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	defer func() {
+		if err != nil && isDependency(err) {
+			_ = service.Receipts.Release(context.WithoutCancel(ctx), receipt.IdempotencyKey, receipt.ClaimToken, service.Clock.Now())
+		}
+	}()
+
+	if receipt.Status == domain.OnboardingReceiptClaimed {
+		canonicalResult, canonicalErr := service.materializeCanonical(ctx, binding, request, receipt)
+		if canonicalErr != nil && !isDependency(canonicalErr) {
+			_ = service.Receipts.Reject(context.WithoutCancel(ctx), receipt.IdempotencyKey, receipt.ClaimToken, service.Clock.Now())
+		}
+		return canonicalResult, canonicalErr
+	}
+	return result, domain.ErrTeacherOnboardingConflict
+}
+
+func (service Service) requireCanonicalActionRuntime() error {
+	if service.Teachers == nil || service.Dialogs == nil ||
+		service.Sources == nil || service.CanonicalMessages == nil || service.Receipts == nil || service.Interactions == nil ||
+		service.IDs == nil || service.Clock == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	return nil
+}
+
+func (service Service) requireCanonicalEnsureAdmission() error {
+	if !service.fullCutoverAdmissionEnabled() {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	if err := service.requireCanonicalActionRuntime(); err != nil || service.StructuredMessages == nil || service.Students == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	if !service.ProductAwareEnabled || !service.PlannerHandoffEnabled || service.Readiness == nil || service.PlainMessages == nil || service.Handoffs == nil || service.TerminalSessions == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	if service.PathOutcomeEnabled && service.PathOutcomes == nil {
+		return domain.ErrTeacherOnboardingUnavailable
+	}
+	return nil
+}
+
+func (service Service) fullCutoverAdmissionEnabled() bool {
+	return service.CanonicalActionsEnabled && service.UnifiedCoordinatorEnabled && service.ProductAwareEnabled && service.PlannerHandoffEnabled
+}
+
+func onboardingPhaseForSlot(slot domain.TeacherOnboardingSlotCode) (domain.TeacherOnboardingSessionV2Phase, error) {
+	switch slot {
+	case domain.TeacherOnboardingSlotGoalCode:
+		return domain.TeacherOnboardingPhaseGettingAcquainted, nil
+	case domain.TeacherOnboardingSlotExperience, domain.TeacherOnboardingSlotDirection, domain.TeacherOnboardingSlotLanguage:
+		return domain.TeacherOnboardingPhaseDeterminingStart, nil
+	case domain.TeacherOnboardingSlotDesiredStacks:
+		return domain.TeacherOnboardingPhasePreparingPath, nil
+	default:
+		return "", domain.ErrTeacherOnboardingConflict
+	}
+}
+
+func (service Service) materializeCanonical(ctx context.Context, binding domain.TeacherDialogBinding, request domain.AssistantUIActionRequest, receipt domain.OnboardingActionReceipt) (domain.AssistantUIActionResult, error) {
+	if service.CanonicalMessages == nil {
+		return domain.AssistantUIActionResult{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	source, err := service.Sources.GetAssistantUISource(ctx, binding, receipt.SourceMessageID)
+	if err != nil {
+		return domain.AssistantUIActionResult{}, onboardingDependencyOrConflict(err)
+	}
+	command, err := domain.ResolveCanonicalOnboardingAction(source, binding, request, receipt)
+	if err != nil {
+		return domain.AssistantUIActionResult{}, err
+	}
+	message, err := service.CanonicalMessages.MaterializeCanonicalStudentTurn(ctx, command)
+	if err != nil {
+		return domain.AssistantUIActionResult{}, onboardingDependency(err)
+	}
+	message, err = domain.NewDialogCanonicalStudentTurn(binding, message, command)
+	if err != nil {
+		return domain.AssistantUIActionResult{}, onboardingDependency(err)
+	}
+	completed, err := service.Receipts.CompleteCanonical(ctx, receipt.IdempotencyKey, receipt.ClaimToken, message.ID, service.Clock.Now())
+	if err != nil {
+		return domain.AssistantUIActionResult{}, receiptError(err)
+	}
+	return completed.CanonicalResult(false)
+}
+
+func (service Service) loadSession(ctx context.Context, studentID string) (domain.PersonalTeacher, domain.TeacherDialogBinding, domain.TeacherStudentOnboardingState, error) {
+	teacher, binding, err := service.ensureBinding(ctx, studentID)
+	if err != nil {
+		return teacher, binding, domain.TeacherStudentOnboardingState{}, err
+	}
+	if service.Students == nil || service.StructuredMessages == nil || service.Receipts == nil || service.Sources == nil {
+		return teacher, binding, domain.TeacherStudentOnboardingState{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	state, err := service.Students.GetTeacherOnboardingState(ctx, studentID)
+	if err != nil {
+		return teacher, binding, state, onboardingDependencyOrConflict(err)
+	}
+	return teacher, binding, state, nil
+}
+
+func (service Service) ensureBinding(ctx context.Context, studentID string) (domain.PersonalTeacher, domain.TeacherDialogBinding, error) {
+	if service.Teachers == nil || service.Dialogs == nil {
+		return domain.PersonalTeacher{}, domain.TeacherDialogBinding{}, domain.ErrTeacherOnboardingUnavailable
+	}
+	teacher, err := service.Teachers.Execute(ctx, studentID)
+	if err != nil {
+		return domain.PersonalTeacher{}, domain.TeacherDialogBinding{}, err
+	}
+	binding, err := service.Dialogs.EnsureTeacherDialog(ctx, studentID, teacher.ID, domain.LearningContextGeneral, "")
+	if err != nil {
+		return teacher, binding, onboardingDependency(err)
+	}
+	if binding.StudentID != studentID || binding.PersonalTeacherID != teacher.ID || binding.ContextType != domain.LearningContextGeneral || binding.ContextID != "" {
+		return teacher, binding, domain.ErrTeacherOnboardingUnavailable
+	}
+	return teacher, binding, nil
+}
+
+func onboardingDependency(err error) error {
+	return errors.Join(domain.ErrTeacherOnboardingUnavailable, err)
+}
+func historicalEvidenceUnavailable(err error) bool {
+	return errors.Is(err, domain.ErrTeacherOnboardingHistoricalSessionUnavailable) ||
+		errors.Is(err, domain.ErrInvalidTeacherOnboarding) ||
+		errors.Is(err, domain.ErrTeacherOnboardingHandoffConflict)
+}
+func onboardingDependencyOrConflict(err error) error {
+	if errors.Is(err, domain.ErrTeacherOnboardingConflict) || errors.Is(err, domain.ErrInvalidTeacherOnboarding) || errors.Is(err, domain.ErrDialogRequestNotFound) || errors.Is(err, domain.ErrInvalidDialogContext) {
+		return domain.ErrTeacherOnboardingConflict
+	}
+	return onboardingDependency(err)
+}
+func isDependency(err error) bool {
+	return errors.Is(err, domain.ErrTeacherOnboardingUnavailable) || errors.Is(err, domain.ErrStudentStateUnavailable) || errors.Is(err, domain.ErrDialogStateUnavailable)
+}
+func receiptError(err error) error {
+	if err == nil || errors.Is(err, domain.ErrTeacherOnboardingConflict) || errors.Is(err, domain.ErrTeacherOnboardingBusy) || errors.Is(err, domain.ErrInvalidTeacherOnboarding) {
+		return err
+	}
+	return onboardingDependency(err)
+}

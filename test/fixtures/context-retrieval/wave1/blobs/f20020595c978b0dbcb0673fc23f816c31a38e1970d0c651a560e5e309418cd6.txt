@@ -1,0 +1,266 @@
+# Architecture
+
+Diagnostic completion is a separate owner-delegation boundary. It ensures the
+persisted Placement and reads durable planning-state, without submitting a
+plan. The explicit diagnostic alternative on the existing planning facade uses
+the plan identity as idempotency key and owner-derived goal/context. Teacher
+stores no new learner or workflow table. On reload, the same completion call
+projects the existing Placement/job; Student confirms any active path claim.
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant Teacher
+    participant Planner
+    participant Student
+    UI->>Teacher: Complete {plan_id}
+    Teacher->>Planner: Ensure Placement (key=plan_id)
+    Teacher->>Planner: Read durable planning-state
+    Teacher->>Student: Read context / confirm path when needed
+    Teacher-->>UI: Placement and planning state
+    UI->>Teacher: Explicit Plan {diagnostic_plan_id}
+    Teacher->>Planner: Same stable initial planning intent
+    Teacher-->>UI: Durable planning state
+```
+
+## Ownership
+
+`ms-go-teacher-agent` owns how the platform should teach a student:
+
+- logical `PersonalTeacher` identity and preferences;
+- teacher orchestration;
+- bounded context construction;
+- recognition and delegation of learning goals, requested skills, and replans;
+- pedagogy, teaching, hint and intervention policies;
+- explainable teacher decisions;
+- immutable teacher-owned assistance summaries per learning action;
+- LLM orchestration behind a port.
+
+It does not own what the platform knows about a student. Mastery, evidence projection, learning paths, sessions, strengths, weaknesses and repeated mistakes belong to `ms-go-student`.
+
+## Layers
+
+```text
+cmd/ms-go-teacher-agent/main.go
+  -> internal/transport/http
+  -> internal/transport/message/nats
+  -> internal/infrastructure/persistence/postgres
+  -> internal/infrastructure/messaging/nats
+  -> internal/infrastructure/http/{student,course,dialog,aiprompt,learningplanner,statistic,telegram}
+  -> internal/usecase
+  -> internal/domain
+```
+
+- `internal/domain`: entities, value objects and outbound port interfaces.
+- `internal/usecase`: application orchestration independent from HTTP, PostgreSQL, NATS and LLM SDKs.
+- `internal/transport/http`: independent API, admin, private, and provider-signed integration contours.
+- `internal/transport/message/nats`: strict durable inbound event decoding and acknowledgement.
+- `internal/infrastructure`: PostgreSQL plus outbound service/messaging implementations.
+- `cmd/ms-go-teacher-agent`: explicit composition root and lifecycle.
+
+Architecture tests and `scripts/check_architecture.py` fail when dependencies point outward or unapproved directories appear.
+
+As in `ms-go-course`, contour routers only register their own routes and explicit role policies. The root HTTP router composes trusted gateway-header authentication for API/admin and mounts the private and provider-signed contours independently. Concrete outbound HTTP clients are forbidden in transport and must use an approved `internal/infrastructure/http/<service>` path.
+
+## Current foundation aggregate
+
+`PersonalTeacher` is unique by `student_id`. It stores teacher profile and behavior configuration with optimistic `version`. Creating it is idempotent. It intentionally has no foreign key to another service database.
+
+`TeacherSoul` is a separate one-to-one row bound by the same
+`(personal_teacher_id, student_id)` pair. Every student therefore owns an
+independently mutable logical teacher identity, voice, relationship style, and
+encouragement style even when defaults initially match. Soul has its own
+optimistic version and never becomes student memory: mastery, evidence, paths,
+attempts, dialog history, raw events, prompts, and code are forbidden.
+
+`TeacherDecision` stores an explainable business/pedagogical reason without chain-of-thought. It records the selected pedagogy method, method version, and method-neutral stage so replacements remain auditable. Task-scoped decisions carry the distinct `learning_action_id` as their correlation ID. Recording a decision and its schema-v2 `teacher.decision.recorded` event is one PostgreSQL transaction. A lease-based outbox relay uses `FOR UPDATE SKIP LOCKED`, bounded publish timeouts, exponential retry, JetStream acknowledgement, and `event_id` deduplication. Delivery remains at least once; consumers must maintain an inbox or processed-event ledger.
+
+The service durably consumes `learning_action.closed` from `TASKANSWER_EVENTS`. The trigger carries a frozen target snapshot but no outcome. Finalization reads only teacher-owned decisions for that exact action cycle. No non-silent decision produces independent context; otherwise policy v1 records guided context, hint count/max level, and intervention, applying those action-level facts to every frozen target.
+
+`LearningActionAssistance` stores that bounded summary over provider-neutral learning targets. The consumed inbox marker, assistance row, and `teacher.assistance.observed` outbox event commit in one transaction. A duplicate source `event_id` is a no-op. An action with zero targets commits only its inbox marker and emits no invented observations. The summary cannot carry objective outcome or mastery. `ms-go-student` consumes it through its own durable inbox.
+
+`StudentContextBuilder` v1 is a synchronous bounded application capability. For a general dialog it loads Student's optional declared onboarding and at most 20 recent current mastery projections; self-assessment remains a hypothesis. For an action dialog it loads an ownership-scoped frozen action snapshot, requires the action to be open, and queries Student mastery only for the exact ordered targets in that snapshot. It returns an in-memory `StudentContext`; no student state is stored locally. Targetless actions remain empty, and Student dependency or contract failures fail closed. The closure finalizer remains independent and never calls Student synchronously.
+
+The mounted Dialog boundary strictly decodes schema-v1
+`dialog.teacher.requested` envelopes and persists a private `teacher_dialog_job`
+before acknowledging. Duplicate event/source identities are accepted only when
+all request metadata is identical. `general_teacher`, `lesson`, `lesson_task`,
+`practice_task`, and `project` are claimed with a fenced lease by the
+TeacherOrchestrator worker.
+
+The student-facing provisioning use case derives `student_id` from the trusted
+actor boundary, ensures that student's canonical PersonalTeacher, and calls
+Dialog's internal idempotent ensure command. It validates the returned student,
+teacher, context type, and context ID before exposing the Dialog-owned binding;
+teacher-agent never creates or stores conversation rows itself.
+
+For a claimed supported job, the worker verifies the PersonalTeacher and its exact
+per-student soul, loads the
+exact source plus at most 49 prior visible messages from Dialog, builds the
+bounded Student context, and for action contexts reads only prior decisions for
+that LearningAction.
+`teacher-dialog-policy-v1` selects a registered deterministic `PedagogyMethod`
+by `pedagogy_profile` before
+model execution: Socratic question, direction, concept reminder, analogous
+example, pseudocode, partial structure, then guided breakdown. The policy never
+permits a complete solution. Its reason is a bounded business explanation,
+never chain-of-thought. The registry has a safe default and no concrete-method
+switch inside TeacherOrchestrator. A method exposes its own code/version and a
+bounded generic stage, so future Bloom, ZPD, retrieval, or other implementations
+can be added or replace an existing method at composition.
+
+The model port calls AI Prompt's confidential `teacher.response.v1` contract
+with exactly four variables: teacher profile (including the bound soul as
+untrusted nested data), teaching plan, Student context,
+and Dialog context. The source event ID is the generation and Dialog-append
+idempotency key. A generation conflict is resolved through successful-result
+replay. Teacher stores no prompt, variables, raw provider response, or context
+snapshot.
+
+Decision, `teacher.decision.recorded` outbox event, and the generated pending
+body commit atomically. Delivery is a separate idempotent Dialog command. If the
+process crashes after Dialog commits but before Teacher marks delivery, the
+same append key returns the committed message. After validation, Teacher marks
+the job delivered and clears the body. Dependency failures release the lease
+with exponential retry; permanent identity/contract failures become blocked.
+Response delivery does not wait for assistance consumption or mastery updates.
+
+For `lesson`, each active source message carries a required `content_revision`
+and non-empty `selected_text`. Teacher loads current active canonical text from
+Course, requires the revision to match exactly, and verifies that the selected
+text is an exact substring. Full Course text exists only as transient
+verification input; the deterministic plan and AI Prompt receive only the
+verified fragment. A changed revision, forged selection, inactive lesson,
+deleted source, or malformed context fails closed. Course currently has no
+immutable content-history or block identity, so the revision is the current
+lesson `updated_at`; historical replay after an edit is intentionally refused.
+
+`InterventionEngine` consumes bounded interesting-activity observations rather
+than raw telemetry. A registry resolves `balanced`, `quiet`, or `proactive`
+policy by the PersonalTeacher's `intervention_mode`; each implementation has a
+stable code/version and can be replaced at composition. The default balanced
+policy offers help only after at least three consecutive same-error failures
+over at least 480 active seconds. Improving tests and idle time without stuck
+evidence remain silent. Every signal produces a bounded business decision, and
+an offer is delivered idempotently to the same general Dialog at most once per
+analytics session. No LLM is invoked for this consent prompt.
+
+Learning-session summary orchestration joins only two exact bounded
+projections: an ended Student-owned session and its linked Statistic-owned
+analytics summary. A deterministic versioned policy produces the localized
+summary and next step. Teacher persists neither input. It delivers the result
+to the same general Dialog with the Student learning-session UUID as an
+idempotency key, then updates the Student-owned session counters with optimistic
+concurrency. These are separate service calls; after a partial failure, retry
+returns the same Dialog message and completes the Student projection.
+
+For a course-linked ended session, the orchestrator submits a `REPLAN` intent
+to Learning Planner after loading the current Student-owned learner overview.
+The session result returns the planning request ID. Teacher neither reads a
+Course curriculum projection nor computes or writes the next Student path.
+
+The same delegation facade accepts an authenticated student's explicit desired
+outcome, requested provider-neutral targets, and bounded constraints. It ensures
+the student's PersonalTeacher and calls Learning Planner's dedicated Teacher
+route with an idempotency key and optional Dialog/message/decision audit
+references. Learning Planner owns graph traversal, mastery gap calculation,
+course generation, assignment, and path replacement.
+
+Learning Planner publishes terminal `course.plan.completed` and
+`course.plan.failed` outcomes to `LEARNING_PLANNER_EVENTS`. Teacher's durable
+consumer strictly validates the versioned envelope, ignores Student/System-owned
+requests, and accepts each Teacher-owned event into a PostgreSQL inbox. When the
+request includes an originating Dialog, it appends one bounded localized
+business notification using the event ID as the Dialog idempotency key. It does
+not expose provider errors, prompts, or hidden reasoning.
+
+Default-dark product-aware onboarding uses a separate synchronous,
+state-fenced Learning Planner readiness read. Teacher sends only the exact
+Student state reference and accepts strict `learning-readiness.v1`; it never
+sends a profile or graph. After an accepted Student effect, readiness resolves
+before a deterministic response is staged. Recovery first proves the same S3
+receipt. Teacher does not finalize Student state or invoke the S8 planning
+mutation, and model text cannot make product claims.
+
+Default-dark S8 transfers only an exact `READY` result into a Teacher-owned
+durable handoff ledger before the S5 source lease is released. A separate
+worker reuses one stable Planner command until strict `ACCEPTED`, checkpoints
+that result, and then appends one deterministic plain Dialog message with a
+second stable key. Source-bound delivery advances the dense cursor only in the
+same transaction that completes the handoff, turn, job, and interaction. An
+Ensure-origin handoff uses the same ledger without manufacturing a source job.
+Planner acceptance is historical and non-executable (`NOT_STARTED`,
+`NOT_CREATED`); executable planning and atomic current-state reservation are a
+later owner boundary.
+
+Next Best Action is a transient read of `ms-go-student` authority. Teacher reads
+`student-next-action.v1` through the dedicated Student Teacher credential at
+`GET /internal/students/{student_id}/next-action`, and forwards the exact primary,
+secondary actions, reason, status, and provenance through its authenticated
+next-action endpoint. Student owns precedence and the computed decision. Teacher
+has no workspace traversal, fallback action selection, runtime state machine,
+progress mutation, or LLM decision for NBA.
+
+READY carries exactly one primary progression action. WAITING,
+PLANNING_REQUIRED, and NO_PROGRESSION carry no executable primary. Optional
+secondary actions remain separate from progression. Source context/path versions,
+bounded runtime version, and state digest are preserved without local hashing.
+A displayed decision is a snapshot, not a capability: owner commands revalidate
+current invariants after explicit student intent.
+
+Explicit English/Russian questions such as “What should I do now?” and
+“Что мне делать сейчас?” in the general Dialog read Student NBA before prompt
+construction and receive a deterministic explanation without AI Prompt. The
+existing durable job, TeacherDecision/outbox, idempotent Dialog append, and retry
+machinery deliver the explanation. Owner failure blocks/retries this request;
+it never falls through to generation or creates a progression command.
+
+Telegram is an optional transport around the same aggregate and Dialog
+history. An authenticated student creates a short-lived one-time code; Teacher
+stores only its SHA-256 digest and atomically binds a private Telegram user/chat
+to that student's exact PersonalTeacher and general Dialog. Inbound plain text
+uses Telegram `update_id` as deterministic Dialog idempotency evidence, so it
+produces the ordinary `dialog.teacher.requested` pipeline. The source channel is
+stored in the durable teacher job. After the canonical Dialog response commits,
+Teacher idempotently creates one leased Telegram delivery row keyed by source
+message ID. Telegram retry never rebuilds context or calls the model again.
+Dialog remains the only conversation store.
+
+The Bot API does not expose a caller idempotency key. The local queue therefore
+guarantees one durable delivery intent and at-least-once attempts; an ambiguous
+network acknowledgement can duplicate a Telegram transport message, but cannot
+duplicate the Dialog message, teacher decision, or generation.
+
+## Deferred boundaries
+
+No direct Sandbox, raw Validation Orchestrator, or separate Knowledge Tree
+integration is implemented. Practice and project dialogs read only the safe,
+bounded current-task and optional validation-explanation projections from
+Practice Runtime. Course task code reaches Teacher only through Student's
+ownership-checked, bounded, secret-safe transient projection, which carries
+only the latest mutation-invalidated validation/test pass flag, bounded issue
+count, and time; raw test output is intentionally forbidden. Analytics
+integration is asynchronous and bounded to interesting-activity observations;
+raw events remain in Statistic. Course is used only for transient
+lesson-selection verification; whole-lesson tutoring remains deferred until an
+owner can prove student access and active position. The
+closure and dialog pipelines do not resolve a graph: Course or the immutable
+practice catalog revision supplies provider-neutral targets, Student freezes
+them on the action, and Teacher uses those exact references. Learning Planner
+is the sole planning-time owner of the target/prerequisite graph, so a second
+Knowledge Tree service would duplicate ownership. Objective evidence projection
+and mastery reduction remain owned by `ms-go-student`.
+
+## Accepted Hybrid Replanning role (Problem #4)
+
+Under the authoritative [Hybrid Mastery → Replanning decision](https://github.com/bemulima/ms-go-learning-planner/blob/main/docs/hybrid-mastery-replanning.md), Teacher may
+request evaluation with an explicit reason and explain the resulting decision
+from Evidence → Mastery Snapshot → Decision → Path Revision provenance. Student
+coordinates the authoritative snapshot; Planner owns planning policy and
+`NO_CHANGE` / `REPLAN_NEEDED`; Student validates and atomically applies at a safe
+boundary. Teacher owns neither resulting Path computation nor direct Path writes
+and cannot provide student consent for major changes.
+
+This accepted target flow does not add a Teacher endpoint or alter existing
+onboarding/diagnostic delegation. An evaluation request does not promise a Path
+change. `OUT_OF_SCOPE_DEPENDENCY: NEXT_BEST_ACTION` is separate.

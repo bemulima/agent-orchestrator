@@ -1,0 +1,221 @@
+package validators
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+func htmlTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// These explicit wire fixtures test the consumer, not the HTML engine's
+// vendored in-process NATS transport. Never subscribe to its real subject.
+func htmlNamedWireFixture(t *testing.T, body *string) *HTMLValidator {
+	t.Helper()
+	address := os.Getenv("T104_HTML_UNIT_NATS_URL")
+	if address == "" {
+		t.Skip("requires the owned isolated consumer wire-fixture broker")
+	}
+	conn, err := natsgo.Connect(address, natsgo.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("connect named HTML consumer wire fixture: %v", err)
+	}
+	t.Cleanup(conn.Close)
+	subject := "t104.html.consumer.wire." + uuid.NewString()
+	if body != nil {
+		_, err := conn.Subscribe(subject, func(msg *natsgo.Msg) { _ = msg.Respond([]byte(*body)) })
+		if err != nil {
+			t.Fatalf("subscribe named HTML consumer wire fixture: %v", err)
+		}
+		if err := conn.FlushTimeout(2 * time.Second); err != nil {
+			t.Fatalf("flush named HTML consumer wire fixture: %v", err)
+		}
+	}
+	return &HTMLValidator{conn: conn, subject: subject}
+}
+
+func htmlHTTPWireFixture(t *testing.T, status int, body string) *HTMLValidator {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/validate" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return &HTMLValidator{baseURL: server.URL}
+}
+
+func TestHTMLValidatorDirectConsumersRejectProtocolFixtures(t *testing.T) {
+	cases := map[string]string{
+		"missing_outcome":          `{"errors":[]}`,
+		"null_outcome":             `{"isValid":null,"errors":[]}`,
+		"missing_errors":           `{"isValid":true}`,
+		"null_errors":              `{"isValid":true,"errors":null}`,
+		"string_outcome":           `{"isValid":"true","errors":[]}`,
+		"wrong_errors_shape":       `{"isValid":false,"errors":{}}`,
+		"positive_with_errors":     `{"isValid":true,"errors":[{"code":"MISSING_ELEMENT","message":"Element missing"}]}`,
+		"configuration_envelope":   `{"error":{"code":"HTML_RULES_UNAVAILABLE","message":"provider-private-source"}}`,
+		"configuration_with_pass":  `{"error":{"code":"HTML_RULES_UNAVAILABLE","message":"provider-private-source"},"isValid":true,"errors":[]}`,
+		"malformed_json":           `provider-private-source`,
+		"trailing_json":            `{"isValid":true,"errors":[]} {"private":"provider-private-source"}`,
+		"null_response":            `null`,
+		"null_semantic_error":      `{"isValid":false,"errors":[null]}`,
+		"nonobject_semantic_error": `{"isValid":false,"errors":["provider-private-source"]}`,
+		"missing_error_code":       `{"isValid":false,"errors":[{"message":"Element missing"}]}`,
+		"missing_error_message":    `{"isValid":false,"errors":[{"code":"MISSING_ELEMENT"}]}`,
+		"blank_error_code":         `{"isValid":false,"errors":[{"code":" ","message":"Element missing"}]}`,
+		"null_error_message":       `{"isValid":false,"errors":[{"code":"MISSING_ELEMENT","message":null}]}`,
+		"nonstring_error_message":  `{"isValid":false,"errors":[{"code":"MISSING_ELEMENT","message":123}]}`,
+		"malformed_semantic_error": `{"isValid":false,"errors":[{"code":123,"message":"provider-private-source"}]}`,
+	}
+	for name, body := range cases {
+		for _, transport := range []string{"HTTP_named_wire_fixture", "NATS_named_wire_fixture"} {
+			t.Run(transport+"/"+name, func(t *testing.T) {
+				var validator *HTMLValidator
+				if transport == "HTTP_named_wire_fixture" {
+					validator = htmlHTTPWireFixture(t, http.StatusOK, body)
+				} else {
+					validator = htmlNamedWireFixture(t, &body)
+				}
+				result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+				if err == nil || result != nil {
+					t.Fatalf("protocol/config fixture must be technical without learner result: result=%#v error=%v", result, err)
+				}
+				for _, forbidden := range []string{"provider-private", "invalid character", "cannot unmarshal", "unexpected end of JSON"} {
+					if strings.Contains(err.Error(), forbidden) {
+						t.Fatalf("provider body/parser detail exposed: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestHTMLValidatorDirectConsumersPreserveSemanticResults(t *testing.T) {
+	for _, body := range []string{`{"isValid":true,"errors":[]}`, `{"isValid":false,"errors":[]}`, `{"isValid":false,"errors":[{"code":"TEXT_MISMATCH","message":"Text differs","path":"body[0]"}]}`} {
+		for _, transport := range []string{"HTTP_named_wire_fixture", "NATS_named_wire_fixture"} {
+			t.Run(transport+"/"+body, func(t *testing.T) {
+				var validator *HTMLValidator
+				if transport == "HTTP_named_wire_fixture" {
+					validator = htmlHTTPWireFixture(t, http.StatusOK, body)
+				} else {
+					validator = htmlNamedWireFixture(t, &body)
+				}
+				result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+				var expected struct {
+					IsValid bool `json:"isValid"`
+					Errors  []struct {
+						Code string `json:"code"`
+					} `json:"errors"`
+				}
+				_ = json.Unmarshal([]byte(body), &expected)
+				if err != nil || result == nil || result.Valid != expected.IsValid {
+					t.Fatalf("semantic result changed: result=%#v error=%v", result, err)
+				}
+				if len(result.Errors) != len(expected.Errors) || (len(result.Errors) != 0 && result.Errors[0].Code != "TEXT_MISMATCH") {
+					t.Fatalf("semantic learner failure lost: %#v", result)
+				}
+			})
+		}
+	}
+}
+
+func TestHTMLValidatorHTTPNon200DoesNotExposeBody(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		validator := htmlHTTPWireFixture(t, status, `{"error":{"code":"HTML_RULES_REQUIRED","message":"provider-private-source"}}`)
+		result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+		if err == nil || result != nil || strings.Contains(err.Error(), "provider-private-source") || strings.Contains(err.Error(), "HTML_RULES_REQUIRED") {
+			t.Fatalf("non200 must be safe technical error: result=%#v error=%v", result, err)
+		}
+	}
+}
+
+func TestHTMLValidatorDirectConsumersPreserveBlankSemanticMessages(t *testing.T) {
+	for name, message := range map[string]string{"blank": "", "whitespace": " "} {
+		for _, transport := range []string{"HTTP", "NATS"} {
+			t.Run(transport+"/"+name, func(t *testing.T) {
+				data, _ := json.Marshal(map[string]any{"isValid": false, "errors": []any{map[string]string{
+					"code": "TAG_MISMATCH", "message": message, "path": "body[0]",
+				}}})
+				body := string(data)
+				var validator *HTMLValidator
+				if transport == "HTTP" {
+					validator = htmlHTTPWireFixture(t, http.StatusOK, body)
+				} else {
+					validator = htmlNamedWireFixture(t, &body)
+				}
+				result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<h1/>"}})
+				if err != nil || result == nil || result.Valid || len(result.Errors) != 1 {
+					t.Fatalf("authored blank message must remain semantic failure: result=%#v error=%v", result, err)
+				}
+				if result.Errors[0].Code != "TAG_MISMATCH" || result.Errors[0].Message != message {
+					t.Fatalf("authored message changed: %#v", result.Errors[0])
+				}
+			})
+		}
+	}
+}
+
+func TestHTMLValidatorDirectConsumersPreservePathMapping(t *testing.T) {
+	for _, tc := range []struct {
+		transport, providerPath, expectedPath string
+	}{
+		{"HTTP", "", "index.html"},
+		{"HTTP", " body[0] ", "body[0]"},
+		{"NATS", "", ""},
+		{"NATS", " body[0] ", " body[0] "},
+	} {
+		t.Run(tc.transport+"/"+tc.providerPath, func(t *testing.T) {
+			data, _ := json.Marshal(map[string]any{"isValid": false, "errors": []any{map[string]string{
+				"code": "TEXT_MISMATCH", "message": "Text differs", "path": tc.providerPath,
+			}}})
+			body := string(data)
+			var validator *HTMLValidator
+			if tc.transport == "HTTP" {
+				validator = htmlHTTPWireFixture(t, http.StatusOK, body)
+			} else {
+				validator = htmlNamedWireFixture(t, &body)
+			}
+			result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+			if err != nil || result == nil || len(result.Errors) != 1 || result.Errors[0].File != tc.expectedPath {
+				t.Fatalf("existing path mapping changed: result=%#v error=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestHTMLValidatorNamedWireTransportFailuresAreTechnical(t *testing.T) {
+	t.Run("no_responder_fixture_not_engine_proof", func(t *testing.T) {
+		validator := htmlNamedWireFixture(t, nil)
+		result, err := validator.ValidateAll(htmlTestContext(t), "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+		if err == nil || result != nil {
+			t.Fatalf("no responder must be technical: result=%#v error=%v", result, err)
+		}
+	})
+	t.Run("cancelled_context", func(t *testing.T) {
+		validator := htmlNamedWireFixture(t, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result, err := validator.ValidateAll(ctx, "task", []WorkspaceFile{{Path: "index.html", Content: "<main/>"}})
+		if err == nil || result != nil {
+			t.Fatalf("cancelled request must be technical: result=%#v error=%v", result, err)
+		}
+	})
+}

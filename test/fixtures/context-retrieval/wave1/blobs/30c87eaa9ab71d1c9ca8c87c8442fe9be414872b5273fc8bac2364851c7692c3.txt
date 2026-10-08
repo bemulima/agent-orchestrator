@@ -1,0 +1,191 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+type TeacherOnboardingTerminalSessionRepository struct{ Pool *pgxpool.Pool }
+
+func (store TeacherOnboardingTerminalSessionRepository) EnsurePending(ctx context.Context, candidate domain.TeacherOnboardingTerminalSession) (domain.TeacherOnboardingTerminalSession, bool, error) {
+	normalized, err := domain.NormalizeTeacherOnboardingTerminalSession(candidate)
+	if store.Pool == nil || err != nil || normalized.Status != domain.TeacherOnboardingTerminalMessagePending {
+		return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	tx, err := store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err = lockOnboardingDialog(ctx, tx, normalized.DialogID); err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	existing, found, err := scanOptionalTeacherOnboardingTerminalSession(tx.QueryRow(ctx, teacherOnboardingTerminalSessionColumns+` WHERE student_id=$1 FOR UPDATE`, normalized.StudentID))
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	if found {
+		if !sameTeacherOnboardingTerminalSessionIdentity(existing, normalized) {
+			return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return domain.TeacherOnboardingTerminalSession{}, false, err
+		}
+		return existing, false, nil
+	}
+	interaction, interactionFound, err := scanOptionalTeacherOnboardingInteraction(tx.QueryRow(ctx, teacherOnboardingInteractionColumns+`
+WHERE dialog_id=$1 AND personal_teacher_id=$2 AND state IN ('active','reserved')
+ORDER BY interaction_id LIMIT 1 FOR UPDATE
+`, normalized.DialogID, normalized.PersonalTeacherID))
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	if interactionFound {
+		if interaction.StudentID != normalized.StudentID || interaction.SessionSchemaVersion != 3 {
+			return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+		}
+		if interaction.State == domain.TeacherOnboardingInteractionReserved {
+			return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingBusy
+		}
+		var actionPending bool
+		if err = tx.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM teacher_onboarding_action_receipt
+ WHERE student_id=$1 AND dialog_id=$2 AND personal_teacher_id=$3
+   AND source_message_id=$4 AND source_message_version=$5
+   AND status IN ('claimed','applied','materialized'))
+`, normalized.StudentID, normalized.DialogID, normalized.PersonalTeacherID, interaction.PromptMessageID, interaction.PromptMessageVersion).Scan(&actionPending); err != nil {
+			return domain.TeacherOnboardingTerminalSession{}, false, err
+		}
+		if actionPending {
+			return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingBusy
+		}
+		closed, closeErr := tx.Exec(ctx, `UPDATE teacher_onboarding_interaction SET state='closed',closed_reason='active_path_exists',closed_at=$2,updated_at=$2 WHERE interaction_id=$1 AND state='active'`, interaction.ID, normalized.CreatedAt)
+		if closeErr != nil || closed.RowsAffected() != 1 {
+			if closeErr != nil {
+				return domain.TeacherOnboardingTerminalSession{}, false, closeErr
+			}
+			return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingConflict
+		}
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_terminal_session (
+ terminal_session_id,student_id,personal_teacher_id,dialog_id,session_schema_version,state_ref_kind,state_ref_version,
+ terminal_kind,terminal_message_command_id,status,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'message_pending',$10,$10)
+ON CONFLICT DO NOTHING
+`, normalized.ID, normalized.StudentID, normalized.PersonalTeacherID, normalized.DialogID, normalized.SessionSchemaVersion,
+		normalized.StateRef.Kind, normalized.StateRef.Version, normalized.TerminalKind, normalized.TerminalMessageCommandID, normalized.CreatedAt)
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	stored, err := scanTeacherOnboardingTerminalSession(tx.QueryRow(ctx, teacherOnboardingTerminalSessionColumns+` WHERE student_id=$1`, normalized.StudentID))
+	if err != nil || !sameTeacherOnboardingTerminalSessionIdentity(stored, normalized) {
+		if err != nil {
+			return domain.TeacherOnboardingTerminalSession{}, false, err
+		}
+		return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	return stored, command.RowsAffected() == 1, nil
+}
+
+func (store TeacherOnboardingTerminalSessionRepository) FindOnlyRecoverableForStudent(ctx context.Context, studentID string) (domain.TeacherOnboardingTerminalSession, bool, error) {
+	if store.Pool == nil || !validUUIDString(studentID) {
+		return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrInvalidTeacherOnboarding
+	}
+	rows, err := store.Pool.Query(ctx, teacherOnboardingTerminalSessionColumns+` WHERE student_id=$1 ORDER BY terminal_session_id LIMIT 2`, studentID)
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	defer rows.Close()
+	var record domain.TeacherOnboardingTerminalSession
+	count := 0
+	for rows.Next() {
+		record, err = scanTeacherOnboardingTerminalSession(rows)
+		if err != nil {
+			return domain.TeacherOnboardingTerminalSession{}, false, err
+		}
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, false, err
+	}
+	if count > 1 {
+		return domain.TeacherOnboardingTerminalSession{}, false, domain.ErrTeacherOnboardingHistoricalSessionUnavailable
+	}
+	return record, count == 1, nil
+}
+
+func (store TeacherOnboardingTerminalSessionRepository) MarkDelivered(ctx context.Context, id, dialogMessageID string, now time.Time) (domain.TeacherOnboardingTerminalSession, error) {
+	if store.Pool == nil || !validUUIDString(id) || !validUUIDString(dialogMessageID) || now.IsZero() {
+		return domain.TeacherOnboardingTerminalSession{}, domain.ErrInvalidTeacherOnboarding
+	}
+	existing, err := scanTeacherOnboardingTerminalSession(store.Pool.QueryRow(ctx, teacherOnboardingTerminalSessionColumns+` WHERE terminal_session_id=$1`, id))
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, err
+	}
+	if existing.Status == domain.TeacherOnboardingTerminalDelivered {
+		if existing.DialogMessageID != dialogMessageID {
+			return domain.TeacherOnboardingTerminalSession{}, domain.ErrTeacherOnboardingConflict
+		}
+		return existing, nil
+	}
+	command, err := store.Pool.Exec(ctx, `UPDATE teacher_onboarding_terminal_session SET status='delivered',dialog_message_id=$2,delivered_at=$3,updated_at=$3 WHERE terminal_session_id=$1 AND status='message_pending'`, id, dialogMessageID, now.UTC())
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, err
+	}
+	if command.RowsAffected() != 1 {
+		stored, readErr := scanTeacherOnboardingTerminalSession(store.Pool.QueryRow(ctx, teacherOnboardingTerminalSessionColumns+` WHERE terminal_session_id=$1`, id))
+		if readErr == nil && stored.Status == domain.TeacherOnboardingTerminalDelivered && stored.DialogMessageID == dialogMessageID {
+			return stored, nil
+		}
+		if readErr != nil {
+			return domain.TeacherOnboardingTerminalSession{}, readErr
+		}
+		return domain.TeacherOnboardingTerminalSession{}, domain.ErrTeacherOnboardingConflict
+	}
+	return scanTeacherOnboardingTerminalSession(store.Pool.QueryRow(ctx, teacherOnboardingTerminalSessionColumns+` WHERE terminal_session_id=$1`, id))
+}
+
+const teacherOnboardingTerminalSessionColumns = `SELECT
+terminal_session_id::text,student_id,personal_teacher_id::text,dialog_id::text,session_schema_version,
+state_ref_kind,state_ref_version,terminal_kind,terminal_message_command_id::text,status,dialog_message_id::text,
+created_at,updated_at,delivered_at
+FROM teacher_onboarding_terminal_session`
+
+func scanTeacherOnboardingTerminalSession(row teacherOnboardingRow) (domain.TeacherOnboardingTerminalSession, error) {
+	var record domain.TeacherOnboardingTerminalSession
+	var dialogMessageID *string
+	var deliveredAt *time.Time
+	err := row.Scan(&record.ID, &record.StudentID, &record.PersonalTeacherID, &record.DialogID, &record.SessionSchemaVersion,
+		&record.StateRef.Kind, &record.StateRef.Version, &record.TerminalKind, &record.TerminalMessageCommandID, &record.Status,
+		&dialogMessageID, &record.CreatedAt, &record.UpdatedAt, &deliveredAt)
+	if err != nil {
+		return domain.TeacherOnboardingTerminalSession{}, err
+	}
+	record.DialogMessageID = valueOrEmpty(dialogMessageID)
+	record.DeliveredAt = timeOrZero(deliveredAt)
+	return domain.NormalizeTeacherOnboardingTerminalSession(record)
+}
+
+func scanOptionalTeacherOnboardingTerminalSession(row teacherOnboardingRow) (domain.TeacherOnboardingTerminalSession, bool, error) {
+	record, err := scanTeacherOnboardingTerminalSession(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherOnboardingTerminalSession{}, false, nil
+	}
+	return record, err == nil, err
+}
+
+func sameTeacherOnboardingTerminalSessionIdentity(left, right domain.TeacherOnboardingTerminalSession) bool {
+	return left.ID == right.ID && left.StudentID == right.StudentID && left.PersonalTeacherID == right.PersonalTeacherID &&
+		left.DialogID == right.DialogID && left.SessionSchemaVersion == right.SessionSchemaVersion && left.StateRef == right.StateRef &&
+		left.TerminalKind == right.TerminalKind && left.TerminalMessageCommandID == right.TerminalMessageCommandID
+}

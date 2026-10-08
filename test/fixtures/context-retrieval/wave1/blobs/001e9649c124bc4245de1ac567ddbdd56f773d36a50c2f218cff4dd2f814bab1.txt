@@ -1,0 +1,484 @@
+package aiprompt
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+const (
+	maximumRequestBytes          = 8 << 20
+	maximumResponseBytes         = 256 << 10
+	maximumSummaryVariablesBytes = 128 << 10
+	maximumSummaryResponseBytes  = 128 << 10
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+type confidentialExecutionRequest struct {
+	IdempotencyKey string                      `json:"idempotency_key"`
+	TemplateCode   string                      `json:"template_code"`
+	LanguageCode   string                      `json:"language_code"`
+	Variables      confidentialPromptVariables `json:"variables"`
+}
+
+type confidentialPromptVariables struct {
+	TeacherProfile map[string]any `json:"teacher_profile"`
+	TeachingPlan   map[string]any `json:"teaching_plan"`
+	StudentContext map[string]any `json:"student_context"`
+	DialogContext  map[string]any `json:"dialog_context"`
+}
+
+type confidentialExecutionResponse struct {
+	ExecutionID        string `json:"execution_id"`
+	IdempotencyKey     string `json:"idempotency_key"`
+	TemplateCode       string `json:"template_code"`
+	TemplateVersion    int    `json:"template_version"`
+	ProviderCode       string `json:"provider_code"`
+	ProviderModel      string `json:"provider_model"`
+	LanguageCode       string `json:"language_code"`
+	ResponseSchemaCode string `json:"response_schema_code"`
+	ParsedResponse     struct {
+		Body string `json:"body"`
+	} `json:"parsed_response"`
+	Cached    bool      `json:"cached"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type summaryExecutionRequest struct {
+	IdempotencyKey string                 `json:"idempotency_key"`
+	TemplateCode   string                 `json:"template_code"`
+	LanguageCode   string                 `json:"language_code"`
+	Variables      summaryPromptVariables `json:"variables"`
+}
+
+type summaryPromptVariables struct {
+	Scope        summaryPromptScope     `json:"scope"`
+	PriorSummary any                    `json:"prior_summary"`
+	Messages     []summaryPromptMessage `json:"messages"`
+}
+
+type summaryPromptScope struct {
+	ScopeType   string                     `json:"scope_type"`
+	ScopeID     string                     `json:"scope_id"`
+	ContextType domain.LearningContextType `json:"context_type"`
+	ContextID   string                     `json:"context_id,omitempty"`
+}
+
+type summaryPromptMessage struct {
+	Sequence   int64                          `json:"sequence"`
+	AuthorType domain.DialogMessageAuthorType `json:"author_type"`
+	Excerpt    string                         `json:"excerpt"`
+}
+
+type summaryExecutionResponse struct {
+	ExecutionID        string                              `json:"execution_id"`
+	IdempotencyKey     string                              `json:"idempotency_key"`
+	TemplateCode       string                              `json:"template_code"`
+	TemplateVersion    int                                 `json:"template_version"`
+	ProviderCode       string                              `json:"provider_code"`
+	ProviderModel      string                              `json:"provider_model"`
+	LanguageCode       string                              `json:"language_code"`
+	ResponseSchemaCode string                              `json:"response_schema_code"`
+	ParsedResponse     domain.TeacherContextSummaryPayload `json:"parsed_response"`
+	Cached             bool                                `json:"cached"`
+	CreatedAt          time.Time                           `json:"created_at"`
+	ExpiresAt          time.Time                           `json:"expires_at"`
+}
+
+func (client Client) Generate(
+	ctx context.Context,
+	input domain.TeacherGenerationRequest,
+) (domain.TeacherGeneratedResponse, error) {
+	normalized, err := domain.NewTeacherGenerationRequest(input)
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	variables := promptVariables(normalized)
+	variablesJSON, err := json.Marshal(variables)
+	if err != nil || len(variablesJSON) > domain.TeacherResponseVariablesMaximumBytes ||
+		utf8.RuneCount(variablesJSON) > domain.TeacherResponseVariablesMaximumRunes {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	payload, err := json.Marshal(confidentialExecutionRequest{
+		IdempotencyKey: normalized.IdempotencyKey,
+		TemplateCode:   domain.TeacherResponseTemplateCode,
+		LanguageCode:   normalized.LanguageCode,
+		Variables:      variables,
+	})
+	if err != nil || len(payload) > maximumRequestBytes {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	endpoint, err := client.endpoint("/api/v1/prompts/execute-confidential")
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, unavailable()
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherGeneratedResponse{}, mapGenerateStatus(response.StatusCode)
+	}
+	result, err := decodeResponse(response.Body)
+	if err != nil || result.IdempotencyKey != normalized.IdempotencyKey || result.LanguageCode != normalized.LanguageCode {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	return result, nil
+}
+
+func (client Client) Summarize(
+	ctx context.Context,
+	input domain.TeacherContextSummarizationRequest,
+) (domain.TeacherContextSummaryPayload, error) {
+	normalized, err := domain.NormalizeTeacherContextSummarizationRequest(input)
+	if err != nil {
+		return domain.TeacherContextSummaryPayload{}, err
+	}
+	messages := make([]summaryPromptMessage, 0, len(normalized.Messages))
+	for _, message := range normalized.Messages {
+		messages = append(messages, summaryPromptMessage{
+			Sequence: message.MessageSequence, AuthorType: message.AuthorType, Excerpt: message.Body,
+		})
+	}
+	prior := any(map[string]any{})
+	if normalized.PriorSummary != nil {
+		prior = *normalized.PriorSummary
+	}
+	variables := summaryPromptVariables{
+		Scope: summaryPromptScope{
+			ScopeType: "dialog", ScopeID: normalized.Scope.DialogID,
+			ContextType: normalized.Scope.ContextType, ContextID: normalized.Scope.ContextID,
+		},
+		PriorSummary: prior, Messages: messages,
+	}
+	variablesJSON, err := json.Marshal(variables)
+	if err != nil || len(variablesJSON) > maximumSummaryVariablesBytes {
+		return domain.TeacherContextSummaryPayload{}, domain.ErrInvalidTeacherContextSummary
+	}
+	payload, err := json.Marshal(summaryExecutionRequest{
+		IdempotencyKey: normalized.IdempotencyKey, TemplateCode: domain.TeacherContextSummarySchemaCode,
+		LanguageCode: normalized.LanguageCode, Variables: variables,
+	})
+	if err != nil || len(payload) > maximumResponseBytes {
+		return domain.TeacherContextSummaryPayload{}, domain.ErrInvalidTeacherContextSummary
+	}
+	endpoint, err := client.endpoint("/api/v1/prompts/execute-confidential")
+	if err != nil {
+		return domain.TeacherContextSummaryPayload{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.TeacherContextSummaryPayload{}, domain.ErrTeacherGenerationUnavailable
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherContextSummaryPayload{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusUnprocessableEntity {
+			return domain.TeacherContextSummaryPayload{}, domain.ErrInvalidTeacherContextSummary
+		}
+		return domain.TeacherContextSummaryPayload{}, domain.ErrTeacherGenerationUnavailable
+	}
+	result, err := decodeSummaryResponse(response.Body)
+	_, executionIDErr := uuid.Parse(result.ExecutionID)
+	if err != nil || executionIDErr != nil || result.IdempotencyKey != normalized.IdempotencyKey ||
+		result.TemplateCode != domain.TeacherContextSummarySchemaCode ||
+		result.ResponseSchemaCode != domain.TeacherContextSummarySchemaCode ||
+		result.LanguageCode != normalized.LanguageCode || result.TemplateVersion < 1 ||
+		strings.TrimSpace(result.ProviderCode) == "" || len(strings.TrimSpace(result.ProviderCode)) > 64 ||
+		strings.TrimSpace(result.ProviderModel) == "" || len(strings.TrimSpace(result.ProviderModel)) > 128 ||
+		result.CreatedAt.IsZero() || result.ExpiresAt.IsZero() || !result.ExpiresAt.After(result.CreatedAt) {
+		return domain.TeacherContextSummaryPayload{}, domain.ErrInvalidTeacherContextSummary
+	}
+	return domain.NormalizeTeacherContextSummaryPayload(result.ParsedResponse)
+}
+
+func (client Client) Replay(ctx context.Context, idempotencyKey string) (domain.TeacherGeneratedResponse, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	endpoint, err := client.endpoint(
+		"/api/v1/prompts/confidential-executions/" + url.PathEscape(idempotencyKey),
+	)
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, unavailable()
+	}
+	client.authorize(request)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusNotFound {
+			return domain.TeacherGeneratedResponse{}, domain.ErrTeacherGenerationNotFound
+		}
+		if response.StatusCode == http.StatusBadRequest {
+			return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+		}
+		return domain.TeacherGeneratedResponse{}, unavailable()
+	}
+	result, err := decodeResponse(response.Body)
+	if err != nil || result.IdempotencyKey != idempotencyKey || !result.Cached {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	return result, nil
+}
+
+func promptVariables(input domain.TeacherGenerationRequest) confidentialPromptVariables {
+	mastery := make([]map[string]any, 0, len(input.Student.RelevantMastery))
+	for _, item := range input.Student.RelevantMastery {
+		mastery = append(mastery, map[string]any{
+			"target": item.Target, "state": item.State, "mastery_score": item.MasteryScore,
+			"confidence": item.Confidence, "independent_success_count": item.IndependentSuccessCount,
+			"assisted_success_count": item.AssistedSuccessCount, "failure_count": item.FailureCount,
+			"evidence_count": item.EvidenceCount, "last_seen_at": item.LastSeenAt,
+			"last_practiced_at": item.LastPracticedAt, "last_failed_at": item.LastFailedAt,
+			"policy_version": item.PolicyVersion,
+		})
+	}
+	messages := make([]map[string]any, 0, len(input.PromptContext.Messages))
+	for _, message := range input.PromptContext.Messages {
+		messages = append(messages, map[string]any{
+			"author_type": message.AuthorType, "body": message.Body,
+			"message_sequence": message.MessageSequence,
+			"is_source":        message.IsSource,
+		})
+	}
+	plan := map[string]any{
+		"policy_version": input.Plan.PolicyVersion, "method_code": input.Plan.MethodCode,
+		"method_version": input.Plan.MethodVersion, "teaching_mode": input.Plan.TeachingMode,
+		"strategy": input.Plan.Strategy, "stage": input.Plan.Stage,
+		"action": input.Plan.Action, "hint_level": input.Plan.HintLevel,
+		"guidance": input.Plan.Guidance, "allow_complete_solution": input.Plan.AllowCompleteSolution,
+		"reason_code": input.Plan.ReasonCode, "reason_summary": input.Plan.ReasonSummary,
+	}
+	dialogContext := map[string]any{
+		"context_type": input.Dialog.ContextType, "context_id": input.Dialog.ContextID,
+		"learning_action_id": input.Dialog.LearningActionID, "messages": messages,
+	}
+	if input.PromptContext.ProvisionalSummary != nil {
+		dialogContext["provisional_summary"] = input.PromptContext.ProvisionalSummary
+	}
+	if input.Lesson != nil {
+		lessonContext := map[string]any{
+			"schema": input.Lesson.Schema, "mode": input.Lesson.Mode,
+			"course_id": input.Lesson.CourseID, "lesson_id": input.Lesson.LessonID,
+			"language": input.Lesson.Language, "content_revision": input.Lesson.ContentRevision,
+		}
+		if input.Lesson.Schema == domain.LessonMessageContextSchemaVersionV2 {
+			delete(lessonContext, "language")
+			lessonContext["learning_path_id"] = input.Lesson.LearningPathID
+			lessonContext["learning_path_item_id"] = input.Lesson.LearningPathItemID
+			lessonContext["content_digest"] = input.Lesson.ContentDigest
+		}
+		if input.Lesson.SectionID != "" {
+			lessonContext["section_id"] = input.Lesson.SectionID
+		}
+		if input.Lesson.Mode == domain.LessonMessageModeOverview {
+			lessonContext["title"] = input.Lesson.Title
+			lessonContext["excerpt"] = input.Lesson.Excerpt
+		} else {
+			lessonContext["selected_text"] = input.Lesson.SelectedText
+		}
+		dialogContext["lesson_context"] = lessonContext
+	}
+	var onboarding any
+	if input.Student.Onboarding != nil {
+		onboarding = map[string]any{
+			"direction_code":           input.Student.Onboarding.DirectionCode,
+			"self_assessed_experience": input.Student.Onboarding.SelfAssessedExperience,
+			"known_stacks":             input.Student.Onboarding.KnownStacks, "desired_stacks": input.Student.Onboarding.DesiredStacks,
+			"goal_code": input.Student.Onboarding.GoalCode, "goal_text": input.Student.Onboarding.GoalText,
+			"preferred_language": input.Student.Onboarding.PreferredLanguage,
+			"weekly_minutes":     input.Student.Onboarding.WeeklyMinutes, "preferred_pace": input.Student.Onboarding.PreferredPace,
+		}
+	}
+	var learningPath any
+	if input.Student.LearningPath != nil {
+		learningPath = map[string]any{
+			"course_id": input.Student.LearningPath.CourseID, "goal_code": input.Student.LearningPath.GoalCode,
+			"curriculum_revision": input.Student.LearningPath.CurriculumRevision,
+			"reason_code":         input.Student.LearningPath.ReasonCode, "reason_summary": input.Student.LearningPath.ReasonSummary,
+			"version": input.Student.LearningPath.Version, "items": input.Student.LearningPath.Items,
+		}
+	}
+	var diagnostic any
+	if input.Student.Diagnostic != nil {
+		diagnostic = map[string]any{
+			"curriculum_revision": input.Student.Diagnostic.CurriculumRevision,
+			"policy_version":      input.Student.Diagnostic.PolicyVersion,
+			"items":               input.Student.Diagnostic.Items, "completed_at": input.Student.Diagnostic.CompletedAt,
+		}
+	}
+	var codeContext any
+	if input.Student.CodeContext != nil {
+		codeContext = map[string]any{
+			"available": input.Student.CodeContext.Available, "files": input.Student.CodeContext.Files,
+			"omitted_file_count": input.Student.CodeContext.OmittedFileCount,
+			"truncated":          input.Student.CodeContext.Truncated, "policy_version": input.Student.CodeContext.PolicyVersion,
+			"validation": input.Student.CodeContext.Validation,
+		}
+	}
+	var practiceTask any
+	if input.Student.PracticeTask != nil {
+		practiceTaskValue := map[string]any{
+			"task_instance_id": input.Student.PracticeTask.TaskInstanceID,
+			"task_revision_id": input.Student.PracticeTask.TaskRevisionID,
+			"locale":           input.Student.PracticeTask.Locale, "status": input.Student.PracticeTask.Status,
+			"step":              input.Student.PracticeTask.Step,
+			"assistance_policy": input.Student.PracticeTask.AssistancePolicy,
+			"workspace":         input.Student.PracticeTask.Workspace,
+			"validation":        input.Student.PracticeTask.Validation,
+		}
+		if input.Student.PracticeValidation != nil {
+			practiceTaskValue["validation_explanation"] = map[string]any{
+				"schema":              input.Student.PracticeValidation.Schema,
+				"submission_id":       input.Student.PracticeValidation.SubmissionID,
+				"workspace_digest":    input.Student.PracticeValidation.WorkspaceDigest,
+				"updated_at":          input.Student.PracticeValidation.UpdatedAt,
+				"passed":              input.Student.PracticeValidation.Passed,
+				"teacher_explanation": input.Student.PracticeValidation.TeacherExplanation,
+			}
+		}
+		practiceTask = practiceTaskValue
+	}
+	return confidentialPromptVariables{
+		TeacherProfile: map[string]any{
+			"teacher_profile_id": input.Teacher.TeacherProfileID, "language": input.Teacher.Language,
+			"communication_style": input.Teacher.CommunicationStyle,
+			"pedagogy_profile":    input.Teacher.PedagogyProfile, "hint_policy": input.Teacher.HintPolicy,
+			"intervention_mode": input.Teacher.InterventionMode, "version": input.Teacher.Version,
+			"soul": map[string]any{
+				"display_name": input.Soul.DisplayName, "persona_code": input.Soul.PersonaCode,
+				"voice_style": input.Soul.VoiceStyle, "relationship_style": input.Soul.RelationshipStyle,
+				"encouragement_style": input.Soul.EncouragementStyle, "version": input.Soul.Version,
+			},
+		},
+		TeachingPlan: plan,
+		StudentContext: map[string]any{
+			"learning_action_id": input.Student.LearningActionID, "task_id": input.Student.TaskID,
+			"context_type": input.Student.ContextType, "context_id": input.Student.ContextID,
+			"learning_targets": input.Student.LearningTargets, "relevant_mastery": mastery,
+			"onboarding": onboarding, "learning_path": learningPath, "diagnostic": diagnostic,
+			"recent_sessions": input.Student.RecentSessions, "code_context": codeContext,
+			"practice_task": practiceTask,
+		},
+		DialogContext: dialogContext,
+	}
+}
+
+func decodeSummaryResponse(reader io.Reader) (summaryExecutionResponse, error) {
+	limited := &io.LimitedReader{R: reader, N: maximumSummaryResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	var payload summaryExecutionResponse
+	if err := decoder.Decode(&payload); err != nil {
+		return summaryExecutionResponse{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || limited.N == 0 {
+		return summaryExecutionResponse{}, domain.ErrInvalidTeacherContextSummary
+	}
+	return payload, nil
+}
+
+func decodeResponse(reader io.Reader) (domain.TeacherGeneratedResponse, error) {
+	limited := &io.LimitedReader{R: reader, N: maximumResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
+	var payload confidentialExecutionResponse
+	if err := decoder.Decode(&payload); err != nil {
+		return domain.TeacherGeneratedResponse{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || limited.N == 0 {
+		return domain.TeacherGeneratedResponse{}, domain.ErrInvalidTeacherGeneration
+	}
+	return domain.NewTeacherGeneratedResponse(domain.TeacherGeneratedResponse{
+		ExecutionID: payload.ExecutionID, IdempotencyKey: payload.IdempotencyKey,
+		TemplateCode: payload.TemplateCode, TemplateVersion: payload.TemplateVersion,
+		ProviderCode: payload.ProviderCode, ProviderModel: payload.ProviderModel,
+		LanguageCode: payload.LanguageCode, ResponseSchemaCode: payload.ResponseSchemaCode,
+		Body: payload.ParsedResponse.Body, Cached: payload.Cached,
+		CreatedAt: payload.CreatedAt, ExpiresAt: payload.ExpiresAt,
+	})
+}
+
+func (client Client) endpoint(path string) (string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(client.BaseURL), "/")
+	if baseURL == "" || strings.TrimSpace(client.InternalToken) == "" {
+		return "", unavailable()
+	}
+	parsed, err := url.ParseRequestURI(baseURL + path)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", unavailable()
+	}
+	return parsed.String(), nil
+}
+
+func (client Client) authorize(request *http.Request) {
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+}
+
+func (client Client) do(request *http.Request) (*http.Response, error) {
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 70 * time.Second}
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return nil, unavailable()
+	}
+	return response, nil
+}
+
+func mapGenerateStatus(statusCode int) error {
+	switch statusCode {
+	case http.StatusConflict:
+		return domain.ErrTeacherGenerationConflict
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return domain.ErrInvalidTeacherGeneration
+	default:
+		return unavailable()
+	}
+}
+
+func unavailable() error {
+	return domain.ErrTeacherGenerationUnavailable
+}
+
+var _ repository.TeacherResponseGenerator = Client{}
+var _ repository.TeacherContextSummarizer = Client{}

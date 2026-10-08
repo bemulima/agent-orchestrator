@@ -1,0 +1,483 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var _ repository.StudentOnboardingTurnRepository = (*StudentOnboardingRepoPG)(nil)
+
+type onboardingTurnReceipt struct {
+	StudentCommandID          string
+	StudentID                 string
+	DialogID                  string
+	PersonalTeacherID         string
+	TeacherTurnSequence       int64
+	CanonicalStudentMessageID string
+	ActionReceiptID           *string
+	SourceEventID             string
+	DialogCausationID         string
+	TeacherJobID              string
+	AIExecutionID             *string
+	CorrelationID             string
+	CausationID               string
+	RequestHash               string
+	StudentEffectState        domain.StudentOnboardingTurnEffectState
+	ResultDraftVersion        *int64
+	ResultProfileVersion      *int64
+	NoEffectProofID           *string
+}
+
+func (repo *StudentOnboardingRepoPG) ApplyOnboardingTurn(
+	ctx context.Context,
+	command domain.StudentOnboardingTurnCommand,
+	effectsEnabled bool,
+) (domain.StudentOnboardingTurnResult, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingTurnResult{}, false, errors.New("student onboarding turn repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentOnboardingTurn(command)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+	command = normalized
+	if !validOnboardingTurnCommand(command) {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, command.StudentID); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	if err := lockOnboardingTurn(ctx, tx, command.StudentCommandID, command.CanonicalStudentMessageID, command.StudentID); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	receipt, err := getOnboardingTurnReceipt(ctx, tx, command.StudentID, command.StudentCommandID)
+	if err == nil {
+		if !onboardingTurnReceiptMatchesCommand(receipt, command) {
+			return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+		}
+		result := onboardingTurnResult(receipt)
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentOnboardingTurnResult{}, false, err
+		}
+		return result, true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	if !effectsEnabled {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrForbidden
+	}
+
+	draft, err := getStudentOnboardingDraft(ctx, tx, command.StudentID, true)
+	createdAt := command.OccurredAt
+	if errors.Is(err, domain.ErrNotFound) {
+		if command.ExpectedDraftVersion != 0 || command.FinalizeCurrentV1 {
+			return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+		}
+	} else if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	} else if draft.Status != domain.StudentOnboardingDraftStatusDraft || draft.Version != command.ExpectedDraftVersion {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+	} else {
+		createdAt = *draft.CreatedAt
+	}
+	patch, err := command.DraftAnswerPatch()
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+	candidate := mergeOnboardingTurnDraft(command.StudentID, draft, patch, command.ExpectedDraftVersion+1, createdAt, command.OccurredAt)
+	candidate, err = domain.NormalizeStudentOnboardingDraft(candidate)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+
+	var resultProfileVersion *int64
+	if command.FinalizeCurrentV1 {
+		storedProfile, profileErr := getStudentOnboardingForUpdate(ctx, tx, command.StudentID)
+		profileCreatedAt, nextProfileVersion := command.OccurredAt, int64(1)
+		profileExists := profileErr == nil
+		switch {
+		case errors.Is(profileErr, domain.ErrNotFound):
+			if command.ExpectedProfileVersion == nil || *command.ExpectedProfileVersion != 0 {
+				return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+			}
+		case profileErr != nil:
+			return domain.StudentOnboardingTurnResult{}, false, profileErr
+		default:
+			if command.ExpectedProfileVersion == nil || storedProfile.Version != *command.ExpectedProfileVersion {
+				return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+			}
+			profileCreatedAt, nextProfileVersion = storedProfile.CreatedAt, storedProfile.Version+1
+		}
+		profile, buildErr := domain.BuildStudentOnboardingFromDraft(candidate, nextProfileVersion, profileCreatedAt, command.OccurredAt)
+		if buildErr != nil {
+			return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+		}
+		if err := saveStudentOnboardingInTransaction(ctx, tx, profile, *command.ExpectedProfileVersion, profileExists); err != nil {
+			return domain.StudentOnboardingTurnResult{}, false, err
+		}
+		completedAt := command.OccurredAt
+		if err := completeOnboardingTurnDraft(ctx, tx, candidate, profile.Version, completedAt, command.ExpectedDraftVersion); err != nil {
+			return domain.StudentOnboardingTurnResult{}, false, err
+		}
+		resultProfileVersion = int64Ptr(profile.Version)
+	} else if err := saveOnboardingTurnDraft(ctx, tx, candidate, command.ExpectedDraftVersion); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+
+	resultDraftVersion := candidate.Version
+	receipt = onboardingTurnReceipt{
+		StudentCommandID: command.StudentCommandID, StudentID: command.StudentID,
+		DialogID: command.DialogID, PersonalTeacherID: command.PersonalTeacherID, TeacherTurnSequence: command.TeacherTurnSequence,
+		CanonicalStudentMessageID: command.CanonicalStudentMessageID, ActionReceiptID: command.ActionReceiptID,
+		SourceEventID: command.SourceEventID, DialogCausationID: command.DialogCausationID, TeacherJobID: command.TeacherJobID, AIExecutionID: command.AIExecutionID,
+		CorrelationID: command.CorrelationID, CausationID: command.CausationID, RequestHash: command.RequestHash,
+		StudentEffectState: domain.StudentOnboardingTurnEffectAccepted, ResultDraftVersion: &resultDraftVersion,
+		ResultProfileVersion: resultProfileVersion,
+	}
+	if err := insertOnboardingTurnReceipt(ctx, tx, receipt, command.ExpectedDraftVersion, command.ExpectedProfileVersion, command.FinalizeCurrentV1, command.OccurredAt); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	for _, slot := range command.Slots {
+		if err := insertOnboardingTurnProvenance(ctx, tx, command, slot, candidate.Version, resultProfileVersion); err != nil {
+			return domain.StudentOnboardingTurnResult{}, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	return onboardingTurnResult(receipt), false, nil
+}
+
+func (repo *StudentOnboardingRepoPG) GetOnboardingTurn(
+	ctx context.Context,
+	studentID, commandID string,
+) (domain.StudentOnboardingTurnResult, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingTurnResult{}, errors.New("student onboarding turn repository pool is required")
+	}
+	receipt, err := getOnboardingTurnReceipt(ctx, repo.Pool, studentID, commandID)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, err
+	}
+	return onboardingTurnResult(receipt), nil
+}
+
+func (repo *StudentOnboardingRepoPG) ProveOnboardingTurnNoEffect(
+	ctx context.Context,
+	proof domain.StudentOnboardingTurnNoEffectProof,
+) (domain.StudentOnboardingTurnResult, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentOnboardingTurnResult{}, false, errors.New("student onboarding turn repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentOnboardingTurnNoEffectProof(proof)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+	proof = normalized
+	if !validOnboardingTurnProof(proof) {
+		return domain.StudentOnboardingTurnResult{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command := proof.Command
+	if err := lockStudentAdmissionFence(ctx, tx, command.StudentID); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	if err := lockOnboardingTurn(ctx, tx, command.StudentCommandID, command.CanonicalStudentMessageID, command.StudentID); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	receipt, err := getOnboardingTurnReceipt(ctx, tx, command.StudentID, command.StudentCommandID)
+	if err == nil {
+		if !onboardingTurnReceiptMatchesProof(receipt, proof) {
+			return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+		}
+		// A durable accepted effect is never evidence of no effect.  Keeping this
+		// distinct prevents a delayed recovery worker from treating an already
+		// applied command as a no_effect terminal outcome.
+		if receipt.StudentEffectState != domain.StudentOnboardingTurnEffectNoEffect {
+			return domain.StudentOnboardingTurnResult{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentOnboardingTurnResult{}, false, err
+		}
+		return onboardingTurnResult(receipt), true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	proofID := uuid.NewString()
+	receipt = onboardingTurnReceipt{
+		StudentCommandID: command.StudentCommandID, StudentID: command.StudentID,
+		DialogID: command.DialogID, PersonalTeacherID: command.PersonalTeacherID, TeacherTurnSequence: command.TeacherTurnSequence,
+		CanonicalStudentMessageID: command.CanonicalStudentMessageID, ActionReceiptID: command.ActionReceiptID,
+		SourceEventID: command.SourceEventID, DialogCausationID: command.DialogCausationID, TeacherJobID: command.TeacherJobID, AIExecutionID: command.AIExecutionID,
+		CorrelationID: command.CorrelationID, CausationID: command.CausationID, RequestHash: command.RequestHash,
+		StudentEffectState: domain.StudentOnboardingTurnEffectNoEffect, NoEffectProofID: &proofID,
+	}
+	if err := insertOnboardingTurnReceipt(ctx, tx, receipt, 0, nil, false, proof.OccurredAt); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentOnboardingTurnResult{}, false, err
+	}
+	return onboardingTurnResult(receipt), false, nil
+}
+
+func saveOnboardingTurnDraft(ctx context.Context, tx pgx.Tx, draft domain.StudentOnboardingDraft, expectedVersion int64) error {
+	if expectedVersion == 0 {
+		result, err := tx.Exec(ctx, `INSERT INTO student_onboarding_draft (`+studentOnboardingDraftColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+ON CONFLICT (student_id) DO NOTHING`, onboardingDraftValues(draft)...)
+		if err != nil {
+			return mapOnboardingTurnError(err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	result, err := tx.Exec(ctx, `UPDATE student_onboarding_draft SET
+schema_version=$2, status=$3, direction_code=$4, self_assessed_experience=$5,
+known_stacks=$6, desired_stacks=$7, goal_code=$8, goal_text=$9,
+preferred_language=$10, weekly_minutes=$11, preferred_pace=$12,
+version=$13, completed_profile_version=$14, created_at=$15, updated_at=$16, completed_at=$17
+WHERE student_id=$1 AND version=$18 AND status='DRAFT'`, append(onboardingDraftValues(draft), expectedVersion)...)
+	if err != nil {
+		return mapOnboardingTurnError(err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func completeOnboardingTurnDraft(ctx context.Context, tx pgx.Tx, candidate domain.StudentOnboardingDraft, profileVersion int64, completedAt time.Time, expectedVersion int64) error {
+	result, err := tx.Exec(ctx, `UPDATE student_onboarding_draft SET
+status='COMPLETED', direction_code=NULL, self_assessed_experience=NULL,
+known_stacks=NULL, desired_stacks=NULL, goal_code=NULL, goal_text=NULL,
+preferred_language=NULL, weekly_minutes=NULL, preferred_pace=NULL,
+version=$2, completed_profile_version=$3, updated_at=$4, completed_at=$4
+WHERE student_id=$1 AND version=$5 AND status='DRAFT'`, candidate.StudentID, candidate.Version, profileVersion, completedAt, expectedVersion)
+	if err != nil {
+		return mapOnboardingTurnError(err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	if _, err := tx.Exec(ctx, `UPDATE student_onboarding_draft_command
+SET response_json='{"redacted":true}'::jsonb
+WHERE student_id=$1 AND command_kind='REPLACE'`, candidate.StudentID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func mergeOnboardingTurnDraft(studentID string, current domain.StudentOnboardingDraft, patch domain.StudentOnboardingDraftAnswers, version int64, createdAt, updatedAt time.Time) domain.StudentOnboardingDraft {
+	answers := current.StudentOnboardingDraftAnswers
+	if patch.DirectionCode != nil {
+		answers.DirectionCode = patch.DirectionCode
+	}
+	if patch.SelfAssessedExperience != nil {
+		answers.SelfAssessedExperience = patch.SelfAssessedExperience
+	}
+	if patch.KnownStacks != nil {
+		answers.KnownStacks = patch.KnownStacks
+	}
+	if patch.DesiredStacks != nil {
+		answers.DesiredStacks = patch.DesiredStacks
+	}
+	if patch.GoalCode != nil {
+		answers.GoalCode = patch.GoalCode
+	}
+	if patch.GoalText != nil {
+		answers.GoalText = patch.GoalText
+	}
+	if patch.PreferredLanguage != nil {
+		answers.PreferredLanguage = patch.PreferredLanguage
+	}
+	if patch.WeeklyMinutes != nil {
+		answers.WeeklyMinutes = patch.WeeklyMinutes
+	}
+	if patch.PreferredPace != nil {
+		answers.PreferredPace = patch.PreferredPace
+	}
+	return domain.StudentOnboardingDraft{
+		Schema: domain.StudentOnboardingDraftSchema, StudentID: studentID, Status: domain.StudentOnboardingDraftStatusDraft,
+		StudentOnboardingDraftAnswers: answers, Version: version, CreatedAt: &createdAt, UpdatedAt: &updatedAt,
+	}
+}
+
+func insertOnboardingTurnProvenance(ctx context.Context, tx pgx.Tx, command domain.StudentOnboardingTurnCommand, slot domain.StudentOnboardingTurnSlot, draftVersion int64, profileVersion *int64) error {
+	var previous *string
+	if err := tx.QueryRow(ctx, `SELECT provenance_id::text FROM student_onboarding_turn_provenance
+WHERE student_id=$1 AND slot_code=$2 ORDER BY created_at DESC, provenance_id DESC LIMIT 1`, command.StudentID, slot.SlotCode).Scan(&previous); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	var sourceMessageID, actionReceiptID, aiExecutionID any
+	switch slot.Origin {
+	case domain.StudentOnboardingTurnOriginExplicitUI:
+		sourceMessageID, actionReceiptID = command.CanonicalStudentMessageID, command.ActionReceiptID
+	case domain.StudentOnboardingTurnOriginExplicitText:
+		sourceMessageID, aiExecutionID = command.CanonicalStudentMessageID, command.AIExecutionID
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO student_onboarding_turn_provenance
+(provenance_id,student_command_id,student_id,canonical_student_message_id,slot_code,code_value,text_value,stacks_value,integer_value,
+origin,confidence_basis_points,default_rule_code,source_message_id,action_receipt_id,ai_execution_id,
+supersedes_provenance_id,accepted_draft_version,accepted_profile_version,created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		uuid.NewString(), command.StudentCommandID, command.StudentID, command.CanonicalStudentMessageID, slot.SlotCode,
+		slot.CodeValue, slot.TextValue, slot.StacksValue, slot.IntegerValue, slot.Origin, slot.ConfidenceBasisPoints,
+		slot.DefaultRuleCode, sourceMessageID, actionReceiptID, aiExecutionID, previous, draftVersion, profileVersion, command.OccurredAt)
+	return mapOnboardingTurnError(err)
+}
+
+func insertOnboardingTurnReceipt(ctx context.Context, tx pgx.Tx, receipt onboardingTurnReceipt, expectedDraftVersion int64, expectedProfileVersion *int64, finalize bool, occurredAt time.Time) error {
+	_, err := tx.Exec(ctx, `INSERT INTO student_onboarding_turn_command
+
+(student_command_id,student_id,dialog_id,personal_teacher_id,teacher_turn_sequence,canonical_student_message_id,
+action_receipt_id,source_event_id,dialog_causation_id,teacher_job_id,ai_execution_id,correlation_id,causation_id,
+request_hash,expected_draft_version,expected_profile_version,finalize_current_v1,student_effect_state,
+result_draft_version,result_profile_version,no_effect_proof_id,created_at,accepted_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		receipt.StudentCommandID, receipt.StudentID, receipt.DialogID, receipt.PersonalTeacherID, receipt.TeacherTurnSequence,
+		receipt.CanonicalStudentMessageID, receipt.ActionReceiptID, receipt.SourceEventID, receipt.DialogCausationID,
+		receipt.TeacherJobID, receipt.AIExecutionID, receipt.CorrelationID, receipt.CausationID, receipt.RequestHash,
+		nullableExpectedDraft(receipt.StudentEffectState, expectedDraftVersion), expectedProfileVersion, finalize,
+		receipt.StudentEffectState, receipt.ResultDraftVersion, receipt.ResultProfileVersion, receipt.NoEffectProofID, occurredAt,
+		nullableAcceptedAt(receipt.StudentEffectState, occurredAt))
+	return mapOnboardingTurnError(err)
+}
+
+func getOnboardingTurnReceipt(ctx context.Context, querier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, studentID, commandID string) (onboardingTurnReceipt, error) {
+	var receipt onboardingTurnReceipt
+	err := querier.QueryRow(ctx, `SELECT student_command_id::text,student_id::text,dialog_id::text,personal_teacher_id::text,
+teacher_turn_sequence,canonical_student_message_id::text,action_receipt_id::text,source_event_id::text,
+dialog_causation_id::text,teacher_job_id::text,ai_execution_id::text,correlation_id::text,
+causation_id::text,request_hash,student_effect_state,result_draft_version,result_profile_version,no_effect_proof_id::text
+FROM student_onboarding_turn_command WHERE student_id=$1 AND student_command_id=$2`, studentID, commandID).Scan(
+		&receipt.StudentCommandID, &receipt.StudentID, &receipt.DialogID, &receipt.PersonalTeacherID, &receipt.TeacherTurnSequence,
+		&receipt.CanonicalStudentMessageID, &receipt.ActionReceiptID, &receipt.SourceEventID, &receipt.DialogCausationID,
+		&receipt.TeacherJobID, &receipt.AIExecutionID, &receipt.CorrelationID, &receipt.CausationID,
+		&receipt.RequestHash, &receipt.StudentEffectState, &receipt.ResultDraftVersion, &receipt.ResultProfileVersion, &receipt.NoEffectProofID,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return onboardingTurnReceipt{}, domain.ErrNotFound
+	}
+	return receipt, err
+}
+
+func lockOnboardingTurn(ctx context.Context, tx pgx.Tx, commandID, canonicalMessageID, studentID string) error {
+	for _, key := range []string{
+		"onboarding-turn-command:" + commandID,
+		"onboarding-turn-canonical:" + canonicalMessageID,
+		// This must remain byte-for-byte the legacy Student draft key: it
+		// serializes v2 virtual-v0 reads and writes with v1 replace/finalize.
+		"onboarding-draft-student:" + studentID,
+	} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func onboardingTurnResult(receipt onboardingTurnReceipt) domain.StudentOnboardingTurnResult {
+	return domain.StudentOnboardingTurnResult{Schema: domain.StudentOnboardingTurnResultSchema,
+		StudentCommandID: receipt.StudentCommandID, CanonicalStudentMessageID: receipt.CanonicalStudentMessageID,
+		StudentEffectState: receipt.StudentEffectState, ResultDraftVersion: copyTurnInt64(receipt.ResultDraftVersion),
+		ResultProfileVersion: copyTurnInt64(receipt.ResultProfileVersion), NoEffectProofID: copyTurnString(receipt.NoEffectProofID)}
+}
+
+func onboardingTurnReceiptMatchesCommand(receipt onboardingTurnReceipt, command domain.StudentOnboardingTurnCommand) bool {
+	return receipt.StudentID == command.StudentID && receipt.StudentCommandID == command.StudentCommandID &&
+		receipt.DialogID == command.DialogID && receipt.PersonalTeacherID == command.PersonalTeacherID && receipt.TeacherTurnSequence == command.TeacherTurnSequence &&
+		receipt.CanonicalStudentMessageID == command.CanonicalStudentMessageID && receipt.SourceEventID == command.SourceEventID && receipt.DialogCausationID == command.DialogCausationID &&
+		receipt.TeacherJobID == command.TeacherJobID && receipt.CorrelationID == command.CorrelationID &&
+		receipt.CausationID == command.CausationID && receipt.RequestHash == command.RequestHash &&
+		turnStringEqual(receipt.ActionReceiptID, command.ActionReceiptID) && turnStringEqual(receipt.AIExecutionID, command.AIExecutionID)
+}
+
+func onboardingTurnReceiptMatchesProof(receipt onboardingTurnReceipt, proof domain.StudentOnboardingTurnNoEffectProof) bool {
+	return onboardingTurnReceiptMatchesCommand(receipt, proof.Command)
+}
+
+func validOnboardingTurnCommand(command domain.StudentOnboardingTurnCommand) bool {
+	return validOnboardingTurnID(command.StudentID) && validOnboardingTurnID(command.StudentCommandID) &&
+		validOnboardingTurnHash(command.RequestHash) && !command.OccurredAt.IsZero()
+}
+
+func validOnboardingTurnProof(proof domain.StudentOnboardingTurnNoEffectProof) bool {
+	return validOnboardingTurnCommand(proof.Command) && !proof.OccurredAt.IsZero()
+}
+
+func validOnboardingTurnID(value string) bool { _, err := uuid.Parse(value); return err == nil }
+func validOnboardingTurnHash(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(strings.TrimSpace(value)) {
+		return false
+	}
+	for _, current := range value {
+		if (current < '0' || current > '9') && (current < 'a' || current > 'f') {
+			return false
+		}
+	}
+	return true
+}
+func nullableExpectedDraft(state domain.StudentOnboardingTurnEffectState, value int64) any {
+	if state == domain.StudentOnboardingTurnEffectNoEffect {
+		return nil
+	}
+	return value
+}
+func nullableAcceptedAt(state domain.StudentOnboardingTurnEffectState, value time.Time) any {
+	if state == domain.StudentOnboardingTurnEffectNoEffect {
+		return nil
+	}
+	return value
+}
+func int64Ptr(value int64) *int64 { return &value }
+func copyTurnInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
+}
+func copyTurnString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
+}
+func turnStringEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+func mapOnboardingTurnError(err error) error {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+		return domain.ErrConflict
+	}
+	return err
+}

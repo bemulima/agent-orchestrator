@@ -1,0 +1,401 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
+)
+
+const NextActionSchema = "student-next-action.v1"
+const NextActionPolicyVersion = "student-next-action-policy.v1"
+
+// NextActionSnapshot extends the existing selected-workspace read responsibility.
+// It is input only: resolution never persists or executes a command.
+type NextActionSnapshot struct {
+	StudentID           string
+	Context             StudentLearningContext
+	SelectedPath        *StudentLearningPath
+	LifecycleReason     string
+	Bindings            []PracticeLearningActionBinding
+	Answers             []NextActionAnswerState
+	BindingRequirements map[string]LessonRequirement
+}
+type NextActionAnswerState struct {
+	LearningPathItemID, RequirementID, AnswerID string
+	Status                                      int
+}
+type NextActionTarget struct {
+	AnswerID           string `json:"answer_id,omitempty"`
+	LearningPathID     string `json:"learning_path_id,omitempty"`
+	CourseID           string `json:"course_id,omitempty"`
+	LearningPathItemID string `json:"learning_path_item_id,omitempty"`
+	LessonID           string `json:"lesson_id,omitempty"`
+	RequirementID      string `json:"requirement_id,omitempty"`
+	TaskID             string `json:"task_id,omitempty"`
+	PracticeRevisionID string `json:"practice_revision_id,omitempty"`
+	TaskInstanceID     string `json:"task_instance_id,omitempty"`
+	StepID             string `json:"step_id,omitempty"`
+	MilestoneID        string `json:"milestone_id,omitempty"`
+	SubmissionID       string `json:"submission_id,omitempty"`
+	SubmissionScope    string `json:"submission_scope,omitempty"`
+}
+type NextAction struct {
+	Kind   string           `json:"kind"`
+	Target NextActionTarget `json:"target"`
+}
+type NextActionVersions struct {
+	ContextVersion int64  `json:"context_version"`
+	PathVersion    int64  `json:"path_version"`
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+	StateDigest    string `json:"state_digest"`
+}
+type StudentNextAction struct {
+	Schema           string             `json:"schema"`
+	PolicyVersion    string             `json:"policy_version"`
+	Status           string             `json:"status"`
+	Primary          *NextAction        `json:"primary,omitempty"`
+	SecondaryActions []NextAction       `json:"secondary_actions"`
+	ReasonCode       string             `json:"reason_code"`
+	SourceVersions   NextActionVersions `json:"source_versions"`
+}
+
+// PracticeExecutionProjection contains no Runtime state-machine enums, private
+// validation payload, workspace pointer, or capability.
+type PracticeExecutionProjection struct {
+	Schema             string   `json:"schema"`
+	StudentID          string   `json:"student_id"`
+	TaskInstanceID     string   `json:"task_instance_id"`
+	LearningActionID   string   `json:"learning_action_id"`
+	TaskRevisionID     string   `json:"task_revision_id"`
+	TaskRevisionDigest string   `json:"task_revision_digest"`
+	LearningPathID     string   `json:"learning_path_id,omitempty"`
+	LearningPathItemID string   `json:"learning_path_item_id,omitempty"`
+	RequirementID      string   `json:"requirement_id,omitempty"`
+	Status             string   `json:"status"`
+	SuggestedAction    string   `json:"suggested_action,omitempty"`
+	AvailableActions   []string `json:"available_actions"`
+	ReasonCode         string   `json:"reason_code"`
+	Version            string   `json:"version"`
+	StepID             string   `json:"step_id,omitempty"`
+	MilestoneID        string   `json:"milestone_id,omitempty"`
+	SubmissionID       string   `json:"submission_id,omitempty"`
+	SubmissionScope    string   `json:"submission_scope,omitempty"`
+}
+
+func IsPracticeProgressionAction(kind string) bool {
+	switch kind {
+	case "START_PRACTICE_LEARNING", "START_PRACTICE", "RESUME_PRACTICE", "SUBMIT_PRACTICE", "REVIEW_VALIDATION_RESULT", "RETRY_PRACTICE":
+		return true
+	}
+	return false
+}
+func RequiredNextActionBinding(s NextActionSnapshot, b PracticeLearningActionBinding) bool {
+	if b.LifecycleStatus != PracticeLearningActionOpen && b.LifecycleStatus != PracticeLearningActionReserved {
+		return false
+	}
+	if b.RequirementID == "" {
+		return true
+	}
+	if requirement, ok := s.BindingRequirements[b.LearningPathItemID+":"+b.RequirementID]; ok {
+		return requirement.Required && !requirement.Satisfied
+	}
+	if s.SelectedPath == nil || b.LearningPathID != s.SelectedPath.ID {
+		return true
+	}
+	for _, i := range s.SelectedPath.Items {
+		if i.ID != b.LearningPathItemID {
+			continue
+		}
+		for _, r := range i.FrozenRequirements {
+			if r.ID == b.RequirementID {
+				return r.Required && !r.Satisfied
+			}
+		}
+	}
+	return true
+}
+
+// ResolveNextAction centralizes deterministic precedence. Runtime facts are
+// owner-provided bounded facts validated by the use case before this pure call.
+func ResolveNextAction(s NextActionSnapshot, projections map[string]PracticeExecutionProjection) StudentNextAction {
+	out := StudentNextAction{Schema: NextActionSchema, PolicyVersion: NextActionPolicyVersion, SecondaryActions: []NextAction{}, SourceVersions: NextActionVersions{ContextVersion: s.Context.Version}}
+	raw, _ := json.Marshal(struct {
+		Snapshot NextActionSnapshot
+		Runtime  map[string]PracticeExecutionProjection
+	}{s, projections})
+	sum := sha256.Sum256(raw)
+	out.SourceVersions.StateDigest = "sha256:" + hex.EncodeToString(sum[:])
+	target := NextActionTarget{}
+	if s.SelectedPath != nil {
+		target.LearningPathID = s.SelectedPath.ID
+		target.CourseID = s.SelectedPath.CourseID
+		out.SourceVersions.PathVersion = s.SelectedPath.Version
+	}
+	decide := func(status, kind, reason string, t NextActionTarget) StudentNextAction {
+		out.Status = status
+		out.ReasonCode = reason
+		if kind != "" {
+			out.Primary = &NextAction{Kind: kind, Target: t}
+		}
+		if status == "READY" || status == "WAITING" {
+			out.SecondaryActions = append(out.SecondaryActions, NextAction{Kind: "ASK_TEACHER", Target: t})
+		}
+		return out
+	}
+	if s.LifecycleReason != "" && s.LifecycleReason != "path_completed" {
+		if s.LifecycleReason == "planning_in_progress" {
+			return decide("WAITING", "", s.LifecycleReason, target)
+		}
+		return decide("PLANNING_REQUIRED", "", s.LifecycleReason, target)
+	}
+	// An already active required execution takes precedence over route selection
+	// and over any lower-priority unsatisfied requirement.
+	bindings := append([]PracticeLearningActionBinding(nil), s.Bindings...)
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].TaskInstanceID < bindings[j].TaskInstanceID })
+	required := []PracticeLearningActionBinding{}
+	for _, b := range bindings {
+		if RequiredNextActionBinding(s, b) {
+			required = append(required, b)
+		}
+	}
+	// Blocking executions win first; ties are stable by immutable instance ID.
+	sort.SliceStable(required, func(i, j int) bool {
+		pi, oki := projections[required[i].TaskInstanceID]
+		pj, okj := projections[required[j].TaskInstanceID]
+		return (!oki || pi.Status == "BLOCKED") && (okj && pj.Status != "BLOCKED")
+	})
+	answers := append([]NextActionAnswerState(nil), s.Answers...)
+	sort.Slice(answers, func(i, j int) bool {
+		if (answers[i].Status == StudentTaskAnswerStatusUnderReview) != (answers[j].Status == StudentTaskAnswerStatusUnderReview) {
+			return answers[i].Status == StudentTaskAnswerStatusUnderReview
+		}
+		if answers[i].LearningPathItemID != answers[j].LearningPathItemID {
+			return answers[i].LearningPathItemID < answers[j].LearningPathItemID
+		}
+		return answers[i].RequirementID < answers[j].RequirementID
+	})
+	officialBlocked := func() *NextActionTarget {
+		if s.SelectedPath == nil {
+			return nil
+		}
+		for _, a := range answers {
+			if a.Status != StudentTaskAnswerStatusUnderReview {
+				continue
+			}
+			for _, i := range s.SelectedPath.Items {
+				if i.ID != a.LearningPathItemID || i.Status == LearningPathItemCompleted || i.Status == LearningPathItemSkippedMastered {
+					continue
+				}
+				for _, r := range i.FrozenRequirements {
+					if r.ID == a.RequirementID && r.Required && !r.Satisfied {
+						t := target
+						t.LearningPathItemID = i.ID
+						t.LessonID = i.ReferenceID
+						t.RequirementID = r.ID
+						t.TaskID = r.SourceReference.ID
+						t.AnswerID = a.AnswerID
+						return &t
+					}
+				}
+			}
+		}
+		return nil
+	}
+	if len(required) > 0 {
+		b := required[0]
+		t := target
+		t.LearningPathID = b.LearningPathID
+		if s.SelectedPath == nil || b.LearningPathID != s.SelectedPath.ID {
+			t.CourseID = ""
+		}
+		t.LearningPathItemID = b.LearningPathItemID
+		t.RequirementID = b.RequirementID
+		t.PracticeRevisionID = b.TaskRevisionID
+		t.TaskInstanceID = b.TaskInstanceID
+		if s.SelectedPath != nil && b.LearningPathID != "" && b.LearningPathID != s.SelectedPath.ID {
+			return decide("WAITING", "", "active_activity_other_path", t)
+		}
+		p, ok := projections[b.TaskInstanceID]
+		if !ok {
+			return decide("WAITING", "", "runtime_unavailable", t)
+		}
+		out.SourceVersions.RuntimeVersion = p.Version
+		t.StepID = p.StepID
+		t.MilestoneID = p.MilestoneID
+		t.SubmissionID = p.SubmissionID
+		t.SubmissionScope = p.SubmissionScope
+		if p.Status == "BLOCKED" {
+			return decide("WAITING", "", p.ReasonCode, t)
+		}
+		if p.Status == "COMPLETED" {
+			return decide("WAITING", "", "completion_evidence_pending", t)
+		}
+		if p.Status == "CANCELLED" {
+			return decide("WAITING", "", "runtime_binding_reconciliation_required", t)
+		}
+		if p.Status != "READY" || !IsPracticeProgressionAction(p.SuggestedAction) {
+			return decide("WAITING", "", "runtime_projection_invalid", t)
+		}
+		if pending := officialBlocked(); pending != nil {
+			return decide("WAITING", "", "official_review_pending", *pending)
+		}
+		for _, a := range p.AvailableActions {
+			if a != p.SuggestedAction && IsPracticeProgressionAction(a) {
+				out.SecondaryActions = append(out.SecondaryActions, NextAction{Kind: a, Target: t})
+			}
+		}
+		if s.SelectedPath != nil && b.LearningPathItemID != "" {
+			t.LessonID = ""
+			for _, i := range s.SelectedPath.Items {
+				if i.ID == b.LearningPathItemID && i.ReferenceType == "lesson" {
+					t.LessonID = i.ReferenceID
+					out.SecondaryActions = append(out.SecondaryActions, NextAction{Kind: "REVIEW_LESSON", Target: t})
+				}
+			}
+		}
+		return decide("READY", p.SuggestedAction, p.ReasonCode, t)
+	}
+	if pending := officialBlocked(); pending != nil {
+		return decide("WAITING", "", "official_review_pending", *pending)
+	}
+	if s.SelectedPath == nil {
+		if s.LifecycleReason == "path_completed" {
+			return decide("NO_PROGRESSION", "", "path_completed", target)
+		}
+		return decide("PLANNING_REQUIRED", "", "planning_required", target)
+	}
+	path := s.SelectedPath
+	if path.Status != LearningPathStatusActive {
+		return decide("NO_PROGRESSION", "", "path_inactive", target)
+	}
+	var item *LearningPathItem
+	for n := range path.Items {
+		if path.Items[n].Status == LearningPathItemInProgress {
+			item = &path.Items[n]
+			break
+		}
+	}
+	if item == nil {
+		for n := range path.Items {
+			i := &path.Items[n]
+			if i.Status == LearningPathItemCompleted || i.Status == LearningPathItemSkippedMastered {
+				continue
+			}
+			if i.Status == LearningPathItemReady || i.Status == LearningPathItemPlanned {
+				item = i
+			}
+			break
+		}
+	}
+	if item == nil {
+		return decide("NO_PROGRESSION", "", "path_items_completed", target)
+	}
+	target.LearningPathItemID = item.ID
+	if item.ReferenceType == "practice" {
+		target.PracticeRevisionID = item.ReferenceID
+		if item.Status == LearningPathItemInProgress {
+			return decide("WAITING", "", "runtime_binding_missing", target)
+		}
+		return decide("READY", "START_PRACTICE", "practice_not_started", target)
+	}
+	target.LessonID = item.ReferenceID
+	// Required in-flight official Course assessment takes priority over other
+	// unsatisfied requirements; Student is already this activity's runtime owner.
+	for _, answer := range answers {
+		if answer.LearningPathItemID != item.ID {
+			continue
+		}
+		required := false
+		quiz := false
+		for _, r := range item.FrozenRequirements {
+			if r.ID == answer.RequirementID && r.Required && !r.Satisfied {
+				required = true
+				quiz = r.Type == "quiz_passed"
+				target.TaskID = r.SourceReference.ID
+			}
+		}
+		if !required {
+			continue
+		}
+		if answer.Status == StudentTaskAnswerStatusUnderReview {
+			target.RequirementID = answer.RequirementID
+			target.AnswerID = answer.AnswerID
+			return decide("WAITING", "", "official_review_pending", target)
+		}
+		if answer.Status == StudentTaskAnswerStatusInProgress {
+			target.RequirementID = answer.RequirementID
+			target.AnswerID = answer.AnswerID
+			kind := "CONTINUE_TASK"
+			if quiz {
+				kind = "TAKE_QUIZ"
+			}
+			return decide("READY", kind, "official_attempt_active", target)
+		}
+	}
+
+	requirements := []LessonRequirement{}
+	for _, r := range item.FrozenRequirements {
+		if r.Required && !r.Satisfied {
+			requirements = append(requirements, r)
+		}
+	}
+	priority := func(kind string) int {
+		switch kind {
+		case "theory_acknowledged":
+			return 0
+		case "quiz_passed":
+			return 1
+		case "task_passed":
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.Slice(requirements, func(i, j int) bool {
+		a, b := priority(requirements[i].Type), priority(requirements[j].Type)
+		if a != b {
+			return a < b
+		}
+		return requirements[i].ID < requirements[j].ID
+	})
+	if len(requirements) > 0 {
+		r := requirements[0]
+		target.RequirementID = r.ID
+		for _, answer := range answers {
+			if answer.LearningPathItemID == item.ID && answer.RequirementID == r.ID {
+				target.AnswerID = answer.AnswerID
+				if answer.Status == StudentTaskAnswerStatusFailed || answer.Status == StudentTaskAnswerStatusRejected {
+					target.TaskID = r.SourceReference.ID
+					return decide("READY", "RETRY_TASK", "official_attempt_failed", target)
+				}
+				if answer.Status == StudentTaskAnswerStatusPassed {
+					return decide("WAITING", "", "completion_evidence_pending", target)
+				}
+			}
+		}
+		switch r.Type {
+		case "theory_acknowledged":
+			if item.Status != LearningPathItemInProgress {
+				return decide("READY", "START_LESSON", "theory_required", target)
+			}
+			return decide("READY", "CONTINUE_LESSON", "theory_required", target)
+		case "quiz_passed":
+			target.TaskID = r.SourceReference.ID
+			return decide("READY", "TAKE_QUIZ", "quiz_required", target)
+		case "task_passed":
+			target.TaskID = r.SourceReference.ID
+			return decide("READY", "START_TASK", "task_required", target)
+		case "practice_completed":
+			target.PracticeRevisionID = r.SourceReference.ID
+			return decide("READY", "START_PRACTICE", "practice_required", target)
+		}
+	}
+	if len(item.FrozenRequirements) > 0 {
+		return decide("WAITING", "", "lesson_completion_pending", target)
+	}
+	if item.Status == LearningPathItemInProgress {
+		return decide("READY", "CONTINUE_LESSON", "lesson_active", target)
+	}
+	return decide("READY", "START_LESSON", "lesson_ready", target)
+}

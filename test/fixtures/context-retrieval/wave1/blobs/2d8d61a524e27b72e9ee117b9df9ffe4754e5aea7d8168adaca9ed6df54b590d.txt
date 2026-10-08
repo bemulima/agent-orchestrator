@@ -1,0 +1,574 @@
+package student
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+type LearningJourneyClock interface{ Now() time.Time }
+type LearningJourneyIDGenerator interface{ NewID() string }
+
+type ReplaceLearningPathInput struct {
+	ExpectedOnboardingVersion int64
+	ExpectedDirectionCode     string
+	StudentID                 string
+	PlanningRequestID         string
+	IdempotencyKey            string
+	CourseID                  string
+	GoalCode                  string
+	CurriculumRevision        string
+	PlannerPolicyVersion      string
+	ReasonCode                string
+	ReasonSummary             string
+	ExpectedVersion           int64
+	Items                     []domain.LearningPathItem
+}
+
+type ReplaceLearningPath struct {
+	Revisions LessonRevisionProvider
+	Journey   repository.LearningJourneyRepository
+	Clock     LearningJourneyClock
+	IDs       LearningJourneyIDGenerator
+}
+
+type CompleteLearningPathInput struct {
+	StudentID            string
+	GoalCode             string
+	CourseFingerprint    string
+	PlannerPolicyVersion string
+	ReasonCode           string
+	ReasonSummary        string
+	ExpectedVersion      int64
+}
+
+type CompleteLearningPath struct {
+	Journey repository.LearningJourneyRepository
+	Clock   LearningJourneyClock
+}
+
+func (useCase CompleteLearningPath) Handle(
+	ctx context.Context,
+	input CompleteLearningPathInput,
+) (domain.StudentLearningPath, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.GoalCode = strings.ToLower(strings.TrimSpace(input.GoalCode))
+	input.CourseFingerprint = strings.TrimSpace(input.CourseFingerprint)
+	input.PlannerPolicyVersion = strings.TrimSpace(input.PlannerPolicyVersion)
+	input.ReasonCode = strings.ToLower(strings.TrimSpace(input.ReasonCode))
+	input.ReasonSummary = strings.TrimSpace(input.ReasonSummary)
+	if useCase.Journey == nil || useCase.Clock == nil || !validStudentUUID(input.StudentID) ||
+		input.ExpectedVersion < 1 || input.GoalCode == "" || input.CourseFingerprint == "" ||
+		input.PlannerPolicyVersion == "" || input.ReasonCode != "mastery_no_gap" || input.ReasonSummary == "" {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	current, err := useCase.Journey.GetLearningPath(ctx, input.StudentID)
+	if err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	if current.Version != input.ExpectedVersion || current.GoalCode != input.GoalCode ||
+		current.CourseFingerprint != input.CourseFingerprint {
+		return domain.StudentLearningPath{}, domain.ErrConflict
+	}
+	alreadyCompleted := current.ReasonCode == input.ReasonCode
+	for _, item := range current.Items {
+		if item.Status != domain.LearningPathItemCompleted && item.Status != domain.LearningPathItemSkippedMastered {
+			alreadyCompleted = false
+			break
+		}
+	}
+	if alreadyCompleted {
+		return current, nil
+	}
+	for index := range current.Items {
+		if current.Items[index].Status == domain.LearningPathItemCompleted ||
+			current.Items[index].Status == domain.LearningPathItemSkippedMastered {
+			continue
+		}
+		current.Items[index].Status = domain.LearningPathItemSkippedMastered
+		current.Items[index].ReasonCode = input.ReasonCode
+	}
+	current.PlannerPolicyVersion = input.PlannerPolicyVersion
+	current.ReasonCode = input.ReasonCode
+	current.ReasonSummary = input.ReasonSummary
+	current.Version++
+	current.UpdatedAt = useCase.Clock.Now().UTC()
+	normalized, err := domain.NormalizeStudentLearningPath(current)
+	if err != nil {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	return useCase.Journey.ReplaceLearningPath(ctx, normalized, input.ExpectedVersion)
+}
+
+func (useCase ReplaceLearningPath) Handle(ctx context.Context, input ReplaceLearningPathInput) (domain.StudentLearningPath, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.PlanningRequestID = strings.TrimSpace(input.PlanningRequestID)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	if useCase.Journey == nil || useCase.Clock == nil || useCase.IDs == nil || !validStudentUUID(input.StudentID) || input.ExpectedVersion < 0 {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	idempotentCreate := input.PlanningRequestID != "" || input.IdempotencyKey != ""
+	input.ExpectedDirectionCode = strings.TrimSpace(input.ExpectedDirectionCode)
+	fenced := input.ExpectedOnboardingVersion != 0 || input.ExpectedDirectionCode != ""
+	if fenced && (!idempotentCreate || input.ExpectedVersion != 0 || input.ExpectedOnboardingVersion < 1 || input.ExpectedDirectionCode == "") {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	if idempotentCreate && (input.ExpectedVersion != 0 || !validStudentUUID(input.PlanningRequestID) || !validStudentUUID(input.IdempotencyKey)) {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	var existingItems []domain.LearningPathItem
+	var originalHash string
+	if useCase.Revisions != nil && idempotentCreate {
+		originalHash = learningPathCreationRequestHash(domain.StudentLearningPath{StudentID: input.StudentID, CourseID: input.CourseID, GoalCode: input.GoalCode, CourseFingerprint: input.CurriculumRevision, PlannerPolicyVersion: input.PlannerPolicyVersion, ReasonCode: input.ReasonCode, ReasonSummary: input.ReasonSummary, Items: input.Items}, repository.LearningPathCreationRequest{ExpectedOnboardingVersion: input.ExpectedOnboardingVersion, ExpectedDirectionCode: input.ExpectedDirectionCode})
+		if reader, ok := useCase.Journey.(interface {
+			ReplayLearningPathCreation(context.Context, string, string, string, string) (domain.StudentLearningPath, bool, error)
+		}); ok {
+			stored, replayed, err := reader.ReplayLearningPathCreation(ctx, input.StudentID, input.IdempotencyKey, input.PlanningRequestID, originalHash)
+			if err != nil {
+				return domain.StudentLearningPath{}, err
+			}
+			if replayed {
+				return stored, nil
+			}
+		}
+	}
+	now := useCase.Clock.Now().UTC()
+	pathID := useCase.IDs.NewID()
+	createdAt := now
+	status := domain.LearningPathStatusActive
+	isPrimary := input.ExpectedVersion == 0 && !idempotentCreate
+	if input.ExpectedVersion > 0 {
+		current, err := useCase.Journey.GetLearningPath(ctx, input.StudentID)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if current.Version != input.ExpectedVersion {
+			return domain.StudentLearningPath{}, domain.ErrConflict
+		}
+		existingItems = current.Items
+		pathID, createdAt = current.ID, current.CreatedAt
+		status, isPrimary = current.Status, current.IsPrimary
+	}
+	if useCase.Revisions != nil {
+		seed := input.PlanningRequestID
+		if seed == "" {
+			seed = pathID
+		}
+		var err error
+		input.Items, err = freezeLessonItems(ctx, useCase.Revisions, input.Items, seed, existingItems)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+	}
+	path, err := domain.NormalizeStudentLearningPath(domain.StudentLearningPath{
+		ID: pathID, StudentID: input.StudentID, CourseID: input.CourseID, GoalCode: input.GoalCode,
+		CurriculumRevision: input.CurriculumRevision, PolicyVersion: domain.LearningPathPolicyVersion,
+		PlannerPolicyVersion: input.PlannerPolicyVersion,
+		ReasonCode:           input.ReasonCode, ReasonSummary: input.ReasonSummary, Version: input.ExpectedVersion + 1,
+		Status: status, IsPrimary: isPrimary,
+		Items: input.Items, CreatedAt: createdAt, UpdatedAt: now,
+	})
+	if err != nil {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	if !idempotentCreate {
+		return useCase.Journey.ReplaceLearningPath(ctx, path, input.ExpectedVersion)
+	}
+	creator, ok := useCase.Journey.(repository.IdempotentLearningPathRepository)
+	if !ok {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	request := repository.LearningPathCreationRequest{
+		IdempotencyKey: input.IdempotencyKey, PlanningRequestID: input.PlanningRequestID,
+		ExpectedOnboardingVersion: input.ExpectedOnboardingVersion, ExpectedDirectionCode: input.ExpectedDirectionCode,
+	}
+	request.RequestHash = learningPathCreationRequestHash(path, request)
+	if originalHash != "" {
+		request.RequestHash = originalHash
+	}
+	stored, _, err := creator.CreateLearningPathIdempotently(ctx, path, request)
+	return stored, err
+}
+
+func learningPathCreationRequestHash(path domain.StudentLearningPath, fences ...repository.LearningPathCreationRequest) string {
+	payload := struct {
+		ExpectedOnboardingVersion int64                     `json:"expected_onboarding_version,omitempty"`
+		ExpectedDirectionCode     string                    `json:"expected_direction_code,omitempty"`
+		StudentID                 string                    `json:"student_id"`
+		CourseID                  string                    `json:"course_id"`
+		GoalCode                  string                    `json:"goal_code"`
+		CourseFingerprint         string                    `json:"course_fingerprint"`
+		PlannerPolicyVersion      string                    `json:"planner_policy_version"`
+		ReasonCode                string                    `json:"reason_code"`
+		ReasonSummary             string                    `json:"reason_summary"`
+		Items                     []domain.LearningPathItem `json:"items"`
+	}{
+		StudentID: path.StudentID, CourseID: path.CourseID, GoalCode: path.GoalCode,
+		CourseFingerprint: path.CourseFingerprint, PlannerPolicyVersion: path.PlannerPolicyVersion,
+		ReasonCode: path.ReasonCode, ReasonSummary: path.ReasonSummary, Items: path.Items,
+	}
+	if len(fences) > 0 {
+		payload.ExpectedOnboardingVersion = fences[0].ExpectedOnboardingVersion
+		payload.ExpectedDirectionCode = fences[0].ExpectedDirectionCode
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+type GetLearningPath struct {
+	Journey repository.LearningJourneyRepository
+}
+
+func (useCase GetLearningPath) Handle(ctx context.Context, studentID string) (domain.StudentLearningPath, error) {
+	studentID = strings.TrimSpace(studentID)
+	if useCase.Journey == nil || !validStudentUUID(studentID) {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	return useCase.Journey.GetLearningPath(ctx, studentID)
+}
+
+type LearningPaths struct {
+	Paths repository.LearningPathStateRepository
+	Clock LearningJourneyClock
+}
+
+func (useCase LearningPaths) List(ctx context.Context, studentID string) (domain.StudentLearningPathList, error) {
+	studentID = strings.TrimSpace(studentID)
+	if useCase.Paths == nil || !validStudentUUID(studentID) {
+		return domain.StudentLearningPathList{}, domain.ErrValidation
+	}
+	var paths []domain.StudentLearningPath
+	var contextValue domain.StudentLearningContext
+	for attempt := 0; attempt < 3; attempt++ {
+		before, err := useCase.contextOrEmpty(ctx, studentID)
+		if err != nil {
+			return domain.StudentLearningPathList{}, err
+		}
+		paths, err = useCase.Paths.ListLearningPaths(ctx, studentID, 100)
+		if err != nil {
+			return domain.StudentLearningPathList{}, err
+		}
+		contextValue, err = useCase.contextOrEmpty(ctx, studentID)
+		if err != nil {
+			return domain.StudentLearningPathList{}, err
+		}
+		if before.Version == contextValue.Version {
+			break
+		}
+		if attempt == 2 {
+			return domain.StudentLearningPathList{}, domain.ErrConflict
+		}
+	}
+	result := domain.StudentLearningPathList{
+		Schema: domain.LearningPathListSchemaVersion, StudentID: studentID,
+		JourneyVersion: contextValue.Version, Items: make([]domain.StudentLearningPathSummary, 0, len(paths)),
+	}
+	for _, path := range paths {
+		summary, err := domain.SummarizeStudentLearningPath(path, contextValue.SelectedLearningPathID)
+		if err != nil {
+			return domain.StudentLearningPathList{}, domain.ErrValidation
+		}
+		result.Items = append(result.Items, summary)
+	}
+	return result, nil
+}
+
+func (useCase LearningPaths) Get(ctx context.Context, studentID, pathID string) (domain.StudentLearningPathMutation, error) {
+	studentID = strings.TrimSpace(studentID)
+	pathID = strings.TrimSpace(pathID)
+	if useCase.Paths == nil || !validStudentUUID(studentID) || !validStudentUUID(pathID) {
+		return domain.StudentLearningPathMutation{}, domain.ErrValidation
+	}
+	var path domain.StudentLearningPath
+	var contextValue domain.StudentLearningContext
+	for attempt := 0; attempt < 3; attempt++ {
+		before, err := useCase.contextOrEmpty(ctx, studentID)
+		if err != nil {
+			return domain.StudentLearningPathMutation{}, err
+		}
+		path, err = useCase.Paths.GetLearningPathByID(ctx, studentID, pathID)
+		if err != nil {
+			return domain.StudentLearningPathMutation{}, err
+		}
+		contextValue, err = useCase.contextOrEmpty(ctx, studentID)
+		if err != nil {
+			return domain.StudentLearningPathMutation{}, err
+		}
+		if before.Version == contextValue.Version {
+			break
+		}
+		if attempt == 2 {
+			return domain.StudentLearningPathMutation{}, domain.ErrConflict
+		}
+	}
+	path.IsSelected = contextValue.SelectedLearningPathID == path.ID
+	return domain.StudentLearningPathMutation{Path: path, Context: contextValue}, nil
+}
+
+func (useCase LearningPaths) GetContext(ctx context.Context, studentID string) (domain.StudentLearningContext, error) {
+	studentID = strings.TrimSpace(studentID)
+	if useCase.Paths == nil || !validStudentUUID(studentID) {
+		return domain.StudentLearningContext{}, domain.ErrValidation
+	}
+	return useCase.contextOrEmpty(ctx, studentID)
+}
+
+func (useCase LearningPaths) Activate(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedJourneyVersion int64,
+	makePrimary bool,
+) (domain.StudentLearningPathMutation, error) {
+	if err := useCase.validateMutation(studentID, pathID, expectedJourneyVersion); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	return useCase.Paths.ActivateLearningPath(
+		ctx, strings.TrimSpace(studentID), strings.TrimSpace(pathID), expectedJourneyVersion, makePrimary, useCase.Clock.Now().UTC(),
+	)
+}
+
+func (useCase LearningPaths) Pause(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedJourneyVersion int64,
+) (domain.StudentLearningPathMutation, error) {
+	if err := useCase.validateMutation(studentID, pathID, expectedJourneyVersion); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	return useCase.Paths.PauseLearningPath(
+		ctx, strings.TrimSpace(studentID), strings.TrimSpace(pathID), expectedJourneyVersion, useCase.Clock.Now().UTC(),
+	)
+}
+
+func (useCase LearningPaths) Resume(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedJourneyVersion int64,
+) (domain.StudentLearningPathMutation, error) {
+	if err := useCase.validateMutation(studentID, pathID, expectedJourneyVersion); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	return useCase.Paths.ResumeLearningPath(
+		ctx, strings.TrimSpace(studentID), strings.TrimSpace(pathID), expectedJourneyVersion, useCase.Clock.Now().UTC(),
+	)
+}
+
+func (useCase LearningPaths) contextOrEmpty(ctx context.Context, studentID string) (domain.StudentLearningContext, error) {
+	contextValue, err := useCase.Paths.GetLearningContext(ctx, studentID)
+	if err == nil {
+		return contextValue, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentLearningContext{}, err
+	}
+	return domain.NormalizeStudentLearningContext(domain.StudentLearningContext{
+		Schema: domain.LearningContextSchemaVersion, StudentID: studentID,
+	})
+}
+
+func (useCase LearningPaths) validateMutation(studentID, pathID string, expectedJourneyVersion int64) error {
+	if useCase.Paths == nil || useCase.Clock == nil || !validStudentUUID(strings.TrimSpace(studentID)) ||
+		!validStudentUUID(strings.TrimSpace(pathID)) || expectedJourneyVersion < 1 {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+type CaptureDiagnosticInput struct {
+	StudentID          string
+	AssessmentID       string
+	CurriculumRevision string
+	Targets            []domain.LearningTargetRef
+}
+
+type TargetMasteryProjection interface {
+	Handle(context.Context, string, []domain.LearningTargetRef) ([]domain.StudentTargetMastery, error)
+}
+
+type CaptureDiagnosticSnapshot struct {
+	Journey repository.LearningJourneyRepository
+	Mastery TargetMasteryProjection
+	Clock   LearningJourneyClock
+	IDs     LearningJourneyIDGenerator
+}
+
+func (useCase CaptureDiagnosticSnapshot) Handle(ctx context.Context, input CaptureDiagnosticInput) (domain.StudentDiagnosticSnapshot, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	if useCase.Journey == nil || useCase.Mastery == nil || useCase.Clock == nil || useCase.IDs == nil ||
+		!validStudentUUID(input.StudentID) || len(input.Targets) < 1 || len(input.Targets) > 500 {
+		return domain.StudentDiagnosticSnapshot{}, domain.ErrValidation
+	}
+	projections := make([]domain.StudentTargetMastery, 0, len(input.Targets))
+	for start := 0; start < len(input.Targets); start += 100 {
+		end := start + 100
+		if end > len(input.Targets) {
+			end = len(input.Targets)
+		}
+		items, err := useCase.Mastery.Handle(ctx, input.StudentID, input.Targets[start:end])
+		if err != nil {
+			return domain.StudentDiagnosticSnapshot{}, err
+		}
+		if len(items) != end-start {
+			return domain.StudentDiagnosticSnapshot{}, domain.ErrValidation
+		}
+		projections = append(projections, items...)
+	}
+	items := make([]domain.DiagnosticSnapshotItem, len(projections))
+	for index, projection := range projections {
+		items[index] = domain.DiagnosticSnapshotItem{
+			Target: projection.Target, State: projection.State,
+			MasteryScore: projection.MasteryScore, Confidence: projection.Confidence,
+		}
+	}
+	snapshot, err := domain.NormalizeStudentDiagnosticSnapshot(domain.StudentDiagnosticSnapshot{
+		ID: useCase.IDs.NewID(), StudentID: input.StudentID, AssessmentID: input.AssessmentID,
+		CurriculumRevision: input.CurriculumRevision, PolicyVersion: domain.DiagnosticPolicyVersion,
+		Items: items, CompletedAt: useCase.Clock.Now(),
+	})
+	if err != nil {
+		return domain.StudentDiagnosticSnapshot{}, domain.ErrValidation
+	}
+	return useCase.Journey.SaveDiagnosticSnapshot(ctx, snapshot)
+}
+
+type LearningSessionMetrics struct {
+	AnalyticsSessionID       string
+	ActiveLearningSeconds    int
+	LessonCount              int
+	TaskCount                int
+	QuestionCount            int
+	SelectedExplanationCount int
+	CodeRunCount             int
+	FailureCount             int
+	PassedTestCount          int
+	HintCount                int
+	TeacherInterventionCount int
+	StuckSignalCount         int
+}
+
+type LearningSessions struct {
+	Journey repository.LearningJourneyRepository
+	Clock   LearningJourneyClock
+	IDs     LearningJourneyIDGenerator
+}
+
+func (useCase LearningSessions) Start(ctx context.Context, studentID, goal, courseID, lessonID, taskID, analyticsSessionID string) (domain.StudentLearningSession, error) {
+	studentID = strings.TrimSpace(studentID)
+	if useCase.Journey == nil || useCase.Clock == nil || useCase.IDs == nil || !validStudentUUID(studentID) {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	now := useCase.Clock.Now().UTC()
+	session, err := domain.NormalizeStudentLearningSession(domain.StudentLearningSession{
+		ID: useCase.IDs.NewID(), StudentID: studentID, Goal: goal, CourseID: courseID, LessonID: lessonID, TaskID: taskID,
+		AnalyticsSessionID: analyticsSessionID,
+		SchemaVersion:      domain.LearningSessionVersion, Version: 1, StartedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	return useCase.Journey.CreateLearningSession(ctx, session)
+}
+
+func (useCase LearningSessions) End(ctx context.Context, studentID, sessionID string, expectedVersion int64) (domain.StudentLearningSession, error) {
+	studentID, sessionID = strings.TrimSpace(studentID), strings.TrimSpace(sessionID)
+	if useCase.Journey == nil || useCase.Clock == nil || !validStudentUUID(studentID) || !validStudentUUID(sessionID) || expectedVersion < 1 {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	current, err := useCase.Journey.GetLearningSession(ctx, studentID, sessionID)
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	if current.Version != expectedVersion || current.EndedAt != nil {
+		return domain.StudentLearningSession{}, domain.ErrConflict
+	}
+	now := useCase.Clock.Now().UTC()
+	current.EndedAt, current.UpdatedAt, current.Version = &now, now, expectedVersion+1
+	return useCase.Journey.UpdateLearningSession(ctx, current, expectedVersion)
+}
+
+func (useCase LearningSessions) ApplyMetrics(ctx context.Context, studentID, sessionID string, expectedVersion int64, metrics LearningSessionMetrics) (domain.StudentLearningSession, error) {
+	studentID, sessionID = strings.TrimSpace(studentID), strings.TrimSpace(sessionID)
+	if useCase.Journey == nil || useCase.Clock == nil || !validStudentUUID(studentID) || !validStudentUUID(sessionID) || expectedVersion < 1 {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	current, err := useCase.Journey.GetLearningSession(ctx, studentID, sessionID)
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	if current.Version != expectedVersion {
+		return domain.StudentLearningSession{}, domain.ErrConflict
+	}
+	stored := current
+	current.AnalyticsSessionID = strings.TrimSpace(metrics.AnalyticsSessionID)
+	current.ActiveLearningSeconds = metrics.ActiveLearningSeconds
+	current.LessonCount = metrics.LessonCount
+	current.TaskCount = metrics.TaskCount
+	current.QuestionCount = metrics.QuestionCount
+	current.SelectedExplanationCount = metrics.SelectedExplanationCount
+	current.CodeRunCount = metrics.CodeRunCount
+	current.FailureCount = metrics.FailureCount
+	current.PassedTestCount = metrics.PassedTestCount
+	current.HintCount = metrics.HintCount
+	current.TeacherInterventionCount = metrics.TeacherInterventionCount
+	current.StuckSignalCount = metrics.StuckSignalCount
+	if _, err := domain.NormalizeStudentLearningSession(current); err != nil {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	if learningSessionMetricsEqual(stored, current) {
+		return current, nil
+	}
+	current.Version++
+	current.UpdatedAt = useCase.Clock.Now().UTC()
+	if _, err := domain.NormalizeStudentLearningSession(current); err != nil {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	return useCase.Journey.UpdateLearningSession(ctx, current, expectedVersion)
+}
+
+func learningSessionMetricsEqual(stored, proposed domain.StudentLearningSession) bool {
+	return stored.AnalyticsSessionID == proposed.AnalyticsSessionID &&
+		stored.ActiveLearningSeconds == proposed.ActiveLearningSeconds && stored.LessonCount == proposed.LessonCount &&
+		stored.TaskCount == proposed.TaskCount && stored.QuestionCount == proposed.QuestionCount &&
+		stored.SelectedExplanationCount == proposed.SelectedExplanationCount && stored.CodeRunCount == proposed.CodeRunCount &&
+		stored.FailureCount == proposed.FailureCount && stored.PassedTestCount == proposed.PassedTestCount &&
+		stored.HintCount == proposed.HintCount && stored.TeacherInterventionCount == proposed.TeacherInterventionCount &&
+		stored.StuckSignalCount == proposed.StuckSignalCount
+}
+
+func (useCase LearningSessions) Get(ctx context.Context, studentID, sessionID string) (domain.StudentLearningSession, error) {
+	studentID, sessionID = strings.TrimSpace(studentID), strings.TrimSpace(sessionID)
+	if useCase.Journey == nil || !validStudentUUID(studentID) || !validStudentUUID(sessionID) {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	return useCase.Journey.GetLearningSession(ctx, studentID, sessionID)
+}
+
+func (useCase LearningSessions) ListRecent(ctx context.Context, studentID string, limit int) ([]domain.StudentLearningSession, error) {
+	if useCase.Journey == nil || !validStudentUUID(strings.TrimSpace(studentID)) {
+		return nil, domain.ErrValidation
+	}
+	if limit == 0 {
+		limit = 5
+	}
+	if limit < 1 || limit > 20 {
+		return nil, domain.ErrValidation
+	}
+	return useCase.Journey.ListRecentLearningSessions(ctx, strings.TrimSpace(studentID), limit)
+}
+
+func validStudentUUID(value string) bool {
+	_, err := uuid.Parse(value)
+	return err == nil
+}

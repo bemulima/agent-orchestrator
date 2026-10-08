@@ -1,0 +1,491 @@
+//go:build integration
+
+package integration
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"mime"
+	"net"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/infrastructure/filestorage"
+	pg "github.com/example/mc-course-service/internal/infrastructure/persistence/postgres"
+	adminhttp "github.com/example/mc-course-service/internal/transport/http/admin/v1"
+	adminhandlers "github.com/example/mc-course-service/internal/transport/http/admin/v1/handlers"
+	adminmw "github.com/example/mc-course-service/internal/transport/http/admin/v1/middleware"
+	"github.com/example/mc-course-service/internal/usecase/task"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const t23ProofDirectory = "/Users/marat/.codex/visualizations/2026/10/03/01a102d8-ab74-7d20-b2e5-79ecea218b46/remediation-20261004-01/EVIDENCE/T23"
+const t23CourseDSN = "postgres://postgres@127.0.0.1:58998/remediation_t23_course_integration_proof?sslmode=disable"
+
+type t23ZipFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int    `json:"size"`
+}
+
+type t23Archive struct {
+	Owner     string
+	Data      []byte // Bounded archive bytes stay in memory, never in evidence files.
+	SHA256    string
+	Files     []t23ZipFile
+	Activated bool
+}
+
+type t23ArchiveFixture struct {
+	mu          sync.Mutex
+	token       string
+	owned       map[string]bool
+	archives    map[string]t23Archive
+	uploads     int
+	activations int
+}
+
+// Root alone starts this finite provider after migrating the new isolated DB.
+// Course routing, multipart handler, upload use case, repositories, transaction
+// and outbound HTTP client are production implementations. Auth verification
+// and FileStorage are named bounded HTTP collaborators, not their live services.
+func TestT23ServeStarterUploadProvider(t *testing.T) {
+	if os.Getenv("T23_COURSE_PROVIDER") != "1" {
+		t.Skip("root-owned T23 provider is disabled")
+	}
+	if os.Getenv("T23_COURSE_DATABASE_URL") != t23CourseDSN {
+		t.Fatal("SETUP: exact isolated T23 PostgreSQL URL required")
+	}
+	infoFile := t23EvidencePath(t, "T23_COURSE_PROVIDER_INFO_FILE")
+	stopFile := t23EvidencePath(t, "T23_COURSE_PROVIDER_STOP_FILE")
+	eventsFile := t23EvidencePath(t, "T23_COURSE_PROVIDER_EVENTS_FILE")
+	if infoFile == stopFile || infoFile == eventsFile || stopFile == eventsFile {
+		t.Fatal("SETUP: evidence paths must be distinct")
+	}
+	for _, filename := range []string{infoFile, stopFile, eventsFile} {
+		if _, err := os.Lstat(filename); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("SETUP: evidence destinations must be fresh")
+		}
+	}
+	proofToken := os.Getenv("T23_PROOF_TOKEN")
+	if len(proofToken) < 16 || len(proofToken) > 512 {
+		t.Fatal("SETUP: bounded ephemeral proof token required")
+	}
+	type actor struct {
+		ID   string
+		Role string
+	}
+	actors := map[string]actor{}
+	for _, role := range []string{"ADMIN", "MODERATOR", "STUDENT", "TEACHER"} {
+		token := os.Getenv("T23_" + role + "_TOKEN")
+		if len(token) < 16 || len(token) > 512 || token == proofToken {
+			t.Fatal("SETUP: distinct bounded actor tokens required")
+		}
+		if _, exists := actors[token]; exists {
+			t.Fatal("SETUP: actor tokens must be distinct")
+		}
+		actors[token] = actor{ID: uuid.NewString(), Role: role}
+	}
+	if bad := os.Getenv("T23_BAD_TOKEN"); bad != "" {
+		if _, exists := actors[bad]; exists || bad == proofToken {
+			t.Fatal("SETUP: negative actor token must not be authorized")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	config, err := pgxpool.ParseConfig(t23CourseDSN)
+	if err != nil || config.ConnConfig.TLSConfig != nil || config.ConnConfig.Password != "" || len(config.ConnConfig.Fallbacks) != 0 {
+		t.Fatal("SETUP: isolated PostgreSQL configuration rejected")
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatalf("SETUP: pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	var database string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&database); err != nil || database != "remediation_t23_course_integration_proof" {
+		t.Fatal("SETUP: isolated migrated database unavailable")
+	}
+	// These are metadata-only CODE fixtures; their code is never executed.
+	structureID, lessonID := uuid.NewString(), uuid.NewString()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := (pg.CodeStructureTypeRepoPG{Pool: pool}).Create(ctx, domain.CodeStructureType{
+		ID: structureID, Code: "T23_CODE_" + strings.ReplaceAll(structureID, "-", "")[:20], Name: "T23 bounded CODE fixture", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("SETUP: CODE repository seed: %v", err)
+	}
+	if err := (pg.LessonRepoPG{Pool: pool}).Create(ctx, domain.Lesson{
+		ID: lessonID, SourceKey: "t23-bounded-lesson-" + lessonID, Title: "T23 bounded fixture", Description: "Metadata fixture only", Status: domain.LessonStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("SETUP: lesson repository seed: %v", err)
+	}
+	taskID, preflightID := uuid.NewString(), uuid.NewString()
+	tasks, taskFiles := pg.TaskRepoPG{Pool: pool}, pg.TaskFileStorageRepoPG{Pool: pool}
+	for i, id := range []string{taskID, preflightID} {
+		fixture := domain.Task{ID: id, SourceKey: "t23-bounded-code-" + id, LessonID: lessonID, CodeStructureTypeID: structureID,
+			CodeStructure: json.RawMessage(`{"fixture":"t23-bounded-code.v1","files":["src/main.js","README.md"]}`),
+			Type:          domain.TaskTypeCLIProgramming, ExecutionMode: domain.TaskExecutionModeTerminalRun, EvaluationMode: domain.TaskEvaluationModeAuto,
+			UIMode: domain.TaskUIModeTerminal, SubmissionMode: domain.TaskSubmissionModeSnapshot, RequiresSandbox: true, ExposesTerminal: true,
+			Order: i + 1, Status: domain.TaskStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}
+		if err := tasks.Create(ctx, fixture); err != nil {
+			t.Fatalf("SETUP: task repository seed: %v", err)
+		}
+		if stored, err := tasks.Get(ctx, id); err != nil || stored.ID != id || stored.Type != domain.TaskTypeCLIProgramming {
+			t.Fatal("SETUP: actual task repository readback failed")
+		}
+		if bindings, err := taskFiles.ListByTask(ctx, id); err != nil || len(bindings) != 0 {
+			t.Fatal("SETUP: fresh owned task must have no starter binding")
+		}
+	}
+	journal, err := os.OpenFile(eventsFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("SETUP: journal: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Errorf("journal close: %v", err)
+		}
+	})
+	var journalMu sync.Mutex
+	var journalErr error
+	errorsCh := make(chan error, 3)
+	archiveFixture := &t23ArchiveFixture{token: uuid.NewString(), owned: map[string]bool{taskID: true, preflightID: true}, archives: map[string]t23Archive{}}
+	fileOrigin := t23Serve(t, errorsCh, archiveFixture)
+	client := filestorage.Client{BaseURL: fileOrigin, InternalToken: archiveFixture.token, HTTPClient: &http.Client{Timeout: 15 * time.Second}}
+	taskHandler := &adminhandlers.TaskHandler{UploadStarterArchiveUC: task.UploadStarterArchive{
+		Tasks: tasks, TaskFiles: taskFiles, Uploader: client, Activator: client, Tx: pg.TxManagerPG{Pool: pool},
+	}}
+	root := chi.NewRouter()
+	root.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			recorded := &t23StatusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(recorded, r)
+			if r.MultipartForm != nil {
+				if err := r.MultipartForm.RemoveAll(); err != nil {
+					journalMu.Lock()
+					journalErr = err
+					journalMu.Unlock()
+				}
+			}
+			role := strings.ToUpper(r.Header.Get("X-User-Role"))
+			switch role {
+			case "ADMIN", "MODERATOR", "TEACHER", "STUDENT", "GUEST":
+			default:
+				role = "UNKNOWN"
+			}
+			language := r.Header.Get("Accept-Language")
+			if len(language) > 64 {
+				language = "oversized"
+			}
+			mediaType, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if mediaType != "multipart/form-data" && mediaType != "application/json" {
+				mediaType = "other"
+			}
+			journalMu.Lock()
+			defer journalMu.Unlock()
+			if err := json.NewEncoder(journal).Encode(map[string]any{"method": r.Method, "path": r.URL.Path, "status": recorded.status,
+				"actor_role": role, "accept_language": language, "content_type": mediaType, "has_boundary": params["boundary"] != ""}); err != nil {
+				journalErr = err
+			}
+		})
+	})
+	root.Get("/__t23/state", func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Proof-Token")), []byte(proofToken)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		id := r.URL.Query().Get("task_id")
+		if !archiveFixture.owned[id] {
+			http.NotFound(w, r)
+			return
+		}
+		bindings, err := taskFiles.ListByTask(r.Context(), id)
+		if err != nil {
+			http.Error(w, "readback unavailable", http.StatusInternalServerError)
+			return
+		}
+		var row []byte
+		if err := pool.QueryRow(r.Context(), "SELECT to_jsonb(t)::text || '|' || xmin::text FROM task t WHERE id=$1", id).Scan(&row); err != nil {
+			http.Error(w, "readback unavailable", http.StatusInternalServerError)
+			return
+		}
+		var bindingJSON []byte
+		if err := pool.QueryRow(r.Context(), `SELECT COALESCE(jsonb_agg(to_jsonb(f) || jsonb_build_object('xmin',f.xmin::text)
+			ORDER BY type,"order",filestorage_id),'[]'::jsonb)::text FROM task_filestorage f WHERE task_id=$1`, id).Scan(&bindingJSON); err != nil {
+			http.Error(w, "readback unavailable", http.StatusInternalServerError)
+			return
+		}
+		wireBindings := make([]map[string]any, 0, len(bindings))
+		archiveFixture.mu.Lock()
+		defer archiveFixture.mu.Unlock()
+		state := map[string]any{"task_id": id, "task_sha256": t23Hash(row), "binding_sha256": t23Hash(bindingJSON), "binding_count": len(bindings),
+			"upload_count": archiveFixture.uploads, "activate_count": archiveFixture.activations,
+			"archive_id": "", "archive_sha256": "", "zip_files": []t23ZipFile{}, "archive_activated": false}
+		for _, binding := range bindings {
+			wireBindings = append(wireBindings, map[string]any{"task_id": binding.TaskID, "type": binding.Type, "filestorage_id": binding.FileStorageID, "order": binding.Order})
+			if archive, found := archiveFixture.archives[binding.FileStorageID]; found && archive.Owner == id {
+				state["archive_id"], state["archive_sha256"], state["zip_files"], state["archive_activated"] = binding.FileStorageID, archive.SHA256, archive.Files, archive.Activated
+			}
+		}
+		state["bindings"] = wireBindings
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := json.NewEncoder(w).Encode(state); err != nil {
+			journalMu.Lock()
+			journalErr = err
+			journalMu.Unlock()
+		}
+	})
+	// Non-upload handler values allow production route registration; no other
+	// use cases are composed, and the proof calls only the registered upload.
+	adminRouter := adminhttp.NewRouter(&adminhandlers.CourseHandler{}, &adminhandlers.TrackHandler{}, &adminhandlers.CourseLevelHandler{}, &adminhandlers.CourseGroupHandler{},
+		&adminhandlers.TrackRelationsHandler{}, &adminhandlers.LevelRelationsHandler{}, &adminhandlers.CourseGroupRelationsHandler{}, &adminhandlers.ModuleHandler{}, &adminhandlers.ModuleRelationsHandler{},
+		&adminhandlers.SectionHandler{}, &adminhandlers.SectionRelationsHandler{}, &adminhandlers.LessonHandler{}, &adminhandlers.LessonRelationsHandler{}, &adminhandlers.LessonExamplesHandler{},
+		&adminhandlers.ExampleRelationsHandler{}, taskHandler, &adminhandlers.TechHandler{}, &adminhandlers.TechVersionHandler{}, &adminhandlers.TagHandler{}, &adminhandlers.ComposeConfigHandler{},
+		&adminhandlers.CourseI18nHandler{}, &adminhandlers.CourseRelationsHandler{}, &adminhandlers.PositionHandler{}, &adminhandlers.PositionRelationsHandler{}, &adminhandlers.CodeStructureTypeHandler{})
+	root.Group(func(r chi.Router) { r.Use(adminmw.AuthMiddleware); r.Mount("/admin/v1", adminRouter) })
+	courseOrigin := t23Serve(t, errorsCh, root)
+	authOrigin := t23Serve(t, errorsCh, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/verify" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct {
+			Token string `json:"token"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		verified, ok := actors[request.Token]
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{"user_id": verified.ID, "claims": map[string]string{"role": verified.Role}}); err != nil {
+			journalMu.Lock()
+			journalErr = err
+			journalMu.Unlock()
+		}
+	}))
+	info := map[string]any{"schema": "t23-starter-provider.v1", "database": database,
+		"course_origin": courseOrigin, "course_port": t23Port(t, courseOrigin), "auth_origin": authOrigin, "auth_port": t23Port(t, authOrigin),
+		"task_id": taskID, "preflight_task_id": preflightID, "readback_url": courseOrigin + "/__t23/state", "events_file": eventsFile, "stop_file": stopFile,
+		"fixture_name": "t23-bounded-code-and-auth-filestorage-http.v1", "auth_base_path": "", "ready": true}
+	encoded, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		t.Fatal("SETUP: readiness encoding failed")
+	}
+	if err := os.WriteFile(infoFile, encoded, 0600); err != nil {
+		t.Fatalf("SETUP: readiness write: %v", err)
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("provider finite lifetime expired before root stop")
+		case err := <-errorsCh:
+			t.Fatalf("provider HTTP server failed: %v", err)
+		case <-ticker.C:
+			journalMu.Lock()
+			err := journalErr
+			journalMu.Unlock()
+			if err != nil {
+				t.Fatalf("safe journal failed: %v", err)
+			}
+			if _, err := os.Stat(stopFile); err == nil {
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stop marker: %v", err)
+			}
+		}
+	}
+}
+
+func (fixture *t23ArchiveFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Token")), []byte(fixture.token)) != 1 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path == "/internal/v1/files/upload" {
+		fixture.mu.Lock()
+		fixture.uploads++
+		fixture.mu.Unlock()
+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			http.Error(w, "invalid bounded multipart", 400)
+			return
+		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
+		owner := r.FormValue("owner_id")
+		if !fixture.owned[owner] || r.FormValue("file_kind") != "PREVIEW_ENV_ARCHIVE" || r.FormValue("is_archive") != "true" ||
+			r.FormValue("archive_format") != "zip" || r.FormValue("is_temp") != "true" || r.FormValue("ttl_minutes") != "60" || len(r.MultipartForm.File["file"]) != 1 {
+			http.Error(w, "unexpected archive contract", 400)
+			return
+		}
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "missing archive", 400)
+			return
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil || len(data) > 1<<20 {
+			http.Error(w, "archive bound exceeded", 400)
+			return
+		}
+		reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil || len(reader.File) == 0 || len(reader.File) > 10 {
+			http.Error(w, "invalid bounded zip", 400)
+			return
+		}
+		files := make([]t23ZipFile, 0, len(reader.File))
+		seen := map[string]bool{}
+		for _, entry := range reader.File {
+			if entry.FileInfo().IsDir() || path.Clean(entry.Name) != entry.Name || strings.HasPrefix(entry.Name, "/") || strings.HasPrefix(entry.Name, "../") || seen[entry.Name] {
+				http.Error(w, "unexpected archive entry", 400)
+				return
+			}
+			seen[entry.Name] = true
+			stream, err := entry.Open()
+			if err != nil {
+				http.Error(w, "unreadable zip entry", 400)
+				return
+			}
+			content, readErr := io.ReadAll(io.LimitReader(stream, (64<<10)+1))
+			closeErr := stream.Close()
+			if readErr != nil || closeErr != nil || len(content) > 64<<10 {
+				http.Error(w, "entry bound exceeded", 400)
+				return
+			}
+			files = append(files, t23ZipFile{Path: entry.Name, SHA256: t23Hash(content), Size: len(content)})
+		}
+		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+		id := uuid.NewString()
+		fixture.mu.Lock()
+		fixture.archives[id] = t23Archive{Owner: owner, Data: data, SHA256: t23Hash(data), Files: files}
+		fixture.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+		return
+	}
+	prefix, suffix := "/internal/v1/files/", "/activate"
+	if strings.HasPrefix(r.URL.Path, prefix) && strings.HasSuffix(r.URL.Path, suffix) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), suffix)
+		fixture.mu.Lock()
+		defer fixture.mu.Unlock()
+		fixture.activations++
+		archive, found := fixture.archives[id]
+		if !found || archive.Activated {
+			http.NotFound(w, r)
+			return
+		}
+		archive.Activated = true
+		fixture.archives[id] = archive
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+type t23StatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *t23StatusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func t23Hash(data []byte) string { hash := sha256.Sum256(data); return hex.EncodeToString(hash[:]) }
+
+func t23EvidencePath(t *testing.T, env string) string {
+	t.Helper()
+	filename := os.Getenv(env)
+	if !filepath.IsAbs(filename) || filepath.Clean(filename) != filename || !strings.HasPrefix(filename, t23ProofDirectory+string(os.PathSeparator)) {
+		t.Fatalf("SETUP: %s must be an exact T23 evidence path", env)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filename))
+	if err != nil || parent != filepath.Dir(filename) {
+		t.Fatalf("SETUP: %s parent must exist without symlinks", env)
+	}
+	return filename
+}
+
+func t23Serve(t *testing.T, errorsCh chan<- error, handler http.Handler) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("SETUP: loopback listener: %v", err)
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 20 * time.Second,
+		IdleTimeout: 30 * time.Second, ErrorLog: log.New(io.Discard, "", 0)}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errorsCh <- err
+		}
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			t.Errorf("HTTP shutdown: %v", err)
+		}
+	})
+	return "http://" + listener.Addr().String()
+}
+
+func t23Port(t *testing.T, origin string) int {
+	t.Helper()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(origin, "http://"))
+	if err != nil {
+		t.Fatal("SETUP: invalid loopback origin")
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal("SETUP: invalid loopback port")
+	}
+	return number
+}

@@ -1,0 +1,235 @@
+//go:build integration
+// +build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	pgadapter "github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TestOnboardingPathAdmissionPostgresHarness is intentionally opt-in: it needs
+// a disposable PostgreSQL database with every migration through 025 already
+// applied. Each subtest uses fresh UUIDs because admission evidence is immutable.
+func TestOnboardingPathAdmissionPostgresHarness(t *testing.T) {
+	pool := getTestDBPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	var installed bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.student_onboarding_path_admission') IS NOT NULL`).Scan(&installed); err != nil {
+		t.Fatal(err)
+	}
+	if !installed {
+		t.Skip("migration 025_student_onboarding_path_admission.sql is not applied to the configured integration database")
+	}
+	repo := &pgadapter.OnboardingPathAdmissionRepoPG{Pool: pool}
+
+	t.Run("reserve renew expiry replay and restart", func(t *testing.T) {
+		student, now := s9AdmissionDraft(t, ctx, pool), time.Now().UTC().Add(-time.Minute)
+		req := s9AdmissionRequest()
+		key := uuid.NewString()
+		first, replayed, err := repo.Reserve(ctx, req, student, key, now, 5*time.Minute)
+		if err != nil || replayed || first.Fence != 1 {
+			t.Fatalf("reserve=%#v replay=%v err=%v", first, replayed, err)
+		}
+		lostACK, replayed, err := repo.Reserve(ctx, req, student, key, now, 5*time.Minute)
+		if err != nil || !replayed || lostACK.AdmissionID != first.AdmissionID || lostACK.Fence != 1 {
+			t.Fatalf("reserve lost ACK=%#v replay=%v err=%v", lostACK, replayed, err)
+		}
+		renewKeyFence1 := s9DeterministicKey("renew-fence-1", student)
+		renewed, replayed, err := repo.Renew(ctx, student, first.AdmissionID, 1, req.ExecutionID, renewKeyFence1, now.Add(time.Minute), 5*time.Minute)
+		if err != nil || replayed || renewed.Fence != 2 {
+			t.Fatalf("renew=%#v replay=%v err=%v", renewed, replayed, err)
+		}
+		pool.Reset() // exact receipt replay survives a connection/process restart.
+		lostACK, replayed, err = repo.Renew(ctx, student, first.AdmissionID, 1, req.ExecutionID, renewKeyFence1, now.Add(time.Minute), 5*time.Minute)
+		if err != nil || !replayed || lostACK.Fence != 2 {
+			t.Fatalf("renew lost ACK=%#v replay=%v err=%v", lostACK, replayed, err)
+		}
+		if _, _, err = repo.Materialize(ctx, student, s9Materialization(req.ExecutionID, 1), first.AdmissionID, uuid.NewString(), uuid.NewString(), now.Add(2*time.Minute)); !errors.Is(err, domain.ErrReservationExpired) {
+			t.Fatalf("stale fence materialize err=%v", err)
+		}
+		expiredAt := now.Add(7 * time.Minute)
+		renewKeyFence2 := s9DeterministicKey("renew-fence-2", student)
+		reacquired, replayed, err := repo.Renew(ctx, student, first.AdmissionID, 2, req.ExecutionID, renewKeyFence2, expiredAt, 5*time.Minute)
+		if err != nil || replayed || reacquired.Fence != 3 || !reacquired.ExpiresAt.After(expiredAt) {
+			t.Fatalf("expiry reacquire=%#v replay=%v err=%v", reacquired, replayed, err)
+		}
+		pool.Reset() // exact receipt replay survives a connection/process restart.
+		lostACK, replayed, err = repo.Renew(ctx, student, first.AdmissionID, 2, req.ExecutionID, renewKeyFence2, expiredAt, 5*time.Minute)
+		if err != nil || !replayed || lostACK.Fence != 3 {
+			t.Fatalf("post-reset lost ACK=%#v replay=%v err=%v", lostACK, replayed, err)
+		}
+	})
+
+	t.Run("materialization atomicity and exact-key replay", func(t *testing.T) {
+		student, now := s9AdmissionDraft(t, ctx, pool), time.Now().UTC()
+		req := s9AdmissionRequest()
+		admission, _, err := repo.Reserve(ctx, req, student, uuid.NewString(), now, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		materialization, key, assignmentID := s9Materialization(req.ExecutionID, admission.Fence), uuid.NewString(), uuid.NewString()
+		result, replayed, err := repo.Materialize(ctx, student, materialization, admission.AdmissionID, key, assignmentID, now.Add(time.Second))
+		if err != nil || replayed || result.FirstLessonID != materialization.Lessons[0].LessonID {
+			t.Fatalf("materialize=%#v replay=%v err=%v", result, replayed, err)
+		}
+		var assignments, paths, ready, planned int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_course_assignment WHERE id=$1`, assignmentID).Scan(&assignments); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM student_learning_path WHERE id=$1 AND student_id=$2 AND status='ACTIVE' AND is_primary`, result.LearningPathID, student).Scan(&paths); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='READY'), count(*) FILTER (WHERE status='PLANNED') FROM student_learning_path_item WHERE student_learning_path_id=$1`, result.LearningPathID).Scan(&ready, &planned); err != nil {
+			t.Fatal(err)
+		}
+		if assignments != 1 || paths != 1 || ready != 1 || planned != len(materialization.Lessons)-1 {
+			t.Fatalf("atomic rows assignments=%d paths=%d ready=%d planned=%d", assignments, paths, ready, planned)
+		}
+		replayedResult, replayed, err := repo.Materialize(ctx, student, materialization, admission.AdmissionID, key, assignmentID, now.Add(time.Second))
+		if err != nil || !replayed || replayedResult.LearningPathID != result.LearningPathID {
+			t.Fatalf("materialize lost ACK=%#v replay=%v err=%v", replayedResult, replayed, err)
+		}
+		if _, _, err = repo.Materialize(ctx, student, materialization, admission.AdmissionID, uuid.NewString(), uuid.NewString(), now.Add(time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("new materialize key must conflict, got %v", err)
+		}
+		changedMaterialization := materialization
+		changedMaterialization.Course.ReasonSummary = "changed"
+		if _, _, err = repo.Materialize(ctx, student, changedMaterialization, admission.AdmissionID, key, assignmentID, now.Add(time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("changed materialize hash must conflict, got %v", err)
+		}
+		abort := domain.OnboardingPathAbort{Schema: domain.OnboardingPathAbortSchema, ExecutionID: req.ExecutionID, Fence: admission.Fence, Reason: "CANCELLED"}
+		if _, _, err = repo.Abort(ctx, student, abort, admission.AdmissionID, s9DeterministicKey("abort-after-materialized", student), now.Add(2*time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("abort after materialized must conflict, got %v", err)
+		}
+	})
+
+	t.Run("abort hash replay transition guard and empty-only rollback", func(t *testing.T) {
+		student, now := s9AdmissionDraft(t, ctx, pool), time.Now().UTC()
+		req := s9AdmissionRequest()
+		admission, _, err := repo.Reserve(ctx, req, student, uuid.NewString(), now, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		abort := domain.OnboardingPathAbort{Schema: domain.OnboardingPathAbortSchema, ExecutionID: req.ExecutionID, Fence: admission.Fence, Reason: "CANCELLED"}
+		key := uuid.NewString()
+		if _, replayed, err := repo.Abort(ctx, student, abort, admission.AdmissionID, key, now.Add(time.Second)); err != nil || replayed {
+			t.Fatalf("abort replay=%v err=%v", replayed, err)
+		}
+		if _, replayed, err := repo.Abort(ctx, student, abort, admission.AdmissionID, key, now.Add(time.Second)); err != nil || !replayed {
+			t.Fatalf("abort lost ACK replay=%v err=%v", replayed, err)
+		}
+		if _, _, err := repo.Abort(ctx, student, abort, admission.AdmissionID, uuid.NewString(), now.Add(time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("new abort key must conflict, got %v", err)
+		}
+		changedAbort := abort
+		changedAbort.Reason = "NO_GAP"
+		if _, _, err := repo.Abort(ctx, student, changedAbort, admission.AdmissionID, key, now.Add(time.Second)); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("changed abort hash must conflict, got %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE student_onboarding_path_admission SET fence=fence+1 WHERE admission_id=$1`, admission.AdmissionID); err == nil {
+			t.Fatal("terminal fence rewrite unexpectedly succeeded")
+		}
+		if _, err := pool.Exec(ctx, `UPDATE student_onboarding_path_admission SET status='ABORTED', fence=fence+1, abort_hash=repeat('a',64), abort_reason='CANCELLED' WHERE admission_id=$1`, s9ReservedAdmission(t, ctx, pool)); err == nil {
+			t.Fatal("terminalization with mutated fence unexpectedly succeeded")
+		}
+		down, err := os.ReadFile("../../docs/onboarding-path-admission-rollback.sql")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(down)); err == nil {
+			t.Fatal("empty-only rollback unexpectedly accepted admission evidence")
+		}
+	})
+
+	t.Run("two reserve commands and generic path writer are fenced", func(t *testing.T) {
+		student, now := s9AdmissionDraft(t, ctx, pool), time.Now().UTC()
+		type outcome struct{ err error }
+		results := make(chan outcome, 2)
+		for range 2 {
+			go func() {
+				_, _, err := repo.Reserve(ctx, s9AdmissionRequest(), student, uuid.NewString(), now, 5*time.Minute)
+				results <- outcome{err: err}
+			}()
+		}
+		first, second := (<-results).err, (<-results).err
+		if (first == nil) == (second == nil) || (!errors.Is(first, domain.ErrReservationConflict) && !errors.Is(second, domain.ErrReservationConflict)) {
+			t.Fatalf("two reserve outcomes first=%v second=%v", first, second)
+		}
+		journey := &pgadapter.LearningJourneyRepoPG{Pool: pool}
+		path := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: student, CourseID: uuid.NewString(), GoalCode: "go.backend", CurriculumRevision: "r1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "planner-v1", ReasonCode: "initial", ReasonSummary: "race", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now, Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap"}}}
+		if _, err := journey.ReplaceLearningPath(ctx, path, 0); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("generic writer bypassed live admission, err=%v", err)
+		}
+
+		// The draft write and materialize intentionally race. Whichever owns the
+		// shared Student fence first is safe: materialization either sees its exact
+		// state and commits atomically, or observes the changed draft and aborts.
+		stateStudent, stateNow := s9AdmissionDraft(t, ctx, pool), time.Now().UTC()
+		stateRequest := s9AdmissionRequest()
+		stateAdmission, _, err := repo.Reserve(ctx, stateRequest, stateStudent, uuid.NewString(), stateNow, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drafts := &pgadapter.StudentOnboardingRepoPG{Pool: pool}
+		materializeResult := make(chan error, 1)
+		draftResult := make(chan error, 1)
+		go func() {
+			_, _, err := repo.Materialize(ctx, stateStudent, s9Materialization(stateRequest.ExecutionID, stateAdmission.Fence), stateAdmission.AdmissionID, uuid.NewString(), uuid.NewString(), stateNow.Add(time.Second))
+			materializeResult <- err
+		}()
+		go func() {
+			_, _, err := drafts.ReplaceDraft(ctx, repository.StudentOnboardingDraftReplaceCommand{StudentID: stateStudent, RequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64), ExpectedVersion: 1, OccurredAt: stateNow.Add(time.Second)})
+			draftResult <- err
+		}()
+		materializeErr, draftErr := <-materializeResult, <-draftResult
+		if draftErr != nil || (materializeErr != nil && !errors.Is(materializeErr, domain.ErrStateChanged)) {
+			t.Fatalf("state/materialize fence race materialize=%v draft=%v", materializeErr, draftErr)
+		}
+	})
+}
+
+func s9AdmissionDraft(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	student := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO student_onboarding_draft(student_id,schema_version,status,version,created_at,updated_at) VALUES($1,'student-onboarding-draft.v1','DRAFT',1,now(),now())`, student); err != nil {
+		t.Fatal(err)
+	}
+	return student
+}
+
+func s9AdmissionRequest() domain.OnboardingPathAdmissionRequest {
+	return domain.OnboardingPathAdmissionRequest{Schema: domain.OnboardingPathAdmissionRequestSchema, HandoffID: uuid.NewString(), ExecutionID: uuid.NewString(), ExpectedStateRef: domain.StudentPlanningReadinessStateRef{Kind: "accepted_draft", Version: 1}, Goal: domain.OnboardingPathGoal{Code: "go.backend", Version: "v1", GraphVersion: "g1"}}
+}
+
+func s9Materialization(executionID string, fence int64) domain.OnboardingPathMaterialization {
+	return domain.OnboardingPathMaterialization{Schema: domain.OnboardingPathMaterializationSchema, ExecutionID: executionID, Fence: fence, Course: domain.OnboardingPathCourseBinding{CourseID: uuid.NewString(), CourseFingerprint: "course-r1", PlannerPolicyVersion: "planner-v1", ReasonCode: "initial", ReasonSummary: "integration"}, Lessons: []domain.OnboardingPathLessonBinding{{LessonID: uuid.NewString(), Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.http", Version: "v1"}}}, {LessonID: uuid.NewString(), Targets: []domain.LearningTargetRef{}}}}
+}
+
+func s9DeterministicKey(label, student string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("student-s9:"+label+":"+student)).String()
+}
+
+func s9ReservedAdmission(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	student := s9AdmissionDraft(t, ctx, pool)
+	req := s9AdmissionRequest()
+	// This helper only needs an ID for the direct transition-guard statement;
+	// insert the minimal valid RESERVED evidence with an independent transaction.
+	id := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO student_onboarding_path_admission(admission_id,student_id,handoff_id,execution_id,state_ref_kind,state_ref_version,goal_code,goal_version,goal_graph_version,request_hash,status,fence,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,'accepted_draft',1,'go.backend','v1','g1',repeat('a',64),'RESERVED',1,now()+interval '5 minutes',now(),now())`, id, student, req.HandoffID, req.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}

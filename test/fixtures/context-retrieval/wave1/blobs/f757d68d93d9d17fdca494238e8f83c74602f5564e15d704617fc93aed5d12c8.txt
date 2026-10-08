@@ -1,0 +1,143 @@
+package curriculum
+
+import (
+	"context"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+type diagnosticFixture struct {
+	state     domain.DiagnosticPlanningState
+	overview  domain.StudentLearnerOverview
+	ensureErr error
+	plans     int
+	reads     int
+	input     PlanInput
+}
+
+func (f *diagnosticFixture) EnsureDiagnosticPlacement(context.Context, string, string) (domain.DiagnosticPlacementSummary, error) {
+	return domain.DiagnosticPlacementSummary{Band: "CORE", RouteCode: "START_CORE"}, f.ensureErr
+}
+func (f *diagnosticFixture) GetDiagnosticPlanningState(context.Context, string, string) (domain.DiagnosticPlanningState, error) {
+	return f.state, nil
+}
+func (f *diagnosticFixture) GetLearnerOverview(context.Context, string) (domain.StudentLearnerOverview, error) {
+	f.reads++
+	return f.overview, nil
+}
+func (f *diagnosticFixture) CreateCoursePlan(_ context.Context, input PlanInput) (PlanResult, error) {
+	f.plans++
+	f.input = input
+	f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "PLANNING"}
+	return PlanResult{}, nil
+}
+func diagnosticService() (Diagnostic, *diagnosticFixture) {
+	f := &diagnosticFixture{state: domain.DiagnosticPlanningState{PlanID: plannerRequestID, GoalCode: "go.backend", DirectionCode: "backend", OnboardingVersion: 2}, overview: domain.StudentLearnerOverview{StudentID: plannerStudentID, Onboarding: &domain.StudentOnboardingSnapshot{GoalCode: "go.backend", DirectionCode: "backend", Version: 2}}}
+	return Diagnostic{Gateway: f, Overview: f, Plans: f}, f
+}
+func TestDiagnosticCompletionNeverPlansIncludingFailedRequest(t *testing.T) {
+	for _, status := range []string{"", "PLANNING", "FAILED"} {
+		t.Run(status, func(t *testing.T) {
+			d, f := diagnosticService()
+			if status != "" {
+				f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: status, FailureCode: "ATTEMPTS_EXHAUSTED"}
+			}
+			_, err := d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+			require.NoError(t, err)
+			require.Zero(t, f.plans)
+		})
+	}
+}
+func TestDiagnosticExplicitPlanUsesFrozenContextAndStableIntent(t *testing.T) {
+	d, f := diagnosticService()
+	result, err := d.Plan(context.Background(), plannerStudentID, plannerRequestID)
+	require.NoError(t, err)
+	require.Equal(t, "PLANNING_PENDING", result.Status)
+	require.Equal(t, plannerRequestID, f.input.DiagnosticPlanID)
+	require.Equal(t, plannerRequestID, f.input.IdempotencyKey)
+	require.Equal(t, "go.backend", f.input.GoalCode)
+	require.Equal(t, PlanConstraints{}, f.input.Constraints)
+}
+func TestDiagnosticStaleContextDoesNotPlan(t *testing.T) {
+	d, f := diagnosticService()
+	f.overview.Onboarding.Version++
+	result, err := d.Plan(context.Background(), plannerStudentID, plannerRequestID)
+	require.NoError(t, err)
+	require.Equal(t, "DIAGNOSTIC_CONTEXT_STALE", result.Status)
+	require.Zero(t, f.plans)
+}
+func TestDiagnosticReloadUsesAcceptedJobBeforeProfileChanges(t *testing.T) {
+	d, f := diagnosticService()
+	f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "PLANNING"}
+	f.overview.Onboarding = nil
+	result, err := d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+	require.NoError(t, err)
+	require.Equal(t, "PLANNING_PENDING", result.Status)
+	require.Zero(t, f.reads)
+	require.Zero(t, f.plans)
+}
+func TestDiagnosticCompletedPathRequiresStudentOwnerIdentity(t *testing.T) {
+	d, f := diagnosticService()
+	f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "COMPLETED", LearningPathID: plannerRequestID}
+	_, err := d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+	require.Error(t, err)
+	f.overview.LearningPath = &domain.StudentLearningPath{ID: plannerRequestID, StudentID: plannerStudentID}
+	_, err = d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+	require.Error(t, err)
+	f.overview.LearningPath.Status = "PAUSED"
+	f.overview.LearningPath.IsSelected = true
+	_, err = d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+	require.Error(t, err)
+	f.overview.LearningPath.Status = "ACTIVE"
+	f.overview.LearningPath.IsSelected = false
+	result, err := d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+	require.NoError(t, err)
+	require.Equal(t, "LEARNING_PATH_ACTIVE", result.Status)
+}
+func TestDiagnosticDependencyFailureAndInvalidActorNeverPlan(t *testing.T) {
+	d, f := diagnosticService()
+	f.ensureErr = domain.ErrCurriculumUnavailable
+	_, err := d.Plan(context.Background(), plannerStudentID, plannerRequestID)
+	require.Error(t, err)
+	require.Zero(t, f.plans)
+	_, err = d.Complete(context.Background(), "bad", plannerRequestID)
+	require.ErrorIs(t, err, domain.ErrInvalidCurriculum)
+}
+func TestDiagnosticOnlyExhaustedJobMayRetry(t *testing.T) {
+	for _, code := range []string{"DIAGNOSTIC_PLAN_INVALID", "ATTEMPTS_EXHAUSTED"} {
+		t.Run(code, func(t *testing.T) {
+			d, f := diagnosticService()
+			f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "FAILED", FailureCode: code}
+			_, err := d.Plan(context.Background(), plannerStudentID, plannerRequestID)
+			require.NoError(t, err)
+			if code == "ATTEMPTS_EXHAUSTED" {
+				require.Equal(t, 1, f.plans)
+			} else {
+				require.Zero(t, f.plans)
+			}
+		})
+	}
+}
+
+func TestDiagnosticFailureRetryabilityIsOwnerPolicy(t *testing.T) {
+	for _, code := range []string{"ATTEMPTS_EXHAUSTED", "DIAGNOSTIC_PLAN_INVALID", "INVALID_INTENT"} {
+		t.Run(code, func(t *testing.T) {
+			d, f := diagnosticService()
+			f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "FAILED", FailureCode: code}
+			result, err := d.Complete(context.Background(), plannerStudentID, plannerRequestID)
+			require.NoError(t, err)
+			require.Equal(t, code == "ATTEMPTS_EXHAUSTED", result.PlanningRetryable)
+			require.Zero(t, f.plans)
+		})
+	}
+}
+
+func TestDiagnosticNoGapAndPermanentFailureRemainTerminalWithoutPlanning(t *testing.T) {
+	d, f := diagnosticService()
+	f.state.Request = &domain.DiagnosticPlanningRequest{RequestID: plannerRequestID, Status: "COMPLETED", ResultCode: "NO_GAP"}
+	result, err := d.Plan(context.Background(), plannerStudentID, plannerRequestID)
+	require.NoError(t, err)
+	require.Equal(t, "NO_GAP", result.Status)
+	require.Zero(t, f.plans)
+}

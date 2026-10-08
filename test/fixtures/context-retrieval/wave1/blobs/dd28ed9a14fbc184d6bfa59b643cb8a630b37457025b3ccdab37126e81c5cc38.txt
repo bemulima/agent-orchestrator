@@ -1,0 +1,368 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/example/ms-student-service/internal/infrastructure/persistence/postgres"
+	"github.com/example/ms-student-service/internal/usecase/student"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type commandEligibilityClock struct{}
+
+func (commandEligibilityClock) Now() time.Time { return time.Now().UTC() }
+
+// Uses already-migrated isolated PostgreSQL; starts/migrates/resets nothing.
+func TestCommandEligibilityPostgres(t *testing.T) {
+	dsn := os.Getenv("COMMAND_ELIGIBILITY_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set COMMAND_ELIGIBILITY_TEST_DATABASE_URL to migrated loopback *_integration_proof")
+	}
+	cfg, e := pgxpool.ParseConfig(dsn)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if (cfg.ConnConfig.Host != "127.0.0.1" && cfg.ConnConfig.Host != "localhost" && cfg.ConnConfig.Host != "::1") || !strings.HasSuffix(cfg.ConnConfig.Database, "_integration_proof") {
+		t.Fatal("requires isolated loopback *_integration_proof")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pool, e := pgxpool.New(ctx, dsn)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pool.Close()
+	if e = pool.Ping(ctx); e != nil {
+		t.Fatal(e)
+	}
+	journey := &postgres.LearningJourneyRepoPG{Pool: pool}
+	actions := postgres.LearningActionLifecycleRepoPG{Pool: pool}
+	newPath := func(t *testing.T, actor, kind string, two bool) domain.StudentLearningPath {
+		t.Helper()
+		if actor == "" {
+			actor = uuid.NewString()
+		}
+		now := time.Now().UTC()
+		p := domain.StudentLearningPath{ID: uuid.NewString(), StudentID: actor, CourseID: uuid.NewString(), GoalCode: "go.backend", CurriculumRevision: "eligibility-r1", PolicyVersion: domain.LearningPathPolicyVersion, PlannerPolicyVersion: "planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Command eligibility fixture", Status: domain.LearningPathStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}
+		count := 1
+		if two {
+			count = 2
+		}
+		for n := 0; n < count; n++ {
+			r := domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: kind, Required: true, SourceReference: domain.LessonSourceReference{ID: uuid.NewString(), RevisionID: uuid.NewString()}}
+			if kind == "practice_completed" {
+				r.SourceReference.ID = r.SourceReference.RevisionID
+			}
+			status := domain.LearningPathItemReady
+			if n > 0 {
+				status = domain.LearningPathItemPlanned
+			}
+			p.Items = append(p.Items, domain.LearningPathItem{ID: uuid.NewString(), ReferenceType: "lesson", ReferenceID: uuid.NewString(), Position: n, Status: status, ReasonCode: "fixture", LessonRevisionID: uuid.NewString(), LessonContent: json.RawMessage(`{"title":"frozen"}`), FrozenRequirements: []domain.LessonRequirement{r}, Targets: []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.syntax", Version: "v1"}}})
+		}
+		if kind == "standalone" {
+			for n := range p.Items {
+				p.Items[n].ReferenceType = "practice"
+				p.Items[n].ReferenceID = uuid.NewString()
+				p.Items[n].LessonRevisionID = ""
+				p.Items[n].LessonContent = nil
+				p.Items[n].FrozenRequirements = nil
+			}
+		}
+		p, _, e := journey.CreateLearningPathIdempotently(ctx, p, repository.LearningPathCreationRequest{IdempotencyKey: uuid.NewString(), PlanningRequestID: uuid.NewString(), RequestHash: strings.Repeat("a", 64)})
+		if e != nil {
+			t.Fatal(e)
+		}
+		return p
+	}
+	reserveInput := func(t *testing.T, p domain.StudentLearningPath, i domain.LearningPathItem, actor string) domain.PracticeLearningActionReserve {
+		t.Helper()
+		r := domain.LessonRequirement{}
+		itemID, requirementID := "", ""
+		if i.ReferenceType == "practice" {
+			r.SourceReference.RevisionID = i.ReferenceID
+		} else {
+			r = i.FrozenRequirements[0]
+			itemID = i.ID
+			requirementID = r.ID
+		}
+		id := uuid.NewString()
+		input, e := domain.NormalizePracticeLearningActionReserve(domain.PracticeLearningActionReserve{Schema: domain.StudentPracticeLearningActionReserveSchema, StudentID: actor, TaskInstanceID: id, TaskRevisionID: r.SourceReference.RevisionID, TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), SurfaceClassification: "practice", LearningTargets: i.Targets, LearningPathID: p.ID, LearningPathItemID: itemID, RequirementID: requirementID, IdempotencyKey: id, LearningActionID: uuid.NewString(), OccurredAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		return input
+	}
+	invoke := func(t *testing.T, p domain.StudentLearningPath, i domain.LearningPathItem, actor string) error {
+		t.Helper()
+		if i.ReferenceType == "practice" {
+			_, _, e := actions.ReservePracticeLearningAction(ctx, reserveInput(t, p, i, actor))
+			return e
+		}
+		r := i.FrozenRequirements[0]
+		if r.Type == "theory_acknowledged" {
+			_, e := (student.LessonCompletion{Repository: journey, Clock: commandEligibilityClock{}}).AcknowledgeTheory(ctx, actor, i.ID, r.ID, uuid.NewString())
+			return e
+		}
+		if r.Type == "practice_completed" {
+			_, _, e := actions.ReservePracticeLearningAction(ctx, reserveInput(t, p, i, actor))
+			return e
+		}
+		now := time.Now().UTC()
+		frozen, _ := json.Marshal(map[string]string{"id": r.SourceReference.ID, "_completion_fact_type": r.Type, "_completion_source_revision_id": r.SourceReference.RevisionID})
+		answer := domain.StudentTaskAnswer{ID: uuid.NewString(), StudentID: actor, TaskID: r.SourceReference.ID, LearningPathItemID: i.ID, RequirementID: r.ID, FrozenTaskJSON: frozen, Status: domain.StudentTaskAnswerStatusInProgress, StartedAt: now, CreatedAt: now, UpdatedAt: now}
+		action, e := domain.NewStudentLearningAction(domain.StudentLearningAction{ID: uuid.NewString(), StudentTaskAnswerID: answer.ID, StudentID: actor, TaskID: answer.TaskID, ContextType: domain.LearningContextLessonTask, ContextID: answer.TaskID, LearningTargets: i.Targets, EvidenceClass: domain.LearningEvidenceKnowledgeCheck, OpenedAt: now})
+		if e != nil {
+			t.Fatal(e)
+		}
+		_, _, e = actions.CreateAnswer(ctx, answer, nil, action)
+		return e
+	}
+	snapshot := func(t *testing.T, p domain.StudentLearningPath) string {
+		t.Helper()
+		state, e := journey.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		var counts []int
+		for _, table := range []string{"student_lesson_activity_fact", "student_task_answer", "student_learning_action", "student_learning_path_command"} {
+			var c int
+			if e = pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE student_id=$1", p.StudentID).Scan(&c); e != nil {
+				t.Fatal(e)
+			}
+			counts = append(counts, c)
+		}
+		b, _ := json.Marshal(struct {
+			State  domain.LearningPathPlanningState
+			Counts []int
+		}{state, counts})
+		return string(b)
+	}
+	for _, kind := range []string{"theory_acknowledged", "quiz_passed", "task_passed", "practice_completed", "standalone"} {
+		for _, mode := range []string{"future", "paused", "unselected", "foreign", "satisfied"} {
+			if kind == "standalone" && mode == "satisfied" {
+				continue
+			}
+			t.Run(kind+"/"+mode, func(t *testing.T) {
+				p := newPath(t, "", kind, mode == "future")
+				i := p.Items[0]
+				actor := p.StudentID
+				if mode == "future" {
+					i = p.Items[1]
+				}
+				if mode == "paused" {
+					c, e := journey.GetLearningContext(ctx, actor)
+					if e != nil {
+						t.Fatal(e)
+					}
+					if _, e = journey.PauseLearningPath(ctx, actor, p.ID, c.Version, time.Now().UTC()); e != nil {
+						t.Fatal(e)
+					}
+				}
+				if mode == "unselected" {
+					other := newPath(t, actor, "theory_acknowledged", false)
+					c, e := journey.GetLearningContext(ctx, actor)
+					if e != nil {
+						t.Fatal(e)
+					}
+					if _, e = journey.ActivateLearningPath(ctx, actor, other.ID, c.Version, false, time.Now().UTC()); e != nil {
+						t.Fatal(e)
+					}
+				}
+				if mode == "foreign" {
+					actor = uuid.NewString()
+				}
+				if mode == "satisfied" {
+					reqs := append([]domain.LessonRequirement(nil), i.FrozenRequirements...)
+					reqs[0].Satisfied = true
+					raw, _ := json.Marshal(reqs)
+					if _, e = pool.Exec(ctx, `UPDATE student_learning_path_item SET frozen_requirements=$2 WHERE id=$1`, i.ID, raw); e != nil {
+						t.Fatal(e)
+					}
+				}
+				before := snapshot(t, p)
+				e := invoke(t, p, i, actor)
+				if !errors.Is(e, domain.ErrConflict) && !errors.Is(e, domain.ErrNotFound) && !errors.Is(e, domain.ErrInvalidStatus) {
+					t.Fatalf("ineligible command accepted mode=%s kind=%s error=%v", mode, kind, e)
+				}
+				if after := snapshot(t, p); before != after {
+					t.Fatal("denial mutated state/counters")
+				}
+			})
+		}
+	}
+	for _, kind := range []string{"quiz_passed", "task_passed"} {
+		t.Run("current_valid_and_late_passed/"+kind, func(t *testing.T) {
+			p := newPath(t, "", kind, false)
+			i := p.Items[0]
+			// Optional activity and other requirement presentation priorities are
+			// not admission prerequisites within the current item.
+			reqs := append([]domain.LessonRequirement(nil), i.FrozenRequirements...)
+			reqs = append(reqs, domain.LessonRequirement{ID: uuid.NewString(), ActivityID: uuid.NewString(), Type: "theory_acknowledged", Required: false, SourceReference: domain.LessonSourceReference{ID: uuid.NewString()}})
+			raw, _ := json.Marshal(reqs)
+			if _, e = pool.Exec(ctx, `UPDATE student_learning_path_item SET frozen_requirements=$2 WHERE id=$1`, i.ID, raw); e != nil {
+				t.Fatal(e)
+			}
+			if e = invoke(t, p, i, p.StudentID); e != nil {
+				t.Fatalf("eligible current command denied: %v", e)
+			}
+			var answerID string
+			if e = pool.QueryRow(ctx, `SELECT id::text FROM student_task_answer WHERE student_id=$1`, p.StudentID).Scan(&answerID); e != nil {
+				t.Fatal(e)
+			}
+			answer, e := (postgres.StudentTaskAnswerRepoPG{Pool: pool}).GetByID(ctx, answerID)
+			if e != nil {
+				t.Fatal(e)
+			}
+			action, e := actions.GetActiveByAnswer(ctx, answerID)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if kind == "quiz_passed" {
+				c, _ := journey.GetLearningContext(ctx, p.StudentID)
+				if _, e = journey.PauseLearningPath(ctx, p.StudentID, p.ID, c.Version, time.Now().UTC()); e != nil {
+					t.Fatal(e)
+				}
+			} else {
+				other := newPath(t, p.StudentID, "theory_acknowledged", false)
+				c, _ := journey.GetLearningContext(ctx, p.StudentID)
+				if _, e = journey.ActivateLearningPath(ctx, p.StudentID, other.ID, c.Version, false, time.Now().UTC()); e != nil {
+					t.Fatal(e)
+				}
+			}
+			closed := time.Now().UTC()
+			event, e := domain.NewLearningActionClosedEvent(uuid.NewString(), action, closed)
+			if e != nil {
+				t.Fatal(e)
+			}
+			action.Outcome = domain.LearningActionPassed
+			action.OutcomePolicyVersion = domain.MasteryPolicyVersion
+			answer.Status = domain.StudentTaskAnswerStatusPassed
+			answer.EndedAt = &closed
+			answer.UpdatedAt = closed
+			if e = actions.CloseAnswer(ctx, *answer, action, event); e != nil {
+				t.Fatalf("valid late outcome rejected: %v", e)
+			}
+			item, e := journey.GetLessonItem(ctx, p.StudentID, i.ID)
+			if e != nil || item.Status != domain.LearningPathItemCompleted || !item.FrozenRequirements[0].Satisfied || item.FrozenRequirements[1].Satisfied {
+				t.Fatalf("late result/optional reducer: %+v err=%v", item, e)
+			}
+		})
+	}
+	for _, kind := range []string{"practice_completed", "standalone"} {
+		t.Run("current_practice_open_replay_and_late_evidence/"+kind, func(t *testing.T) {
+			p := newPath(t, "", kind, false)
+			input := reserveInput(t, p, p.Items[0], p.StudentID)
+			b, _, e := actions.ReservePracticeLearningAction(ctx, input)
+			if e != nil {
+				t.Fatal(e)
+			}
+			opened, replayed, e := actions.OpenPracticeLearningAction(ctx, p.StudentID, b.TaskInstanceID, b.LearningActionID, time.Now().UTC())
+			if e != nil || replayed {
+				t.Fatalf("eligible open: %v", e)
+			}
+			c, _ := journey.GetLearningContext(ctx, p.StudentID)
+			if _, e = journey.PauseLearningPath(ctx, p.StudentID, p.ID, c.Version, time.Now().UTC()); e != nil {
+				t.Fatal(e)
+			}
+			before := snapshot(t, p)
+			again, replayed, e := actions.OpenPracticeLearningAction(ctx, p.StudentID, b.TaskInstanceID, b.LearningActionID, time.Now().UTC())
+			if e != nil || !replayed || !reflect.DeepEqual(opened, again) {
+				t.Fatalf("OPEN replay denied: %v", e)
+			}
+			if before != snapshot(t, p) {
+				t.Fatal("OPEN replay mutated state")
+			}
+			id := uuid.NewString()
+			now := time.Now().UTC()
+			evidence := domain.PracticeCompetencyEvidenceBundleV2{Schema: domain.PracticeCompetencyEvidenceSchemaV2, EvidenceID: id, SubmissionID: id, LearningActionID: b.LearningActionID, StudentID: p.StudentID, TaskInstanceID: b.TaskInstanceID, TaskRevisionID: b.TaskRevisionID, TaskRevisionDigest: b.TaskRevisionDigest, WorkspaceDigest: "sha256:" + strings.Repeat("c", 64), LearningPathItemID: b.LearningPathItemID, RequirementID: b.RequirementID, Outcome: "passed", AssistancePolicyVersion: "practice-assistance-v1", PolicyVersion: domain.PracticeCompetencyEvidencePolicyV2, Evidence: []domain.PracticeCompetencyEvidence{{Target: input.LearningTargets[0], Correctness: 1, Independence: 1, Confidence: 0.9, StepIDs: []string{"implement"}}}, OccurredAt: now}
+			evidence, e = domain.NormalizePracticeCompetencyEvidenceBundleV2(p.StudentID, b.TaskInstanceID, id, evidence)
+			if e != nil {
+				t.Fatal(e)
+			}
+			changed, e := actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now)
+			if e != nil || !changed {
+				t.Fatalf("late real Practice evidence denied: changed=%v err=%v", changed, e)
+			}
+			state, e := journey.GetLearningPathPlanningState(ctx, p.StudentID, p.ID)
+			if e != nil || state.Items[0].Status != domain.LearningPathItemCompleted {
+				t.Fatalf("late Practice item not completed: %+v err=%v", state, e)
+			}
+			if changed, e = actions.ApplyPracticeLearningActionEvidence(ctx, evidence, now); e != nil || changed {
+				t.Fatalf("evidence replay changed: %v", e)
+			}
+		})
+	}
+	t.Run("theory_exact_replay_after_pause_and_pure_read", func(t *testing.T) {
+		p := newPath(t, "", "theory_acknowledged", false)
+		i := p.Items[0]
+		r := i.FrozenRequirements[0]
+		key := uuid.NewString()
+		uc := student.LessonCompletion{Repository: journey, Clock: commandEligibilityClock{}}
+		accepted, e := uc.AcknowledgeTheory(ctx, p.StudentID, i.ID, r.ID, key)
+		if e != nil {
+			t.Fatal(e)
+		}
+		c, e := journey.GetLearningContext(ctx, p.StudentID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = journey.PauseLearningPath(ctx, p.StudentID, p.ID, c.Version, time.Now().UTC()); e != nil {
+			t.Fatal(e)
+		}
+		before := snapshot(t, p)
+		replay, e := uc.AcknowledgeTheory(ctx, p.StudentID, i.ID, r.ID, key)
+		if e != nil || !reflect.DeepEqual(accepted, replay) {
+			t.Fatalf("exact accepted replay lost: %v", e)
+		}
+		if _, e = journey.GetLessonItem(ctx, p.StudentID, i.ID); e != nil {
+			t.Fatal("pure content read should remain available")
+		}
+		if before != snapshot(t, p) {
+			t.Fatal("replay/read mutated state")
+		}
+	})
+	for _, mode := range []string{"paused", "unselected"} {
+		t.Run("reserved_embedded_open/"+mode, func(t *testing.T) {
+			p := newPath(t, "", "practice_completed", false)
+			input := reserveInput(t, p, p.Items[0], p.StudentID)
+			b, _, e := actions.ReservePracticeLearningAction(ctx, input)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if mode == "paused" {
+				c, _ := journey.GetLearningContext(ctx, p.StudentID)
+				if _, e = journey.PauseLearningPath(ctx, p.StudentID, p.ID, c.Version, time.Now().UTC()); e != nil {
+					t.Fatal(e)
+				}
+			} else {
+				other := newPath(t, p.StudentID, "theory_acknowledged", false)
+				c, _ := journey.GetLearningContext(ctx, p.StudentID)
+				if _, e = journey.ActivateLearningPath(ctx, p.StudentID, other.ID, c.Version, false, time.Now().UTC()); e != nil {
+					t.Fatal(e)
+				}
+			}
+			before := snapshot(t, p)
+			if _, _, e = actions.OpenPracticeLearningAction(ctx, p.StudentID, b.TaskInstanceID, b.LearningActionID, time.Now().UTC()); !errors.Is(e, domain.ErrConflict) {
+				t.Fatalf("reserved open bypasses admission: %v", e)
+			}
+			if _, replayed, e := actions.ReservePracticeLearningAction(ctx, input); e != nil || !replayed {
+				t.Fatalf("reservation receipt lost: replay=%v err=%v", replayed, e)
+			}
+			if before != snapshot(t, p) {
+				t.Fatal("denial/replay mutated state")
+			}
+		})
+	}
+}

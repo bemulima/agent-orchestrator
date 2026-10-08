@@ -1,0 +1,106 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"github.com/example/ms-student-service/internal/domain"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func planningSnapshotProtectedFixture() (domain.StudentLearningPath, domain.LessonActivityFact, domain.PracticeLearningActionBinding) {
+	sid := "11111111-1111-4111-8111-111111111111"
+	itemID := "22222222-2222-4222-8222-222222222222"
+	reqID := "33333333-3333-4333-8333-333333333333"
+	revision := "44444444-4444-4444-8444-444444444444"
+	pathID := "55555555-5555-4555-8555-555555555555"
+	path := domain.StudentLearningPath{ID: pathID, StudentID: sid, Items: []domain.LearningPathItem{{ID: itemID, Position: 0, Status: domain.LearningPathItemCompleted, FrozenRequirements: []domain.LessonRequirement{{ID: reqID, Type: "practice_completed", SourceReference: domain.LessonSourceReference{ID: revision, RevisionID: revision}, Satisfied: true}}}}}
+	fact := domain.LessonActivityFact{StudentID: sid, ItemID: itemID, RequirementID: reqID, Type: "practice_completed", FactID: "66666666-6666-4666-8666-666666666666", OccurredAt: time.Now().UTC()}
+	binding := domain.PracticeLearningActionBinding{StudentID: sid, LearningPathID: pathID, LearningPathItemID: itemID, RequirementID: reqID, TaskRevisionID: revision, LearningPathPositionReservation: 0}
+	return path, fact, binding
+}
+func TestPlanningSnapshotFactIsBoundToActualFrozenRequirement(t *testing.T) {
+	p, f, _ := planningSnapshotProtectedFixture()
+	got, e := planningSnapshotFactWithRequirement(p, f)
+	if e != nil || got.SourceID != p.Items[0].FrozenRequirements[0].SourceReference.ID || got.SourceRevisionID != p.Items[0].FrozenRequirements[0].SourceReference.RevisionID {
+		t.Fatalf("lost immutable fact provenance: %+v %v", got, e)
+	}
+	for _, change := range []func(*domain.LessonActivityFact){func(x *domain.LessonActivityFact) { x.StudentID = "foreign" }, func(x *domain.LessonActivityFact) { x.RequirementID = "foreign" }, func(x *domain.LessonActivityFact) { x.Type = "task_passed" }, func(x *domain.LessonActivityFact) { x.OccurredAt = time.Time{} }} {
+		bad := f
+		change(&bad)
+		if _, e = planningSnapshotFactWithRequirement(p, bad); !errors.Is(e, domain.ErrValidation) {
+			t.Fatal("accepted missing/mismatched frozen fact binding")
+		}
+	}
+	p.Items[0].FrozenRequirements[0].Satisfied = false
+	if _, e = planningSnapshotFactWithRequirement(p, f); !errors.Is(e, domain.ErrValidation) {
+		t.Fatal("accepted fact contradicting frozen requirement progress")
+	}
+}
+func TestPlanningSnapshotPreservesPracticeAssociation(t *testing.T) {
+	p, _, binding := planningSnapshotProtectedFixture()
+	if !planningSnapshotPracticeBindingMatches(p, binding) {
+		t.Fatal("valid completed association lost")
+	}
+	binding.TaskRevisionID = "99999999-9999-4999-8999-999999999999"
+	if planningSnapshotPracticeBindingMatches(p, binding) {
+		t.Fatal("different Practice revision accepted")
+	}
+	binding.TaskRevisionID = p.Items[0].FrozenRequirements[0].SourceReference.ID
+	binding.LearningPathItemID = "foreign"
+	if planningSnapshotPracticeBindingMatches(p, binding) {
+		t.Fatal("foreign item association accepted")
+	}
+}
+func TestPlanningSnapshotAdapterReadBoundary(t *testing.T) {
+	raw, e := os.ReadFile("planning_snapshot_repo_pg.go")
+	if e != nil {
+		t.Fatal(e)
+	}
+	text := string(raw)
+	for _, s := range []string{"pgx.RepeatableRead", "pgx.ReadOnly", "readPlanningSnapshotMastery", "readPlanningSnapshotEvidence", "readPlanningSnapshotFacts", "readPlanningSnapshotCourseBindings", "readPlanningSnapshotPracticeBindings", "transaction_timestamp()"} {
+		if !strings.Contains(text, s) {
+			t.Fatalf("missing owner read projection %s", s)
+		}
+	}
+	// The sole LIMIT is a two-row intent cardinality guard. Histories remain complete.
+	intentQuery := "FROM student_learning_intent WHERE student_id=$1 AND learning_path_id=$2 AND expected_path_revision=$3 AND consumed_at IS NULL ORDER BY intent_id LIMIT 2"
+	if strings.Count(text, "LIMIT ") != 1 || !strings.Contains(text, intentQuery) {
+		t.Fatal("intent guard missing or snapshot history truncated")
+	}
+	text = strings.Replace(text, intentQuery, "intent cardinality guard", 1)
+	for _, s := range []string{"INSERT INTO", "DELETE FROM", "FOR UPDATE", "LIMIT ", "AnswerPayload", "workspace_digest", "lesson_content_json FROM", "frozen_task_json FROM", "http.NewRequest"} {
+		if strings.Contains(text, s) {
+			t.Fatalf("read projection contains forbidden or truncating operation %s", s)
+		}
+	}
+	repo := (*LearningJourneyRepoPG)(nil)
+	if _, e = repo.ReadPlanningSnapshot(context.Background(), "invalid", "invalid", nil); e == nil {
+		t.Fatal("missing repository defaulted permissively")
+	}
+}
+
+func TestPlanningSnapshotRetiredCancelledBindingDoesNotBlockCurrentPath(t *testing.T) {
+	p, _, x := planningSnapshotProtectedFixture()
+	x.LifecycleStatus = domain.PracticeLearningActionCancelled
+	x.LearningPathItemID = "77777777-7777-4777-8777-777777777777"
+	include, e := planningSnapshotCurrentPracticeBinding(p, x)
+	if e != nil || include {
+		t.Fatalf("detached CANCELLED history incorrectly blocks current path: include=%v err=%v", include, e)
+	}
+	x.LifecycleStatus = domain.PracticeLearningActionOpen
+	if _, e = planningSnapshotCurrentPracticeBinding(p, x); !errors.Is(e, domain.ErrValidation) {
+		t.Fatal("dangling protected OPEN work silently omitted")
+	}
+	x.LifecycleStatus = domain.PracticeLearningActionReserved
+	if _, e = planningSnapshotCurrentPracticeBinding(p, x); !errors.Is(e, domain.ErrValidation) {
+		t.Fatal("dangling protected RESERVED work silently omitted")
+	}
+	x.LifecycleStatus = domain.PracticeLearningActionClosed
+	x.LearningPathItemID = p.Items[0].ID
+	if include, e = planningSnapshotCurrentPracticeBinding(p, x); e != nil || !include {
+		t.Fatal("current completed binding association lost")
+	}
+}

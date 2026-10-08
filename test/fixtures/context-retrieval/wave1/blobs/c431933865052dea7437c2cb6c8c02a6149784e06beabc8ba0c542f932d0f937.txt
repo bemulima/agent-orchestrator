@@ -1,0 +1,382 @@
+//go:build nativeintegration
+
+package integration_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/example/ms-go-statistic/internal/domain"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+)
+
+const learningAnalyticsStream = "LEARNING_ANALYTICS_EVENTS"
+
+func TestNativeTelemetryLifecycle(t *testing.T) {
+	baseURL := setting("STATISTIC_NATIVE_BASE_URL", "http://127.0.0.1:18090")
+	clickHouseDSN := setting("STATISTIC_NATIVE_CLICKHOUSE_DSN", "tcp://127.0.0.1:19000?database=default")
+	natsURL := setting("STATISTIC_NATIVE_NATS_URL", "nats://127.0.0.1:4222")
+	internalToken := setting("STATISTIC_NATIVE_INTERNAL_TOKEN", os.Getenv("STAT_INTERNAL_TOKEN"))
+	if internalToken == "" {
+		t.Fatal("explicit native internal token is required for the session-summary proof")
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	requireHealthy(t, client, baseURL)
+	assertInternalSummaryGuard(t, client, baseURL, internalToken)
+
+	clickHouse := openClickHouse(t, clickHouseDSN)
+	defer func() { _ = clickHouse.Close() }()
+
+	natsConnection, err := nats.Connect(natsURL, nats.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("connect NATS: %v", err)
+	}
+	defer natsConnection.Close()
+	jetStream, err := natsConnection.JetStream()
+	if err != nil {
+		t.Fatalf("open JetStream: %v", err)
+	}
+	before, err := jetStream.StreamInfo(learningAnalyticsStream)
+	if err != nil {
+		t.Fatalf("read %s: %v", learningAnalyticsStream, err)
+	}
+
+	userID := uuid.New()
+	courseID, lessonID, taskID := uuid.New(), uuid.New(), uuid.New()
+	eventID := uuid.New()
+	defer cleanupFixture(t, clickHouse, jetStream, userID, eventID)
+
+	sessionID := startSession(t, client, baseURL, userID, courseID, lessonID, taskID)
+	// Server timestamps must span a full second so the Int64 active-time
+	// projection is tested with a positive value as well as count aggregates.
+	time.Sleep(1100 * time.Millisecond)
+	postInterestingEvent(t, client, baseURL, userID, courseID, lessonID, taskID, sessionID, eventID)
+
+	waitFor(t, 10*time.Second, func() error {
+		var count uint64
+		query := fmt.Sprintf("SELECT count() FROM stat_events WHERE user_id = toUUID('%s')", userID)
+		if err := clickHouse.QueryRow(context.Background(), query).Scan(&count); err != nil {
+			return err
+		}
+		if count != 2 {
+			return fmt.Errorf("expected two ClickHouse rows, got %d", count)
+		}
+		return nil
+	})
+
+	assertSummary(t, client, baseURL, userID, courseID, lessonID, taskID)
+	assertInternalSessionSummary(t, client, baseURL, internalToken, userID, sessionID)
+	if sequence := findNATSFixture(t, jetStream, before.State.LastSeq+1, eventID); sequence == 0 {
+		t.Fatalf("did not find JetStream message for event %s", eventID)
+	}
+}
+
+func internalSummaryResponse(t *testing.T, client *http.Client, baseURL, token string, studentID, sessionID uuid.UUID) *http.Response {
+	t.Helper()
+	endpoint := fmt.Sprintf("%s/internal/v1/students/%s/learning-sessions/%s/summary", strings.TrimRight(baseURL, "/"), studentID, sessionID)
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatal("create internal session-summary request")
+	}
+	if token != "" {
+		request.Header.Set("X-Internal-Token", token)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal("internal session-summary request failed")
+	}
+	return response
+}
+
+func assertInternalSummaryGuard(t *testing.T, client *http.Client, baseURL, token string) {
+	t.Helper()
+	studentID, sessionID := uuid.New(), uuid.New()
+	for _, provided := range []string{"", token + "-invalid"} {
+		response := internalSummaryResponse(t, client, baseURL, provided, studentID, sessionID)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("internal summary must reject absent/incorrect token, got HTTP %d", response.StatusCode)
+		}
+	}
+}
+
+func assertInternalSessionSummary(t *testing.T, client *http.Client, baseURL, token string, studentID, sessionID uuid.UUID) {
+	t.Helper()
+	response := internalSummaryResponse(t, client, baseURL, token, studentID, sessionID)
+	if response.StatusCode != http.StatusOK {
+		_ = response.Body.Close()
+		t.Fatalf("internal session-summary regression: HTTP %d", response.StatusCode)
+	}
+	var decoded struct {
+		Summary *domain.LearningSessionSummary `json:"summary"`
+	}
+	decodeJSON(t, response, &decoded)
+	summary := decoded.Summary
+	if summary == nil || summary.StudentID != studentID || summary.AnalyticsSessionID != sessionID || summary.PolicyVersion != "learning-analytics-active-time-v1" {
+		t.Fatal("internal session-summary identity or policy differs")
+	}
+	if summary.StartedAt.IsZero() || summary.LastActivityAt.Before(summary.StartedAt) || summary.WallClockSeconds < 1 || summary.ActiveLearningSeconds < 1 || summary.ActiveLearningSeconds > 60 || summary.ActiveLearningSeconds > summary.WallClockSeconds {
+		t.Fatal("internal session-summary active time is outside the nonnegative capped projection")
+	}
+	if summary.PassedTestCount != 1 || summary.FailureCount != 0 || summary.LessonCount != 0 || summary.TaskCount != 0 || summary.QuestionCount != 0 || summary.SelectedExplanationCount != 0 || summary.CodeRunCount != 0 || summary.HintCount != 0 || summary.TeacherInterventionCount != 0 || summary.StuckSignalCount != 0 {
+		t.Fatal("internal session-summary event counts differ from the exact telemetry fixture")
+	}
+	for _, scope := range [][2]uuid.UUID{{uuid.New(), sessionID}, {studentID, uuid.New()}} {
+		response := internalSummaryResponse(t, client, baseURL, token, scope[0], scope[1])
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			t.Fatalf("empty internal session-summary scope: HTTP %d", response.StatusCode)
+		}
+		decodeJSON(t, response, &decoded)
+		if decoded.Summary != nil {
+			t.Fatal("internal session-summary leaked another student or session")
+		}
+	}
+}
+
+func setting(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func requireHealthy(t *testing.T, client *http.Client, baseURL string) {
+	t.Helper()
+	response, err := client.Get(strings.TrimRight(baseURL, "/") + "/internal/health")
+	if err != nil {
+		t.Fatalf("native health request: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("native health status: %s", response.Status)
+	}
+}
+
+func openClickHouse(t *testing.T, rawDSN string) clickhouse.Conn {
+	t.Helper()
+	parsed, err := url.Parse(rawDSN)
+	if err != nil || parsed.Host == "" {
+		t.Fatalf("parse ClickHouse DSN: %v", err)
+	}
+	database := parsed.Query().Get("database")
+	if database == "" {
+		database = "default"
+	}
+	connection, err := clickhouse.Open(&clickhouse.Options{
+		Addr:     []string{parsed.Host},
+		Protocol: clickhouse.Native,
+		Auth:     clickhouse.Auth{Database: database},
+	})
+	if err != nil {
+		t.Fatalf("open ClickHouse: %v", err)
+	}
+	if err := connection.Ping(context.Background()); err != nil {
+		t.Fatalf("ping ClickHouse: %v", err)
+	}
+	return connection
+}
+
+func startSession(t *testing.T, client *http.Client, baseURL string, userID, courseID, lessonID, taskID uuid.UUID) uuid.UUID {
+	t.Helper()
+	payload := map[string]any{
+		"course_id":   courseID,
+		"lesson_id":   lessonID,
+		"task_id":     taskID,
+		"platform":    "d8-native-proof",
+		"editor_mode": "code",
+		"payload":     map[string]any{"fixture": "d8-wave3-statistic"},
+	}
+	response := postJSON(t, client, baseURL+"/api/v1/stat/session/start", userID, payload)
+	var decoded struct {
+		Data struct {
+			SessionID uuid.UUID `json:"session_id"`
+		} `json:"data"`
+	}
+	decodeJSON(t, response, &decoded)
+	if decoded.Data.SessionID == uuid.Nil {
+		t.Fatal("session start did not return a session ID")
+	}
+	return decoded.Data.SessionID
+}
+
+func postInterestingEvent(t *testing.T, client *http.Client, baseURL string, userID, courseID, lessonID, taskID, sessionID, eventID uuid.UUID) {
+	t.Helper()
+	payload := map[string]any{
+		"course_id":   courseID,
+		"lesson_id":   lessonID,
+		"task_id":     taskID,
+		"platform":    "d8-native-proof",
+		"editor_mode": "code",
+		"events": []map[string]any{{
+			"event_id":   eventID,
+			"session_id": sessionID,
+			"event_type": "test_passed",
+			"payload": map[string]any{
+				"active_seconds":       480,
+				"same_error_count":     0,
+				"consecutive_failures": 0,
+			},
+		}},
+	}
+	response := postJSON(t, client, baseURL+"/api/v1/stat/events", userID, payload)
+	var decoded struct {
+		Data struct {
+			Accepted int `json:"accepted"`
+		} `json:"data"`
+	}
+	decodeJSON(t, response, &decoded)
+	if decoded.Data.Accepted != 1 {
+		t.Fatalf("expected one accepted event, got %d", decoded.Data.Accepted)
+	}
+}
+
+func postJSON(t *testing.T, client *http.Client, endpoint string, userID uuid.UUID, payload any) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-User-Id", userID.String())
+	request.Header.Set("X-User-Role", "student")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("post %s: %v", endpoint, err)
+	}
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		t.Fatalf("post %s: %s: %s", endpoint, response.Status, body)
+	}
+	return response
+}
+
+func decodeJSON(t *testing.T, response *http.Response, destination any) {
+	t.Helper()
+	defer func() { _ = response.Body.Close() }()
+	if err := json.NewDecoder(response.Body).Decode(destination); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+}
+
+func assertSummary(t *testing.T, client *http.Client, baseURL string, userID, courseID, lessonID, taskID uuid.UUID) {
+	t.Helper()
+	query := url.Values{
+		"course_id": []string{courseID.String()},
+		"lesson_id": []string{lessonID.String()},
+		"from":      []string{time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)},
+		"to":        []string{time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)},
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/stat/summary/task/%s?%s", strings.TrimRight(baseURL, "/"), taskID, query.Encode())
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatalf("create summary request: %v", err)
+	}
+	request.Header.Set("X-User-Id", userID.String())
+	request.Header.Set("X-User-Role", "student")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("get summary: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		t.Fatalf("summary response: %s: %s", response.Status, body)
+	}
+	var decoded struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	decodeJSON(t, response, &decoded)
+	if string(decoded.Data["summary"]) == "null" || len(decoded.Data["summary"]) == 0 {
+		t.Fatal("summary projection is empty")
+	}
+}
+
+func findNATSFixture(t *testing.T, jetStream nats.JetStreamContext, firstSequence uint64, eventID uuid.UUID) uint64 {
+	t.Helper()
+	var found uint64
+	waitFor(t, 10*time.Second, func() error {
+		info, err := jetStream.StreamInfo(learningAnalyticsStream)
+		if err != nil {
+			return err
+		}
+		for sequence := firstSequence; sequence <= info.State.LastSeq; sequence++ {
+			message, err := jetStream.GetMsg(learningAnalyticsStream, sequence)
+			if err == nats.ErrMsgNotFound {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if bytes.Contains(message.Data, []byte(eventID.String())) {
+				found = sequence
+				return nil
+			}
+		}
+		return fmt.Errorf("fixture event is not present in stream")
+	})
+	return found
+}
+
+func cleanupFixture(t *testing.T, clickHouse clickhouse.Conn, jetStream nats.JetStreamContext, userID, eventID uuid.UUID) {
+	t.Helper()
+	if err := clickHouse.Exec(
+		context.Background(),
+		fmt.Sprintf("ALTER TABLE stat_events DELETE WHERE user_id = toUUID('%s') SETTINGS mutations_sync = 1", userID),
+	); err != nil {
+		t.Errorf("delete exact ClickHouse fixture: %v", err)
+	}
+	info, err := jetStream.StreamInfo(learningAnalyticsStream)
+	if err != nil {
+		t.Errorf("read stream for cleanup: %v", err)
+		return
+	}
+	for sequence := info.State.FirstSeq; sequence <= info.State.LastSeq; sequence++ {
+		message, messageErr := jetStream.GetMsg(learningAnalyticsStream, sequence)
+		if messageErr == nats.ErrMsgNotFound {
+			continue
+		}
+		if messageErr != nil {
+			t.Errorf("read NATS fixture during cleanup: %v", messageErr)
+			return
+		}
+		if bytes.Contains(message.Data, []byte(eventID.String())) {
+			if deleteErr := jetStream.DeleteMsg(learningAnalyticsStream, sequence); deleteErr != nil {
+				t.Errorf("delete exact NATS fixture: %v", deleteErr)
+			}
+			return
+		}
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, check func() error) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := check(); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("condition did not converge: %v", lastErr)
+}

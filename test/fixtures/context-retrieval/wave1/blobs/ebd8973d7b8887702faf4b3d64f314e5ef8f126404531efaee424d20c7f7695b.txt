@@ -1,0 +1,209 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+// TeacherDecisionRepository atomically records a decision and its outbox event.
+type TeacherDecisionRepository struct {
+	Pool *pgxpool.Pool
+}
+
+// Record commits the decision and event in the same PostgreSQL transaction.
+func (repository TeacherDecisionRepository) Record(ctx context.Context, decision domain.TeacherDecision, event domain.IntegrationEvent) error {
+	if repository.Pool == nil {
+		return errors.New("teacher decision repository pool is required")
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := insertTeacherDecisionAndOutbox(ctx, tx, decision, event); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func insertTeacherDecisionAndOutbox(
+	ctx context.Context,
+	tx pgx.Tx,
+	decision domain.TeacherDecision,
+	event domain.IntegrationEvent,
+) error {
+	if tx == nil || event.StudentID != decision.StudentID || event.CorrelationID != decision.CorrelationID ||
+		event.CausationID != decision.CausationID || !event.OccurredAt.Equal(decision.CreatedAt) ||
+		event.Subject != domain.SubjectTeacherDecisionRecorded {
+		return errors.New("teacher decision event does not match decision")
+	}
+	var contextID any
+	if decision.ContextID != "" {
+		contextID = decision.ContextID
+	}
+	var causationID any
+	if decision.CausationID != "" {
+		causationID = decision.CausationID
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO teacher_decision (
+			id,
+			personal_teacher_id,
+			student_id,
+			correlation_id,
+			causation_id,
+			learning_action_id,
+			teaching_mode,
+			context_type,
+			context_id,
+			practice_step_id,
+			pedagogy_method,
+			pedagogy_method_version,
+			pedagogy_stage,
+			strategy,
+			action,
+			hint_level,
+			reason_code,
+			reason_summary,
+			policy_version,
+			created_at
+		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::uuid, $7, $8, $9, NULLIF($10, ''), $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+	`,
+		decision.ID,
+		decision.PersonalTeacherID,
+		decision.StudentID,
+		decision.CorrelationID,
+		causationID,
+		decision.LearningActionID,
+		decision.TeachingMode,
+		decision.ContextType,
+		contextID,
+		decision.PracticeStepID,
+		decision.PedagogyMethod,
+		decision.PedagogyVersion,
+		decision.PedagogyStage,
+		decision.Strategy,
+		decision.Action,
+		decision.HintLevel,
+		decision.ReasonCode,
+		decision.ReasonSummary,
+		decision.PolicyVersion,
+		decision.CreatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO teacher_outbox (
+			event_id,
+			subject,
+			schema_version,
+			student_id,
+			correlation_id,
+			causation_id,
+			occurred_at,
+			payload,
+			next_attempt_at,
+			created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+	`,
+		event.EventID,
+		event.Subject,
+		event.SchemaVersion,
+		event.StudentID,
+		event.CorrelationID,
+		causationID,
+		event.OccurredAt,
+		string(event.Payload),
+		event.OccurredAt,
+		event.OccurredAt,
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListByLearningAction returns decisions in stable causal order.
+func (repository TeacherDecisionRepository) ListByLearningAction(
+	ctx context.Context,
+	studentID string,
+	learningActionID string,
+) ([]domain.TeacherDecision, error) {
+	if repository.Pool == nil {
+		return nil, errors.New("teacher decision repository pool is required")
+	}
+	studentID = strings.TrimSpace(studentID)
+	learningActionID = strings.TrimSpace(learningActionID)
+	if studentID == "" || learningActionID == "" {
+		return nil, errors.New("student_id and learning_action_id are required")
+	}
+	rows, err := repository.Pool.Query(ctx, `
+SELECT
+    id,
+    personal_teacher_id,
+    student_id,
+    correlation_id,
+    COALESCE(causation_id, ''),
+    learning_action_id::text,
+    teaching_mode,
+    context_type,
+    COALESCE(context_id, ''),
+	COALESCE(practice_step_id, ''),
+	pedagogy_method,
+	pedagogy_method_version,
+	pedagogy_stage,
+    strategy,
+    action,
+    hint_level,
+    reason_code,
+    reason_summary,
+    policy_version,
+    created_at
+FROM teacher_decision
+WHERE student_id = $1 AND learning_action_id = $2
+ORDER BY created_at, id
+`, studentID, learningActionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	decisions := make([]domain.TeacherDecision, 0)
+	for rows.Next() {
+		var decision domain.TeacherDecision
+		if err := rows.Scan(
+			&decision.ID,
+			&decision.PersonalTeacherID,
+			&decision.StudentID,
+			&decision.CorrelationID,
+			&decision.CausationID,
+			&decision.LearningActionID,
+			&decision.TeachingMode,
+			&decision.ContextType,
+			&decision.ContextID,
+			&decision.PracticeStepID,
+			&decision.PedagogyMethod,
+			&decision.PedagogyVersion,
+			&decision.PedagogyStage,
+			&decision.Strategy,
+			&decision.Action,
+			&decision.HintLevel,
+			&decision.ReasonCode,
+			&decision.ReasonSummary,
+			&decision.PolicyVersion,
+			&decision.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions, rows.Err()
+}

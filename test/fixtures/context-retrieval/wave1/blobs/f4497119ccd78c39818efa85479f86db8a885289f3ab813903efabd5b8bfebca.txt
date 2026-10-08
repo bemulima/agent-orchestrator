@@ -1,0 +1,144 @@
+# Learning paths and selected context
+
+Student owns enrollment in multiple learning paths and the single selected path used by learning surfaces. A learner may have several `ACTIVE` paths. At most one path is primary, at most one path is selected, and a selected path must be `ACTIVE`.
+
+`student_learning_context.version` is the optimistic version of the whole Student path-selection/lifecycle aggregate. It is created at version 1 with the first path and increments exactly once for each real path creation, content replacement, selection, primary-marker move, pause, or resume. An idempotent replay and activation of an already selected path without a primary change are no-ops and keep the version stable.
+
+## Public API
+
+- `GET /api/v1/student/learning-paths` returns bounded summaries under `student-learning-path-list.v1` and includes `journey_version`.
+- `GET /api/v1/student/learning-paths/{pathID}` enforces the authenticated student's ownership.
+- `POST /api/v1/student/learning-paths/{pathID}/activate` selects an `ACTIVE` path and may atomically move the primary marker.
+- `POST /api/v1/student/learning-paths/{pathID}/pause` moves selection and the primary marker to an active fallback when needed, or clears selection when none exists.
+- `POST /api/v1/student/learning-paths/{pathID}/resume` permits only `PAUSED -> ACTIVE`.
+- `GET /api/v1/student/learning-context` returns `student-learning-context.v1`.
+
+Lifecycle commands accept `expected_version`; stale versions and illegal transitions return `409`. The old singular `GET /api/v1/student/learning-path` remains an exact-shape compatibility projection selected by: selected active path, primary active path, then most recently updated active path.
+
+## Planner compatibility and allocation
+
+The existing Planner-only `PUT /internal/students/{studentID}/learning-path` remains compatible. A new-path command may add `planning_request_id` and a UUID `Idempotency-Key`; if the header is omitted, `planning_request_id` is used as the idempotency key. Student allocates the path ID inside its transaction. An exact replay returns that ID without creating a path or advancing the journey version; reuse with different content conflicts.
+
+Student now owns the path-scoped persistence boundary below; rollout of its caller remains a separate Planner change. Student still does not persist a typed activity pointer/resume anchor or expose `PUT /student/learning-context`.
+
+Diagnostic-linked initial allocation may provide paired `expected_onboarding_version` (positive) and `expected_direction_code`. These fields require idempotent initial creation (`expected_version=0`) and participate in the command hash; absent fields preserve the legacy hash. For a fresh allocation Student locks the authoritative onboarding row and compares its version, direction and `goal_code` inside the path transaction. Missing or stale context returns `409 diagnostic_context_stale` without path changes. An exact already committed request replays its existing path before this context check, even after onboarding changes. Placement remains Planner-owned; this fence stores no additional Placement state.
+
+## Teacher S10 workspace snapshot
+
+`GET /internal/students/{studentID}/learning-workspace` is a default-off,
+read-only projection for a generic Teacher **open learning workspace** action.
+It requires the dedicated `TEACHER_INTERNAL_TOKEN` (the general
+`COURSE_SERVICE_INTERNAL_TOKEN` is rejected) and
+`STUDENT_LEARNING_WORKSPACE_SNAPSHOT_ENABLED=true`.
+
+The response is `student-learning-workspace.v1`: a context version and, only
+when one exists, the exact selected `ACTIVE` path with its path version and at
+most 500 position-ordered item identities/statuses. It intentionally excludes
+the Student ID, targets, planner reason/rationale, curriculum revision, Course
+content, planning/admission/job IDs, evidence, receipts, and all message or
+model data. It is read in one repeatable-read, read-only PostgreSQL
+transaction and never creates an outbox entry, receipt, or lifecycle mutation.
+
+Legacy generic workspace navigation may select the first `IN_PROGRESS` item
+or, if absent, the first `READY` item for presentation only. Authoritative
+progression uses the Next Best Action route below. This is **not** a lesson-open authority:
+it does not perform `READY -> IN_PROGRESS`, mark completion, promote another
+item, claim a Course revision binding, or bypass the Student lesson access
+guard. Those lifecycle operations remain outside S10.
+
+## Planner exact-path contract
+
+The Planner-only routes below require the dedicated `LEARNING_PLANNER_INTERNAL_TOKEN`; the general internal token is rejected.
+
+- `GET /internal/students/{studentID}/learning-paths/{pathID}/planning-state` returns `student-learning-path-planning-state.v1`. It contains exact student/path/course identity, path and journey versions, lifecycle/selection flags, Planner policy/reason, and ordered items.
+- `PUT /internal/students/{studentID}/learning-paths/{pathID}` accepts `student-learning-path-replan.v1`, a UUID `planning_request_id`, UUID `Idempotency-Key`, desired Course identity/fingerprint, `expected_version` for the current path, Planner policy/reason, and one to 500 desired `PLANNED`/`READY` items. The owned URL path plus its version is the current-state precondition; Student atomically replaces that exact path's Course identity and items without consulting or changing the selected/primary projection.
+- `PUT /internal/students/{studentID}/learning-paths/{pathID}/completion` accepts `student-learning-path-no-gap.v1` with the same identity/version fields, no items, and `reason_code=mastery_no_gap`.
+
+Both commands return `student-learning-path-command-result.v1` with the immutable planning request identity, command kind, `changed`, and resulting planning state. Malformed JSON/unknown fields return `400`; semantic/schema errors return `422`; missing or foreign paths return indistinguishable `404`; stale versions, illegal lifecycle transitions, or identity/key reuse return `409`; unexpected persistence errors return `500`.
+
+Student reconciles a replan only within the exact owned path by frozen item identity (or `(reference_type,reference_id)` for legacy unbound items). Planner cannot send progress statuses. Completed occurrences cannot be omitted, reordered, rebound to another reference, or assigned another revision. Matching completed items retain their entire Student-owned history, including identity, content, targets, reason and satisfied frozen requirements, regardless of Planner-supplied mutable values.
+
+Ordinary structural replan waits until the current activity boundary: an `IN_PROGRESS` item blocks changes to the item set/order or Course/goal/fingerprint. An `OPEN` ordinary Course learning action also blocks those changes through its immutable item correlation, even when the item status is still `READY`. `NO_GAP` cannot skip active work. Violations return `409` and roll back path, context, revision and receipt changes, so a late official success can still commit against its original assignment. A semantically identical reconciliation remains valid. The legacy replacement/completion persistence path enforces the same completed-history and active-work protection; initial allocation is unchanged. An already committed exact receipt is recovered before current admission/protection/freshness checks. New/reopened Course action cycles take the same Student planning fence, reload the persisted immutable assignment, and validate it before writing; a previously read answer cannot recreate an open cycle after its item has been removed. Existing active-cycle reads remain replayable.
+
+These guards implement the accepted ordinary boundary only; they do not implement the hybrid evaluator, planning significance, consent policy or exceptional interruption.
+
+Planner cannot send progress statuses. A matching `READY`, `IN_PROGRESS`, `COMPLETED`, or `SKIPPED_MASTERED` item never regresses to `PLANNED`; advanced status, reason, and frozen targets are retained. No progress is inferred from targets when a desired Course supplies different lesson/practice references; shared knowledge remains in Student mastery. Desired Course identity and future ordering own the resulting route subject to the completed-history and active-boundary protections above. A real replan or NO_GAP completion increments the path version and the whole journey version exactly once. A semantic no-op and an exact receipt replay keep both versions stable.
+
+For a matching legacy item without a frozen lesson revision, an omitted desired item ID retains the persisted Student item ID. Normalization does not rewrite an explicitly supplied item ID. Empty frozen requirements represented as `null` or `[]` are equivalent after normalization. These persistence representations alone do not advance path or journey versions on a semantic no-op.
+
+`student_learning_path_command` persists the bounded complete response with the request hash in the same transaction as path reconciliation/completion. Reusing either identity inconsistently conflicts; an exact replay returns the original response even if later path state has changed. NO_GAP changes only the addressed path row/items. If it completes the selected path, Student atomically selects another active fallback or clears selection; it does not mutate the fallback path.
+
+## Accepted Hybrid Replanning boundary (Problem #4)
+
+[HYBRID MASTERY → REPLANNING ARCHITECTURE DECISION](https://github.com/bemulima/ms-go-learning-planner/blob/main/docs/hybrid-mastery-replanning.md) is the authoritative
+business architecture for Evidence/Mastery-driven Path adaptation. The preceding
+sections continue to describe current implementation contracts and counters.
+
+Student initiates evaluation on relevant objective completion, Planner-defined
+significant transitions, stable gaps, freshness checks before activation, manual
+requests, and confirmed goal changes; it coalesces insignificant updates. Mastery
+changes do not directly mutate the Path. Planning significance jointly considers
+Mastery, Confidence, Evidence quality, and Stability; one failed attempt or a small
+threshold fluctuation is insufficient. Numerical thresholds remain configurable
+planning-policy parameters. Planner returns `NO_CHANGE` or
+`REPLAN_NEEDED` with a desired mutation, reasons, and expected snapshot revisions.
+
+For application, Student first recovers an already-applied decision by identity;
+otherwise it checks consent, safe boundary, protected work, and expected learner
+planning/Path/Mastery/goal/constraints revisions. A stale result is rejected and
+re-evaluated. All operations apply atomically or none; NO_CHANGE creates no
+structural revision. Every changed route preserves parent/decision/snapshot and
+item-identity provenance. These conceptual revisions do not redefine existing
+path/journey version counters.
+
+COMPLETED history and its frozen requirements remain immutable. ACTIVE items are
+protected; an existing TaskInstance cannot be removed, replaced, or orphaned by
+ordinary replan. PENDING items may be skipped, inserted, reordered, or replaced at
+the boundary after current completion and before next activation. Skip is not
+completion. Remediation does not repeat merely because a decision is redelivered.
+An exceptional critical interruption requires explicit student intent and available
+Runtime-confirmed safe checkpoint/hold/resume, preserving the same item/TaskInstance
+and return association. This capability is optional and is not implemented here.
+Without it, ACTIVE Practice is not interrupted for remediation; remediation waits
+for the ordinary boundary. Its absence does not block Hybrid Replanning.
+
+Small future adaptations toward the already-confirmed goal can be automatic within
+learner preferences: skip redundant PENDING items, small remediation, minor reorder,
+and small future-segment replacement. Goal changes, large scope expansion,
+fundamental direction changes, FULL_REBUILD, and changes to already-started work
+(including abandonment/cancellation) require explicit student intent. Learner
+preferences constrain optional adaptation; Teacher may request and explain but cannot rewrite Path or give student
+consent. Activity/Revision owners establish INVALID; Runtime owners establish
+IMPOSSIBLE (Practice Runtime for Practice). Planner decides their planning
+consequence; Student applies authoritative learner/Path state with the same
+protection, consent, revision, atomicity, and idempotency checks. Protective blocking
+does not imply consent to abandon active work. Planning failure preserves the
+existing valid route. Completion and progress semantics remain those of [revision-bound lesson completion](lesson-completion.md).
+`OUT_OF_SCOPE_DEPENDENCY: NEXT_BEST_ACTION` remains separate.
+
+## Authoritative Next Best Action (Problem #5)
+
+Student owns `NextActionResolver`, the centralized extension of selected workspace/current progression responsibility. `GET /api/v1/student/next-action` and dedicated Teacher-token `GET /internal/students/{studentID}/next-action` expose the same computed `student-next-action.v1`; both are `no-store`. Teacher and UI present its exact primary decision and may explain its machine-readable reason. They cannot substitute a model decision or derive their own progression from ordered path items. Planner continues to own strategic route/replanning only.
+
+Inputs are one repeatable-read Student snapshot of selected context/path, frozen Lesson requirements, current correlated official Course attempts, learner prerequisites and Student Practice bindings; Runtime supplies a bounded versioned execution projection. Runtime identity must exactly match student, instance, learning action, immutable revision/digest, path/item/requirement. Unknown/malformed/unavailable execution facts fail closed. Student rechecks its snapshot after Runtime reads; changes produce `WAITING/state_changed`.
+
+Policy `student-next-action-policy.v1` applies lifecycle prerequisites, then blocking required execution, then active required execution, then active required path item, then its unfinished required requirement, then the first eligible route item after completed/skipped predecessors. Lesson requirements use semantic priority theory → quiz → Course task → Practice, with stable requirement UUID tie breaking. Active official required Course attempts override remaining lower-priority requirements: review is waiting; in-progress attempts target the exact answer. Optional lesson activity/bindings never block required progression. Eligible `PLANNED` successors can be recommended without mutation; command owners validate readiness on execution. Completed routes yield `NO_PROGRESSION`; absent route or required selection yields `PLANNING_REQUIRED`.
+
+A result has one `primary {kind,target}` only while `READY`, optional `secondary_actions`, deterministic `reason_code`, and `source_versions {context_version,path_version,runtime_version?,state_digest}`. `WAITING`, `PLANNING_REQUIRED`, and `NO_PROGRESSION` omit primary: waiting is a status rather than an executable WAIT command. Ask Teacher and review Lesson are secondary assistance/navigation. Runtime permitted retry/submission actions may also appear secondary. Project actions use concrete Runtime step/milestone/submission identities, rather than a generic continue-project command. Practice prerequisites use `START_PRACTICE_LEARNING` to navigate existing Runtime-owned learning materialization on explicit intent, without inventing lesson identities.
+
+New revision-bound theory, Course start/reopen and embedded Practice reserve/open mutations recheck the selected ACTIVE path, current unfinished item, terminal predecessors and exact unsatisfied requirement under the same Student planning fence. This does not turn the presentation priority among requirements into a new prerequisite or disallow optional current activity. Pure assignment reads and valid previously initiated Course/Practice outcomes are separate from new-command admission; outcome reducers remain late-safe after pause/selection changes. Existing exact receipts replay before these eligibility checks.
+
+NBA is never stored as an independent mutable truth and never creates a Practice instance, executes a submission, acknowledges theory, completes a lesson/path, or starts planning. Relevant immutable identities, state versions and snapshot digest explain WHAT/WHY and permit clients to recognize change. Cross-service reads cannot constitute a distributed transaction; a previously returned NBA is not a capability. Existing explicit intent commands must revalidate authoritative identity/version/lifecycle/requirement guards. A required active execution cannot silently be abandoned in favor of a later route item; a different selected path yields waiting for reconciliation. Runtime completed before Student evidence commits yields `completion_evidence_pending` rather than advancing the path prematurely.
+
+Runtime connection uses `PRACTICE_RUNTIME_URL` and `PRACTICE_RUNTIME_INTERNAL_TOKEN`; an unconfigured connection blocks required active Practice safely. Ordinary Course assessment status remains Student-owned and Lesson completion remains the existing frozen-requirement reducer. The legacy S10 workspace snapshot remains a read-only compatibility projection; it no longer confers authority to calculate progression in Teacher/UI.
+
+## Replan protection regression proof
+
+`go test -tags=integration test/integration/replan_protection_test.go -count=1 -v`
+uses `REPLAN_PROTECTION_TEST_DATABASE_URL`. The URL must point to an already
+migrated loopback PostgreSQL database ending `_integration_proof`. The suite
+creates only UUID-scoped fixtures and never starts services, applies migrations,
+or resets a schema. It verifies denial without state/version/receipt mutation,
+late successful fact and Course answer closure, completed frozen history,
+permitted future adaptation, exact receipt replay after activation, and legacy
+replacement protection, late reopen denial, and bounded observation of new/reopened action writers waiting on the same PostgreSQL advisory fence. This is a real PostgreSQL adapter proof, not live E2E.

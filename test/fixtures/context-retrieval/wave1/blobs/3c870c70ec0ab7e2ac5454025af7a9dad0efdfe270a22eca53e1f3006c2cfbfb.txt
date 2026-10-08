@@ -1,0 +1,241 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+)
+
+type publicationRepositoryStub struct {
+	item *domain.StudentPracticeTaskPublication
+}
+
+func (stub *publicationRepositoryStub) CreatePendingPublication(_ context.Context, publication domain.StudentPracticeTaskPublication) error {
+	copy := publication
+	stub.item = &copy
+	return nil
+}
+
+func (stub *publicationRepositoryStub) GetPublicationByProjectID(_ context.Context, projectID string) (*domain.StudentPracticeTaskPublication, error) {
+	if stub.item == nil || stub.item.StudentPracticeTaskID != projectID {
+		return nil, domain.ErrNotFound
+	}
+	copy := *stub.item
+	return &copy, nil
+}
+
+func (stub *publicationRepositoryStub) GetPublicationBySlug(_ context.Context, slug string) (*domain.StudentPracticeTaskPublication, error) {
+	if stub.item == nil || stub.item.ShareSlug != slug || stub.item.Status != domain.PracticeTaskPublicationStatusReady ||
+		stub.item.Visibility == domain.PracticeTaskPublicationVisibilityPrivate {
+		return nil, domain.ErrNotFound
+	}
+	copy := *stub.item
+	return &copy, nil
+}
+
+func (stub *publicationRepositoryStub) ListPublicationsByStudentID(_ context.Context, studentID string) ([]domain.StudentPracticeTaskPublication, error) {
+	if stub.item == nil || stub.item.StudentID != studentID || stub.item.Visibility != domain.PracticeTaskPublicationVisibilityPublic {
+		return []domain.StudentPracticeTaskPublication{}, nil
+	}
+	return []domain.StudentPracticeTaskPublication{*stub.item}, nil
+}
+
+func (stub *publicationRepositoryStub) MarkPublicationReady(_ context.Context, publicationID string, visibility int16, publishedAt *time.Time, updatedAt time.Time) error {
+	if stub.item == nil || stub.item.ID != publicationID || stub.item.Status != domain.PracticeTaskPublicationStatusPending {
+		return domain.ErrConflict
+	}
+	stub.item.Status = domain.PracticeTaskPublicationStatusReady
+	stub.item.Visibility = visibility
+	stub.item.PublishedAt = publishedAt
+	stub.item.UpdatedAt = updatedAt
+	return nil
+}
+
+func (stub *publicationRepositoryStub) UpdatePublicationVisibility(_ context.Context, publicationID string, visibility int16, publishedAt *time.Time, updatedAt time.Time) error {
+	if stub.item == nil || stub.item.ID != publicationID || stub.item.Status != domain.PracticeTaskPublicationStatusReady {
+		return domain.ErrConflict
+	}
+	stub.item.Visibility = visibility
+	stub.item.PublishedAt = publishedAt
+	stub.item.UpdatedAt = updatedAt
+	return nil
+}
+
+type publicationFileStorageStub struct {
+	source    []byte
+	public    []byte
+	uploaded  bool
+	activated bool
+	sourceID  string
+	publicID  string
+}
+
+func (stub *publicationFileStorageStub) DownloadSourceArchive(_ context.Context, fileID string) ([]byte, error) {
+	stub.sourceID = fileID
+	if fileID == "approved-artifact-file" {
+		return append([]byte(nil), stub.source...), nil
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (stub *publicationFileStorageStub) DownloadPublicationSnapshot(_ context.Context, fileID string) ([]byte, error) {
+	stub.publicID = fileID
+	if fileID == "public-snapshot-file" {
+		return append([]byte(nil), stub.public...), nil
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (stub *publicationFileStorageStub) UploadTemporaryArchive(_ context.Context, ownerID, filename string, content []byte) (string, error) {
+	if ownerID != "student-1" || !strings.HasSuffix(filename, ".snapshot") {
+		return "", errors.New("unexpected upload metadata")
+	}
+	stub.uploaded = true
+	stub.public = append([]byte(nil), content...)
+	return "public-snapshot-file", nil
+}
+
+func (stub *publicationFileStorageStub) Activate(_ context.Context, fileID string) error {
+	if fileID != "public-snapshot-file" {
+		return errors.New("unexpected activation")
+	}
+	stub.activated = true
+	return nil
+}
+
+func TestPracticeTaskPublicationUsesApprovedArtifactAndNeverExposesStorageOrSandbox(t *testing.T) {
+	useCase, projectRepository := newFinalReviewTestUseCase(nil)
+	now := time.Now().UTC()
+	artifactID := "approved-artifact"
+	projectRepository.project.Status = domain.StudentPracticeTaskStatusCompleted
+	projectRepository.project.CompletedAt = &now
+	projectRepository.artifacts = []domain.StudentPracticeTaskArtifact{{
+		ID: artifactID, StudentPracticeTaskID: projectRepository.project.ID, StorageFileID: "approved-artifact-file",
+	}}
+	projectRepository.reviews = []domain.StudentPracticeTaskFinalReview{{
+		ID: "review-1", StudentPracticeTaskID: projectRepository.project.ID, ArtifactID: &artifactID,
+		Status: domain.PracticeTaskFinalReviewStatusPassed, MentorStatus: domain.PracticeTaskMentorReviewStatusPassed,
+		ReviewedAt: &now,
+	}}
+	catalog := useCase.Catalog.(finalReviewCatalogStub)
+	catalog.runtime.RevisionNumber = 7
+	catalog.runtime.PracticeTask.Title = "Storefront Lite"
+	catalog.runtime.PracticeTask.Theme = "Product catalog"
+	catalog.runtime.SolutionVariants[0].Code = "html-css-js"
+	catalog.runtime.SolutionVariants[0].Title = "HTML + CSS + JavaScript"
+	catalog.runtime.SolutionVariants[0].Topology = "frontend_only"
+	catalog.runtime.SolutionVariants[0].StackCodes = []string{"html", "css", "javascript"}
+	catalog.runtime.PracticeTaskMilestones[0].Title = "Visible product catalog"
+	catalog.runtime.PracticeTaskMilestones[0].StackCodes = []string{"html", "css", "javascript"}
+	useCase.Catalog = catalog
+	publicationRepository := &publicationRepositoryStub{}
+	fileStorage := &publicationFileStorageStub{source: publicationTestZip(t, map[string]string{
+		"index.html": "<h1>Storefront Lite</h1>",
+		"app.js":     `document.querySelector("h1")`,
+		".env":       "TOKEN=must-not-leak",
+	})}
+	useCase.Publications = publicationRepository
+	useCase.PublicationFiles = fileStorage
+
+	ownerView, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "unlisted")
+	if err != nil {
+		t.Fatalf("publish completed practice task: %v", err)
+	}
+	if !fileStorage.uploaded || !fileStorage.activated || fileStorage.sourceID != "approved-artifact-file" {
+		t.Fatalf("expected approved artifact -> sanitized upload -> activation, got %#v", fileStorage)
+	}
+	if ownerView.Visibility != "unlisted" || ownerView.SecurityReport == nil || ownerView.Manifest.ExcludedFilesCount != 1 {
+		t.Fatalf("unexpected owner publication view: %#v", ownerView)
+	}
+
+	publicView, err := useCase.GetPublicPracticeTaskPublication(context.Background(), ownerView.ShareSlug)
+	if err != nil {
+		t.Fatalf("get unlisted publication by link: %v", err)
+	}
+	if len(publicView.Files) != 2 || publicView.SecurityReport != nil {
+		t.Fatalf("public view must contain safe code without private scan paths: %#v", publicView)
+	}
+	if fileStorage.publicID != "public-snapshot-file" {
+		t.Fatalf("expected encrypted publication snapshot download, got %#v", fileStorage)
+	}
+	payload, err := json.Marshal(publicView)
+	if err != nil {
+		t.Fatalf("marshal public view: %v", err)
+	}
+	forbiddenValues := []string{"approved-artifact-file", "public-snapshot-file", "sandbox-1", "must-not-leak", ".env", ownerView.ID}
+	for _, forbidden := range forbiddenValues {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("public response leaked %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestPracticeTaskPublicationVisibilityRevokesAndListsCorrectly(t *testing.T) {
+	useCase, projectRepository := publicationReadyUseCase(t)
+	view, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "public")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	items, err := useCase.ListPublicPracticeTaskPublications(context.Background(), "student-1")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("public profile must list publication: items=%#v err=%v", items, err)
+	}
+	if _, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "private"); err != nil {
+		t.Fatalf("make private: %v", err)
+	}
+	if _, err := useCase.GetPublicPracticeTaskPublication(context.Background(), view.ShareSlug); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private publication link must be revoked, got %v", err)
+	}
+	items, err = useCase.ListPublicPracticeTaskPublications(context.Background(), "student-1")
+	if err != nil || len(items) != 0 {
+		t.Fatalf("private publication must disappear from profile: items=%#v err=%v", items, err)
+	}
+}
+
+func TestPracticeTaskPublicationRequiresMentorApprovedCompletion(t *testing.T) {
+	useCase, projectRepository := publicationReadyUseCase(t)
+	projectRepository.project.Status = domain.StudentPracticeTaskStatusInReview
+	_, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "public")
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("expected completed-project requirement, got %v", err)
+	}
+}
+
+func TestPracticeTaskPublicationCanAlwaysBeRevokedAfterCreation(t *testing.T) {
+	useCase, projectRepository := publicationReadyUseCase(t)
+	view, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "unlisted")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	projectRepository.project.Status = domain.StudentPracticeTaskStatusChangesRequested
+	if _, err := useCase.SetPracticeTaskPublicationVisibility(context.Background(), "student-1", projectRepository.project.ID, "private"); err != nil {
+		t.Fatalf("revocation must not depend on a later project status: %v", err)
+	}
+	if _, err := useCase.GetPublicPracticeTaskPublication(context.Background(), view.ShareSlug); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("revoked publication must not remain readable, got %v", err)
+	}
+}
+
+func publicationReadyUseCase(t *testing.T) (StudentUseCase, *finalReviewRepositoryStub) {
+	t.Helper()
+	useCase, repositoryStub := newFinalReviewTestUseCase(nil)
+	now := time.Now().UTC()
+	artifactID := "artifact-1"
+	repositoryStub.project.Status = domain.StudentPracticeTaskStatusCompleted
+	repositoryStub.project.CompletedAt = &now
+	repositoryStub.artifacts[0].ID = artifactID
+	repositoryStub.artifacts[0].StorageFileID = "approved-artifact-file"
+	repositoryStub.reviews = []domain.StudentPracticeTaskFinalReview{{
+		ID: "review-1", StudentPracticeTaskID: repositoryStub.project.ID, ArtifactID: &artifactID,
+		Status: domain.PracticeTaskFinalReviewStatusPassed, MentorStatus: domain.PracticeTaskMentorReviewStatusPassed,
+		ReviewedAt: &now,
+	}}
+	useCase.Publications = &publicationRepositoryStub{}
+	useCase.PublicationFiles = &publicationFileStorageStub{source: publicationTestZip(t, map[string]string{"main.go": "package main"})}
+	return useCase, repositoryStub
+}

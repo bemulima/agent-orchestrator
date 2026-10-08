@@ -1,0 +1,244 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+var (
+	ErrInvalidTeacherDialogJob      = errors.New("invalid teacher dialog job")
+	ErrTeacherDialogRequestConflict = errors.New("teacher dialog request conflict")
+	ErrTeacherDialogLeaseLost       = errors.New("teacher dialog job lease lost")
+	ErrTeacherDialogCursorBlocked   = errors.New("teacher dialog cursor blocked")
+)
+
+type TeacherDialogJobStatus string
+
+const (
+	TeacherDialogJobQueued          TeacherDialogJobStatus = "queued"
+	TeacherDialogJobProcessing      TeacherDialogJobStatus = "processing"
+	TeacherDialogJobDeliveryPending TeacherDialogJobStatus = "delivery_pending"
+	TeacherDialogJobDelivered       TeacherDialogJobStatus = "delivered"
+	TeacherDialogJobCompleted       TeacherDialogJobStatus = "completed"
+	TeacherDialogJobBlocked         TeacherDialogJobStatus = "blocked"
+)
+
+const (
+	TeacherDialogErrorUnsupportedContext = "unsupported_context"
+	TeacherDialogErrorTeacherIdentity    = "teacher_identity"
+	TeacherDialogErrorDialogContext      = "dialog_context"
+	TeacherDialogErrorContextBudget      = "context_budget"
+	TeacherDialogErrorStudentContext     = "student_context"
+	TeacherDialogErrorGeneration         = "generation"
+	TeacherDialogErrorDelivery           = "delivery"
+	TeacherDialogErrorPersistence        = "persistence"
+	maximumTeacherResponseRunes          = 12000
+	maximumTeacherResponseBytes          = 48000
+)
+
+// TeacherDialogJob is private orchestration state, not a conversation store.
+// Only a generated response awaiting idempotent Dialog append is retained.
+type TeacherDialogJob struct {
+	Request                   DialogTeacherRequest
+	TeacherJobID              string
+	Status                    TeacherDialogJobStatus
+	ClaimToken                string
+	WorkerID                  string
+	DecisionID                string
+	ResponseBody              string
+	DeliveredMessageID        string
+	AIExecutionID             string
+	CoordinatorMode           string
+	ResponseAssistantUI       json.RawMessage
+	ResponseAssistantUIDigest string
+	StudentCommandID          string
+	TerminalOutcome           TeacherTurnTerminalOutcome
+	ReconciliationState       TeacherTurnReconciliationState
+	NoEffectProofID           string
+	RecoverableOutcomeID      string
+	ErrorCode                 string
+	Attempts                  int
+	NextAttemptAt             time.Time
+	LockedUntil               time.Time
+	AcceptedAt                time.Time
+	UpdatedAt                 time.Time
+	DeliveredAt               time.Time
+}
+
+func NewTeacherDialogJob(request DialogTeacherRequest, now time.Time) (TeacherDialogJob, error) {
+	normalizedRequest, err := NewDialogTeacherRequest(request)
+	if err != nil || now.IsZero() {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	now = now.UTC()
+	job := TeacherDialogJob{
+		Request: normalizedRequest, StudentCommandID: normalizedRequest.StudentCommandID, Status: TeacherDialogJobQueued,
+		NextAttemptAt: now, AcceptedAt: now, UpdatedAt: now,
+	}
+	if !SupportsTeacherDialogRuntime(normalizedRequest.ContextType) {
+		job.Status = TeacherDialogJobBlocked
+		job.ErrorCode = TeacherDialogErrorUnsupportedContext
+	}
+	return NormalizeTeacherDialogJob(job)
+}
+
+func SupportsTeacherDialogRuntime(contextType LearningContextType) bool {
+	return contextType == LearningContextGeneral || contextType == LearningContextLesson || contextType == LearningContextLessonTask ||
+		contextType == LearningContextPracticeTask ||
+		contextType == LearningContextProject
+}
+
+func NormalizeTeacherDialogJob(input TeacherDialogJob) (TeacherDialogJob, error) {
+	request, err := NewDialogTeacherRequest(input.Request)
+	if err != nil {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	input.Request = request
+	input.ClaimToken = strings.TrimSpace(input.ClaimToken)
+	input.WorkerID = strings.TrimSpace(input.WorkerID)
+	input.TeacherJobID = strings.TrimSpace(input.TeacherJobID)
+	input.DecisionID = strings.TrimSpace(input.DecisionID)
+	input.ResponseBody = strings.TrimSpace(input.ResponseBody)
+	input.DeliveredMessageID = strings.TrimSpace(input.DeliveredMessageID)
+	input.AIExecutionID = strings.TrimSpace(input.AIExecutionID)
+	input.CoordinatorMode = strings.TrimSpace(input.CoordinatorMode)
+	if input.CoordinatorMode == "" {
+		input.CoordinatorMode = "legacy"
+	}
+	input.ResponseAssistantUIDigest = strings.ToLower(strings.TrimSpace(input.ResponseAssistantUIDigest))
+	input.StudentCommandID = strings.TrimSpace(input.StudentCommandID)
+	input.TerminalOutcome = TeacherTurnTerminalOutcome(strings.TrimSpace(string(input.TerminalOutcome)))
+	input.ReconciliationState = TeacherTurnReconciliationState(strings.TrimSpace(string(input.ReconciliationState)))
+	input.NoEffectProofID = strings.TrimSpace(input.NoEffectProofID)
+	input.RecoverableOutcomeID = strings.TrimSpace(input.RecoverableOutcomeID)
+	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
+	input.NextAttemptAt = input.NextAttemptAt.UTC()
+	input.LockedUntil = input.LockedUntil.UTC()
+	input.AcceptedAt = input.AcceptedAt.UTC()
+	input.UpdatedAt = input.UpdatedAt.UTC()
+	input.DeliveredAt = input.DeliveredAt.UTC()
+
+	if input.Attempts < 0 || input.NextAttemptAt.IsZero() || input.AcceptedAt.IsZero() || input.UpdatedAt.IsZero() ||
+		len(input.WorkerID) > 128 || len(input.ErrorCode) > 64 ||
+		(input.ResponseBody != "" && (!utf8.ValidString(input.ResponseBody) || len(input.ResponseBody) > maximumTeacherResponseBytes || utf8.RuneCountInString(input.ResponseBody) > maximumTeacherResponseRunes)) {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	if input.CoordinatorMode != "legacy" && input.CoordinatorMode != "onboarding_action" && input.CoordinatorMode != "onboarding_text" {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	if len(input.ResponseAssistantUI) == 0 {
+		if input.ResponseAssistantUIDigest != "" {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	} else {
+		digest, digestErr := DigestTeacherAssistantUI(input.ResponseAssistantUI)
+		if digestErr != nil || input.CoordinatorMode == "legacy" || digest != input.ResponseAssistantUIDigest {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	}
+	for _, value := range []string{input.TeacherJobID, input.DecisionID, input.DeliveredMessageID, input.AIExecutionID, input.StudentCommandID, input.NoEffectProofID, input.RecoverableOutcomeID} {
+		if value != "" && !validUUID(value) {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	}
+	if input.ReconciliationState != "" && input.ReconciliationState != TeacherTurnUnknown && input.ReconciliationState != TeacherTurnPartial && input.ReconciliationState != TeacherTurnCommittedUnreconciled {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	if input.TerminalOutcome != "" && input.TerminalOutcome != TeacherTurnDelivered && input.TerminalOutcome != TeacherTurnFailedNoEffect {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	if input.Request.UsesDenseTeacherOrdering() && input.Request.TeacherTurnSequence < 1 {
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+
+	activeLease := validUUID(input.ClaimToken) && input.WorkerID != "" && !input.LockedUntil.IsZero()
+	inactiveLease := input.ClaimToken == "" && input.WorkerID == "" && input.LockedUntil.IsZero()
+	generatedLegacy := input.CoordinatorMode == "legacy" && input.DecisionID != "" && input.ResponseBody != ""
+	generatedCoordinator := input.CoordinatorMode != "legacy" && input.DecisionID == "" && input.ResponseBody != ""
+	generated := generatedLegacy || generatedCoordinator
+	ungenerated := input.DecisionID == "" && input.ResponseBody == ""
+	retainedPendingPractice := generatedLegacy && input.Attempts > 0 &&
+		(input.Request.ContextType == LearningContextPracticeTask || input.Request.ContextType == LearningContextProject) &&
+		input.DeliveredMessageID == "" && input.DeliveredAt.IsZero()
+
+	switch input.Status {
+	case TeacherDialogJobQueued:
+		if !inactiveLease || !ungenerated || input.DeliveredMessageID != "" || !input.DeliveredAt.IsZero() || input.TerminalOutcome != "" || input.ReconciliationState != "" || input.NoEffectProofID != "" || input.RecoverableOutcomeID != "" {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	case TeacherDialogJobProcessing:
+		if !activeLease || input.Attempts < 1 || (!generated && !ungenerated) ||
+			input.DeliveredMessageID != "" || !input.DeliveredAt.IsZero() || input.TerminalOutcome != "" || input.ReconciliationState != "" || input.NoEffectProofID != "" || input.RecoverableOutcomeID != "" {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	case TeacherDialogJobDeliveryPending:
+		if !inactiveLease || input.Attempts < 1 || !generated || input.DeliveredMessageID != "" || !input.DeliveredAt.IsZero() || input.TerminalOutcome != "" || input.ReconciliationState != "" || input.NoEffectProofID != "" || input.RecoverableOutcomeID != "" {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	case TeacherDialogJobDelivered:
+		if !inactiveLease || input.Attempts < 1 || (input.CoordinatorMode == "legacy" && input.DecisionID == "") || (input.CoordinatorMode != "legacy" && input.DecisionID != "") || input.ResponseBody != "" ||
+			input.DeliveredMessageID == "" || input.DeliveredAt.IsZero() || input.ErrorCode != "" || input.ReconciliationState != "" || input.NoEffectProofID != "" || input.RecoverableOutcomeID != "" || input.TerminalOutcome == TeacherTurnFailedNoEffect {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+		if input.TerminalOutcome != "" && input.TerminalOutcome != TeacherTurnDelivered {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	case TeacherDialogJobCompleted:
+		if !inactiveLease || input.Attempts < 1 || input.DecisionID != "" || input.ResponseBody != "" || input.DeliveredMessageID != "" || !input.DeliveredAt.IsZero() || input.ErrorCode == "" || input.TerminalOutcome != TeacherTurnFailedNoEffect || input.ReconciliationState != "" || !validUUID(input.NoEffectProofID) || !validUUID(input.RecoverableOutcomeID) {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	case TeacherDialogJobBlocked:
+		if !inactiveLease || (input.ResponseBody != "" && !retainedPendingPractice) ||
+			(input.DeliveredMessageID != "" && input.ReconciliationState != TeacherTurnCommittedUnreconciled) ||
+			!input.DeliveredAt.IsZero() || input.ErrorCode == "" || input.TerminalOutcome != "" || input.NoEffectProofID != "" || input.RecoverableOutcomeID != "" {
+			return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+		}
+	default:
+		return TeacherDialogJob{}, ErrInvalidTeacherDialogJob
+	}
+	return input, nil
+}
+
+func NormalizeTeacherResponseBody(body string) (string, error) {
+	body = strings.TrimSpace(body)
+	if body == "" || !utf8.ValidString(body) || len(body) > maximumTeacherResponseBytes || utf8.RuneCountInString(body) > maximumTeacherResponseRunes {
+		return "", ErrInvalidTeacherDialogJob
+	}
+	return body, nil
+}
+
+func NormalizeTeacherDialogErrorCode(code string) (string, error) {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return "", ErrInvalidTeacherDialogJob
+	}
+	return code, nil
+}
+
+// TeacherCoordinatedDialogResponse is staged before Dialog append and is the
+// only S5 exception to the legacy TeacherDecision requirement. Assistant UI
+// is validated/digested here; it never comes directly from a model response.
+type TeacherCoordinatedDialogResponse struct {
+	Mode        string
+	Body        string
+	AssistantUI json.RawMessage
+}
+
+func NewTeacherCoordinatedDialogResponse(input TeacherCoordinatedDialogResponse) (TeacherCoordinatedDialogResponse, error) {
+	input.Mode = strings.TrimSpace(input.Mode)
+	body, err := NormalizeTeacherResponseBody(input.Body)
+	if err != nil || (input.Mode != "onboarding_action" && input.Mode != "onboarding_text") {
+		return TeacherCoordinatedDialogResponse{}, ErrInvalidTeacherDialogJob
+	}
+	input.Body = body
+	if len(input.AssistantUI) != 0 {
+		if _, err := DigestTeacherAssistantUI(input.AssistantUI); err != nil {
+			return TeacherCoordinatedDialogResponse{}, ErrInvalidTeacherDialogJob
+		}
+		input.AssistantUI = append(json.RawMessage(nil), input.AssistantUI...)
+	}
+	return input, nil
+}

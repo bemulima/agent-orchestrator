@@ -1,0 +1,436 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+)
+
+func buildRuntimeTaskSnapshotFromPart(current partRuntimeContext, access domain.MilestoneAccess) (*domain.RuntimeTaskSnapshot, error) {
+	runtimePlan, err := buildPartRuntimePlan(current)
+	if err != nil {
+		return nil, err
+	}
+
+	description := strings.TrimSpace(derefString(current.part.Description))
+	if description == "" {
+		description = current.runtimeContext.PracticeTask.Theme
+	}
+	activeMilestones := current.partMilestones
+	if current.build != nil && len(current.build.Milestones) > 0 {
+		activeMilestones = make([]domain.PracticeTaskRuntimeMilestone, 0, len(current.build.Milestones))
+		for _, preview := range current.build.Milestones {
+			activeMilestones = append(activeMilestones, preview.Milestone)
+		}
+	}
+	if len(activeMilestones) > 0 {
+		lines := make([]string, 0, len(activeMilestones))
+		for _, milestone := range activeMilestones {
+			line := milestone.Title
+			if acceptance := extractAcceptanceChecklist(milestone.AcceptanceCriteriaJSON); len(acceptance) > 0 {
+				line += ": " + strings.Join(acceptance, ", ")
+			}
+			lines = append(lines, line)
+		}
+		if len(lines) > 0 {
+			description += "\n\nMilestones:\n- " + strings.Join(lines, "\n- ")
+		}
+	}
+	learningTargets := []domain.LearningTargetRef{}
+	if len(activeMilestones) == 1 {
+		learningTargets, err = domain.NormalizeLearningTargetRefs(activeMilestones[0].LearningTargets)
+		if err != nil {
+			return nil, err
+		}
+	} else if len(activeMilestones) > 1 {
+		return nil, domain.ErrValidation
+	}
+
+	studentMilestoneIDs := make([]string, 0, len(activeMilestones))
+	partMilestoneIDs := make([]string, 0, len(activeMilestones))
+	for _, milestone := range activeMilestones {
+		partMilestoneIDs = append(partMilestoneIDs, milestone.ID)
+		if studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestone.ID]; ok {
+			studentMilestoneIDs = append(studentMilestoneIDs, studentMilestone.ID)
+		}
+	}
+
+	return &domain.RuntimeTaskSnapshot{
+		ID:                     current.studentPracticeTask.WorkspaceTaskID,
+		LessonID:               current.studentPracticeTask.WorkspaceLessonID,
+		CourseID:               current.runtimeContext.PracticeTask.ID,
+		PracticeTaskPartID:     current.part.ID,
+		StudentMilestoneIDs:    studentMilestoneIDs,
+		PartMilestoneIDs:       partMilestoneIDs,
+		Title:                  current.part.Title,
+		Description:            description,
+		LearningTargets:        learningTargets,
+		Status:                 domain.TaskStatusActive,
+		Type:                   practiceTaskTaskTypePracticeTaskMilestone,
+		TaskKind:               practiceTaskTaskKindPart,
+		CodeStructureTypeCode:  runtimePlan.CodeStructureTypeCode,
+		CodeStructure:          runtimePlan.ContractJSON,
+		ComposeConfig:          runtimePlan.ComposeConfig,
+		ExecutionMode:          taskExecutionModeBrowserPreview,
+		EvaluationMode:         taskEvaluationModeAuto,
+		UIMode:                 taskUIModePreview,
+		SubmissionMode:         taskSubmissionModeSnapshot,
+		RequiresSandbox:        true,
+		ExposesPreview:         true,
+		ExposesTerminal:        false,
+		SupportsLiveValidation: true,
+		AllowedErrorsCount:     0,
+		Access:                 access,
+	}, nil
+}
+
+func buildPartRuntimePlan(current partRuntimeContext) (milestoneRuntimePlan, error) {
+	if current.build == nil || len(current.build.Milestones) == 0 {
+		return milestoneRuntimePlan{}, domain.ErrValidation
+	}
+	contractJSON, err := json.Marshal(current.build.Contract)
+	if err != nil {
+		return milestoneRuntimePlan{}, err
+	}
+	firstMilestone := current.build.Milestones[0].Milestone
+	codeStructureTypeCode, composeConfig, err := milestoneRuntimeProfile(firstMilestone)
+	if err != nil {
+		return milestoneRuntimePlan{}, err
+	}
+	for _, preview := range current.build.Milestones[1:] {
+		otherCode, otherCompose, profileErr := milestoneRuntimeProfile(preview.Milestone)
+		if profileErr != nil {
+			return milestoneRuntimePlan{}, profileErr
+		}
+		if otherCode != codeStructureTypeCode || !jsonBytesEqual(otherCompose, composeConfig) {
+			return milestoneRuntimePlan{}, domain.ErrValidation
+		}
+	}
+	return milestoneRuntimePlan{
+		TaskID:                milestoneRuntimeTaskID(current.part.ID),
+		CodeStructureTypeCode: codeStructureTypeCode,
+		ComposeConfig:         composeConfig,
+		ContractJSON:          contractJSON,
+	}, nil
+}
+
+func jsonBytesEqual(left, right json.RawMessage) bool {
+	var leftValue any
+	var rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
+}
+
+func (useCase StudentUseCase) seedMissingPartStarterFiles(ctx context.Context, current *partRuntimeContext, sandbox *domain.SandboxSession) error {
+	if useCase.Sandbox == nil || sandbox == nil || current == nil || current.build == nil {
+		return nil
+	}
+	files, err := useCase.Sandbox.GetSnapshot(ctx, sandbox.SandboxID)
+	if err != nil {
+		return err
+	}
+	existing := map[string]struct{}{}
+	for _, file := range files {
+		existing[file.Path] = struct{}{}
+	}
+	for _, file := range current.build.Starter.Files {
+		if _, ok := existing[file.Path]; ok {
+			continue
+		}
+		if err := useCase.Sandbox.CreateFile(ctx, sandbox.SandboxID, current.studentPracticeTask.StudentID, file.Path, file.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (useCase StudentUseCase) finalizeRuntimePartAnswer(
+	ctx context.Context,
+	binding *domain.StudentPracticeTaskTaskBinding,
+	snapshot domain.RuntimeTaskSnapshot,
+	input domain.RuntimeFinalizeInput,
+) error {
+	project, err := useCase.Students.GetStudentPracticeTask(ctx, binding.StudentPracticeTaskID)
+	if err != nil {
+		return err
+	}
+	milestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, binding.StudentPracticeTaskID)
+	if err != nil {
+		return err
+	}
+
+	milestonesByID := map[string]domain.StudentPracticeTaskMilestone{}
+	for _, item := range milestones {
+		milestonesByID[item.ID] = item
+	}
+
+	perMilestoneResults, rawByPartMilestoneID, err := splitPartValidationResult(input.RawResult)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	alreadyFinalizedPart := true
+	for _, studentMilestoneID := range snapshot.StudentMilestoneIDs {
+		currentMilestone, ok := milestonesByID[studentMilestoneID]
+		if !ok {
+			continue
+		}
+		subset, hasSubset := perMilestoneResults[currentMilestone.PracticeTaskPartMilestoneID]
+		alreadyFinalizedForAnswer := currentMilestone.TaskAnswerID != nil &&
+			*currentMilestone.TaskAnswerID == input.AnswerID &&
+			isFinalizedMilestoneStatus(currentMilestone.Status) &&
+			len(bytes.TrimSpace(currentMilestone.BestResultJSON)) > 0
+		if !alreadyFinalizedForAnswer {
+			alreadyFinalizedPart = false
+		}
+
+		currentMilestone.TaskAnswerID = &input.AnswerID
+		currentMilestone.UpdatedAt = now
+		if input.SandboxID != nil {
+			currentMilestone.SandboxID = input.SandboxID
+		}
+		if hasSubset && !alreadyFinalizedForAnswer && validationResultHasActivity(subset) {
+			currentMilestone.AttemptsCount++
+		}
+		if rawSubset, ok := rawByPartMilestoneID[currentMilestone.PracticeTaskPartMilestoneID]; ok && len(rawSubset) > 0 {
+			currentMilestone.BestResultJSON = rawSubset
+		}
+		switch {
+		case hasSubset && validationSubsetPassed(subset):
+			currentMilestone.Status = domain.StudentMilestoneStatusPassed
+			currentMilestone.PassedAt = &now
+		case hasSubset && validationResultHasHardFailure(subset):
+			currentMilestone.Status = domain.StudentMilestoneStatusFailed
+			currentMilestone.PassedAt = nil
+		case currentMilestone.Status != domain.StudentMilestoneStatusPassed && currentMilestone.Status != domain.StudentMilestoneStatusSkipped:
+			currentMilestone.Status = domain.StudentMilestoneStatusInProgress
+			currentMilestone.PassedAt = nil
+		}
+		if err := useCase.Students.UpdateStudentPracticeTaskMilestone(ctx, currentMilestone); err != nil {
+			return err
+		}
+		milestonesByID[currentMilestone.ID] = currentMilestone
+	}
+
+	project.UpdatedAt = now
+	project.CurrentTaskAnswerID = &input.AnswerID
+	if input.SandboxID != nil {
+		project.ActiveSandboxID = input.SandboxID
+	}
+	if input.PreviewURL != nil {
+		project.PreviewURL = input.PreviewURL
+	}
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, *project); err != nil {
+		return err
+	}
+
+	if !alreadyFinalizedPart && input.FileStorageID != nil && *input.FileStorageID != "" {
+		metaJSON, _ := json.Marshal(map[string]any{
+			"task_answer_id":        input.AnswerID,
+			"practice_task_part_id": snapshot.PracticeTaskPartID,
+			"student_milestone_ids": snapshot.StudentMilestoneIDs,
+			"part_milestone_ids":    snapshot.PartMilestoneIDs,
+			"status":                input.Status,
+		})
+		artifact := domain.StudentPracticeTaskArtifact{
+			ID:                    uuid.NewString(),
+			StudentPracticeTaskID: project.ID,
+			ArtifactType:          "task_answer_submission",
+			StorageFileID:         *input.FileStorageID,
+			PreviewURL:            input.PreviewURL,
+			MetaJSON:              metaJSON,
+			CreatedAt:             now,
+		}
+		if err := useCase.Students.CreateArtifact(ctx, artifact); err != nil {
+			return err
+		}
+	}
+
+	allMilestones := make([]domain.StudentPracticeTaskMilestone, 0, len(milestonesByID))
+	for _, item := range milestonesByID {
+		allMilestones = append(allMilestones, item)
+	}
+	if allMilestonesCompleted(allMilestones) {
+		if err := useCase.advanceProjectAfterRuntimePass(ctx, project, "", now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitPartValidationResult(raw json.RawMessage) (map[string]domain.ValidationRunResult, map[string]json.RawMessage, error) {
+	result := map[string]domain.ValidationRunResult{}
+	rawByMilestoneID := map[string]json.RawMessage{}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return result, rawByMilestoneID, nil
+	}
+
+	var envelope struct {
+		ValidationReport json.RawMessage `json:"validation_report"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err == nil && len(bytes.TrimSpace(envelope.ValidationReport)) > 0 {
+		trimmed = bytes.TrimSpace(envelope.ValidationReport)
+	}
+
+	var aggregated domain.ValidationRunResult
+	if err := json.Unmarshal(trimmed, &aggregated); err != nil {
+		return nil, nil, err
+	}
+
+	ensureBucket := func(milestoneID string) *domain.ValidationRunResult {
+		item, ok := result[milestoneID]
+		if ok {
+			return &item
+		}
+		item = domain.ValidationRunResult{
+			ContractKind:    aggregated.ContractKind,
+			ContractVersion: aggregated.ContractVersion,
+			Legacy:          aggregated.Legacy,
+			Stages:          []domain.ValidationStageRun{},
+			Links:           []domain.ValidationLinkRun{},
+			Errors:          []domain.ValidationRunIssue{},
+		}
+		result[milestoneID] = item
+		return &item
+	}
+
+	for _, stage := range aggregated.Stages {
+		milestoneID, localStageID, ok := splitPrefixedPartStageID(stage.StageID)
+		if !ok {
+			continue
+		}
+		bucket := ensureBucket(milestoneID)
+		stageCopy := stage
+		stageCopy.StageID = localStageID
+		stageCopy.Errors = stripPrefixedValidationIssues(stageCopy.Errors)
+		stageCopy.Warnings = stripPrefixedValidationIssues(stageCopy.Warnings)
+		bucket.Stages = append(bucket.Stages, stageCopy)
+		result[milestoneID] = *bucket
+	}
+
+	for _, link := range aggregated.Links {
+		milestoneID, localLinkID, ok := splitPrefixedPartStageID(link.LinkID)
+		if !ok {
+			continue
+		}
+		bucket := ensureBucket(milestoneID)
+		linkCopy := link
+		linkCopy.LinkID = localLinkID
+		linkCopy.Errors = stripPrefixedValidationIssues(linkCopy.Errors)
+		bucket.Links = append(bucket.Links, linkCopy)
+		result[milestoneID] = *bucket
+	}
+
+	for _, issue := range aggregated.Errors {
+		milestoneID, localStageID, ok := splitPrefixedPartStageID(issue.StageID)
+		if !ok {
+			continue
+		}
+		bucket := ensureBucket(milestoneID)
+		issueCopy := issue
+		issueCopy.StageID = localStageID
+		bucket.Errors = append(bucket.Errors, issueCopy)
+		result[milestoneID] = *bucket
+	}
+
+	for milestoneID, bucket := range result {
+		bucket.Passed = validationSubsetPassed(bucket)
+		rawBucket, err := json.Marshal(bucket)
+		if err != nil {
+			return nil, nil, err
+		}
+		result[milestoneID] = bucket
+		rawByMilestoneID[milestoneID] = rawBucket
+	}
+
+	return result, rawByMilestoneID, nil
+}
+
+func stripPrefixedValidationIssues(issues []domain.ValidationRunIssue) []domain.ValidationRunIssue {
+	if len(issues) == 0 {
+		return nil
+	}
+	result := make([]domain.ValidationRunIssue, 0, len(issues))
+	for _, issue := range issues {
+		issueCopy := issue
+		if _, localStageID, ok := splitPrefixedPartStageID(issueCopy.StageID); ok {
+			issueCopy.StageID = localStageID
+		}
+		result = append(result, issueCopy)
+	}
+	return result
+}
+
+func validationSubsetPassed(result domain.ValidationRunResult) bool {
+	if len(result.Errors) > 0 {
+		return false
+	}
+	hasChecks := false
+	for _, stage := range result.Stages {
+		if stage.Optional {
+			continue
+		}
+		hasChecks = true
+		if !stage.Passed {
+			return false
+		}
+	}
+	for _, link := range result.Links {
+		if link.Optional {
+			continue
+		}
+		hasChecks = true
+		if !link.Passed {
+			return false
+		}
+	}
+	if !hasChecks {
+		return result.Passed
+	}
+	return true
+}
+
+func validationResultHasHardFailure(result domain.ValidationRunResult) bool {
+	if len(result.Errors) > 0 {
+		return true
+	}
+	for _, stage := range result.Stages {
+		if len(stage.Errors) > 0 {
+			return true
+		}
+		if stage.Passed || stage.Optional {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(stage.Status)) {
+		case "", "passed", "ok", "success", "skipped", "blocked", "pending", "waiting", "not_run":
+			continue
+		default:
+			return true
+		}
+	}
+	for _, link := range result.Links {
+		if len(link.Errors) > 0 {
+			return true
+		}
+		if link.Passed || link.Optional {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(link.Status)) {
+		case "", "passed", "ok", "success", "skipped", "blocked", "pending", "waiting", "not_run":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}

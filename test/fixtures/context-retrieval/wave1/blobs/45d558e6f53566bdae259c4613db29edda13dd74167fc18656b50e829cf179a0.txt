@@ -1,0 +1,343 @@
+// Package migrations applies the repository-owned Student PostgreSQL schema.
+package migrations
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	historyTable      = "student_schema_migrations"
+	migrationLockName = "ms-go-student-migrations-v1"
+	migrationLockWait = 5 * time.Second
+)
+
+var (
+	outerBegin  = regexp.MustCompile(`(?is)\A(?:\s|--[^\r\n]*(?:\r?\n|\z)|/\*.*?\*/)*BEGIN\s*;`)
+	outerCommit = regexp.MustCompile(`(?is)COMMIT\s*;(?:\s|--[^\r\n]*(?:\r?\n|\z)|/\*.*?\*/)*\z`)
+)
+
+// Migration is one forward-only SQL file from db/migrations.
+type Migration struct {
+	Filename string
+	SQL      string
+	SHA256   string
+}
+
+// Status is schema metadata only. It never includes application rows.
+type Status struct {
+	Database           string
+	Role               string
+	Superuser          bool
+	PublicTableCount   int
+	HistoryTableExists bool
+	Applied            int
+	Available          int
+}
+
+// Runner applies the same SQL source for native, Docker, and CI invocations.
+type Runner struct {
+	pool       *pgxpool.Pool
+	migrations []Migration
+}
+
+// New opens the configured PostgreSQL database and reads the supplied SQL files.
+func New(ctx context.Context, databaseURL, directory string) (*Runner, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+	migrationList, err := Discover(directory)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+	return &Runner{pool: pool, migrations: migrationList}, nil
+}
+
+// Close releases the PostgreSQL connection pool.
+func (runner *Runner) Close() {
+	if runner != nil && runner.pool != nil {
+		runner.pool.Close()
+	}
+}
+
+// Discover reads and sorts the repository-owned forward SQL files.
+func Discover(directory string) ([]Migration, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, fmt.Errorf("read migration directory: %w", err)
+	}
+	migrations := make([]Migration, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" || strings.HasSuffix(strings.ToLower(entry.Name()), ".down.sql") {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read migration %s: %w", entry.Name(), err)
+		}
+		if len(strings.TrimSpace(string(contents))) == 0 {
+			return nil, fmt.Errorf("migration %s is empty", entry.Name())
+		}
+		digest := sha256.Sum256(contents)
+		migrations = append(migrations, Migration{
+			Filename: entry.Name(),
+			SQL:      string(contents),
+			SHA256:   fmt.Sprintf("%x", digest),
+		})
+	}
+	if len(migrations) == 0 {
+		return nil, fmt.Errorf("no SQL migrations found in %s", directory)
+	}
+	sort.Slice(migrations, func(i, j int) bool {
+		return migrations[i].Filename < migrations[j].Filename
+	})
+	return migrations, nil
+}
+
+// Status reports connection identity, migration ledger state, and schema size.
+func (runner *Runner) Status(ctx context.Context) (Status, error) {
+	return statusOn(ctx, runner.pool, len(runner.migrations))
+}
+
+type queryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func statusOn(ctx context.Context, connection queryRower, available int) (Status, error) {
+	status := Status{Available: available}
+	if err := connection.QueryRow(ctx, `
+SELECT current_database(), current_user,
+       (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+`).Scan(&status.Database, &status.Role, &status.Superuser); err != nil {
+		return Status{}, fmt.Errorf("read database identity: %w", err)
+	}
+	if err := connection.QueryRow(ctx, `SELECT to_regclass('public.student_schema_migrations') IS NOT NULL`).Scan(&status.HistoryTableExists); err != nil {
+		return Status{}, fmt.Errorf("check migration ledger: %w", err)
+	}
+	if err := connection.QueryRow(ctx, `
+SELECT count(*)
+FROM pg_tables
+WHERE schemaname = 'public' AND tablename <> $1
+`, historyTable).Scan(&status.PublicTableCount); err != nil {
+		return Status{}, fmt.Errorf("count public tables: %w", err)
+	}
+	if status.HistoryTableExists {
+		if err := connection.QueryRow(ctx, `SELECT count(*) FROM student_schema_migrations`).Scan(&status.Applied); err != nil {
+			return Status{}, fmt.Errorf("count applied migrations: %w", err)
+		}
+	}
+	return status, nil
+}
+
+// Up applies pending migrations in lexical filename order. A single physical
+// PostgreSQL connection owns the session lock and every state read and write
+// until the lock is released.
+func (runner *Runner) Up(ctx context.Context) (completed []string, resultErr error) {
+	connection, err := runner.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer connection.Release()
+
+	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, migrationLockName); err != nil {
+		// If the request was canceled after PostgreSQL granted the lock, the
+		// outcome is ambiguous. Discard this session instead of pooling a lock.
+		_ = connection.Conn().PgConn().Close(context.Background())
+		return nil, fmt.Errorf("lock migrations: %w", err)
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), migrationLockWait)
+		defer cancel()
+		var unlocked bool
+		if err := connection.QueryRow(unlockCtx, `SELECT pg_advisory_unlock(hashtext($1))`, migrationLockName).Scan(&unlocked); err != nil || !unlocked {
+			// Never return a session with an unknown lock state to the pool.
+			_ = connection.Conn().PgConn().Close(context.Background())
+			if resultErr == nil {
+				if err != nil {
+					resultErr = fmt.Errorf("unlock migrations: %w", err)
+				} else {
+					resultErr = errors.New("unlock migrations: session advisory lock was not held")
+				}
+			}
+		}
+	}()
+
+	status, err := statusOn(ctx, connection, len(runner.migrations))
+	if err != nil {
+		return nil, err
+	}
+	if !status.HistoryTableExists && status.PublicTableCount > 0 {
+		return nil, errors.New("refusing to adopt an existing Student schema without a migration ledger")
+	}
+	if status.HistoryTableExists && status.Applied == 0 && status.PublicTableCount > 0 {
+		return nil, errors.New("migration ledger is empty while the Student schema contains tables; inspect and recover explicitly")
+	}
+
+	applied := make(map[string]string)
+	if status.HistoryTableExists {
+		applied, err = readHistory(ctx, connection)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateHistory(runner.migrations, applied); err != nil {
+		return nil, err
+	}
+
+	completed = make([]string, 0)
+	historyExists := status.HistoryTableExists
+	for _, migration := range runner.migrations {
+		if _, exists := applied[migration.Filename]; exists {
+			continue
+		}
+		if err := runner.applyOne(ctx, connection, migration, !historyExists); err != nil {
+			return completed, fmt.Errorf("apply %s: %w", migration.Filename, err)
+		}
+		historyExists = true
+		applied[migration.Filename] = migration.SHA256
+		completed = append(completed, migration.Filename)
+	}
+	return completed, nil
+}
+
+func readHistory(ctx context.Context, connection *pgxpool.Conn) (map[string]string, error) {
+	rows, err := connection.Query(ctx, `SELECT filename, sha256 FROM student_schema_migrations ORDER BY filename`)
+	if err != nil {
+		return nil, fmt.Errorf("read migration ledger: %w", err)
+	}
+	defer rows.Close()
+	applied := make(map[string]string)
+	for rows.Next() {
+		var filename, digest string
+		if err := rows.Scan(&filename, &digest); err != nil {
+			return nil, fmt.Errorf("scan migration ledger: %w", err)
+		}
+		applied[filename] = strings.TrimSpace(digest)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate migration ledger: %w", err)
+	}
+	return applied, nil
+}
+
+func validateHistory(migrations []Migration, applied map[string]string) error {
+	known := make(map[string]string, len(migrations))
+	for _, migration := range migrations {
+		known[migration.Filename] = migration.SHA256
+	}
+	for filename, digest := range applied {
+		expected, knownMigration := known[filename]
+		if !knownMigration {
+			return fmt.Errorf("migration ledger contains unknown migration %s", filename)
+		}
+		if digest != expected {
+			return fmt.Errorf("migration %s checksum differs from the repository source", filename)
+		}
+	}
+	for index, migration := range migrations {
+		_, isApplied := applied[migration.Filename]
+		if isApplied {
+			continue
+		}
+		for _, later := range migrations[index+1:] {
+			if _, laterApplied := applied[later.Filename]; laterApplied {
+				return fmt.Errorf("migration ledger has a gap before %s", later.Filename)
+			}
+		}
+		break
+	}
+	return nil
+}
+
+func (runner *Runner) applyOne(ctx context.Context, connection *pgxpool.Conn, migration Migration, createHistory bool) error {
+	sql, err := normalizeOuterTransaction(migration.SQL)
+	if err != nil {
+		return err
+	}
+	tx, err := connection.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if createHistory {
+		if _, err := tx.Exec(ctx, `
+CREATE TABLE student_schema_migrations (
+    filename text PRIMARY KEY,
+    sha256 char(64) NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+)
+`); err != nil {
+			return fmt.Errorf("create migration ledger: %w", err)
+		}
+	}
+	if _, err := tx.Conn().PgConn().Exec(ctx, sql).ReadAll(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO student_schema_migrations (filename, sha256) VALUES ($1, $2)`, migration.Filename, migration.SHA256); err != nil {
+		return fmt.Errorf("record migration checksum: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizeOuterTransaction removes a migration's optional outer BEGIN/COMMIT
+// pair so its SQL and checksum can share the runner-owned transaction.
+func normalizeOuterTransaction(sql string) (string, error) {
+	begin := outerBegin.FindStringIndex(sql)
+	commit := outerCommit.FindStringIndex(sql)
+	if (begin == nil) != (commit == nil) {
+		return "", errors.New("migration has an incomplete outer BEGIN/COMMIT pair")
+	}
+	if begin == nil {
+		return strings.TrimSpace(sql), nil
+	}
+	if begin[1] > commit[0] {
+		return "", errors.New("migration outer transaction has no SQL body")
+	}
+	body := strings.TrimSpace(sql[begin[1]:commit[0]])
+	if body == "" {
+		return "", errors.New("migration outer transaction has no SQL body")
+	}
+	return body, nil
+}
+
+// PrintStatus writes only non-sensitive database metadata for operators.
+func PrintStatus(status Status) string {
+	history := "absent"
+	if status.HistoryTableExists {
+		history = "present"
+	}
+	return fmt.Sprintf(
+		"database=%s role=%s superuser=%t public_tables=%d migration_ledger=%s migrations=%d/%d checked_at=%s",
+		status.Database,
+		status.Role,
+		status.Superuser,
+		status.PublicTableCount,
+		history,
+		status.Applied,
+		status.Available,
+		time.Now().UTC().Format(time.RFC3339),
+	)
+}

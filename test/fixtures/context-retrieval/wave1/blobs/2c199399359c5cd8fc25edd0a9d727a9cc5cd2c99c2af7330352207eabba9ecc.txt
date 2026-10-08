@@ -1,0 +1,150 @@
+package lesson
+
+import (
+	"context"
+	"time"
+
+	"github.com/example/mc-course-service/internal/domain"
+	"github.com/example/mc-course-service/internal/domain/repository"
+	"github.com/google/uuid"
+)
+
+// UpdateLessonInput holds input values.
+type UpdateLessonInput struct {
+	LessonID            string
+	Title               string
+	Excerpt             string
+	Description         string
+	Translations        []domain.LessonI18n
+	Versions            []domain.LessonVersion
+	ComposeConfig       *[]byte
+	Status              int
+	LessonReadAccess    *domain.LessonReadAccess
+	LessonReadAccessSet bool
+}
+
+// UpdateLesson updates lesson.
+type UpdateLesson struct {
+	Courses        repository.CourseRepository
+	Lessons        repository.LessonRepository
+	LessonVersions repository.LessonVersionRepository
+	LessonI18n     repository.LessonI18nRepository
+	Tasks          repository.TaskRepository
+	TechVersions   repository.TechVersionRepository
+	ComposeConfigs repository.ComposeConfigRepository
+	Tx             repository.TransactionManager
+}
+
+// Handle performs update.
+func (uc UpdateLesson) Handle(ctx context.Context, in UpdateLessonInput) (*domain.Lesson, error) {
+	var lesson *domain.Lesson
+	run := func(fn func(ctx context.Context) error) error {
+		if uc.Tx != nil {
+			return uc.Tx.WithTx(ctx, fn)
+		}
+		return fn(ctx)
+	}
+	if err := run(func(ctx context.Context) error {
+		var err error
+		lesson, err = uc.Lessons.Get(ctx, in.LessonID)
+		if err != nil {
+			return err
+		}
+
+		versions := normalizeLessonVersions(in.Versions)
+		for _, version := range versions {
+			if uc.TechVersions != nil {
+				if _, err := uc.TechVersions.GetByID(ctx, version.TechVersionID); err != nil {
+					return err
+				}
+			}
+		}
+
+		translations := normalizeTranslations(in.Translations)
+		if len(translations) > 0 {
+			lesson.Title = translations[0].Title
+			lesson.Excerpt = translations[0].Excerpt
+			lesson.Description = translations[0].Description
+		} else {
+			lesson.Title = in.Title
+			lesson.Excerpt = in.Excerpt
+			lesson.Description = in.Description
+		}
+
+		if in.ComposeConfig != nil {
+			composeConfig := domain.NormalizeComposeConfig(*in.ComposeConfig)
+			if len(composeConfig) == 0 {
+				if err := ensureLessonRuntimeCanBeCleared(ctx, uc.Tasks, lesson.ID); err != nil {
+					return err
+				}
+			}
+			lesson.ComposeConfig = composeConfig
+			lesson.ComposeConfigID = nil
+			if len(composeConfig) > 0 && uc.ComposeConfigs != nil {
+				existing, err := uc.ComposeConfigs.GetByConfig(ctx, composeConfig)
+				if err != nil && err != domain.ErrNotFound {
+					return err
+				}
+				if existing != nil {
+					lesson.ComposeConfigID = &existing.ID
+				} else {
+					title, description := domain.DeriveComposeConfigMeta(composeConfig)
+					config := domain.ComposeConfig{
+						ID:          uuid.NewString(),
+						Title:       &title,
+						Description: &description,
+						Config:      composeConfig,
+						CreatedAt:   time.Now().UTC(),
+					}
+					if err := uc.ComposeConfigs.Create(ctx, config); err != nil {
+						return err
+					}
+					lesson.ComposeConfigID = &config.ID
+				}
+			}
+		}
+		if lesson.Status != domain.LessonStatusActive && in.Status == domain.LessonStatusActive {
+			if err := ensureLessonCanBeActive(ctx, uc.Tasks, lesson.ID); err != nil {
+				return err
+			}
+		}
+		if lesson.Status == domain.LessonStatusActive && in.Status == domain.LessonStatusNoActive {
+			if err := ensureLessonCanBeDeactivated(ctx, uc.Courses, lesson.CourseID); err != nil {
+				return err
+			}
+		}
+		lesson.Status = in.Status
+		if in.LessonReadAccessSet {
+			if err := domain.ValidateLessonReadAccess(in.LessonReadAccess); err != nil {
+				return err
+			}
+			lesson.LessonReadAccess = in.LessonReadAccess
+		}
+		lesson.Versions = versions
+		lesson.UpdatedAt = time.Now().UTC()
+
+		if err := uc.Lessons.Update(ctx, *lesson); err != nil {
+			return err
+		}
+
+		if uc.LessonVersions != nil {
+			if err := uc.LessonVersions.ReplaceByLesson(ctx, lesson.ID, versions); err != nil {
+				return err
+			}
+		}
+
+		if uc.LessonI18n != nil {
+			for _, translation := range translations {
+				translation.LessonID = lesson.ID
+				if err := uc.LessonI18n.Upsert(ctx, translation); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return lesson, nil
+}

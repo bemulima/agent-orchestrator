@@ -1,0 +1,85 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/google/uuid"
+)
+
+func (client Client) GetNextAction(ctx context.Context, studentID string) (domain.TeacherNextAction, error) {
+	parsed, err := uuid.Parse(studentID)
+	if err != nil || parsed.String() != studentID {
+		return domain.TeacherNextAction{}, domain.ErrInvalidNextBestActionRequest
+	}
+	endpoint, err := client.endpointWithToken("/internal/students/"+url.PathEscape(studentID)+"/next-action", client.LearningWorkspaceToken)
+	if err != nil {
+		return domain.TeacherNextAction{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.TeacherNextAction{}, unavailable(err)
+	}
+	request.Header.Set("Accept", "application/json")
+	client.authorizeWithToken(request, client.LearningWorkspaceToken)
+	response, err := client.do(request)
+	if err != nil {
+		return domain.TeacherNextAction{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return domain.TeacherNextAction{}, unavailableStatus(response.Status)
+	}
+	if !studentJSONMediaType(response.Header.Get("Content-Type")) {
+		return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumLearningWorkspaceResponseBytes+1))
+	if err != nil || len(contents) > maximumLearningWorkspaceResponseBytes {
+		return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+	}
+	var action domain.TeacherNextAction
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&action); err != nil {
+		return domain.TeacherNextAction{}, unavailable(err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+	}
+	// Zero versions are valid without a path, but omitted versions are corrupt.
+	// Decode presence separately so neither Teacher nor UI invents provenance.
+	var required struct {
+		SourceVersions *struct {
+			ContextVersion *int64 `json:"context_version"`
+			PathVersion    *int64 `json:"path_version"`
+		} `json:"source_versions"`
+		Primary *struct {
+			Target *json.RawMessage `json:"target"`
+		} `json:"primary"`
+		SecondaryActions []struct {
+			Target *json.RawMessage `json:"target"`
+		} `json:"secondary_actions"`
+	}
+	if err := json.Unmarshal(contents, &required); err != nil || required.SourceVersions == nil || required.SourceVersions.ContextVersion == nil || required.SourceVersions.PathVersion == nil {
+		return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+	}
+	if required.Primary != nil && required.Primary.Target == nil {
+		return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+	}
+	for _, choice := range required.SecondaryActions {
+		if choice.Target == nil {
+			return domain.TeacherNextAction{}, unavailable(domain.ErrInvalidNextBestActionRequest)
+		}
+	}
+	action, err = domain.NormalizeTeacherNextAction(action)
+	if err != nil {
+		return domain.TeacherNextAction{}, unavailable(err)
+	}
+	return action, nil
+}

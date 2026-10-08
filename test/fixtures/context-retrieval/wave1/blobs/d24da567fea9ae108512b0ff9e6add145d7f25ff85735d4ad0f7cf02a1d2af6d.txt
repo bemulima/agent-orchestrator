@@ -1,0 +1,143 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type InterventionRepository struct{ Pool *pgxpool.Pool }
+
+var _ repository.InterventionStore = InterventionRepository{}
+
+func (repository InterventionRepository) Commit(
+	ctx context.Context,
+	signal domain.LearningActivitySignal,
+	record domain.InterventionRecord,
+	decision domain.TeacherDecision,
+	event domain.IntegrationEvent,
+) (domain.InterventionRecord, bool, error) {
+	if repository.Pool == nil {
+		return domain.InterventionRecord{}, false, errors.New("intervention repository pool is required")
+	}
+	normalized, err := domain.NewLearningActivitySignal(signal)
+	if err != nil || record.EventID != normalized.EventID || record.StudentID != normalized.StudentID ||
+		record.AnalyticsSessionID != normalized.AnalyticsSessionID || record.SignalType != normalized.SignalType ||
+		record.DecisionID != decision.ID || decision.StudentID != normalized.StudentID ||
+		record.PersonalTeacherID != decision.PersonalTeacherID || record.Action != decision.Action ||
+		decision.CausationID != normalized.EventID || decision.CorrelationID != normalized.AnalyticsSessionID ||
+		!record.CreatedAt.Equal(decision.CreatedAt) ||
+		(record.Action != domain.TeacherActionIntervene && record.Action != domain.TeacherActionStaySilent) ||
+		(record.Action == domain.TeacherActionIntervene) != (strings.TrimSpace(record.OfferBody) != "") {
+		return domain.InterventionRecord{}, false, errors.New("invalid intervention record")
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.InterventionRecord{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	existing, existingErr := scanInterventionRecord(tx.QueryRow(ctx, `
+SELECT event_id::text, student_id, analytics_session_id::text, personal_teacher_id::text,
+decision_id::text, signal_type, action, COALESCE(offer_body,''), COALESCE(dialog_id::text,''),
+COALESCE(dialog_message_id::text,''), created_at, delivered_at
+FROM teacher_intervention_inbox WHERE event_id=$1`, record.EventID))
+	if existingErr == nil {
+		if existing.StudentID != record.StudentID || existing.AnalyticsSessionID != record.AnalyticsSessionID ||
+			existing.SignalType != record.SignalType {
+			return domain.InterventionRecord{}, false, errors.New("conflicting intervention event replay")
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(existingErr, pgx.ErrNoRows) {
+		return domain.InterventionRecord{}, false, existingErr
+	}
+	if err := insertTeacherDecisionAndOutbox(ctx, tx, decision, event); err != nil {
+		return domain.InterventionRecord{}, false, err
+	}
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_intervention_inbox
+(event_id, student_id, analytics_session_id, personal_teacher_id, decision_id, signal_type, action, offer_body, created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9)
+ON CONFLICT (event_id) DO NOTHING`,
+		record.EventID, record.StudentID, record.AnalyticsSessionID, record.PersonalTeacherID,
+		record.DecisionID, record.SignalType, record.Action, record.OfferBody, record.CreatedAt.UTC())
+	if err != nil {
+		return domain.InterventionRecord{}, false, err
+	}
+	if command.RowsAffected() == 0 {
+		existing, readErr := scanInterventionRecord(tx.QueryRow(ctx, `
+SELECT event_id::text, student_id, analytics_session_id::text, personal_teacher_id::text,
+decision_id::text, signal_type, action, COALESCE(offer_body,''), COALESCE(dialog_id::text,''),
+COALESCE(dialog_message_id::text,''), created_at, delivered_at
+FROM teacher_intervention_inbox WHERE event_id=$1`, record.EventID))
+		if readErr != nil {
+			return domain.InterventionRecord{}, false, readErr
+		}
+		if existing.StudentID != record.StudentID || existing.AnalyticsSessionID != record.AnalyticsSessionID ||
+			existing.SignalType != record.SignalType {
+			return domain.InterventionRecord{}, false, errors.New("conflicting intervention event replay")
+		}
+		return existing, false, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.InterventionRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (repository InterventionRepository) HasDeliveredInSession(ctx context.Context, studentID, analyticsSessionID string) (bool, error) {
+	if repository.Pool == nil {
+		return false, errors.New("intervention repository pool is required")
+	}
+	var exists bool
+	err := repository.Pool.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM teacher_intervention_inbox
+WHERE student_id=$1 AND analytics_session_id=$2 AND action='intervene' AND delivered_at IS NOT NULL
+)`, studentID, analyticsSessionID).Scan(&exists)
+	return exists, err
+}
+
+func (repository InterventionRepository) MarkDelivered(ctx context.Context, eventID, dialogID, messageID string, deliveredAt time.Time) error {
+	if repository.Pool == nil {
+		return errors.New("intervention repository pool is required")
+	}
+	if _, err := uuid.Parse(eventID); err != nil {
+		return err
+	}
+	if _, err := uuid.Parse(dialogID); err != nil {
+		return err
+	}
+	if _, err := uuid.Parse(messageID); err != nil {
+		return err
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_intervention_inbox
+SET dialog_id=$2, dialog_message_id=$3, delivered_at=$4
+WHERE event_id=$1 AND action='intervene' AND
+      (delivered_at IS NULL OR (dialog_id=$2 AND dialog_message_id=$3))`,
+		eventID, dialogID, messageID, deliveredAt.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return errors.New("intervention delivery state conflict")
+	}
+	return nil
+}
+
+type interventionRow interface{ Scan(...any) error }
+
+func scanInterventionRecord(row interventionRow) (domain.InterventionRecord, error) {
+	var record domain.InterventionRecord
+	err := row.Scan(&record.EventID, &record.StudentID, &record.AnalyticsSessionID, &record.PersonalTeacherID,
+		&record.DecisionID, &record.SignalType, &record.Action, &record.OfferBody, &record.DialogID, &record.DialogMessageID,
+		&record.CreatedAt, &record.DeliveredAt)
+	return record, err
+}

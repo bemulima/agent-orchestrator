@@ -1,0 +1,91 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/google/uuid"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+type diagnosticPublisherCapture struct {
+	natsgo.JetStreamContext
+	message *natsgo.Msg
+	err     error
+}
+
+func (capture *diagnosticPublisherCapture) PublishMsg(message *natsgo.Msg, _ ...natsgo.PubOpt) (*natsgo.PubAck, error) {
+	capture.message = message
+	return &natsgo.PubAck{}, capture.err
+}
+
+func TestOutboxPublisherAdmitsOnlyOwnedSubjectsAndPreservesHeaders(t *testing.T) {
+	planID := uuid.NewString()
+	data := domain.DiagnosticResultCommittedData{PlanID: planID, PlanRevision: 1, PlanDigest: "sha256:" + strings.Repeat("a", 64), ResultDigest: "sha256:" + strings.Repeat("b", 64)}
+	event, err := domain.NewIntegrationEvent(domain.DiagnosticResultCommittedEventID(planID), domain.SubjectDiagnosticResultCommitted, planID, uuid.NewString(), uuid.NewString(), time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC), 1, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &diagnosticPublisherCapture{}
+	publisher := &OutboxPublisher{Conn: &natsgo.Conn{}, js: capture}
+	if err := publisher.Publish(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if capture.message.Subject != event.Subject || string(capture.message.Data) != string(event.Payload) || capture.message.Header.Get(natsgo.MsgIdHdr) != event.EventID || capture.message.Header.Get("X-Event-ID") != event.EventID || capture.message.Header.Get("X-Correlation-ID") != planID || capture.message.Header.Get("X-Causation-ID") != event.CausationID || capture.message.Header.Get("X-Schema-Version") != "1" {
+		t.Fatal("publication lost payload or stable delivery headers")
+	}
+	capture.err = errors.New("broker unavailable")
+	if err := publisher.Publish(context.Background(), event); !errors.Is(err, capture.err) {
+		t.Fatal("publication ambiguity must remain retryable")
+	}
+	capture.err = nil
+	for _, subject := range []string{domain.SubjectLearningActionClosed, "student.diagnostic-result.committed.v2", "student.mastery.changed", "taskAnswer.started"} {
+		candidate := event
+		candidate.Subject = subject
+		capture.message = nil
+		err := publisher.Publish(context.Background(), candidate)
+		if subject == domain.SubjectLearningActionClosed {
+			if err != nil || capture.message == nil {
+				t.Fatal("prior closure admission changed")
+			}
+		} else if err == nil || capture.message != nil {
+			t.Fatalf("unowned subject admitted: %s", subject)
+		}
+	}
+	capture.message = nil
+	event.Payload = json.RawMessage(`{}`)
+	if err := publisher.Publish(context.Background(), event); err == nil || capture.message != nil {
+		t.Fatal("malformed diagnostic envelope reached broker")
+	}
+}
+
+func TestOutboxPublisherAdmitsPlanningStateFact(t *testing.T) {
+	studentID, pathID, identity := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	subject := "student.planning-state.changed.v1"
+	eventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte(subject+":"+studentID+":"+pathID+":OBJECTIVE_EVIDENCE:"+identity)).String()
+	event, err := domain.NewIntegrationEvent(eventID, subject, pathID, identity, studentID, time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC), 1, map[string]any{
+		"learning_path_id": pathID, "path_version": int64(2), "trigger_kind": "OBJECTIVE_EVIDENCE", "trigger_identity": identity,
+		"targets": []domain.LearningTargetRef{{Type: domain.LearningTargetConcept, Key: "go.loops", Version: "v1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &diagnosticPublisherCapture{}
+	publisher := &OutboxPublisher{Conn: &natsgo.Conn{}, js: capture}
+	if err := publisher.Publish(context.Background(), event); err != nil {
+		t.Fatalf("committed planning-state fact rejected: %v", err)
+	}
+	if capture.message == nil || capture.message.Subject != subject || capture.message.Header.Get(natsgo.MsgIdHdr) != eventID {
+		t.Fatal("planning fact lost subject/dedupe identity")
+	}
+	capture.message = nil
+	event.Payload = json.RawMessage(`{}`)
+	if err := publisher.Publish(context.Background(), event); err == nil || capture.message != nil {
+		t.Fatal("malformed planning event reached broker")
+	}
+}

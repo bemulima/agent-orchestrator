@@ -1,0 +1,826 @@
+package postgres
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	"github.com/example/ms-student-service/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type LearningJourneyRepoPG struct {
+	Pool *pgxpool.Pool
+}
+
+var (
+	_ repository.LearningJourneyRepository        = (*LearningJourneyRepoPG)(nil)
+	_ repository.LearningPathStateRepository      = (*LearningJourneyRepoPG)(nil)
+	_ repository.IdempotentLearningPathRepository = (*LearningJourneyRepoPG)(nil)
+)
+
+const learningPathColumns = `id, student_id, course_id, goal_code, curriculum_revision,
+policy_version, planner_policy_version, reason_code, reason_summary, status, is_primary,
+version, created_at, updated_at`
+
+func (repo *LearningJourneyRepoPG) GetLearningPath(ctx context.Context, studentID string) (domain.StudentLearningPath, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningPath{}, errors.New("learning journey repository pool is required")
+	}
+	path, err := scanLearningPath(repo.Pool.QueryRow(ctx, `SELECT `+learningPathColumns+`
+FROM student_learning_path p
+WHERE p.student_id=$1 AND p.status='ACTIVE'
+ORDER BY (p.id=(SELECT c.selected_learning_path_id FROM student_learning_context c WHERE c.student_id=p.student_id)) DESC,
+p.is_primary DESC, p.updated_at DESC, p.id DESC
+LIMIT 1`, studentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningPath{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	if err := loadLearningPathItems(ctx, repo.Pool, &path); err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	return domain.NormalizeStudentLearningPath(path)
+}
+
+func (repo *LearningJourneyRepoPG) GetLearningPathByID(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+) (domain.StudentLearningPath, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningPath{}, errors.New("learning journey repository pool is required")
+	}
+	return getLearningPathByID(ctx, repo.Pool, studentID, pathID, false)
+}
+
+func (repo *LearningJourneyRepoPG) ListLearningPaths(
+	ctx context.Context,
+	studentID string,
+	limit int,
+) ([]domain.StudentLearningPath, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("learning journey repository pool is required")
+	}
+	if limit < 1 || limit > 100 {
+		return nil, domain.ErrValidation
+	}
+	rows, err := repo.Pool.Query(ctx, `SELECT `+learningPathColumns+`
+FROM student_learning_path WHERE student_id=$1
+ORDER BY is_primary DESC, updated_at DESC, id DESC LIMIT $2`, studentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]domain.StudentLearningPath, 0, limit)
+	for rows.Next() {
+		path, err := scanLearningPath(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for index := range paths {
+		if err := loadLearningPathItems(ctx, repo.Pool, &paths[index]); err != nil {
+			return nil, err
+		}
+		normalized, err := domain.NormalizeStudentLearningPath(paths[index])
+		if err != nil {
+			return nil, err
+		}
+		paths[index] = normalized
+	}
+	return paths, nil
+}
+
+func (repo *LearningJourneyRepoPG) GetLearningContext(
+	ctx context.Context,
+	studentID string,
+) (domain.StudentLearningContext, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningContext{}, errors.New("learning journey repository pool is required")
+	}
+	return getLearningContext(ctx, repo.Pool, studentID, false)
+}
+
+func (repo *LearningJourneyRepoPG) ReplaceLearningPath(ctx context.Context, path domain.StudentLearningPath, expectedVersion int64) (domain.StudentLearningPath, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningPath{}, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentLearningPath(path)
+	if err != nil || expectedVersion < 0 || normalized.Version != expectedVersion+1 ||
+		(expectedVersion == 0 && normalized.Status != domain.LearningPathStatusActive) {
+		return domain.StudentLearningPath{}, domain.ErrValidation
+	}
+	snapshot, err := json.Marshal(normalized)
+	if err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, normalized.StudentID); err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	if blocked, err := hasLiveOnboardingPathAdmission(ctx, tx, normalized.StudentID); err != nil {
+		return domain.StudentLearningPath{}, err
+	} else if blocked {
+		return domain.StudentLearningPath{}, domain.ErrConflict
+	}
+	if expectedVersion > 0 {
+		current, err := getLearningPathByID(ctx, tx, normalized.StudentID, normalized.ID, true)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if err := domain.GuardLearningPathPlanningMutation(current, normalized); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if err := guardOpenCourseLearningActionPlanning(ctx, tx, current, normalized); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if err := guardPracticeLearningActionPlanning(ctx, tx, current, domain.LearningPathPlanningCommand{
+			Kind: domain.LearningPathPlanningCommandReplan, DesiredItems: normalized.Items,
+		}, false); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+	}
+	if expectedVersion == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM student_learning_path WHERE student_id=$1)`, normalized.StudentID).Scan(&exists); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if exists {
+			return domain.StudentLearningPath{}, domain.ErrConflict
+		}
+		normalized.IsPrimary = true
+		command, err := tx.Exec(ctx, `INSERT INTO student_learning_path (`+learningPathColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			normalized.ID, normalized.StudentID, normalized.CourseID, normalized.GoalCode, normalized.CurriculumRevision,
+			normalized.PolicyVersion, normalized.PlannerPolicyVersion, normalized.ReasonCode, normalized.ReasonSummary,
+			normalized.Status, normalized.IsPrimary, normalized.Version, normalized.CreatedAt, normalized.UpdatedAt)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if command.RowsAffected() != 1 {
+			return domain.StudentLearningPath{}, domain.ErrConflict
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO student_learning_context
+(student_id, selected_learning_path_id, selected_path_status, version, updated_at)
+VALUES ($1,$2,'ACTIVE',1,$3)`, normalized.StudentID, normalized.ID, normalized.UpdatedAt); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+	} else {
+		command, err := tx.Exec(ctx, `UPDATE student_learning_path SET course_id=$3, goal_code=$4,
+curriculum_revision=$5, policy_version=$6, planner_policy_version=$7, reason_code=$8, reason_summary=$9, version=$10, updated_at=$11
+WHERE id=$1 AND student_id=$2 AND version=$12`, normalized.ID, normalized.StudentID, normalized.CourseID,
+			normalized.GoalCode, normalized.CurriculumRevision, normalized.PolicyVersion, normalized.PlannerPolicyVersion, normalized.ReasonCode,
+			normalized.ReasonSummary, normalized.Version, normalized.UpdatedAt, expectedVersion)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if command.RowsAffected() != 1 {
+			return domain.StudentLearningPath{}, domain.ErrConflict
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM student_learning_path_item WHERE student_learning_path_id=$1`, normalized.ID); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+	}
+	for _, item := range normalized.Items {
+		targetsJSON, err := json.Marshal(item.Targets)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO student_learning_path_item
+(student_learning_path_id, reference_type, reference_id, position, status, targets_json, reason_code, id,lesson_revision_id,frozen_requirements,lesson_content_json)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::uuid,$10,$11)`, normalized.ID, item.ReferenceType, item.ReferenceID, item.Position,
+			item.Status, targetsJSON, item.ReasonCode, persistedItemID(normalized.ID, item), item.LessonRevisionID, requirementsJSON(item), nullableContent(item.LessonContent)); err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO student_learning_path_revision
+(student_learning_path_id, version, snapshot_json, reason_code, reason_summary, created_at)
+VALUES ($1,$2,$3,$4,$5,$6)`, normalized.ID, normalized.Version, snapshot,
+		normalized.ReasonCode, normalized.ReasonSummary, normalized.UpdatedAt); err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	if expectedVersion > 0 {
+		command, err := tx.Exec(ctx, `UPDATE student_learning_context
+SET version=version+1, updated_at=$2 WHERE student_id=$1`, normalized.StudentID, normalized.UpdatedAt)
+		if err != nil {
+			return domain.StudentLearningPath{}, err
+		}
+		if command.RowsAffected() != 1 {
+			return domain.StudentLearningPath{}, domain.ErrConflict
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	return normalized, nil
+}
+
+func (repo *LearningJourneyRepoPG) CreateLearningPathIdempotently(
+	ctx context.Context,
+	path domain.StudentLearningPath,
+	request repository.LearningPathCreationRequest,
+) (domain.StudentLearningPath, bool, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningPath{}, false, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentLearningPath(path)
+	if err != nil || normalized.Version != 1 || normalized.Status != domain.LearningPathStatusActive ||
+		!validLearningPathCreationRequest(request) {
+		return domain.StudentLearningPath{}, false, domain.ErrValidation
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, lockKey := range []string{
+		"learning-path-request:" + request.IdempotencyKey,
+		"learning-path-plan:" + request.PlanningRequestID,
+	} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+	}
+	if err := lockStudentAdmissionFence(ctx, tx, normalized.StudentID); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	stored, storedStudentID, storedPlanningRequestID, storedHash, err := getLearningPathByRequest(
+		ctx, tx, "idempotency_key", request.IdempotencyKey,
+	)
+	switch {
+	case err == nil:
+		if storedStudentID != normalized.StudentID || storedPlanningRequestID != request.PlanningRequestID ||
+			storedHash != request.RequestHash {
+			return domain.StudentLearningPath{}, false, domain.ErrConflict
+		}
+		learningContext, err := getLearningContext(ctx, tx, normalized.StudentID, false)
+		if err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+		stored.IsSelected = learningContext.SelectedLearningPathID == stored.ID
+		if err := tx.Commit(ctx); err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+		return stored, true, nil
+	case !errors.Is(err, domain.ErrNotFound):
+		return domain.StudentLearningPath{}, false, err
+	}
+	if _, _, _, _, err := getLearningPathByRequest(ctx, tx, "planning_request_id", request.PlanningRequestID); err == nil {
+		return domain.StudentLearningPath{}, false, domain.ErrConflict
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.StudentLearningPath{}, false, err
+	}
+	if blocked, err := hasLiveOnboardingPathAdmission(ctx, tx, normalized.StudentID); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	} else if blocked {
+		return domain.StudentLearningPath{}, false, domain.ErrConflict
+	}
+	if request.ExpectedOnboardingVersion != 0 || request.ExpectedDirectionCode != "" {
+		if request.ExpectedOnboardingVersion < 1 || strings.TrimSpace(request.ExpectedDirectionCode) == "" {
+			return domain.StudentLearningPath{}, false, domain.ErrValidation
+		}
+		var version int64
+		var direction, goal string
+		err := tx.QueryRow(ctx, `SELECT version, direction_code, goal_code FROM student_onboarding WHERE student_id=$1 FOR UPDATE`, normalized.StudentID).Scan(&version, &direction, &goal)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (version != request.ExpectedOnboardingVersion || direction != request.ExpectedDirectionCode || goal != normalized.GoalCode)) {
+			return domain.StudentLearningPath{}, false, domain.ErrDiagnosticContextStale
+		}
+		if err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+	}
+	var pathCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM student_learning_path WHERE student_id=$1`, normalized.StudentID).Scan(&pathCount); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	normalized.IsPrimary = pathCount == 0
+	normalized.IsSelected = pathCount == 0
+	if _, err := tx.Exec(ctx, `INSERT INTO student_learning_path (`+learningPathColumns+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		normalized.ID, normalized.StudentID, normalized.CourseID, normalized.GoalCode, normalized.CurriculumRevision,
+		normalized.PolicyVersion, normalized.PlannerPolicyVersion, normalized.ReasonCode, normalized.ReasonSummary,
+		normalized.Status, normalized.IsPrimary, normalized.Version, normalized.CreatedAt, normalized.UpdatedAt,
+	); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	if err := insertLearningPathItemsAndRevision(ctx, tx, normalized); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	if pathCount == 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO student_learning_context
+(student_id, selected_learning_path_id, selected_path_status, version, updated_at)
+VALUES ($1,$2,'ACTIVE',1,$3)`, normalized.StudentID, normalized.ID, normalized.UpdatedAt); err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+	} else {
+		command, err := tx.Exec(ctx, `UPDATE student_learning_context
+SET version=version+1, updated_at=$2 WHERE student_id=$1`, normalized.StudentID, normalized.UpdatedAt)
+		if err != nil {
+			return domain.StudentLearningPath{}, false, err
+		}
+		if command.RowsAffected() != 1 {
+			return domain.StudentLearningPath{}, false, domain.ErrConflict
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO student_learning_path_request
+(idempotency_key, planning_request_id, student_id, student_learning_path_id, request_hash, created_at)
+VALUES ($1,$2,$3,$4,$5,$6)`, request.IdempotencyKey, request.PlanningRequestID, normalized.StudentID,
+		normalized.ID, request.RequestHash, normalized.CreatedAt); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentLearningPath{}, false, err
+	}
+	return normalized, false, nil
+}
+
+func (repo *LearningJourneyRepoPG) ActivateLearningPath(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedVersion int64,
+	makePrimary bool,
+	now time.Time,
+) (domain.StudentLearningPathMutation, error) {
+	return repo.mutateLearningPath(ctx, studentID, pathID, expectedVersion, now, func(
+		ctx context.Context, tx pgx.Tx, path domain.StudentLearningPath, learningContext domain.StudentLearningContext,
+	) error {
+		if path.Status != domain.LearningPathStatusActive {
+			return domain.ErrConflict
+		}
+		if learningContext.SelectedLearningPathID == pathID && (!makePrimary || path.IsPrimary) {
+			return errLearningPathMutationNoop
+		}
+		if makePrimary {
+			if _, err := tx.Exec(ctx, `UPDATE student_learning_path SET is_primary=FALSE
+WHERE student_id=$1 AND id<>$2 AND is_primary`, studentID, pathID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE student_learning_path SET is_primary=TRUE WHERE id=$1 AND student_id=$2`, pathID, studentID); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `UPDATE student_learning_context SET
+selected_learning_path_id=$2, selected_path_status='ACTIVE', version=version+1, updated_at=$3
+WHERE student_id=$1`, studentID, pathID, now)
+		return err
+	})
+}
+
+func (repo *LearningJourneyRepoPG) PauseLearningPath(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedVersion int64,
+	now time.Time,
+) (domain.StudentLearningPathMutation, error) {
+	return repo.mutateLearningPath(ctx, studentID, pathID, expectedVersion, now, func(
+		ctx context.Context, tx pgx.Tx, path domain.StudentLearningPath, learningContext domain.StudentLearningContext,
+	) error {
+		if path.Status != domain.LearningPathStatusActive {
+			return domain.ErrConflict
+		}
+		var fallbackID string
+		err := tx.QueryRow(ctx, `SELECT id FROM student_learning_path
+WHERE student_id=$1 AND id<>$2 AND status='ACTIVE'
+ORDER BY (id=NULLIF($3,'')::uuid) DESC, is_primary DESC, updated_at DESC, id DESC LIMIT 1`,
+			studentID, pathID, learningContext.SelectedLearningPathID).Scan(&fallbackID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		selectedID := learningContext.SelectedLearningPathID
+		if selectedID == pathID {
+			selectedID = fallbackID
+		}
+		if _, err := tx.Exec(ctx, `UPDATE student_learning_context SET
+selected_learning_path_id=NULLIF($2,'')::uuid, selected_path_status='ACTIVE', version=version+1, updated_at=$3
+WHERE student_id=$1`, studentID, selectedID, now); err != nil {
+			return err
+		}
+		if path.IsPrimary {
+			if _, err := tx.Exec(ctx, `UPDATE student_learning_path SET is_primary=FALSE
+WHERE id=$1 AND student_id=$2`, pathID, studentID); err != nil {
+				return err
+			}
+		}
+		if path.IsPrimary && fallbackID != "" {
+			if _, err := tx.Exec(ctx, `UPDATE student_learning_path SET is_primary=TRUE WHERE id=$1 AND student_id=$2`, fallbackID, studentID); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, `UPDATE student_learning_path
+SET status='PAUSED', is_primary=FALSE, updated_at=$3 WHERE id=$1 AND student_id=$2`, pathID, studentID, now)
+		return err
+	})
+}
+
+func (repo *LearningJourneyRepoPG) ResumeLearningPath(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedVersion int64,
+	now time.Time,
+) (domain.StudentLearningPathMutation, error) {
+	return repo.mutateLearningPath(ctx, studentID, pathID, expectedVersion, now, func(
+		ctx context.Context, tx pgx.Tx, path domain.StudentLearningPath, _ domain.StudentLearningContext,
+	) error {
+		if path.Status != domain.LearningPathStatusPaused {
+			return domain.ErrConflict
+		}
+		if _, err := tx.Exec(ctx, `UPDATE student_learning_path SET status='ACTIVE', updated_at=$3
+WHERE id=$1 AND student_id=$2`, pathID, studentID, now); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE student_learning_context SET version=version+1, updated_at=$2 WHERE student_id=$1`, studentID, now)
+		return err
+	})
+}
+
+type learningPathQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+var errLearningPathMutationNoop = errors.New("learning path mutation is a no-op")
+
+func getLearningPathByID(
+	ctx context.Context,
+	querier learningPathQuerier,
+	studentID string,
+	pathID string,
+	forUpdate bool,
+) (domain.StudentLearningPath, error) {
+	query := `SELECT ` + learningPathColumns + ` FROM student_learning_path WHERE student_id=$1 AND id=$2`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	path, err := scanLearningPath(querier.QueryRow(ctx, query, studentID, pathID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningPath{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	if err := loadLearningPathItems(ctx, querier, &path); err != nil {
+		return domain.StudentLearningPath{}, err
+	}
+	return domain.NormalizeStudentLearningPath(path)
+}
+
+func loadLearningPathItems(ctx context.Context, querier learningPathQuerier, path *domain.StudentLearningPath) error {
+	rows, err := querier.Query(ctx, `SELECT reference_type, reference_id, position, status, targets_json, reason_code, id::text, COALESCE(lesson_revision_id::text,''), frozen_requirements, lesson_content_json
+FROM student_learning_path_item WHERE student_learning_path_id=$1 ORDER BY position`, path.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	path.Items = nil
+	for rows.Next() {
+		var item domain.LearningPathItem
+		var targetsJSON []byte
+		var requirementsJSON []byte
+		if err := rows.Scan(&item.ReferenceType, &item.ReferenceID, &item.Position, &item.Status, &targetsJSON, &item.ReasonCode, &item.ID, &item.LessonRevisionID, &requirementsJSON, &item.LessonContent); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(targetsJSON, &item.Targets); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(requirementsJSON, &item.FrozenRequirements); err != nil {
+			return err
+		}
+		path.Items = append(path.Items, item)
+	}
+	return rows.Err()
+}
+
+func getLearningContext(
+	ctx context.Context,
+	querier interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	},
+	studentID string,
+	forUpdate bool,
+) (domain.StudentLearningContext, error) {
+	query := `SELECT student_id, COALESCE(selected_learning_path_id::text,''), version, updated_at
+FROM student_learning_context WHERE student_id=$1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	item := domain.StudentLearningContext{Schema: domain.LearningContextSchemaVersion}
+	var updatedAt time.Time
+	err := querier.QueryRow(ctx, query, studentID).Scan(&item.StudentID, &item.SelectedLearningPathID, &item.Version, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningContext{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentLearningContext{}, err
+	}
+	item.UpdatedAt = &updatedAt
+	return domain.NormalizeStudentLearningContext(item)
+}
+
+func (repo *LearningJourneyRepoPG) mutateLearningPath(
+	ctx context.Context,
+	studentID string,
+	pathID string,
+	expectedVersion int64,
+	now time.Time,
+	mutation func(context.Context, pgx.Tx, domain.StudentLearningPath, domain.StudentLearningContext) error,
+) (domain.StudentLearningPathMutation, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningPathMutation{}, errors.New("learning journey repository pool is required")
+	}
+	tx, err := repo.Pool.Begin(ctx)
+	if err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockStudentAdmissionFence(ctx, tx, studentID); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	if blocked, err := hasLiveOnboardingPathAdmission(ctx, tx, studentID); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	} else if blocked {
+		return domain.StudentLearningPathMutation{}, domain.ErrConflict
+	}
+	path, err := getLearningPathByID(ctx, tx, studentID, pathID, true)
+	if err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	learningContext, err := getLearningContext(ctx, tx, studentID, true)
+	if err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	if learningContext.Version != expectedVersion {
+		return domain.StudentLearningPathMutation{}, domain.ErrConflict
+	}
+	if err := mutation(ctx, tx, path, learningContext); err != nil && !errors.Is(err, errLearningPathMutationNoop) {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	path, err = getLearningPathByID(ctx, tx, studentID, pathID, false)
+	if err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	learningContext, err = getLearningContext(ctx, tx, studentID, false)
+	if err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	path.IsSelected = learningContext.SelectedLearningPathID == path.ID
+	if err := tx.Commit(ctx); err != nil {
+		return domain.StudentLearningPathMutation{}, err
+	}
+	return domain.StudentLearningPathMutation{Path: path, Context: learningContext}, nil
+}
+
+func insertLearningPathItemsAndRevision(ctx context.Context, tx pgx.Tx, path domain.StudentLearningPath) error {
+	for _, item := range path.Items {
+		targetsJSON, err := json.Marshal(item.Targets)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO student_learning_path_item
+(student_learning_path_id, reference_type, reference_id, position, status, targets_json, reason_code, id,lesson_revision_id,frozen_requirements,lesson_content_json)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::uuid,$10,$11)`, path.ID, item.ReferenceType, item.ReferenceID, item.Position,
+			item.Status, targetsJSON, item.ReasonCode, persistedItemID(path.ID, item), item.LessonRevisionID, requirementsJSON(item), nullableContent(item.LessonContent)); err != nil {
+			return err
+		}
+	}
+	return insertLearningPathRevision(ctx, tx, path)
+}
+
+func insertLearningPathRevision(ctx context.Context, tx pgx.Tx, path domain.StudentLearningPath) error {
+	snapshot, err := json.Marshal(path)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO student_learning_path_revision
+(student_learning_path_id, version, snapshot_json, reason_code, reason_summary, created_at)
+VALUES ($1,$2,$3,$4,$5,$6)`, path.ID, path.Version, snapshot, path.ReasonCode, path.ReasonSummary, path.UpdatedAt)
+	return err
+}
+
+func getLearningPathByRequest(
+	ctx context.Context,
+	querier learningPathQuerier,
+	column string,
+	value string,
+) (domain.StudentLearningPath, string, string, string, error) {
+	if column != "idempotency_key" && column != "planning_request_id" {
+		return domain.StudentLearningPath{}, "", "", "", domain.ErrValidation
+	}
+	var pathID, studentID, planningRequestID, requestHash string
+	err := querier.QueryRow(ctx, `SELECT student_learning_path_id, student_id, planning_request_id, request_hash
+FROM student_learning_path_request
+WHERE `+column+`=$1`, value).Scan(&pathID, &studentID, &planningRequestID, &requestHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningPath{}, "", "", "", domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentLearningPath{}, "", "", "", err
+	}
+	path, err := getLearningPathByID(ctx, querier, studentID, pathID, false)
+	return path, studentID, planningRequestID, strings.TrimSpace(requestHash), err
+}
+
+func validLearningPathCreationRequest(request repository.LearningPathCreationRequest) bool {
+	if (request.ExpectedOnboardingVersion != 0 || request.ExpectedDirectionCode != "") &&
+		(request.ExpectedOnboardingVersion < 1 || strings.TrimSpace(request.ExpectedDirectionCode) == "") {
+		return false
+	}
+	_, keyErr := uuid.Parse(request.IdempotencyKey)
+	_, planErr := uuid.Parse(request.PlanningRequestID)
+	decoded, hashErr := hex.DecodeString(request.RequestHash)
+	return keyErr == nil && planErr == nil && hashErr == nil && len(decoded) == 32
+}
+
+func (repo *LearningJourneyRepoPG) SaveDiagnosticSnapshot(ctx context.Context, snapshot domain.StudentDiagnosticSnapshot) (domain.StudentDiagnosticSnapshot, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentDiagnosticSnapshot{}, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentDiagnosticSnapshot(snapshot)
+	if err != nil {
+		return domain.StudentDiagnosticSnapshot{}, domain.ErrValidation
+	}
+	itemsJSON, err := json.Marshal(normalized.Items)
+	if err != nil {
+		return domain.StudentDiagnosticSnapshot{}, err
+	}
+	var stored domain.StudentDiagnosticSnapshot
+	var storedItems []byte
+	err = repo.Pool.QueryRow(ctx, `INSERT INTO student_diagnostic_snapshot
+(id, student_id, assessment_id, curriculum_revision, policy_version, items_json, completed_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT (student_id, assessment_id, curriculum_revision) DO UPDATE SET assessment_id=EXCLUDED.assessment_id
+RETURNING id, student_id, assessment_id, curriculum_revision, policy_version, items_json, completed_at`,
+		normalized.ID, normalized.StudentID, normalized.AssessmentID, normalized.CurriculumRevision,
+		normalized.PolicyVersion, itemsJSON, normalized.CompletedAt).Scan(
+		&stored.ID, &stored.StudentID, &stored.AssessmentID, &stored.CurriculumRevision,
+		&stored.PolicyVersion, &storedItems, &stored.CompletedAt,
+	)
+	if err != nil {
+		return domain.StudentDiagnosticSnapshot{}, err
+	}
+	if err := json.Unmarshal(storedItems, &stored.Items); err != nil {
+		return domain.StudentDiagnosticSnapshot{}, err
+	}
+	return domain.NormalizeStudentDiagnosticSnapshot(stored)
+}
+
+func (repo *LearningJourneyRepoPG) GetLatestDiagnosticSnapshot(ctx context.Context, studentID string) (domain.StudentDiagnosticSnapshot, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentDiagnosticSnapshot{}, errors.New("learning journey repository pool is required")
+	}
+	var item domain.StudentDiagnosticSnapshot
+	var itemsJSON []byte
+	err := repo.Pool.QueryRow(ctx, `SELECT id, student_id, assessment_id, curriculum_revision, policy_version, items_json, completed_at
+FROM student_diagnostic_snapshot WHERE student_id=$1 ORDER BY completed_at DESC, id DESC LIMIT 1`, studentID).Scan(
+		&item.ID, &item.StudentID, &item.AssessmentID, &item.CurriculumRevision, &item.PolicyVersion, &itemsJSON, &item.CompletedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentDiagnosticSnapshot{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.StudentDiagnosticSnapshot{}, err
+	}
+	if err := json.Unmarshal(itemsJSON, &item.Items); err != nil {
+		return domain.StudentDiagnosticSnapshot{}, err
+	}
+	return domain.NormalizeStudentDiagnosticSnapshot(item)
+}
+
+const learningSessionColumns = `id, student_id, goal, course_id, lesson_id, task_id, analytics_session_id,
+active_learning_seconds, lesson_count, task_count, question_count, hint_count, teacher_intervention_count,
+selected_explanation_count, code_run_count, failure_count, passed_test_count, stuck_signal_count,
+schema_version, version, started_at, ended_at, updated_at`
+const learningSessionReadColumns = `id, student_id, goal,
+COALESCE(course_id::text,''), COALESCE(lesson_id::text,''), COALESCE(task_id::text,''),
+COALESCE(analytics_session_id::text,''), active_learning_seconds, lesson_count, task_count,
+question_count, hint_count, teacher_intervention_count, selected_explanation_count, code_run_count,
+failure_count, passed_test_count, stuck_signal_count, schema_version, version, started_at, ended_at, updated_at`
+
+func (repo *LearningJourneyRepoPG) CreateLearningSession(ctx context.Context, session domain.StudentLearningSession) (domain.StudentLearningSession, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningSession{}, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentLearningSession(session)
+	if err != nil || normalized.Version != 1 || normalized.EndedAt != nil {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	stored, err := scanLearningSession(repo.Pool.QueryRow(ctx, `INSERT INTO student_learning_session (`+learningSessionColumns+`)
+VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+ON CONFLICT DO NOTHING RETURNING `+learningSessionReadColumns,
+		normalized.ID, normalized.StudentID, normalized.Goal, normalized.CourseID, normalized.LessonID,
+		normalized.TaskID, normalized.AnalyticsSessionID, normalized.ActiveLearningSeconds, normalized.LessonCount,
+		normalized.TaskCount, normalized.QuestionCount, normalized.HintCount, normalized.TeacherInterventionCount,
+		normalized.SelectedExplanationCount, normalized.CodeRunCount, normalized.FailureCount,
+		normalized.PassedTestCount, normalized.StuckSignalCount, normalized.SchemaVersion, normalized.Version,
+		normalized.StartedAt, normalized.EndedAt, normalized.UpdatedAt))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningSession{}, domain.ErrConflict
+	}
+	return stored, err
+}
+
+func (repo *LearningJourneyRepoPG) GetLearningSession(ctx context.Context, studentID, sessionID string) (domain.StudentLearningSession, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningSession{}, errors.New("learning journey repository pool is required")
+	}
+	item, err := scanLearningSession(repo.Pool.QueryRow(ctx, `SELECT `+learningSessionReadColumns+`
+FROM student_learning_session WHERE id=$1 AND student_id=$2`, sessionID, studentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningSession{}, domain.ErrNotFound
+	}
+	return item, err
+}
+
+func (repo *LearningJourneyRepoPG) UpdateLearningSession(ctx context.Context, session domain.StudentLearningSession, expectedVersion int64) (domain.StudentLearningSession, error) {
+	if repo == nil || repo.Pool == nil {
+		return domain.StudentLearningSession{}, errors.New("learning journey repository pool is required")
+	}
+	normalized, err := domain.NormalizeStudentLearningSession(session)
+	if err != nil || expectedVersion < 1 || normalized.Version != expectedVersion+1 {
+		return domain.StudentLearningSession{}, domain.ErrValidation
+	}
+	stored, err := scanLearningSession(repo.Pool.QueryRow(ctx, `UPDATE student_learning_session SET
+analytics_session_id=NULLIF($3,''), active_learning_seconds=$4, lesson_count=$5, task_count=$6,
+question_count=$7, hint_count=$8, teacher_intervention_count=$9,
+selected_explanation_count=$10, code_run_count=$11, failure_count=$12, passed_test_count=$13,
+stuck_signal_count=$14, version=$15, ended_at=$16, updated_at=$17
+WHERE id=$1 AND student_id=$2 AND version=$18 RETURNING `+learningSessionReadColumns,
+		normalized.ID, normalized.StudentID, normalized.AnalyticsSessionID, normalized.ActiveLearningSeconds,
+		normalized.LessonCount, normalized.TaskCount, normalized.QuestionCount, normalized.HintCount,
+		normalized.TeacherInterventionCount, normalized.SelectedExplanationCount, normalized.CodeRunCount,
+		normalized.FailureCount, normalized.PassedTestCount, normalized.StuckSignalCount, normalized.Version,
+		normalized.EndedAt, normalized.UpdatedAt, expectedVersion))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StudentLearningSession{}, domain.ErrConflict
+	}
+	return stored, err
+}
+
+func (repo *LearningJourneyRepoPG) ListRecentLearningSessions(ctx context.Context, studentID string, limit int) ([]domain.StudentLearningSession, error) {
+	if repo == nil || repo.Pool == nil {
+		return nil, errors.New("learning journey repository pool is required")
+	}
+	if limit < 1 || limit > 20 {
+		return nil, domain.ErrValidation
+	}
+	rows, err := repo.Pool.Query(ctx, `SELECT `+learningSessionReadColumns+`
+FROM student_learning_session WHERE student_id=$1 ORDER BY started_at DESC, id DESC LIMIT $2`, studentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]domain.StudentLearningSession, 0, limit)
+	for rows.Next() {
+		item, err := scanLearningSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func scanLearningPath(row pgx.Row) (domain.StudentLearningPath, error) {
+	var item domain.StudentLearningPath
+	err := row.Scan(&item.ID, &item.StudentID, &item.CourseID, &item.GoalCode, &item.CurriculumRevision,
+		&item.PolicyVersion, &item.PlannerPolicyVersion, &item.ReasonCode, &item.ReasonSummary,
+		&item.Status, &item.IsPrimary, &item.Version, &item.CreatedAt, &item.UpdatedAt)
+	item.CourseFingerprint = item.CurriculumRevision
+	return item, err
+}
+
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanLearningSession(row rowScanner) (domain.StudentLearningSession, error) {
+	var item domain.StudentLearningSession
+	err := row.Scan(&item.ID, &item.StudentID, &item.Goal, &item.CourseID, &item.LessonID, &item.TaskID,
+		&item.AnalyticsSessionID, &item.ActiveLearningSeconds, &item.LessonCount, &item.TaskCount,
+		&item.QuestionCount, &item.HintCount, &item.TeacherInterventionCount, &item.SelectedExplanationCount,
+		&item.CodeRunCount, &item.FailureCount, &item.PassedTestCount, &item.StuckSignalCount, &item.SchemaVersion,
+		&item.Version, &item.StartedAt, &item.EndedAt, &item.UpdatedAt)
+	if err != nil {
+		return domain.StudentLearningSession{}, err
+	}
+	return domain.NormalizeStudentLearningSession(item)
+}

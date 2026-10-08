@@ -1,0 +1,134 @@
+package handlers
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/transport/http/api/v1/middleware"
+	"github.com/go-chi/chi/v5"
+)
+
+type onboardingHTTPStub struct {
+	ensureCalls, actionCalls int
+	request                  domain.AssistantUIActionRequest
+	session                  domain.TeacherOnboardingSession
+	ensureErr                error
+}
+
+func (stub *onboardingHTTPStub) Ensure(context.Context, string) (domain.TeacherOnboardingSession, error) {
+	stub.ensureCalls++
+	if stub.ensureErr != nil {
+		return domain.TeacherOnboardingSession{}, stub.ensureErr
+	}
+	if stub.session.V2 != nil || stub.session.V3 != nil {
+		return stub.session, nil
+	}
+	return domain.TeacherOnboardingSession{Schema: domain.TeacherOnboardingSessionSchema, DialogID: "33333333-3333-4333-8333-333333333333", Status: domain.StudentOnboardingDraftDraft}, nil
+}
+
+func TestOnboardingHTTPHistoricalSessionUnavailableIsNonRetryableConflict(t *testing.T) {
+	stub := &onboardingHTTPStub{ensureErr: domain.ErrTeacherOnboardingHistoricalSessionUnavailable}
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware)
+	router.Post("/ensure", (TeacherOnboardingHandler{Ensurer: stub}).Ensure)
+
+	response := performOnboardingHTTP(router, "/ensure", `{"schema":"teacher-onboarding-ensure.v1"}`, true)
+	if response.Code != http.StatusConflict || response.Body.String() != "{\"error\":\"historical_session_unavailable\"}\n" || response.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+}
+
+func TestOnboardingHTTPSerializesOnlyBoundedDeliveredPathOutcomeMarker(t *testing.T) {
+	session, err := domain.DurableHandoffTeacherOnboardingSession(domain.TeacherOnboardingSessionV3{
+		Schema: domain.TeacherOnboardingSessionV3Schema, DialogID: "33333333-3333-4333-8333-333333333333",
+		Status: domain.TeacherOnboardingSessionHandoffAccepted, Phase: domain.TeacherOnboardingPhaseReadyToStart,
+		StateRef:    domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		Terminal:    &domain.TeacherOnboardingTerminalV3{Kind: domain.TeacherOnboardingSessionHandoffAccepted, DisplayName: domain.TeacherGoBackendGoalDisplayName, ExecutionStatus: domain.TeacherOnboardingExecutionNotStarted, ContentStatus: domain.TeacherLearningContentNotCreated},
+		PathOutcome: &domain.TeacherOnboardingPathOutcomeMarker{Kind: domain.TeacherOnboardingPathOutcomeMarkerKind, Status: domain.TeacherOnboardingPathOutcomeMarkerReady, DialogMessageID: "99999999-9999-4999-8999-999999999999"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := &onboardingHTTPStub{session: session}
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware)
+	router.Post("/ensure", (TeacherOnboardingHandler{Ensurer: stub}).Ensure)
+	response := performOnboardingHTTP(router, "/ensure", `{"schema":"teacher-onboarding-ensure.v1"}`, true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"path_outcome":{"kind":"ONBOARDING_PATH_OUTCOME","status":"PATH_READY","dialog_message_id":"99999999-9999-4999-8999-999999999999"}`) || strings.Contains(response.Body.String(), "handoff_id") || strings.Contains(response.Body.String(), "execution_id") || strings.Contains(response.Body.String(), "course_id") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestOnboardingHTTPSerializesSessionV2WithoutLegacyFields(t *testing.T) {
+	session, err := domain.ProductAwareTeacherOnboardingSession(domain.TeacherOnboardingSessionV2{
+		Schema: domain.TeacherOnboardingSessionV2Schema, DialogID: "33333333-3333-4333-8333-333333333333",
+		Status: domain.TeacherOnboardingSessionPlanningReady, Phase: domain.TeacherOnboardingPhaseReadyToStart,
+		StateRef: domain.TeacherStudentReadinessStateRef{Kind: domain.TeacherReadinessStateDraft, Version: 4},
+		Terminal: &domain.TeacherOnboardingTerminal{Kind: domain.TeacherOnboardingSessionPlanningReady, DisplayName: domain.TeacherFoundationGoalDisplayName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := &onboardingHTTPStub{session: session}
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware)
+	router.Post("/ensure", (TeacherOnboardingHandler{Ensurer: stub}).Ensure)
+	response := performOnboardingHTTP(router, "/ensure", `{"schema":"teacher-onboarding-ensure.v1"}`, true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"schema":"teacher-onboarding-session.v2"`) || strings.Contains(response.Body.String(), "draft_version") || strings.Contains(response.Body.String(), "current_prompt") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+func (stub *onboardingHTTPStub) ApplyAction(_ context.Context, _ string, request domain.AssistantUIActionRequest) (domain.AssistantUIActionResult, error) {
+	stub.actionCalls++
+	stub.request = request
+	return domain.LegacyAssistantUIActionResult(domain.AssistantUIActionResultPayload{Schema: domain.AssistantUIActionResultSchema, Applied: true, Status: domain.StudentOnboardingDraftDraft, DraftVersion: 1}), nil
+}
+
+func TestOnboardingHTTPStrictContractsAndTrustedActor(t *testing.T) {
+	stub := &onboardingHTTPStub{}
+	router := chi.NewRouter()
+	router.Use(middleware.AuthMiddleware)
+	handler := TeacherOnboardingHandler{Ensurer: stub, Actions: stub}
+	router.Post("/ensure", handler.Ensure)
+	router.Post("/actions", handler.ApplyAction)
+	ensure := performOnboardingHTTP(router, "/ensure", `{"schema":"teacher-onboarding-ensure.v1"}`, true)
+	if ensure.Code != http.StatusOK || ensure.Header().Get("Cache-Control") != "no-store" || stub.ensureCalls != 1 {
+		t.Fatalf("ensure=%d %s", ensure.Code, ensure.Body.String())
+	}
+	actionBody := `{"schema":"assistant-ui-action.v1","dialog_id":"33333333-3333-4333-8333-333333333333","message_id":"44444444-4444-4444-8444-444444444444","message_version":1,"block_id":"onboarding.direction.d0.v1","action_id":"direction.backend","idempotency_key":"55555555-5555-4555-8555-555555555555"}`
+	action := performOnboardingHTTP(router, "/actions", actionBody, true)
+	if action.Code != http.StatusOK || stub.actionCalls != 1 || stub.request.ActionID != "direction.backend" {
+		t.Fatalf("action=%d %s request=%+v", action.Code, action.Body.String(), stub.request)
+	}
+	for name, body := range map[string]string{"label": strings.TrimSuffix(actionBody, "}") + `,"label":"Backend"}`, "value": strings.TrimSuffix(actionBody, "}") + `,"value":"backend"}`, "unknown ensure": `{"schema":"teacher-onboarding-ensure.v1","student_id":"11111111-1111-4111-8111-111111111111"}`, "trailing": actionBody + ` {}`, "oversize": `{"schema":"assistant-ui-action.v1","padding":"` + strings.Repeat("x", 5<<10) + `"}`} {
+		t.Run(name, func(t *testing.T) {
+			path := "/actions"
+			if name == "unknown ensure" {
+				path = "/ensure"
+			}
+			response := performOnboardingHTTP(router, path, body, true)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	unauthorized := performOnboardingHTTP(router, "/ensure", `{"schema":"teacher-onboarding-ensure.v1"}`, false)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+}
+
+func performOnboardingHTTP(handler http.Handler, path, body string, authorized bool) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if authorized {
+		request.Header.Set("X-User-ID", "11111111-1111-4111-8111-111111111111")
+		request.Header.Set("X-User-Role", "STUDENT")
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}

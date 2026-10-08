@@ -1,0 +1,118 @@
+package onboarding
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+)
+
+func (dialog *testDialog) MaterializeCanonicalStudentTurn(_ context.Context, input domain.CanonicalStudentTurnMaterialization) (domain.DialogMessage, error) {
+	dialog.mu.Lock()
+	dialog.materializeCalls++
+	dialog.mu.Unlock()
+	normalized, err := input.Normalize()
+	if err != nil {
+		return domain.DialogMessage{}, err
+	}
+	message := domain.DialogMessage{
+		ID: domain.DeterministicOnboardingUUID("canonical-message", normalized.CanonicalMessageCommandID), DialogID: normalized.DialogID,
+		AuthorType: domain.DialogMessageAuthorUser, Channel: domain.DialogMessageChannelWeb, SenderID: normalized.StudentID,
+		ReplyToMessageID: normalized.SourceMessageID, Body: normalized.Body, Status: 1, Version: 1,
+		MessageSequence: 2, LastEventSequence: 2, CreatedAt: time.Date(2026, 9, 5, 8, 1, 0, 0, time.UTC),
+	}
+	return message, nil
+}
+
+func TestConcurrentDifferentCanonicalActionsMaterializeOnePromptExactlyOnce(t *testing.T) {
+	service, student, dialog, _ := newTestService()
+	service.CanonicalActionsEnabled = true
+	service.UnifiedCoordinatorEnabled = true
+	service.CanonicalMessages = dialog
+	session, err := service.Ensure(context.Background(), testStudentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, messageVersion := sessionPrompt(t, session)
+	requests := []domain.AssistantUIActionRequest{
+		actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "91919191-9191-4191-8191-919191919191"),
+		actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "92929292-9292-4292-8292-929292929292"),
+	}
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(len(requests))
+	errorsByAction := make([]error, len(requests))
+	for index := range requests {
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			_, errorsByAction[index] = service.ApplyAction(context.Background(), testStudentID, requests[index])
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	successes, conflicts := 0, 0
+	for _, actionErr := range errorsByAction {
+		switch actionErr {
+		case nil:
+			successes++
+		case domain.ErrTeacherOnboardingConflict:
+			conflicts++
+		default:
+			t.Fatalf("unexpected action error: %v", actionErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 || dialog.materializeCalls != 1 || student.replaceCalls != 0 {
+		t.Fatalf("success=%d conflict=%d materialize=%d student=%d", successes, conflicts, dialog.materializeCalls, student.replaceCalls)
+	}
+}
+
+func TestCanonicalActionMaterializesDialogOnlyAndReplays(t *testing.T) {
+	service, _, _, store := newTestService()
+	service.CanonicalActionsEnabled = true
+	service.UnifiedCoordinatorEnabled = true
+	session, err := service.Ensure(context.Background(), testStudentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, messageVersion := sessionPrompt(t, session)
+	service.Students = nil
+	service.StructuredMessages = nil
+	service.PlainMessages = nil
+	service.CanonicalMessages = service.Dialogs.(interface {
+		MaterializeCanonicalStudentTurn(context.Context, domain.CanonicalStudentTurnMaterialization) (domain.DialogMessage, error)
+	})
+	request := actionRequest(messageID, messageVersion, "onboarding.goal.d0.v2", "goal.learn_programming", "93939393-9393-4939-8939-939393939393")
+	first, err := service.ApplyAction(context.Background(), testStudentID, request)
+	if err != nil || first.V2 == nil || first.V2.Schema != domain.AssistantUIActionResultV2Schema || !first.V2.Materialized || first.V2.Replayed {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	if len(store.items) != 1 || store.items[request.IdempotencyKey].CanonicalStudentMessageID == "" {
+		t.Fatalf("receipt=%+v", store.items)
+	}
+	replayed, err := service.ApplyAction(context.Background(), testStudentID, request)
+	if err != nil || replayed.V2 == nil || !replayed.V2.Replayed || replayed.V2.CanonicalStudentMessageID != first.V2.CanonicalStudentMessageID {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+	service.CanonicalActionsEnabled = false
+	flagOffReplay, err := service.ApplyAction(context.Background(), testStudentID, request)
+	if err != nil || flagOffReplay.V2 == nil || !flagOffReplay.V2.Replayed || flagOffReplay.V2.CanonicalStudentMessageID != first.V2.CanonicalStudentMessageID {
+		t.Fatalf("flag-off replay=%+v err=%v", flagOffReplay, err)
+	}
+	conflict := request
+	conflict.IdempotencyKey = "94949494-9494-4949-8949-949494949494"
+	if _, err = service.ApplyAction(context.Background(), testStudentID, conflict); err == nil || err != domain.ErrTeacherOnboardingUnavailable {
+		t.Fatalf("different key err=%v", err)
+	}
+}
+
+func TestCanonicalFlagRequiresUnifiedCoordinator(t *testing.T) {
+	service, _, _, _ := newTestService()
+	service.CanonicalActionsEnabled = true
+	service.UnifiedCoordinatorEnabled = false
+	if _, err := service.ApplyAction(context.Background(), testStudentID, actionRequest(testDialogID, 1, "onboarding.direction.d0.v1", "direction.backend", "95959595-9595-4959-8959-959595959595")); err != domain.ErrTeacherOnboardingUnavailable {
+		t.Fatalf("err=%v", err)
+	}
+}

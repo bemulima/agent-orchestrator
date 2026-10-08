@@ -1,0 +1,906 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/example/ms-student-service/internal/domain"
+	domainservice "github.com/example/ms-student-service/internal/domain/service"
+	answeruc "github.com/example/ms-student-service/internal/usecase/answer"
+)
+
+const (
+	practiceTaskTaskKindPart              = "practice_task_part"
+	blockingReasonPartPrerequisites       = "PART_PREREQUISITES_NOT_MET"
+	blockingReasonParentMilestoneRequired = "PARENT_MILESTONE_NOT_PASSED"
+	blockingReasonPreviousMilestone       = "PREVIOUS_MILESTONE_NOT_PASSED"
+	blockingReasonStrictOrderRequired     = "STRICT_ORDER_NOT_MET"
+)
+
+type partRuntimeContext struct {
+	studentPracticeTask                *domain.StudentPracticeTask
+	runtimeContext                     *domain.PracticeTaskRuntimeContext
+	part                               *domain.PracticeTaskPart
+	partMilestones                     []domain.PracticeTaskRuntimeMilestone
+	studentMilestones                  []domain.StudentPracticeTaskMilestone
+	studentMilestonesByPartMilestoneID map[string]domain.StudentPracticeTaskMilestone
+	completedLessonIDs                 map[string]struct{}
+	build                              *PartBuildPreview
+}
+
+func (useCase StudentUseCase) ListStudentPracticeTaskParts(ctx context.Context, studentID, studentPracticeTaskID string) ([]domain.StudentPracticeTaskPartBundle, error) {
+	project, runtimeContext, studentMilestones, completedLessons, err := useCase.loadStudentPracticeTaskRuntimeState(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+
+	studentMilestonesByPartMilestoneID := map[string]domain.StudentPracticeTaskMilestone{}
+	for _, item := range studentMilestones {
+		studentMilestonesByPartMilestoneID[item.PracticeTaskPartMilestoneID] = item
+	}
+
+	parts := sortPracticeTaskParts(runtimeContext.PracticeTaskParts, runtimeContext.PracticeTaskMilestones)
+	items := make([]domain.StudentPracticeTaskPartBundle, 0, len(parts))
+	for _, part := range parts {
+		partMilestones := filterPartMilestones(runtimeContext.PracticeTaskMilestones, part.ID)
+		if len(partMilestones) == 0 {
+			continue
+		}
+		bundle, err := useCase.buildPartBundleFromContext(&partRuntimeContext{
+			studentPracticeTask:                project,
+			runtimeContext:                     runtimeContext,
+			part:                               &part,
+			partMilestones:                     partMilestones,
+			studentMilestones:                  studentMilestones,
+			studentMilestonesByPartMilestoneID: studentMilestonesByPartMilestoneID,
+			completedLessonIDs:                 completedLessons,
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, bundle)
+	}
+	return items, nil
+}
+
+func (useCase StudentUseCase) GetStudentPracticeTaskPart(ctx context.Context, studentID, studentPracticeTaskID, partID string) (*domain.StudentPracticeTaskPartBundle, error) {
+	current, err := useCase.loadPartRuntimeContext(ctx, studentID, studentPracticeTaskID, partID, false)
+	if err != nil {
+		return nil, err
+	}
+	artifacts, err := useCase.Students.ListArtifacts(ctx, current.studentPracticeTask.ID)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := useCase.buildPartBundleFromContext(current, artifacts)
+	if err != nil {
+		return nil, err
+	}
+	return &bundle, nil
+}
+
+func (useCase StudentUseCase) OpenPracticeTaskPart(ctx context.Context, studentID, studentPracticeTaskID, partID string) (*domain.RuntimeOpenPartResult, error) {
+	current, err := useCase.loadPartRuntimeContext(ctx, studentID, studentPracticeTaskID, partID, false)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := useCase.buildPartBundleFromContext(current, nil)
+	if err != nil {
+		return nil, err
+	}
+	if bundle.Access.Locked {
+		return nil, firstLockedPartError(bundle)
+	}
+	if err := useCase.setActivePracticeTaskPart(ctx, current.studentPracticeTask, partID); err != nil {
+		return nil, err
+	}
+	return &domain.RuntimeOpenPartResult{
+		StudentPracticeTaskID: current.studentPracticeTask.ID,
+		PracticeTaskPartID:    current.part.ID,
+		TaskID:                current.studentPracticeTask.WorkspaceTaskID,
+		LessonID:              current.studentPracticeTask.WorkspaceLessonID,
+		OpenURL:               fmt.Sprintf("/student/my-practice-tasks/%s/part/%s", current.studentPracticeTask.ID, current.part.ID),
+		Access:                bundle.Access,
+	}, nil
+}
+
+func (useCase StudentUseCase) ValidatePracticeTaskPart(ctx context.Context, studentID, studentPracticeTaskID, partID string) (*domain.StudentPracticeTaskPartValidation, error) {
+	if useCase.AnswerStarter == nil || useCase.FinalValidator == nil {
+		return nil, domain.ErrValidation
+	}
+
+	current, err := useCase.loadPartRuntimeContext(ctx, studentID, studentPracticeTaskID, partID, false)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := useCase.buildPartBundleFromContext(current, nil)
+	if err != nil {
+		return nil, err
+	}
+	if bundle.Access.Locked {
+		return nil, firstLockedPartError(bundle)
+	}
+	if err := useCase.setActivePracticeTaskPart(ctx, current.studentPracticeTask, partID); err != nil {
+		return nil, err
+	}
+
+	started, err := useCase.AnswerStarter.Handle(ctx, answeruc.StartTaskAnswerInput{
+		StudentID: studentID,
+		TaskID:    current.studentPracticeTask.WorkspaceTaskID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := useCase.FinalValidator.Handle(ctx, started.AnswerID, nil); err != nil {
+		return nil, err
+	}
+
+	validated, err := useCase.loadPartRuntimeContext(ctx, studentID, studentPracticeTaskID, partID, false)
+	if err != nil {
+		return nil, err
+	}
+	artifacts, err := useCase.Students.ListArtifacts(ctx, validated.studentPracticeTask.ID)
+	if err != nil {
+		return nil, err
+	}
+	validatedBundle, err := useCase.buildPartBundleFromContext(validated, artifacts)
+	if err != nil {
+		return nil, err
+	}
+	result := mergePartValidationResults(validatedBundle.Milestones)
+	return &domain.StudentPracticeTaskPartValidation{
+		Bundle: validatedBundle,
+		Result: result,
+	}, nil
+}
+
+func (useCase StudentUseCase) loadPartRuntimeContext(
+	ctx context.Context,
+	studentID, studentPracticeTaskID, partID string,
+	withBuild bool,
+) (*partRuntimeContext, error) {
+	project, runtimeContext, studentMilestones, completedLessons, err := useCase.loadStudentPracticeTaskRuntimeState(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, err
+	}
+
+	var part *domain.PracticeTaskPart
+	for index := range runtimeContext.PracticeTaskParts {
+		if runtimeContext.PracticeTaskParts[index].ID != partID {
+			continue
+		}
+		item := runtimeContext.PracticeTaskParts[index]
+		part = &item
+		break
+	}
+	if part == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	partMilestones := filterPartMilestones(runtimeContext.PracticeTaskMilestones, partID)
+	if len(partMilestones) == 0 {
+		return nil, domain.ErrNotFound
+	}
+
+	current := &partRuntimeContext{
+		studentPracticeTask:                project,
+		runtimeContext:                     runtimeContext,
+		part:                               part,
+		partMilestones:                     partMilestones,
+		studentMilestones:                  studentMilestones,
+		studentMilestonesByPartMilestoneID: map[string]domain.StudentPracticeTaskMilestone{},
+		completedLessonIDs:                 completedLessons,
+	}
+	for _, item := range studentMilestones {
+		current.studentMilestonesByPartMilestoneID[item.PracticeTaskPartMilestoneID] = item
+	}
+	if withBuild {
+		currentMilestone := currentPartMilestone(current)
+		if currentMilestone == nil {
+			return nil, domain.ErrInvalidStatus
+		}
+		build, err := useCase.Builders.BuildPartPreview(ctx, runtimeContext.PracticeTask, *part, []domain.PracticeTaskRuntimeMilestone{*currentMilestone})
+		if err != nil {
+			return nil, err
+		}
+		current.build = build
+	}
+	return current, nil
+}
+
+func (useCase StudentUseCase) loadStudentPracticeTaskRuntimeState(
+	ctx context.Context,
+	studentID, studentPracticeTaskID string,
+) (*domain.StudentPracticeTask, *domain.PracticeTaskRuntimeContext, []domain.StudentPracticeTaskMilestone, map[string]struct{}, error) {
+	project, err := useCase.GetStudentPracticeTask(ctx, studentID, studentPracticeTaskID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	runtimeContext, err := useCase.getStudentPracticeTaskRuntimeContext(ctx, project)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	studentMilestones, err := useCase.Students.ListStudentPracticeTaskMilestones(ctx, studentPracticeTaskID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	completedLessons := map[string]struct{}{}
+	lessonIDs := runtimeContextLessonIDs(runtimeContext)
+	if useCase.Completion != nil && len(lessonIDs) > 0 {
+		completedLessons, err = useCase.Completion.GetCompletedLessonIDs(ctx, project.StudentID, lessonIDs)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+	return project, runtimeContext, studentMilestones, completedLessons, nil
+}
+
+func filterPartMilestones(items []domain.PracticeTaskRuntimeMilestone, partID string) []domain.PracticeTaskRuntimeMilestone {
+	filtered := make([]domain.PracticeTaskRuntimeMilestone, 0, len(items))
+	for _, item := range items {
+		if item.PracticeTaskPartID != partID {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	sort.Slice(filtered, func(left, right int) bool {
+		if filtered[left].SortOrder == filtered[right].SortOrder {
+			return filtered[left].Title < filtered[right].Title
+		}
+		return filtered[left].SortOrder < filtered[right].SortOrder
+	})
+	return filtered
+}
+
+func sortPracticeTaskParts(parts []domain.PracticeTaskPart, milestones []domain.PracticeTaskRuntimeMilestone) []domain.PracticeTaskPart {
+	partOrder := map[string]int{}
+	for _, milestone := range milestones {
+		order, ok := partOrder[milestone.PracticeTaskPartID]
+		if !ok || milestone.PartSortOrder < order {
+			partOrder[milestone.PracticeTaskPartID] = milestone.PartSortOrder
+		}
+	}
+	result := append([]domain.PracticeTaskPart(nil), parts...)
+	sort.Slice(result, func(left, right int) bool {
+		leftOrder, leftOK := partOrder[result[left].ID]
+		rightOrder, rightOK := partOrder[result[right].ID]
+		switch {
+		case leftOK && rightOK && leftOrder != rightOrder:
+			return leftOrder < rightOrder
+		case leftOK != rightOK:
+			return leftOK
+		default:
+			return result[left].Title < result[right].Title
+		}
+	})
+	return result
+}
+
+func (useCase StudentUseCase) buildPartBundleFromContext(current *partRuntimeContext, artifacts []domain.StudentPracticeTaskArtifact) (domain.StudentPracticeTaskPartBundle, error) {
+	milestones := make([]domain.StudentPracticeTaskPartMilestone, 0, len(current.partMilestones))
+	for _, milestone := range current.partMilestones {
+		view, err := useCase.buildPartMilestoneView(current, milestone)
+		if err != nil {
+			return domain.StudentPracticeTaskPartBundle{}, err
+		}
+		milestones = append(milestones, view)
+	}
+	partStatus := derivePartStatus(milestones)
+	access := buildPartAccess(current, milestones, partStatus)
+	return domain.StudentPracticeTaskPartBundle{
+		StudentPracticeTask: *current.studentPracticeTask,
+		Part:                *current.part,
+		Status:              partStatus,
+		RuntimeTaskID:       current.studentPracticeTask.WorkspaceTaskID,
+		RuntimeLessonID:     current.studentPracticeTask.WorkspaceLessonID,
+		OpenURL:             fmt.Sprintf("/student/my-practice-tasks/%s/part/%s", current.studentPracticeTask.ID, current.part.ID),
+		Access:              access,
+		Lessons:             aggregatePartLessons(milestones, current.completedLessonIDs),
+		Milestones:          milestones,
+		Artifacts:           artifacts,
+	}, nil
+}
+
+func (useCase StudentUseCase) buildPartMilestoneView(current *partRuntimeContext, milestone domain.PracticeTaskRuntimeMilestone) (domain.StudentPracticeTaskPartMilestone, error) {
+	studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestone.ID]
+	if !ok {
+		return domain.StudentPracticeTaskPartMilestone{}, domain.ErrNotFound
+	}
+	prerequisites := resolvePartMilestonePrerequisites(current.runtimeContext, milestone, current.completedLessonIDs)
+	status, blockingReason := resolvePartMilestoneStatus(current, milestone, studentMilestone, prerequisites)
+
+	var validationResult *domain.ValidationRunResult
+	if result, err := validationResultFromMilestone(studentMilestone); err != nil {
+		return domain.StudentPracticeTaskPartMilestone{}, err
+	} else if validationResultHasActivity(result) {
+		resultCopy := result
+		validationResult = &resultCopy
+	}
+
+	return domain.StudentPracticeTaskPartMilestone{
+		ID:                             milestone.ID,
+		StudentPracticeTaskMilestoneID: studentMilestone.ID,
+		PracticeTaskMilestoneID:        milestone.PracticeTaskMilestoneID,
+		PracticeTaskPartID:             milestone.PracticeTaskPartID,
+		ParentPartMilestoneID:          milestone.ParentPartMilestoneID,
+		MilestoneKindCode:              milestone.MilestoneKindCode,
+		StackCode:                      milestone.StackCode,
+		StackCodes:                     milestone.StackCodes,
+		Title:                          milestone.Title,
+		Description:                    milestone.Description,
+		SortOrder:                      milestone.SortOrder,
+		Status:                         status,
+		BlockingReason:                 blockingReason,
+		Prerequisites:                  prerequisites,
+		LessonBindings:                 append([]domain.PracticeTaskRuntimeLessonBinding(nil), milestone.LessonBindings...),
+		ValidationResult:               validationResult,
+		ValidationIssues:               flattenValidationIssues(validationResult),
+	}, nil
+}
+
+func resolvePartMilestonePrerequisites(
+	runtimeContext *domain.PracticeTaskRuntimeContext,
+	milestone domain.PracticeTaskRuntimeMilestone,
+	completedLessons map[string]struct{},
+) domain.MilestonePrerequisites {
+	if len(milestone.LessonBindings) > 0 {
+		return resolveExplicitLessonPrerequisites(milestone.LessonBindings, completedLessons)
+	}
+	requiredSkillTags := []string{}
+	for _, item := range runtimeContext.MilestoneSkillTags {
+		if item.MilestoneKindCode != milestone.MilestoneKindCode {
+			continue
+		}
+		requiredSkillTags = append(requiredSkillTags, item.SkillTagCode)
+	}
+	requiredSkillTags = dedupeStrings(requiredSkillTags)
+
+	matchedLessonsSet := map[string]struct{}{}
+	unmatchedSkillTags := []string{}
+	for _, skillTag := range requiredSkillTags {
+		found := false
+		for _, lessonTag := range runtimeContext.LessonSkillTags {
+			if lessonTag.SkillTagCode != skillTag {
+				continue
+			}
+			found = true
+			matchedLessonsSet[lessonTag.LessonID] = struct{}{}
+		}
+		if !found {
+			unmatchedSkillTags = append(unmatchedSkillTags, skillTag)
+		}
+	}
+
+	matchedLessonIDs := sortedStringKeys(matchedLessonsSet)
+	completedLessonIDs := []string{}
+	for _, lessonID := range matchedLessonIDs {
+		if _, ok := completedLessons[lessonID]; ok {
+			completedLessonIDs = append(completedLessonIDs, lessonID)
+		}
+	}
+
+	return domain.MilestonePrerequisites{
+		RequiredSkillTags:  requiredSkillTags,
+		MatchedLessonIDs:   matchedLessonIDs,
+		CompletedLessonIDs: completedLessonIDs,
+		UnmetLessonIDs:     diffStrings(matchedLessonIDs, completedLessonIDs),
+		UnmatchedSkillTags: dedupeStrings(unmatchedSkillTags),
+	}
+}
+
+func resolveExplicitLessonPrerequisites(bindings []domain.PracticeTaskRuntimeLessonBinding, completedLessons map[string]struct{}) domain.MilestonePrerequisites {
+	ordered := sortedRuntimeLessonBindings(bindings)
+	matchedLessonIDs := make([]string, 0, len(ordered))
+	recommendedLessonIDs := make([]string, 0)
+	optionalLessonIDs := make([]string, 0)
+	completedLessonIDs := make([]string, 0)
+	unmetLessonIDs := make([]string, 0)
+	alternativeGroups := make(map[string][]string)
+	alternativeSatisfied := make(map[string]bool)
+
+	for _, binding := range ordered {
+		matchedLessonIDs = append(matchedLessonIDs, binding.LessonID)
+		_, completed := completedLessons[binding.LessonID]
+		if completed {
+			completedLessonIDs = append(completedLessonIDs, binding.LessonID)
+		}
+		switch binding.Requirement {
+		case domain.PracticeTaskLessonRequirementRecommended:
+			recommendedLessonIDs = append(recommendedLessonIDs, binding.LessonID)
+		case domain.PracticeTaskLessonRequirementOptional:
+			optionalLessonIDs = append(optionalLessonIDs, binding.LessonID)
+		case domain.PracticeTaskLessonRequirementRequired:
+			if binding.AlternativeGroup != nil && strings.TrimSpace(*binding.AlternativeGroup) != "" {
+				group := strings.TrimSpace(*binding.AlternativeGroup)
+				alternativeGroups[group] = append(alternativeGroups[group], binding.LessonID)
+				alternativeSatisfied[group] = alternativeSatisfied[group] || completed
+			} else if !completed {
+				unmetLessonIDs = append(unmetLessonIDs, binding.LessonID)
+			}
+		}
+	}
+	for group, lessonIDs := range alternativeGroups {
+		if !alternativeSatisfied[group] {
+			unmetLessonIDs = append(unmetLessonIDs, lessonIDs...)
+		}
+	}
+
+	return domain.MilestonePrerequisites{
+		MatchedLessonIDs:     dedupeStrings(matchedLessonIDs),
+		RecommendedLessonIDs: dedupeStrings(recommendedLessonIDs),
+		OptionalLessonIDs:    dedupeStrings(optionalLessonIDs),
+		CompletedLessonIDs:   dedupeStrings(completedLessonIDs),
+		UnmetLessonIDs:       dedupeStrings(unmetLessonIDs),
+		RequiredSkillTags:    []string{},
+		UnmatchedSkillTags:   []string{},
+		UsesExplicitRoute:    true,
+	}
+}
+
+func sortedRuntimeLessonBindings(items []domain.PracticeTaskRuntimeLessonBinding) []domain.PracticeTaskRuntimeLessonBinding {
+	result := append([]domain.PracticeTaskRuntimeLessonBinding(nil), items...)
+	sort.SliceStable(result, func(left, right int) bool {
+		if result[left].SortOrder == result[right].SortOrder {
+			return result[left].LessonID < result[right].LessonID
+		}
+		return result[left].SortOrder < result[right].SortOrder
+	})
+	return result
+}
+
+func resolvePartMilestoneStatus(
+	current *partRuntimeContext,
+	milestone domain.PracticeTaskRuntimeMilestone,
+	studentMilestone domain.StudentPracticeTaskMilestone,
+	prerequisites domain.MilestonePrerequisites,
+) (string, string) {
+	if studentMilestone.Status == domain.StudentMilestoneStatusPassed {
+		return domain.MilestoneRuntimeStatusPassed, ""
+	}
+	if studentMilestone.Status == domain.StudentMilestoneStatusSkipped {
+		return domain.MilestoneRuntimeStatusSkipped, ""
+	}
+	if len(prerequisites.UnmetLessonIDs) > 0 || len(prerequisites.UnmatchedSkillTags) > 0 {
+		return domain.MilestoneRuntimeStatusLocked, blockingReasonMilestonePrerequisites
+	}
+	if parentID := parentPartMilestoneID(milestone); parentID != "" {
+		parent, ok := current.studentMilestonesByPartMilestoneID[parentID]
+		if !ok || !isMilestoneCompleted(parent.Status) {
+			return domain.MilestoneRuntimeStatusLocked, blockingReasonParentMilestoneRequired
+		}
+	}
+	if previousID := previousRouteMilestoneID(current.runtimeContext.PracticeTaskMilestones, milestone); previousID != "" {
+		previous, ok := current.studentMilestonesByPartMilestoneID[previousID]
+		if !ok || !isMilestoneCompleted(previous.Status) {
+			return domain.MilestoneRuntimeStatusLocked, blockingReasonPreviousMilestone
+		}
+	}
+	if current.part.IsStrictOrder {
+		if previousID := previousSiblingMilestoneID(current.partMilestones, milestone); previousID != "" {
+			previousMilestone, ok := current.studentMilestonesByPartMilestoneID[previousID]
+			if ok && !isMilestoneCompleted(previousMilestone.Status) {
+				return domain.MilestoneRuntimeStatusLocked, blockingReasonStrictOrderRequired
+			}
+		}
+	}
+	switch studentMilestone.Status {
+	case domain.StudentMilestoneStatusInProgress:
+		return domain.MilestoneRuntimeStatusInProgress, ""
+	case domain.StudentMilestoneStatusFailed:
+		return domain.MilestoneRuntimeStatusFailed, ""
+	default:
+		if studentMilestone.TaskAnswerID != nil {
+			return domain.MilestoneRuntimeStatusInProgress, ""
+		}
+		return domain.MilestoneRuntimeStatusAvailable, ""
+	}
+}
+
+func buildPartAccess(current *partRuntimeContext, milestones []domain.StudentPracticeTaskPartMilestone, status string) domain.MilestoneAccess {
+	var active *domain.StudentPracticeTaskPartMilestone
+	for _, item := range milestones {
+		if item.Status == domain.MilestoneRuntimeStatusPassed || item.Status == domain.MilestoneRuntimeStatusSkipped {
+			continue
+		}
+		itemCopy := item
+		active = &itemCopy
+		break
+	}
+
+	locked := active != nil && active.Status == domain.MilestoneRuntimeStatusLocked
+	blockingReason := ""
+	if locked {
+		blockingReason = active.BlockingReason
+		if blockingReason == blockingReasonMilestonePrerequisites {
+			blockingReason = blockingReasonPartPrerequisites
+		}
+	}
+	prerequisites := domain.MilestonePrerequisites{}
+	if active != nil {
+		prerequisites = active.Prerequisites
+	}
+
+	return domain.MilestoneAccess{
+		Status:              status,
+		Locked:              locked,
+		BlockingReason:      blockingReason,
+		CurrentTaskID:       current.studentPracticeTask.WorkspaceTaskID,
+		CurrentLessonID:     current.studentPracticeTask.WorkspaceLessonID,
+		CurrentTaskAnswerID: current.studentPracticeTask.CurrentTaskAnswerID,
+		CurrentSandboxID:    current.studentPracticeTask.ActiveSandboxID,
+		PreviewURL:          current.studentPracticeTask.PreviewURL,
+		Prerequisites:       prerequisites,
+	}
+}
+
+func aggregatePartLessons(
+	milestones []domain.StudentPracticeTaskPartMilestone,
+	completedLessons map[string]struct{},
+) []domain.StudentPracticeTaskPartLesson {
+	explicitLessons := make([]domain.StudentPracticeTaskPartLesson, 0)
+	seenExplicit := make(map[string]struct{})
+	for _, milestone := range milestones {
+		for _, binding := range sortedRuntimeLessonBindings(milestone.LessonBindings) {
+			if _, ok := seenExplicit[binding.LessonID]; ok {
+				continue
+			}
+			seenExplicit[binding.LessonID] = struct{}{}
+			_, done := completedLessons[binding.LessonID]
+			explicitLessons = append(explicitLessons, domain.StudentPracticeTaskPartLesson{
+				LessonID:         binding.LessonID,
+				CourseID:         binding.CourseID,
+				Requirement:      binding.Requirement,
+				SortOrder:        binding.SortOrder,
+				StepTitle:        binding.StepTitle,
+				StepInstructions: binding.StepInstructions,
+				Completed:        done,
+			})
+		}
+	}
+	requiredSkillTagsByLessonID := map[string]map[string]struct{}{}
+	for _, milestone := range milestones {
+		if len(milestone.LessonBindings) > 0 {
+			continue
+		}
+		for _, lessonID := range milestone.Prerequisites.MatchedLessonIDs {
+			if _, ok := requiredSkillTagsByLessonID[lessonID]; !ok {
+				requiredSkillTagsByLessonID[lessonID] = map[string]struct{}{}
+			}
+			for _, skillTag := range milestone.Prerequisites.RequiredSkillTags {
+				requiredSkillTagsByLessonID[lessonID][skillTag] = struct{}{}
+			}
+		}
+	}
+	lessonIDs := sortedStringKeysMap(requiredSkillTagsByLessonID)
+	result := append([]domain.StudentPracticeTaskPartLesson(nil), explicitLessons...)
+	for _, lessonID := range lessonIDs {
+		if _, ok := seenExplicit[lessonID]; ok {
+			continue
+		}
+		skillTags := sortedStringKeys(requiredSkillTagsByLessonID[lessonID])
+		_, done := completedLessons[lessonID]
+		result = append(result, domain.StudentPracticeTaskPartLesson{
+			LessonID:          lessonID,
+			Requirement:       domain.PracticeTaskLessonRequirementRequired,
+			RequiredSkillTags: skillTags,
+			Completed:         done,
+		})
+	}
+	return result
+}
+
+func derivePartStatus(milestones []domain.StudentPracticeTaskPartMilestone) string {
+	if len(milestones) == 0 {
+		return domain.MilestoneRuntimeStatusAvailable
+	}
+	allCompleted := true
+	hasFailed := false
+	hasProgress := false
+	hasAvailable := false
+	hasLocked := false
+	for _, item := range milestones {
+		if item.Status != domain.MilestoneRuntimeStatusPassed && item.Status != domain.MilestoneRuntimeStatusSkipped {
+			allCompleted = false
+		}
+		switch item.Status {
+		case domain.MilestoneRuntimeStatusFailed:
+			hasFailed = true
+		case domain.MilestoneRuntimeStatusInProgress:
+			hasProgress = true
+		case domain.MilestoneRuntimeStatusPassed:
+			hasProgress = true
+		case domain.MilestoneRuntimeStatusAvailable:
+			hasAvailable = true
+		case domain.MilestoneRuntimeStatusLocked:
+			hasLocked = true
+		}
+	}
+	switch {
+	case allCompleted:
+		return domain.MilestoneRuntimeStatusPassed
+	case hasFailed:
+		return domain.MilestoneRuntimeStatusFailed
+	case hasProgress:
+		return domain.MilestoneRuntimeStatusInProgress
+	case hasAvailable:
+		return domain.MilestoneRuntimeStatusAvailable
+	case hasLocked:
+		return domain.MilestoneRuntimeStatusLocked
+	default:
+		return domain.MilestoneRuntimeStatusAvailable
+	}
+}
+
+func flattenValidationIssues(result *domain.ValidationRunResult) []domain.ValidationRunIssue {
+	if result == nil {
+		return nil
+	}
+	issues := make([]domain.ValidationRunIssue, 0, len(result.Errors))
+	issues = append(issues, result.Errors...)
+	for _, stage := range result.Stages {
+		issues = append(issues, stage.Errors...)
+	}
+	for _, link := range result.Links {
+		issues = append(issues, link.Errors...)
+	}
+	return issues
+}
+
+func mergePartValidationResults(milestones []domain.StudentPracticeTaskPartMilestone) domain.ValidationRunResult {
+	result := domain.ValidationRunResult{
+		ContractKind:    "validation_contract_v1",
+		ContractVersion: 1,
+		Stages:          []domain.ValidationStageRun{},
+		Links:           []domain.ValidationLinkRun{},
+		Errors:          []domain.ValidationRunIssue{},
+	}
+	allPassed := true
+	for _, milestone := range milestones {
+		if milestone.ValidationResult == nil {
+			allPassed = false
+			continue
+		}
+		if milestone.ValidationResult.ContractKind != "" {
+			result.ContractKind = milestone.ValidationResult.ContractKind
+		}
+		if milestone.ValidationResult.ContractVersion > 0 {
+			result.ContractVersion = milestone.ValidationResult.ContractVersion
+		}
+		result.Legacy = result.Legacy || milestone.ValidationResult.Legacy
+		if !milestone.ValidationResult.Passed {
+			allPassed = false
+		}
+		for _, stage := range milestone.ValidationResult.Stages {
+			stageCopy := stage
+			stageCopy.StageID = prefixedPartStageID(milestone.ID, stage.StageID)
+			stageCopy.Errors = prefixValidationIssues(milestone.ID, stageCopy.Errors)
+			stageCopy.Warnings = prefixValidationIssues(milestone.ID, stageCopy.Warnings)
+			result.Stages = append(result.Stages, stageCopy)
+		}
+		for _, link := range milestone.ValidationResult.Links {
+			linkCopy := link
+			linkCopy.LinkID = prefixedPartStageID(milestone.ID, link.LinkID)
+			linkCopy.Errors = prefixValidationIssues(milestone.ID, linkCopy.Errors)
+			result.Links = append(result.Links, linkCopy)
+		}
+		result.Errors = append(result.Errors, prefixValidationIssues(milestone.ID, milestone.ValidationResult.Errors)...)
+	}
+	result.Passed = allPassed && len(milestones) > 0
+	return result
+}
+
+func prefixValidationIssues(milestoneID string, issues []domain.ValidationRunIssue) []domain.ValidationRunIssue {
+	if len(issues) == 0 {
+		return nil
+	}
+	result := make([]domain.ValidationRunIssue, 0, len(issues))
+	for _, issue := range issues {
+		issueCopy := issue
+		if strings.TrimSpace(issueCopy.StageID) != "" {
+			issueCopy.StageID = prefixedPartStageID(milestoneID, issueCopy.StageID)
+		}
+		result = append(result, issueCopy)
+	}
+	return result
+}
+
+func sortedStringKeysMap(values map[string]map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for key := range values {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func parentPartMilestoneID(item domain.PracticeTaskRuntimeMilestone) string {
+	if item.ParentPartMilestoneID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*item.ParentPartMilestoneID)
+}
+
+func previousSiblingMilestoneID(items []domain.PracticeTaskRuntimeMilestone, current domain.PracticeTaskRuntimeMilestone) string {
+	parentID := parentPartMilestoneID(current)
+	siblings := make([]domain.PracticeTaskRuntimeMilestone, 0, len(items))
+	for _, item := range items {
+		if parentPartMilestoneID(item) != parentID {
+			continue
+		}
+		siblings = append(siblings, item)
+	}
+	sort.Slice(siblings, func(left, right int) bool {
+		if siblings[left].SortOrder == siblings[right].SortOrder {
+			return siblings[left].Title < siblings[right].Title
+		}
+		return siblings[left].SortOrder < siblings[right].SortOrder
+	})
+	for index := range siblings {
+		if siblings[index].ID != current.ID || index == 0 {
+			continue
+		}
+		return siblings[index-1].ID
+	}
+	return ""
+}
+
+func previousRouteMilestoneID(items []domain.PracticeTaskRuntimeMilestone, current domain.PracticeTaskRuntimeMilestone) string {
+	ordered := domainservice.SortMilestonesForStudent(items)
+	previousID := ""
+	for _, item := range ordered {
+		if !item.IsActive {
+			continue
+		}
+		if item.ID == current.ID {
+			return previousID
+		}
+		previousID = item.ID
+	}
+	return ""
+}
+
+func currentPartMilestone(current *partRuntimeContext) *domain.PracticeTaskRuntimeMilestone {
+	if current == nil {
+		return nil
+	}
+	for _, milestone := range domainservice.SortMilestonesForStudent(current.partMilestones) {
+		studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestone.ID]
+		if !ok || isMilestoneCompleted(studentMilestone.Status) {
+			continue
+		}
+		item := milestone
+		return &item
+	}
+	return nil
+}
+
+func isMilestoneCompleted(status int16) bool {
+	return status == domain.StudentMilestoneStatusPassed || status == domain.StudentMilestoneStatusSkipped
+}
+
+func validationResultHasActivity(result domain.ValidationRunResult) bool {
+	if len(result.Errors) > 0 || len(result.Stages) > 0 || len(result.Links) > 0 {
+		return true
+	}
+	return result.Passed
+}
+
+func activePartID(project *domain.StudentPracticeTask) string {
+	if project == nil {
+		return ""
+	}
+	state := decodeWorkspaceState(project.WorkspaceStateJSON)
+	if state.ActivePartID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*state.ActivePartID)
+}
+
+func decodeWorkspaceState(raw json.RawMessage) domain.StudentPracticeTaskWorkspaceState {
+	if len(raw) == 0 {
+		return domain.StudentPracticeTaskWorkspaceState{}
+	}
+	var state domain.StudentPracticeTaskWorkspaceState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return domain.StudentPracticeTaskWorkspaceState{}
+	}
+	return state
+}
+
+func encodeWorkspaceState(state domain.StudentPracticeTaskWorkspaceState) json.RawMessage {
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return payload
+}
+
+func (useCase StudentUseCase) setActivePracticeTaskPart(ctx context.Context, project *domain.StudentPracticeTask, partID string) error {
+	if project == nil {
+		return domain.ErrNotFound
+	}
+	state := decodeWorkspaceState(project.WorkspaceStateJSON)
+	trimmedPartID := strings.TrimSpace(partID)
+	if trimmedPartID == "" {
+		state.ActivePartID = nil
+	} else {
+		state.ActivePartID = &trimmedPartID
+	}
+	projectCopy := *project
+	projectCopy.WorkspaceStateJSON = encodeWorkspaceState(state)
+	projectCopy.UpdatedAt = time.Now().UTC()
+	if err := useCase.Students.UpdateStudentPracticeTask(ctx, projectCopy); err != nil {
+		return err
+	}
+	project.WorkspaceStateJSON = projectCopy.WorkspaceStateJSON
+	project.UpdatedAt = projectCopy.UpdatedAt
+	return nil
+}
+
+func (useCase StudentUseCase) loadActivePartRuntimeContextForProject(
+	ctx context.Context,
+	project *domain.StudentPracticeTask,
+	withBuild bool,
+) (*partRuntimeContext, error) {
+	partID := activePartID(project)
+	if partID == "" {
+		return nil, domain.ErrNotFound
+	}
+	return useCase.loadPartRuntimeContext(ctx, project.StudentID, project.ID, partID, withBuild)
+}
+
+func firstLockedPartError(bundle domain.StudentPracticeTaskPartBundle) error {
+	for _, milestone := range bundle.Milestones {
+		if milestone.Status != domain.MilestoneRuntimeStatusLocked {
+			continue
+		}
+		return &domain.MilestoneLockedError{
+			StudentPracticeTaskID:          bundle.StudentPracticeTask.ID,
+			StudentPracticeTaskMilestoneID: milestone.StudentPracticeTaskMilestoneID,
+			BlockingReason:                 milestone.BlockingReason,
+			Prerequisites:                  milestone.Prerequisites,
+		}
+	}
+	return &domain.MilestoneLockedError{
+		StudentPracticeTaskID: bundle.StudentPracticeTask.ID,
+		BlockingReason:        bundle.Access.BlockingReason,
+		Prerequisites:         bundle.Access.Prerequisites,
+	}
+}
+
+func currentPartRepresentativeMilestone(current *partRuntimeContext) *domain.StudentPracticeTaskMilestone {
+	if current == nil {
+		return nil
+	}
+	if current.build != nil && len(current.build.Milestones) > 0 {
+		milestoneID := current.build.Milestones[0].Milestone.ID
+		if studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestoneID]; ok {
+			item := studentMilestone
+			return &item
+		}
+	}
+	for _, milestone := range domainservice.SortMilestonesForStudent(current.partMilestones) {
+		studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestone.ID]
+		if !ok {
+			continue
+		}
+		if studentMilestone.Status == domain.StudentMilestoneStatusPassed || studentMilestone.Status == domain.StudentMilestoneStatusSkipped {
+			continue
+		}
+		item := studentMilestone
+		return &item
+	}
+	for _, milestone := range domainservice.SortMilestonesForStudent(current.partMilestones) {
+		studentMilestone, ok := current.studentMilestonesByPartMilestoneID[milestone.ID]
+		if !ok {
+			continue
+		}
+		item := studentMilestone
+		return &item
+	}
+	return nil
+}

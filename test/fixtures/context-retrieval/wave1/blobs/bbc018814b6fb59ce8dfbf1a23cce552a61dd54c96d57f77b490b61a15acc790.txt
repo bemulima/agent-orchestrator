@@ -1,0 +1,1012 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain"
+	"github.com/bemulima/ms-go-teacher-agent/internal/domain/repository"
+)
+
+type TeacherDialogJobRepository struct {
+	Pool                 *pgxpool.Pool
+	DenseOrderingEnabled bool
+	HandoffEnabled       bool
+}
+
+var _ repository.TeacherDialogJob = TeacherDialogJobRepository{}
+var _ repository.TeacherOnboardingDeliveryStore = TeacherDialogJobRepository{}
+
+// ErrDenseTeacherOrderingDisabledWithPendingV2 identifies accepted dense work
+// that cannot drain under the current consumer configuration.
+var ErrDenseTeacherOrderingDisabledWithPendingV2 = errors.New("dense_teacher_ordering_disabled_with_pending_v2")
+
+// CheckDenseOrderingReadiness diagnoses incompatible configuration without
+// changing intake, claims, retries, or any durable job/cursor facts.
+func (repository TeacherDialogJobRepository) CheckDenseOrderingReadiness(ctx context.Context) error {
+	if repository.Pool == nil {
+		return errors.New("teacher dialog job repository pool is required")
+	}
+	if repository.DenseOrderingEnabled {
+		return nil
+	}
+	var pending bool
+	if err := repository.Pool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM teacher_dialog_job
+    WHERE teacher_turn_schema_version = 2
+      AND status IN ('queued','processing','delivery_pending','blocked')
+)`).Scan(&pending); err != nil {
+		return err
+	}
+	if pending {
+		return ErrDenseTeacherOrderingDisabledWithPendingV2
+	}
+	return nil
+}
+
+func (repository TeacherDialogJobRepository) Accept(ctx context.Context, job domain.TeacherDialogJob) (bool, error) {
+	if repository.Pool == nil {
+		return false, errors.New("teacher dialog job repository pool is required")
+	}
+	normalized, err := domain.NormalizeTeacherDialogJob(job)
+	if err != nil || (normalized.Status != domain.TeacherDialogJobQueued && normalized.Status != domain.TeacherDialogJobBlocked) {
+		return false, domain.ErrInvalidTeacherDialogJob
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	teacherJobID := uuid.NewString()
+	command, err := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_job (
+    event_id,teacher_job_id,teacher_turn_schema_version,teacher_turn_sequence,canonical_student_message_id,correlation_id,dialog_causation_id,causation_id,action_receipt_id,student_command_id,
+    dialog_id,event_sequence,source_message_id,source_message_sequence,source_message_version,reply_to_message_id,source_channel,
+    student_id,personal_teacher_id,context_type,context_id,learning_action_id,occurred_at,
+    status,error_code,attempts,next_attempt_at,accepted_at,updated_at
+) VALUES ($1,$2,$3,$4,NULLIF($5,'')::uuid,NULLIF($6,'')::uuid,NULLIF($7,'')::uuid,NULLIF($8,'')::uuid,NULLIF($9,'')::uuid,NULLIF($10,'')::uuid,
+	$11,$12,$13,$14,NULLIF($15,0),NULLIF($16,'')::uuid,$17,$18,$19,$20,NULLIF($21,'')::uuid,NULLIF($22,'')::uuid,$23,$24,$25,0,$26,$27,$27)
+ON CONFLICT DO NOTHING
+`, normalized.Request.EventID, teacherJobID, normalized.Request.SchemaVersion, nullableInt64(normalized.Request.TeacherTurnSequence),
+		normalized.Request.CanonicalStudentMessageID, normalized.Request.CorrelationID, normalized.Request.DialogCausationID, normalized.Request.CausationID,
+		normalized.Request.ActionReceiptID, normalized.Request.StudentCommandID, normalized.Request.DialogID, normalized.Request.EventSequence,
+		normalized.Request.SourceMessageID, normalized.Request.SourceSequence, nullableInt64(normalized.Request.SourceMessageVersion), normalized.Request.ReplyToMessageID, normalized.Request.SourceChannel, normalized.Request.StudentID,
+		normalized.Request.PersonalTeacherID, normalized.Request.ContextType, normalized.Request.ContextID,
+		normalized.Request.LearningActionID, normalized.Request.OccurredAt, normalized.Status,
+		normalized.ErrorCode, normalized.NextAttemptAt, normalized.AcceptedAt)
+	if err != nil {
+		return false, err
+	}
+	if command.RowsAffected() == 1 {
+		if normalized.Request.UsesDenseTeacherOrdering() {
+			if _, err := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_turn_cursor (dialog_id, updated_at)
+VALUES ($1, $2)
+ON CONFLICT (dialog_id) DO NOTHING
+`, normalized.Request.DialogID, normalized.AcceptedAt.UTC()); err != nil {
+				return false, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return false, err
+	}
+	existing, err := repository.getByEventID(ctx, normalized.Request.EventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, domain.ErrTeacherDialogRequestConflict
+	}
+	if err != nil {
+		return false, err
+	}
+	if !sameDialogRequest(existing.Request, normalized.Request) {
+		return false, domain.ErrTeacherDialogRequestConflict
+	}
+	return false, nil
+}
+
+func (repository TeacherDialogJobRepository) Claim(
+	ctx context.Context,
+	claim repository.TeacherDialogClaim,
+) (domain.TeacherDialogJob, bool, error) {
+	if repository.Pool == nil || !validUUIDString(claim.ClaimToken) || strings.TrimSpace(claim.WorkerID) == "" ||
+		len(strings.TrimSpace(claim.WorkerID)) > 128 || claim.Now.IsZero() || !claim.LockedUntil.After(claim.Now) {
+		return domain.TeacherDialogJob{}, false, domain.ErrInvalidTeacherDialogJob
+	}
+	handoffFence := ""
+	if repository.HandoffEnabled {
+		handoffFence = `
+      AND NOT EXISTS (
+          SELECT 1 FROM teacher_onboarding_plan_handoff AS handoff
+          WHERE handoff.source_teacher_job_id=job.teacher_job_id
+            AND handoff.status IN ('queued','dispatching','accepted','message_pending','active_path')
+      )`
+	}
+	job, err := scanTeacherDialogJob(repository.Pool.QueryRow(ctx, `
+WITH candidate AS (
+    SELECT job.event_id
+    FROM teacher_dialog_job AS job
+    LEFT JOIN teacher_dialog_turn_cursor AS cursor ON cursor.dialog_id = job.dialog_id
+    WHERE (
+        (job.status IN ('queued','delivery_pending') AND job.next_attempt_at <= $1)
+        OR (job.status = 'processing' AND job.locked_until <= $1)
+    )
+`+handoffFence+`
+      AND (
+          job.teacher_turn_schema_version = 1
+          OR ($5 AND job.teacher_turn_schema_version = 2 AND cursor.next_teacher_turn_sequence = job.teacher_turn_sequence)
+      )
+    ORDER BY job.occurred_at,job.event_id
+    FOR UPDATE OF job SKIP LOCKED
+    LIMIT 1
+)
+UPDATE teacher_dialog_job AS job SET
+    status='processing',claim_token=$2,locked_by=$3,locked_until=$4,
+    attempts=job.attempts+1,updated_at=$1
+FROM candidate
+WHERE job.event_id=candidate.event_id
+RETURNING `+teacherDialogJobColumns,
+		claim.Now.UTC(), claim.ClaimToken, strings.TrimSpace(claim.WorkerID), claim.LockedUntil.UTC(), repository.DenseOrderingEnabled))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TeacherDialogJob{}, false, nil
+	}
+	return job, err == nil, err
+}
+
+func (repository TeacherDialogJobRepository) RenewLease(
+	ctx context.Context,
+	eventID, claimToken string,
+	now, lockedUntil time.Time,
+) error {
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || now.IsZero() || !lockedUntil.After(now) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_dialog_job SET locked_until=$3,updated_at=$4
+WHERE event_id=$1 AND claim_token=$2 AND status='processing' AND locked_until > $4
+`, eventID, claimToken, lockedUntil.UTC(), now.UTC())
+	return requireTeacherDialogLease(command.RowsAffected(), err)
+}
+
+func (repository TeacherDialogJobRepository) SaveGenerated(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	decision domain.TeacherDecision,
+	event domain.IntegrationEvent,
+	responseBody string,
+	aiExecutionID string,
+	now time.Time,
+) error {
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || (aiExecutionID != "" && !validUUIDString(aiExecutionID)) || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	body, err := domain.NormalizeTeacherResponseBody(responseBody)
+	if err != nil {
+		return err
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	job, err := scanTeacherDialogJob(tx.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+`
+FROM teacher_dialog_job AS job
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+FOR UPDATE
+`, eventID, claimToken))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if !teacherDialogDecisionMatchesJob(job, decision) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if err := insertTeacherDecisionAndOutbox(ctx, tx, decision, event); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    decision_id=$3,response_body=$4,ai_execution_id=NULLIF($5,'')::uuid,error_code=NULL,updated_at=$6
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+  AND decision_id IS NULL AND response_body IS NULL
+`, eventID, claimToken, decision.ID, body, aiExecutionID, now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	return tx.Commit(ctx)
+}
+
+// SaveCoordinatedResponse stages a registry-built onboarding response without
+// manufacturing a legacy TeacherDecision/outbox event. The job claim is the
+// fence; Dialog delivery later reuses the deterministic response command.
+func (repository TeacherDialogJobRepository) SaveCoordinatedResponse(
+	ctx context.Context,
+	eventID, claimToken string,
+	response domain.TeacherCoordinatedDialogResponse,
+	now time.Time,
+) error {
+	normalized, err := domain.NewTeacherCoordinatedDialogResponse(response)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || err != nil || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	digest := ""
+	if len(normalized.AssistantUI) != 0 {
+		digest, err = domain.DigestTeacherAssistantUI(normalized.AssistantUI)
+		if err != nil {
+			return domain.ErrInvalidTeacherDialogJob
+		}
+	}
+	var assistantUI any
+	if len(normalized.AssistantUI) != 0 {
+		assistantUI = []byte(normalized.AssistantUI)
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var teacherJobID string
+	err = tx.QueryRow(ctx, `
+UPDATE teacher_dialog_job SET
+ coordinator_mode=$3,response_body=$4,response_assistant_ui=$5,response_assistant_ui_digest=NULLIF($6,''),
+ status='delivery_pending',claim_token=NULL,locked_by=NULL,locked_until=NULL,error_code=NULL,updated_at=$7
+WHERE event_id=$1 AND claim_token=$2 AND status='processing' AND decision_id IS NULL
+  AND coordinator_mode IN ('legacy',$3)
+	RETURNING teacher_job_id::text
+	`, eventID, claimToken, normalized.Mode, normalized.Body, assistantUI, digest, now.UTC()).Scan(&teacherJobID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_turn SET
+ stage='delivery_pending',response_assistant_ui_digest=NULLIF($2,''),updated_at=$3
+WHERE teacher_job_id=$1 AND stage='response_staged'
+	`, teacherJobID, digest, now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	return tx.Commit(ctx)
+}
+
+// StageProductAwareOnboardingResponse atomically binds one exact readiness
+// decision to the already accepted Student effect. A committed transaction is
+// immediately delivery_pending; there is no crash-visible response_staged
+// state from which Planner could be called again without the original result.
+func (repository TeacherDialogJobRepository) StageProductAwareOnboardingResponse(
+	ctx context.Context,
+	eventID, claimToken string,
+	response domain.TeacherCoordinatedDialogResponse,
+	now time.Time,
+) error {
+	normalized, err := domain.NewTeacherCoordinatedDialogResponse(response)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || err != nil || now.IsZero() || normalized.Mode == "legacy" {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	digest := ""
+	if len(normalized.AssistantUI) != 0 {
+		digest, err = domain.DigestTeacherAssistantUI(normalized.AssistantUI)
+		if err != nil {
+			return domain.ErrInvalidTeacherDialogJob
+		}
+	}
+	var assistantUI any
+	if len(normalized.AssistantUI) != 0 {
+		assistantUI = []byte(normalized.AssistantUI)
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var teacherJobID string
+	err = tx.QueryRow(ctx, `
+UPDATE teacher_dialog_job SET
+ coordinator_mode=$3,response_body=$4,response_assistant_ui=$5,response_assistant_ui_digest=NULLIF($6,''),
+ status='delivery_pending',claim_token=NULL,locked_by=NULL,locked_until=NULL,error_code=NULL,updated_at=$7
+WHERE event_id=$1 AND claim_token=$2 AND status='processing' AND decision_id IS NULL AND response_body IS NULL
+  AND coordinator_mode IN ('legacy',$3)
+RETURNING teacher_job_id::text
+`, eventID, claimToken, normalized.Mode, normalized.Body, assistantUI, digest, now.UTC()).Scan(&teacherJobID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_onboarding_turn SET
+ stage='delivery_pending',response_assistant_ui_digest=NULLIF($2,''),updated_at=$3
+WHERE teacher_job_id=$1 AND stage='student_staged' AND student_effect_state='accepted'
+`, teacherJobID, digest, now.UTC())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	return tx.Commit(ctx)
+}
+
+func teacherDialogDecisionMatchesJob(job domain.TeacherDialogJob, decision domain.TeacherDecision) bool {
+	expectedCorrelationID := job.Request.LearningActionID
+	if expectedCorrelationID == "" {
+		expectedCorrelationID = job.Request.DialogID
+	}
+
+	return job.DecisionID == "" && job.ResponseBody == "" &&
+		decision.CausationID == job.Request.EventID &&
+		decision.StudentID == job.Request.StudentID &&
+		decision.PersonalTeacherID == job.Request.PersonalTeacherID &&
+		decision.LearningActionID == job.Request.LearningActionID &&
+		decision.CorrelationID == expectedCorrelationID &&
+		decision.ContextType == job.Request.ContextType &&
+		decision.ContextID == job.Request.ContextID
+}
+
+func (repository TeacherDialogJobRepository) CompleteDelivery(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	messageID string,
+	now time.Time,
+) error {
+	return repository.completeDelivery(ctx, eventID, claimToken, messageID, nil, false, now)
+}
+
+func (repository TeacherDialogJobRepository) CompleteOnboardingDelivery(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	messageID string,
+	next *domain.TeacherOnboardingInteraction,
+	preserveActiveInteraction bool,
+	now time.Time,
+) error {
+	if preserveActiveInteraction && next != nil {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if next != nil {
+		normalized, err := domain.NormalizeTeacherOnboardingInteraction(*next)
+		if err != nil || normalized.State != domain.TeacherOnboardingInteractionActive {
+			return domain.ErrInvalidTeacherDialogJob
+		}
+		next = &normalized
+	}
+	return repository.completeDelivery(ctx, eventID, claimToken, messageID, next, preserveActiveInteraction, now)
+}
+
+func (repository TeacherDialogJobRepository) completeDelivery(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	messageID string,
+	next *domain.TeacherOnboardingInteraction,
+	preserveActiveInteraction bool,
+	now time.Time,
+) error {
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) ||
+		!validUUIDString(messageID) || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	job, err := scanTeacherDialogJob(tx.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+`
+FROM teacher_dialog_job AS job
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+FOR UPDATE
+`, eventID, claimToken))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A repeated completion after the atomic commit is a safe replay. A
+		// different message identity still fails closed as a lost lease.
+		existing, existingErr := repository.getByEventID(ctx, eventID)
+		if existingErr == nil && existing.Status == domain.TeacherDialogJobDelivered && existing.DeliveredMessageID == messageID {
+			return nil
+		}
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if job.ResponseBody == "" || (job.CoordinatorMode == "legacy" && job.DecisionID == "") || (job.CoordinatorMode != "legacy" && job.DecisionID != "") {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if job.CoordinatorMode == "legacy" && (next != nil || preserveActiveInteraction) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if job.CoordinatorMode != "legacy" {
+		// The remote Dialog append is deliberately outside this transaction.  At
+		// this boundary we therefore bind its returned message identity back to
+		// the response that was durably staged before the append.  In particular,
+		// a retry must never close a reserved prompt and activate an interaction
+		// for a different (or silently UI-less) response.
+		if preserveActiveInteraction && job.ResponseAssistantUIDigest != "" {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		if !preserveActiveInteraction && (job.ResponseAssistantUIDigest == "") != (next == nil) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		if next != nil && (next.DialogID != job.Request.DialogID || next.StudentID != job.Request.StudentID ||
+			next.PersonalTeacherID != job.Request.PersonalTeacherID || next.PromptMessageID != messageID ||
+			next.PromptAssistantUIDigest != job.ResponseAssistantUIDigest) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+	}
+	studentCommandID := job.StudentCommandID
+	noEffectProofID := ""
+	var turnInteractionID *string
+	if job.CoordinatorMode != "legacy" {
+		// Student command identity is not part of a Dialog v2 event or its job
+		// intake identity. It is local immutable S5-turn state, written before
+		// the Student call; delivery outcomes read the locked turn rather than a
+		// mutable/request-level job column.
+		var turnStudentCommandID string
+		var turnNoEffectProofID *string
+		turnErr := tx.QueryRow(ctx, `
+SELECT student_command_id::text,interaction_id::text,no_effect_proof_id::text
+FROM teacher_onboarding_turn
+WHERE teacher_job_id=$1 AND stage='delivery_pending'
+FOR UPDATE
+	`, job.TeacherJobID).Scan(&turnStudentCommandID, &turnInteractionID, &turnNoEffectProofID)
+		if errors.Is(turnErr, pgx.ErrNoRows) {
+			return domain.ErrTeacherDialogLeaseLost
+		}
+		if turnErr != nil {
+			return turnErr
+		}
+		if !validUUIDString(turnStudentCommandID) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+		studentCommandID = turnStudentCommandID
+		noEffectProofID = valueOrEmpty(turnNoEffectProofID)
+		if noEffectProofID != "" {
+			// The Student service generated this proof.  Store the immutable ID
+			// before any cursor/outcome references it, so a delivered no-effect
+			// response remains auditable after a retry or restart.
+			proofInsert, proofErr := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_turn_proof (no_effect_proof_id,teacher_job_id,source_event_id,student_command_id,recorded_at)
+VALUES ($1,$2,$3,$4,$5)
+ON CONFLICT (source_event_id) DO NOTHING
+`, noEffectProofID, job.TeacherJobID, job.Request.EventID, studentCommandID, now.UTC())
+			if proofErr != nil {
+				return proofErr
+			}
+			if proofInsert.RowsAffected() == 0 {
+				var storedProofID string
+				proofErr = tx.QueryRow(ctx, `SELECT no_effect_proof_id::text FROM teacher_dialog_turn_proof WHERE source_event_id=$1 FOR UPDATE`, job.Request.EventID).Scan(&storedProofID)
+				if proofErr != nil || storedProofID != noEffectProofID {
+					if proofErr != nil {
+						return proofErr
+					}
+					return domain.ErrTeacherOnboardingConflict
+				}
+			}
+		}
+		if turnInteractionID == nil && (preserveActiveInteraction || next != nil) {
+			return domain.ErrTeacherOnboardingConflict
+		}
+	}
+	if job.Request.UsesDenseTeacherOrdering() {
+		var nextSequence int64
+		var revision int64
+		cursorErr := tx.QueryRow(ctx, `
+SELECT next_teacher_turn_sequence, revision
+FROM teacher_dialog_turn_cursor
+WHERE dialog_id=$1
+FOR UPDATE
+`, job.Request.DialogID).Scan(&nextSequence, &revision)
+		if errors.Is(cursorErr, pgx.ErrNoRows) {
+			return repository.blockCommittedUnreconciled(ctx, tx, eventID, messageID, now)
+		}
+		if cursorErr != nil {
+			return cursorErr
+		}
+		if nextSequence != job.Request.TeacherTurnSequence {
+			return repository.blockCommittedUnreconciled(ctx, tx, eventID, messageID, now)
+		}
+		cursorUpdate, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_turn_cursor SET
+    next_teacher_turn_sequence=next_teacher_turn_sequence+1,
+    last_source_event_id=$2,last_teacher_job_id=$3,last_terminal_outcome='delivered',
+    last_teacher_response_message_id=$4,last_no_effect_proof_id=NULLIF($5,'')::uuid,last_recoverable_outcome_id=NULL,
+    last_failure_code=NULL,revision=$6,updated_at=$7
+WHERE dialog_id=$1 AND next_teacher_turn_sequence=$8 AND revision=$9
+		`, job.Request.DialogID, job.Request.EventID, job.TeacherJobID, messageID, noEffectProofID, revision+1, now.UTC(), job.Request.TeacherTurnSequence, revision)
+		if err != nil {
+			return err
+		}
+		if cursorUpdate.RowsAffected() != 1 {
+			return repository.blockCommittedUnreconciled(ctx, tx, eventID, messageID, now)
+		}
+	}
+	if job.Request.UsesDenseTeacherOrdering() {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_turn_outcome (
+    recoverable_outcome_id,teacher_job_id,source_event_id,dialog_id,teacher_turn_sequence,
+    turn_correlation_id,outcome,student_command_id,teacher_response_message_id,no_effect_proof_id,failure_code,created_at
+) VALUES ($1,$2,$3,$4,NULLIF($5,0),NULLIF($6,'')::uuid,'delivered',NULLIF($7,'')::uuid,$8,NULLIF($9,'')::uuid,NULL,$10)
+ON CONFLICT (source_event_id) DO NOTHING
+		`, uuid.NewString(), job.TeacherJobID, job.Request.EventID, job.Request.DialogID, job.Request.TeacherTurnSequence, job.Request.CorrelationID, studentCommandID, messageID, noEffectProofID, now.UTC()); err != nil {
+			return err
+		}
+	}
+	if job.CoordinatorMode != "legacy" {
+		// Dialog has already committed (or replayed) the deterministic response.
+		// Close exactly its reserved interaction before opening the next one in
+		// this same local transaction, otherwise two tabs could consume a stale
+		// prompt during a crash-retry window.
+		if turnInteractionID == nil {
+			// A stale known-prompt response has no reservation to close. It is
+			// still a fenced, durable coordinator delivery and must not create an
+			// interaction from a UI-less warning.
+		} else if preserveActiveInteraction {
+			released, releaseErr := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET
+ state='active',reserved_teacher_job_id=NULL,reserved_action_receipt_id=NULL,reservation_mode=NULL,updated_at=$2
+WHERE reserved_teacher_job_id=$1 AND state='reserved'
+`, job.TeacherJobID, now.UTC())
+			if releaseErr != nil {
+				return releaseErr
+			}
+			if released.RowsAffected() != 1 {
+				return domain.ErrTeacherDialogLeaseLost
+			}
+		} else {
+			closed, closeErr := tx.Exec(ctx, `
+UPDATE teacher_onboarding_interaction SET state='completed',completed_at=$2,updated_at=$2
+WHERE reserved_teacher_job_id=$1 AND state='reserved'
+`, job.TeacherJobID, now.UTC())
+			if closeErr != nil {
+				return closeErr
+			}
+			if closed.RowsAffected() != 1 {
+				return domain.ErrTeacherDialogLeaseLost
+			}
+		}
+		if next != nil {
+			created, createErr := tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_interaction (
+ interaction_id,dialog_id,student_id,personal_teacher_id,prompt_message_id,prompt_message_version,prompt_assistant_ui_digest,slot_code,
+ expected_draft_version,expected_profile_version,session_schema_version,state,created_at,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$12)
+ON CONFLICT DO NOTHING
+`, next.ID, next.DialogID, next.StudentID, next.PersonalTeacherID, next.PromptMessageID, next.PromptMessageVersion,
+				next.PromptAssistantUIDigest, next.SlotCode, next.ExpectedDraftVersion, next.ExpectedProfileVersion, next.SessionSchemaVersion, next.CreatedAt)
+			if createErr != nil {
+				return createErr
+			}
+			if created.RowsAffected() != 1 {
+				return domain.ErrTeacherOnboardingConflict
+			}
+		}
+		command, stageErr := tx.Exec(ctx, `
+UPDATE teacher_onboarding_turn SET stage='delivered',updated_at=$2
+WHERE teacher_job_id=$1 AND stage='delivery_pending'
+`, job.TeacherJobID, now.UTC())
+		if stageErr != nil {
+			return stageErr
+		}
+		if command.RowsAffected() != 1 {
+			return domain.ErrTeacherDialogLeaseLost
+		}
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='delivered',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+    response_body=NULL,delivered_message_id=$3::uuid,
+    teacher_response_message_id=CASE WHEN teacher_turn_schema_version=2 THEN $3::uuid ELSE NULL END,
+    terminal_outcome=CASE WHEN teacher_turn_schema_version=2 THEN 'delivered' ELSE NULL END,
+    no_effect_proof_id=NULL,recoverable_outcome_id=NULL,
+    reconciliation_state=NULL,error_code=NULL,updated_at=$4,delivered_at=$4
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+	  AND response_body IS NOT NULL
+	  AND ((coordinator_mode='legacy' AND decision_id IS NOT NULL)
+	       OR (coordinator_mode IN ('onboarding_action','onboarding_text') AND decision_id IS NULL))
+`, eventID, claimToken, messageID, now.UTC())
+	if err := requireTeacherDialogLease(command.RowsAffected(), err); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (repository TeacherDialogJobRepository) blockCommittedUnreconciled(ctx context.Context, tx pgx.Tx, eventID, messageID string, now time.Time) error {
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+    response_body=NULL,delivered_message_id=$2,teacher_response_message_id=$2,
+    terminal_outcome=NULL,reconciliation_state='committed_unreconciled',error_code='cursor_mismatch',
+    updated_at=$3
+WHERE event_id=$1 AND status='processing'
+`, eventID, messageID, now.UTC())
+	if err := requireTeacherDialogLease(command.RowsAffected(), err); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return domain.ErrTeacherDialogCursorBlocked
+}
+
+func (repository TeacherDialogJobRepository) Retry(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	errorCode string,
+	retryAt time.Time,
+	now time.Time,
+) error {
+	code, codeErr := domain.NormalizeTeacherDialogErrorCode(errorCode)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) ||
+		codeErr != nil || retryAt.IsZero() || !retryAt.After(now) || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status=CASE WHEN response_body IS NULL THEN 'queued' ELSE 'delivery_pending' END,
+    claim_token=NULL,locked_by=NULL,locked_until=NULL,error_code=$3,
+    next_attempt_at=$4,updated_at=$5
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+`, eventID, claimToken, code, retryAt.UTC(), now.UTC())
+	return requireTeacherDialogLease(command.RowsAffected(), err)
+}
+
+func (repository TeacherDialogJobRepository) RecordFailedNoEffect(
+	ctx context.Context,
+	eventID, claimToken string,
+	proof domain.TeacherDialogNoEffectProof,
+	outcome domain.TeacherDialogRecoverableOutcome,
+	failureCode string,
+	now time.Time,
+) error {
+	code, codeErr := domain.NormalizeTeacherDialogErrorCode(failureCode)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || codeErr != nil || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if !validUUIDString(proof.ID) || !validUUIDString(outcome.ID) || proof.SourceEventID != eventID || outcome.SourceEventID != eventID || !proof.RecordedAt.IsZero() && proof.RecordedAt.After(now) || !outcome.CreatedAt.IsZero() && outcome.CreatedAt.After(now) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	tx, err := repository.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	job, err := scanTeacherDialogJob(tx.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+`
+FROM teacher_dialog_job AS job
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+FOR UPDATE
+`, eventID, claimToken))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if !job.Request.UsesDenseTeacherOrdering() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if outcome.TurnCorrelationID != "" && outcome.TurnCorrelationID != job.Request.CorrelationID {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if proof.TeacherJobID != "" && proof.TeacherJobID != job.TeacherJobID || outcome.TeacherJobID != "" && outcome.TeacherJobID != job.TeacherJobID {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	studentCommandID := proof.StudentCommandID
+	if studentCommandID == "" {
+		studentCommandID = job.StudentCommandID
+	}
+	if studentCommandID != "" && !validUUIDString(studentCommandID) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	if job.Request.UsesDenseTeacherOrdering() {
+		var nextSequence int64
+		var revision int64
+		cursorErr := tx.QueryRow(ctx, `
+SELECT next_teacher_turn_sequence, revision
+FROM teacher_dialog_turn_cursor
+WHERE dialog_id=$1
+FOR UPDATE
+		`, job.Request.DialogID).Scan(&nextSequence, &revision)
+		if errors.Is(cursorErr, pgx.ErrNoRows) {
+			if err := repository.markReconciliationTx(ctx, tx, eventID, "unknown", code, now); err != nil {
+				return err
+			}
+			return domain.ErrTeacherDialogCursorBlocked
+		}
+		if cursorErr != nil {
+			return cursorErr
+		}
+		if nextSequence != job.Request.TeacherTurnSequence {
+			if err := repository.markReconciliationTx(ctx, tx, eventID, "partial", code, now); err != nil {
+				return err
+			}
+			return domain.ErrTeacherDialogCursorBlocked
+		}
+		cursorUpdate, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_turn_cursor SET
+    next_teacher_turn_sequence=next_teacher_turn_sequence+1,
+    last_source_event_id=$2,last_teacher_job_id=$3,last_terminal_outcome='failed_no_effect',
+    last_teacher_response_message_id=NULL,last_no_effect_proof_id=$4,last_recoverable_outcome_id=$5,
+    last_failure_code=$6,revision=$7,updated_at=$8
+WHERE dialog_id=$1 AND next_teacher_turn_sequence=$9 AND revision=$10
+		`, job.Request.DialogID, eventID, job.TeacherJobID, proof.ID, outcome.ID, code, revision+1, now.UTC(), job.Request.TeacherTurnSequence, revision)
+		if err != nil {
+			return err
+		}
+		if cursorUpdate.RowsAffected() != 1 {
+			if err := repository.markReconciliationTx(ctx, tx, eventID, "partial", code, now); err != nil {
+				return err
+			}
+			return domain.ErrTeacherDialogCursorBlocked
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_turn_proof (no_effect_proof_id,teacher_job_id,source_event_id,student_command_id,recorded_at)
+VALUES ($1,$2,$3,NULLIF($4,'')::uuid,$5)
+ON CONFLICT (source_event_id) DO NOTHING
+`, proof.ID, job.TeacherJobID, eventID, studentCommandID, now.UTC()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO teacher_dialog_turn_outcome (
+    recoverable_outcome_id,teacher_job_id,source_event_id,dialog_id,teacher_turn_sequence,
+    turn_correlation_id,outcome,student_command_id,teacher_response_message_id,no_effect_proof_id,failure_code,created_at
+) VALUES ($1,$2,$3,$4,NULLIF($5,0),NULLIF($6,'')::uuid,'failed_no_effect',NULLIF($7,'')::uuid,NULL,$8::uuid,$9,$10)
+ON CONFLICT (source_event_id) DO NOTHING
+	`, outcome.ID, job.TeacherJobID, eventID, job.Request.DialogID, job.Request.TeacherTurnSequence, job.Request.CorrelationID, studentCommandID, proof.ID, code, now.UTC()); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='completed',claim_token=NULL,locked_by=NULL,locked_until=NULL,response_body=NULL,
+    delivered_message_id=NULL,teacher_response_message_id=NULL,terminal_outcome='failed_no_effect',
+    reconciliation_state=NULL,no_effect_proof_id=$3,recoverable_outcome_id=$4,student_command_id=NULLIF($5,'')::uuid,
+    error_code=$6,updated_at=$7,delivered_at=NULL
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+`, eventID, claimToken, proof.ID, outcome.ID, studentCommandID, code, now.UTC())
+	if err := requireTeacherDialogLease(command.RowsAffected(), err); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (repository TeacherDialogJobRepository) MarkReconciliation(
+	ctx context.Context,
+	eventID, claimToken string,
+	state domain.TeacherTurnReconciliationState,
+	errorCode string,
+	now time.Time,
+) error {
+	code, codeErr := domain.NormalizeTeacherDialogErrorCode(errorCode)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || codeErr != nil || now.IsZero() ||
+		(state != domain.TeacherTurnUnknown && state != domain.TeacherTurnPartial && state != domain.TeacherTurnCommittedUnreconciled) {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+    response_body=CASE WHEN coordinator_mode='legacy' AND context_type IN ('practice_task','project')
+        AND decision_id IS NOT NULL AND attempts>0 AND delivered_message_id IS NULL AND teacher_response_message_id IS NULL
+        AND delivered_at IS NULL THEN response_body ELSE NULL END,terminal_outcome=NULL,reconciliation_state=$3,error_code=$4,updated_at=$5
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+`, eventID, claimToken, string(state), code, now.UTC())
+	return requireTeacherDialogLease(command.RowsAffected(), err)
+}
+
+func (repository TeacherDialogJobRepository) markReconciliationTx(ctx context.Context, tx pgx.Tx, eventID, state, errorCode string, now time.Time) error {
+	command, err := tx.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+    response_body=CASE WHEN coordinator_mode='legacy' AND context_type IN ('practice_task','project')
+        AND decision_id IS NOT NULL AND attempts>0 AND delivered_message_id IS NULL AND teacher_response_message_id IS NULL
+        AND delivered_at IS NULL THEN response_body ELSE NULL END,terminal_outcome=NULL,reconciliation_state=$2,error_code=$3,updated_at=$4
+WHERE event_id=$1 AND status='processing'
+`, eventID, state, errorCode, now.UTC())
+	if err := requireTeacherDialogLease(command.RowsAffected(), err); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (repository TeacherDialogJobRepository) GetCursor(ctx context.Context, dialogID string) (domain.TeacherDialogTurnCursor, error) {
+	if repository.Pool == nil || !validUUIDString(dialogID) {
+		return domain.TeacherDialogTurnCursor{}, domain.ErrInvalidTeacherDialogJob
+	}
+	var cursor domain.TeacherDialogTurnCursor
+	var outcome, sourceEventID, jobID, responseID, proofID, recoverableID, failureCode *string
+	err := repository.Pool.QueryRow(ctx, `
+SELECT dialog_id,next_teacher_turn_sequence,last_source_event_id,last_teacher_job_id,last_terminal_outcome,
+       last_teacher_response_message_id,last_no_effect_proof_id,last_recoverable_outcome_id,last_failure_code,revision,updated_at
+FROM teacher_dialog_turn_cursor WHERE dialog_id=$1
+`, dialogID).Scan(&cursor.DialogID, &cursor.NextTeacherTurnSequence, &sourceEventID, &jobID, &outcome, &responseID, &proofID, &recoverableID, &failureCode, &cursor.Revision, &cursor.UpdatedAt)
+	if err != nil {
+		return domain.TeacherDialogTurnCursor{}, err
+	}
+	cursor.LastSourceEventID = valueOrEmpty(sourceEventID)
+	cursor.LastTeacherJobID = valueOrEmpty(jobID)
+	cursor.LastTerminalOutcome = domain.TeacherTurnTerminalOutcome(valueOrEmpty(outcome))
+	cursor.LastTeacherResponseID = valueOrEmpty(responseID)
+	cursor.LastNoEffectProofID = valueOrEmpty(proofID)
+	cursor.LastRecoverableOutcomeID = valueOrEmpty(recoverableID)
+	cursor.LastFailureCode = valueOrEmpty(failureCode)
+	return cursor, nil
+}
+
+func (repository TeacherDialogJobRepository) Block(
+	ctx context.Context,
+	eventID string,
+	claimToken string,
+	errorCode string,
+	now time.Time,
+) error {
+	code, codeErr := domain.NormalizeTeacherDialogErrorCode(errorCode)
+	if repository.Pool == nil || !validUUIDString(eventID) || !validUUIDString(claimToken) || codeErr != nil || now.IsZero() {
+		return domain.ErrInvalidTeacherDialogJob
+	}
+	command, err := repository.Pool.Exec(ctx, `
+UPDATE teacher_dialog_job SET
+    status='blocked',claim_token=NULL,locked_by=NULL,locked_until=NULL,
+    response_body=CASE WHEN coordinator_mode='legacy' AND context_type IN ('practice_task','project')
+        AND decision_id IS NOT NULL AND attempts>0 AND delivered_message_id IS NULL AND teacher_response_message_id IS NULL
+        AND delivered_at IS NULL THEN response_body ELSE NULL END,terminal_outcome=NULL,reconciliation_state=CASE WHEN teacher_turn_schema_version=2 THEN 'unknown' ELSE NULL END,
+    no_effect_proof_id=NULL,recoverable_outcome_id=NULL,error_code=$3,updated_at=$4
+WHERE event_id=$1 AND claim_token=$2 AND status='processing'
+`, eventID, claimToken, code, now.UTC())
+	return requireTeacherDialogLease(command.RowsAffected(), err)
+}
+
+func (repository TeacherDialogJobRepository) getByEventID(ctx context.Context, eventID string) (domain.TeacherDialogJob, error) {
+	return scanTeacherDialogJob(repository.Pool.QueryRow(ctx, `SELECT `+teacherDialogJobColumns+`
+FROM teacher_dialog_job AS job WHERE event_id=$1
+`, eventID))
+}
+
+func requireTeacherDialogLease(rowsAffected int64, err error) error {
+	if err != nil {
+		return err
+	}
+	if rowsAffected != 1 {
+		return domain.ErrTeacherDialogLeaseLost
+	}
+	return nil
+}
+
+const teacherDialogJobColumns = `
+job.event_id,job.teacher_job_id,job.teacher_turn_schema_version,job.teacher_turn_sequence,job.canonical_student_message_id,job.correlation_id,job.dialog_causation_id,job.causation_id,job.action_receipt_id,job.student_command_id,
+job.dialog_id,job.event_sequence,job.source_message_id,job.source_message_sequence,job.source_message_version,job.reply_to_message_id,job.source_channel,
+job.student_id,job.personal_teacher_id,job.context_type,job.context_id,job.learning_action_id,job.occurred_at,
+job.status,job.claim_token,job.locked_by,job.decision_id,job.response_body,job.delivered_message_id,
+job.teacher_response_message_id,job.ai_execution_id,job.terminal_outcome,job.reconciliation_state,
+job.no_effect_proof_id,job.recoverable_outcome_id,job.error_code,job.attempts,job.next_attempt_at,
+job.locked_until,job.accepted_at,job.updated_at,job.delivered_at,
+job.coordinator_mode,job.response_assistant_ui,job.response_assistant_ui_digest`
+
+type teacherDialogJobScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTeacherDialogJob(scanner teacherDialogJobScanner) (domain.TeacherDialogJob, error) {
+	var job domain.TeacherDialogJob
+	var contextID, learningActionID, replyToMessageID, claimToken, workerID, decisionID, responseBody, deliveredMessageID, teacherResponseMessageID, errorCode, coordinatorMode, responseAssistantUIDigest *string
+	var teacherJobID, canonicalStudentMessageID, correlationID, dialogCausationID, causationID, actionReceiptID, studentCommandID, aiExecutionID, terminalOutcome, reconciliationState, noEffectProofID, recoverableOutcomeID *string
+	var schemaVersion int
+	var teacherTurnSequence, sourceMessageVersion *int64
+	var lockedUntil, deliveredAt *time.Time
+	var responseAssistantUI json.RawMessage
+	err := scanner.Scan(
+		&job.Request.EventID, &teacherJobID, &schemaVersion, &teacherTurnSequence, &canonicalStudentMessageID, &correlationID, &dialogCausationID, &causationID, &actionReceiptID, &studentCommandID,
+		&job.Request.DialogID, &job.Request.EventSequence, &job.Request.SourceMessageID, &job.Request.SourceSequence, &sourceMessageVersion, &replyToMessageID, &job.Request.SourceChannel, &job.Request.StudentID,
+		&job.Request.PersonalTeacherID, &job.Request.ContextType, &contextID, &learningActionID,
+		&job.Request.OccurredAt, &job.Status, &claimToken, &workerID, &decisionID, &responseBody,
+		&deliveredMessageID, &teacherResponseMessageID, &aiExecutionID, &terminalOutcome, &reconciliationState,
+		&noEffectProofID, &recoverableOutcomeID, &errorCode, &job.Attempts, &job.NextAttemptAt, &lockedUntil,
+		&job.AcceptedAt, &job.UpdatedAt, &deliveredAt,
+		&coordinatorMode, &responseAssistantUI, &responseAssistantUIDigest,
+	)
+	if err != nil {
+		return domain.TeacherDialogJob{}, err
+	}
+	job.Request.ContextID = valueOrEmpty(contextID)
+	job.Request.LearningActionID = valueOrEmpty(learningActionID)
+	job.Request.SchemaVersion = schemaVersion
+	job.Request.TeacherTurnSequence = valueOrZeroInt64(teacherTurnSequence)
+	job.Request.SourceMessageVersion = valueOrZeroInt64(sourceMessageVersion)
+	job.Request.ReplyToMessageID = valueOrEmpty(replyToMessageID)
+	job.Request.CanonicalStudentMessageID = valueOrEmpty(canonicalStudentMessageID)
+	job.Request.CorrelationID = valueOrEmpty(correlationID)
+	job.Request.DialogCausationID = valueOrEmpty(dialogCausationID)
+	job.Request.CausationID = valueOrEmpty(causationID)
+	job.Request.ActionReceiptID = valueOrEmpty(actionReceiptID)
+	job.Request.StudentCommandID = valueOrEmpty(studentCommandID)
+	job.ClaimToken = valueOrEmpty(claimToken)
+	job.WorkerID = valueOrEmpty(workerID)
+	job.TeacherJobID = valueOrEmpty(teacherJobID)
+	job.DecisionID = valueOrEmpty(decisionID)
+	job.ResponseBody = valueOrEmpty(responseBody)
+	job.DeliveredMessageID = valueOrEmpty(deliveredMessageID)
+	if valueOrEmpty(teacherResponseMessageID) != "" {
+		job.DeliveredMessageID = valueOrEmpty(teacherResponseMessageID)
+	}
+	job.AIExecutionID = valueOrEmpty(aiExecutionID)
+	job.StudentCommandID = valueOrEmpty(studentCommandID)
+	job.TerminalOutcome = domain.TeacherTurnTerminalOutcome(valueOrEmpty(terminalOutcome))
+	job.ReconciliationState = domain.TeacherTurnReconciliationState(valueOrEmpty(reconciliationState))
+	job.NoEffectProofID = valueOrEmpty(noEffectProofID)
+	job.RecoverableOutcomeID = valueOrEmpty(recoverableOutcomeID)
+	job.ErrorCode = valueOrEmpty(errorCode)
+	job.LockedUntil = timeOrZero(lockedUntil)
+	job.DeliveredAt = timeOrZero(deliveredAt)
+	job.CoordinatorMode = valueOrEmpty(coordinatorMode)
+	job.ResponseAssistantUI = append(json.RawMessage(nil), responseAssistantUI...)
+	job.ResponseAssistantUIDigest = valueOrEmpty(responseAssistantUIDigest)
+	return domain.NormalizeTeacherDialogJob(job)
+}
+
+func sameDialogRequest(left, right domain.DialogTeacherRequest) bool {
+	return left.SchemaVersion == right.SchemaVersion && left.EventID == right.EventID && left.TeacherTurnSequence == right.TeacherTurnSequence &&
+		left.CanonicalStudentMessageID == right.CanonicalStudentMessageID && left.CorrelationID == right.CorrelationID && left.DialogCausationID == right.DialogCausationID &&
+		left.CausationID == right.CausationID && left.ActionReceiptID == right.ActionReceiptID && left.StudentCommandID == right.StudentCommandID &&
+		left.DialogID == right.DialogID &&
+		left.EventSequence == right.EventSequence && left.SourceMessageID == right.SourceMessageID &&
+		left.SourceSequence == right.SourceSequence && left.SourceMessageVersion == right.SourceMessageVersion && left.ReplyToMessageID == right.ReplyToMessageID && left.SourceChannel == right.SourceChannel && left.StudentID == right.StudentID &&
+		left.PersonalTeacherID == right.PersonalTeacherID && left.ContextType == right.ContextType &&
+		left.ContextID == right.ContextID && left.LearningActionID == right.LearningActionID &&
+		left.OccurredAt.Equal(right.OccurredAt)
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func timeOrZero(value *time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return value.UTC()
+}
+
+func nullableInt64(value int64) *int64 {
+	if value <= 0 {
+		return nil
+	}
+	return &value
+}
+
+func valueOrZeroInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func validUUIDString(value string) bool {
+	_, err := uuid.Parse(strings.TrimSpace(value))
+	return err == nil
+}
