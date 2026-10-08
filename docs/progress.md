@@ -1469,3 +1469,28 @@ all 39 native CLI/API equality and repeat digest checks passed.
 Code re-review reports P0=0/P1=0; exact publication-tree review and final full
 verification bind the already authorized normal origin/main publication.
 No service runtime/metadata changes, new per-service RAG, or vector storage.
+
+## CDO cleanup: cancellation proposal constraint — 2026-10-08
+
+The existing plan supersession operation cancels unpublished work-item proposals.
+Migration 019 permits that legitimate cancelled state while retaining paired,
+positive external references for issued proposals. Its downgrade refuses to
+rewrite cancelled unpublished history; operators must resolve incompatibility
+before attempting the older constraint.
+
+Independent disposable PostgreSQL regressions exercise the actual repository
+operation against migrations 001–017, reproduce the old constraint rejection,
+prove transactional rollback of approvals/proposals/tasks, and verify successful
+supersession after 019. Compatible down/up and invalid reference-pair cases are
+covered. The complete integration suite passed with owned-resource cleanup.
+Migration number 018 remains reserved by the separate unpublished shard work;
+019 has no dependency on it and the migration runner supports independently
+applied filename versions.
+
+Accumulated shard/composition, lifecycle, sandbox/release and agent distribution
+source is being preserved separately. Its source backup is not production
+certification. Distribution threat review found unresolved sensitive-read,
+pre-read admission, path race and inventory-bound gaps; runtime admission remains
+DENIED pending exact certification. These workstreams must not be inferred from
+this isolated constraint repair. Published Wave 1 retrieval, Course fixtures,
+CI evidence paths and historical owner evidence remain intact.
