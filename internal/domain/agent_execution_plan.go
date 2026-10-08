@@ -2,6 +2,28 @@ package domain
 
 import "time"
 
+type ShardStatus string
+
+const (
+	ShardStatusPlanned     ShardStatus = "PLANNED"
+	ShardStatusComposition ShardStatus = "COMPOSITION_REQUIRED"
+	ShardStatusOwnerReview ShardStatus = "OWNER_REVIEW_REQUIRED"
+)
+
+type ShardRiskAssessment struct {
+	Level   RiskLevel `json:"level"`
+	Reasons []string  `json:"reasons,omitempty"`
+}
+
+type ShardWriteScope struct {
+	Allow             []string `json:"allow"`
+	Deny              []string `json:"deny"`
+	ReadOnlyContracts []string `json:"read_only_contracts,omitempty"`
+	CompositionOnly   []string `json:"composition_only,omitempty"`
+	TestPaths         []string `json:"test_paths,omitempty"`
+	MaxFiles          int      `json:"max_files"`
+}
+
 type ContractReference struct {
 	Kind                string `json:"kind"`
 	RepositoryProjectID string `json:"repository_project_id"`
@@ -9,6 +31,51 @@ type ContractReference struct {
 	Symbol              string `json:"symbol,omitempty"`
 	RouteID             string `json:"route_id"`
 	Relation            string `json:"relation"`
+}
+
+type ShardVerification struct {
+	Kind        string   `json:"kind"`
+	EvidenceIDs []string `json:"evidence_ids,omitempty"`
+	Commands    []string `json:"commands,omitempty"`
+}
+
+type ShardExecutionBase struct {
+	Kind               string `json:"kind"`
+	Revision           string `json:"revision,omitempty"`
+	ContractBaselineID string `json:"contract_baseline_id,omitempty"`
+}
+
+const (
+	ShardBaseSourceRevision   = "SOURCE_REVISION"
+	ShardBaseContractBaseline = "CONTRACT_BASELINE"
+)
+
+// ArchitecturalShard is an internal execution design unit. It never creates
+// or replaces a project/repository-level Plan Task.
+type ArchitecturalShard struct {
+	ID                  string              `json:"id"`
+	PlanID              string              `json:"plan_id"`
+	TaskID              string              `json:"task_id"`
+	RepositoryProjectID string              `json:"repository_project_id"`
+	Repository          string              `json:"repository"`
+	ProfileID           string              `json:"profile_id"`
+	ProfileFingerprint  string              `json:"profile_fingerprint"`
+	RouteID             string              `json:"route_id"`
+	ExecutionBase       ShardExecutionBase  `json:"execution_base"`
+	LocalIntent         string              `json:"local_intent"`
+	Targets             RoutedTarget        `json:"targets"`
+	Consumes            []ContractReference `json:"consumes,omitempty"`
+	Implements          []ContractReference `json:"implements,omitempty"`
+	WriteScope          ShardWriteScope     `json:"write_scope"`
+	DependsOn           []string            `json:"depends_on,omitempty"`
+	Acceptance          []string            `json:"acceptance"`
+	Risk                ShardRiskAssessment `json:"risk"`
+	Verification        []ShardVerification `json:"verification"`
+	Confidence          float64             `json:"confidence"`
+	Status              ShardStatus         `json:"status"`
+	Parallel            bool                `json:"parallel"`
+	Phase               string              `json:"phase"`
+	CreatedAt           time.Time           `json:"created_at"`
 }
 
 type ContractBaselineState string
@@ -71,4 +138,26 @@ type ContractBaseline struct {
 	Validation                 ContractBaselineValidation `json:"validation"`
 	CreatedAt                  time.Time                  `json:"created_at"`
 	UpdatedAt                  time.Time                  `json:"updated_at"`
+}
+
+type FanoutReadinessState string
+
+const (
+	FanoutReadinessReady       FanoutReadinessState = "READY_FOR_FANOUT"
+	FanoutReadinessBlocked     FanoutReadinessState = "BLOCKED"
+	FanoutReadinessOwnerReview FanoutReadinessState = "OWNER_REVIEW_REQUIRED"
+)
+
+const FanoutParallelismScopeSameRepository = "same_repository_only"
+
+type FanoutReadinessEvidence struct {
+	PlanID              string               `json:"plan_id"`
+	State               FanoutReadinessState `json:"state"`
+	ParallelismScope    string               `json:"parallelism_scope"`
+	Reasons             []string             `json:"reasons,omitempty"`
+	TaskIDs             []string             `json:"task_ids"`
+	ShardIDs            []string             `json:"shard_ids"`
+	BaselineIDs         []string             `json:"baseline_ids"`
+	ProfileFingerprints map[string]string    `json:"profile_fingerprints"`
+	RecordedAt          time.Time            `json:"recorded_at"`
 }

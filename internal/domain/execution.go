@@ -228,6 +228,7 @@ type ScheduledTask struct {
 }
 
 type PlanSchedule struct {
+	ExecutionTimeout    time.Duration   `json:"execution_timeout,omitempty"`
 	RunID               string          `json:"run_id"`
 	PlanID              string          `json:"plan_id"`
 	WorkflowID          string          `json:"workflow_id,omitempty"`

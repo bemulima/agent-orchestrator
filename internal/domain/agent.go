@@ -8,14 +8,19 @@ import (
 type TaskAttemptStatus string
 
 const (
-	TaskAttemptStatusRunning          TaskAttemptStatus = "running"
-	TaskAttemptStatusVerification     TaskAttemptStatus = "verification"
-	TaskAttemptStatusReview           TaskAttemptStatus = "review"
-	TaskAttemptStatusChangesRequested TaskAttemptStatus = "changes_requested"
-	TaskAttemptStatusCompleted        TaskAttemptStatus = "completed"
-	TaskAttemptStatusBlocked          TaskAttemptStatus = "blocked"
-	TaskAttemptStatusFailed           TaskAttemptStatus = "failed"
-	TaskAttemptStatusCancelled        TaskAttemptStatus = "cancelled"
+	TaskAttemptStatusCreated               TaskAttemptStatus = "created"
+	TaskAttemptStatusAdmitted              TaskAttemptStatus = "admitted"
+	TaskAttemptStatusTimedOut              TaskAttemptStatus = "timed_out"
+	TaskAttemptStatusSandboxLost           TaskAttemptStatus = "sandbox_lost"
+	TaskAttemptStatusInfrastructureUnknown TaskAttemptStatus = "infrastructure_unknown"
+	TaskAttemptStatusRunning               TaskAttemptStatus = "running"
+	TaskAttemptStatusVerification          TaskAttemptStatus = "verification"
+	TaskAttemptStatusReview                TaskAttemptStatus = "review"
+	TaskAttemptStatusChangesRequested      TaskAttemptStatus = "changes_requested"
+	TaskAttemptStatusCompleted             TaskAttemptStatus = "completed"
+	TaskAttemptStatusBlocked               TaskAttemptStatus = "blocked"
+	TaskAttemptStatusFailed                TaskAttemptStatus = "failed"
+	TaskAttemptStatusCancelled             TaskAttemptStatus = "cancelled"
 )
 
 type AgentResultStatus string
@@ -156,6 +161,13 @@ type WorkspaceState struct {
 	HeadCommit   string   `json:"head_commit"`
 }
 
+// WorkspaceSnapshot records the Git-visible paths and content/mode digests at
+// one point in a managed workspace. The map is used to attribute agent edits
+// relative to the deterministic pre-agent state.
+type WorkspaceSnapshot struct {
+	Files map[string]string `json:"files"`
+}
+
 type WorkspaceCheckResult struct {
 	Command  string `json:"command"`
 	ExitCode int    `json:"exit_code"`
@@ -175,20 +187,26 @@ const (
 )
 
 type AgentRunRequest struct {
-	Role             AgentRunRole       `json:"role"`
-	ThreadID         string             `json:"thread_id,omitempty"`
-	WorkingDirectory string             `json:"working_directory"`
-	Model            string             `json:"model,omitempty"`
-	ReasoningEffort  string             `json:"reasoning_effort,omitempty"`
-	Prompt           string             `json:"prompt"`
-	OutputSchema     map[string]any     `json:"output_schema"`
-	UsageContext     *AgentUsageContext `json:"-"`
+	ExecutionDeadline string             `json:"execution_deadline,omitempty"`
+	ExecutionID       string             `json:"execution_id,omitempty"`
+	Attempt           int                `json:"attempt,omitempty"`
+	Role              AgentRunRole       `json:"role"`
+	ThreadID          string             `json:"thread_id,omitempty"`
+	WorkingDirectory  string             `json:"working_directory"`
+	Model             string             `json:"model,omitempty"`
+	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
+	Prompt            string             `json:"prompt"`
+	OutputSchema      map[string]any     `json:"output_schema"`
+	UsageContext      *AgentUsageContext `json:"-"`
+	SandboxScope      *AgentSandboxScope `json:"sandbox_scope,omitempty"`
 }
 
 type AgentRunResponse struct {
-	ThreadID string          `json:"thread_id"`
-	Result   json.RawMessage `json:"result"`
-	Usage    AgentTokenUsage `json:"usage"`
+	ExecutionID string          `json:"execution_id,omitempty"`
+	Attempt     int             `json:"attempt,omitempty"`
+	ThreadID    string          `json:"thread_id"`
+	Result      json.RawMessage `json:"result"`
+	Usage       AgentTokenUsage `json:"usage"`
 }
 
 type RequiredTaskSchedule struct {
@@ -199,4 +217,11 @@ type RequiredTaskSchedule struct {
 type TaskExecutionOutcome struct {
 	Result           TaskResult            `json:"result"`
 	RequiredSchedule *RequiredTaskSchedule `json:"required_schedule,omitempty"`
+}
+
+// AgentSandboxScope is trusted orchestration data, never parsed from model output.
+// Paths are exact repository-relative files; network capabilities are not granted.
+type AgentSandboxScope struct {
+	Profile    string   `json:"profile"`
+	WritePaths []string `json:"write_paths"`
 }

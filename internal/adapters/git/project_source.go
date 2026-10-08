@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -121,6 +123,45 @@ func (s ProjectSource) Inspect(ctx context.Context, path string) (domain.Reposit
 		return domain.RepositorySource{}, fmt.Errorf("repository path is outside managed and allowed roots: %w", domain.ErrForbidden)
 	}
 	return s.inspectGit(ctx, canonical)
+}
+
+// InspectWithAllowedChanges accepts only exact, persisted contract-baseline
+// paths as dirty while a frozen baseline is being reproduced. It never
+// discards or alters user changes.
+func (s ProjectSource) InspectWithAllowedChanges(ctx context.Context, path string, allowedPaths []string) (domain.RepositorySource, error) {
+	source, err := s.Inspect(ctx, path)
+	if err != nil {
+		return domain.RepositorySource{}, err
+	}
+	allowed := make(map[string]struct{}, len(allowedPaths))
+	for _, value := range allowedPaths {
+		if value == "" || !fs.ValidPath(value) || pathpkg.Clean(value) != value || strings.Contains(value, "\\") || strings.HasPrefix(value, "../") || value == ".." {
+			return domain.RepositorySource{}, fmt.Errorf("invalid allowed repository change path %q: %w", value, domain.ErrValidation)
+		}
+		allowed[filepath.ToSlash(filepath.Clean(filepath.FromSlash(value)))] = struct{}{}
+	}
+	status, err := s.run(ctx, source.LocalPath, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return domain.RepositorySource{}, fmt.Errorf("inspect repository changes: %w", err)
+	}
+	source.IsDirty = false
+	for _, record := range bytes.Split([]byte(status), []byte{0}) {
+		if len(record) < 4 {
+			continue
+		}
+		name := filepath.ToSlash(string(record[3:]))
+		if _, ok := allowed[name]; !ok {
+			source.IsDirty = true
+			break
+		}
+		// Rename/copy status records contain a second NUL-separated path;
+		// conservatively treat those as unrelated source drift.
+		if record[0] == 'R' || record[1] == 'R' || record[0] == 'C' || record[1] == 'C' {
+			source.IsDirty = true
+			break
+		}
+	}
+	return source, nil
 }
 
 func (s ProjectSource) inspectGit(ctx context.Context, path string) (domain.RepositorySource, error) {

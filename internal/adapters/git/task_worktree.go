@@ -2,8 +2,11 @@ package git
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +30,19 @@ func (w TaskWorktree) Prepare(
 	project domain.Project,
 	task domain.Task,
 ) (domain.TaskWorkspace, error) {
-	if task.ProjectID != project.ID || project.LocalPath == nil || project.HeadCommit == "" {
+	return w.PrepareAtCommit(ctx, project, task, project.HeadCommit)
+}
+
+// PrepareAtCommit creates a managed task workspace at an explicitly approved
+// execution revision while still proving that the connected source checkout
+// remains clean at its separately persisted project revision.
+func (w TaskWorktree) PrepareAtCommit(
+	ctx context.Context,
+	project domain.Project,
+	task domain.Task,
+	baseCommit string,
+) (domain.TaskWorkspace, error) {
+	if task.ProjectID != project.ID || project.LocalPath == nil || project.HeadCommit == "" || !isFullCommitSHA(baseCommit) {
 		return domain.TaskWorkspace{}, fmt.Errorf("task does not match a connected project: %w", domain.ErrConflict)
 	}
 	manager := ProjectSource{StoragePath: w.StoragePath}
@@ -37,6 +52,13 @@ func (w TaskWorktree) Prepare(
 	}
 	if source.HeadCommit != project.HeadCommit || source.IsDirty {
 		return domain.TaskWorkspace{}, fmt.Errorf("source checkout is not the planned clean base: %w", domain.ErrConflict)
+	}
+	resolvedBase, err := manager.run(ctx, *project.LocalPath, "rev-parse", "--verify", baseCommit+"^{commit}")
+	if err != nil || strings.TrimSpace(resolvedBase) != baseCommit {
+		return domain.TaskWorkspace{}, fmt.Errorf("approved workspace base commit is unavailable: %w", domain.ErrConflict)
+	}
+	if _, err := manager.run(ctx, *project.LocalPath, "merge-base", "--is-ancestor", project.HeadCommit, baseCommit); err != nil {
+		return domain.TaskWorkspace{}, fmt.Errorf("approved workspace base does not descend from clean source revision: %w", domain.ErrConflict)
 	}
 	storage, err := canonicalStoragePath(w.StoragePath)
 	if err != nil {
@@ -64,7 +86,7 @@ func (w TaskWorktree) Prepare(
 			if _, err := manager.run(ctx, *project.LocalPath, "worktree", "add", worktreePath, branchName); err != nil {
 				return domain.TaskWorkspace{}, fmt.Errorf("restore task worktree: %w", err)
 			}
-		} else if _, err := manager.run(ctx, *project.LocalPath, "worktree", "add", "-b", branchName, worktreePath, project.HeadCommit); err != nil {
+		} else if _, err := manager.run(ctx, *project.LocalPath, "worktree", "add", "-b", branchName, worktreePath, baseCommit); err != nil {
 			return domain.TaskWorkspace{}, fmt.Errorf("create task worktree: %w", err)
 		}
 	} else if statErr != nil {
@@ -88,13 +110,25 @@ func (w TaskWorktree) Prepare(
 	if sourceCommon != worktreeCommon {
 		return domain.TaskWorkspace{}, fmt.Errorf("task worktree belongs to another Git repository: %w", domain.ErrConflict)
 	}
-	if _, err := manager.run(ctx, worktreePath, "merge-base", "--is-ancestor", project.HeadCommit, "HEAD"); err != nil {
-		return domain.TaskWorkspace{}, fmt.Errorf("task branch does not descend from planned base: %w", domain.ErrConflict)
+	if _, err := manager.run(ctx, worktreePath, "merge-base", "--is-ancestor", baseCommit, "HEAD"); err != nil {
+		return domain.TaskWorkspace{}, fmt.Errorf("task branch does not descend from approved execution base: %w", domain.ErrConflict)
 	}
 	if err := prepareNodeDependencies(ctx, worktreePath, task.VerificationCommands); err != nil {
 		return domain.TaskWorkspace{}, err
 	}
-	return domain.TaskWorkspace{Path: worktreePath, BranchName: branchName, BaseCommit: project.HeadCommit}, nil
+	return domain.TaskWorkspace{Path: worktreePath, BranchName: branchName, BaseCommit: baseCommit}, nil
+}
+
+func isFullCommitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func prepareNodeDependencies(ctx context.Context, worktreePath string, verificationCommands []string) error {
@@ -163,6 +197,75 @@ func (w TaskWorktree) Inspect(
 	}, nil
 }
 
+func (w TaskWorktree) Snapshot(
+	ctx context.Context,
+	project domain.Project,
+	workspace domain.TaskWorkspace,
+) (domain.WorkspaceSnapshot, error) {
+	if err := w.validateWorkspace(ctx, project, workspace); err != nil {
+		return domain.WorkspaceSnapshot{}, err
+	}
+	manager := ProjectSource{StoragePath: w.StoragePath}
+	listed, err := manager.run(ctx, workspace.Path, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return domain.WorkspaceSnapshot{}, fmt.Errorf("list snapshot workspace files: %w", err)
+	}
+	paths := uniqueNULPaths(listed)
+	if len(paths) > 100_000 {
+		return domain.WorkspaceSnapshot{}, fmt.Errorf("workspace snapshot exceeds the file-count limit: %w", domain.ErrValidation)
+	}
+	snapshot := domain.WorkspaceSnapshot{Files: make(map[string]string, len(paths))}
+	for _, relative := range paths {
+		if err := ctx.Err(); err != nil {
+			return domain.WorkspaceSnapshot{}, err
+		}
+		clean, err := taskRelativePath(relative)
+		if err != nil {
+			return domain.WorkspaceSnapshot{}, err
+		}
+		filename := filepath.Join(workspace.Path, clean)
+		info, err := os.Lstat(filename)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return domain.WorkspaceSnapshot{}, fmt.Errorf("inspect snapshot file %s: %w", relative, err)
+		}
+		mode := info.Mode().Perm() & 0o111
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			resolved, resolveErr := filepath.EvalSymlinks(filename)
+			if resolveErr != nil || !pathWithin(workspace.Path, resolved) {
+				return domain.WorkspaceSnapshot{}, fmt.Errorf("snapshot symlink %s escaped managed workspace: %w", relative, domain.ErrForbidden)
+			}
+			target, readErr := os.Readlink(filename)
+			if readErr != nil {
+				return domain.WorkspaceSnapshot{}, fmt.Errorf("read snapshot symlink %s: %w", relative, readErr)
+			}
+			hash := sha256.Sum256([]byte("symlink\x00" + target))
+			snapshot.Files[relative] = fmt.Sprintf("symlink:%03o:%s", mode, hex.EncodeToString(hash[:]))
+		case info.Mode().IsRegular():
+			file, openErr := os.Open(filename)
+			if openErr != nil {
+				return domain.WorkspaceSnapshot{}, fmt.Errorf("open snapshot file %s: %w", relative, openErr)
+			}
+			hash := sha256.New()
+			_, copyErr := io.Copy(hash, file)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return domain.WorkspaceSnapshot{}, fmt.Errorf("hash snapshot file %s: %w", relative, copyErr)
+			}
+			if closeErr != nil {
+				return domain.WorkspaceSnapshot{}, fmt.Errorf("close snapshot file %s: %w", relative, closeErr)
+			}
+			snapshot.Files[relative] = fmt.Sprintf("file:%03o:%s", mode, hex.EncodeToString(hash.Sum(nil)))
+		default:
+			return domain.WorkspaceSnapshot{}, fmt.Errorf("snapshot path %s is not a regular file or safe symlink: %w", relative, domain.ErrValidation)
+		}
+	}
+	return snapshot, nil
+}
+
 func (w TaskWorktree) RunCheck(
 	ctx context.Context,
 	workspace domain.TaskWorkspace,
@@ -204,11 +307,7 @@ func (w TaskWorktree) ReadArtifact(
 	if err != nil {
 		return nil, err
 	}
-	maxAllowedBytes := int64(10 << 20)
-	if relative == filepath.Join(".ai", "testing", "policy", "policy-runner.cjs") {
-		maxAllowedBytes = 32 << 20
-	}
-	if maxBytes < 1 || maxBytes > maxAllowedBytes {
+	if maxBytes < 1 || maxBytes > 10<<20 {
 		return nil, fmt.Errorf("invalid artifact size limit: %w", domain.ErrValidation)
 	}
 	target := filepath.Join(workspace.Path, relative)
@@ -307,12 +406,101 @@ func (w TaskWorktree) Commit(
 	return strings.TrimSpace(commitSHA), nil
 }
 
+// VerifyCommit mechanically proves that an orchestrator-created commit is a
+// single-parent child of the approved baseline and contains exactly the
+// verified path set.
+func (w TaskWorktree) VerifyCommit(
+	ctx context.Context,
+	project domain.Project,
+	workspace domain.TaskWorkspace,
+	commit, expectedParent string,
+	expectedFiles []string,
+) error {
+	if err := w.validateWorkspace(ctx, project, workspace); err != nil {
+		return err
+	}
+	manager := ProjectSource{StoragePath: w.StoragePath}
+	parents, err := manager.run(ctx, workspace.Path, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return fmt.Errorf("inspect shard commit parents: %w", err)
+	}
+	fields := strings.Fields(parents)
+	if len(fields) != 2 || fields[0] != commit || fields[1] != expectedParent {
+		return fmt.Errorf("shard commit is not a direct child of its frozen baseline: %w", domain.ErrConflict)
+	}
+	changed, err := manager.run(ctx, workspace.Path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit)
+	if err != nil {
+		return fmt.Errorf("inspect shard commit paths: %w", err)
+	}
+	if !samePaths(uniqueNULPaths(changed), expectedFiles) {
+		return fmt.Errorf("shard commit paths differ from the verified diff: %w", domain.ErrWriteScope)
+	}
+	if _, err := manager.run(ctx, workspace.Path, "diff", "--check", expectedParent, commit); err != nil {
+		return fmt.Errorf("shard commit diff check failed: %w", err)
+	}
+	head, err := manager.run(ctx, workspace.Path, "rev-parse", "HEAD")
+	if err != nil || strings.TrimSpace(head) != commit {
+		return fmt.Errorf("managed worktree HEAD differs from created shard commit: %w", domain.ErrConflict)
+	}
+	return nil
+}
+
+// ApplyVerifiedCommit replays one already verified sibling commit into a
+// managed integration worktree. Calls are made sequentially in deterministic
+// route/shard order by the orchestrator activity.
+func (w TaskWorktree) ApplyVerifiedCommit(
+	ctx context.Context,
+	project domain.Project,
+	workspace domain.TaskWorkspace,
+	commit, commonBaseline string,
+	expectedFiles []string,
+) (string, error) {
+	if err := w.validateWorkspace(ctx, project, workspace); err != nil {
+		return "", err
+	}
+	manager := ProjectSource{StoragePath: w.StoragePath}
+	parents, err := manager.run(ctx, workspace.Path, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return "", fmt.Errorf("inspect verified shard commit: %w", err)
+	}
+	fields := strings.Fields(parents)
+	if len(fields) != 2 || fields[0] != commit || fields[1] != commonBaseline {
+		return "", fmt.Errorf("assembly received a shard commit from another baseline: %w", domain.ErrConflict)
+	}
+	changed, err := manager.run(ctx, workspace.Path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit)
+	if err != nil || !samePaths(uniqueNULPaths(changed), expectedFiles) {
+		return "", fmt.Errorf("assembly shard paths differ from verified attempt: %w", domain.ErrWriteScope)
+	}
+	status, err := manager.run(ctx, workspace.Path, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil || strings.TrimSpace(status) != "" {
+		return "", fmt.Errorf("integration workspace is not clean before serialized commit application: %w", domain.ErrConflict)
+	}
+	previousHead, err := manager.run(ctx, workspace.Path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve integration tip before shard application: %w", err)
+	}
+	if _, err := manager.run(ctx, workspace.Path, "-c", "user.name=Course Dev Orchestrator", "-c", "user.email=orchestrator@local.invalid", "cherry-pick", "--no-edit", commit); err != nil {
+		_, _ = manager.run(ctx, workspace.Path, "cherry-pick", "--abort")
+		return "", fmt.Errorf("serialized shard application conflict: %w", domain.ErrConflict)
+	}
+	newHead, err := manager.run(ctx, workspace.Path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve integration tip after shard application: %w", err)
+	}
+	newParents, err := manager.run(ctx, workspace.Path, "rev-list", "--parents", "-n", "1", strings.TrimSpace(newHead))
+	newParentFields := strings.Fields(newParents)
+	if err != nil || len(newParentFields) != 2 || newParentFields[1] != strings.TrimSpace(previousHead) {
+		return "", fmt.Errorf("serialized shard application did not create a direct integration child: %w", domain.ErrConflict)
+	}
+	return strings.TrimSpace(newHead), nil
+}
+
 func (w TaskWorktree) validateWorkspace(
 	ctx context.Context,
 	project domain.Project,
 	workspace domain.TaskWorkspace,
 ) error {
-	if project.LocalPath == nil || workspace.Path == "" || workspace.BaseCommit != project.HeadCommit {
+	if project.LocalPath == nil || workspace.Path == "" || !isFullCommitSHA(workspace.BaseCommit) {
 		return fmt.Errorf("invalid task workspace identity: %w", domain.ErrConflict)
 	}
 	storage, err := canonicalStoragePath(w.StoragePath)
@@ -337,6 +525,13 @@ func (w TaskWorktree) validateWorkspace(
 	}
 	if common != sourceCommon {
 		return fmt.Errorf("task workspace repository mismatch: %w", domain.ErrConflict)
+	}
+	source, err := manager.inspectGit(ctx, *project.LocalPath)
+	if err != nil || source.HeadCommit != project.HeadCommit || source.IsDirty {
+		return fmt.Errorf("connected source changed while shard work was active: %w", domain.ErrConflict)
+	}
+	if _, err := manager.run(ctx, *project.LocalPath, "merge-base", "--is-ancestor", project.HeadCommit, workspace.BaseCommit); err != nil {
+		return fmt.Errorf("task workspace base does not descend from the clean source revision: %w", domain.ErrConflict)
 	}
 	if _, err := manager.run(ctx, canonical, "merge-base", "--is-ancestor", workspace.BaseCommit, "HEAD"); err != nil {
 		return fmt.Errorf("task workspace base mismatch: %w", domain.ErrConflict)
@@ -452,7 +647,7 @@ func safeCommandEnvironment(source []string) []string {
 	allowed := map[string]struct{}{
 		"PATH": {}, "HOME": {}, "USER": {}, "LOGNAME": {}, "SHELL": {}, "TMPDIR": {},
 		"LANG": {}, "LC_ALL": {}, "TERM": {}, "CI": {}, "GOPATH": {}, "GOCACHE": {},
-		"GOMODCACHE": {}, "npm_config_cache": {},
+		"GOMODCACHE": {}, "npm_config_cache": {}, "TEST_DATABASE_URL": {},
 	}
 	result := make([]string, 0, len(allowed)+4)
 	for _, pair := range source {

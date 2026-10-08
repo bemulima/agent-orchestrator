@@ -38,6 +38,38 @@ func TestProjectSource_ConnectLocalValidatesAndCanonicalizes(t *testing.T) {
 	}
 }
 
+func TestProjectSourceAllowsOnlyPersistedBaselinePathsAsDirty(t *testing.T) {
+	allowedRoot := t.TempDir()
+	repositoryPath := filepath.Join(allowedRoot, "service")
+	initRepository(t, repositoryPath)
+	manager := ProjectSource{AllowedRoots: []string{allowedRoot}}
+	contractPath := filepath.Join(repositoryPath, "internal", "contracts", "frozen.go")
+	if err := os.MkdirAll(filepath.Dir(contractPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contractPath, []byte("package contracts\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err := manager.InspectWithAllowedChanges(context.Background(), repositoryPath, nil)
+	if err != nil || !source.IsDirty {
+		t.Fatalf("unallowlisted generated artifact should remain dirty: source=%#v err=%v", source, err)
+	}
+	source, err = manager.InspectWithAllowedChanges(context.Background(), repositoryPath, []string{"internal/contracts/frozen.go"})
+	if err != nil || source.IsDirty {
+		t.Fatalf("exact baseline artifact should be allowed for verification: source=%#v err=%v", source, err)
+	}
+	if err := os.WriteFile(filepath.Join(repositoryPath, "README.md"), []byte("owner edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err = manager.InspectWithAllowedChanges(context.Background(), repositoryPath, []string{"internal/contracts/frozen.go"})
+	if err != nil || !source.IsDirty {
+		t.Fatalf("unrelated owner edit was hidden by baseline allowlist: source=%#v err=%v", source, err)
+	}
+	if _, err := manager.InspectWithAllowedChanges(context.Background(), repositoryPath, []string{"../outside.go"}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("unsafe dirty-path allowlist error = %v", err)
+	}
+}
+
 func TestProjectSource_ConnectLocalRejectsUnsafePaths(t *testing.T) {
 	allowedRoot := t.TempDir()
 	outside := t.TempDir()

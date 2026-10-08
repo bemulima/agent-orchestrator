@@ -88,11 +88,7 @@ func (r PlanningRepoPG) CreatePlan(
 	if err != nil {
 		return domain.PlanBundle{}, fmt.Errorf("marshal planner output: %w", err)
 	}
-	fingerprintInput := make([]byte, 0, len(rawInput)+len(rawOutput)+1)
-	fingerprintInput = append(fingerprintInput, rawInput...)
-	fingerprintInput = append(fingerprintInput, 0)
-	fingerprintInput = append(fingerprintInput, rawOutput...)
-	fingerprint := planningChecksum(fingerprintInput)
+	fingerprint := domain.PlannerFingerprint(rawInput, rawOutput)
 	tx, err := r.Pool.Begin(ctx)
 	if err != nil {
 		return domain.PlanBundle{}, fmt.Errorf("begin plan transaction: %w", err)

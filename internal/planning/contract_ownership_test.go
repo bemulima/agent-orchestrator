@@ -6,6 +6,7 @@ import (
 	"github.com/bemulima/agent-orchestrator/internal/contractbaseline"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"testing"
+	"time"
 )
 
 func ownershipOutput(t *testing.T) (domain.PlannerOutput, Validator) {
@@ -38,6 +39,19 @@ func TestContractOwnerOnlyDomainAndDependencySplit(t *testing.T) {
 	for _, r := range o.Routing.Routes {
 		if r.RouteID == "backend.domain" {
 			t.Fatal("contract ownership selected domain implementation")
+		}
+	}
+	ids := []string{}
+	for _, r := range o.Routing.Routes {
+		ids = append(ids, r.RouteID)
+	}
+	shards, err := PlanArchitecturalShards(ShardPlanningInput{PlanID: "plan", Task: domain.Task{ID: "task", ProjectID: "project"}, Repository: "fixture", Profile: v.ControlPlane.Profiles["go.canonical"], ProfileFingerprint: o.Routing.Profiles[0].ProfileFingerprint, Routing: *o.Routing, RouteIDs: ids, Evidence: o.Routing.EvidenceIndex, Verification: o.Routing.Verification, Now: time.Now()})
+	if err != nil || len(shards) != 3 {
+		t.Fatalf("shards=%d err=%v", len(shards), err)
+	}
+	for _, s := range shards {
+		if s.RouteID == "backend.domain" {
+			t.Fatal("domain shard created")
 		}
 	}
 

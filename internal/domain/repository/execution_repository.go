@@ -31,6 +31,12 @@ type TaskWorktree interface {
 	Commit(context.Context, domain.Project, domain.Task, domain.TaskWorkspace, []string) (string, error)
 }
 
+// TaskWorkspaceSnapshotter is implemented by managed isolation adapters that
+// can capture a deterministic workspace snapshot for provenance attribution.
+type TaskWorkspaceSnapshotter interface {
+	Snapshot(context.Context, domain.Project, domain.TaskWorkspace) (domain.WorkspaceSnapshot, error)
+}
+
 type AgentThreadCallback func(context.Context, string) error
 
 type AgentRunner interface {

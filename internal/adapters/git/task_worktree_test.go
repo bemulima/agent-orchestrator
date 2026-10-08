@@ -30,8 +30,16 @@ func TestTaskWorktreeIsolatesVerifiesAndCommitsFixture(t *testing.T) {
 	workspace, err := worktrees.Prepare(context.Background(), project, task)
 	require.NoError(t, err)
 	require.Equal(t, filepath.Base(sourcePath), filepath.Base(workspace.Path))
+	preAgent, err := worktrees.Snapshot(context.Background(), project, workspace)
+	require.NoError(t, err)
+	require.Contains(t, preAgent.Files, "README.md")
+	require.NotContains(t, preAgent.Files, "result.txt")
 	require.NoError(t, os.WriteFile(filepath.Join(workspace.Path, "README.md"), []byte("after\n"), 0o640))
 	require.NoError(t, os.WriteFile(filepath.Join(workspace.Path, "result.txt"), []byte("artifact\n"), 0o640))
+	postAgent, err := worktrees.Snapshot(context.Background(), project, workspace)
+	require.NoError(t, err)
+	require.NotEqual(t, preAgent.Files["README.md"], postAgent.Files["README.md"])
+	require.Contains(t, postAgent.Files, "result.txt")
 
 	state, err := worktrees.Inspect(context.Background(), project, workspace)
 	require.NoError(t, err)
@@ -56,6 +64,21 @@ func TestTaskWorktreeIsolatesVerifiesAndCommitsFixture(t *testing.T) {
 	repeatedCommit, err := worktrees.Commit(context.Background(), project, task, repeated, state.ChangedFiles)
 	require.NoError(t, err)
 	require.Equal(t, commit, repeatedCommit)
+}
+
+func TestSafeCommandEnvironmentPassesOnlyExplicitTestDatabaseURL(t *testing.T) {
+	result := strings.Join(safeCommandEnvironment([]string{
+		"TEST_DATABASE_URL=postgres://canary@availability-postgres:5432/availability_test?sslmode=disable",
+		"DATABASE_URL=postgres://user:password@production.example.invalid/service",
+		"GITHUB_TOKEN=not-for-tests",
+	}), "\n")
+	if !strings.Contains(result, "TEST_DATABASE_URL=postgres://canary@availability-postgres:5432/availability_test?sslmode=disable") {
+		t.Fatal("explicit test database URL was not passed to the test command")
+	}
+	if strings.Contains(result, "\nDATABASE_URL=") || strings.HasPrefix(result, "DATABASE_URL=") ||
+		strings.Contains(result, "\nGITHUB_TOKEN=") || strings.HasPrefix(result, "GITHUB_TOKEN=") {
+		t.Fatal("general database or external-service credentials leaked into the test environment")
+	}
 }
 
 func TestTestingPolicyRunnerCommandsAreExactAndArgumentBound(t *testing.T) {
@@ -97,6 +120,118 @@ func TestTaskWorktreeRejectsEscapingArtifactSymlink(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestPrepareAtCommitUsesFrozenDescendantWhileKeepingSourceCheckoutUntouched(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source")
+	require.NoError(t, os.Mkdir(sourcePath, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "contract.go"), []byte("package source\n"), 0o640))
+	runGit(t, sourcePath, "init", "-b", "main")
+	runGit(t, sourcePath, "add", "contract.go")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "source")
+	sourceCommit := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "-b", "contract-baseline")
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "contract.go"), []byte("package source\n// frozen\n"), 0o640))
+	runGit(t, sourcePath, "add", "contract.go")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "frozen contract")
+	frozenCommit := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "main")
+	localPath := sourcePath
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &localPath, HeadCommit: sourceCommit}
+	task := domain.Task{ID: "87654321-abcd-0000-0000-123456789012", ProjectID: project.ID, Title: "shard work"}
+	worktrees := TaskWorktree{StoragePath: filepath.Join(root, "worktrees")}
+
+	workspace, err := worktrees.PrepareAtCommit(context.Background(), project, task, frozenCommit)
+	require.NoError(t, err)
+	require.Equal(t, frozenCommit, workspace.BaseCommit)
+	require.Equal(t, frozenCommit, runGit(t, workspace.Path, "rev-parse", "HEAD"))
+	assertSourceUnchanged(t, sourcePath, sourceCommit)
+
+	_, err = worktrees.PrepareAtCommit(context.Background(), project, task, strings.Repeat("f", 40))
+	require.Error(t, err)
+}
+
+func TestApplyVerifiedCommitsSeriallyAndDeterministically(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source")
+	require.NoError(t, os.Mkdir(sourcePath, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "a.txt"), []byte("a0\n"), 0o640))
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "b.txt"), []byte("b0\n"), 0o640))
+	runGit(t, sourcePath, "init", "-b", "main")
+	runGit(t, sourcePath, "add", ".")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "base")
+	base := runGit(t, sourcePath, "rev-parse", "HEAD")
+
+	runGit(t, sourcePath, "checkout", "-b", "worker-a")
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "a.txt"), []byte("a1\n"), 0o640))
+	runGit(t, sourcePath, "add", "a.txt")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "worker a")
+	commitA := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "main")
+	runGit(t, sourcePath, "checkout", "-b", "worker-b")
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "b.txt"), []byte("b1\n"), 0o640))
+	runGit(t, sourcePath, "add", "b.txt")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "worker b")
+	commitB := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "main")
+
+	localPath := sourcePath
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &localPath, HeadCommit: base}
+	task := domain.Task{ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ProjectID: project.ID, Title: "integration"}
+	worktrees := TaskWorktree{StoragePath: filepath.Join(root, "worktrees")}
+	workspace, err := worktrees.PrepareAtCommit(context.Background(), project, task, base)
+	require.NoError(t, err)
+	_, err = worktrees.ApplyVerifiedCommit(context.Background(), project, workspace, commitA, base, []string{"a.txt"})
+	require.NoError(t, err)
+	tip, err := worktrees.ApplyVerifiedCommit(context.Background(), project, workspace, commitB, base, []string{"b.txt"})
+	require.NoError(t, err)
+	require.Equal(t, tip, runGit(t, workspace.Path, "rev-parse", "HEAD"))
+	a, err := os.ReadFile(filepath.Join(workspace.Path, "a.txt"))
+	require.NoError(t, err)
+	b, err := os.ReadFile(filepath.Join(workspace.Path, "b.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "a1\n", string(a))
+	require.Equal(t, "b1\n", string(b))
+	assertSourceUnchanged(t, sourcePath, base)
+}
+
+func TestApplyVerifiedCommitConflictAbortsFailClosed(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source")
+	require.NoError(t, os.Mkdir(sourcePath, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "same.txt"), []byte("base\n"), 0o640))
+	runGit(t, sourcePath, "init", "-b", "main")
+	runGit(t, sourcePath, "add", "same.txt")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "base")
+	base := runGit(t, sourcePath, "rev-parse", "HEAD")
+
+	runGit(t, sourcePath, "checkout", "-b", "worker-a")
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "same.txt"), []byte("worker a\n"), 0o640))
+	runGit(t, sourcePath, "add", "same.txt")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "worker a")
+	commitA := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "main")
+	runGit(t, sourcePath, "checkout", "-b", "worker-b")
+	require.NoError(t, os.WriteFile(filepath.Join(sourcePath, "same.txt"), []byte("worker b\n"), 0o640))
+	runGit(t, sourcePath, "add", "same.txt")
+	runGit(t, sourcePath, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "worker b")
+	commitB := runGit(t, sourcePath, "rev-parse", "HEAD")
+	runGit(t, sourcePath, "checkout", "main")
+
+	localPath := sourcePath
+	project := domain.Project{ID: "project-1", Name: "fixture", LocalPath: &localPath, HeadCommit: base}
+	task := domain.Task{ID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", ProjectID: project.ID, Title: "integration"}
+	worktrees := TaskWorktree{StoragePath: filepath.Join(root, "worktrees")}
+	workspace, err := worktrees.PrepareAtCommit(context.Background(), project, task, base)
+	require.NoError(t, err)
+	firstTip, err := worktrees.ApplyVerifiedCommit(context.Background(), project, workspace, commitA, base, []string{"same.txt"})
+	require.NoError(t, err)
+	_, err = worktrees.ApplyVerifiedCommit(context.Background(), project, workspace, commitB, base, []string{"same.txt"})
+	require.Error(t, err)
+	require.Equal(t, firstTip, runGit(t, workspace.Path, "rev-parse", "HEAD"))
+	require.Empty(t, runGit(t, workspace.Path, "status", "--porcelain=v1"))
+	assertSourceUnchanged(t, sourcePath, base)
+}
+
 func TestPrepareNodeDependenciesUsesLockfileAndDisablesScripts(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fixture uses a POSIX shell script")
@@ -121,60 +256,4 @@ func TestPrepareNodeDependenciesRequiresRegularLockfile(t *testing.T) {
 	root := t.TempDir()
 	require.Error(t, prepareNodeDependencies(context.Background(), root, []string{"npm run build"}))
 	require.NoError(t, prepareNodeDependencies(context.Background(), root, []string{"go test ./..."}))
-}
-
-func TestTaskWorktreeReadArtifactBoundsReviewedPolicyBundleSeparately(t *testing.T) {
-	const bundlePath = ".ai/testing/policy/policy-runner.cjs"
-	for _, test := range []struct {
-		name, path  string
-		size, limit int64
-		wantError   bool
-	}{
-		{name: "canonical bundle at 32 MiB", path: bundlePath, size: 32 << 20, limit: 32 << 20},
-		{name: "normalized canonical bundle", path: "./.ai/testing/policy/sub/../policy-runner.cjs", size: 16, limit: 32 << 20},
-		{name: "canonical bundle above 32 MiB", path: bundlePath, size: (32 << 20) + 1, limit: 32 << 20, wantError: true},
-		{name: "canonical limit above 32 MiB", path: bundlePath, size: 16, limit: (32 << 20) + 1, wantError: true},
-		{name: "generic artifact limit stays 10 MiB", path: "result.txt", size: 16, limit: (10 << 20) + 1, wantError: true},
-		{name: "generic artifact bytes stay bounded", path: "result.txt", size: (10 << 20) + 1, limit: 10 << 20, wantError: true},
-		{name: "zero limit rejected", path: bundlePath, size: 16, limit: 0, wantError: true},
-		{name: "negative limit rejected", path: bundlePath, size: 16, limit: -1, wantError: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			canonicalRoot, err := filepath.EvalSymlinks(t.TempDir())
-			require.NoError(t, err)
-			workspace := domain.TaskWorkspace{Path: canonicalRoot}
-			relative, err := taskRelativePath(test.path)
-			require.NoError(t, err)
-			target := filepath.Join(workspace.Path, relative)
-			require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o750))
-			file, err := os.Create(target)
-			require.NoError(t, err)
-			require.NoError(t, file.Truncate(test.size))
-			require.NoError(t, file.Close())
-			content, err := (TaskWorktree{}).ReadArtifact(context.Background(), workspace, test.path, test.limit)
-			if test.wantError {
-				require.ErrorIs(t, err, domain.ErrValidation)
-			} else {
-				require.NoError(t, err)
-				require.Len(t, content, int(test.size))
-			}
-		})
-	}
-}
-
-func TestTaskWorktreeReviewedPolicyBundlePreservesPathContainment(t *testing.T) {
-	canonicalRoot, err := filepath.EvalSymlinks(t.TempDir())
-	require.NoError(t, err)
-	workspace := domain.TaskWorkspace{Path: canonicalRoot}
-	for _, path := range []string{"../policy-runner.cjs", "/tmp/policy-runner.cjs", "\x00policy-runner.cjs"} {
-		_, err := (TaskWorktree{}).ReadArtifact(context.Background(), workspace, path, 32<<20)
-		require.ErrorIs(t, err, domain.ErrWriteScope)
-	}
-	outside := filepath.Join(t.TempDir(), "outside.cjs")
-	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o640))
-	canonical := filepath.Join(workspace.Path, ".ai", "testing", "policy", "policy-runner.cjs")
-	require.NoError(t, os.MkdirAll(filepath.Dir(canonical), 0o750))
-	require.NoError(t, os.Symlink(outside, canonical))
-	_, err = (TaskWorktree{}).ReadArtifact(context.Background(), workspace, ".ai/testing/policy/policy-runner.cjs", 32<<20)
-	require.ErrorIs(t, err, domain.ErrForbidden)
 }

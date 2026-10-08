@@ -1705,10 +1705,6 @@ func contractImplementers(profile agentcontrol.Profile, kind string, consumers [
 	return result
 }
 
-func isCompositionRoute(routeID string) bool {
-	return routeID == "backend.composition" || routeID == "frontend.app-runtime" || routeID == "frontend.shared.bff"
-}
-
 // Ambiguous infrastructure/http roots need both an owner declaration and
 // outbound source syntax. Legacy unambiguous client roots retain their contract.
 func verifiedOutboundRoot(route string, evidence indexedEvidence, inventory repositoryInventory) bool {
