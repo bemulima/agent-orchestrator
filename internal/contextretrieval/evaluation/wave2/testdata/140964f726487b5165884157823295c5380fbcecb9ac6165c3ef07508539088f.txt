@@ -1,0 +1,986 @@
+package adapters
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"path"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+const (
+	studentReserveSchema    = "student-practice-learning-action-reserve.v1"
+	studentOpenSchema       = "student-practice-learning-action-open.v1"
+	studentCancelSchema     = "student-practice-learning-action-cancel.v1"
+	studentEvidenceV2       = "practice-task-competency-evidence.v2"
+	studentEvidencePolicyV2 = "practice-competency-evidence-v2"
+	studentReceiptPolicyV1  = "student-mastery-v1"
+
+	routeRequestSchema     = "practice-learning-route-request.v1"
+	readinessRequestSchema = "practice-learning-readiness-reconcile.v1"
+	materialRequestSchema  = "practice-learning-material-ensure-request.v1"
+
+	workspaceCreateSchema  = "practice-workspace-create.v2"
+	workspaceBindingSchema = "practice-workspace-binding.v2"
+	snapshotFreezeSchema   = "practice-snapshot-freeze.v2"
+	pinnedSnapshotSchema   = "practice-pinned-snapshot.v2"
+	pinnedContentSchema    = "practice-pinned-snapshot-content.v2"
+	writeLockRequestSchema = "practice-write-lock.v2"
+	writeLockResultSchema  = "practice-write-lock-result.v2"
+	writeUnlockSchema      = "practice-write-unlock.v2"
+	workspaceRestoreSchema = "practice-workspace-restore.v2"
+
+	validationRequestSchema = "practice-validation-request.v2"
+	validationResultSchema  = "practice-validation-result.v2"
+	validationSpecSchema    = "practice-validation-specification.v1"
+
+	maxDefaultResponseBytes    = 32 << 20
+	maxValidationResponseBytes = 2 << 20
+)
+
+type serviceHTTP struct {
+	baseURL string
+	token   string
+	client  *http.Client
+}
+
+func newServiceHTTP(baseURL, token string, client *http.Client) *serviceHTTP {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &serviceHTTP{baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"), token: token, client: client}
+}
+
+func (service *serviceHTTP) do(ctx context.Context, method, endpoint string, body any, extraHeaders map[string]string, response any, maxBytes int64) (int, error) {
+	status, payload, err := service.doRaw(ctx, method, endpoint, body, extraHeaders, maxBytes)
+	if err != nil {
+		return 0, err
+	}
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return status, serviceError(status, payload)
+	}
+	if response == nil {
+		return status, nil
+	}
+	if err := decodeSingleJSON(payload, response); err != nil {
+		return status, errors.Join(domain.ErrDependency, domain.APIError{Code: "invalid_provider_response"}, fmt.Errorf("decode provider response: %w", err))
+	}
+	return status, nil
+}
+
+func (service *serviceHTTP) doRaw(ctx context.Context, method, endpoint string, body any, extraHeaders map[string]string, maxBytes int64) (int, []byte, error) {
+	if service.baseURL == "" {
+		return 0, nil, errors.Join(domain.ErrDependency, domain.APIError{Code: "provider_unavailable"}, errors.New("provider base URL is empty"))
+	}
+	var requestBody io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, fmt.Errorf("encode provider request: %w", err)
+		}
+		requestBody = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, service.baseURL+endpoint, requestBody)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create provider request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Cache-Control", "no-store")
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if service.token != "" {
+		request.Header.Set("X-Internal-Token", service.token)
+	}
+	for name, value := range extraHeaders {
+		request.Header.Set(name, value)
+	}
+	response, err := service.client.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil, ctx.Err()
+		}
+		return 0, nil, errors.Join(domain.ErrDependency, domain.APIError{Code: "provider_unavailable"}, fmt.Errorf("provider request failed: %w", err))
+	}
+	defer response.Body.Close()
+	if maxBytes <= 0 {
+		maxBytes = maxDefaultResponseBytes
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return response.StatusCode, nil, errors.Join(domain.ErrDependency, domain.APIError{Code: "provider_unavailable"}, fmt.Errorf("read provider response: %w", err))
+	}
+	if int64(len(payload)) > maxBytes {
+		return response.StatusCode, nil, errors.Join(domain.ErrDependency, domain.APIError{Code: "invalid_provider_response"}, errors.New("provider response exceeded size limit"))
+	}
+	return response.StatusCode, payload, nil
+}
+
+func decodeSingleJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("provider returned trailing JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func serviceError(status int, payload []byte) error {
+	code := providerErrorCode(payload)
+	switch status {
+	case http.StatusNotFound:
+		return errors.Join(domain.ErrNotFound, domain.APIError{Code: codeOr(code, "not_found")})
+	case http.StatusConflict:
+		return errors.Join(domain.ErrConflict, domain.ErrIdempotency, domain.APIError{Code: codeOr(code, "conflict")})
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return errors.Join(domain.ErrInvalid, domain.APIError{Code: codeOr(code, "invalid_request")})
+	default:
+		return errors.Join(domain.ErrDependency, domain.APIError{Code: codeOr(code, "provider_unavailable")})
+	}
+}
+
+func providerErrorCode(payload []byte) string {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(payload, &envelope) == nil && len(envelope.Error) > 0 {
+		var object struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(envelope.Error, &object) == nil && object.Code != "" {
+			return object.Code
+		}
+		var message string
+		if json.Unmarshal(envelope.Error, &message) == nil && message != "" {
+			return message
+		}
+	}
+	var flat struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(payload, &flat) == nil && flat.Code != "" {
+		return flat.Code
+	}
+	var message string
+	if json.Unmarshal(payload, &message) == nil {
+		return message
+	}
+	return ""
+}
+
+func codeOr(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+func pathSegment(value string) string { return url.PathEscape(value) }
+
+// RevisionHTTPClient reads the immutable Catalog envelope for one exact ID.
+type RevisionHTTPClient struct{ http *serviceHTTP }
+
+func NewRevisionHTTPClient(baseURL, token string, client *http.Client) *RevisionHTTPClient {
+	return &RevisionHTTPClient{http: newServiceHTTP(baseURL, token, client)}
+}
+
+func (client *RevisionHTTPClient) GetPublishedRevisionEnvelope(ctx context.Context, revisionID string) (domain.RevisionEnvelope, error) {
+	var envelope domain.RevisionEnvelope
+	_, err := client.http.do(ctx, http.MethodGet, "/internal/catalog/practice-task-revisions/"+pathSegment(revisionID)+"/execution-envelope", nil, nil, &envelope, 8<<20)
+	if err != nil {
+		return domain.RevisionEnvelope{}, err
+	}
+	if envelope.Schema != "practice-task-execution-envelope.v1" || envelope.Revision.ID != revisionID ||
+		envelope.RevisionDigestSchema != domain.RevisionDigestV1 || envelope.RevisionDigest == "" ||
+		!jsonObject(envelope.RuntimeContext) || !jsonObject(envelope.EvaluationContext) ||
+		envelope.RevisionDigest != envelope.ComputedDigest() {
+		return domain.RevisionEnvelope{}, errors.Join(domain.ErrAuthoringDefect, domain.APIError{Code: "invalid_immutable_revision"})
+	}
+	return envelope, nil
+}
+
+func jsonObject(raw json.RawMessage) bool {
+	var value map[string]json.RawMessage
+	return len(raw) > 0 && json.Unmarshal(raw, &value) == nil && value != nil
+}
+
+func validRuntimeProfile(raw json.RawMessage) bool {
+	var profile struct {
+		CodeStructureTypeCode string          `json:"code_structure_type_code"`
+		ComposeConfig         json.RawMessage `json:"compose_config"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&profile) != nil || strings.TrimSpace(profile.CodeStructureTypeCode) == "" || !jsonObject(profile.ComposeConfig) {
+		return false
+	}
+	var trailing any
+	return decoder.Decode(&trailing) == io.EOF
+}
+
+// StudentHTTPClient implements both the Student LearningAction and evidence ports.
+type StudentHTTPClient struct{ http *serviceHTTP }
+
+func NewStudentHTTPClient(baseURL, token string, client *http.Client) *StudentHTTPClient {
+	return &StudentHTTPClient{http: newServiceHTTP(baseURL, token, client)}
+}
+
+type studentLearningActionBinding struct {
+	Schema                          string          `json:"schema"`
+	LearningActionID                string          `json:"learning_action_id"`
+	StudentID                       string          `json:"student_id"`
+	TaskInstanceID                  string          `json:"task_instance_id"`
+	TaskRevisionID                  string          `json:"task_revision_id"`
+	TaskRevisionDigest              string          `json:"task_revision_digest"`
+	SurfaceClassification           string          `json:"surface_classification"`
+	LearningTargets                 []domain.Target `json:"learning_targets"`
+	LifecycleStatus                 string          `json:"lifecycle_status"`
+	LearningPathID                  string          `json:"learning_path_id,omitempty"`
+	LearningPathItemID              string          `json:"learning_path_item_id,omitempty"`
+	RequirementID                   string          `json:"requirement_id,omitempty"`
+	LearningPathVersionReservation  int64           `json:"learning_path_version_at_reservation,omitempty"`
+	LearningPathPositionReservation int             `json:"learning_path_position_at_reservation,omitempty"`
+}
+
+func (client *StudentHTTPClient) Reserve(ctx context.Context, input ports.ReserveLearningAction) (ports.LearningActionBinding, error) {
+	if !domain.IsCanonicalUUID(input.StudentID) || !domain.IsCanonicalUUID(input.TaskInstanceID) || !domain.IsCanonicalUUID(input.TaskRevisionID) ||
+		!domain.IsCanonicalUUID(input.LearningActionID) || input.LearningActionID == input.TaskInstanceID || input.LearningActionID == input.TaskRevisionID ||
+		!validDigest(input.TaskRevisionDigest) || (input.SurfaceClassification != "practice" && input.SurfaceClassification != "project") ||
+		(input.LearningPathID != "" && !domain.IsCanonicalUUID(input.LearningPathID)) ||
+		!domain.ValidRequirementCorrelation(input.LearningPathItemID, input.RequirementID) || (input.LearningPathItemID != "" && input.LearningPathID == "") || !validTargets(input.LearningTargets) {
+		return ports.LearningActionBinding{}, domain.ErrInvalid
+	}
+	body := struct {
+		Schema                string          `json:"schema"`
+		TaskRevisionID        string          `json:"task_revision_id"`
+		TaskRevisionDigest    string          `json:"task_revision_digest"`
+		LearningActionID      string          `json:"learning_action_id"`
+		SurfaceClassification string          `json:"surface_classification"`
+		LearningTargets       []domain.Target `json:"learning_targets"`
+		LearningPathID        string          `json:"learning_path_id,omitempty"`
+		LearningPathItemID    string          `json:"learning_path_item_id,omitempty"`
+		RequirementID         string          `json:"requirement_id,omitempty"`
+	}{studentReserveSchema, input.TaskRevisionID, input.TaskRevisionDigest, input.LearningActionID, input.SurfaceClassification, input.LearningTargets, input.LearningPathID, input.LearningPathItemID, input.RequirementID}
+	var response studentLearningActionBinding
+	base := studentActionPath(input.StudentID, input.TaskInstanceID)
+	_, err := client.http.do(ctx, http.MethodPut, base, body, map[string]string{"Idempotency-Key": input.TaskInstanceID}, &response, 128<<10)
+	if err != nil {
+		return ports.LearningActionBinding{}, err
+	}
+	binding, err := mapStudentBinding(response, input.StudentID, input.TaskInstanceID, input.TaskRevisionID, input.TaskRevisionDigest, input.SurfaceClassification, input.LearningTargets, input.LearningPathID, "RESERVED", input.LearningActionID)
+	if err == nil && (binding.LearningPathID != input.LearningPathID || binding.LearningPathItemID != input.LearningPathItemID || binding.RequirementID != input.RequirementID) {
+		return ports.LearningActionBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "student_identity_mismatch"})
+	}
+	return binding, err
+}
+
+func (client *StudentHTTPClient) Get(ctx context.Context, studentID, taskInstanceID string) (ports.LearningActionBinding, error) {
+	var response studentLearningActionBinding
+	_, err := client.http.do(ctx, http.MethodGet, studentActionPath(studentID, taskInstanceID), nil, nil, &response, 128<<10)
+	if err != nil {
+		return ports.LearningActionBinding{}, err
+	}
+	return mapStudentBinding(response, studentID, taskInstanceID, "", "", "", nil, "", "", "")
+}
+
+func (client *StudentHTTPClient) Open(ctx context.Context, input ports.OpenLearningAction) (ports.LearningActionBinding, error) {
+	body := map[string]string{"schema": studentOpenSchema, "learning_action_id": input.LearningActionID}
+	var response studentLearningActionBinding
+	_, err := client.http.do(ctx, http.MethodPost, studentActionPath(input.StudentID, input.TaskInstanceID)+"/open", body, nil, &response, 128<<10)
+	if err != nil {
+		return ports.LearningActionBinding{}, err
+	}
+	binding, err := mapStudentBinding(response, input.StudentID, input.TaskInstanceID, "", "", "", nil, "", "OPEN", input.LearningActionID)
+	return binding, err
+}
+
+func (client *StudentHTTPClient) CancelProvisioning(ctx context.Context, input ports.CancelLearningAction) (ports.LearningActionBinding, error) {
+	if input.Reason != "practice_provisioning_failed" && input.Reason != "student_cancelled" {
+		return ports.LearningActionBinding{}, domain.ErrInvalid
+	}
+	body := map[string]string{"schema": studentCancelSchema, "learning_action_id": input.LearningActionID, "reason": input.Reason}
+	var response studentLearningActionBinding
+	_, err := client.http.do(ctx, http.MethodPost, studentActionPath(input.StudentID, input.TaskInstanceID)+"/cancel", body, nil, &response, 128<<10)
+	if err != nil {
+		return ports.LearningActionBinding{}, err
+	}
+	binding, err := mapStudentBinding(response, input.StudentID, input.TaskInstanceID, "", "", "", nil, "", "CANCELLED", input.LearningActionID)
+	return binding, err
+}
+
+func studentActionPath(studentID, taskInstanceID string) string {
+	return "/internal/v2/students/" + pathSegment(studentID) + "/practice-learning-actions/" + pathSegment(taskInstanceID)
+}
+
+func mapStudentBinding(response studentLearningActionBinding, studentID, taskInstanceID, revisionID, revisionDigest, surface string, targets []domain.Target, pathID, lifecycle, actionID string) (ports.LearningActionBinding, error) {
+	if response.Schema != "student-practice-learning-action-binding.v1" || !domain.IsCanonicalUUID(response.LearningActionID) ||
+		response.LearningActionID == taskInstanceID || response.LearningActionID == response.TaskRevisionID || response.StudentID != studentID || response.TaskInstanceID != taskInstanceID ||
+		(response.TaskRevisionID == "" || (revisionID != "" && response.TaskRevisionID != revisionID)) ||
+		(response.TaskRevisionDigest == "" || (revisionDigest != "" && response.TaskRevisionDigest != revisionDigest)) ||
+		(response.SurfaceClassification != "practice" && response.SurfaceClassification != "project") ||
+		(surface != "" && response.SurfaceClassification != surface) ||
+		(lifecycle != "" && response.LifecycleStatus != lifecycle) || (actionID != "" && response.LearningActionID != actionID) ||
+		(pathID != "" && response.LearningPathID != pathID) || !validTargets(response.LearningTargets) || !sameTargetOrder(response.LearningTargets, targets) {
+		return ports.LearningActionBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "student_identity_mismatch"})
+	}
+	if !domain.ValidRequirementCorrelation(response.LearningPathItemID, response.RequirementID) {
+		return ports.LearningActionBinding{}, domain.ErrDependency
+	}
+	if response.LifecycleStatus != "RESERVED" && response.LifecycleStatus != "OPEN" && response.LifecycleStatus != "CANCELLED" && response.LifecycleStatus != "CLOSED" {
+		return ports.LearningActionBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "invalid_student_response"})
+	}
+	if response.LearningPathID == "" && (response.LearningPathVersionReservation != 0 || response.LearningPathPositionReservation != 0) {
+		return ports.LearningActionBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "invalid_student_response"})
+	}
+	return ports.LearningActionBinding{LearningActionID: response.LearningActionID, StudentID: response.StudentID,
+		TaskInstanceID: response.TaskInstanceID, TaskRevisionID: response.TaskRevisionID,
+		TaskRevisionDigest: response.TaskRevisionDigest, SurfaceClassification: response.SurfaceClassification,
+		LearningTargets: append([]domain.Target(nil), response.LearningTargets...), LifecycleStatus: response.LifecycleStatus,
+		LearningPathID: response.LearningPathID, LearningPathItemID: response.LearningPathItemID, RequirementID: response.RequirementID, PathVersion: response.LearningPathVersionReservation,
+		PathPosition: response.LearningPathPositionReservation}, nil
+}
+
+func sameTargetOrder(left, right []domain.Target) bool {
+	if right == nil {
+		return len(left) > 0
+	}
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+type studentEvidenceItem struct {
+	Target       domain.Target `json:"target"`
+	Correctness  float64       `json:"correctness"`
+	Independence float64       `json:"independence"`
+	Confidence   float64       `json:"confidence"`
+	StepIDs      []string      `json:"step_ids"`
+}
+
+func (client *StudentHTTPClient) ApplyPassedEvidence(ctx context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+	if !domain.ValidRequirementCorrelation(input.LearningPathItemID, input.RequirementID) || !domain.IsCanonicalUUID(input.EvidenceID) || input.EvidenceID != input.SubmissionID ||
+		!domain.IsCanonicalUUID(input.StudentID) || !domain.IsCanonicalUUID(input.TaskInstanceID) ||
+		!domain.IsCanonicalUUID(input.LearningActionID) || input.LearningActionID == input.EvidenceID || input.LearningActionID == input.TaskRevisionID || input.LearningActionID == input.TaskInstanceID ||
+		!domain.IsCanonicalUUID(input.TaskRevisionID) || !validDigest(input.TaskRevisionDigest) || !validDigest(input.WorkspaceDigest) || !validTargets(input.Targets) ||
+		len(input.Steps) == 0 || len(input.Evidence) != len(input.Targets) || input.OccurredAt.IsZero() || input.AssistancePolicyVersion == "" ||
+		input.AssistancePolicyVersion != "practice-task-assistance-policy.v1" ||
+		input.HintsUsed < 0 || input.HintsUsed > 1000 || (input.HintsUsed == 0 && input.MaxHintLevel != nil) ||
+		(input.HintsUsed > 0 && (input.MaxHintLevel == nil || *input.MaxHintLevel < 1 || *input.MaxHintLevel > 7)) {
+		return ports.EvidenceReceipt{}, domain.ErrInvalid
+	}
+	expectedIndependence := 1.0
+	if input.HintsUsed > 0 || input.TeacherAssistanceUsed {
+		expectedIndependence = 0
+	}
+	allowedSteps := make(map[string]struct{}, len(input.Steps))
+	for _, stepID := range input.Steps {
+		if !domain.IsCanonicalUUID(stepID) {
+			return ports.EvidenceReceipt{}, domain.ErrInvalid
+		}
+		allowedSteps[stepID] = struct{}{}
+	}
+	evidence := make([]studentEvidenceItem, 0, len(input.Evidence))
+	for index, item := range input.Evidence {
+		if item.Target != input.Targets[index] || item.Target.Type == "" || item.Target.Key == "" || item.Target.Version == "" ||
+			item.Correctness != 1 || item.Confidence != 1 || item.Independence != expectedIndependence || len(item.StepIDs) == 0 {
+			return ports.EvidenceReceipt{}, domain.ErrInvalid
+		}
+		seenSteps := make(map[string]struct{}, len(item.StepIDs))
+		for _, stepID := range item.StepIDs {
+			if _, allowed := allowedSteps[stepID]; !allowed {
+				return ports.EvidenceReceipt{}, domain.ErrInvalid
+			}
+			if _, duplicate := seenSteps[stepID]; duplicate {
+				return ports.EvidenceReceipt{}, domain.ErrInvalid
+			}
+			seenSteps[stepID] = struct{}{}
+		}
+		evidence = append(evidence, studentEvidenceItem{Target: item.Target, Correctness: item.Correctness, Independence: item.Independence,
+			Confidence: item.Confidence, StepIDs: append([]string(nil), item.StepIDs...)})
+	}
+	body := struct {
+		Schema                  string                `json:"schema"`
+		EvidenceID              string                `json:"evidence_id"`
+		LearningActionID        string                `json:"learning_action_id"`
+		LearningPathItemID      string                `json:"learning_path_item_id,omitempty"`
+		RequirementID           string                `json:"requirement_id,omitempty"`
+		StudentID               string                `json:"student_id"`
+		TaskInstanceID          string                `json:"task_instance_id"`
+		TaskRevisionID          string                `json:"task_revision_id"`
+		TaskRevisionDigest      string                `json:"task_revision_digest"`
+		WorkspaceDigest         string                `json:"workspace_digest"`
+		SubmissionID            string                `json:"submission_id"`
+		Outcome                 string                `json:"outcome"`
+		AssistancePolicyVersion string                `json:"assistance_policy_version"`
+		HintsUsed               int                   `json:"hints_used"`
+		MaxHintLevel            *int                  `json:"max_hint_level,omitempty"`
+		TeacherAssistanceUsed   bool                  `json:"teacher_assistance_used"`
+		Evidence                []studentEvidenceItem `json:"evidence"`
+		OccurredAt              time.Time             `json:"occurred_at"`
+		PolicyVersion           string                `json:"policy_version"`
+	}{studentEvidenceV2, input.EvidenceID, input.LearningActionID, input.LearningPathItemID, input.RequirementID, input.StudentID, input.TaskInstanceID,
+		input.TaskRevisionID, input.TaskRevisionDigest, input.WorkspaceDigest, input.SubmissionID, "passed",
+		input.AssistancePolicyVersion, input.HintsUsed, input.MaxHintLevel, input.TeacherAssistanceUsed, evidence,
+		input.OccurredAt.UTC(), studentEvidencePolicyV2}
+	var response struct {
+		Schema           string `json:"schema"`
+		EvidenceID       string `json:"evidence_id"`
+		LearningActionID string `json:"learning_action_id"`
+		Accepted         bool   `json:"accepted"`
+		PolicyVersion    string `json:"policy_version"`
+	}
+	path := studentActionPath(input.StudentID, input.TaskInstanceID) + "/evidence"
+	_, err := client.http.do(ctx, http.MethodPost, path, body, map[string]string{"Idempotency-Key": input.EvidenceID}, &response, 128<<10)
+	if err != nil {
+		return ports.EvidenceReceipt{}, err
+	}
+	if response.Schema != "student-practice-evidence-receipt.v2" || response.EvidenceID != input.EvidenceID ||
+		response.LearningActionID != input.LearningActionID || !response.Accepted || response.PolicyVersion != studentReceiptPolicyV1 {
+		return ports.EvidenceReceipt{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "student_identity_mismatch"})
+	}
+	return ports.EvidenceReceipt{Schema: response.Schema, EvidenceID: response.EvidenceID, LearningActionID: response.LearningActionID,
+		Accepted: response.Accepted, PolicyVersion: response.PolicyVersion}, nil
+}
+
+// LearningPlannerHTTPClient implements route resolution and exact material ensuring.
+type LearningPlannerHTTPClient struct{ http *serviceHTTP }
+
+func NewLearningPlannerHTTPClient(baseURL, token string, client *http.Client) *LearningPlannerHTTPClient {
+	return &LearningPlannerHTTPClient{http: newServiceHTTP(baseURL, token, client)}
+}
+
+func (client *LearningPlannerHTTPClient) ResolveRoute(ctx context.Context, input ports.ResolveLearningRoute) (domain.LearningRouteReceipt, error) {
+	var request struct {
+		Schema             string `json:"schema"`
+		StudentID          string `json:"student_id"`
+		TaskInstanceID     string `json:"task_instance_id"`
+		TaskRevisionID     string `json:"task_revision_id"`
+		TaskRevisionDigest string `json:"task_revision_digest"`
+		Locale             string `json:"locale"`
+	}
+	if err := json.Unmarshal(input.Request, &request); err != nil || request.Schema != routeRequestSchema || request.TaskInstanceID == "" {
+		return domain.LearningRouteReceipt{}, domain.ErrInvalid
+	}
+	var receipt domain.LearningRouteReceipt
+	_, err := client.http.do(ctx, http.MethodPost, "/internal/practice-learning-routes", input.Request,
+		map[string]string{"Idempotency-Key": request.TaskInstanceID}, &receipt, 2<<20)
+	if err != nil {
+		return domain.LearningRouteReceipt{}, err
+	}
+	if receipt.Schema != "student-task-learning-snapshot.v1" || !domain.IsCanonicalUUID(receipt.ID) || receipt.TaskInstanceID != request.TaskInstanceID ||
+		receipt.TaskRevisionID != request.TaskRevisionID || receipt.TaskRevisionDigest != request.TaskRevisionDigest ||
+		receipt.StudentID != request.StudentID || receipt.Locale != request.Locale || !validDigest(receipt.RouteDigest) || receipt.CreatedAt.IsZero() ||
+		!nonEmptyJSONArray(receipt.Steps) {
+		return domain.LearningRouteReceipt{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "planner_identity_mismatch"})
+	}
+	return receipt, nil
+}
+
+func (client *LearningPlannerHTTPClient) ReconcileReadiness(ctx context.Context, input ports.ReconcileLearningReadiness) (domain.LearningReadinessReceipt, error) {
+	if !domain.IsCanonicalUUID(input.IdempotencyKey) || !domain.IsCanonicalUUID(input.TaskInstanceID) || !domain.IsCanonicalUUID(input.StudentID) ||
+		!domain.IsCanonicalUUID(input.TaskRevisionID) || !validDigest(input.RevisionDigest) || !domain.IsCanonicalUUID(input.RouteID) ||
+		!validDigest(input.RouteDigest) || strings.TrimSpace(input.StepID) == "" {
+		return domain.LearningReadinessReceipt{}, domain.ErrInvalid
+	}
+	body := struct {
+		Schema             string `json:"schema"`
+		TaskInstanceID     string `json:"task_instance_id"`
+		StudentID          string `json:"student_id"`
+		TaskRevisionID     string `json:"task_revision_id"`
+		TaskRevisionDigest string `json:"task_revision_digest"`
+		RouteID            string `json:"route_id"`
+		RouteDigest        string `json:"route_digest"`
+		StepID             string `json:"step_id"`
+	}{readinessRequestSchema, input.TaskInstanceID, input.StudentID, input.TaskRevisionID, input.RevisionDigest,
+		input.RouteID, input.RouteDigest, input.StepID}
+	endpoint := "/internal/practice-learning-routes/" + pathSegment(input.RouteID) + "/steps/" + pathSegment(input.StepID) + "/readiness-reconciliations"
+	var receipt domain.LearningReadinessReceipt
+	_, err := client.http.do(ctx, http.MethodPost, endpoint, body, map[string]string{"Idempotency-Key": input.IdempotencyKey}, &receipt, 128<<10)
+	if err != nil {
+		return domain.LearningReadinessReceipt{}, err
+	}
+	if !domain.ValidLearningReadinessReceipt(receipt) || receipt.TaskInstanceID != input.TaskInstanceID || receipt.StudentID != input.StudentID ||
+		receipt.TaskRevisionID != input.TaskRevisionID || receipt.TaskRevisionDigest != input.RevisionDigest || receipt.RouteID != input.RouteID ||
+		receipt.RouteDigest != input.RouteDigest || receipt.StepID != input.StepID {
+		return domain.LearningReadinessReceipt{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "planner_identity_mismatch"})
+	}
+	return receipt, nil
+}
+
+func (client *LearningPlannerHTTPClient) Materialize(ctx context.Context, input ports.MaterializeLearningStep) (ports.LearningMaterialReceipt, error) {
+	if !domain.IsCanonicalUUID(input.GenerationKey) || !isLowerHex(input.MaterialKey, 64) || !domain.IsCanonicalUUID(input.RouteID) || !validDigest(input.RouteDigest) ||
+		input.Target.Type == "" || input.Target.Key == "" || input.Target.Version == "" {
+		return ports.LearningMaterialReceipt{}, domain.ErrInvalid
+	}
+	body := map[string]string{"schema": materialRequestSchema, "route_id": input.RouteID, "route_digest": input.RouteDigest}
+	var receipt ports.LearningMaterialReceipt
+	endpoint := "/internal/practice-learning-materials/" + pathSegment(input.MaterialKey) + "/ensure"
+	_, err := client.http.do(ctx, http.MethodPost, endpoint, body, map[string]string{"Idempotency-Key": input.GenerationKey}, &receipt, 128<<10)
+	if err != nil {
+		return ports.LearningMaterialReceipt{}, err
+	}
+	if receipt.Schema != "practice-learning-material.v1" || receipt.MaterialKey != input.MaterialKey || receipt.Target != input.Target ||
+		!domain.IsCanonicalUUID(receipt.CourseID) || !domain.IsCanonicalUUID(receipt.LessonID) {
+		return ports.LearningMaterialReceipt{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "planner_identity_mismatch"})
+	}
+	return receipt, nil
+}
+
+// SandboxHTTPClient implements all official Practice workspace operations.
+type SandboxHTTPClient struct{ http *serviceHTTP }
+
+func NewSandboxHTTPClient(baseURL, token string, client *http.Client) *SandboxHTTPClient {
+	return &SandboxHTTPClient{http: newServiceHTTP(baseURL, token, client)}
+}
+
+type sandboxInitialGeneration struct {
+	Revision        uint64 `json:"revision"`
+	GenerationID    string `json:"generation_id"`
+	WorkspaceDigest string `json:"workspace_digest"`
+	FenceEpoch      uint64 `json:"fence_epoch"`
+}
+
+type sandboxWorkspaceBinding struct {
+	Schema            string                   `json:"schema"`
+	SandboxID         string                   `json:"sandbox_id"`
+	TaskInstanceID    string                   `json:"task_instance_id"`
+	TaskRevisionID    string                   `json:"task_revision_id"`
+	RevisionDigest    string                   `json:"revision_digest"`
+	PreviewURL        string                   `json:"preview_url,omitempty"`
+	InitialGeneration sandboxInitialGeneration `json:"initial_generation"`
+}
+
+func (client *SandboxHTTPClient) CreateOrResumeWorkspace(ctx context.Context, input ports.CreateWorkspace) (domain.WorkspaceBinding, error) {
+	if input.RequestID != input.TaskInstanceID || !domain.IsCanonicalUUID(input.StudentID) || !domain.IsCanonicalUUID(input.TaskInstanceID) ||
+		!domain.IsCanonicalUUID(input.TaskRevisionID) || !validDigest(input.RevisionDigest) || !validRuntimeProfile(input.RuntimeProfile) {
+		return domain.WorkspaceBinding{}, domain.ErrInvalid
+	}
+	starterFiles := input.StarterFiles
+	if starterFiles == nil {
+		starterFiles = []domain.WorkspaceFile{}
+	}
+	body := struct {
+		Schema         string                 `json:"schema"`
+		RequestID      string                 `json:"request_id"`
+		StudentID      string                 `json:"student_id"`
+		TaskInstanceID string                 `json:"task_instance_id"`
+		TaskRevisionID string                 `json:"task_revision_id"`
+		RevisionDigest string                 `json:"revision_digest"`
+		RuntimeProfile json.RawMessage        `json:"runtime_profile"`
+		StarterFiles   []domain.WorkspaceFile `json:"starter_files"`
+	}{workspaceCreateSchema, input.RequestID, input.StudentID, input.TaskInstanceID, input.TaskRevisionID, input.RevisionDigest,
+		input.RuntimeProfile, starterFiles}
+	var response sandboxWorkspaceBinding
+	_, err := client.http.do(ctx, http.MethodPost, "/internal/v2/practice-workspaces", body, nil, &response, 256<<10)
+	if err != nil {
+		return domain.WorkspaceBinding{}, err
+	}
+	if response.Schema != workspaceBindingSchema || !domain.IsCanonicalUUID(response.SandboxID) || response.TaskInstanceID != input.TaskInstanceID ||
+		response.TaskRevisionID != input.TaskRevisionID || response.RevisionDigest != input.RevisionDigest ||
+		!validGenerationID(response.InitialGeneration.GenerationID) || !validDigest(response.InitialGeneration.WorkspaceDigest) {
+		return domain.WorkspaceBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_identity_mismatch"})
+	}
+	return domain.WorkspaceBinding{Schema: response.Schema, SandboxID: response.SandboxID, Available: true,
+		PreviewURL: response.PreviewURL, GenerationID: response.InitialGeneration.GenerationID,
+		WorkspaceDigest: response.InitialGeneration.WorkspaceDigest}, nil
+}
+
+func (client *SandboxHTTPClient) FreezeSnapshot(ctx context.Context, input ports.FreezeSnapshot) (domain.SnapshotRef, error) {
+	if input.SandboxID == "" || input.SubmissionID == "" || input.TaskInstanceID == "" {
+		return domain.SnapshotRef{}, domain.ErrInvalid
+	}
+	body := map[string]string{"schema": snapshotFreezeSchema, "request_id": input.SubmissionID, "task_instance_id": input.TaskInstanceID}
+	var response struct {
+		Schema          string    `json:"schema"`
+		SandboxID       string    `json:"sandbox_id"`
+		SnapshotID      string    `json:"snapshot_id"`
+		GenerationID    string    `json:"generation_id"`
+		WorkspaceDigest string    `json:"workspace_digest"`
+		Revision        *uint64   `json:"revision"`
+		FileCount       int       `json:"file_count"`
+		PinnedAt        time.Time `json:"pinned_at"`
+	}
+	endpoint := "/internal/v2/sandboxes/" + pathSegment(input.SandboxID) + "/submissions/" + pathSegment(input.SubmissionID) + "/freeze"
+	_, err := client.http.do(ctx, http.MethodPost, endpoint, body, nil, &response, 128<<10)
+	if err != nil {
+		return domain.SnapshotRef{}, sandboxError(err)
+	}
+	ref := domain.SnapshotRef{SandboxID: response.SandboxID, SnapshotID: response.SnapshotID, GenerationID: response.GenerationID, WorkspaceDigest: response.WorkspaceDigest}
+	if response.Schema != pinnedSnapshotSchema || ref.SandboxID != input.SandboxID || ref.SnapshotID != input.SubmissionID ||
+		!validGenerationID(ref.GenerationID) || !validDigest(ref.WorkspaceDigest) || response.Revision == nil || response.FileCount < 0 || response.PinnedAt.IsZero() {
+		return domain.SnapshotRef{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_snapshot_corrupt"})
+	}
+	return ref, nil
+}
+
+func (client *SandboxHTTPClient) ReadPinnedSnapshot(ctx context.Context, ref domain.SnapshotRef) (ports.WorkspaceSnapshot, error) {
+	if !validSnapshotRef(ref) {
+		return ports.WorkspaceSnapshot{}, domain.ErrInvalid
+	}
+	endpoint := "/internal/v2/sandboxes/" + pathSegment(ref.SandboxID) + "/snapshots/" + pathSegment(ref.SnapshotID) +
+		"?generation_id=" + url.QueryEscape(ref.GenerationID) + "&workspace_digest=" + url.QueryEscape(ref.WorkspaceDigest)
+	var response struct {
+		Schema          string                 `json:"schema"`
+		SandboxID       string                 `json:"sandbox_id"`
+		SnapshotID      string                 `json:"snapshot_id"`
+		GenerationID    string                 `json:"generation_id"`
+		WorkspaceDigest string                 `json:"workspace_digest"`
+		Revision        *uint64                `json:"revision"`
+		FileCount       int                    `json:"file_count"`
+		PinnedAt        time.Time              `json:"pinned_at"`
+		Files           []domain.WorkspaceFile `json:"files"`
+	}
+	_, err := client.http.do(ctx, http.MethodGet, endpoint, nil, nil, &response, maxDefaultResponseBytes)
+	if err != nil {
+		return ports.WorkspaceSnapshot{}, sandboxError(err)
+	}
+	if response.Schema != pinnedContentSchema || response.SandboxID != ref.SandboxID || response.SnapshotID != ref.SnapshotID ||
+		response.GenerationID != ref.GenerationID || response.WorkspaceDigest != ref.WorkspaceDigest || response.Revision == nil ||
+		response.FileCount != len(response.Files) || response.PinnedAt.IsZero() {
+		return ports.WorkspaceSnapshot{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_snapshot_corrupt"})
+	}
+	digest, err := workspaceFilesDigest(response.Files)
+	if err != nil {
+		return ports.WorkspaceSnapshot{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_snapshot_corrupt"}, err)
+	}
+	if digest != ref.WorkspaceDigest {
+		return ports.WorkspaceSnapshot{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_snapshot_corrupt"})
+	}
+	return ports.WorkspaceSnapshot{Ref: ref, Files: response.Files}, nil
+}
+
+func (client *SandboxHTTPClient) LockWrites(ctx context.Context, input ports.LockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	if !domain.IsCanonicalUUID(input.SandboxID) || !domain.IsCanonicalUUID(input.RequestID) || (input.Mode != "TEMPORARY" && input.Mode != "PERMANENT") ||
+		(input.SubmissionID != "" && !domain.IsCanonicalUUID(input.SubmissionID)) {
+		return ports.WorkspaceWriteLock{}, domain.ErrInvalid
+	}
+	body := map[string]string{"schema": writeLockRequestSchema, "request_id": input.RequestID, "mode": input.Mode}
+	if input.SubmissionID != "" {
+		body["submission_id"] = input.SubmissionID
+	}
+	var response sandboxWriteLockResponse
+	endpoint := "/internal/v2/sandboxes/" + pathSegment(input.SandboxID) + "/write-lock"
+	_, err := client.http.do(ctx, http.MethodPost, endpoint, body, nil, &response, 128<<10)
+	if err != nil {
+		return ports.WorkspaceWriteLock{}, sandboxError(err)
+	}
+	return mapSandboxLock(response, input.SandboxID, input.RequestID, input.RequestID, input.Mode, input.SubmissionID, input.Mode == "PERMANENT", true)
+}
+
+func (client *SandboxHTTPClient) UnlockWrites(ctx context.Context, input ports.UnlockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	if !domain.IsCanonicalUUID(input.SandboxID) || !domain.IsCanonicalUUID(input.LockID) || !domain.IsCanonicalUUID(input.RequestID) {
+		return ports.WorkspaceWriteLock{}, domain.ErrInvalid
+	}
+	body := map[string]string{"schema": writeUnlockSchema, "request_id": input.RequestID}
+	var response sandboxWriteLockResponse
+	endpoint := "/internal/v2/sandboxes/" + pathSegment(input.SandboxID) + "/write-lock/" + pathSegment(input.LockID)
+	_, err := client.http.do(ctx, http.MethodDelete, endpoint, body, nil, &response, 128<<10)
+	if err != nil {
+		return ports.WorkspaceWriteLock{}, sandboxError(err)
+	}
+	return mapSandboxLock(response, input.SandboxID, input.RequestID, input.LockID, "TEMPORARY", "", false, false)
+}
+
+type sandboxWriteLockResponse struct {
+	Schema         string `json:"schema"`
+	SandboxID      string `json:"sandbox_id"`
+	TaskInstanceID string `json:"task_instance_id"`
+	RequestID      string `json:"request_id"`
+	LockID         string `json:"lock_id"`
+	Mode           string `json:"mode"`
+	SubmissionID   string `json:"submission_id,omitempty"`
+	FenceEpoch     int64  `json:"fence_epoch"`
+	Permanent      bool   `json:"permanent"`
+	Locked         bool   `json:"locked"`
+}
+
+func mapSandboxLock(response sandboxWriteLockResponse, sandboxID, requestID, lockID, mode, submissionID string, permanent, locked bool) (ports.WorkspaceWriteLock, error) {
+	if response.Schema != writeLockResultSchema || response.SandboxID != sandboxID || response.RequestID != requestID ||
+		!domain.IsCanonicalUUID(response.TaskInstanceID) || response.LockID != lockID || response.FenceEpoch <= 0 ||
+		response.Mode != mode || (submissionID != "" && response.SubmissionID != submissionID) ||
+		response.Permanent != permanent || response.Locked != locked {
+		return ports.WorkspaceWriteLock{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_identity_mismatch"})
+	}
+	return ports.WorkspaceWriteLock{LockID: response.LockID, FenceEpoch: response.FenceEpoch, Permanent: response.Permanent}, nil
+}
+
+func (client *SandboxHTTPClient) RestoreWorkspace(ctx context.Context, input ports.RestoreWorkspace) (domain.WorkspaceBinding, error) {
+	if input.SandboxID == "" || input.TaskInstanceID == "" || !validSnapshotRef(input.Ref) || input.Ref.SandboxID != input.SandboxID || !domain.IsCanonicalUUID(input.Ref.SnapshotID) {
+		return domain.WorkspaceBinding{}, domain.ErrInvalid
+	}
+	// Snapshot IDs are the originating Submission UUIDs, so they are a stable
+	// idempotency key for restoring this exact retained generation.
+	requestID := input.Ref.SnapshotID
+	body := struct {
+		Schema         string             `json:"schema"`
+		RequestID      string             `json:"request_id"`
+		TaskInstanceID string             `json:"task_instance_id"`
+		Snapshot       domain.SnapshotRef `json:"snapshot"`
+	}{workspaceRestoreSchema, requestID, input.TaskInstanceID, input.Ref}
+	var response sandboxWorkspaceBinding
+	endpoint := "/internal/v2/sandboxes/" + pathSegment(input.SandboxID) + "/restore"
+	_, err := client.http.do(ctx, http.MethodPost, endpoint, body, nil, &response, 128<<10)
+	if err != nil {
+		return domain.WorkspaceBinding{}, sandboxError(err)
+	}
+	if response.Schema != workspaceBindingSchema || response.SandboxID != input.SandboxID || response.TaskInstanceID != input.TaskInstanceID ||
+		!validGenerationID(response.InitialGeneration.GenerationID) || !validDigest(response.InitialGeneration.WorkspaceDigest) {
+		return domain.WorkspaceBinding{}, errors.Join(domain.ErrDependency, domain.APIError{Code: "sandbox_identity_mismatch"})
+	}
+	return domain.WorkspaceBinding{Schema: response.Schema, SandboxID: response.SandboxID, Available: true, PreviewURL: response.PreviewURL,
+		GenerationID: response.InitialGeneration.GenerationID, WorkspaceDigest: response.InitialGeneration.WorkspaceDigest}, nil
+}
+
+func sandboxError(err error) error {
+	var apiError domain.APIError
+	if !errors.As(err, &apiError) {
+		return err
+	}
+	switch apiError.Code {
+	case "sandbox_snapshot_unavailable", "sandbox_snapshot_corrupt", "sandbox_identity_mismatch", "sandbox_fence_conflict":
+		return errors.Join(domain.ErrDependency, apiError)
+	default:
+		return err
+	}
+}
+
+func validSnapshotRef(ref domain.SnapshotRef) bool {
+	return domain.IsCanonicalUUID(ref.SandboxID) && domain.IsCanonicalUUID(ref.SnapshotID) && validGenerationID(ref.GenerationID) && validDigest(ref.WorkspaceDigest)
+}
+
+func validTargets(targets []domain.Target) bool {
+	if len(targets) == 0 || len(targets) > 100 {
+		return false
+	}
+	seen := make(map[domain.Target]struct{}, len(targets))
+	for _, target := range targets {
+		if (target.Type != "concept" && target.Type != "capability") || strings.TrimSpace(target.Key) == "" || strings.TrimSpace(target.Version) == "" {
+			return false
+		}
+		if _, duplicate := seen[target]; duplicate {
+			return false
+		}
+		seen[target] = struct{}{}
+	}
+	return true
+}
+
+func validDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil && strings.ToLower(value) == value
+}
+
+func isLowerHex(value string, size int) bool {
+	if len(value) != size || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func nonEmptyJSONArray(raw json.RawMessage) bool {
+	var values []json.RawMessage
+	return json.Unmarshal(raw, &values) == nil && len(values) > 0
+}
+
+func validGenerationID(value string) bool {
+	return strings.HasPrefix(value, "gen-") && isLowerHex(strings.TrimPrefix(value, "gen-"), 64)
+}
+
+func workspaceFilesDigest(files []domain.WorkspaceFile) (string, error) {
+	canonical := append([]domain.WorkspaceFile(nil), files...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Path < canonical[j].Path })
+	for index, file := range canonical {
+		if file.Path == "" || strings.Contains(file.Path, "\\") || strings.HasPrefix(file.Path, "/") || path.Clean(file.Path) != file.Path ||
+			file.Path == "." || file.Path == ".." || strings.HasPrefix(file.Path, "../") || (index > 0 && canonical[index-1].Path == file.Path) {
+			return "", errors.New("invalid or duplicate workspace file path")
+		}
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// ValidationHTTPClient calls the typed official validation endpoint. Every
+// technical/protocol failure is a normalized ERROR result, never learner FAIL.
+type ValidationHTTPClient struct{ http *serviceHTTP }
+
+func NewValidationHTTPClient(baseURL, token string, client *http.Client) *ValidationHTTPClient {
+	return &ValidationHTTPClient{http: newServiceHTTP(baseURL, token, client)}
+}
+
+type validationRequestV2 struct {
+	Schema                   string             `json:"schema"`
+	TaskInstanceID           string             `json:"task_instance_id"`
+	SubmissionID             string             `json:"submission_id"`
+	ValidationRunID          string             `json:"validation_run_id"`
+	RevisionDigest           string             `json:"revision_digest"`
+	ValidationContractDigest string             `json:"validation_contract_digest"`
+	Snapshot                 domain.SnapshotRef `json:"snapshot"`
+	Scope                    string             `json:"scope"`
+	MilestoneID              string             `json:"milestone_id,omitempty"`
+	ValidationSpecification  json.RawMessage    `json:"validation_specification"`
+}
+
+func (client *ValidationHTTPClient) ValidateOfficialSubmission(ctx context.Context, input ports.OfficialValidationRequest) (domain.ValidationResult, error) {
+	result := validationIdentity(input)
+	if !validDigest(input.RevisionDigest) || !validDigest(input.ValidationContractDigest) || !validSnapshotRef(input.Snapshot) ||
+		!jsonObject(input.ValidationSpecification) || !validValidationScope(input.Scope, input.MilestoneID) {
+		result.Outcome = domain.OutcomeError
+		result.ErrorClassification = "AUTHORING_DEFECT"
+		return result, nil
+	}
+	request := validationRequestV2{Schema: validationRequestSchema, TaskInstanceID: input.TaskInstanceID, SubmissionID: input.SubmissionID,
+		ValidationRunID: input.ValidationRunID, RevisionDigest: input.RevisionDigest, ValidationContractDigest: input.ValidationContractDigest,
+		Snapshot: input.Snapshot, Scope: input.Scope, MilestoneID: input.MilestoneID, ValidationSpecification: input.ValidationSpecification}
+	status, payload, err := client.http.doRaw(ctx, http.MethodPost, "/api/v2/practice-validations", request, nil, maxValidationResponseBytes)
+	if err != nil {
+		result.Outcome = domain.OutcomeError
+		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+			result.ErrorClassification = "VALIDATOR_TIMEOUT"
+		} else if hasAPIErrorCode(err, "invalid_provider_response") {
+			result.ErrorClassification = "VALIDATOR_PROTOCOL"
+		} else {
+			result.ErrorClassification = "VALIDATOR_UNAVAILABLE"
+		}
+		return result, nil
+	}
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		result.Outcome = domain.OutcomeError
+		if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
+			result.ErrorClassification = "AUTHORING_DEFECT"
+		} else if status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout {
+			result.ErrorClassification = "VALIDATOR_TIMEOUT"
+		} else {
+			result.ErrorClassification = "VALIDATOR_UNAVAILABLE"
+		}
+		return result, nil
+	}
+	var response validationResultV2
+	if err := decodeSingleJSON(payload, &response); err != nil {
+		result.Outcome = domain.OutcomeError
+		result.ErrorClassification = "VALIDATOR_PROTOCOL"
+		return result, nil
+	}
+	mapped, ok := mapValidationResult(response, input)
+	if !ok {
+		result.Outcome = domain.OutcomeError
+		result.ErrorClassification = "VALIDATOR_PROTOCOL"
+		return result, nil
+	}
+	return mapped, nil
+}
+
+type validationResultV2 struct {
+	Schema                   string                   `json:"schema"`
+	TaskInstanceID           string                   `json:"task_instance_id"`
+	SubmissionID             string                   `json:"submission_id"`
+	ValidationRunID          string                   `json:"validation_run_id"`
+	RevisionDigest           string                   `json:"revision_digest"`
+	ValidationContractDigest string                   `json:"validation_contract_digest"`
+	Snapshot                 domain.SnapshotRef       `json:"snapshot"`
+	Outcome                  domain.ValidationOutcome `json:"outcome"`
+	ErrorClassification      string                   `json:"error_classification,omitempty"`
+	Stages                   []validationStageV2      `json:"stages"`
+}
+
+type validationStageV2 struct {
+	StageID  string                   `json:"stage_id"`
+	Required bool                     `json:"required"`
+	Outcome  string                   `json:"outcome"`
+	Issues   []domain.ValidationIssue `json:"issues,omitempty"`
+}
+
+func validationIdentity(input ports.OfficialValidationRequest) domain.ValidationResult {
+	return domain.ValidationResult{TaskInstanceID: input.TaskInstanceID, SubmissionID: input.SubmissionID, ValidationRunID: input.ValidationRunID,
+		RevisionDigest: input.RevisionDigest, ValidationContractDigest: input.ValidationContractDigest, Snapshot: input.Snapshot}
+}
+
+func mapValidationResult(response validationResultV2, input ports.OfficialValidationRequest) (domain.ValidationResult, bool) {
+	if response.Schema != validationResultSchema || response.TaskInstanceID != input.TaskInstanceID || response.SubmissionID != input.SubmissionID ||
+		response.ValidationRunID != input.ValidationRunID || response.RevisionDigest != input.RevisionDigest ||
+		response.ValidationContractDigest != input.ValidationContractDigest || response.Snapshot != input.Snapshot ||
+		(response.Outcome != domain.OutcomePass && response.Outcome != domain.OutcomeFail && response.Outcome != domain.OutcomeError) {
+		return domain.ValidationResult{}, false
+	}
+	if response.Outcome == domain.OutcomeError && !validValidationErrorClass(response.ErrorClassification) ||
+		response.Outcome != domain.OutcomeError && response.ErrorClassification != "" {
+		return domain.ValidationResult{}, false
+	}
+	stages := make([]domain.ValidationStage, 0, len(response.Stages))
+	for _, stage := range response.Stages {
+		if stage.StageID == "" || (stage.Outcome != "PASS" && stage.Outcome != "FAIL" && stage.Outcome != "ERROR" && stage.Outcome != "SKIPPED") {
+			return domain.ValidationResult{}, false
+		}
+		for _, issue := range stage.Issues {
+			if len(issue.Code) > 128 || len(issue.Message) > 1024 {
+				return domain.ValidationResult{}, false
+			}
+		}
+		stages = append(stages, domain.ValidationStage{StageID: stage.StageID, Required: stage.Required, Outcome: stage.Outcome, Issues: stage.Issues})
+	}
+	return domain.ValidationResult{TaskInstanceID: response.TaskInstanceID, SubmissionID: response.SubmissionID, ValidationRunID: response.ValidationRunID,
+		RevisionDigest: response.RevisionDigest, ValidationContractDigest: response.ValidationContractDigest, Snapshot: response.Snapshot,
+		Outcome: response.Outcome, ErrorClassification: response.ErrorClassification, Stages: stages}, true
+}
+
+func validValidationScope(scope, milestoneID string) bool {
+	return (scope == "FINAL" && milestoneID == "") || (scope == "MILESTONE" && milestoneID != "")
+}
+
+func validValidationErrorClass(value string) bool {
+	switch value {
+	case "VALIDATOR_TIMEOUT", "VALIDATOR_UNAVAILABLE", "VALIDATOR_PROTOCOL", "STAGE_EXECUTION_ERROR", "SNAPSHOT_UNAVAILABLE", "SNAPSHOT_CORRUPT", "SNAPSHOT_DIGEST_MISMATCH", "UNSUPPORTED_CONFIGURATION", "AUTHORING_DEFECT":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTimeout(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func hasAPIErrorCode(err error, code string) bool {
+	var apiError domain.APIError
+	return errors.As(err, &apiError) && apiError.Code == code
+}
+
+var _ ports.RevisionProvider = (*RevisionHTTPClient)(nil)
+var _ ports.LearningActionPort = (*StudentHTTPClient)(nil)
+var _ ports.EvidencePort = (*StudentHTTPClient)(nil)
+var _ ports.LearningRouteProvider = (*LearningPlannerHTTPClient)(nil)
+var _ ports.WorkspacePort = (*SandboxHTTPClient)(nil)
+var _ ports.ValidationPort = (*ValidationHTTPClient)(nil)

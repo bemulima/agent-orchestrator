@@ -1,0 +1,104 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+const onboardingPlanHandoffColumns = `handoff_id, student_id, idempotency_key, request_hash,
+state_ref_kind, state_ref_version, dialog_id, teacher_job_id, goal_code, goal_version, graph_version,
+readiness_observed_at, created_at`
+
+func (store Store) GetByStudentAndIdempotency(
+	ctx context.Context,
+	studentID string,
+	idempotencyKey string,
+) (domain.OnboardingPlanHandoffRecord, error) {
+	return scanOnboardingPlanHandoff(store.Pool.QueryRow(ctx, `
+SELECT `+onboardingPlanHandoffColumns+`
+FROM teacher_onboarding_plan_handoff
+WHERE student_id=$1 AND idempotency_key=$2`, studentID, idempotencyKey))
+}
+
+func (store Store) CreateOrGetOnboardingPlanHandoff(
+	ctx context.Context,
+	record domain.OnboardingPlanHandoffRecord,
+) (domain.OnboardingPlanHandoffRecord, bool, error) {
+	// Serialize both the idempotency and state-ref identities. The latter is a
+	// durable no-double-handoff fence even when callers use different keys.
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "onboarding-handoff:"+record.StudentID); err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	existing, err := scanOnboardingPlanHandoff(tx.QueryRow(ctx, `
+SELECT `+onboardingPlanHandoffColumns+`
+FROM teacher_onboarding_plan_handoff
+WHERE student_id=$1 AND idempotency_key=$2`, record.StudentID, record.IdempotencyKey))
+	if err == nil {
+		if existing.RequestHash != record.RequestHash {
+			return domain.OnboardingPlanHandoffRecord{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.OnboardingPlanHandoffRecord{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	var occupied bool
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS(
+  SELECT 1 FROM teacher_onboarding_plan_handoff
+  WHERE student_id=$1 AND state_ref_kind=$2 AND state_ref_version=$3
+)`, record.StudentID, record.StateRef.Kind, record.StateRef.Version).Scan(&occupied); err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	if occupied {
+		return domain.OnboardingPlanHandoffRecord{}, false, domain.ErrConflict
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO teacher_onboarding_plan_handoff(
+  handoff_id, student_id, idempotency_key, request_hash,
+  state_ref_kind, state_ref_version, dialog_id, teacher_job_id,
+  goal_code, goal_version, graph_version, readiness_observed_at, created_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		record.HandoffID, record.StudentID, record.IdempotencyKey, record.RequestHash,
+		record.StateRef.Kind, record.StateRef.Version, record.DialogID, record.TeacherJobID,
+		record.Goal.Code, record.Goal.Version, record.Goal.GraphVersion, record.ReadinessObservedAt, record.CreatedAt)
+	if err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+type onboardingPlanHandoffRow interface{ Scan(...any) error }
+
+func scanOnboardingPlanHandoff(row onboardingPlanHandoffRow) (domain.OnboardingPlanHandoffRecord, error) {
+	var record domain.OnboardingPlanHandoffRecord
+	err := row.Scan(
+		&record.HandoffID, &record.StudentID, &record.IdempotencyKey, &record.RequestHash,
+		&record.StateRef.Kind, &record.StateRef.Version, &record.DialogID, &record.TeacherJobID,
+		&record.Goal.Code, &record.Goal.Version, &record.Goal.GraphVersion, &record.ReadinessObservedAt, &record.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OnboardingPlanHandoffRecord{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.OnboardingPlanHandoffRecord{}, err
+	}
+	return domain.NormalizeOnboardingPlanHandoffRecord(record)
+}
+
+var _ repository.OnboardingPlanHandoffRepository = Store{}

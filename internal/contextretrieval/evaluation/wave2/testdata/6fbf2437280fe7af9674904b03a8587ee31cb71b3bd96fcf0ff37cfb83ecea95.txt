@@ -1,0 +1,228 @@
+package nats
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+const PlanningStateStream = "STUDENT_PLANNING_STATE_EVENTS"
+const HybridReplanDurable = "ms-learning-planner-hybrid-replan-v1"
+const PlanningStateRetryDelay = 2 * time.Second
+
+type PlanningStateProcessor interface {
+	ReceivePlanningStateEvent(context.Context, domain.PlanningStateChangedEvent) (bool, error)
+}
+
+// DecodePlanningStateMessage admits only the exact owner subject and
+// mandatory single-valued headers matching the strict envelope.
+func DecodePlanningStateMessage(message *natsgo.Msg) (domain.PlanningStateChangedEvent, error) {
+	if message == nil || message.Subject != domain.SubjectPlanningStateChanged {
+		return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+	}
+	headerBytes := 0
+	headerValues := 0
+	if len(message.Header) > 32 {
+		return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+	}
+	for key, values := range message.Header {
+		headerBytes += len(key)
+		headerValues += len(values)
+		if headerValues > 64 {
+			return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+		}
+		for _, value := range values {
+			headerBytes += len(value)
+		}
+		if headerBytes > 8192 {
+			return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+		}
+	}
+	event, err := domain.DecodePlanningStateChangedEvent(message.Data)
+	if err != nil {
+		return event, err
+	}
+	expected := map[string]string{"X-Event-ID": event.EventID, "X-Correlation-ID": event.CorrelationID, "X-Causation-ID": event.CausationID, "X-Schema-Version": "1"}
+	for name, value := range expected {
+		count := 0
+		for key, values := range message.Header {
+			if strings.EqualFold(key, name) {
+				count += len(values)
+				if len(values) != 1 || values[0] != value {
+					return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+				}
+			}
+		}
+		if count != 1 {
+			return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+		}
+	}
+	for key, values := range message.Header {
+		if strings.EqualFold(key, natsgo.MsgIdHdr) && (len(values) != 1 || values[0] != event.EventID) {
+			return domain.PlanningStateChangedEvent{}, domain.ErrValidation
+		}
+	}
+	return event, nil
+}
+
+type planningStateDelivery interface {
+	AckSync(...natsgo.AckOpt) error
+	Term(...natsgo.AckOpt) error
+	NakWithDelay(time.Duration, ...natsgo.AckOpt) error
+}
+
+// HandlePlanningStateMessage acknowledges only an immutable durable inbox
+// receipt; malformed/reference-mismatched messages terminate without mutation.
+func HandlePlanningStateMessage(ctx context.Context, message *natsgo.Msg, processor PlanningStateProcessor) error {
+	if message == nil {
+		return domain.ErrValidation
+	}
+	return handlePlanningStateDelivery(ctx, message, processor, message)
+}
+
+func handlePlanningStateDelivery(ctx context.Context, message *natsgo.Msg, processor PlanningStateProcessor, delivery planningStateDelivery) error {
+	event, err := DecodePlanningStateMessage(message)
+	if err == nil {
+		metadata, metadataErr := message.Metadata()
+		if metadataErr != nil || metadata.Stream != PlanningStateStream || metadata.Consumer != HybridReplanDurable {
+			err = domain.ErrValidation
+		}
+	}
+	if err == nil {
+		if processor == nil {
+			err = domain.ErrUpstreamUnavailable
+		} else {
+			_, err = processor.ReceivePlanningStateEvent(ctx, event)
+		}
+	}
+	if err == nil {
+		return delivery.AckSync(natsgo.Context(ctx))
+	}
+	if errors.Is(err, domain.ErrValidation) || errors.Is(err, domain.ErrConflict) || errors.Is(err, domain.ErrForbidden) {
+		if terminalErr := delivery.Term(); terminalErr != nil {
+			return terminalErr
+		}
+	} else if retryErr := delivery.NakWithDelay(PlanningStateRetryDelay); retryErr != nil {
+		return retryErr
+	}
+	return err
+}
+
+// PlanningStateConsumer owns its connection, context, and one pull loop.
+// It binds the durable without resetting or changing any shared stream.
+type PlanningStateConsumer struct {
+	connection   *natsgo.Conn
+	subscription *natsgo.Subscription
+	cancel       context.CancelFunc
+	done         chan struct{}
+	closeOnce    sync.Once
+}
+
+// NewPlanningStateConsumer uses the existing NATS_URL configuration. Startup
+// fails unless infrastructure provisioned the dedicated lossless workqueue.
+func NewPlanningStateConsumer(ctx context.Context, url string, processor PlanningStateProcessor) (*PlanningStateConsumer, error) {
+	if ctx == nil || strings.TrimSpace(url) == "" || processor == nil {
+		return nil, domain.ErrValidation
+	}
+	connection, err := natsgo.Connect(url, natsgo.Name(HybridReplanDurable), natsgo.Timeout(5*time.Second), natsgo.MaxReconnects(-1), natsgo.ReconnectWait(time.Second))
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			connection.Close()
+		}
+	}()
+	js, err := connection.JetStream()
+	if err != nil {
+		return nil, err
+	}
+	startup, cancelStartup := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStartup()
+	stream, err := js.StreamInfo(PlanningStateStream, natsgo.Context(startup))
+	if err != nil {
+		return nil, fmt.Errorf("planning state stream required: %w", err)
+	}
+	if err = validatePlanningStateStream(stream.Config); err != nil {
+		return nil, err
+	}
+	info, err := js.ConsumerInfo(PlanningStateStream, HybridReplanDurable, natsgo.Context(startup))
+	if errors.Is(err, natsgo.ErrConsumerNotFound) {
+		info, err = js.AddConsumer(PlanningStateStream, &natsgo.ConsumerConfig{Durable: HybridReplanDurable, FilterSubject: domain.SubjectPlanningStateChanged, DeliverPolicy: natsgo.DeliverAllPolicy, AckPolicy: natsgo.AckExplicitPolicy, AckWait: 30 * time.Second, MaxDeliver: -1, MaxAckPending: 1, MaxWaiting: 128}, natsgo.Context(startup))
+		// Concurrent service starts may race to create the same fixed durable.
+		if err != nil {
+			info, err = js.ConsumerInfo(PlanningStateStream, HybridReplanDurable, natsgo.Context(startup))
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = validatePlanningStateConsumer(info.Config); err != nil {
+		return nil, err
+	}
+	subscription, err := js.PullSubscribe(domain.SubjectPlanningStateChanged, HybridReplanDurable, natsgo.Bind(PlanningStateStream, HybridReplanDurable), natsgo.ManualAck())
+	if err != nil {
+		return nil, err
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	consumer := &PlanningStateConsumer{connection: connection, subscription: subscription, cancel: cancel, done: make(chan struct{})}
+	succeeded = true
+	go consumer.run(runContext, processor)
+	return consumer, nil
+}
+
+func validatePlanningStateStream(config natsgo.StreamConfig) error {
+	if config.Name != PlanningStateStream || len(config.Subjects) != 1 || config.Subjects[0] != domain.SubjectPlanningStateChanged || config.Retention != natsgo.WorkQueuePolicy || config.Storage != natsgo.FileStorage || config.MaxAge != 0 || config.MaxMsgs != -1 || config.MaxBytes != 1<<30 || config.Discard != natsgo.DiscardNew || config.Replicas != 1 || config.MaxMsgsPerSubject > 0 || config.Duplicates != 10*time.Minute {
+		return errors.New("planning state stream contract mismatch")
+	}
+	return nil
+}
+func validatePlanningStateConsumer(config natsgo.ConsumerConfig) error {
+	if config.Durable != HybridReplanDurable || config.FilterSubject != domain.SubjectPlanningStateChanged || config.DeliverPolicy != natsgo.DeliverAllPolicy || config.AckPolicy != natsgo.AckExplicitPolicy || config.MaxDeliver != -1 || config.DeliverSubject != "" || config.AckWait != 30*time.Second || config.MaxAckPending != 1 {
+		return errors.New("hybrid replanning durable contract mismatch")
+	}
+	return nil
+}
+func (c *PlanningStateConsumer) run(ctx context.Context, processor PlanningStateProcessor) {
+	defer close(c.done)
+	for ctx.Err() == nil {
+		fetchContext, cancelFetch := context.WithTimeout(ctx, time.Second)
+		messages, err := c.subscription.Fetch(1, natsgo.Context(fetchContext))
+		cancelFetch()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			if errors.Is(err, natsgo.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			timer := time.NewTimer(PlanningStateRetryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		for _, message := range messages {
+			processContext, cancelProcess := context.WithTimeout(ctx, 20*time.Second)
+			_ = HandlePlanningStateMessage(processContext, message, processor)
+			cancelProcess()
+		}
+	}
+}
+
+func (c *PlanningStateConsumer) Close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() { c.cancel(); <-c.done; _ = c.subscription.Unsubscribe(); c.connection.Close() })
+}

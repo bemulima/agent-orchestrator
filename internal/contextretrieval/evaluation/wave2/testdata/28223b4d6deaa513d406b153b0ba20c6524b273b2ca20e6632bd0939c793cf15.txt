@@ -1,0 +1,134 @@
+package domain
+
+import (
+	"github.com/google/uuid"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestHybridEvidenceQualityUsesOnlyFrozenProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		source, class, surface string
+		expected               HybridEvidenceQuality
+	}{
+		{"quiz", "course_answer", "knowledge_check", "", HybridQualityAssessment},
+		{"execution", "course_answer", "application", "", HybridQualityExecution},
+		{"practice", "practice_v2", "application", "practice", HybridQualityExecution},
+		{"project", "practice_v2", "application", "project", HybridQualityProject},
+		{"legacy", "practice_legacy", "application", "", HybridQualityExecution},
+		{"unknown surface", "practice_v2", "application", "", HybridQualityUnknown},
+		{"unknown provenance", "unknown", "application", "project", HybridQualityUnknown},
+		{"teacher assistance", "teacher_assistance", "application", "", HybridQualityUnknown},
+		{"unrecognized class", "course_answer", "unknown", "", HybridQualityUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := HybridEvidenceReference{SourceKind: tc.source, EvidenceClass: tc.class, SurfaceClassification: tc.surface}
+			if got := ClassifyHybridEvidence(e); got != tc.expected {
+				t.Fatalf("quality=%s want=%s", got, tc.expected)
+			}
+		})
+	}
+	if DefaultMasteryConfidence != .80 {
+		t.Fatal("accepted existing threshold changed")
+	}
+}
+
+func TestHybridStabilityUsesIndependentApplicationsAndDistinctReducerTasks(t *testing.T) {
+	target := HybridTargetRef{Type: TargetConcept, Key: "go.syntax", Version: "v1"}
+	e := func(id, task string) HybridEvidenceReference {
+		eid := uuid.NewSHA1(uuid.NameSpaceOID, []byte(id)).String()
+		tid := uuid.NewSHA1(uuid.NameSpaceOID, []byte(task)).String()
+		return HybridEvidenceReference{Target: target, SourceKind: "course_answer", EvidenceID: eid, LearningActionID: eid, TaskID: tid, EvidenceClass: "application", Outcome: "passed", SupportContext: "independent", Kind: "independent_application", TeacherPolicyVersion: "teacher-support-v1", MasteryPolicyVersion: StudentMasteryPolicyVersion, OccurredAt: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)}
+	}
+	a, b, c := e("1", "task-a"), e("2", "task-b"), e("3", "task-b")
+	for _, tc := range []struct {
+		name            string
+		state           MasteryState
+		evidence        []HybridEvidenceReference
+		expected        HybridMasteryStability
+		count, distinct int
+	}{
+		{"one application", MasteryMastered, []HybridEvidenceReference{a}, HybridStabilityUnstable, 1, 1},
+		{"two same task", MasteryMastered, []HybridEvidenceReference{a, e("2", "task-a")}, HybridStabilityUnstable, 2, 1},
+		{"two distinct", MasteryMastered, []HybridEvidenceReference{a, b}, HybridStabilityDeveloping, 2, 2},
+		{"three not mastered", MasteryApplied, []HybridEvidenceReference{a, b, c}, HybridStabilityDeveloping, 3, 2},
+		{"three mastered", MasteryMastered, []HybridEvidenceReference{a, b, c}, HybridStabilityStable, 3, 2},
+		{"duplicate evidence", MasteryMastered, []HybridEvidenceReference{a, b, b}, HybridStabilityDeveloping, 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := HybridSnapshotMastery{Target: target, State: tc.state, IndependentSuccessCount: 999}
+			got := DeriveHybridTargetSignal(m, tc.evidence)
+			if got.Stability != tc.expected || got.IndependentApplications != tc.count || got.DistinctApplicationSources != tc.distinct {
+				t.Fatalf("signal=%+v", got)
+			}
+		})
+	}
+	quiz := a
+	quiz.EvidenceClass = "knowledge_check"
+	quiz.Kind = "independent_understanding"
+	assisted := b
+	assisted.SupportContext = "guided"
+	assisted.Kind = "assisted_application"
+	failed := c
+	failed.Outcome = "failed"
+	failed.Kind = "failed_application"
+	signal := DeriveHybridTargetSignal(HybridSnapshotMastery{Target: target, State: MasteryMastered, IndependentSuccessCount: 999}, []HybridEvidenceReference{quiz, assisted, failed})
+	if signal.IndependentApplications != 0 || signal.Stability != HybridStabilityUnstable {
+		t.Fatalf("non-independent inputs fabricated stability: %+v", signal)
+	}
+	practice := []HybridEvidenceReference{a, b, c}
+	for i := range practice {
+		practice[i].SourceKind = "practice_v2"
+		practice[i].SurfaceClassification = "practice"
+		practice[i].TaskInstanceID = practice[i].TaskID
+		practice[i].TaskID = ""
+		practice[i].TaskRevisionID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("same-revision")).String()
+		practice[i].SubmissionID = practice[i].EvidenceID
+		practice[i].ReceiptHash = "sha256:" + strings.Repeat("a", 64)
+	}
+	if got := DeriveHybridTargetSignal(HybridSnapshotMastery{Target: target, State: MasteryMastered}, practice); got.Stability != HybridStabilityStable || got.DistinctApplicationSources != 2 {
+		t.Fatalf("wrong Practice reducer identity: %+v", got)
+	}
+	malformed := append([]HybridEvidenceReference{}, practice...)
+	level := 1
+	malformed[0].MaxHintLevel = &level
+	if got := DeriveHybridTargetSignal(HybridSnapshotMastery{Target: target, State: MasteryMastered}, malformed); got.Stability == HybridStabilityStable || got.IndependentApplications != 2 || got.Quality != HybridQualityUnknown {
+		t.Fatalf("malformed hints counted as independent stability: %+v", got)
+	}
+	unclassified := append([]HybridEvidenceReference{}, practice...)
+	for i := range unclassified {
+		unclassified[i].SurfaceClassification = ""
+	}
+	if got := DeriveHybridTargetSignal(HybridSnapshotMastery{Target: target, State: MasteryMastered}, unclassified); got.Stability != HybridStabilityStable || got.Quality != HybridQualityUnknown {
+		t.Fatalf("valid Student independence was redefined by unknown quality: %+v", got)
+	}
+	unknown := a
+	unknown.SourceKind = "unknown"
+	if got := DeriveHybridTargetSignal(HybridSnapshotMastery{Target: target, State: MasteryMastered}, append(practice, unknown)); got.Quality != HybridQualityUnknown {
+		t.Fatalf("mixed unknown provenance bypassed quality: %+v", got)
+	}
+}
+
+func TestHybridObservationRequiresRealTargetBoundTheoryFact(t *testing.T) {
+	target := HybridTargetRef{Type: TargetConcept, Key: "go.syntax", Version: "v1"}
+	m := HybridSnapshotMastery{Target: target, State: MasteryUnknown}
+	s := HybridPlanningSnapshot{Path: HybridSnapshotPath{Items: []HybridSnapshotItem{{ID: "item", Targets: []HybridTargetRef{target}}}}, ActivityFacts: []HybridSnapshotActivityFact{{ItemID: "item", Type: "theory_acknowledged"}}}
+	if got := DeriveHybridSnapshotTargetSignal(s, m); got.Quality != HybridQualityObservation || got.Stability != HybridStabilityUnstable {
+		t.Fatalf("signal=%+v", got)
+	}
+	s.ActivityFacts[0].Type = "teacher_hint"
+	if got := DeriveHybridSnapshotTargetSignal(s, m); got.Quality != HybridQualityUnknown {
+		t.Fatalf("hint inferred objective observation: %+v", got)
+	}
+}
+
+func TestHybridUnknownEvidenceCannotFallbackToObservation(t *testing.T) {
+	target := HybridTargetRef{Type: TargetConcept, Key: "go.syntax", Version: "v1"}
+	m := HybridSnapshotMastery{Target: target, State: MasteryMastered}
+	s := HybridPlanningSnapshot{Path: HybridSnapshotPath{Items: []HybridSnapshotItem{{ID: "item", Targets: []HybridTargetRef{target}}}}, ActivityFacts: []HybridSnapshotActivityFact{{ItemID: "item", Type: "theory_acknowledged"}}, Evidence: []HybridEvidenceReference{{Target: target, SourceKind: "practice_v2", EvidenceClass: "application"}}}
+	if got := DeriveHybridSnapshotTargetSignal(s, m); got.Quality != HybridQualityUnknown {
+		t.Fatalf("unknown objective provenance became %s", got.Quality)
+	}
+}

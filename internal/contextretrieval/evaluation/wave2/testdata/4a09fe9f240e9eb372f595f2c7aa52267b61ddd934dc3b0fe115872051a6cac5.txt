@@ -1,0 +1,136 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	OnboardingPathExecutionSchema = "planner-onboarding-path-execution.v1"
+	OnboardingPathOutcomeSchema   = "planner-onboarding-path-outcome.v1"
+	SubjectOnboardingPathOutcome  = "planner.onboarding-path.outcome.v1"
+
+	OnboardingExecutionPending          = "PENDING"
+	OnboardingExecutionSnapshotFrozen   = "SNAPSHOT_FROZEN"
+	OnboardingExecutionCourseFrozen     = "COURSE_FROZEN"
+	OnboardingExecutionPathReady        = "PATH_READY"
+	OnboardingExecutionActivePathExists = "ACTIVE_PATH_EXISTS"
+	OnboardingExecutionStateChanged     = "STATE_CHANGED"
+	OnboardingExecutionFailed           = "FAILED"
+)
+
+// OnboardingPathExecution is a separate S9 aggregate.  The S8 handoff remains
+// immutable historical admission evidence and is never updated into a job.
+type OnboardingPathExecution struct {
+	ExecutionID         string
+	Handoff             OnboardingPlanHandoffRecord
+	Status              string
+	RequestHash         string
+	Snapshot            json.RawMessage
+	SnapshotHash        string
+	GeneratedCourse     json.RawMessage
+	GeneratedCourseHash string
+	CourseID            string
+	CourseReused        bool
+	CourseLessons       []CourseLessonBinding
+	AdmissionID         string
+	AdmissionFence      int64
+	AdmissionExpiresAt  *time.Time
+	ReserveKey          string
+	StudentCommandID    string
+	StudentCommandHash  string
+	LearningPathID      string
+	FirstLessonID       string
+	Attempts            int
+	ClaimToken          string
+	LeaseUntil          *time.Time
+	NextAttemptAt       time.Time
+	FailureCode         string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	CompletedAt         *time.Time
+}
+
+// OnboardingPathLessonContent is immutable per-lesson AI evidence.  It is
+// deliberately separate from the assembled Course checkpoint so a process
+// crash never repeats a successfully parsed confidential prompt response.
+type OnboardingPathLessonContent struct {
+	ExecutionID      string
+	LessonIndex      int
+	ModuleCode       string
+	SectionCode      string
+	LessonCode       string
+	AIIdempotencyKey string
+	Content          json.RawMessage
+	ContentHash      string
+	CreatedAt        time.Time
+}
+
+func NewOnboardingPathExecution(handoff OnboardingPlanHandoffRecord, now time.Time) (OnboardingPathExecution, error) {
+	handoff, err := NormalizeOnboardingPlanHandoffRecord(handoff)
+	if err != nil {
+		return OnboardingPathExecution{}, err
+	}
+	// UUID v5 provides a stable aggregate identity across discovery/replay races.
+	id := uuid.NewSHA1(uuid.NameSpaceOID, []byte("planner-onboarding-path-execution:"+handoff.HandoffID)).String()
+	studentCommand := uuid.NewSHA1(uuid.NameSpaceOID, []byte("student-onboarding-path-materialize:"+id)).String()
+	reserveKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("student-onboarding-path-reserve:"+id)).String()
+	hash := sha256.Sum256([]byte(strings.Join([]string{handoff.HandoffID, handoff.StudentID, handoff.Goal.Code, handoff.Goal.Version, handoff.Goal.GraphVersion}, "\x00")))
+	return OnboardingPathExecution{ExecutionID: id, Handoff: handoff, Status: OnboardingExecutionPending,
+		RequestHash: hex.EncodeToString(hash[:]), StudentCommandID: studentCommand, ReserveKey: reserveKey,
+		NextAttemptAt: now.UTC(), CreatedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
+}
+
+// OnboardingAdmissionOperationKey is a deterministic, distinct Student
+// idempotency key.  The operation name and current fence are part of the
+// identity so Student's global operation inbox never treats reserve, renew,
+// materialize, and abort as one command.
+func OnboardingAdmissionOperationKey(executionID, operation string, fence int64) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("student-onboarding-path:"+executionID+":"+operation+":"+strconv.FormatInt(fence, 10))).String()
+}
+
+func IsOnboardingExecutionTerminal(status string) bool {
+	switch status {
+	case OnboardingExecutionPathReady, OnboardingExecutionActivePathExists, OnboardingExecutionStateChanged, OnboardingExecutionFailed:
+		return true
+	}
+	return false
+}
+
+type OnboardingPathOutcome struct {
+	Schema         string `json:"schema"`
+	ExecutionID    string `json:"execution_id"`
+	HandoffID      string `json:"handoff_id"`
+	StudentID      string `json:"student_id"`
+	DialogID       string `json:"dialog_id"`
+	TeacherJobID   string `json:"teacher_job_id"`
+	Status         string `json:"status"`
+	CourseID       string `json:"course_id,omitempty"`
+	LearningPathID string `json:"learning_path_id,omitempty"`
+	FirstLessonID  string `json:"first_lesson_id,omitempty"`
+	FailureCode    string `json:"failure_code,omitempty"`
+}
+
+func NewOnboardingPathOutcome(execution OnboardingPathExecution) (OnboardingPathOutcome, error) {
+	if !IsOnboardingExecutionTerminal(execution.Status) || execution.Status == OnboardingExecutionFailed {
+		return OnboardingPathOutcome{}, ErrValidation
+	}
+	out := OnboardingPathOutcome{Schema: OnboardingPathOutcomeSchema, ExecutionID: execution.ExecutionID,
+		HandoffID: execution.Handoff.HandoffID, StudentID: execution.Handoff.StudentID, DialogID: execution.Handoff.DialogID,
+		TeacherJobID: execution.Handoff.TeacherJobID, Status: execution.Status}
+	if execution.Status == OnboardingExecutionPathReady {
+		if execution.CourseID == "" || execution.LearningPathID == "" || execution.FirstLessonID == "" {
+			return OnboardingPathOutcome{}, ErrValidation
+		}
+		out.CourseID, out.LearningPathID, out.FirstLessonID = execution.CourseID, execution.LearningPathID, execution.FirstLessonID
+	} else if execution.CourseID != "" || execution.LearningPathID != "" || execution.FirstLessonID != "" {
+		return OnboardingPathOutcome{}, ErrValidation
+	}
+	return out, nil
+}

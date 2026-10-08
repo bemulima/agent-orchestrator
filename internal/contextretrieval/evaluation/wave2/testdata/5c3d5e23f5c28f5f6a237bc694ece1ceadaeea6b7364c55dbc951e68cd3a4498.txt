@@ -1,0 +1,234 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+const (
+	EvidenceSchemaV2          = "practice-task-competency-evidence.v2"
+	EvidencePolicyV2          = "practice-competency-evidence-v2"
+	StudentReceiptPolicyV1    = "student-mastery-v1"
+	ClassificationUnavailable = "VALIDATOR_UNAVAILABLE"
+	ClassificationProtocol    = "VALIDATOR_PROTOCOL"
+)
+
+func (runtime *Runtime) ProcessValidation(ctx context.Context, pending ports.PendingValidation) error {
+	instance, err := runtime.Repository.GetInstanceByID(ctx, pending.TaskInstanceID)
+	if err != nil {
+		return err
+	}
+	if pending.StudentID != "" && instance.StudentID != pending.StudentID {
+		return domain.ErrConflict
+	}
+	submission, err := runtime.Repository.GetSubmission(ctx, instance.ID, pending.SubmissionID)
+	if err != nil {
+		return err
+	}
+	if instance.CurrentSubmissionID != submission.ID || instance.Status != domain.TaskInstanceValidating || submission.Status != domain.SubmissionValidating {
+		return domain.ErrConflict
+	}
+	runIndex := -1
+	for index := range submission.ValidationRuns {
+		if submission.ValidationRuns[index].ID == pending.RunID {
+			runIndex = index
+		}
+	}
+	if runIndex < 0 || runIndex != len(submission.ValidationRuns)-1 {
+		return domain.ErrConflict
+	}
+	now := runtime.now()
+	if err := runtime.Repository.SetRunRunning(ctx, pending.RunID, now); err != nil {
+		return err
+	}
+	run := submission.ValidationRuns[runIndex]
+	run.Status = domain.ValidationRunRunning
+	run.StartedAt = &now
+	result, validationErr := runtime.Validator.ValidateOfficialSubmission(ctx, ports.OfficialValidationRequest{
+		TaskInstanceID: instance.ID, SubmissionID: submission.ID, ValidationRunID: run.ID,
+		RevisionDigest: instance.TaskRevisionDigest, ValidationContractDigest: submission.ValidationContractDigest,
+		Snapshot: submission.Snapshot, Scope: submission.Scope, MilestoneID: submission.MilestoneID,
+		ValidationSpecification: append(json.RawMessage(nil), submission.ValidationSpecification...),
+	})
+	if validationErr != nil {
+		result = domain.ValidationResult{Outcome: domain.OutcomeError, ErrorClassification: ClassificationUnavailable}
+	} else if !validValidationResult(result, instance, submission, run) {
+		result = domain.ValidationResult{Outcome: domain.OutcomeError, ErrorClassification: ClassificationProtocol}
+	}
+	finished := runtime.now()
+	run.FinishedAt = &finished
+	run.Outcome = result.Outcome
+	run.ErrorClassification = result.ErrorClassification
+	run.SafeSummary = domain.NewSafeValidationSummary(run.ID, result)
+	switch result.Outcome {
+	case domain.OutcomePass:
+		run.Status = domain.ValidationRunPassed
+	case domain.OutcomeFail:
+		run.Status = domain.ValidationRunFailed
+	case domain.OutcomeError:
+		run.Status = domain.ValidationRunError
+	default:
+		return domain.ErrDependency
+	}
+	submission.ValidationRuns[runIndex] = run
+	submission.UpdatedAt = finished
+	instance.UpdatedAt = finished
+	if result.Outcome == domain.OutcomeError {
+		if submission.CompletedAt != nil {
+			submission.CompletedAt = nil
+		}
+		return runtime.Repository.CompleteValidation(ctx, submission, run, instance)
+	}
+	submission.CompletedAt = &finished
+	if result.Outcome == domain.OutcomeFail {
+		if submission.Scope == "MILESTONE" {
+			for index := range instance.Steps {
+				if instance.Steps[index].ID == submission.MilestoneID {
+					instance.Steps[index].Status = "AVAILABLE"
+				}
+			}
+		}
+		if err := runtime.unlockSubmission(ctx, submission, run.ID); err != nil {
+			return err
+		}
+		submission.Status = domain.SubmissionFailed
+		instance.Status = domain.TaskInstanceInProgress
+		setCurrentStep(&instance)
+		return runtime.Repository.CompleteValidation(ctx, submission, run, instance)
+	}
+	if submission.Scope == "MILESTONE" {
+		for index := range instance.Steps {
+			if instance.Steps[index].ID == submission.MilestoneID {
+				instance.Steps[index].Status = "CHECKPOINTED"
+			}
+		}
+		if err := runtime.unlockSubmission(ctx, submission, run.ID); err != nil {
+			return err
+		}
+		submission.Status = domain.SubmissionPassed
+		instance.Status = domain.TaskInstanceInProgress
+		setCurrentStep(&instance)
+		return runtime.Repository.CompleteValidation(ctx, submission, run, instance)
+	}
+	for index := range instance.Steps {
+		if instance.Steps[index].Required {
+			instance.Steps[index].Status = "PASSED"
+		}
+	}
+	instance.FinalSubmissionID = submission.ID
+	setCurrentStep(&instance)
+	submission.Status = domain.SubmissionPassed
+	if submission.RequiresHumanReview {
+		submission.Status = domain.SubmissionReviewRequired
+		instance.Status = domain.TaskInstanceInReview
+		return runtime.Repository.CompleteValidation(ctx, submission, run, instance)
+	}
+	permanentLock, err := runtime.Workspace.LockWrites(ctx, ports.LockWorkspaceWrites{SandboxID: instance.WorkspaceBinding.SandboxID,
+		RequestID: run.ID, Mode: "PERMANENT", SubmissionID: submission.ID})
+	if err != nil || permanentLock.LockID == "" || !permanentLock.Permanent {
+		return domain.ErrDependency
+	}
+	instance.Status = domain.TaskInstanceCompleted
+	instance.CompletedAt = &finished
+	instance.UpdatedAt = runtime.now()
+	payload, err := passedEvidencePayload(instance, submission, finished)
+	if err != nil {
+		return err
+	}
+	return runtime.Repository.CompleteInstanceAndEnqueueEvidence(ctx, instance, submission, payload)
+}
+
+func validValidationResult(result domain.ValidationResult, instance domain.TaskInstance, submission domain.Submission, run domain.ValidationRun) bool {
+	return result.TaskInstanceID == instance.ID && result.SubmissionID == submission.ID && result.ValidationRunID == run.ID &&
+		result.RevisionDigest == instance.TaskRevisionDigest && result.ValidationContractDigest == submission.ValidationContractDigest &&
+		result.Snapshot == submission.Snapshot && (result.Outcome == domain.OutcomePass || result.Outcome == domain.OutcomeFail || result.Outcome == domain.OutcomeError) &&
+		((result.Outcome == domain.OutcomeError && domain.KnownValidationErrorClassification(result.ErrorClassification)) ||
+			(result.Outcome != domain.OutcomeError && result.ErrorClassification == ""))
+}
+
+func (runtime *Runtime) unlockSubmission(ctx context.Context, submission domain.Submission, runID string) error {
+	intent, err := runtime.Repository.GetIntent(ctx, submission.TaskInstanceID, submission.IdempotencyKey)
+	if err != nil || intent.WriteLockID == "" {
+		return domain.ErrDependency
+	}
+	lock, err := runtime.Workspace.UnlockWrites(ctx, ports.UnlockWorkspaceWrites{SandboxID: submission.Snapshot.SandboxID,
+		LockID: intent.WriteLockID, RequestID: runID})
+	if err != nil || lock.LockID != intent.WriteLockID || lock.Permanent || lock.FenceEpoch <= intent.FenceEpoch {
+		return domain.ErrDependency
+	}
+	return nil
+}
+
+func passedEvidencePayload(instance domain.TaskInstance, submission domain.Submission, occurredAt time.Time) (json.RawMessage, error) {
+	independenceIsZero := instance.HintsUsed > 0 || instance.TeacherAssistanceUsed
+	evidence, err := passedTargetEvidence(instance.Steps, independenceIsZero)
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		Schema                  string                 `json:"schema"`
+		EvidenceID              string                 `json:"evidence_id"`
+		StudentID               string                 `json:"student_id"`
+		TaskInstanceID          string                 `json:"task_instance_id"`
+		TaskRevisionID          string                 `json:"task_revision_id"`
+		TaskRevisionDigest      string                 `json:"task_revision_digest"`
+		LearningActionID        string                 `json:"learning_action_id"`
+		LearningPathItemID      string                 `json:"learning_path_item_id,omitempty"`
+		RequirementID           string                 `json:"requirement_id,omitempty"`
+		SubmissionID            string                 `json:"submission_id"`
+		WorkspaceDigest         string                 `json:"workspace_digest"`
+		Outcome                 string                 `json:"outcome"`
+		AssistancePolicyVersion string                 `json:"assistance_policy_version"`
+		HintsUsed               int                    `json:"hints_used"`
+		MaxHintLevel            *int                   `json:"max_hint_level,omitempty"`
+		TeacherAssistanceUsed   bool                   `json:"teacher_assistance_used"`
+		Evidence                []ports.TargetEvidence `json:"evidence"`
+		OccurredAt              time.Time              `json:"occurred_at"`
+		PolicyVersion           string                 `json:"policy_version"`
+	}{Schema: EvidenceSchemaV2, EvidenceID: submission.ID, StudentID: instance.StudentID,
+		TaskInstanceID: instance.ID, TaskRevisionID: instance.TaskRevisionID, TaskRevisionDigest: instance.TaskRevisionDigest,
+		LearningActionID: instance.LearningActionID, LearningPathItemID: instance.LearningPathItemID, RequirementID: instance.RequirementID, SubmissionID: submission.ID, WorkspaceDigest: submission.WorkspaceDigest,
+		Outcome: "passed", AssistancePolicyVersion: instance.AssistancePolicyVersion, HintsUsed: instance.HintsUsed,
+		MaxHintLevel: instance.MaxHintLevel, TeacherAssistanceUsed: instance.TeacherAssistanceUsed,
+		Evidence: evidence, OccurredAt: occurredAt, PolicyVersion: EvidencePolicyV2}
+	if !domain.ValidRequirementCorrelation(instance.LearningPathItemID, instance.RequirementID) || payload.EvidenceID == "" || payload.LearningActionID == "" || payload.TaskRevisionDigest == "" || payload.WorkspaceDigest == "" ||
+		payload.AssistancePolicyVersion == "" || payload.OccurredAt.IsZero() {
+		return nil, fmt.Errorf("incomplete passed-evidence identity")
+	}
+	return json.Marshal(payload)
+}
+
+func (runtime *Runtime) RetryValidation(ctx context.Context, runID string) (domain.Submission, error) {
+	if !domain.IsCanonicalUUID(runID) {
+		return domain.Submission{}, domain.ErrInvalid
+	}
+	instance, submission, err := runtime.Repository.GetValidationContextByRunID(ctx, runID)
+	if err != nil {
+		return domain.Submission{}, err
+	}
+	if instance.Status != domain.TaskInstanceValidating || instance.CurrentSubmissionID == "" {
+		return domain.Submission{}, domain.ErrConflict
+	}
+	if submission.TaskInstanceID != instance.ID || submission.ID != instance.CurrentSubmissionID ||
+		submission.Status != domain.SubmissionValidating || len(submission.ValidationRuns) == 0 ||
+		submission.ValidationRuns[len(submission.ValidationRuns)-1].Status != domain.ValidationRunError ||
+		submission.ValidationRuns[len(submission.ValidationRuns)-1].ID != runID {
+		return domain.Submission{}, domain.ErrConflict
+	}
+	newRun := domain.ValidationRun{ID: runtime.newID(), Status: domain.ValidationRunPending}
+	if !domain.IsCanonicalUUID(newRun.ID) || newRun.ID == submission.ValidationRuns[len(submission.ValidationRuns)-1].ID {
+		return domain.Submission{}, errors.New("invalid generated validation-run identity")
+	}
+	submission.ValidationRuns = append(submission.ValidationRuns, newRun)
+	submission.UpdatedAt = runtime.now()
+	if err := runtime.Repository.CreateValidationRetry(ctx, submission, newRun); err != nil {
+		return domain.Submission{}, err
+	}
+	return submission.PublicProjection(), nil
+}

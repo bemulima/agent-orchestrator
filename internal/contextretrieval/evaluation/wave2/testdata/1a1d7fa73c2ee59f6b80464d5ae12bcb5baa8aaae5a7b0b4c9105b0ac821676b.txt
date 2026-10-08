@@ -1,0 +1,154 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+func (store Store) GetPublishedGoalGraph(ctx context.Context, goalCode string) (domain.GoalGraph, error) {
+	return store.getPublishedGoalGraph(ctx, `
+SELECT goal_code, version, title, description, graph_version
+FROM learning_goal_version
+WHERE goal_code=$1 AND status='PUBLISHED'`, goalCode)
+}
+
+func (store Store) GetPublishedGoalGraphExact(
+	ctx context.Context,
+	goalCode string,
+	goalVersion string,
+	graphVersion string,
+) (domain.GoalGraph, error) {
+	return store.getPublishedGoalGraph(ctx, `
+SELECT goal_code, version, title, description, graph_version
+FROM learning_goal_version
+WHERE goal_code=$1 AND version=$2 AND graph_version=$3 AND status='PUBLISHED'`, goalCode, goalVersion, graphVersion)
+}
+
+func (store Store) getPublishedGoalGraph(ctx context.Context, goalQuery string, goalArgs ...any) (domain.GoalGraph, error) {
+	var graph domain.GoalGraph
+	err := store.Pool.QueryRow(ctx, goalQuery, goalArgs...).Scan(
+		&graph.Goal.Code, &graph.Goal.Version, &graph.Goal.Title,
+		&graph.Goal.Description, &graph.Goal.GraphVersion,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.GoalGraph{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.GoalGraph{}, err
+	}
+	rows, err := store.Pool.Query(ctx, `
+SELECT gt.target_type, gt.target_key, gt.target_version, target.title, target.description,
+       gt.module_code, gt.module_title, gt.module_order,
+       gt.section_code, gt.section_title, gt.section_order,
+       gt.lesson_code, gt.lesson_title, gt.lesson_excerpt, gt.lesson_order
+FROM learning_goal_target gt
+JOIN learning_target target
+  ON target.target_type=gt.target_type
+ AND target.target_key=gt.target_key
+ AND target.target_version=gt.target_version
+WHERE gt.goal_code=$1 AND gt.goal_version=$2
+ORDER BY gt.module_order, gt.section_order, gt.lesson_order,
+         gt.target_type, gt.target_key, gt.target_version`, graph.Goal.Code, graph.Goal.Version)
+	if err != nil {
+		return domain.GoalGraph{}, err
+	}
+	defer rows.Close()
+	graph.Targets = make([]domain.LearningTarget, 0)
+	targetIndexes := make(map[string]int)
+	for rows.Next() {
+		var target domain.LearningTarget
+		if err := rows.Scan(
+			&target.Ref.Type, &target.Ref.Key, &target.Ref.Version, &target.Title, &target.Description,
+			&target.ModuleCode, &target.ModuleTitle, &target.ModuleOrder,
+			&target.SectionCode, &target.SectionTitle, &target.SectionOrder,
+			&target.LessonCode, &target.LessonTitle, &target.LessonExcerpt, &target.LessonOrder,
+		); err != nil {
+			return domain.GoalGraph{}, err
+		}
+		targetIndexes[domain.TargetIdentity(target.Ref)] = len(graph.Targets)
+		graph.Targets = append(graph.Targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.GoalGraph{}, err
+	}
+	prerequisiteRows, err := store.Pool.Query(ctx, `
+SELECT prerequisite.target_type, prerequisite.target_key, prerequisite.target_version,
+       prerequisite.prerequisite_type, prerequisite.prerequisite_key, prerequisite.prerequisite_version
+FROM target_prerequisite prerequisite
+JOIN learning_goal_target gt
+  ON gt.target_type=prerequisite.target_type
+ AND gt.target_key=prerequisite.target_key
+ AND gt.target_version=prerequisite.target_version
+WHERE gt.goal_code=$1 AND gt.goal_version=$2
+ORDER BY prerequisite.target_type, prerequisite.target_key, prerequisite.target_version,
+         prerequisite.prerequisite_type, prerequisite.prerequisite_key, prerequisite.prerequisite_version`,
+		graph.Goal.Code, graph.Goal.Version,
+	)
+	if err != nil {
+		return domain.GoalGraph{}, err
+	}
+	defer prerequisiteRows.Close()
+	for prerequisiteRows.Next() {
+		var target, prerequisite domain.TargetRef
+		if err := prerequisiteRows.Scan(
+			&target.Type, &target.Key, &target.Version,
+			&prerequisite.Type, &prerequisite.Key, &prerequisite.Version,
+		); err != nil {
+			return domain.GoalGraph{}, err
+		}
+		index, exists := targetIndexes[domain.TargetIdentity(target)]
+		if !exists {
+			return domain.GoalGraph{}, domain.ErrValidation
+		}
+		graph.Targets[index].Prerequisites = append(graph.Targets[index].Prerequisites, prerequisite)
+	}
+	if err := prerequisiteRows.Err(); err != nil {
+		return domain.GoalGraph{}, err
+	}
+	transitionRows, err := store.Pool.Query(ctx, `
+SELECT transition.source_stack, transition.target_type, transition.target_key,
+       transition.target_version, transition.similarity, transition.difference,
+       transition.analogy_boundary, transition.common_mistakes_json
+FROM transition_knowledge transition
+JOIN learning_goal_target gt
+  ON gt.target_type=transition.target_type
+ AND gt.target_key=transition.target_key
+ AND gt.target_version=transition.target_version
+WHERE gt.goal_code=$1 AND gt.goal_version=$2
+ORDER BY transition.source_stack, transition.target_type, transition.target_key, transition.target_version`,
+		graph.Goal.Code, graph.Goal.Version,
+	)
+	if err != nil {
+		return domain.GoalGraph{}, err
+	}
+	defer transitionRows.Close()
+	graph.Transitions = make([]domain.TransitionKnowledge, 0)
+	for transitionRows.Next() {
+		var transition domain.TransitionKnowledge
+		var mistakesJSON []byte
+		if err := transitionRows.Scan(
+			&transition.SourceStack, &transition.Target.Type, &transition.Target.Key,
+			&transition.Target.Version, &transition.Similarity, &transition.Difference,
+			&transition.AnalogyBoundary, &mistakesJSON,
+		); err != nil {
+			return domain.GoalGraph{}, err
+		}
+		if err := json.Unmarshal(mistakesJSON, &transition.CommonMistakes); err != nil {
+			return domain.GoalGraph{}, fmt.Errorf("%w: invalid transition common mistakes: %v", domain.ErrValidation, err)
+		}
+		graph.Transitions = append(graph.Transitions, transition)
+	}
+	if err := transitionRows.Err(); err != nil {
+		return domain.GoalGraph{}, err
+	}
+	return domain.NormalizeGoalGraph(graph)
+}
+
+var _ repository.GoalGraphRepository = Store{}
+var _ repository.ReadinessGoalGraphRepository = Store{}

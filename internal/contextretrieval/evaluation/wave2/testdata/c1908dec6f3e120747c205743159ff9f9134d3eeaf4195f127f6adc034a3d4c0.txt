@@ -1,0 +1,432 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+const projectAuthoringColumns = `id, student_id, learning_path_id, idempotency_key, request_hash, status, version,
+learning_path_version, path_snapshot_digest, authoring_profile_version, authoring_profile_digest,
+goal_code, input_json, authoring_request_json, authoring_input_digest,
+confirmation_idempotency_key, confirmation_digest, confirmed_at, tz_authoring_job_id, tz_job_status,
+ready_blueprint_digest, ready_candidate_digest, ready_contract_digest, ready_capabilities_digest, ready_verification_digest, ready_at,
+publication_idempotency_key, publication_request_digest, publication_requested_at, publication_receipt_json, publication_receipt_digest, published_at,
+failure_code, attempts, claim_token, lease_until, next_attempt_at, created_at, updated_at, staging_receipt_json`
+
+func (store Store) CreateOrGetProjectAuthoringFlow(ctx context.Context, flow domain.ProjectAuthoringFlow) (domain.ProjectAuthoringFlow, bool, error) {
+	flow, err := domain.NormalizeProjectAuthoringFlow(flow)
+	if err != nil || flow.Status != domain.ProjectAuthoringProposed {
+		return domain.ProjectAuthoringFlow{}, false, domain.ErrValidation
+	}
+	// The partial immutable-snapshot index and idempotency-key index are both
+	// intentional conflict targets. PostgreSQL cannot name both in one ON
+	// CONFLICT target, so DO NOTHING is followed by an exact identity re-read.
+	// Other constraint failures are still returned by INSERT unchanged.
+	row := store.Pool.QueryRow(ctx, `
+INSERT INTO project_authoring_flow(
+    id, student_id, learning_path_id, idempotency_key, request_hash, status, version,
+    learning_path_version, path_snapshot_digest, authoring_profile_version, authoring_profile_digest,
+    goal_code, input_json, authoring_request_json, authoring_input_digest,
+    attempts, next_attempt_at, created_at, updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+ON CONFLICT DO NOTHING
+RETURNING `+projectAuthoringColumns,
+		flow.ID, flow.StudentID, flow.LearningPathID, flow.IdempotencyKey, flow.RequestHash, flow.Status, flow.Version,
+		flow.LearningPathVersion, flow.PathSnapshotDigest, flow.AuthoringProfileVersion, flow.AuthoringProfileDigest,
+		flow.GoalCode, mustJSON(flow.Input), mustJSON(flow.AuthoringRequest), flow.AuthoringInputDigest,
+		flow.Attempts, flow.NextAttemptAt, flow.CreatedAt, flow.UpdatedAt,
+	)
+	stored, err := getProjectAuthoringFlow(row)
+	if err == nil {
+		return stored, true, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	// Preserve the original idempotency identity if a concurrent same-key
+	// request won. The command layer validates it as an exact replay.
+	stored, err = store.GetProjectAuthoringFlowByKey(ctx, flow.StudentID, flow.IdempotencyKey)
+	if err == nil {
+		return stored, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	// A distinct key for this immutable owner snapshot converges on the winner.
+	stored, err = store.GetCurrentProjectAuthoringFlow(ctx, flow.StudentID, flow.LearningPathID,
+		flow.LearningPathVersion, flow.PathSnapshotDigest, flow.AuthoringProfileVersion, flow.AuthoringProfileDigest)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	return stored, false, nil
+}
+
+func (store Store) GetProjectAuthoringFlow(ctx context.Context, studentID, flowID string) (domain.ProjectAuthoringFlow, error) {
+	return getProjectAuthoringFlow(store.Pool.QueryRow(ctx,
+		`SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE id=$1 AND student_id=$2`, flowID, studentID,
+	))
+}
+
+func (store Store) GetProjectAuthoringFlowByKey(ctx context.Context, studentID, idempotencyKey string) (domain.ProjectAuthoringFlow, error) {
+	return getProjectAuthoringFlow(store.Pool.QueryRow(ctx,
+		`SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE student_id=$1 AND idempotency_key=$2`, studentID, idempotencyKey,
+	))
+}
+
+func (store Store) GetCurrentProjectAuthoringFlow(
+	ctx context.Context, studentID, learningPathID string, learningPathVersion int64, pathSnapshotDigest string,
+	authoringProfileVersion int64, authoringProfileDigest string,
+) (domain.ProjectAuthoringFlow, error) {
+	return getProjectAuthoringFlow(store.Pool.QueryRow(ctx, `SELECT `+projectAuthoringColumns+`
+FROM project_authoring_flow
+WHERE student_id=$1 AND learning_path_id=$2 AND learning_path_version=$3 AND path_snapshot_digest=$4
+  AND authoring_profile_version=$5 AND authoring_profile_digest=$6 AND status <> 'FAILED'`,
+		studentID, learningPathID, learningPathVersion, pathSnapshotDigest, authoringProfileVersion, authoringProfileDigest,
+	))
+}
+
+func (store Store) ConfirmProjectAuthoringFlow(
+	ctx context.Context, studentID, flowID, key, digest string, now time.Time,
+) (domain.ProjectAuthoringFlow, error) {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	flow, err := getProjectAuthoringFlow(tx.QueryRow(ctx,
+		`SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE id=$1 AND student_id=$2 FOR UPDATE`, flowID, studentID,
+	))
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if flow.ConfirmationIdempotencyKey != "" {
+		if flow.ConfirmationIdempotencyKey != key || flow.ConfirmationDigest != digest {
+			return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ProjectAuthoringFlow{}, err
+		}
+		return flow, nil
+	}
+	if flow.Status != domain.ProjectAuthoringProposed {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE project_authoring_flow
+SET status='CONFIRMED', confirmation_idempotency_key=$1, confirmation_digest=$2,
+    confirmed_at=$3, next_attempt_at=$3, version=version+1, updated_at=$3
+WHERE id=$4 AND student_id=$5 AND version=$6 AND status='PROPOSED'`, key, digest, now, flowID, studentID, flow.Version)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	stored, err := getProjectAuthoringFlow(tx.QueryRow(ctx, `SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE id=$1`, flowID))
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	return stored, nil
+}
+
+func (store Store) RequestProjectPublication(
+	ctx context.Context, studentID, flowID, key, digest string, now time.Time,
+) (domain.ProjectAuthoringFlow, error) {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	flow, err := getProjectAuthoringFlow(tx.QueryRow(ctx,
+		`SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE id=$1 AND student_id=$2 FOR UPDATE`, flowID, studentID,
+	))
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if flow.PublicationIdempotencyKey != "" {
+		if flow.PublicationIdempotencyKey != key || flow.PublicationRequestDigest != digest {
+			return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ProjectAuthoringFlow{}, err
+		}
+		return flow, nil
+	}
+	if flow.Status != domain.ProjectAuthoringReady {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE project_authoring_flow
+SET publication_idempotency_key=$1, publication_request_digest=$2, publication_requested_at=$3,
+    next_attempt_at=$3, version=version+1, updated_at=$3
+WHERE id=$4 AND student_id=$5 AND version=$6 AND status='READY' AND publication_requested_at IS NULL`,
+		key, digest, now, flowID, studentID, flow.Version)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	stored, err := getProjectAuthoringFlow(tx.QueryRow(ctx, `SELECT `+projectAuthoringColumns+` FROM project_authoring_flow WHERE id=$1`, flowID))
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	return stored, nil
+}
+
+func (store Store) ClaimNextProjectAuthoringFlow(
+	ctx context.Context, token string, now, leaseUntil time.Time,
+) (domain.ProjectAuthoringFlow, error) {
+	flow, err := getProjectAuthoringFlow(store.Pool.QueryRow(ctx, `
+WITH candidate AS (
+    SELECT id
+    FROM project_authoring_flow
+    WHERE (status IN ('CONFIRMED','AUTHORING') OR (status='READY' AND publication_requested_at IS NOT NULL))
+      AND next_attempt_at <= $2 AND (lease_until IS NULL OR lease_until <= $2)
+    ORDER BY next_attempt_at, created_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE project_authoring_flow AS flow
+SET status=CASE WHEN flow.status='CONFIRMED' THEN 'AUTHORING' ELSE flow.status END,
+    claim_token=$1, lease_until=$3, attempts=flow.attempts+1,
+    version=flow.version+1, updated_at=$2
+FROM candidate
+WHERE flow.id=candidate.id
+RETURNING `+prefixedProjectAuthoringColumns("flow"), token, now, leaseUntil))
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	return flow, err
+}
+
+func (store Store) RenewProjectAuthoringClaim(
+	ctx context.Context, flowID, token string, version int64, now, leaseUntil time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE project_authoring_flow
+SET lease_until=$5, updated_at=$4
+WHERE id=$1 AND claim_token=$2 AND version=$3
+  AND (status='AUTHORING' OR (status='READY' AND publication_requested_at IS NOT NULL))`,
+		flowID, token, version, now, leaseUntil)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) CheckpointTZAuthoringJob(
+	ctx context.Context, flow domain.ProjectAuthoringFlow, token, jobID string, status domain.TZAuthoringJobStatus, now time.Time,
+) (domain.ProjectAuthoringFlow, error) {
+	stored, err := getProjectAuthoringFlow(store.Pool.QueryRow(ctx, `
+UPDATE project_authoring_flow
+SET tz_authoring_job_id=COALESCE(tz_authoring_job_id,$1), tz_job_status=$2,
+    version=version+1, updated_at=$3
+WHERE id=$4 AND status='AUTHORING' AND claim_token=$5 AND version=$6
+  AND (tz_authoring_job_id IS NULL OR tz_authoring_job_id=$1)
+RETURNING `+projectAuthoringColumns, jobID, status, now, flow.ID, token, flow.Version))
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	return stored, nil
+}
+
+func (store Store) MarkProjectAuthoringStaged(
+	ctx context.Context, flow domain.ProjectAuthoringFlow, token string, job domain.TZAuthoringJob, now time.Time,
+) error {
+	if domain.ValidateTZAuthoringJob(job) != nil || job.Status != domain.TZAuthoringStaged || job.Staging == nil {
+		return domain.ErrValidation
+	}
+	command, err := store.Pool.Exec(ctx, `
+UPDATE project_authoring_flow
+SET status='STAGED', tz_job_status='STAGED', ready_blueprint_digest=$1,
+    ready_candidate_digest=$2, ready_contract_digest=$3, ready_capabilities_digest=$4,
+    ready_verification_digest=$5, ready_at=$6, claim_token=NULL, lease_until=NULL,
+    version=version+1, updated_at=$6, staging_receipt_json=$11
+WHERE id=$7 AND status='AUTHORING' AND claim_token=$8 AND version=$9 AND tz_authoring_job_id=$10`,
+		job.BlueprintDigest, job.CandidateDigest, job.ContractDigest, job.CapabilitiesDigest,
+		job.VerificationDigest, now, flow.ID, token, flow.Version, job.ID, mustJSON(job.Staging))
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) MarkProjectAuthoringPublished(
+	ctx context.Context, flow domain.ProjectAuthoringFlow, token string, receipt domain.ProjectPublicationReceiptV1, digest string, now time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE project_authoring_flow
+SET status='PUBLISHED', publication_receipt_json=$1, publication_receipt_digest=$2,
+    published_at=$3, claim_token=NULL, lease_until=NULL, version=version+1, updated_at=$3
+WHERE id=$4 AND status='READY' AND publication_requested_at IS NOT NULL
+  AND claim_token=$5 AND version=$6 AND tz_authoring_job_id=$7`,
+		mustJSON(receipt), digest, now, flow.ID, token, flow.Version, flow.TZAuthoringJobID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) RetryProjectAuthoring(
+	ctx context.Context, flow domain.ProjectAuthoringFlow, token string, nextAttemptAt, now time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE project_authoring_flow
+SET claim_token=NULL, lease_until=NULL, next_attempt_at=$1, version=version+1, updated_at=$2
+WHERE id=$3 AND claim_token=$4 AND version=$5
+  AND (status='AUTHORING' OR (status='READY' AND publication_requested_at IS NOT NULL))`,
+		nextAttemptAt, now, flow.ID, token, flow.Version)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) FailProjectAuthoring(
+	ctx context.Context, flow domain.ProjectAuthoringFlow, token, failureCode string, now time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE project_authoring_flow
+SET status='FAILED', failure_code=$1, claim_token=NULL, lease_until=NULL,
+    version=version+1, updated_at=$2
+WHERE id=$3 AND claim_token=$4 AND version=$5
+  AND (status='AUTHORING' OR (status='READY' AND publication_requested_at IS NOT NULL))`,
+		failureCode, now, flow.ID, token, flow.Version)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+type projectAuthoringRow interface{ Scan(...any) error }
+
+func getProjectAuthoringFlow(row projectAuthoringRow) (domain.ProjectAuthoringFlow, error) {
+	flow, err := scanProjectAuthoringFlow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	return flow, err
+}
+
+func scanProjectAuthoringFlow(row projectAuthoringRow) (domain.ProjectAuthoringFlow, error) {
+	var flow domain.ProjectAuthoringFlow
+	var inputJSON, requestJSON, publicationJSON, stagingJSON []byte
+	var confirmationKey, confirmationDigest, tzJobID, tzStatus sql.NullString
+	var readyBlueprint, readyCandidate, readyContract, readyCapabilities, readyVerification sql.NullString
+	var publicationKey, publicationRequestDigest, publicationReceiptDigest, claimToken sql.NullString
+	var confirmedAt, readyAt, publicationRequestedAt, publishedAt, leaseUntil sql.NullTime
+	if err := row.Scan(
+		&flow.ID, &flow.StudentID, &flow.LearningPathID, &flow.IdempotencyKey, &flow.RequestHash, &flow.Status, &flow.Version,
+		&flow.LearningPathVersion, &flow.PathSnapshotDigest, &flow.AuthoringProfileVersion, &flow.AuthoringProfileDigest,
+		&flow.GoalCode, &inputJSON, &requestJSON, &flow.AuthoringInputDigest,
+		&confirmationKey, &confirmationDigest, &confirmedAt, &tzJobID, &tzStatus,
+		&readyBlueprint, &readyCandidate, &readyContract, &readyCapabilities, &readyVerification, &readyAt,
+		&publicationKey, &publicationRequestDigest, &publicationRequestedAt, &publicationJSON, &publicationReceiptDigest, &publishedAt,
+		&flow.FailureCode, &flow.Attempts, &claimToken, &leaseUntil, &flow.NextAttemptAt, &flow.CreatedAt, &flow.UpdatedAt,
+		&stagingJSON,
+	); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if err := strictUnmarshal(inputJSON, &flow.Input); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if err := strictUnmarshal(requestJSON, &flow.AuthoringRequest); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	flow.ConfirmationIdempotencyKey, flow.ConfirmationDigest = nullableString(confirmationKey), nullableString(confirmationDigest)
+	flow.TZAuthoringJobID = nullableString(tzJobID)
+	if tzStatus.Valid {
+		flow.TZJobStatus = domain.TZAuthoringJobStatus(tzStatus.String)
+	}
+	flow.ReadyBlueprintDigest, flow.ReadyCandidateDigest = nullableString(readyBlueprint), nullableString(readyCandidate)
+	flow.ReadyContractDigest, flow.ReadyCapabilitiesDigest = nullableString(readyContract), nullableString(readyCapabilities)
+	flow.ReadyVerificationDigest = nullableString(readyVerification)
+	flow.PublicationIdempotencyKey, flow.PublicationRequestDigest = nullableString(publicationKey), nullableString(publicationRequestDigest)
+	flow.PublicationReceiptDigest, flow.ClaimToken = nullableString(publicationReceiptDigest), nullableString(claimToken)
+	flow.ConfirmedAt, flow.ReadyAt = nullableTime(confirmedAt), nullableTime(readyAt)
+	flow.PublicationRequestedAt, flow.PublishedAt, flow.LeaseUntil = nullableTime(publicationRequestedAt), nullableTime(publishedAt), nullableTime(leaseUntil)
+	if len(publicationJSON) > 0 {
+		var receipt domain.ProjectPublicationReceiptV1
+		if err := strictUnmarshal(publicationJSON, &receipt); err != nil {
+			return domain.ProjectAuthoringFlow{}, err
+		}
+		flow.Publication = &receipt
+	}
+	if len(stagingJSON) > 0 {
+		var receipt domain.ProjectStagingReceiptV1
+		if err := strictUnmarshal(stagingJSON, &receipt); err != nil {
+			return domain.ProjectAuthoringFlow{}, err
+		}
+		flow.Staging = &receipt
+	}
+	return domain.NormalizeProjectAuthoringFlow(flow)
+}
+
+func strictUnmarshal(raw []byte, output any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+func nullableString(value sql.NullString) string {
+	if value.Valid {
+		return value.String
+	}
+	return ""
+}
+
+func nullableTime(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	result := value.Time.UTC()
+	return &result
+}
+
+func prefixedProjectAuthoringColumns(prefix string) string {
+	columns := strings.Split(projectAuthoringColumns, ",")
+	for index := range columns {
+		columns[index] = prefix + "." + strings.TrimSpace(columns[index])
+	}
+	return strings.Join(columns, ", ")
+}
+
+var _ repository.ProjectAuthoringFlowRepository = Store{}

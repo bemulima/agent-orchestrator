@@ -1,0 +1,152 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+func committedMessage() *natsgo.Msg {
+	planID := "11111111-1111-4111-8111-111111111111"
+	event := domain.DiagnosticResultCommittedEvent{EventID: domain.DiagnosticResultCommittedEventID(planID), EventType: domain.SubjectDiagnosticResultCommitted, CorrelationID: planID, CausationID: "22222222-2222-4222-8222-222222222222", StudentID: "33333333-3333-4333-8333-333333333333", OccurredAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), SchemaVersion: 1, Data: domain.DiagnosticResultCommittedData{PlanID: planID, PlanRevision: 1, PlanDigest: "sha256:" + strings.Repeat("a", 64), ResultDigest: "sha256:" + strings.Repeat("b", 64)}}
+	message := natsgo.NewMsg(domain.SubjectDiagnosticResultCommitted)
+	message.Sub = &natsgo.Subscription{}
+	message.Reply = "$JS.ACK." + DiagnosticResultStream + "." + DiagnosticPlacementDurable + ".1.1.1.1700000000000000000.0"
+	message.Data, _ = json.Marshal(event)
+	for key, value := range map[string]string{"X-Event-ID": event.EventID, "X-Correlation-ID": event.CorrelationID, "X-Causation-ID": event.CausationID, "X-Schema-Version": "1", natsgo.MsgIdHdr: event.EventID} {
+		message.Header.Set(key, value)
+	}
+	return message
+}
+
+type recordingDelivery struct {
+	ack, term, nak   int
+	delay            time.Duration
+	commit           *bool
+	ackedAfterCommit bool
+}
+
+func (d *recordingDelivery) AckSync(...natsgo.AckOpt) error {
+	d.ack++
+	d.ackedAfterCommit = d.commit != nil && *d.commit
+	return nil
+}
+func (d *recordingDelivery) Term(...natsgo.AckOpt) error { d.term++; return nil }
+func (d *recordingDelivery) NakWithDelay(delay time.Duration, _ ...natsgo.AckOpt) error {
+	d.nak++
+	d.delay = delay
+	return nil
+}
+
+type recordingCommittedProcessor struct {
+	calls     int
+	committed bool
+	err       error
+}
+
+func (p *recordingCommittedProcessor) ProcessCommittedResult(context.Context, domain.DiagnosticResultCommittedEvent) (domain.DiagnosticPlacement, bool, error) {
+	p.calls++
+	if p.err != nil {
+		return domain.DiagnosticPlacement{}, false, p.err
+	}
+	p.committed = true
+	return domain.DiagnosticPlacement{}, true, nil
+}
+
+func TestCommittedMessageAckOnlyAfterSuccessfulProcessor(t *testing.T) {
+	processor := &recordingCommittedProcessor{}
+	delivery := &recordingDelivery{commit: &processor.committed}
+	if err := handleDiagnosticResultDelivery(context.Background(), committedMessage(), processor, delivery); err != nil || !delivery.ackedAfterCommit || delivery.ack != 1 || delivery.term != 0 || delivery.nak != 0 {
+		t.Fatalf("delivery=%#v err=%v", delivery, err)
+	}
+}
+
+func TestCommittedMessageInvalidTermAndTransientRetry(t *testing.T) {
+	for _, err := range []error{domain.ErrValidation, domain.ErrConflict, domain.ErrForbidden, domain.ErrUpstreamUnavailable, domain.ErrNotFound, errors.New("database unavailable")} {
+		t.Run(err.Error(), func(t *testing.T) {
+			processor := &recordingCommittedProcessor{err: err}
+			delivery := &recordingDelivery{}
+			if got := handleDiagnosticResultDelivery(context.Background(), committedMessage(), processor, delivery); !errors.Is(got, err) || delivery.ack != 0 {
+				t.Fatalf("delivery=%#v err=%v", delivery, got)
+			}
+			invalid := errors.Is(err, domain.ErrValidation) || errors.Is(err, domain.ErrConflict) || errors.Is(err, domain.ErrForbidden)
+			if invalid && (delivery.term != 1 || delivery.nak != 0) || !invalid && (delivery.nak != 1 || delivery.term != 0 || delivery.delay != 2*time.Second) {
+				t.Fatalf("delivery=%#v", delivery)
+			}
+		})
+	}
+}
+
+func TestCommittedMessageStrictHeadersNoDispatchForMalformed(t *testing.T) {
+	for _, name := range []string{"subject", "missing", "duplicate", "case_duplicate", "mismatch", "schema", "causation", "message_id", "unknown_body", "oversized_header", "too_many_header_values", "wrong_stream", "wrong_durable", "missing_metadata"} {
+		t.Run(name, func(t *testing.T) {
+			message := committedMessage()
+			switch name {
+			case "wrong_stream":
+				message.Reply = strings.Replace(message.Reply, DiagnosticResultStream, "WRONG_STREAM", 1)
+			case "wrong_durable":
+				message.Reply = strings.Replace(message.Reply, DiagnosticPlacementDurable, "wrong-durable", 1)
+			case "missing_metadata":
+				message.Reply = ""
+			case "subject":
+				message.Subject = "student.diagnostic-result.committed.v2"
+			case "missing":
+				message.Header.Del("X-Event-ID")
+			case "duplicate":
+				message.Header.Add("X-Event-ID", message.Header.Get("X-Event-ID"))
+			case "case_duplicate":
+				message.Header["x-event-id"] = []string{message.Header.Get("X-Event-ID")}
+			case "mismatch":
+				message.Header.Set("X-Correlation-ID", "wrong")
+			case "schema":
+				message.Header.Set("X-Schema-Version", "01")
+			case "causation":
+				message.Header.Del("X-Causation-ID")
+			case "message_id":
+				message.Header.Set(natsgo.MsgIdHdr, "wrong")
+			case "oversized_header":
+				message.Header.Set("X-Extra", strings.Repeat("a", 8193))
+			case "too_many_header_values":
+				message.Header["X-Extra"] = make([]string, 65)
+			case "unknown_body":
+				message.Data = []byte(strings.Replace(string(message.Data), `"plan_revision":1`, `"plan_revision":1,"score":100`, 1))
+			}
+			processor := &recordingCommittedProcessor{}
+			delivery := &recordingDelivery{}
+			if err := handleDiagnosticResultDelivery(context.Background(), message, processor, delivery); !errors.Is(err, domain.ErrValidation) || processor.calls != 0 || delivery.term != 1 || delivery.ack != 0 || delivery.nak != 0 {
+				t.Fatalf("calls=%d delivery=%#v err=%v", processor.calls, delivery, err)
+			}
+		})
+	}
+}
+
+func TestCommittedStreamAndDurableAdmission(t *testing.T) {
+	stream := natsgo.StreamConfig{Name: DiagnosticResultStream, Subjects: []string{domain.SubjectDiagnosticResultCommitted}, Retention: natsgo.WorkQueuePolicy, Storage: natsgo.FileStorage, MaxAge: 0, MaxMsgs: -1, MaxBytes: 1 << 30, Discard: natsgo.DiscardNew, Replicas: 1, Duplicates: 10 * time.Minute}
+	if err := validateDiagnosticResultStream(stream); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*natsgo.StreamConfig){func(c *natsgo.StreamConfig) { c.MaxAge = time.Hour }, func(c *natsgo.StreamConfig) { c.Subjects = append(c.Subjects, "student.>") }, func(c *natsgo.StreamConfig) { c.Discard = natsgo.DiscardOld }, func(c *natsgo.StreamConfig) { c.Retention = natsgo.LimitsPolicy }} {
+		changed := stream
+		mutate(&changed)
+		if validateDiagnosticResultStream(changed) == nil {
+			t.Fatal("unsafe stream accepted")
+		}
+	}
+	durable := natsgo.ConsumerConfig{Durable: DiagnosticPlacementDurable, FilterSubject: domain.SubjectDiagnosticResultCommitted, DeliverPolicy: natsgo.DeliverAllPolicy, AckPolicy: natsgo.AckExplicitPolicy, MaxDeliver: -1, AckWait: 30 * time.Second, MaxAckPending: 1}
+	if err := validateDiagnosticResultConsumer(durable); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*natsgo.ConsumerConfig){func(c *natsgo.ConsumerConfig) { c.MaxDeliver = 5 }, func(c *natsgo.ConsumerConfig) { c.AckPolicy = natsgo.AckNonePolicy }, func(c *natsgo.ConsumerConfig) { c.DeliverPolicy = natsgo.DeliverNewPolicy }, func(c *natsgo.ConsumerConfig) { c.FilterSubject = "student.>" }} {
+		changed := durable
+		mutate(&changed)
+		if validateDiagnosticResultConsumer(changed) == nil {
+			t.Fatal("unsafe durable accepted")
+		}
+	}
+}

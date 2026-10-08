@@ -1,0 +1,113 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	service "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+// PlacementConsumer converts only Student's authoritative aggregate placement
+// result to a fixed future-planning route. It has no Student/Course mutation port.
+type PlacementConsumer struct {
+	Plans      repository.DiagnosticAssessmentPlanRepository
+	Placements repository.DiagnosticPlacementRepository
+	Students   service.DiagnosticAssessmentStudentService
+	Clock      Clock
+}
+
+func (c PlacementConsumer) Get(ctx context.Context, studentID, planID string) (domain.DiagnosticPlacement, error) {
+	if c.Plans == nil || c.Placements == nil || !canonicalUUID(studentID) || !canonicalUUID(planID) {
+		return domain.DiagnosticPlacement{}, domain.ErrValidation
+	}
+	plan, err := c.Plans.GetDiagnosticByID(ctx, planID)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, err
+	}
+	if domain.ValidateDiagnosticPlan(plan.Plan) != nil {
+		return domain.DiagnosticPlacement{}, domain.ErrValidation
+	}
+	if plan.Plan.StudentID != studentID {
+		return domain.DiagnosticPlacement{}, domain.ErrNotFound
+	}
+	stored, err := c.Placements.GetDiagnosticPlacement(ctx, planID)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, err
+	}
+	if domain.ValidateStoredDiagnosticPlacement(stored.Decision, plan.Plan, stored.RequestID, stored.RequestHash, stored.Decision.DecisionDigest) != nil {
+		return domain.DiagnosticPlacement{}, domain.ErrValidation
+	}
+	return stored.Decision, nil
+}
+
+func (c PlacementConsumer) Consume(ctx context.Context, studentID, planID, key string, input domain.DiagnosticPlacementConsumeRequest) (domain.DiagnosticPlacement, bool, error) {
+	if c.Plans == nil || c.Placements == nil || c.Students == nil || c.Clock == nil || !canonicalUUID(studentID) || !canonicalUUID(planID) || key != planID || domain.NormalizeDiagnosticPlacementConsume(input) != nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	planRecord, err := c.Plans.GetDiagnosticByID(ctx, planID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticPlacement{}, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if domain.ValidateDiagnosticPlan(planRecord.Plan) != nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	if planRecord.Plan.StudentID != studentID {
+		return domain.DiagnosticPlacement{}, false, domain.ErrNotFound
+	}
+	requestHash, err := domain.DiagnosticPlacementConsumeHash(studentID, planID)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if stored, err := c.Placements.GetDiagnosticPlacement(ctx, planID); err == nil {
+		if stored.RequestHash != requestHash {
+			return domain.DiagnosticPlacement{}, false, domain.ErrConflict
+		}
+		if domain.ValidateStoredDiagnosticPlacement(stored.Decision, planRecord.Plan, stored.RequestID, stored.RequestHash, stored.Decision.DecisionDigest) != nil {
+			return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+		}
+		return stored.Decision, false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	result, err := c.Students.GetDiagnosticAssessmentResult(ctx, studentID, planID)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if domain.ValidateDiagnosticResult(result, planRecord.Plan) != nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrUpstreamInvalid
+	}
+	route, err := domain.DiagnosticPlacementRoute(result.Band)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrUpstreamInvalid
+	}
+	decision := domain.DiagnosticPlacement{
+		Schema: domain.DiagnosticPlacementSchemaV1, StudentID: result.StudentID, CourseID: result.CourseID,
+		CourseContentRevision: result.CourseContentRevision, PolicyVersion: result.PolicyVersion,
+		AttemptID: result.AttemptID, PlanID: result.PlanID, PlanRevision: result.PlanRevision,
+		Correct: result.Correct, Total: result.Total, Percent: result.Percent, Band: result.Band,
+		BandPolicyVersion: result.BandPolicyVersion, PlanDigest: result.PlanDigest, ResultDigest: result.ResultDigest,
+		ResultCompletedAt: result.CompletedAt, RouteCode: route, RoutePolicyVersion: domain.DiagnosticPlacementRoutePolicyV1,
+		DecidedAt: c.Clock.Now().UTC().Truncate(1000),
+	}
+	decision.DecisionDigest, err = domain.DiagnosticPlacementDigest(decision)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	record := domain.DiagnosticPlacementRecord{RequestID: planID, RequestHash: requestHash, Decision: decision}
+	stored, err := c.Placements.InsertDiagnosticPlacement(ctx, record)
+	if errors.Is(err, domain.ErrConflict) {
+		stored, err = c.Placements.GetDiagnosticPlacement(ctx, planID)
+	}
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if stored.RequestHash != requestHash || domain.ValidateStoredDiagnosticPlacement(stored.Decision, planRecord.Plan, stored.RequestID, stored.RequestHash, stored.Decision.DecisionDigest) != nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrConflict
+	}
+	return stored.Decision, true, nil
+}

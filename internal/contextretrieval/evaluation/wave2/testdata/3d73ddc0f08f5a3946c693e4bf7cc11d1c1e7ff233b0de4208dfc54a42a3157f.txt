@@ -1,0 +1,105 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+const maximumHybridApplicationResponseBytes = 64 << 10
+
+var _ domainservice.HybridStudentApplicationService = Client{}
+
+func (client Client) ApplyHybridConsequence(ctx context.Context, c domain.HybridConsequence) (domain.HybridApplicationReceipt, error) {
+	var result domain.HybridApplicationReceipt
+	if domain.ValidateHybridConsequence(c) != nil {
+		return result, domain.ErrValidation
+	}
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.WriteToken) == "" || client.HTTPClient == nil {
+		return result, domain.ErrUpstreamUnavailable
+	}
+	raw, err := json.Marshal(c)
+	if err != nil || len(raw) > domain.MaximumHybridSnapshotRequestBytes {
+		return result, domain.ErrValidation
+	}
+	endpoint := strings.TrimRight(client.BaseURL, "/") + "/internal/v1/students/" + url.PathEscape(c.StudentID) + "/learning-paths/" + url.PathEscape(c.LearningPathID) + "/hybrid-consequences"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return result, domain.ErrUpstreamUnavailable
+	}
+	request.Header.Set("X-Internal-Token", client.WriteToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.HTTPClient.Do(request)
+	if err != nil {
+		return result, domain.ErrUpstreamUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 500 {
+		return result, domain.ErrUpstreamUnavailable
+	}
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return result, domain.ErrUpstreamInvalid
+	}
+	raw, err = io.ReadAll(io.LimitReader(response.Body, maximumHybridApplicationResponseBytes+1))
+	if err != nil {
+		return result, domain.ErrUpstreamUnavailable
+	}
+	if len(raw) > maximumHybridApplicationResponseBytes || validateHybridJSONEnvelope(raw) != nil {
+		return result, domain.ErrUpstreamInvalid
+	}
+	if response.StatusCode != http.StatusOK {
+		var envelope struct {
+			Error string `json:"error"`
+		}
+		if decodeHybridApplicationJSON(raw, &envelope) != nil {
+			return result, domain.ErrUpstreamInvalid
+		}
+		switch {
+		case response.StatusCode == 409 && envelope.Error == "HYBRID_STALE":
+			return result, domain.ErrHybridApplicationStale
+		case response.StatusCode == 409 && envelope.Error == "HYBRID_INTENT_REQUIRED":
+			return result, domain.ErrHybridApplicationIntentRequired
+		case response.StatusCode == 409 && envelope.Error == "HYBRID_UNSAFE":
+			return result, domain.ErrHybridApplicationUnsafe
+		case response.StatusCode == 409 && envelope.Error == "HYBRID_CONFLICT":
+			return result, domain.ErrConflict
+		case response.StatusCode == 422 && envelope.Error == "HYBRID_UNSUPPORTED":
+			return result, domain.ErrHybridApplicationUnsupported
+		case response.StatusCode == 422 && envelope.Error == "HYBRID_INVALID":
+			return result, domain.ErrValidation
+		case response.StatusCode == 404 && envelope.Error == "HYBRID_NOT_FOUND":
+			return result, domain.ErrNotFound
+		case response.StatusCode == 403 && envelope.Error == "HYBRID_FORBIDDEN":
+			return result, domain.ErrForbidden
+		default:
+			return result, domain.ErrUpstreamInvalid
+		}
+	}
+	if decodeHybridApplicationJSON(raw, &result) != nil || domain.ValidateHybridApplicationReceipt(result, c) != nil {
+		return domain.HybridApplicationReceipt{}, domain.ErrUpstreamInvalid
+	}
+	return result, nil
+}
+
+func decodeHybridApplicationJSON(raw []byte, result any) error {
+	if validateHybridJSONShape(raw, reflect.TypeOf(result).Elem(), "") != nil {
+		return domain.ErrUpstreamInvalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(result) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.ErrUpstreamInvalid
+	}
+	return nil
+}

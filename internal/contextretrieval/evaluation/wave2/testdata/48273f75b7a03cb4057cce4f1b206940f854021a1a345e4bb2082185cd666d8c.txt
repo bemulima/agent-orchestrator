@@ -1,0 +1,399 @@
+//go:build integration
+
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+	runtimehttp "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+)
+
+type t12FeedbackSandboxFixture struct {
+	URL                string `json:"url"`
+	SandboxID          string `json:"sandbox_id"`
+	StudentID          string `json:"student_id"`
+	TaskInstanceID     string `json:"task_instance_id"`
+	TaskRevisionID     string `json:"task_revision_id"`
+	TaskRevisionDigest string `json:"task_revision_digest"`
+	GenerationID       string `json:"generation_id"`
+	WorkspaceDigest    string `json:"workspace_digest"`
+	Revision           uint64 `json:"revision"`
+}
+
+// Only root launches this explicitly gated fixture. Actual public Submit HTTP,
+// Runtime ProcessValidation, PG transactions, Sandbox HTTP/Tarantool/S3 pins,
+// production Orchestrator App HTTP and the HTML owner all participate. Start,
+// Catalog, Planner, Student and container provisioning are synthetic/absent.
+// It deliberately avoids new feedback Go types so original usecase overlays
+// reproduce the real pre-fix loss against the same real provider chain.
+func TestT12ServeDurableFeedbackHTTP(t *testing.T) {
+	if os.Getenv("T12_SERVE_RUNTIME") != "true" {
+		t.Skip("owned Runtime fixture gate absent")
+	}
+	fixturePath, ready, stop := os.Getenv("T12_SANDBOX_READY_FILE"), os.Getenv("T12_RUNTIME_READY_FILE"), os.Getenv("T12_RUNTIME_STOP_FILE")
+	actionFile, resultFile := os.Getenv("T12_RUNTIME_ACTION_FILE"), os.Getenv("T12_RUNTIME_RESULT_FILE")
+	sandboxToken, orchToken := os.Getenv("T12_SANDBOX_TOKEN"), os.Getenv("T12_ORCHESTRATOR_TOKEN")
+	internalToken, teacherToken := os.Getenv("T12_RUNTIME_TOKEN"), os.Getenv("T12_TEACHER_TOKEN")
+	orchURL := os.Getenv("T12_ORCHESTRATOR_URL")
+	if fixturePath == "" || ready == "" || stop == "" || actionFile == "" || resultFile == "" || sandboxToken == "" || orchToken == "" || internalToken == "" || teacherToken == "" || orchURL == "" || internalToken == teacherToken {
+		t.Fatal("missing or unscoped owned Runtime configuration")
+	}
+	if _, err := os.Stat(stop); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stop marker must be absent")
+	}
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal("safe Sandbox metadata unavailable")
+	}
+	var f t12FeedbackSandboxFixture
+	if json.Unmarshal(raw, &f) != nil || f.URL == "" || !domain.IsCanonicalUUID(f.StudentID) || !domain.IsCanonicalUUID(f.TaskInstanceID) || !domain.IsCanonicalUUID(f.TaskRevisionID) || f.GenerationID == "" || f.Revision != 0 {
+		t.Fatal("invalid actual genesis fixture")
+	}
+	repo, db := openTestRepository(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	instance := fixtureInstance()
+	instance.ID, instance.StudentID, instance.TaskRevisionID = f.TaskInstanceID, f.StudentID, f.TaskRevisionID
+	instance.TaskRevisionDigest = f.TaskRevisionDigest
+	instance.LearningActionID = t12FeedbackUUID(t)
+	instance.SolutionVariantID = t12FeedbackUUID(t)
+	instance.RevisionSummary = domain.RevisionSummary{Schema: "practice-task-revision-summary.v2", RevisionID: f.TaskRevisionID, Digest: f.TaskRevisionDigest, VariantID: instance.SolutionVariantID, FamilyKey: "t12-public-html", VariantKey: "public-feedback", RevisionNumber: 1, Surface: "practice", Title: "Public HTML feedback", Type: "BUILD", PublishedAt: now}
+	instance.RevisionEnvelope.Revision.ID = f.TaskRevisionID
+	instance.RevisionEnvelope.RevisionDigest = f.TaskRevisionDigest
+	instance.RevisionEnvelope.RuntimeContext = json.RawMessage(`{"code_structure_type_code":"html","compose_config":{}}`)
+	instance.RevisionEnvelope.EvaluationContext = json.RawMessage(`{"synthetic_frozen_revision":true,"private_canary":"T12_PRIVATE_VALIDATOR_CANARY"}`)
+	contract := json.RawMessage(`{"version":1,"kind":"workspace_contract","workspace":{"required_files":["index.html"]},"stages":[{"id":"html-main","engine":"html.dom","mode":"final","targets":{"files":["index.html"]},"rules":{"version":2,"body":{"roots":[{"tag":{"value":"main","errorMessage":"T12_PRIVATE_VALIDATOR_CANARY private evaluation reference"}}]}}}]}`)
+	instance.Steps = []domain.Step{}
+	for n := 1; n <= 2; n++ {
+		instance.Steps = append(instance.Steps, domain.Step{ID: t12FeedbackUUID(t), Title: fmt.Sprintf("Public HTML milestone %d", n), Objective: "Use the required public semantic HTML element", Deliverables: []string{"index.html"}, Acceptance: []domain.Acceptance{{ID: fmt.Sprintf("public-main-%d", n), Text: "The page uses a main element", EvidenceKind: "artifact"}}, MilestoneOrder: n, StepOrder: n, Required: true, Status: "AVAILABLE", Targets: []domain.Target{{Type: "concept", Key: "semantic-html", Version: "v1"}}, RuntimeProfile: instance.RevisionEnvelope.RuntimeContext, ValidationContract: contract, EvaluationAssets: domain.EvaluationAssets{TestSuiteRef: "asset://t12-public-html-inline"}, StarterFiles: []domain.WorkspaceFile{}})
+	}
+	instance.CurrentStep = &instance.Steps[0]
+	instance.Progress = domain.Progress{TotalSteps: 2}
+	routeSteps := []map[string]any{}
+	for _, step := range instance.Steps {
+		routeSteps = append(routeSteps, map[string]any{"step_id": step.ID, "ready": true, "requirements": []any{}})
+	}
+	routeJSON, _ := json.Marshal(routeSteps)
+	instance.LearningRoute = domain.LearningRouteReceipt{Schema: "student-task-learning-snapshot.v1", ID: t12FeedbackUUID(t), TaskInstanceID: instance.ID, TaskRevisionID: instance.TaskRevisionID, TaskRevisionDigest: instance.TaskRevisionDigest, StudentID: instance.StudentID, Locale: "en", PlannerVersion: "t12-synthetic-public-binding-v1", RouteDigest: "sha256:" + strings.Repeat("c", 64), Steps: routeJSON, CreatedAt: now}
+	instance.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: f.SandboxID, Available: true, GenerationID: f.GenerationID, WorkspaceDigest: f.WorkspaceDigest}
+	instance.Provisioning = domain.ProvisioningReceipts{StudentReserved: true, RouteResolved: true, WorkspaceCreated: true, StudentOpened: true}
+	instance, _, err = repo.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance, err = repo.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	newRuntime := func() *usecase.Runtime {
+		return &usecase.Runtime{Repository: NewRepository(db), Workspace: adapters.NewSandboxHTTPClient(f.URL, sandboxToken, client), Validator: adapters.NewValidationHTTPClient(orchURL, orchToken, client)}
+	}
+	var current atomic.Pointer[usecase.Runtime]
+	current.Store(newRuntime())
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		(&runtimehttp.Server{Runtime: current.Load(), InternalToken: internalToken, TeacherToken: teacherToken}).Handler().ServeHTTP(w, r)
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("owned Runtime listener unavailable")
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	defer server.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(listener) }()
+	baseURL := "http://" + listener.Addr().String()
+	call := func(method, url, actor, token, key string, input any, want int) json.RawMessage {
+		t.Helper()
+		var payload []byte
+		if input != nil {
+			payload, err = json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		request, e := http.NewRequest(method, url, bytes.NewReader(payload))
+		if e != nil {
+			t.Fatal("owned request encoding failed")
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if actor != "" {
+			request.Header.Set("X-User-ID", actor)
+			request.Header.Set("X-User-Role", "STUDENT")
+		}
+		if token != "" {
+			request.Header.Set("X-Internal-Token", token)
+		}
+		if key != "" {
+			request.Header.Set("Idempotency-Key", key)
+		}
+		response, e := client.Do(request)
+		if e != nil {
+			t.Fatal("actual HTTP chain request failed")
+		}
+		defer response.Body.Close()
+		body, e := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
+		if e != nil || len(body) > 4<<20 {
+			t.Fatal("bounded actual HTTP response failed")
+		}
+		if response.StatusCode != want {
+			t.Fatalf("actual HTTP %s status=%d want=%d", request.URL.Path, response.StatusCode, want)
+		}
+		if strings.Contains(string(body), "T12_PRIVATE_VALIDATOR_CANARY") || strings.Contains(string(body), "safe_summary") || strings.Contains(string(body), "evaluation_context") || strings.Contains(string(body), "validation_specification") {
+			t.Fatal("private payload leaked through HTTP")
+		}
+		return body
+	}
+	publicPath := baseURL + "/api/v2/task-instances/" + instance.ID
+	checkpoint := func() domain.Submission {
+		body := call(http.MethodPost, publicPath+"/steps/"+instance.Steps[0].ID+"/checkpoints", instance.StudentID, "", t12FeedbackUUID(t), map[string]string{"schema": domain.SubmitSchema, "scope": "MILESTONE", "milestone_id": instance.Steps[0].ID}, http.StatusAccepted)
+		var submission domain.Submission
+		if json.Unmarshal(body, &submission) != nil || len(submission.ValidationRuns) != 1 {
+			t.Fatal("real pending Submit response invalid")
+		}
+		return submission
+	}
+	process := func(submission domain.Submission, want domain.ValidationOutcome) domain.Submission {
+		t.Helper()
+		run := submission.ValidationRuns[len(submission.ValidationRuns)-1]
+		if err := current.Load().ProcessValidation(ctx, ports.PendingValidation{TaskInstanceID: instance.ID, StudentID: instance.StudentID, SubmissionID: submission.ID, RunID: run.ID}); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := NewRepository(db).GetSubmission(ctx, instance.ID, submission.ID)
+		if err != nil || loaded.ValidationRuns[len(loaded.ValidationRuns)-1].Outcome != want {
+			t.Fatalf("actual durable outcome want=%s err=%v", want, err)
+		}
+		return loaded
+	}
+	first := process(checkpoint(), domain.OutcomeFail)
+	if first.Snapshot.GenerationID != f.GenerationID || first.WorkspaceDigest != f.WorkspaceDigest {
+		t.Fatal("initial Submit did not pin actual genesis0")
+	}
+	firstPrivate, _ := json.Marshal(first)
+	firstPinned, err := current.Load().Workspace.ReadPinnedSnapshot(ctx, first.Snapshot)
+	if err != nil || len(firstPinned.Files) != 1 || firstPinned.Files[0].Path != "index.html" || !strings.Contains(firstPinned.Files[0].Content, "<div>") {
+		t.Fatal("actual retained failed pin missing")
+	}
+	proofs := map[string]any{"classification": "actual Runtime public Submit+ProcessValidation+PG → registered Sandbox HTTP/Tarantool/S3 → production App HTTP → actual HTML DI/parser/rules/HTTP; synthetic two-step frozen instance, route/bindings; no Start/container/Student/learner E2E", "first_submission_id": first.ID, "first_snapshot": first.Snapshot, "genesis_revision": f.Revision, "phases": map[string]any{}}
+	var schema string
+	if err = db.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	baseline := os.Getenv("T12_BASELINE_RED") == "true"
+	observe := func(phase string, submission domain.Submission) {
+		t.Helper()
+		public := call(http.MethodGet, publicPath+"/submissions/"+submission.ID, instance.StudentID, "", "", nil, http.StatusOK)
+		teacher := call(http.MethodGet, baseURL+"/internal/task-instances/"+instance.ID+"/teacher-validation-explanation?student_id="+instance.StudentID, "", teacherToken, "", nil, http.StatusOK)
+		var publicObject, teacherObject map[string]json.RawMessage
+		json.Unmarshal(public, &publicObject)
+		json.Unmarshal(teacher, &teacherObject)
+		var available bool
+		json.Unmarshal(teacherObject["available"], &available)
+		summary := publicObject["current_validation_summary"]
+		if baseline {
+			missing := (len(summary) == 0 || bytes.Equal(summary, []byte("null"))) && !available
+			proofs["baseline_feedback_missing"] = missing
+			if !missing {
+				t.Fatal("baseline original usecases unexpectedly retain feedback; RED not reproduced")
+			}
+		}
+		run := submission.ValidationRuns[len(submission.ValidationRuns)-1]
+		if !baseline && (len(summary) == 0 || bytes.Equal(summary, []byte("null")) || !available) {
+			t.Fatal("durable safe feedback lost after real validation")
+		}
+		if len(summary) > 0 && !bytes.Equal(summary, []byte("null")) {
+			var s struct {
+				RunID   string  `json:"validation_run_id"`
+				Outcome string  `json:"outcome"`
+				Error   *string `json:"error_classification"`
+				Stages  []struct {
+					ID      string `json:"stage_id"`
+					Outcome string `json:"outcome"`
+					Issues  []struct {
+						Code    string `json:"code"`
+						Message string `json:"message"`
+					} `json:"issues"`
+				} `json:"stages"`
+			}
+			if json.Unmarshal(summary, &s) != nil || s.RunID != run.ID || s.Outcome != string(run.Outcome) || (run.Outcome != domain.OutcomeError && len(s.Stages) == 0) {
+				t.Fatal("public feedback correlation invalid")
+			}
+			if run.Outcome == domain.OutcomeFail && (len(s.Stages[0].Issues) == 0 || s.Stages[0].Issues[0].Code != "TAG_MISMATCH") {
+				t.Fatal("actual semantic issue lost")
+			}
+			if run.Outcome == domain.OutcomeError && (s.Error == nil || *s.Error != run.ErrorClassification) {
+				t.Fatal("technical feedback classification lost")
+			}
+		}
+		call(http.MethodPost, baseURL+"/internal/v2/validation-runs/"+run.ID+"/retry", "", teacherToken, "", map[string]any{}, http.StatusUnauthorized)
+		call(http.MethodGet, baseURL+"/internal/task-instances/"+instance.ID+"/teacher-validation-explanation?student_id="+instance.StudentID, "", internalToken, "", nil, http.StatusUnauthorized)
+		call(http.MethodGet, publicPath+"/submissions/"+submission.ID, t12FeedbackUUID(t), "", "", nil, http.StatusNotFound)
+		call(http.MethodGet, publicPath+"/submissions/"+submission.ID, "", "", "", nil, http.StatusForbidden)
+		call(http.MethodGet, baseURL+"/internal/task-instances/"+instance.ID+"/teacher-validation-explanation?student_id="+instance.StudentID, "", "synthetic-wrong-token", "", nil, http.StatusUnauthorized)
+		call(http.MethodGet, baseURL+"/internal/task-instances/"+instance.ID+"/teacher-validation-explanation?student_id="+t12FeedbackUUID(t), "", teacherToken, "", nil, http.StatusNotFound)
+		currentInstance, e := NewRepository(db).GetInstance(ctx, instance.StudentID, instance.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		var submissions, runs, intents, safeRuns int
+		if e = db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM practice_submissions WHERE task_instance_id=$1),(SELECT count(*) FROM practice_validation_runs WHERE task_instance_id=$1),(SELECT count(*) FROM practice_submit_intents WHERE task_instance_id=$1),(SELECT count(*) FROM practice_validation_runs WHERE task_instance_id=$1 AND payload->'safe_summary' IS NOT NULL AND payload->'safe_summary' <> 'null'::jsonb)`, instance.ID).Scan(&submissions, &runs, &intents, &safeRuns); e != nil {
+			t.Fatal(e)
+		}
+		proofs["phases"].(map[string]any)[phase] = map[string]any{"public": public, "teacher": teacher, "submissions": submissions, "runs": runs, "intents": intents, "persisted_safe_run_count": safeRuns, "instance_status": currentInstance.Status, "owner_isolation_checked": true}
+		var classification any
+		if run.ErrorClassification != "" {
+			classification = run.ErrorClassification
+		}
+		readyBody := map[string]any{"url": baseURL, "base_url": baseURL, "database_schema": schema, "student_id": instance.StudentID, "task_instance_id": instance.ID, "instance_id": instance.ID, "task_revision_id": instance.TaskRevisionID, "learning_action_id": instance.LearningActionID, "submission_id": submission.ID, "validation_run_id": run.ID, "workspace_digest": submission.WorkspaceDigest, "outcome": run.Outcome, "error_classification": classification, "step_id": instance.Steps[0].ID, "phase": phase, "first_submission_id": first.ID, "sandbox_id": f.SandboxID, "classification": proofs["classification"]}
+		t12FeedbackWriteJSON(t, ready, readyBody)
+		t12FeedbackWriteJSON(t, resultFile, proofs)
+	}
+	current.Store(newRuntime()) // Discard Runtime and repository objects before the first HTTP read.
+	active := first
+	observe("failed_checkpoint", active)
+	t.Log("T12 actual durable failed checkpoint ready; root may consume Teacher/browser")
+	lastAction := ""
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
+	for {
+		select {
+		case e := <-errCh:
+			if !errors.Is(e, http.ErrServerClosed) {
+				t.Fatal("owned Runtime listener failed")
+			}
+			return
+		case <-deadline.C:
+			t.Fatal("owned Runtime root-control deadline exceeded")
+		case <-ticker.C:
+			if _, e := os.Stat(stop); e == nil {
+				if baseline {
+					t.Error("RED: actual official FAIL feedback unavailable after PG storage/reconstruction and real Runtime Teacher HTTP")
+				}
+				return
+			} else if !errors.Is(e, os.ErrNotExist) {
+				t.Fatal("stop marker read failed")
+			}
+			raw, e := os.ReadFile(actionFile)
+			if errors.Is(e, os.ErrNotExist) {
+				continue
+			}
+			if e != nil {
+				t.Fatal("root action read failed")
+			}
+			var action struct {
+				ID     string `json:"id"`
+				Action string `json:"action"`
+			}
+			if json.Unmarshal(raw, &action) != nil || action.ID == "" {
+				t.Fatal("invalid safe root action")
+			}
+			if action.ID == lastAction {
+				continue
+			}
+			lastAction = action.ID
+			switch action.Action {
+			case "technical_error":
+				call(http.MethodPost, orchURL+"/__t12/outage/on", "", orchToken, "", nil, http.StatusNoContent)
+				active = process(checkpoint(), domain.OutcomeError)
+				if active.ValidationRuns[len(active.ValidationRuns)-1].ErrorClassification != "VALIDATOR_UNAVAILABLE" {
+					t.Fatal("actual local transport fault misclassified")
+				}
+			case "retry":
+				call(http.MethodPost, orchURL+"/__t12/outage/off", "", orchToken, "", nil, http.StatusNoContent)
+				oldRun := active.ValidationRuns[len(active.ValidationRuns)-1]
+				pending := call(http.MethodPost, baseURL+"/internal/v2/validation-runs/"+oldRun.ID+"/retry", "", internalToken, "", map[string]any{}, http.StatusAccepted)
+				var retried domain.Submission
+				if json.Unmarshal(pending, &retried) != nil {
+					t.Fatal("actual retry response invalid")
+				}
+				var object map[string]json.RawMessage
+				json.Unmarshal(pending, &object)
+				if v := object["current_validation_summary"]; len(v) > 0 && !bytes.Equal(v, []byte("null")) {
+					t.Fatal("retry retained stale current explanation")
+				}
+				if retried.ID != active.ID || retried.Snapshot != active.Snapshot || len(retried.ValidationRuns) != len(active.ValidationRuns)+1 {
+					t.Fatal("actual retry changed pin or submission identity")
+				}
+				active = process(retried, domain.OutcomeFail)
+			case "correct":
+				call(http.MethodPost, f.URL+"/__t12/correct", "", sandboxToken, "", nil, http.StatusOK)
+				active = process(checkpoint(), domain.OutcomePass)
+				if active.ID == first.ID || active.Snapshot.GenerationID == first.Snapshot.GenerationID || active.WorkspaceDigest == first.WorkspaceDigest {
+					t.Fatal("correction did not create new exact frozen source")
+				}
+				corrected, e := current.Load().Workspace.ReadPinnedSnapshot(ctx, active.Snapshot)
+				if e != nil || len(corrected.Files) != 1 || !strings.Contains(corrected.Files[0].Content, "<main>") {
+					t.Fatal("actual corrected pin missing")
+				}
+			case "reconstruct":
+				current.Store(newRuntime())
+				active, e = NewRepository(db).GetSubmission(ctx, instance.ID, active.ID)
+				if e != nil {
+					t.Fatal(e)
+				}
+			default:
+				t.Fatal("unknown root action")
+			}
+			historical, e := NewRepository(db).GetSubmission(ctx, instance.ID, first.ID)
+			historyJSON, _ := json.Marshal(historical)
+			retained, e2 := current.Load().Workspace.ReadPinnedSnapshot(ctx, first.Snapshot)
+			if e != nil || e2 != nil || !bytes.Equal(historyJSON, firstPrivate) || retained.Ref != firstPinned.Ref || len(retained.Files) != 1 || retained.Files[0] != firstPinned.Files[0] {
+				t.Fatal("historical failure or retained immutable content changed")
+			}
+			proofs["historical_failure_unchanged"] = true
+			proofs["retained_failed_content_unchanged"] = true
+			observe(action.Action, active)
+			// Matching action ID makes root coordination deterministic across polling.
+			var readyObject map[string]any
+			readyRaw, _ := os.ReadFile(ready)
+			json.Unmarshal(readyRaw, &readyObject)
+			readyObject["action_id"] = action.ID
+			t12FeedbackWriteJSON(t, ready, readyObject)
+		}
+	}
+}
+
+func t12FeedbackUUID(t *testing.T) string {
+	t.Helper()
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		t.Fatal("fixture UUID entropy unavailable")
+	}
+	value[6] = (value[6] & 15) | 64
+	value[8] = (value[8] & 63) | 128
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
+}
+func t12FeedbackWriteJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe root metadata encoding failed")
+	}
+	temporary := path + ".tmp"
+	if err = os.WriteFile(temporary, append(raw, '\n'), 0600); err != nil {
+		t.Fatal("safe root metadata export failed")
+	}
+	if err = os.Rename(temporary, path); err != nil {
+		t.Fatal("safe root metadata publish failed")
+	}
+}

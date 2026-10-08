@@ -230,13 +230,15 @@ func resolveArchitectureProfile(requestText, projectID string, inventory reposit
 	var profileEvidence []string
 	if goMod != nil && goSources > 0 {
 		goProfile := catalog.Profiles["go.canonical"]
-		if !matchesRepositoryShape(inventory, goProfile.RepoShape) {
+		shapeMatches, alternateEvidence := matchesGoRepositoryShape(inventory, goProfile)
+		if !shapeMatches {
 			profileReason = "Go source was found, but required canonical layered source was not found"
 			if inventory.coverage.UnscannedRemainder || inventory.coverage.ReadErrors > 0 {
 				profileReason = "Required canonical layered source NOT_VERIFIED_BY_ACQUISITION_LIMIT_OR_READ_ERROR"
 			}
 		}
-		if matchesRepositoryShape(inventory, goProfile.RepoShape) {
+		if shapeMatches {
+			profileEvidence = append(profileEvidence, alternateEvidence...)
 			profileID = "go.canonical"
 			profileEvidence = append(profileEvidence, goMod.value.ID)
 			for _, evidence := range inventory.evidence {
@@ -315,6 +317,85 @@ func matchesRepositoryShape(inventory repositoryInventory, shape agentcontrol.Re
 	return true
 }
 
+// An already declared profile target may satisfy its canonical usecase root only
+// when structured repository metadata and parsed implementation corroborate it.
+func matchesGoRepositoryShape(inventory repositoryInventory, profile agentcontrol.Profile) (bool, []string) {
+	if matchesRepositoryShape(inventory, profile.RepoShape) {
+		return true, nil
+	}
+	alternate := "internal/application/usecase"
+	targetDeclared := false
+	for _, route := range profile.Routes {
+		if route.ID == "backend.usecase" {
+			targetDeclared = evidenceMatchesRoute(alternate+"/source.go", route.Targets)
+		}
+	}
+	if !targetDeclared {
+		return false, nil
+	}
+	var metadata, source []string
+	for _, item := range inventory.evidence {
+		if item.value.Kind == "architecture_metadata" || item.value.Kind == "service_metadata" {
+			var node yaml.Node
+			if yaml.Unmarshal(item.content, &node) == nil && declaresUsecaseDirectory(&node, alternate) {
+				metadata = append(metadata, item.value.ID)
+			}
+		}
+		if item.value.Kind == "source" && strings.HasPrefix(item.value.Path, alternate+"/") && strings.HasSuffix(item.value.Path, ".go") && !strings.HasSuffix(item.value.Path, "_test.go") {
+			if file, err := parser.ParseFile(token.NewFileSet(), "usecase.go", item.content, 0); err == nil && hasGoImplementationDeclaration(file) {
+				source = append(source, item.value.ID)
+			}
+		}
+	}
+	if len(metadata) == 0 || len(source) == 0 {
+		return false, nil
+	}
+	shape := profile.RepoShape
+	shape.RequiredPaths = append([]string(nil), shape.RequiredPaths...)
+	replaced := false
+	for i, required := range shape.RequiredPaths {
+		if strings.TrimSuffix(required, "/") == "internal/usecase" {
+			shape.RequiredPaths[i] = alternate + "/"
+			replaced = true
+		}
+	}
+	return replaced && matchesRepositoryShape(inventory, shape), uniqueSorted(append(metadata, source...))
+}
+
+func hasGoImplementationDeclaration(file *ast.File) bool {
+	for _, d := range file.Decls {
+		if f, ok := d.(*ast.FuncDecl); ok && f.Body != nil {
+			return true
+		}
+		if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.TYPE {
+			return true
+		}
+	}
+	return false
+}
+
+func declaresUsecaseDirectory(node *yaml.Node, directory string) bool {
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		return declaresUsecaseDirectory(node.Content[0], directory)
+	}
+	if node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != "layers" || node.Content[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		layers := node.Content[i+1]
+		for j := 0; j+1 < len(layers.Content); j += 2 {
+			key, value := layers.Content[j], layers.Content[j+1]
+			if (key.Value == "usecase" || key.Value == "use_cases") && value.Kind == yaml.ScalarNode && strings.TrimSuffix(value.Value, "/") == directory {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isRequiredShapePath(path string, shape agentcontrol.RepositoryShape) bool {
 	for _, required := range shape.RequiredPaths {
 		required = strings.TrimSuffix(required, "/")
@@ -341,11 +422,16 @@ func selectEvidenceBackedRoutes(
 			candidate.localScore = localRouteScore(route, inventory)
 		}
 		candidate.diagnostic = analyzeRouteCandidateWithCoverage(route.ID, requestText, projectID, architectureEvidence, candidate.files, inventory.coverage)
-		if candidate.diagnostic.Polarity == domain.RoutePolarityNeutral && routeActionPattern.MatchString(requestText) && namedSourceSyntax(requestText, candidate.files) {
+		if candidate.diagnostic.Polarity == domain.RoutePolarityNeutral && (routeActionPattern.MatchString(requestText) || requestedRoutingActionPattern.MatchString(requestText)) && namedSourceSyntax(requestText, candidate.files) {
 			candidate.diagnostic.Polarity = domain.RoutePolarityPositive
 			candidate.diagnostic.CandidateSignal = "named source syntax anchors requested inspection or work; no type-aware relationship claimed"
 		}
-		if route.ID == "backend.transport.message" && strings.EqualFold(candidate.diagnostic.MatchedPhrase, "consumer") && !regexp.MustCompile(`(?i)\b(?:nats|queue|message|messaging|jetstream|broker)\b`).MatchString(requestText) {
+		protocolSyntax := verifiedProtocolTask(requestText, route.ID, candidate.files, inventory)
+		if candidate.diagnostic.Polarity == domain.RoutePolarityNeutral && protocolSyntax {
+			candidate.diagnostic.Polarity = domain.RoutePolarityPositive
+			candidate.diagnostic.CandidateSignal = "concrete protocol literal and admitted implementation call syntax anchor analysis; no execution or type-aware proof"
+		}
+		if route.ID == "backend.transport.message" && strings.EqualFold(candidate.diagnostic.MatchedPhrase, "consumer") && !protocolSyntax && !regexp.MustCompile(`(?i)\b(?:nats|queue|message|messaging|jetstream|broker)\b`).MatchString(requestText) {
 			candidate.diagnostic.Polarity = domain.RoutePolarityNeutral
 			candidate.diagnostic.CandidateSignal = "consumer without an incoming message protocol does not establish queue transport ownership"
 		}
@@ -688,11 +774,14 @@ type evidenceBackedRouteCandidate struct {
 	diagnostic domain.RoutingCandidateEvidence
 }
 
-var routingClauseSeparator = regexp.MustCompile(`(?i)\b(?:but|however|while)\b|[,.!?;\n]+`)
+var routingClauseSeparator = regexp.MustCompile(`(?i)\b(?:but|however|while)\b|[,!?;\n]+|\.\s+|\.$`)
 
 var routeActionPattern = regexp.MustCompile(`(?i)\b(?:inspect(?:s|ed|ing)?|implement(?:s|ed|ing)?|add(?:s|ed|ing)?|chang(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|fix(?:es|ed|ing)?|creat(?:e|es|ed|ing)|build(?:s|ing)?|writ(?:e|es|ten|ing)|introduc(?:e|es|ed|ing)|extend(?:s|ed|ing)?|refactor(?:s|ed|ing)?|replac(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|support(?:s|ed|ing)?|реализ\p{L}*|добав\p{L}*|измен\p{L}*|обнов\p{L}*|исправ\p{L}*|созда\p{L}*|поддерж\p{L}*)\b`)
 
-var requestedRoutingActionPattern = regexp.MustCompile(`(?i)(?:^|[.!?;,]\s*)(?:only\s+)?(?:inspect|implement|add|change|modify|update|fix|create|build|write|introduce|extend|refactor|replace|remove|support)\b`)
+var requestedRoutingActionPattern = regexp.MustCompile(`(?i)(?:^|[.!?;,]\s*)(?:only\s+)?(?:inspect|trace|explain|investigate|audit|review|select|locate|verify|implement|add|change|modify|update|fix|create|build|write|introduce|extend|refactor|replace|remove|support)\b`)
+
+var routingAnalysisPattern = regexp.MustCompile(`(?i)^\s*(?:trace|explain|investigate|audit|review|select|locate|verify)\b`)
+var routingDependentFragmentPattern = regexp.MustCompile(`(?i)^\s*(?:including|such as|for example|with|without)\b`)
 
 var compositionActionPattern = regexp.MustCompile(`(?i)\b(?:register(?:s|ed|ing)?|wire(?:s|d|ing)?|connect(?:s|ed|ing)?|bootstrap(?:s|ped|ping)?|bind(?:s|bound|ing)?|configur(?:e|es|ed|ing)|add(?:s|ed|ing)?|change(?:s|d|ing)?|modify(?:s|ied|ying)?|update(?:s|d|ing)?)\b`)
 
@@ -772,13 +861,26 @@ func analyzeRouteCandidateWithCoverage(routeID, requestText, projectID string, a
 		lower := strings.ToLower(clause.text)
 		conditional := routingConditionalPattern.MatchString(lower)
 		explanatory := routingExplanatoryPattern.MatchString(lower)
-		if action, context := routeActionPattern.FindStringIndex(lower), routingExplanatoryPattern.FindStringIndex(lower); action != nil && (context == nil || action[0] < context[0]) {
+		action, context := routeActionPattern.FindStringIndex(lower), routingExplanatoryPattern.FindStringIndex(lower)
+		if action == nil {
+			action = routingAnalysisPattern.FindStringIndex(lower)
+		}
+		if action != nil && (context == nil || action[0] < context[0]) {
 			explanatory = false
 		}
-		positiveAction := routeActionPattern.MatchString(lower) || routeIssuePattern.MatchString(lower)
+		if (regexp.MustCompile(`(?i)^\s*explain\s+that\b`).MatchString(lower) || regexp.MustCompile(`(?i)^\s*(?:trace|explain|investigate|audit|review|select|locate|verify)\s+(?:the\s+)?(?:current|existing|already)\b`).MatchString(lower)) && routingExplanatoryPattern.MatchString(lower) {
+			explanatory = true
+		}
+		positiveAction := routeActionPattern.MatchString(lower) || routingAnalysisPattern.MatchString(lower) || routeIssuePattern.MatchString(lower)
 		strongCompositionAction := routeID == "backend.composition" && compositionOwnershipActionPattern.MatchString(lower)
-		fragmentAction := routeID != "backend.composition" && isNominalTaskFragment(lower)
+		analysisAction := routingAnalysisPattern.MatchString(lower)
+		dependent := routingDependentFragmentPattern.MatchString(lower)
+		fragmentAction := routeID != "backend.composition" && !analysisAction && !dependent && isNominalTaskFragment(lower)
 		for _, match := range matches {
+			actionForMatch := positiveAction && !dependent
+			if analysisAction && strings.EqualFold(match.phrase, "application") && !regexp.MustCompile(`(?i)\bapplication\s+(?:layer|workflow|usecase)\b`).MatchString(lower) {
+				actionForMatch = false
+			}
 			if context := routingExplanatoryPattern.FindStringIndex(lower); context != nil && context[0] < match.start && regexp.MustCompile(`(?i)\b(?:using|with|depends on)\s+(?:(?:a|an|the)\s+)?$`).MatchString(lower[:context[0]]) {
 				signals = append(signals, signal{domain.RoutePolarityNeutral, match.phrase, clippedTaskSpan(clause.text), "existing dependency is contextual evidence, not this action's target"})
 				continue
@@ -810,9 +912,9 @@ func analyzeRouteCandidateWithCoverage(routeID, requestText, projectID string, a
 				}
 				continue
 			}
-			if positiveAction || fragmentAction {
+			if actionForMatch || fragmentAction {
 				detail := "positive task action matched this route responsibility"
-				if fragmentAction && !positiveAction {
+				if fragmentAction && !actionForMatch {
 					detail = "bounded task-fragment form implies requested work for this route"
 				}
 				signals = append(signals, signal{domain.RoutePolarityPositive, match.phrase, clippedTaskSpan(clause.text), detail})
@@ -1049,12 +1151,22 @@ func classifyRequest(text string) string {
 	}
 	for _, category := range categories {
 		for _, word := range category.words {
-			if strings.Contains(text, word) {
+			if classificationWordMatches(text, word) {
 				return category.name
 			}
 		}
 	}
 	return "maintenance"
+}
+
+func classificationWordMatches(text, word string) bool {
+	// Retain the historical Russian stem behavior; ASCII terms require boundaries.
+	for _, r := range word {
+		if r > 127 {
+			return strings.Contains(text, word)
+		}
+	}
+	return regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])` + strings.ReplaceAll(regexp.QuoteMeta(word), " ", `\s+`) + `(?:$|[^\p{L}\p{N}_])`).MatchString(text)
 }
 
 func classificationForRoute(routeID string) string {
@@ -1712,7 +1824,7 @@ func isCompositionRoute(routeID string) bool {
 // Ambiguous infrastructure/http roots need both an owner declaration and
 // outbound source syntax. Legacy unambiguous client roots retain their contract.
 func verifiedOutboundRoot(route string, evidence indexedEvidence, inventory repositoryInventory) bool {
-	if route != "backend.infrastructure.client" || !strings.HasPrefix(evidence.value.Path, "internal/infrastructure/http/") {
+	if route != "backend.infrastructure.client" || (!strings.HasPrefix(evidence.value.Path, "internal/infrastructure/http/") && !strings.HasPrefix(evidence.value.Path, "internal/infrastructure/adapters/")) {
 		return true
 	}
 	directory := path.Dir(evidence.value.Path)
@@ -1987,6 +2099,9 @@ func namedSourceSyntax(task string, files []indexedEvidence) bool {
 		if clause == "" {
 			continue
 		}
+		if routingConditionalPattern.MatchString(clause) || routingDependentFragmentPattern.MatchString(clause) || routingAnalysisPattern.MatchString(clause) && routingExplanatoryPattern.MatchString(clause) {
+			continue
+		}
 		action := requestedRoutingActionPattern.MatchString(clause)
 		if !action && (!inspection || routingExplanatoryPattern.MatchString(clause)) {
 			continue
@@ -2212,4 +2327,134 @@ func declaredOwnerFieldCall(owner indexedEvidence, typ, method string, consumer 
 		return !found
 	})
 	return found
+}
+
+// Literal protocol discovery is bounded local syntax evidence. Imported constant
+// references must bind to the admitted module, and only implementation calls
+// count. It establishes a layer to inspect, never runtime registration/execution.
+func verifiedProtocolTask(task, route string, files []indexedEvidence, inventory repositoryInventory) bool {
+	if route != "backend.transport.http" && route != "backend.transport.message" {
+		return false
+	}
+	module := ""
+	for _, e := range inventory.evidence {
+		if e.value.Path == "go.mod" {
+			fields := strings.Fields(string(e.content))
+			if len(fields) > 1 && fields[0] == "module" {
+				module = strings.Trim(fields[1], `"`)
+			}
+		}
+	}
+	constants := map[string]string{}
+	for _, e := range inventory.evidence {
+		if e.value.Kind != "source" || !strings.HasSuffix(e.value.Path, ".go") || strings.HasSuffix(e.value.Path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), "protocol.go", e.content, 0)
+		if err != nil {
+			continue
+		}
+		for _, d := range f.Decls {
+			g, ok := d.(*ast.GenDecl)
+			if !ok || g.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range g.Specs {
+				v, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, n := range v.Names {
+					if i >= len(v.Values) {
+						continue
+					}
+					lit, ok := v.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err == nil {
+						constants[module+"/"+path.Dir(e.value.Path)+"."+n.Name] = value
+					}
+				}
+			}
+		}
+	}
+	for _, clause := range splitRoutingClauses(task) {
+		if !routingAnalysisPattern.MatchString(clause.text) || routeNegativePrefixPattern.MatchString(clause.text) || routeNegativeSuffixPattern.MatchString(clause.text) || routingConditionalPattern.MatchString(clause.text) || routingExplanatoryPattern.MatchString(clause.text) {
+			continue
+		}
+		values := []string{}
+		httpMethods := map[string]string{}
+		if route == "backend.transport.http" {
+			for _, m := range regexp.MustCompile(`(?i)\b(GET|POST|PUT|PATCH|DELETE)\s+(/[^\s,;]+)`).FindAllStringSubmatch(clause.text, -1) {
+				values = append(values, m[2])
+				httpMethods[m[2]] = strings.ToUpper(m[1])
+			}
+		} else {
+			values = regexp.MustCompile(`\b[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+){2,}\b`).FindAllString(clause.text, -1)
+		}
+		for _, e := range files {
+			if e.value.Kind != "source" || !strings.HasSuffix(e.value.Path, ".go") || strings.HasSuffix(e.value.Path, "_test.go") {
+				continue
+			}
+			f, err := parser.ParseFile(token.NewFileSet(), "protocol.go", e.content, 0)
+			if err != nil {
+				continue
+			}
+			imports := map[string]string{}
+			for _, imp := range f.Imports {
+				p, err := strconv.Unquote(imp.Path.Value)
+				if err != nil {
+					continue
+				}
+				name := path.Base(p)
+				if imp.Name != nil {
+					name = imp.Name.Name
+				}
+				imports[name] = p
+			}
+			found := false
+			ast.Inspect(f, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				method := sel.Sel.Name
+				allowed := route == "backend.transport.http" && (method == "GET" || method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE" || method == "Handle" || method == "HandleFunc") || route == "backend.transport.message" && (method == "Subscribe" || method == "QueueSubscribe" || method == "PullSubscribe")
+				if !allowed || len(call.Args) == 0 {
+					return true
+				}
+				value := ""
+				switch a := call.Args[0].(type) {
+				case *ast.BasicLit:
+					if a.Kind == token.STRING {
+						value, _ = strconv.Unquote(a.Value)
+					}
+				case *ast.Ident:
+					value = constants[module+"/"+path.Dir(e.value.Path)+"."+a.Name]
+				case *ast.SelectorExpr:
+					if recv, ok := a.X.(*ast.Ident); ok {
+						if p := imports[recv.Name]; module != "" && strings.HasPrefix(p, module+"/") {
+							value = constants[p+"."+a.Sel.Name]
+						}
+					}
+				}
+				for _, expected := range values {
+					if value != "" && value == expected && (route != "backend.transport.http" || method == httpMethods[expected]) {
+						found = true
+					}
+				}
+				return !found
+			})
+			if found {
+				return true
+			}
+		}
+	}
+	return false
 }

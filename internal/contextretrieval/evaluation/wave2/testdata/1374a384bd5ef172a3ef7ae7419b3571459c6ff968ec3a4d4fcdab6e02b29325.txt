@@ -1,0 +1,239 @@
+package hybridreplan
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+// Named in-memory orchestration doubles, not an owner-boundary proof.
+type applicationQueue struct {
+	work                                        domain.HybridApplicationWork
+	receipt                                     domain.HybridApplicationReceipt
+	done                                        bool
+	claims, completes, releases, stales         int
+	claimErr, completeErr, releaseErr, staleErr error
+	retryAt                                     time.Time
+	onComplete                                  func()
+	staleReason                                 string
+}
+
+func (q *applicationQueue) ClaimHybridApplication(_ context.Context, now time.Time, ttl time.Duration) (domain.HybridApplicationWork, bool, error) {
+	q.claims++
+	if q.claimErr != nil {
+		return q.work, false, q.claimErr
+	}
+	if q.done || now.Before(q.retryAt) {
+		return domain.HybridApplicationWork{}, false, nil
+	}
+	q.work.ClaimToken = snapshotID("application-claim")
+	q.work.LeaseUntil = now.Add(ttl)
+	return q.work, true, nil
+}
+func (q *applicationQueue) CompleteHybridApplication(_ context.Context, w domain.HybridApplicationWork, r domain.HybridApplicationReceipt) error {
+	q.completes++
+	if q.onComplete != nil {
+		q.onComplete()
+	}
+	if q.completeErr != nil {
+		return q.completeErr
+	}
+	q.receipt = r
+	q.done = true
+	return nil
+}
+func (q *applicationQueue) ReleaseHybridApplication(_ context.Context, w domain.HybridApplicationWork, retryAt time.Time) error {
+	q.releases++
+	q.retryAt = retryAt
+	return q.releaseErr
+}
+func (q *applicationQueue) RecordHybridApplicationStale(_ context.Context, w domain.HybridApplicationWork, reason string, now time.Time) error {
+	q.stales++
+	q.staleReason = reason
+	if q.staleErr != nil {
+		return q.staleErr
+	}
+	q.done = true
+	return nil
+}
+
+type applicationStudent struct {
+	calls    int
+	received []domain.HybridConsequence
+	receipt  domain.HybridApplicationReceipt
+	err      error
+	onApply  func(context.Context)
+}
+
+func (s *applicationStudent) ApplyHybridConsequence(ctx context.Context, c domain.HybridConsequence) (domain.HybridApplicationReceipt, error) {
+	s.calls++
+	s.received = append(s.received, c)
+	if s.onApply != nil {
+		s.onApply(ctx)
+	}
+	return s.receipt, s.err
+}
+func applicationFixture(t *testing.T) (ApplicationProcessor, *applicationQueue, *applicationStudent, *snapshotTestClock) {
+	t.Helper()
+	_, evaluator, policies, _, clock := evaluationFixture(t)
+	s := evaluator.work.Job.Snapshot
+	inputs, err := domain.NormalizeHybridConsequenceInputs(policies.policy, domain.HybridPrerequisiteGraph{GoalCode: s.Path.GoalCode, Targets: []domain.HybridPrerequisiteTarget{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := domain.EvaluateHybridSnapshot(s, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := domain.HybridConsequencePayloadHash(c)
+	q := &applicationQueue{work: domain.HybridApplicationWork{Consequence: domain.HybridConsequenceReceipt{JobID: snapshotID("app-job"), PayloadHash: hash, Consequence: c, CommittedAt: s.CapturedAt}}}
+	student := &applicationStudent{receipt: domain.HybridApplicationReceipt{ConsequenceID: c.ConsequenceID, PayloadHash: hash, LearningPathID: c.LearningPathID, PreviousRevision: c.ExpectedPathRevision, ResultingRevision: c.ExpectedPathRevision, Status: "NO_CHANGE", CommittedAt: clock.now}}
+	return ApplicationProcessor{Applications: q, Students: student, Clock: clock, LeaseTTL: time.Minute, RetryDelay: time.Second}, q, student, clock
+}
+func TestHybridApplicationDurableConsequenceDeliveredExactly(t *testing.T) {
+	p, q, student, _ := applicationFixture(t)
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || student.calls != 1 || q.completes != 1 || !q.done {
+		t.Fatalf("durable consequence not delivered processed=%v calls=%d complete=%d err=%v", processed, student.calls, q.completes, err)
+	}
+	if !reflect.DeepEqual(student.received[0], q.work.Consequence.Consequence) {
+		t.Fatal("delivery reinterpreted immutable consequence")
+	}
+	if processed, err = p.ProcessNext(context.Background()); err != nil || processed || student.calls != 1 {
+		t.Fatal("completed work delivered again")
+	}
+}
+
+func makeApplicationReplan(q *applicationQueue, s *applicationStudent, mode string) {
+	c := q.work.Consequence.Consequence
+	c.Outcome = domain.HybridOutcomeReplanNeeded
+	c.ApplicationMode = mode
+	c.Mutations = []domain.HybridFutureMutation{{Kind: "SKIP_REDUNDANT_PENDING_ITEM", ItemID: snapshotID("synthetic-future-item")}}
+	c.ReasonCodes = []string{"TARGET_MASTERED_STABLE"}
+	if mode == domain.HybridApplicationRequiresIntent {
+		c.IntentID = snapshotID("synthetic-bound-intent")
+		c.RequiredIntentKind = "SUBSTANTIAL_SCOPE_CHANGE"
+		c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+	}
+	hash, _ := domain.HybridConsequencePayloadHash(c)
+	q.work.Consequence.Consequence = c
+	q.work.Consequence.PayloadHash = hash
+	s.receipt.ConsequenceID = c.ConsequenceID
+	s.receipt.PayloadHash = hash
+	s.receipt.Status = "APPLIED"
+	s.receipt.ResultingRevision = c.ExpectedPathRevision + 1
+}
+func TestHybridApplicationWaitingKeepsDurableWorkAndExactIntent(t *testing.T) {
+	p, q, s, clock := applicationFixture(t)
+	makeApplicationReplan(q, s, domain.HybridApplicationRequiresIntent)
+	s.receipt.Status = "WAITING_SAFE_BOUNDARY"
+	s.receipt.ResultingRevision = s.receipt.PreviousRevision
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || q.done || q.completes != 0 || q.releases != 1 || q.stales != 0 || !q.retryAt.Equal(clock.now.Add(p.RetryDelay)) {
+		t.Fatalf("waiting prematurely completed %+v err=%v", q, err)
+	}
+	if s.received[0].IntentID != q.work.Consequence.Consequence.IntentID {
+		t.Fatal("delivery lost bound intent")
+	}
+	clock.now = clock.now.Add(2 * time.Second)
+	s.receipt.Status = "APPLIED"
+	s.receipt.ResultingRevision++
+	processed, err = p.ProcessNext(context.Background())
+	if err != nil || !processed || !q.done || q.completes != 1 || s.calls != 2 {
+		t.Fatalf("safe boundary never retried err=%v", err)
+	}
+}
+func TestHybridApplicationLostResponseAndPersistenceFailureReplayExactPayload(t *testing.T) {
+	for _, phase := range []string{"owner lost response", "Planner receipt failure"} {
+		t.Run(phase, func(t *testing.T) {
+			p, q, s, clock := applicationFixture(t)
+			makeApplicationReplan(q, s, domain.HybridApplicationAuto)
+			if phase == "owner lost response" {
+				s.err = domain.ErrUpstreamUnavailable
+			} else {
+				q.completeErr = errors.New("named receipt persistence outage")
+			}
+			processed, err := p.ProcessNext(context.Background())
+			if !processed || err == nil || q.done || q.releases != 1 {
+				t.Fatal("outage lost durable delivery")
+			}
+			q.completeErr = nil
+			s.err = nil
+			clock.now = clock.now.Add(2 * time.Second)
+			processed, err = p.ProcessNext(context.Background())
+			if !processed || err != nil || !q.done || s.calls != 2 || !reflect.DeepEqual(s.received[0], s.received[1]) {
+				t.Fatalf("recovery changed immutable request err=%v", err)
+			}
+		})
+	}
+}
+func TestHybridApplicationOnlyTypedStaleSchedulesLocalRecovery(t *testing.T) {
+	for _, ownerErr := range []error{domain.ErrHybridApplicationStale, domain.ErrConflict, domain.ErrHybridApplicationIntentRequired, domain.ErrHybridApplicationUnsafe, domain.ErrHybridApplicationUnsupported, domain.ErrUpstreamInvalid} {
+		t.Run(ownerErr.Error(), func(t *testing.T) {
+			p, q, s, _ := applicationFixture(t)
+			s.err = ownerErr
+			processed, err := p.ProcessNext(context.Background())
+			if !processed {
+				t.Fatal("no claimed work")
+			}
+			if errors.Is(ownerErr, domain.ErrHybridApplicationStale) {
+				if err != nil || q.stales != 1 || q.staleReason != "OWNER_APPLICATION_STALE" || !q.done || q.completes != 0 || q.releases != 0 {
+					t.Fatalf("typed stale not durable %+v err=%v", q, err)
+				}
+			} else if !errors.Is(err, ownerErr) || q.stales != 0 || q.done || q.releases != 1 {
+				t.Fatalf("nonstale fabricated local recovery %+v err=%v", q, err)
+			}
+		})
+	}
+}
+func TestHybridApplicationInvalidOwnerReceiptNeverCompletes(t *testing.T) {
+	for _, mutate := range []func(*domain.HybridApplicationReceipt){func(r *domain.HybridApplicationReceipt) {
+		r.PayloadHash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	}, func(r *domain.HybridApplicationReceipt) { r.PreviousRevision++ }, func(r *domain.HybridApplicationReceipt) { r.Status = "APPLIED" }, func(r *domain.HybridApplicationReceipt) { r.ConsequenceID = snapshotID("foreign-result") }} {
+		p, q, s, _ := applicationFixture(t)
+		mutate(&s.receipt)
+		processed, err := p.ProcessNext(context.Background())
+		if !processed || !errors.Is(err, domain.ErrUpstreamInvalid) || q.done || q.completes != 0 || q.releases != 1 {
+			t.Fatalf("bad receipt completed %+v err=%v", q, err)
+		}
+	}
+}
+func TestHybridApplicationExpiredLeaseCannotCompleteOrMarkStale(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		p, q, s, clock := applicationFixture(t)
+		if stale {
+			s.err = domain.ErrHybridApplicationStale
+		}
+		s.onApply = func(ctx context.Context) {
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) > p.LeaseTTL {
+				t.Fatal("owner call unbounded")
+			}
+			clock.now = clock.now.Add(2 * time.Minute)
+		}
+		processed, err := p.ProcessNext(context.Background())
+		if !processed || !errors.Is(err, domain.ErrConflict) || q.completes != 0 || q.stales != 0 || q.done {
+			t.Fatalf("expired worker completed %+v err=%v", q, err)
+		}
+	}
+}
+func TestHybridApplicationReleaseAndStalePersistenceOutagesRemainRetryable(t *testing.T) {
+	p, q, s, _ := applicationFixture(t)
+	s.err = domain.ErrHybridApplicationStale
+	q.staleErr = errors.New("named stale transaction outage")
+	q.releaseErr = errors.New("named release outage")
+	_, err := p.ProcessNext(context.Background())
+	if !errors.Is(err, q.staleErr) || !errors.Is(err, q.releaseErr) || q.done {
+		t.Fatal("stale persistence failure hidden or completed")
+	}
+	p, q, s, _ = applicationFixture(t)
+	q.work.Consequence.PayloadHash = "tampered"
+	_, err = p.ProcessNext(context.Background())
+	if !errors.Is(err, domain.ErrValidation) || s.calls != 0 || q.completes != 0 {
+		t.Fatal("unverified immutable consequence sent")
+	}
+}

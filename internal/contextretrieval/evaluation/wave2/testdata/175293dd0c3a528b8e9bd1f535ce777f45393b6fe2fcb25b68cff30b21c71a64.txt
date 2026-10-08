@@ -1,0 +1,205 @@
+package course
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/google/uuid"
+)
+
+const maximumResponseBytes = 1 << 20
+
+type Client struct {
+	BaseURL                string
+	InternalToken          string
+	DiagnosticCatalogToken string
+	HTTPClient             *http.Client
+}
+
+func (client Client) EnsureCourse(
+	ctx context.Context,
+	course domain.GeneratedCourse,
+	idempotencyKey string,
+) (domain.EnsureCourseResult, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" ||
+		client.HTTPClient == nil || strings.TrimSpace(idempotencyKey) == "" {
+		return domain.EnsureCourseResult{}, errors.New("course client is not configured")
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domain.EnsureCourseResult{}, domain.ErrValidation
+	}
+	payload, err := json.Marshal(course)
+	if err != nil {
+		return domain.EnsureCourseResult{}, err
+	}
+	if len(payload) > domain.MaximumGeneratedCoursePayloadBytes {
+		return domain.EnsureCourseResult{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/generated-courses"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(payload))
+	if err != nil {
+		return domain.EnsureCourseResult{}, err
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	httpResponse, err := client.HTTPClient.Do(request)
+	if err != nil {
+		return domain.EnsureCourseResult{}, err
+	}
+	defer func() { _ = httpResponse.Body.Close() }()
+	contents, err := io.ReadAll(io.LimitReader(httpResponse.Body, maximumResponseBytes+1))
+	if err != nil {
+		return domain.EnsureCourseResult{}, err
+	}
+	if len(contents) > maximumResponseBytes {
+		return domain.EnsureCourseResult{}, errors.New("course response exceeds limit")
+	}
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		switch httpResponse.StatusCode {
+		case http.StatusConflict:
+			return domain.EnsureCourseResult{}, domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domain.EnsureCourseResult{}, domain.ErrValidation
+		default:
+			return domain.EnsureCourseResult{}, fmt.Errorf("course returned status %d", httpResponse.StatusCode)
+		}
+	}
+	var result domain.EnsureCourseResult
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	if err := decoder.Decode(&result); err != nil {
+		return domain.EnsureCourseResult{}, err
+	}
+	if _, err := uuid.Parse(result.CourseID); err != nil {
+		return domain.EnsureCourseResult{}, domain.ErrValidation
+	}
+	if len(result.Lessons) == 0 || len(result.Lessons) > 500 {
+		return domain.EnsureCourseResult{}, domain.ErrValidation
+	}
+	for index := range result.Lessons {
+		binding := &result.Lessons[index]
+		if _, err := uuid.Parse(binding.LessonID); err != nil || binding.Order != index || len(binding.Targets) == 0 {
+			return domain.EnsureCourseResult{}, domain.ErrValidation
+		}
+		if revision, err := uuid.Parse(binding.LessonRevisionID); err != nil || revision.String() != binding.LessonRevisionID {
+			return domain.EnsureCourseResult{}, domain.ErrValidation
+		}
+		targets, err := domain.NormalizeTargetRefs(binding.Targets)
+		if err != nil {
+			return domain.EnsureCourseResult{}, domain.ErrValidation
+		}
+		binding.Targets = targets
+	}
+	return result, nil
+}
+
+var _ domainservice.CourseService = Client{}
+
+// GetDiagnosticAssessmentCatalog uses the deliberately narrow Course projection.
+// It rejects a catalogue which cannot be frozen safely by the diagnostic plan.
+func (client Client) GetDiagnosticAssessmentCatalog(ctx context.Context, courseID string) (domain.DiagnosticAssessmentCatalog, error) {
+	parsedCourseID, parseErr := uuid.Parse(courseID)
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.DiagnosticCatalogToken) == "" || client.HTTPClient == nil || parseErr != nil || parsedCourseID.String() != courseID {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrValidation
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(client.BaseURL, "/")+"/internal/course/get-internal-diagnostic-assessments/"+courseID, nil)
+	if err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, err
+	}
+	req.Header.Set("X-Internal-Token", client.DiagnosticCatalogToken)
+	req.Header.Set("Accept", "application/json")
+	safeClient := *client.HTTPClient
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamUnavailable
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maximumResponseBytes+1))
+	if err != nil || len(body) > maximumResponseBytes {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotFound {
+			return domain.DiagnosticAssessmentCatalog{}, domain.ErrNotFound
+		}
+		if resp.StatusCode >= 500 {
+			return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamUnavailable
+		}
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	media, _, contentErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if contentErr != nil || media != "application/json" {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	var wire struct {
+		Schema   string `json:"schema"`
+		CourseID string `json:"course_id"`
+		Revision string `json:"curric\u0075lum_revision"`
+		Lessons  []struct {
+			ID          string    `json:"id"`
+			CourseID    string    `json:"course_id"`
+			SectionID   string    `json:"section_id"`
+			Title       string    `json:"title"`
+			Description string    `json:"description"`
+			Order       int       `json:"order"`
+			Status      int       `json:"status"`
+			UpdatedAt   time.Time `json:"updated_at"`
+			Tasks       []struct {
+				ID                string             `json:"id"`
+				LessonID          string             `json:"lesson_id"`
+				Title             string             `json:"title"`
+				Description       string             `json:"description"`
+				Type              int                `json:"type"`
+				AssessmentPurpose string             `json:"assessment_purpose"`
+				EvaluationMode    string             `json:"evaluation_mode"`
+				Status            int                `json:"status"`
+				Version           int64              `json:"version"`
+				UpdatedAt         time.Time          `json:"updated_at"`
+				Order             int                `json:"order"`
+				LearningTargets   []domain.TargetRef `json:"learning_targets"`
+			} `json:"tasks"`
+		} `json:"lessons"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	catalog := domain.DiagnosticAssessmentCatalog{Schema: wire.Schema, CourseID: wire.CourseID, Revision: wire.Revision}
+	for _, l := range wire.Lessons {
+		if l.CourseID != wire.CourseID || l.Status != 1 {
+			return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+		}
+		for _, t := range l.Tasks {
+			if t.LessonID != l.ID || t.Status != 1 || t.AssessmentPurpose != "diagnostic" || (t.Type != 11 && t.Type != 12 && t.Type != 13) || !validDiagnosticEvaluationMode(t.EvaluationMode) {
+				return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+			}
+			catalog.Assessments = append(catalog.Assessments, domain.DiagnosticAssessment{LessonID: l.ID, TaskID: t.ID, TaskVersion: t.Version, UpdatedAt: t.UpdatedAt, LessonOrder: l.Order, TaskOrder: t.Order, LearningTargets: t.LearningTargets})
+		}
+	}
+	result, err := domain.NormalizeDiagnosticCatalog(catalog)
+	if err != nil {
+		return domain.DiagnosticAssessmentCatalog{}, domain.ErrUpstreamInvalid
+	}
+	return result, nil
+}
+
+func validDiagnosticEvaluationMode(value string) bool { return value == "AUTO" }
+
+var _ domainservice.CourseService = Client{}
+var _ domainservice.DiagnosticCourseCatalogService = Client{}

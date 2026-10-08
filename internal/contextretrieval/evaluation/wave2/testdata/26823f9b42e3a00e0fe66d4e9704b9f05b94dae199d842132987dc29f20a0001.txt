@@ -1,0 +1,530 @@
+package adapters
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+const (
+	testStudentID  = "11111111-1111-4111-8111-111111111111"
+	testInstanceID = "22222222-2222-4222-8222-222222222222"
+	testRevisionID = "33333333-3333-4333-8333-333333333333"
+	testActionID   = "44444444-4444-4444-8444-444444444444"
+	testSandboxID  = "55555555-5555-4555-8555-555555555555"
+	testSubmission = "66666666-6666-4666-8666-666666666666"
+	testRunID      = "77777777-7777-4777-8777-777777777777"
+	testGeneration = "gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testDigest     = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+
+// newTestServer uses the httptest handler and recorder in-memory. The managed
+// test sandbox disallows opening local TCP listeners, so this RoundTripper
+// preserves the real HTTP request/handler boundary without network access.
+type inMemoryHTTPServer struct {
+	URL    string
+	client *http.Client
+}
+
+func newTestServer(handler http.Handler) *inMemoryHTTPServer {
+	return &inMemoryHTTPServer{URL: "http://provider.test", client: &http.Client{Transport: inMemoryRoundTripper{handler: handler}}}
+}
+
+func (server *inMemoryHTTPServer) Client() *http.Client { return server.client }
+func (server *inMemoryHTTPServer) Close()               {}
+
+type inMemoryRoundTripper struct{ handler http.Handler }
+
+func (transport inMemoryRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	transport.handler.ServeHTTP(recorder, request)
+	response := recorder.Result()
+	response.Request = request
+	return response, nil
+}
+
+func TestRevisionHTTPClientReadsExactExecutionEnvelope(t *testing.T) {
+	envelope := domain.RevisionEnvelope{
+		Schema:               "practice-task-execution-envelope.v1",
+		Revision:             domain.RevisionMetadata{ID: testRevisionID, PracticeTaskID: testInstanceID, RevisionNumber: 3, PublishedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
+		RevisionDigestSchema: domain.RevisionDigestV1,
+		RuntimeContext:       json.RawMessage(`{"practice_task":{"id":"` + testInstanceID + `"}}`),
+		EvaluationContext:    json.RawMessage(`{"milestones":[]}`),
+	}
+	envelope.RevisionDigest = envelope.ComputedDigest()
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/internal/catalog/practice-task-revisions/"+testRevisionID+"/execution-envelope" {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+		}
+		if r.Header.Get("X-Internal-Token") != "catalog-secret" {
+			t.Errorf("internal token = %q", r.Header.Get("X-Internal-Token"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(envelope)
+	}))
+	defer server.Close()
+
+	got, err := NewRevisionHTTPClient(server.URL, "catalog-secret", server.Client()).GetPublishedRevisionEnvelope(context.Background(), testRevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision.ID != testRevisionID || got.RevisionDigest != envelope.RevisionDigest || got.ComputedDigest() != got.RevisionDigest {
+		t.Fatalf("envelope = %#v", got)
+	}
+}
+
+func TestStudentHTTPClientUsesDedicatedPracticeRoutesAndExactIdentity(t *testing.T) {
+	target := domain.Target{Type: "concept", Key: "go.interfaces", Version: "v1"}
+	binding := map[string]any{
+		"schema": "student-practice-learning-action-binding.v1", "learning_action_id": testActionID,
+		"student_id": testStudentID, "task_instance_id": testInstanceID, "task_revision_id": testRevisionID,
+		"task_revision_digest": testDigest, "surface_classification": "practice", "learning_targets": []any{target},
+		"lifecycle_status": "RESERVED",
+	}
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base := "/internal/v2/students/" + testStudentID + "/practice-learning-actions/" + testInstanceID
+		if !strings.HasPrefix(r.URL.Path, base) || r.Header.Get("X-Internal-Token") != "student-practice-secret" {
+			t.Errorf("request path/token = %s %q", r.URL.Path, r.Header.Get("X-Internal-Token"))
+		}
+		if r.Method == http.MethodPut {
+			if r.URL.Path != base || r.Header.Get("Idempotency-Key") != testInstanceID {
+				t.Errorf("reserve request = %s %s key=%q", r.Method, r.URL.Path, r.Header.Get("Idempotency-Key"))
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]any{"schema": "student-practice-learning-action-reserve.v1", "task_revision_id": testRevisionID, "task_revision_digest": testDigest} {
+				if body[key] != want {
+					t.Errorf("reserve body[%s] = %#v, want %#v", key, body[key], want)
+				}
+			}
+			if body["learning_action_id"] != testActionID {
+				t.Errorf("reserve body learning_action_id = %#v", body["learning_action_id"])
+			}
+		} else if strings.HasSuffix(r.URL.Path, "/open") {
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["schema"] != "student-practice-learning-action-open.v1" || body["learning_action_id"] != testActionID {
+				t.Errorf("open body = %#v", body)
+			}
+		} else if strings.HasSuffix(r.URL.Path, "/cancel") {
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["schema"] != "student-practice-learning-action-cancel.v1" || body["reason"] != "practice_provisioning_failed" {
+				t.Errorf("cancel body = %#v", body)
+			}
+		} else if r.Method != http.MethodGet {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		response := map[string]any{}
+		for key, value := range binding {
+			response[key] = value
+		}
+		if strings.HasSuffix(r.URL.Path, "/open") {
+			response["lifecycle_status"] = "OPEN"
+			response["opened_at"] = "2026-01-01T00:00:00Z"
+		}
+		if strings.HasSuffix(r.URL.Path, "/cancel") {
+			response["lifecycle_status"] = "CANCELLED"
+			response["closed_at"] = "2026-01-01T00:00:00Z"
+			response["cancel_reason"] = "practice_provisioning_failed"
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewStudentHTTPClient(server.URL, "student-practice-secret", server.Client())
+	reserved, err := client.Reserve(context.Background(), ports.ReserveLearningAction{
+		StudentID: testStudentID, TaskInstanceID: testInstanceID, TaskRevisionID: testRevisionID,
+		LearningActionID:   testActionID,
+		TaskRevisionDigest: testDigest, SurfaceClassification: "practice", LearningTargets: []domain.Target{target},
+		OccurredAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil || reserved.LearningActionID != testActionID {
+		t.Fatalf("Reserve() = %#v, %v", reserved, err)
+	}
+	if _, err := client.Get(context.Background(), testStudentID, testInstanceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Open(context.Background(), ports.OpenLearningAction{StudentID: testStudentID, TaskInstanceID: testInstanceID, LearningActionID: testActionID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CancelProvisioning(context.Background(), ports.CancelLearningAction{StudentID: testStudentID, TaskInstanceID: testInstanceID, LearningActionID: testActionID, Reason: "practice_provisioning_failed"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStudentHTTPClientAppliesPassedEvidenceWithDeterministicMetrics(t *testing.T) {
+	var gotBody map[string]any
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/evidence") || r.Header.Get("Idempotency-Key") != testSubmission {
+			t.Errorf("evidence request = %s %s key=%q", r.Method, r.URL.Path, r.Header.Get("Idempotency-Key"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]any{
+			"schema": "practice-task-competency-evidence.v2", "evidence_id": testSubmission, "policy_version": "practice-competency-evidence-v2",
+			"learning_action_id": testActionID, "student_id": testStudentID, "task_instance_id": testInstanceID,
+			"task_revision_id": testRevisionID, "task_revision_digest": testDigest,
+			"workspace_digest": testDigest, "submission_id": testSubmission, "outcome": "passed",
+		} {
+			if gotBody[key] != want {
+				t.Errorf("evidence body[%s] = %#v, want %#v", key, gotBody[key], want)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"schema":"student-practice-evidence-receipt.v2","evidence_id":%q,"learning_action_id":%q,"accepted":true,"policy_version":"student-mastery-v1"}`, testSubmission, testActionID)
+	}))
+	defer server.Close()
+	client := NewStudentHTTPClient(server.URL, "student-practice-secret", server.Client())
+	_, err := client.ApplyPassedEvidence(context.Background(), ports.PassedEvidence{
+		EvidenceID: testSubmission, LearningActionID: testActionID, StudentID: testStudentID, TaskInstanceID: testInstanceID,
+		TaskRevisionID: testRevisionID, TaskRevisionDigest: testDigest, WorkspaceDigest: testDigest, SubmissionID: testSubmission,
+		Targets: []domain.Target{{Type: "concept", Key: "go.interfaces", Version: "v1"}}, Steps: []string{testRevisionID},
+		Evidence:                []ports.TargetEvidence{{Target: domain.Target{Type: "concept", Key: "go.interfaces", Version: "v1"}, Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{testRevisionID}}},
+		AssistancePolicyVersion: "practice-task-assistance-policy.v1", OccurredAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, ok := gotBody["evidence"].([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("evidence entries = %#v", gotBody["evidence"])
+	}
+	entry := entries[0].(map[string]any)
+	if entry["correctness"] != float64(1) || entry["confidence"] != float64(1) || entry["independence"] != float64(1) {
+		t.Fatalf("evidence metrics = %#v", entry)
+	}
+	if entry["target"].(map[string]any)["key"] != "go.interfaces" || len(entry["step_ids"].([]any)) != 1 {
+		t.Fatalf("target/step evidence = %#v", entry)
+	}
+
+	missingDigest := ports.PassedEvidence{EvidenceID: testSubmission, SubmissionID: testSubmission, StudentID: testStudentID,
+		TaskInstanceID: testInstanceID, LearningActionID: testActionID, TaskRevisionID: testRevisionID,
+		Targets: []domain.Target{{Type: "concept", Key: "go.interfaces", Version: "v1"}},
+		Steps:   []string{testRevisionID}, Evidence: []ports.TargetEvidence{{Target: domain.Target{Type: "concept", Key: "go.interfaces", Version: "v1"}, Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{testRevisionID}}},
+		AssistancePolicyVersion: "practice-task-assistance-policy.v1", OccurredAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	if _, err := client.ApplyPassedEvidence(context.Background(), missingDigest); err == nil {
+		t.Fatal("expected missing revision/workspace digests to be rejected before HTTP")
+	}
+}
+
+func TestStudentHTTPClientRejectsBindingIdentityMismatch(t *testing.T) {
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"schema": "student-practice-learning-action-binding.v1", "learning_action_id": testActionID,
+			"student_id": testStudentID, "task_instance_id": testInstanceID, "task_revision_id": testRevisionID,
+			"task_revision_digest": testDigest, "surface_classification": "practice", "learning_targets": []any{map[string]any{"type": "concept", "key": "go.interfaces", "version": "v1"}}, "lifecycle_status": "RESERVED",
+		})
+	}))
+	defer server.Close()
+	client := NewStudentHTTPClient(server.URL, "student-practice-secret", server.Client())
+	if _, err := client.Get(context.Background(), testStudentID, "88888888-8888-4888-8888-888888888888"); err == nil {
+		t.Fatal("expected mismatched TaskInstance identity to be rejected")
+	}
+}
+
+func TestLearningPlannerHTTPClientResolvesExactReceipt(t *testing.T) {
+	request := json.RawMessage(`{"schema":"practice-learning-route-request.v1","student_id":"` + testStudentID + `","task_instance_id":"` + testInstanceID + `","task_revision_id":"` + testRevisionID + `","task_revision_digest":"` + testDigest + `","locale":"en","steps":[{"step_id":"` + testRevisionID + `","requirements":[{"id":"` + testRevisionID + `.target-001","target":{"type":"concept","key":"go.interfaces","version":"v1"},"policy":"required","mastery_threshold":0.7}]}]}`)
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/practice-learning-routes" || r.Header.Get("X-Internal-Token") != "planner-secret" || r.Header.Get("Idempotency-Key") != testInstanceID {
+			t.Errorf("request = %s %s token=%q key=%q", r.Method, r.URL.Path, r.Header.Get("X-Internal-Token"), r.Header.Get("Idempotency-Key"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["task_instance_id"] != testInstanceID || body["task_revision_digest"] != testDigest {
+			t.Errorf("route request body = %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"schema":"student-task-learning-snapshot.v1","id":"99999999-9999-4999-8999-999999999999","task_instance_id":%q,"task_revision_id":%q,"task_revision_digest":%q,"student_id":%q,"locale":"en","planner_version":"v1","route_digest":%q,"steps":[{"step_id":%q,"ready":true,"requirements":[]}],"created_at":"2026-01-01T00:00:00Z"}`,
+			testInstanceID, testRevisionID, testDigest, testStudentID, testDigest, testRevisionID)
+	}))
+	defer server.Close()
+	client := NewLearningPlannerHTTPClient(server.URL, "planner-secret", server.Client())
+	got, err := client.ResolveRoute(context.Background(), ports.ResolveLearningRoute{Request: request})
+	if err != nil || got.ID != "99999999-9999-4999-8999-999999999999" || got.TaskInstanceID != testInstanceID {
+		t.Fatalf("ResolveRoute() = %#v, %v", got, err)
+	}
+}
+
+func TestLearningPlannerHTTPClientEnsuresExactMaterial(t *testing.T) {
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		materialKey := strings.Repeat("a", 64)
+		generationKey := "88888888-8888-4888-8888-888888888888"
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/practice-learning-materials/"+materialKey+"/ensure" || r.Header.Get("Idempotency-Key") != generationKey {
+			t.Errorf("material request = %s %s key=%q", r.Method, r.URL.Path, r.Header.Get("Idempotency-Key"))
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["schema"] != "practice-learning-material-ensure-request.v1" || body["route_id"] != "99999999-9999-4999-8999-999999999999" || body["route_digest"] != testDigest {
+			t.Errorf("material body = %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"schema":"practice-learning-material.v1","material_key":%q,"target":{"type":"concept","key":"go.interfaces","version":"v1"},"course_id":%q,"lesson_id":%q,"reused":true}`, materialKey, testRevisionID, testActionID)
+	}))
+	defer server.Close()
+	client := NewLearningPlannerHTTPClient(server.URL, "planner-secret", server.Client())
+	got, err := client.Materialize(context.Background(), ports.MaterializeLearningStep{
+		TaskInstanceID: testInstanceID, StepID: testRevisionID, RouteID: "99999999-9999-4999-8999-999999999999", RouteDigest: testDigest,
+		MaterialKey: strings.Repeat("a", 64), GenerationKey: "88888888-8888-4888-8888-888888888888",
+		Target: domain.Target{Type: "concept", Key: "go.interfaces", Version: "v1"},
+	})
+	if err != nil || got.MaterialKey != strings.Repeat("a", 64) || !got.Reused {
+		t.Fatalf("Materialize() = %#v, %v", got, err)
+	}
+}
+
+func TestLearningPlannerHTTPClientReconcilesExactReadinessReceipt(t *testing.T) {
+	key := "88888888-8888-4888-8888-888888888888"
+	routeID := "99999999-9999-4999-8999-999999999999"
+	stepID := "00000000-0000-4000-8000-000000000021"
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/practice-learning-routes/"+routeID+"/steps/"+stepID+"/readiness-reconciliations" ||
+			r.Header.Get("X-Internal-Token") != "planner-secret" || r.Header.Get("Idempotency-Key") != key {
+			t.Errorf("readiness request = %s %s token=%q key=%q", r.Method, r.URL.Path, r.Header.Get("X-Internal-Token"), r.Header.Get("Idempotency-Key"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["schema"] != "practice-learning-readiness-reconcile.v1" || body["task_instance_id"] != testInstanceID ||
+			body["task_revision_id"] != testRevisionID || body["route_id"] != routeID || body["step_id"] != stepID {
+			t.Errorf("readiness body = %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"schema":"practice-learning-readiness-receipt.v1","id":%q,"task_instance_id":%q,"student_id":%q,"task_revision_id":%q,"task_revision_digest":%q,"route_id":%q,"route_digest":%q,"step_id":%q,"decision":"READY","learner_state_digest":%q,"mastery_policy_version":"student-mastery-v1","observed_at":"2026-01-01T00:00:00Z"}`,
+			"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", testInstanceID, testStudentID, testRevisionID, testDigest, routeID, testDigest, stepID, testDigest)
+	}))
+	client := NewLearningPlannerHTTPClient(server.URL, "planner-secret", server.Client())
+	got, err := client.ReconcileReadiness(context.Background(), ports.ReconcileLearningReadiness{
+		IdempotencyKey: key, TaskInstanceID: testInstanceID, StudentID: testStudentID, TaskRevisionID: testRevisionID,
+		RevisionDigest: testDigest, RouteID: routeID, RouteDigest: testDigest, StepID: stepID,
+	})
+	if err != nil || got.Decision != "READY" || got.RouteID != routeID || got.StepID != stepID {
+		t.Fatalf("ReconcileReadiness() = %#v, %v", got, err)
+	}
+}
+
+func TestSandboxHTTPClientUsesExactPinnedSnapshotAndFenceContracts(t *testing.T) {
+	var calls []string
+	pinnedFiles := []domain.WorkspaceFile{{Path: "main.go", Content: "package main // state A"}}
+	liveHeadFiles := []domain.WorkspaceFile{{Path: "main.go", Content: "package main // state A"}}
+	snapshotDigest, err := workspaceFilesDigest(pinnedFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != "sandbox-secret" {
+			t.Errorf("token = %q", r.Header.Get("X-Internal-Token"))
+		}
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/internal/v2/practice-workspaces":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["schema"] != "practice-workspace-create.v2" || body["request_id"] != testInstanceID {
+				t.Errorf("create body = %#v", body)
+			}
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-workspace-binding.v2","sandbox_id":%q,"task_instance_id":%q,"task_revision_id":%q,"revision_digest":%q,"initial_generation":{"revision":1,"generation_id":%q,"workspace_digest":%q,"fence_epoch":1}}`, testSandboxID, testInstanceID, testRevisionID, testDigest, testGeneration, snapshotDigest)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/submissions/"+testSubmission+"/freeze"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["schema"] != "practice-snapshot-freeze.v2" || body["request_id"] != testSubmission {
+				t.Errorf("freeze body = %#v", body)
+			}
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-pinned-snapshot.v2","sandbox_id":%q,"snapshot_id":%q,"generation_id":%q,"workspace_digest":%q,"revision":2,"file_count":1,"pinned_at":"2026-01-01T00:00:00Z"}`, testSandboxID, testSubmission, testGeneration, snapshotDigest)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/snapshots/"+testSubmission):
+			if r.URL.Query().Get("generation_id") != testGeneration || r.URL.Query().Get("workspace_digest") != snapshotDigest {
+				t.Errorf("snapshot query = %s", r.URL.RawQuery)
+			}
+			encodedFiles, _ := json.Marshal(pinnedFiles)
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-pinned-snapshot-content.v2","sandbox_id":%q,"snapshot_id":%q,"generation_id":%q,"workspace_digest":%q,"revision":4,"file_count":1,"pinned_at":"2026-01-01T00:00:00Z","files":%s}`, testSandboxID, testSubmission, testGeneration, snapshotDigest, encodedFiles)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/write-lock"):
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-write-lock-result.v2","sandbox_id":%q,"task_instance_id":%q,"request_id":%q,"lock_id":%q,"mode":"TEMPORARY","submission_id":%q,"fence_epoch":8,"permanent":false,"locked":true}`, testSandboxID, testInstanceID, testInstanceID, testInstanceID, testSubmission)
+		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/write-lock/"+testInstanceID):
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-write-lock-result.v2","sandbox_id":%q,"task_instance_id":%q,"request_id":%q,"lock_id":%q,"mode":"TEMPORARY","submission_id":%q,"fence_epoch":9,"permanent":false,"locked":false}`, testSandboxID, testInstanceID, testInstanceID, testInstanceID, testSubmission)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/restore"):
+			_, _ = fmt.Fprintf(w, `{"schema":"practice-workspace-binding.v2","sandbox_id":%q,"task_instance_id":%q,"task_revision_id":%q,"revision_digest":%q,"initial_generation":{"revision":2,"generation_id":%q,"workspace_digest":%q,"fence_epoch":10}}`, testSandboxID, testInstanceID, testRevisionID, testDigest, testGeneration, snapshotDigest)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewSandboxHTTPClient(server.URL, "sandbox-secret", server.Client())
+	profile := json.RawMessage(`{"code_structure_type_code":"go","compose_config":{}}`)
+	binding, err := client.CreateOrResumeWorkspace(context.Background(), ports.CreateWorkspace{
+		RequestID: testInstanceID, StudentID: testStudentID, TaskInstanceID: testInstanceID,
+		TaskRevisionID: testRevisionID, RevisionDigest: testDigest, RuntimeProfile: profile,
+		StarterFiles: []domain.WorkspaceFile{{Path: "main.go", Content: "package main"}},
+	})
+	if err != nil || binding.SandboxID != testSandboxID || binding.WorkspaceDigest != snapshotDigest {
+		t.Fatalf("CreateOrResumeWorkspace() = %#v, %v", binding, err)
+	}
+	ref, err := client.FreezeSnapshot(context.Background(), ports.FreezeSnapshot{SandboxID: testSandboxID, SubmissionID: testSubmission, TaskInstanceID: testInstanceID})
+	if err != nil || ref.SnapshotID != testSubmission || ref.WorkspaceDigest != snapshotDigest {
+		t.Fatalf("FreezeSnapshot() = %#v, %v", ref, err)
+	}
+	snapshot, err := client.ReadPinnedSnapshot(context.Background(), ref)
+	if err != nil || len(snapshot.Files) != 1 || snapshot.Ref != ref || snapshot.Files[0].Content != "package main // state A" {
+		t.Fatalf("ReadPinnedSnapshot() = %#v, %v", snapshot, err)
+	}
+	liveHeadFiles = []domain.WorkspaceFile{{Path: "main.go", Content: "package main // state B"}}
+	retriedSnapshot, err := client.ReadPinnedSnapshot(context.Background(), ref)
+	if err != nil || retriedSnapshot.Ref != ref || retriedSnapshot.Files[0].Content != "package main // state A" {
+		t.Fatalf("pinned snapshot retry used the later live head %q: (%+v, %v)", liveHeadFiles[0].Content, retriedSnapshot, err)
+	}
+	lock, err := client.LockWrites(context.Background(), ports.LockWorkspaceWrites{SandboxID: testSandboxID, RequestID: testInstanceID, Mode: "TEMPORARY", SubmissionID: testSubmission})
+	if err != nil || lock.FenceEpoch != 8 {
+		t.Fatalf("LockWrites() = %#v, %v", lock, err)
+	}
+	lock, err = client.UnlockWrites(context.Background(), ports.UnlockWorkspaceWrites{SandboxID: testSandboxID, LockID: testInstanceID, RequestID: testInstanceID})
+	if err != nil || lock.FenceEpoch != 9 {
+		t.Fatalf("UnlockWrites() = %#v, %v", lock, err)
+	}
+	_, err = client.RestoreWorkspace(context.Background(), ports.RestoreWorkspace{SandboxID: testSandboxID, TaskInstanceID: testInstanceID, Ref: ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 7 {
+		t.Fatalf("calls = %v", calls)
+	}
+}
+
+func TestSandboxHTTPClientRejectsNoncanonicalSandboxID(t *testing.T) {
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"schema":"practice-workspace-binding.v2","sandbox_id":"sandbox-one","task_instance_id":%q,"task_revision_id":%q,"revision_digest":%q,"initial_generation":{"revision":1,"generation_id":%q,"workspace_digest":%q}}`, testInstanceID, testRevisionID, testDigest, testGeneration, testDigest)
+	}))
+	defer server.Close()
+	client := NewSandboxHTTPClient(server.URL, "sandbox-secret", server.Client())
+	_, err := client.CreateOrResumeWorkspace(context.Background(), ports.CreateWorkspace{
+		RequestID: testInstanceID, StudentID: testStudentID, TaskInstanceID: testInstanceID,
+		TaskRevisionID: testRevisionID, RevisionDigest: testDigest,
+		RuntimeProfile: json.RawMessage(`{"code_structure_type_code":"go","compose_config":{}}`),
+	})
+	if err == nil {
+		t.Fatal("expected noncanonical sandbox ID to be rejected")
+	}
+}
+
+func TestValidationHTTPClientVerifiesAllEchoedIdentities(t *testing.T) {
+	response := map[string]any{
+		"schema": "practice-validation-result.v2", "task_instance_id": testInstanceID,
+		"submission_id": testSubmission, "validation_run_id": testRunID,
+		"revision_digest": testDigest, "validation_contract_digest": testDigest,
+		"snapshot": map[string]string{"sandbox_id": testSandboxID, "snapshot_id": testSubmission, "generation_id": testGeneration, "workspace_digest": testDigest},
+		"outcome":  "PASS", "stages": []any{},
+	}
+	server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v2/practice-validations" || r.Header.Get("X-Internal-Token") != "validation-secret" {
+			t.Errorf("request = %s %s token=%q", r.Method, r.URL.Path, r.Header.Get("X-Internal-Token"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["schema"] != "practice-validation-request.v2" || body["validation_run_id"] != testRunID {
+			t.Errorf("validation body = %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+	client := NewValidationHTTPClient(server.URL, "validation-secret", server.Client())
+	request := ports.OfficialValidationRequest{
+		TaskInstanceID: testInstanceID, SubmissionID: testSubmission, ValidationRunID: testRunID,
+		RevisionDigest: testDigest, ValidationContractDigest: testDigest,
+		Snapshot: domain.SnapshotRef{SandboxID: testSandboxID, SnapshotID: testSubmission, GenerationID: testGeneration, WorkspaceDigest: testDigest},
+		Scope:    "FINAL", ValidationSpecification: json.RawMessage(`{"schema":"practice-validation-specification.v1","runtime_profile":{},"contracts":[]}`),
+	}
+	got, err := client.ValidateOfficialSubmission(context.Background(), request)
+	if err != nil || got.Outcome != domain.OutcomePass {
+		t.Fatalf("ValidateOfficialSubmission() = %#v, %v", got, err)
+	}
+
+	identityFields := []string{"schema", "task_instance_id", "submission_id", "validation_run_id", "revision_digest", "validation_contract_digest",
+		"snapshot.sandbox_id", "snapshot.snapshot_id", "snapshot.generation_id", "snapshot.workspace_digest"}
+	original := response
+	for _, field := range identityFields {
+		encoded, _ := json.Marshal(original)
+		var mismatched map[string]any
+		_ = json.Unmarshal(encoded, &mismatched)
+		if strings.HasPrefix(field, "snapshot.") {
+			snapshot := mismatched["snapshot"].(map[string]any)
+			snapshot[strings.TrimPrefix(field, "snapshot.")] = "mismatched"
+		} else {
+			mismatched[field] = "mismatched"
+		}
+		response = mismatched
+		got, err = client.ValidateOfficialSubmission(context.Background(), request)
+		response = original
+		if err != nil || got.Outcome != domain.OutcomeError || got.ErrorClassification != "VALIDATOR_PROTOCOL" {
+			t.Fatalf("mismatched %s echo = %#v, %v", field, got, err)
+		}
+	}
+}
+
+func TestSandboxHTTPClientRequiresExplicitSnapshotRevisionAndAcceptsGenesis(t *testing.T) {
+	files := []domain.WorkspaceFile{{Path: "answer.txt", Content: "synthetic immutable protocol proof\n"}}
+	digest, err := workspaceFilesDigest(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.SnapshotRef{SandboxID: testSandboxID, SnapshotID: testSubmission, GenerationID: testGeneration, WorkspaceDigest: digest}
+	for _, operation := range []string{"freeze", "read"} {
+		for _, revision := range []struct {
+			name     string
+			value    json.RawMessage
+			accepted bool
+		}{
+			{name: "genesis-zero", value: json.RawMessage(`0`), accepted: true},
+			{name: "positive", value: json.RawMessage(`1`), accepted: true},
+			{name: "missing"},
+			{name: "null", value: json.RawMessage(`null`)},
+			{name: "negative", value: json.RawMessage(`-1`)},
+			{name: "wrong-type", value: json.RawMessage(`"0"`)},
+		} {
+			t.Run(operation+"/"+revision.name, func(t *testing.T) {
+				server := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					response := map[string]any{"schema": "practice-pinned-snapshot.v2", "sandbox_id": ref.SandboxID, "snapshot_id": ref.SnapshotID,
+						"generation_id": ref.GenerationID, "workspace_digest": ref.WorkspaceDigest, "file_count": len(files), "pinned_at": "2026-01-01T00:00:00Z"}
+					if revision.value != nil {
+						response["revision"] = revision.value
+					}
+					if operation == "read" {
+						response["schema"], response["files"] = "practice-pinned-snapshot-content.v2", files
+					}
+					_ = json.NewEncoder(w).Encode(response)
+				}))
+				defer server.Close()
+				client := NewSandboxHTTPClient(server.URL, "fixture-token", server.Client())
+				if operation == "freeze" {
+					got, err := client.FreezeSnapshot(context.Background(), ports.FreezeSnapshot{SandboxID: ref.SandboxID, SubmissionID: ref.SnapshotID, TaskInstanceID: testInstanceID})
+					if revision.accepted && (err != nil || got != ref) {
+						t.Fatalf("accepted snapshot revision: ref=%+v err=%v", got, err)
+					}
+					if !revision.accepted && err == nil {
+						t.Fatal("missing/invalid revision accepted")
+					}
+				} else {
+					got, err := client.ReadPinnedSnapshot(context.Background(), ref)
+					if revision.accepted && (err != nil || got.Ref != ref || len(got.Files) != 1 || got.Files[0] != files[0]) {
+						t.Fatalf("accepted pinned content revision: snapshot=%+v err=%v", got, err)
+					}
+					if !revision.accepted && err == nil {
+						t.Fatal("missing/invalid revision accepted")
+					}
+				}
+			})
+		}
+	}
+}

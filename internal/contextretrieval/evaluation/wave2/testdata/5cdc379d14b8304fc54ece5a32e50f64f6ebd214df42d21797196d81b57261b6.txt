@@ -1,0 +1,317 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type TeacherTaskContext struct {
+	Schema           string                        `json:"schema"`
+	TaskInstanceID   string                        `json:"task_instance_id"`
+	StudentID        string                        `json:"student_id"`
+	TaskRevisionID   string                        `json:"task_revision_id"`
+	LearningActionID string                        `json:"learning_action_id"`
+	LearningPathID   string                        `json:"learning_path_id,omitempty"`
+	LearningPathRef  *domain.LearningPathReference `json:"learning_path_reference,omitempty"`
+	Surface          string                        `json:"surface_classification"`
+	Locale           string                        `json:"locale"`
+	Status           string                        `json:"status"`
+	Step             TeacherStepContext            `json:"step"`
+	Policy           TeacherAssistancePolicy       `json:"assistance_policy"`
+	Targets          []domain.Target               `json:"learning_targets"`
+	Workspace        TeacherWorkspaceContext       `json:"workspace"`
+	Validation       TeacherValidationSummary      `json:"validation"`
+}
+
+type TeacherStepContext struct {
+	ID           string              `json:"id"`
+	Title        string              `json:"title"`
+	Objective    string              `json:"objective"`
+	Deliverables []string            `json:"deliverables"`
+	Acceptance   []domain.Acceptance `json:"acceptance"`
+	Status       string              `json:"status"`
+}
+
+type TeacherAssistancePolicy struct {
+	Version                     int                     `json:"version"`
+	MaxHintLevel                int                     `json:"max_hint_level"`
+	RevealSolutionAfterAttempts *int                    `json:"reveal_solution_after_attempts,omitempty"`
+	Teacher                     TeacherCapabilityPolicy `json:"teacher"`
+	Debugging                   TeacherDebuggingPolicy  `json:"debugging"`
+}
+type TeacherCapabilityPolicy struct {
+	MayExplain               bool `json:"may_explain"`
+	MayWriteCompleteSolution bool `json:"may_write_complete_solution"`
+}
+type TeacherDebuggingPolicy struct {
+	MayPointToArea     bool `json:"may_point_to_area"`
+	MayNameLikelyCause bool `json:"may_name_likely_cause"`
+	MaySuggestPatch    bool `json:"may_suggest_patch"`
+}
+type TeacherWorkspaceContext struct {
+	Available        bool              `json:"available"`
+	Files            []TeacherCodeFile `json:"files"`
+	OmittedFileCount int               `json:"omitted_file_count"`
+	Truncated        bool              `json:"truncated"`
+}
+type TeacherCodeFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+type TeacherValidationSummary struct {
+	Available  bool `json:"available"`
+	Passed     bool `json:"passed"`
+	StageCount int  `json:"stage_count"`
+	ErrorCount int  `json:"error_count"`
+}
+
+type TeacherValidationContext struct {
+	Schema             string                        `json:"schema"`
+	Available          bool                          `json:"available"`
+	TaskInstanceID     string                        `json:"task_instance_id"`
+	StudentID          string                        `json:"student_id"`
+	TaskRevisionID     string                        `json:"task_revision_id"`
+	LearningActionID   string                        `json:"learning_action_id"`
+	SubmissionID       *string                       `json:"submission_id"`
+	WorkspaceDigest    *string                       `json:"workspace_digest"`
+	UpdatedAt          *time.Time                    `json:"updated_at"`
+	Passed             *bool                         `json:"passed"`
+	TeacherExplanation *TeacherValidationExplanation `json:"teacher_explanation"`
+}
+type TeacherValidationExplanation struct {
+	Schema         string                   `json:"schema"`
+	Passed         bool                     `json:"passed"`
+	BlockingIssues []TeacherValidationIssue `json:"blocking_issues"`
+	Truncated      bool                     `json:"truncated"`
+	SourceDigest   string                   `json:"source_digest"`
+}
+type TeacherValidationIssue struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Hint     string `json:"hint,omitempty"`
+	File     string `json:"file,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Column   int    `json:"column,omitempty"`
+	StageID  string `json:"stage_id,omitempty"`
+	Engine   string `json:"engine,omitempty"`
+	Severity string `json:"severity,omitempty"`
+}
+
+func (runtime *Runtime) TeacherContext(ctx context.Context, instanceID, studentID string) (TeacherTaskContext, error) {
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return TeacherTaskContext{}, err
+	}
+	if instance.LearningActionID == "" || instance.CurrentStep == nil || instance.Status == domain.TaskInstanceStarting || instance.Status == domain.TaskInstanceCancelled {
+		return TeacherTaskContext{}, domain.ErrConflict
+	}
+	validation := TeacherValidationSummary{}
+	var currentSubmission *domain.Submission
+	if instance.CurrentSubmissionID != "" {
+		submission, readErr := runtime.Repository.GetSubmission(ctx, instance.ID, instance.CurrentSubmissionID)
+		if readErr != nil {
+			return TeacherTaskContext{}, readErr
+		}
+		if !teacherSubmissionMatches(instance, submission) {
+			return TeacherTaskContext{}, domain.ErrConflict
+		}
+		currentSubmission = &submission
+		if summary := submission.CurrentSafeValidationSummary(); summary != nil {
+			validation.Available, validation.Passed, validation.StageCount = true, summary.Outcome == domain.OutcomePass, len(summary.Stages)
+			for _, stage := range summary.Stages {
+				validation.ErrorCount += len(stage.Issues)
+			}
+			if summary.Outcome == domain.OutcomeError && validation.ErrorCount == 0 {
+				validation.ErrorCount = 1
+			}
+		}
+	}
+	status := "ACTIVE"
+	if instance.Status == domain.TaskInstanceInReview {
+		status = "IN_REVIEW"
+	} else if instance.Status == domain.TaskInstanceCompleted {
+		status = "COMPLETED"
+	} else if currentSubmission != nil && currentSubmission.Status == domain.SubmissionChangesRequested {
+		status = "CHANGES_REQUESTED"
+	}
+	step := *instance.CurrentStep
+	acceptance := append([]domain.Acceptance(nil), step.Acceptance...)
+	deliverables := append([]string(nil), step.Deliverables...)
+	pathRef := instance.LearningPathReference
+	if pathRef != nil {
+		pathCopy := *pathRef
+		pathRef = &pathCopy
+	}
+	return TeacherTaskContext{Schema: "practice-task-teacher-context.v1", TaskInstanceID: instance.ID, StudentID: instance.StudentID,
+		TaskRevisionID: instance.TaskRevisionID, LearningActionID: instance.LearningActionID, LearningPathID: instance.LearningPathID,
+		LearningPathRef: pathRef, Surface: instance.SurfaceClassification, Locale: instance.Locale, Status: status,
+		Step: TeacherStepContext{ID: step.ID, Title: step.Title, Objective: step.Objective, Deliverables: deliverables, Acceptance: acceptance, Status: step.Status},
+		Policy: TeacherAssistancePolicy{Version: 1, MaxHintLevel: 7, Teacher: TeacherCapabilityPolicy{MayExplain: true},
+			Debugging: TeacherDebuggingPolicy{MayPointToArea: true, MayNameLikelyCause: true}},
+		Targets: uniqueTargets(instance.Steps), Workspace: TeacherWorkspaceContext{Available: false, Files: []TeacherCodeFile{}},
+		Validation: validation}, nil
+}
+
+func (runtime *Runtime) TeacherValidation(ctx context.Context, instanceID, studentID string) (TeacherValidationContext, error) {
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return TeacherValidationContext{}, err
+	}
+	result := TeacherValidationContext{Schema: "practice-task-teacher-validation-context.v1", Available: false,
+		TaskInstanceID: instance.ID, StudentID: instance.StudentID, TaskRevisionID: instance.TaskRevisionID, LearningActionID: instance.LearningActionID}
+	if instance.CurrentSubmissionID == "" {
+		return result, nil
+	}
+	submission, err := runtime.Repository.GetSubmission(ctx, instance.ID, instance.CurrentSubmissionID)
+	if err != nil {
+		return TeacherValidationContext{}, err
+	}
+	if !teacherSubmissionMatches(instance, submission) {
+		return TeacherValidationContext{}, domain.ErrConflict
+	}
+	submissionID, digest, updated := submission.ID, submission.WorkspaceDigest, submission.UpdatedAt.UTC()
+	result.SubmissionID, result.WorkspaceDigest, result.UpdatedAt = &submissionID, &digest, &updated
+	summary := submission.CurrentSafeValidationSummary()
+	if summary == nil {
+		return result, nil
+	}
+	explanation, err := teacherExplanation(summary)
+	if err != nil {
+		return TeacherValidationContext{}, err
+	}
+	if summary.Outcome == domain.OutcomeFail && len(explanation.BlockingIssues) == 0 {
+		return result, nil
+	}
+	passed := summary.Outcome == domain.OutcomePass
+	result.Available, result.Passed, result.TeacherExplanation = true, &passed, &explanation
+	return result, nil
+}
+
+func teacherSubmissionMatches(instance domain.TaskInstance, submission domain.Submission) bool {
+	return submission.ID == instance.CurrentSubmissionID && submission.TaskInstanceID == instance.ID && submission.StudentID == instance.StudentID &&
+		submission.RevisionDigest == instance.TaskRevisionDigest && submission.WorkspaceDigest == submission.Snapshot.WorkspaceDigest
+}
+
+func teacherExplanation(summary *domain.ValidationSummary) (TeacherValidationExplanation, error) {
+	digest, err := domain.CommandDigest(summary)
+	if err != nil {
+		return TeacherValidationExplanation{}, err
+	}
+	explanation := TeacherValidationExplanation{Schema: "teacher-validation-explanation.v1", Passed: summary.Outcome == domain.OutcomePass,
+		BlockingIssues: make([]TeacherValidationIssue, 0), SourceDigest: digest}
+	if summary.Outcome == domain.OutcomeError {
+		explanation.BlockingIssues = append(explanation.BlockingIssues, TeacherValidationIssue{Code: *summary.ErrorClassification,
+			Message: domain.SafeTechnicalIssueMessage, Severity: "error"})
+		return explanation, nil
+	}
+	if summary.Outcome == domain.OutcomePass {
+		return explanation, nil
+	}
+	seen := make(map[TeacherValidationIssue]bool)
+	for _, stage := range summary.Stages {
+		if !stage.Required || stage.Outcome != "FAIL" {
+			continue
+		}
+		for _, issue := range stage.Issues {
+			blocking := TeacherValidationIssue{Code: issue.Code, Message: issue.Message, StageID: stage.StageID, Severity: "error"}
+			if seen[blocking] {
+				continue
+			}
+			seen[blocking] = true
+			if len(explanation.BlockingIssues) == 5 {
+				explanation.Truncated = true
+				continue
+			}
+			explanation.BlockingIssues = append(explanation.BlockingIssues, blocking)
+		}
+	}
+	return explanation, nil
+}
+
+func (runtime *Runtime) RecordAssistance(ctx context.Context, instanceID string, receipt ports.AssistanceReceipt) (ports.AssistanceReceipt, error) {
+	if !domain.IsCanonicalUUID(instanceID) || receipt.Schema != "practice-task-assistance-usage.v1" ||
+		!domain.IsCanonicalUUID(receipt.UsageID) || !domain.IsCanonicalUUID(receipt.StudentID) || receipt.TaskInstanceID != instanceID ||
+		(strings.TrimSpace(receipt.StepID) != receipt.StepID) || receipt.Kind == "" {
+		return ports.AssistanceReceipt{}, domain.ErrInvalid
+	}
+	if receipt.Kind != "HINT" && receipt.Kind != "TEACHER_QUESTION" && receipt.Kind != "TEACHER_EXPLANATION" {
+		return ports.AssistanceReceipt{}, domain.ErrInvalid
+	}
+	if receipt.Kind == "HINT" {
+		if receipt.HintLevel < 1 || receipt.HintLevel > 7 {
+			return ports.AssistanceReceipt{}, domain.ErrInvalid
+		}
+	} else if receipt.HintLevel != 0 {
+		return ports.AssistanceReceipt{}, domain.ErrInvalid
+	}
+	unlock := runtime.lockInstance(instanceID)
+	defer unlock()
+	instance, err := runtime.Repository.GetInstance(ctx, receipt.StudentID, instanceID)
+	if err != nil {
+		return ports.AssistanceReceipt{}, err
+	}
+	digest, err := domain.CommandDigest(struct {
+		Schema, UsageID, StudentID, TaskInstanceID, StepID, Kind string
+		HintLevel                                                int
+	}{receipt.Schema, receipt.UsageID, receipt.StudentID, receipt.TaskInstanceID, receipt.StepID, receipt.Kind, receipt.HintLevel})
+	if err != nil {
+		return ports.AssistanceReceipt{}, err
+	}
+	// Ownership was checked above, even for an exact committed replay. Fresh
+	// lifecycle, action, step and cap guards apply only when no fact exists.
+	stored, storedDigest, err := runtime.Repository.GetAssistance(ctx, receipt.StudentID, instanceID, receipt.UsageID)
+	if err == nil {
+		if storedDigest != digest || !stored.SameCommand(receipt) {
+			return ports.AssistanceReceipt{}, domain.ErrIdempotency
+		}
+		if stored.PolicyVersion == "" || stored.OccurredAt.IsZero() || stored.OccurredAt.Location() != time.UTC {
+			return ports.AssistanceReceipt{}, fmt.Errorf("assistance receipt identity mismatch")
+		}
+		return stored, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return ports.AssistanceReceipt{}, err
+	}
+	if instance.Status != domain.TaskInstanceInProgress || instance.LearningActionID == "" {
+		return ports.AssistanceReceipt{}, domain.ErrConflict
+	}
+	found := false
+	for _, step := range instance.Steps {
+		if step.ID == receipt.StepID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ports.AssistanceReceipt{}, domain.ErrNotFound
+	}
+	if receipt.Kind == "HINT" {
+		if instance.HintsUsed >= 1000 {
+			return ports.AssistanceReceipt{}, domain.ErrConflict
+		}
+		instance.HintsUsed++
+		if instance.MaxHintLevel == nil || receipt.HintLevel > *instance.MaxHintLevel {
+			level := receipt.HintLevel
+			instance.MaxHintLevel = &level
+		}
+	}
+	instance.TeacherAssistanceUsed = true
+	instance.AssistancePolicyVersion = AssistancePolicyVersion
+	receipt.PolicyVersion = AssistancePolicyVersion
+	receipt.OccurredAt = runtime.now()
+	_, stored, _, err = runtime.Repository.RecordAssistance(ctx, instance, receipt, digest)
+	if err != nil {
+		return ports.AssistanceReceipt{}, err
+	}
+	if stored.UsageID != receipt.UsageID || stored.StudentID != receipt.StudentID || stored.TaskInstanceID != instance.ID ||
+		!stored.SameCommand(receipt) || stored.PolicyVersion == "" || stored.OccurredAt.IsZero() || stored.OccurredAt.Location() != time.UTC {
+		return ports.AssistanceReceipt{}, fmt.Errorf("assistance receipt identity mismatch")
+	}
+	return stored, nil
+}

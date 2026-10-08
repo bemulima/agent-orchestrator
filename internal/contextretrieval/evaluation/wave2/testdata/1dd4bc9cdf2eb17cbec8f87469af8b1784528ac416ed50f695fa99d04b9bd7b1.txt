@@ -1,0 +1,139 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+)
+
+const PracticeLearningRoutePolicyV1 = "practice-learning-route-policy.v1"
+
+type LearningRouteRequest struct {
+	Schema             string                     `json:"schema"`
+	StudentID          string                     `json:"student_id"`
+	TaskInstanceID     string                     `json:"task_instance_id"`
+	TaskRevisionID     string                     `json:"task_revision_id"`
+	TaskRevisionDigest string                     `json:"task_revision_digest"`
+	Locale             string                     `json:"locale"`
+	Steps              []LearningRouteStepRequest `json:"steps"`
+}
+
+type LearningRouteStepRequest struct {
+	StepID       string                     `json:"step_id"`
+	Requirements []LearningRouteRequirement `json:"requirements"`
+}
+
+type LearningRouteRequirement struct {
+	ID               string  `json:"id"`
+	Target           Target  `json:"target"`
+	Policy           string  `json:"policy"`
+	MasteryThreshold float64 `json:"mastery_threshold"`
+}
+
+func BuildLearningRouteRequest(instance TaskInstance) (LearningRouteRequest, error) {
+	if !IsCanonicalUUID(instance.ID) || !IsCanonicalUUID(instance.StudentID) || !IsCanonicalUUID(instance.TaskRevisionID) || !canonicalDigest.MatchString(instance.TaskRevisionDigest) || instance.Locale == "" || len(instance.Steps) == 0 {
+		return LearningRouteRequest{}, ErrInvalid
+	}
+	request := LearningRouteRequest{Schema: "practice-learning-route-request.v1", StudentID: instance.StudentID,
+		TaskInstanceID: instance.ID, TaskRevisionID: instance.TaskRevisionID, TaskRevisionDigest: instance.TaskRevisionDigest,
+		Locale: instance.Locale, Steps: make([]LearningRouteStepRequest, 0, len(instance.Steps))}
+	for _, step := range instance.Steps {
+		if !IsCanonicalUUID(step.ID) || len(step.Targets) == 0 {
+			return LearningRouteRequest{}, fmt.Errorf("%w: route step lacks frozen targets", ErrAuthoringDefect)
+		}
+		mapped := LearningRouteStepRequest{StepID: step.ID, Requirements: make([]LearningRouteRequirement, 0, len(step.Targets))}
+		for index, target := range step.Targets {
+			if target.Version == "" || (target.Type != "concept" && target.Type != "capability") || target.Key == "" {
+				return LearningRouteRequest{}, fmt.Errorf("%w: invalid frozen target", ErrAuthoringDefect)
+			}
+			mapped.Requirements = append(mapped.Requirements, LearningRouteRequirement{ID: fmt.Sprintf("%s.target-%03d", step.ID, index+1), Target: target, Policy: "required", MasteryThreshold: 0.7})
+		}
+		request.Steps = append(request.Steps, mapped)
+	}
+	return request, nil
+}
+
+type ValidationSpecification struct {
+	Schema         string               `json:"schema"`
+	RuntimeProfile json.RawMessage      `json:"runtime_profile"`
+	Contracts      []ValidationContract `json:"contracts"`
+}
+
+type ValidationContract struct {
+	MilestoneID        string           `json:"milestone_id"`
+	Required           bool             `json:"required"`
+	ValidationContract json.RawMessage  `json:"validation_contract"`
+	EvaluationAssets   EvaluationAssets `json:"evaluation_assets"`
+}
+
+func BuildValidationSpecification(instance TaskInstance, scope, milestoneID string) (ValidationSpecification, string, error) {
+	if scope != "FINAL" && scope != "MILESTONE" {
+		return ValidationSpecification{}, "", ErrInvalid
+	}
+	if (scope == "FINAL" && milestoneID != "") || (scope == "MILESTONE" && !IsCanonicalUUID(milestoneID)) {
+		return ValidationSpecification{}, "", ErrInvalid
+	}
+	spec := ValidationSpecification{Schema: "practice-validation-specification.v1", RuntimeProfile: append(json.RawMessage(nil), instance.RevisionEnvelope.RuntimeContext...), Contracts: []ValidationContract{}}
+	profile, _, err := normalizeRuntimeProfileForSpecification(instance)
+	if err != nil {
+		return ValidationSpecification{}, "", err
+	}
+	spec.RuntimeProfile = profile
+	found := scope == "FINAL"
+	for _, step := range instance.Steps {
+		if !step.Required {
+			continue
+		}
+		if scope == "MILESTONE" && step.ID != milestoneID {
+			continue
+		}
+		if len(step.ValidationContract) == 0 || !json.Valid(step.ValidationContract) || step.EvaluationAssets.TestSuiteRef == "" {
+			return ValidationSpecification{}, "", fmt.Errorf("%w: required validation contract or suite missing", ErrAuthoringDefect)
+		}
+		spec.Contracts = append(spec.Contracts, ValidationContract{MilestoneID: step.ID, Required: true,
+			ValidationContract: append(json.RawMessage(nil), step.ValidationContract...), EvaluationAssets: step.EvaluationAssets})
+		if scope == "MILESTONE" {
+			found = true
+		}
+	}
+	if !found || len(spec.Contracts) == 0 {
+		return ValidationSpecification{}, "", ErrConflict
+	}
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		return ValidationSpecification{}, "", err
+	}
+	canonical, err := CanonicalJSON(encoded)
+	if err != nil {
+		return ValidationSpecification{}, "", err
+	}
+	digestInput := struct {
+		Schema                  string          `json:"schema"`
+		Scope                   string          `json:"scope"`
+		MilestoneID             string          `json:"milestone_id,omitempty"`
+		ValidationSpecification json.RawMessage `json:"validation_specification"`
+	}{ValidationDigestV1, scope, milestoneID, canonical}
+	digestBytes, err := json.Marshal(digestInput)
+	if err != nil {
+		return ValidationSpecification{}, "", err
+	}
+	canonicalDigestInput, err := CanonicalJSON(digestBytes)
+	if err != nil {
+		return ValidationSpecification{}, "", err
+	}
+	sum := sha256.Sum256(canonicalDigestInput)
+	return spec, "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func normalizeRuntimeProfileForSpecification(instance TaskInstance) (json.RawMessage, []byte, error) {
+	if len(instance.Steps) == 0 {
+		return nil, nil, ErrAuthoringDefect
+	}
+	for _, step := range instance.Steps {
+		if step.Required {
+			return normalizeRuntimeProfile(step.RuntimeProfile)
+		}
+	}
+	return nil, nil, ErrAuthoringDefect
+}

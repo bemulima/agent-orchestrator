@@ -1,0 +1,149 @@
+package readiness
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+const (
+	foundationGoalCode         = "programming.foundation"
+	foundationGoalVersion      = "v1"
+	foundationGoalGraphVersion = "programming-foundation-graph-v1"
+	goBackendGoalCode          = "go.backend"
+	goBackendGoalVersion       = "v1"
+	goBackendGoalGraphVersion  = "go-backend-graph-v1"
+)
+
+type resolvedGoal struct {
+	code         string
+	version      string
+	graphVersion string
+}
+
+type ResolveInput struct {
+	StudentID string
+	Request   domain.LearningReadinessRequest
+}
+
+// Resolver performs only read-side state and exact published-graph lookup.
+// It has no Course, mastery, AI, outbox, assignment, path, or lesson port.
+type Resolver struct {
+	Enabled  bool
+	Students domainservice.StudentPlanningReadinessService
+	Graphs   repository.ReadinessGoalGraphRepository
+}
+
+func (resolver Resolver) Handle(ctx context.Context, input ResolveInput) (domain.LearningReadiness, error) {
+	if !resolver.Enabled {
+		return domain.LearningReadiness{}, domain.ErrFeatureDisabled
+	}
+	request, err := domain.NormalizeLearningReadinessRequest(input.Request)
+	if err != nil || !domain.ValidLearningReadinessStudentID(input.StudentID) {
+		return domain.LearningReadiness{}, domain.ErrValidation
+	}
+	if resolver.Students == nil {
+		return domain.LearningReadiness{}, domain.ErrStudentStateUnavailable
+	}
+	snapshot, err := resolver.Students.GetPlanningReadiness(ctx, input.StudentID)
+	if err != nil {
+		return domain.LearningReadiness{}, fmt.Errorf("%w: %v", domain.ErrStudentStateUnavailable, err)
+	}
+	snapshot, err = domain.NormalizeStudentPlanningReadinessSnapshot(snapshot)
+	if err != nil || snapshot.StudentID != input.StudentID {
+		return domain.LearningReadiness{}, fmt.Errorf("%w: malformed snapshot", domain.ErrStudentStateUnavailable)
+	}
+	if request.ExpectedStateRef != nil && *request.ExpectedStateRef != snapshot.StateRef {
+		return domain.LearningReadiness{}, domain.ErrConflict
+	}
+	if snapshot.ActivePath != nil {
+		return result(snapshot, domain.LearningReadinessNotReady, domain.ReadinessReasonActivePathExists, snapshot.ActivePath), nil
+	}
+	goal, decision, reason := resolveGoal(snapshot)
+	if goal.code == "" {
+		return result(snapshot, decision, reason, nil), nil
+	}
+	if resolver.Graphs == nil {
+		return domain.LearningReadiness{}, domain.ErrGoalGraphUnavailable
+	}
+	graph, err := resolver.Graphs.GetPublishedGoalGraphExact(ctx, goal.code, goal.version, goal.graphVersion)
+	if errors.Is(err, domain.ErrNotFound) {
+		return result(snapshot, domain.LearningReadinessNotReady, domain.ReadinessReasonPublishedGraphUnavailable, nil), nil
+	}
+	if errors.Is(err, domain.ErrValidation) {
+		return domain.LearningReadiness{}, domain.ErrGoalGraphInvalid
+	}
+	if err != nil {
+		return domain.LearningReadiness{}, fmt.Errorf("%w: %v", domain.ErrGoalGraphUnavailable, err)
+	}
+	graph, err = domain.NormalizeGoalGraph(graph)
+	if err != nil || graph.Goal.Code != goal.code || graph.Goal.Version != goal.version ||
+		graph.Goal.GraphVersion != goal.graphVersion {
+		return domain.LearningReadiness{}, domain.ErrGoalGraphInvalid
+	}
+	readiness := result(snapshot, domain.LearningReadinessReady, reason, nil)
+	readiness.Goal = &domain.LearningReadinessGoal{
+		Code: graph.Goal.Code, Version: graph.Goal.Version, GraphVersion: graph.Goal.GraphVersion,
+	}
+	return readiness, nil
+}
+
+func resolveGoal(snapshot domain.StudentPlanningReadinessSnapshot) (resolvedGoal, domain.LearningReadinessResult, string) {
+	if snapshot.StateRef.Kind == domain.StudentReadinessStateNone {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonStudentStateMissing
+	}
+	if snapshot.LearningIntent == nil {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonLearningIntentMissing
+	}
+	if snapshot.Profile.ContentLanguage == nil {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonContentLanguageUntrusted
+	}
+	direction := snapshot.Profile.DirectionCode
+	experience := snapshot.Profile.SelfAssessedExperience
+	if direction == "" || experience == "" {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonProfileIncomplete
+	}
+	desired := snapshot.Profile.DesiredStacks
+	if desired.State == domain.StudentReadinessArrayUnresolved {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonDesiredStacksUnresolved
+	}
+	if desired.State == domain.StudentReadinessArrayAnswered && len(desired.Values) > 1 {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonMultipleDesiredStacks
+	}
+	emptyDesired := desired.State == domain.StudentReadinessArrayUnanswered ||
+		desired.State == domain.StudentReadinessArrayAnswered && len(desired.Values) == 0
+	if experience == "beginner" && direction == "undecided" && emptyDesired {
+		return resolvedGoal{foundationGoalCode, foundationGoalVersion, foundationGoalGraphVersion}, domain.LearningReadinessReady, domain.ReadinessReasonFoundationGraphResolved
+	}
+	if direction == "backend" && desired.State == domain.StudentReadinessArrayAnswered &&
+		len(desired.Values) == 1 && desired.Values[0] == "go" {
+		return resolvedGoal{goBackendGoalCode, goBackendGoalVersion, goBackendGoalGraphVersion}, domain.LearningReadinessReady, domain.ReadinessReasonGoBackendGraphResolved
+	}
+	if direction == "undecided" && !emptyDesired || direction == "backend" && emptyDesired {
+		return resolvedGoal{}, domain.LearningReadinessNeedsClarification, domain.ReadinessReasonProfileContradictory
+	}
+	return resolvedGoal{}, domain.LearningReadinessNotReady, domain.ReadinessReasonProfileUnsupported
+}
+
+func result(
+	snapshot domain.StudentPlanningReadinessSnapshot,
+	decision domain.LearningReadinessResult,
+	reason string,
+	activePath *domain.StudentReadinessActivePath,
+) domain.LearningReadiness {
+	return domain.LearningReadiness{
+		Schema:          domain.LearningReadinessSchema,
+		Result:          decision,
+		ReasonCodes:     []string{reason},
+		ResolverVersion: domain.LearningReadinessResolverV1,
+		StateRef:        snapshot.StateRef,
+		ReadinessScope:  domain.ReadinessScopePublishedGraph,
+		Executable:      false,
+		ContentStatus:   domain.ReadinessContentNotCreated,
+		ActivePath:      activePath,
+	}
+}

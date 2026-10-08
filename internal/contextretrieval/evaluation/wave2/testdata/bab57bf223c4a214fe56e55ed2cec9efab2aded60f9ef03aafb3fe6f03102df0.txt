@@ -1,0 +1,475 @@
+package usecase
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+const AssistancePolicyVersion = "practice-task-assistance-policy.v1"
+
+type Runtime struct {
+	Repository   ports.Repository
+	Revisions    ports.RevisionProvider
+	Student      ports.LearningActionPort
+	Planner      ports.LearningRouteProvider
+	Workspace    ports.WorkspacePort
+	Validator    ports.ValidationPort
+	Evidence     ports.EvidencePort
+	Now          func() time.Time
+	NewID        func() string
+	locks        sync.Map
+	workerCursor atomic.Uint64
+}
+
+func (runtime *Runtime) now() time.Time {
+	if runtime.Now != nil {
+		return runtime.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (runtime *Runtime) newID() string {
+	if runtime.NewID != nil {
+		return runtime.NewID()
+	}
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic("crypto/rand unavailable")
+	}
+	value[6] = value[6]&0x0f | 0x40
+	value[8] = value[8]&0x3f | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
+}
+
+func (runtime *Runtime) newLearningActionID(instanceID, revisionID string) (string, error) {
+	for attempt := 0; attempt < 4; attempt++ {
+		candidate := runtime.newID()
+		if domain.IsCanonicalUUID(candidate) && candidate != instanceID && candidate != revisionID {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("could not generate a distinct learning action ID")
+}
+
+func (runtime *Runtime) lockInstance(id string) func() {
+	value, _ := runtime.locks.LoadOrStore(id, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+func (runtime *Runtime) Start(ctx context.Context, command domain.StartCommand) (domain.StartResult, int, error) {
+	normalized, err := domain.NormalizeStartCommand(command)
+	if err != nil {
+		return domain.StartResult{}, 0, err
+	}
+	digest, err := domain.StartCommandDigest(normalized)
+	if err != nil {
+		return domain.StartResult{}, 0, err
+	}
+	unlock := runtime.lockInstance(normalized.IdempotencyKey)
+	defer unlock()
+
+	instance, err := runtime.Repository.GetInstanceByID(ctx, normalized.IdempotencyKey)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return domain.StartResult{}, 0, err
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		envelope, fetchErr := runtime.Revisions.GetPublishedRevisionEnvelope(ctx, normalized.TaskRevisionID)
+		if fetchErr != nil {
+			if errors.Is(fetchErr, domain.ErrNotFound) {
+				return domain.StartResult{}, 404, domain.ErrNotFound
+			}
+			return domain.StartResult{}, 503, domain.ErrDependency
+		}
+		projection, projectErr := domain.ProjectPublishedRevision(envelope, normalized.SolutionVariantID, normalized.SurfaceClassification)
+		if projectErr != nil {
+			if errors.Is(projectErr, domain.ErrVariantRequired) {
+				return domain.StartResult{}, 422, domain.ErrVariantRequired
+			}
+			return domain.StartResult{}, 422, domain.ErrAuthoringDefect
+		}
+		instance = newTaskInstance(normalized, digest, envelope, projection, runtime.now())
+		instance.LearningActionID, err = runtime.newLearningActionID(instance.ID, instance.TaskRevisionID)
+		if err != nil {
+			return domain.StartResult{}, 503, err
+		}
+		stored, created, createErr := runtime.Repository.CreateOrLoadStart(ctx, instance)
+		if createErr != nil {
+			return domain.StartResult{}, statusFor(createErr), createErr
+		}
+		if stored.StartCommandDigest != digest {
+			return domain.StartResult{}, 409, domain.ErrIdempotency
+		}
+		instance = stored
+		_ = created
+	} else if instance.StudentID != normalized.StudentID || instance.StartCommandDigest != digest {
+		return domain.StartResult{}, 409, domain.ErrIdempotency
+	}
+
+	if instance.Status == domain.TaskInstanceStarting {
+		instance, err = runtime.provision(ctx, instance)
+		if err != nil {
+			// The immutable STARTING receipt remains queryable and resumable; dependency
+			// failures are represented as 202 until all idempotent receipts are verified.
+			latest, readErr := runtime.Repository.GetInstanceByID(ctx, instance.ID)
+			if readErr == nil {
+				instance = latest
+			}
+			return runtime.started(instance), 202, nil
+		}
+	}
+	if instance.Status == domain.TaskInstanceCancelled {
+		return domain.StartResult{}, 409, domain.ErrConflict
+	}
+	return runtime.started(instance), 200, nil
+}
+
+func newTaskInstance(command domain.StartCommand, digest string, envelope domain.RevisionEnvelope, projection domain.RevisionProjection, now time.Time) domain.TaskInstance {
+	steps := append([]domain.Step(nil), projection.Steps...)
+	for index := range steps {
+		if index > 0 && steps[index].Required {
+			steps[index].Status = "LOCKED"
+		}
+	}
+	instance := domain.TaskInstance{Schema: domain.InstanceSchema, ID: command.IdempotencyKey, StudentID: command.StudentID,
+		TaskRevisionID: envelope.Revision.ID, TaskRevisionDigest: projection.Digest, Status: domain.TaskInstanceStarting,
+		SurfaceClassification: command.SurfaceClassification, Locale: command.Locale, LearningPathID: command.LearningPathID, LearningPathItemID: command.LearningPathItemID, RequirementID: command.RequirementID,
+		SolutionVariantID: projection.VariantID, Steps: steps, StartedAt: now, UpdatedAt: now,
+		RevisionSummary: projection.Summary, RevisionEnvelope: envelope, StartCommandDigest: digest,
+		ReviewRequired: projection.ReviewRequired, AssistancePolicyVersion: AssistancePolicyVersion,
+		WorkspaceBinding: domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", Available: false}}
+	instance.LearningActionID = ""
+	instance.Progress = progressFor(steps)
+	setCurrentStep(&instance)
+	return instance
+}
+
+func (runtime *Runtime) provision(ctx context.Context, instance domain.TaskInstance) (domain.TaskInstance, error) {
+	if !instance.Provisioning.StudentReserved {
+		binding, err := runtime.Student.Reserve(ctx, ports.ReserveLearningAction{StudentID: instance.StudentID,
+			TaskInstanceID: instance.ID, TaskRevisionID: instance.TaskRevisionID, TaskRevisionDigest: instance.TaskRevisionDigest,
+			LearningActionID: instance.LearningActionID, SurfaceClassification: instance.SurfaceClassification,
+			LearningTargets: uniqueTargets(instance.Steps), LearningPathID: instance.LearningPathID, LearningPathItemID: instance.LearningPathItemID, RequirementID: instance.RequirementID, OccurredAt: instance.StartedAt})
+		if err != nil {
+			return instance, err
+		}
+		if !validLearningActionBinding(binding, instance, "RESERVED") {
+			return instance, domain.ErrDependency
+		}
+		instance.LearningActionID = binding.LearningActionID
+		if instance.LearningPathID != "" {
+			if binding.LearningPathID != instance.LearningPathID {
+				return instance, domain.ErrDependency
+			}
+			instance.LearningPathReference = &domain.LearningPathReference{ReferenceType: "practice", ReferenceID: instance.LearningPathID}
+		}
+		instance.Provisioning.StudentReserved = true
+		var errSave error
+		instance, errSave = runtime.Repository.SaveInstance(ctx, instance)
+		if errSave != nil {
+			return instance, errSave
+		}
+	}
+
+	if !instance.Provisioning.RouteResolved {
+		request, err := domain.BuildLearningRouteRequest(instance)
+		if err != nil {
+			return instance, err
+		}
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			return instance, err
+		}
+		receipt, err := runtime.Planner.ResolveRoute(ctx, ports.ResolveLearningRoute{Request: encoded})
+		if err != nil {
+			return instance, err
+		}
+		if !validLearningRouteReceipt(receipt, instance) {
+			return instance, domain.ErrDependency
+		}
+		instance.LearningRoute = receipt
+		if err := applyRouteReadiness(&instance); err != nil {
+			return instance, err
+		}
+		instance.Provisioning.RouteResolved = true
+		instance.UpdatedAt = runtime.now()
+		instance, err = runtime.Repository.SaveInstance(ctx, instance)
+		if err != nil {
+			return instance, err
+		}
+	}
+
+	if !instance.Provisioning.WorkspaceCreated {
+		var binding domain.WorkspaceBinding
+		request := ports.CreateWorkspace{RequestID: instance.ID, StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+			TaskRevisionID: instance.TaskRevisionID, RevisionDigest: instance.TaskRevisionDigest,
+			RuntimeProfile: runtimeProfile(instance.Steps), StarterFiles: starterFiles(instance.Steps)}
+		binding, err := runtime.Workspace.CreateOrResumeWorkspace(ctx, request)
+		if err != nil {
+			return instance, err
+		}
+		if binding.Schema != "practice-workspace-binding.v2" || strings.TrimSpace(binding.SandboxID) == "" || !binding.Available {
+			return instance, domain.ErrDependency
+		}
+		instance.WorkspaceBinding = binding
+		instance.Provisioning.WorkspaceCreated = true
+		instance.UpdatedAt = runtime.now()
+		instance, err = runtime.Repository.SaveInstance(ctx, instance)
+		if err != nil {
+			return instance, err
+		}
+	}
+
+	if !instance.Provisioning.StudentOpened {
+		binding, err := runtime.Student.Open(ctx, ports.OpenLearningAction{StudentID: instance.StudentID, TaskInstanceID: instance.ID, LearningActionID: instance.LearningActionID})
+		if err != nil {
+			return instance, err
+		}
+		if !validLearningActionBinding(binding, instance, "OPEN") {
+			return instance, domain.ErrDependency
+		}
+		instance.Provisioning.StudentOpened = true
+		instance.Status = domain.TaskInstanceInProgress
+		instance.UpdatedAt = runtime.now()
+		instance, err = runtime.Repository.SaveInstance(ctx, instance)
+		if err != nil {
+			return instance, err
+		}
+	}
+	return instance, nil
+}
+
+func (runtime *Runtime) started(instance domain.TaskInstance) domain.StartResult {
+	return domain.StartResult{Schema: domain.StartedSchema, Instance: instance.PublicProjection(), Revision: instance.RevisionSummary}
+}
+
+func validLearningActionBinding(binding ports.LearningActionBinding, instance domain.TaskInstance, lifecycle string) bool {
+	return domain.IsCanonicalUUID(instance.LearningActionID) && binding.LearningActionID == instance.LearningActionID &&
+		binding.LearningActionID != instance.ID && binding.LearningActionID != instance.TaskRevisionID && binding.StudentID == instance.StudentID &&
+		binding.TaskInstanceID == instance.ID && binding.TaskRevisionID == instance.TaskRevisionID && binding.TaskRevisionDigest == instance.TaskRevisionDigest &&
+		binding.LearningPathItemID == instance.LearningPathItemID && binding.RequirementID == instance.RequirementID &&
+		binding.SurfaceClassification == instance.SurfaceClassification && binding.LifecycleStatus == lifecycle &&
+		sameTargets(binding.LearningTargets, uniqueTargets(instance.Steps)) && (instance.LearningPathID == "" || binding.LearningPathID == instance.LearningPathID)
+}
+
+func sameTargets(left, right []domain.Target) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueTargets(steps []domain.Step) []domain.Target {
+	seen := map[string]struct{}{}
+	var result []domain.Target
+	for _, step := range steps {
+		if !step.Required {
+			continue
+		}
+		for _, target := range step.Targets {
+			key := target.Type + "\x00" + target.Key + "\x00" + target.Version
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			result = append(result, target)
+		}
+	}
+	return result
+}
+
+func validLearningRouteReceipt(receipt domain.LearningRouteReceipt, instance domain.TaskInstance) bool {
+	if receipt.Schema != "student-task-learning-snapshot.v1" || receipt.StudentID != instance.StudentID || receipt.TaskInstanceID != instance.ID ||
+		receipt.TaskRevisionID != instance.TaskRevisionID || receipt.TaskRevisionDigest != instance.TaskRevisionDigest || receipt.Locale != instance.Locale ||
+		receipt.ID == "" || receipt.RouteDigest == "" || len(receipt.Steps) == 0 {
+		return false
+	}
+	return true
+}
+
+func applyRouteReadiness(instance *domain.TaskInstance) error {
+	var route []struct {
+		StepID string `json:"step_id"`
+		Ready  bool   `json:"ready"`
+	}
+	if err := json.Unmarshal(instance.LearningRoute.Steps, &route); err != nil || len(route) != len(instance.Steps) {
+		return domain.ErrDependency
+	}
+	for index, item := range route {
+		if item.StepID != instance.Steps[index].ID {
+			return domain.ErrDependency
+		}
+		if instance.Steps[index].Status == "PASSED" {
+			continue
+		}
+		if item.Ready {
+			instance.Steps[index].Status = "AVAILABLE"
+		} else {
+			instance.Steps[index].Status = "LEARNING_REQUIRED"
+		}
+	}
+	setCurrentStep(instance)
+	return nil
+}
+
+func runtimeProfile(steps []domain.Step) json.RawMessage {
+	for _, step := range steps {
+		if step.Required {
+			return append(json.RawMessage(nil), step.RuntimeProfile...)
+		}
+	}
+	return json.RawMessage(`{}`)
+}
+
+func starterFiles(steps []domain.Step) []domain.WorkspaceFile {
+	for _, step := range steps {
+		if step.Required {
+			return append([]domain.WorkspaceFile(nil), step.StarterFiles...)
+		}
+	}
+	return []domain.WorkspaceFile{}
+}
+
+func progressFor(steps []domain.Step) domain.Progress {
+	progress := domain.Progress{}
+	for _, step := range steps {
+		if step.Required {
+			progress.TotalSteps++
+			if step.Status == "PASSED" || step.Status == "CHECKPOINTED" {
+				progress.PassedSteps++
+			}
+		}
+	}
+	if progress.TotalSteps > 0 {
+		progress.Percentage = float64(progress.PassedSteps) * 100 / float64(progress.TotalSteps)
+	}
+	return progress
+}
+
+func setCurrentStep(instance *domain.TaskInstance) {
+	instance.CurrentStep = nil
+	for index := range instance.Steps {
+		step := &instance.Steps[index]
+		if step.Status == "PASSED" || step.Status == "CHECKPOINTED" || !step.Required {
+			continue
+		}
+		copy := *step
+		instance.CurrentStep = &copy
+		break
+	}
+	instance.Progress = progressFor(instance.Steps)
+}
+
+func statusFor(err error) int {
+	switch {
+	case errors.Is(err, domain.ErrInvalid), errors.Is(err, domain.ErrAuthoringDefect), errors.Is(err, domain.ErrVariantRequired):
+		return 422
+	case errors.Is(err, domain.ErrNotFound):
+		return 404
+	case errors.Is(err, domain.ErrIdempotency), errors.Is(err, domain.ErrConflict):
+		return 409
+	default:
+		return 503
+	}
+}
+
+func (runtime *Runtime) GetDetail(ctx context.Context, studentID, instanceID string) (domain.StartResult, error) {
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return domain.StartResult{}, err
+	}
+	return domain.StartResult{Schema: "practice-task-instance-detail.v2", Instance: instance.PublicProjection(), Revision: instance.RevisionSummary}, nil
+}
+
+func (runtime *Runtime) List(ctx context.Context, studentID, cursor string, limit int, status domain.TaskInstanceStatus) ([]domain.TaskInstance, string, error) {
+	if !domain.IsCanonicalUUID(studentID) || limit < 1 || limit > 100 {
+		return nil, "", domain.ErrInvalid
+	}
+	items, next, err := runtime.Repository.ListInstances(ctx, studentID, cursor, limit, status)
+	if err != nil {
+		return nil, "", err
+	}
+	for index := range items {
+		items[index] = items[index].PublicProjection()
+	}
+	return items, next, nil
+}
+
+func (runtime *Runtime) Materialize(ctx context.Context, studentID, instanceID, stepID string) (MaterializationResult, error) {
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return MaterializationResult{}, err
+	}
+	if instance.Status == domain.TaskInstanceCancelled {
+		return MaterializationResult{}, domain.ErrConflict
+	}
+	for _, step := range instance.Steps {
+		if step.ID == stepID {
+			value, projectionErr := projectStepMaterialization(instance, step)
+			if projectionErr != nil {
+				return MaterializationResult{}, projectionErr
+			}
+			materials, parseErr := plannerMaterialsForStep(instance.LearningRoute.Steps, step.ID)
+			if parseErr != nil {
+				return MaterializationResult{}, parseErr
+			}
+			replayed := true
+			for _, material := range materials {
+				receipt, materialErr := runtime.Planner.Materialize(ctx, ports.MaterializeLearningStep{TaskInstanceID: instance.ID, StepID: step.ID,
+					RouteID: instance.LearningRoute.ID, RouteDigest: instance.LearningRoute.RouteDigest,
+					MaterialKey: material.Key, GenerationKey: material.GenerationKey, Target: material.Target})
+				if materialErr != nil {
+					return MaterializationResult{}, materialErr
+				}
+				if receipt.Schema != "practice-learning-material.v1" || receipt.MaterialKey != material.Key || receipt.Target != material.Target ||
+					!domain.IsCanonicalUUID(receipt.CourseID) || !domain.IsCanonicalUUID(receipt.LessonID) {
+					return MaterializationResult{}, domain.ErrDependency
+				}
+				if !receipt.Reused {
+					replayed = false
+				}
+			}
+			return MaterializationResult{Value: value, Replayed: replayed}, nil
+		}
+	}
+	return MaterializationResult{}, domain.ErrNotFound
+}
+
+func parseCursor(cursor string) string {
+	if cursor == "" {
+		return ""
+	}
+	decoded, err := hex.DecodeString(cursor)
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func formatCursor(value string) string { return hex.EncodeToString([]byte(value)) }
+
+func validatePreviewURL(value string) bool {
+	if value == "" {
+		return true
+	}
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+}

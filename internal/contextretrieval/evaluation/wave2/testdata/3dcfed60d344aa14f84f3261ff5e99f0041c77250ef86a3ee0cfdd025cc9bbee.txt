@@ -1,0 +1,246 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestCanonicalDigestSortsObjectKeysAndPreservesArrayOrder(t *testing.T) {
+	left := json.RawMessage(`{"z":[1,2],"a":{"y":true,"x":"<tag>"}}`)
+	right := json.RawMessage(` { "a" : { "x":"<tag>","y":true }, "z" : [1,2] } `)
+	if got, want := Digest("practice-task-revision-digest.v1", left), Digest("practice-task-revision-digest.v1", right); got != want {
+		t.Fatalf("canonical digest mismatch: %s != %s", got, want)
+	}
+	reordered := json.RawMessage(`{"a":{"x":"<tag>","y":true},"z":[2,1]}`)
+	if Digest("practice-task-revision-digest.v1", left) == Digest("practice-task-revision-digest.v1", reordered) {
+		t.Fatal("array order must affect the digest")
+	}
+}
+
+func TestTaskInstanceTransitionRules(t *testing.T) {
+	cases := []struct {
+		from, to TaskInstanceStatus
+		want     bool
+	}{
+		{TaskInstanceStarting, TaskInstanceInProgress, true},
+		{TaskInstanceStarting, TaskInstanceCancelled, true},
+		{TaskInstanceInProgress, TaskInstanceValidating, true},
+		{TaskInstanceValidating, TaskInstanceCompleted, false},
+		{TaskInstanceCompleted, TaskInstanceCancelled, false},
+		{TaskInstanceCancelled, TaskInstanceStarting, false},
+	}
+	for _, test := range cases {
+		if got := CanTransitionInstance(test.from, test.to); got != test.want {
+			t.Errorf("CanTransitionInstance(%s,%s) = %v, want %v", test.from, test.to, got, test.want)
+		}
+	}
+}
+
+func TestStartCommandRequiresCanonicalUUIDsAndNormalizedDigest(t *testing.T) {
+	valid := StartCommand{StudentID: "00000000-0000-4000-8000-000000000001", IdempotencyKey: "00000000-0000-4000-8000-000000000002", TaskRevisionID: "00000000-0000-4000-8000-000000000003", Locale: "en", SurfaceClassification: "practice"}
+	if _, err := NormalizeStartCommand(valid); err != nil {
+		t.Fatalf("valid start rejected: %v", err)
+	}
+	valid.IdempotencyKey = "00000000-0000-4000-8000-000000000002 "
+	if _, err := NormalizeStartCommand(valid); err == nil {
+		t.Fatal("non-canonical idempotency key accepted")
+	}
+}
+
+func TestStartCommandDigestIncludesEndpointSuppliedSurface(t *testing.T) {
+	command := StartCommand{StudentID: "00000000-0000-4000-8000-000000000001", IdempotencyKey: "00000000-0000-4000-8000-000000000002", TaskRevisionID: "00000000-0000-4000-8000-000000000003", Locale: "en", SurfaceClassification: "project"}
+	projectDigest, err := StartCommandDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.SurfaceClassification = "practice"
+	practiceDigest, err := StartCommandDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectDigest == practiceDigest {
+		t.Fatal("same idempotency key must not replay across start surfaces")
+	}
+}
+
+func TestProjectPublishedRevisionRequiresVersionedTargetsAndValidationContracts(t *testing.T) {
+	envelope := validRevisionEnvelope()
+	projection, err := ProjectPublishedRevision(envelope)
+	if err != nil {
+		t.Fatalf("valid revision rejected: %v", err)
+	}
+	if projection.Digest != envelope.ComputedDigest() || len(projection.Steps) != 1 || projection.Steps[0].Targets[0].Version != "v1" || projection.Summary.Type != "BUILD" {
+		t.Fatalf("unexpected frozen projection: %+v", projection)
+	}
+
+	targetless := envelope
+	targetless.RuntimeContext = json.RawMessage(`{"practice_task":{"title":"Task"},"practice_task_milestones":[{"id":"00000000-0000-4000-8000-000000000005","is_required":true,"validation_contract_json":{"schema":"contract.v1"},"learning_targets":[]}]}`)
+	targetless.RevisionDigest = targetless.ComputedDigest()
+	if _, err := ProjectPublishedRevision(targetless); err == nil {
+		t.Fatal("targetless revision must be rejected")
+	}
+}
+
+func TestProjectPublishedRevisionRejectsMissingOrUnsupportedTaskType(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		taskType   string
+		removeType bool
+	}{
+		{name: "missing", removeType: true},
+		{name: "unsupported", taskType: "frontend_only"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			envelope := validRevisionEnvelope()
+			var runtimeContext map[string]json.RawMessage
+			if err := json.Unmarshal(envelope.RuntimeContext, &runtimeContext); err != nil {
+				t.Fatal(err)
+			}
+			if test.removeType {
+				delete(runtimeContext, "task_type")
+			} else {
+				value, err := json.Marshal(test.taskType)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runtimeContext["task_type"] = value
+			}
+			updatedRuntime, err := json.Marshal(runtimeContext)
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope.RuntimeContext = updatedRuntime
+			envelope.RevisionDigest = envelope.ComputedDigest()
+
+			_, err = ProjectPublishedRevision(envelope)
+			if !errors.Is(err, ErrAuthoringDefect) {
+				t.Fatalf("got error %v, want ErrAuthoringDefect", err)
+			}
+		})
+	}
+}
+
+func TestProjectPublishedRevisionRequiresVersionedExecutionSpecAndProjectsAcceptanceChecklist(t *testing.T) {
+	envelope := validRevisionEnvelope()
+	projection, err := ProjectPublishedRevision(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Steps[0].Deliverables) != 1 || projection.Steps[0].Deliverables[0] != "main.go" ||
+		len(projection.Steps[0].Acceptance) != 1 || projection.Steps[0].Acceptance[0].Text != "The service builds" {
+		t.Fatalf("unexpected learner execution projection: %+v", projection.Steps[0])
+	}
+	stepJSON, err := json.Marshal(projection.Steps[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, privateField := range []string{"test_suite_ref", "reference_solution_ref", "negative_fixture_refs", "validation_contract"} {
+		if strings.Contains(string(stepJSON), privateField) {
+			t.Fatalf("private evaluation field %q leaked into learner Step: %s", privateField, stepJSON)
+		}
+	}
+	var runtimeContext map[string]json.RawMessage
+	if err := json.Unmarshal(envelope.RuntimeContext, &runtimeContext); err != nil {
+		t.Fatal(err)
+	}
+	var milestones []map[string]json.RawMessage
+	if err := json.Unmarshal(runtimeContext["practice_task_milestones"], &milestones); err != nil {
+		t.Fatal(err)
+	}
+	delete(milestones[0], "execution_spec")
+	runtimeContext["practice_task_milestones"], _ = json.Marshal(milestones)
+	envelope.RuntimeContext, _ = json.Marshal(runtimeContext)
+	envelope.RevisionDigest = envelope.ComputedDigest()
+	if _, err := ProjectPublishedRevision(envelope); !errors.Is(err, ErrAuthoringDefect) {
+		t.Fatalf("missing required execution spec error = %v, want ErrAuthoringDefect", err)
+	}
+}
+
+func TestRouteRequestUsesFrozenTargetPolicyAndDeterministicRequirementIDs(t *testing.T) {
+	envelope := validRevisionEnvelope()
+	projection, err := ProjectPublishedRevision(envelope, "", "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := TaskInstance{ID: "00000000-0000-4000-8000-000000000002", StudentID: "00000000-0000-4000-8000-000000000001", TaskRevisionID: envelope.Revision.ID, TaskRevisionDigest: envelope.RevisionDigest, Locale: "en", Steps: projection.Steps}
+	request, err := BuildLearningRouteRequest(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Schema != "practice-learning-route-request.v1" || len(request.Steps) != 1 || len(request.Steps[0].Requirements) != 1 {
+		t.Fatalf("unexpected route request: %+v", request)
+	}
+	requirement := request.Steps[0].Requirements[0]
+	if requirement.ID != "00000000-0000-4000-8000-000000000005.target-001" || requirement.Policy != "required" || requirement.MasteryThreshold != 0.7 {
+		t.Fatalf("unexpected deterministic target mapping: %+v", requirement)
+	}
+}
+
+func TestFinalValidationSpecificationContainsOnlyRequiredFrozenContracts(t *testing.T) {
+	envelope := validRevisionEnvelope()
+	projection, err := ProjectPublishedRevision(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := TaskInstance{Steps: projection.Steps, RevisionEnvelope: envelope}
+	spec, digest, err := BuildValidationSpecification(instance, "FINAL", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Schema != "practice-validation-specification.v1" || len(spec.Contracts) != 1 || !canonicalDigest.MatchString(digest) {
+		t.Fatalf("unexpected final validation specification: %+v %s", spec, digest)
+	}
+	if digest != "sha256:835744643ba85702dae1d1de1e580224ea9166dd7b0e9ba286bfb14dfd95079f" {
+		t.Fatalf("validation digest changed unexpectedly: %s", digest)
+	}
+}
+
+func validRevisionEnvelope() RevisionEnvelope {
+	runtime := json.RawMessage(`{"execution_projection_schema":"practice-task-runtime-projection.v2","task_type_schema":"practice-task-type.v1","task_type":"BUILD","practice_task":{"id":"00000000-0000-4000-8000-000000000004","slug":"practice-one","title":"Practice one"},"practice_task_milestones":[{"id":"00000000-0000-4000-8000-000000000005","title":"Build it","description":"Build a tiny service","sort_order":1,"part_sort_order":1,"is_required":true,"is_active":true,"acceptance_criteria_json":{"checklist":["The service builds"]},"execution_spec":{"schema":"practice-step-execution-spec.v1","deliverables":["main.go"]},"validation_contract_json":{"schema":"validation-contract.v1","checks":[{"id":"compile","required":true}]},"runtime_profile_json":{"code_structure_type_code":"HTML_BASIC_DOCUMENT","compose_config":{"services":{"web":{"image":"nginx"}}}},"learning_targets":[{"type":"concept","key":"go.variables","version":"v1"}]}],"solution_variants":[{"id":"00000000-0000-4000-8000-000000000006","code":"default","title":"Default","topology":"frontend_only","sort_order":1,"is_active":true,"review_policy_json":{"version":1,"mentor_review":{"mode":"required"},"ai_review":{"mode":"disabled"}},"milestone_bindings":[{"practice_task_part_milestone_id":"00000000-0000-4000-8000-000000000005","sort_order":1,"is_required":true}]}]}`)
+	evaluation := json.RawMessage(`{"milestones":[{"practice_task_runtime_milestone_id":"00000000-0000-4000-8000-000000000005","test_suite_ref":"suite://safe-ref"}]}`)
+	envelope := RevisionEnvelope{
+		Schema:               "practice-task-execution-envelope.v1",
+		Revision:             RevisionMetadata{ID: "00000000-0000-4000-8000-000000000003", PracticeTaskID: "00000000-0000-4000-8000-000000000004", RevisionNumber: 1, PublishedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)},
+		RevisionDigestSchema: RevisionDigestV1,
+		RuntimeContext:       runtime,
+		EvaluationContext:    evaluation,
+	}
+	envelope.RevisionDigest = envelope.ComputedDigest()
+	return envelope
+}
+
+func TestStartAssignmentCorrelationIsAtomicAndPartOfIdempotency(t *testing.T) {
+	command := StartCommand{StudentID: "00000000-0000-4000-8000-000000000001", IdempotencyKey: "00000000-0000-4000-8000-000000000002", TaskRevisionID: "00000000-0000-4000-8000-000000000003", Locale: "en", SurfaceClassification: "practice"}
+	legacy, _ := StartCommandDigest(command)
+	command.LearningPathID = "00000000-0000-4000-8000-000000000004"
+	command.LearningPathItemID = "00000000-0000-4000-8000-000000000005"
+	if _, err := NormalizeStartCommand(command); err == nil {
+		t.Fatal("partial pair accepted")
+	}
+	command.RequirementID = "00000000-0000-4000-8000-000000000006"
+	if _, err := NormalizeStartCommand(command); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := StartCommandDigest(command)
+	replay, _ := StartCommandDigest(command)
+	if first == legacy || first != replay {
+		t.Fatal("correlation did not bind deterministic receipt")
+	}
+	command.RequirementID = "00000000-0000-4000-8000-000000000007"
+	changed, _ := StartCommandDigest(command)
+	if first == changed {
+		t.Fatal("changed requirement shares receipt")
+	}
+	command.LearningPathID = ""
+	if _, err := NormalizeStartCommand(command); err == nil {
+		t.Fatal("correlated start without path accepted")
+	}
+	command.LearningPathID = "00000000-0000-4000-8000-000000000004"
+	command.RequirementID = "BAD"
+	if _, err := NormalizeStartCommand(command); err == nil {
+		t.Fatal("invalid UUID accepted")
+	}
+}

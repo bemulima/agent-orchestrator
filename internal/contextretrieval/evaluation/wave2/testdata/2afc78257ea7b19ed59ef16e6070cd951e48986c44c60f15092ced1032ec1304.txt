@@ -1,0 +1,483 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	courseclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/course"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root provisions and launches isolated owner providers. Planning, claiming,
+// retry/checkpoint persistence, Course ensure and Student writes are actual.
+// Lesson content is an explicitly named bounded fixture, not an LLM proof.
+// Mastery changes use the provider's named synthetic projection fixture; live
+// profile changes use the actual Student onboarding use case.
+func TestT19ActualPinnedPlanning(t *testing.T) {
+	if os.Getenv("T19_ACTUAL_PLANNING") != "true" {
+		t.Skip("owned actual T19 planning gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("PLANNER_TEST_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Database != "remediation_t19_planner_test" || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998 {
+		t.Fatal("SETUP: exact isolated Planner database required")
+	}
+	var course struct {
+		URL      string `json:"url"`
+		Database string `json:"database"`
+	}
+	var student struct {
+		URL               string `json:"url"`
+		Database          string `json:"database"`
+		StudentID         string `json:"student_id"`
+		ExistingStudentID string `json:"existing_student_id"`
+	}
+	t19ReadReady(t, "T19_COURSE_READY_FILE", &course)
+	t19ReadReady(t, "T19_STUDENT_READY_FILE", &student)
+	if course.Database != "remediation_t19_course_test" || student.Database != "remediation_t19_student_integration_proof" || uuid.Validate(student.StudentID) != nil || uuid.Validate(student.ExistingStudentID) != nil || student.StudentID == student.ExistingStudentID {
+		t.Fatal("SETUP: exact isolated owner metadata required")
+	}
+	for _, address := range []string{course.URL, student.URL} {
+		u, e := url.Parse(address)
+		if e != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Path != "" {
+			t.Fatal("SETUP: loopback owner HTTP required")
+		}
+	}
+	if os.Getenv("T19_COURSE_TOKEN") == "" || os.Getenv("T19_STUDENT_TOKEN") == "" || os.Getenv("T19_COURSE_TOKEN") == os.Getenv("T19_STUDENT_TOKEN") {
+		t.Fatal("SETUP: distinct owner credentials required")
+	}
+	resultFile := os.Getenv("T19_ACTUAL_RESULT_FILE")
+	if resultFile == "" {
+		t.Fatal("SETUP: safe result file required")
+	}
+	if _, e := os.Lstat(resultFile); !os.IsNotExist(e) {
+		t.Fatal("SETUP: result file must be absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: actual Planner pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact actual Planner database unavailable")
+	}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	h := t19HTTP{t: t, ctx: ctx, client: client, studentURL: student.URL, courseURL: course.URL}
+	store := postgres.Store{Pool: pool}
+	clock := t19Clock{}
+	ids := t19IDs{}
+	students := studentclient.Client{BaseURL: student.URL, ReadToken: os.Getenv("T19_STUDENT_TOKEN"), WriteToken: os.Getenv("T19_STUDENT_TOKEN"), HTTPClient: client}
+	courses := courseclient.Client{BaseURL: course.URL, InternalToken: os.Getenv("T19_COURSE_TOKEN"), HTTPClient: client}
+	graph, err := store.GetPublishedGoalGraph(ctx, "go.backend")
+	if err != nil || len(graph.Targets) == 0 {
+		t.Fatal("SETUP: actual published graph unavailable")
+	}
+	policy, err := store.GetActivePolicyBundle(ctx)
+	if err != nil {
+		t.Fatal("SETUP: actual active policy unavailable")
+	}
+	targets := make([]domain.TargetRef, len(graph.Targets))
+	for i, target := range graph.Targets {
+		targets[i] = target.Ref
+	}
+	for _, owner := range []string{student.StudentID, student.ExistingStudentID} {
+		h.profile(owner, []string{}, []string{"go"})
+	}
+	creator := courseplan.Create{Requests: store, IDs: ids, Clock: clock}
+	newRequest := func(owner, pathID string) domain.CoursePlanRequest {
+		reason := domain.PlanningReasonInitial
+		if pathID != "" {
+			reason = domain.PlanningReasonReplan
+		}
+		input := courseplan.CreateInput{StudentID: owner, IdempotencyKey: uuid.NewString(), GoalCode: "go.backend", LearningPathID: pathID, Intent: domain.PlanningIntent{Source: domain.PlanningSourceStudent, Reason: reason, DesiredOutcome: "Owned T19 pinned Go backend plan"}}
+		request, created, e := creator.Handle(ctx, input)
+		if e != nil || !created {
+			t.Fatal("actual planning request creation failed")
+		}
+		replay, replayCreated, e := creator.Handle(ctx, input)
+		if e != nil || replayCreated || replay.ID != request.ID || replay.RequestHash != request.RequestHash {
+			t.Fatal("actual request idempotency changed identity")
+		}
+		return request
+	}
+	newProcessor := func(generator *t19GenerationFixture) courseplan.Processor {
+		return courseplan.Processor{Requests: store, Graphs: store, Policies: store, Students: students, Courses: courses, Generator: generator, IDs: ids, Clock: clock, Strategies: pedagogy.NewDefaultRegistry(), LeaseTTL: 30 * time.Second, MaxAttempts: 5}
+	}
+	get := func(request domain.CoursePlanRequest) domain.CoursePlanRequest {
+		r, e := store.GetForStudent(ctx, request.StudentID, request.ID)
+		if e != nil {
+			t.Fatal("actual planning request read failed")
+		}
+		return r
+	}
+	processRetry := func(processor courseplan.Processor, request domain.CoursePlanRequest) (bool, error) {
+		r := get(request)
+		for time.Now().Before(r.NextAttemptAt) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		return processor.ProcessNext(ctx)
+	}
+
+	// Actual Course persistence succeeds before the actual assignment contour
+	// returns a test-only 503. Every private checkpoint must already exist.
+	firstBefore := h.studentState(student.StudentID)
+	first := newRequest(student.StudentID, "")
+	firstGenerator := &t19GenerationFixture{}
+	processor := newProcessor(firstGenerator)
+	h.cut("assignment", true)
+	defer h.cut("assignment", false)
+	processed, processErr := processor.ProcessNext(ctx)
+	if !processed || processErr == nil {
+		t.Fatal("actual assignment outage did not produce retry")
+	}
+	partial := get(first)
+	if partial.Status != domain.CoursePlanPlanning || partial.Attempts != 1 || partial.CompletedAt != nil || partial.CourseID != "" || partial.ResultCode != "" {
+		t.Fatal("partial success exposed a completed outcome")
+	}
+	pin, err := store.GetPlanningInput(ctx, partial)
+	if err != nil || pin.Validate(partial) != nil || pin.OriginalPath != nil || pin.OriginalLearningPathID != "" {
+		t.Fatal("actual original INITIAL input not pinned")
+	}
+	artifact, err := store.GetGeneratedCourse(ctx, partial)
+	if err != nil || artifact.Validate(pin) != nil {
+		t.Fatal("actual generated artifact not pinned")
+	}
+	ensure, err := store.GetCourseEnsure(ctx, partial)
+	if err != nil || ensure.Validate(pin, artifact) != nil || ensure.Result.CourseID == "" {
+		t.Fatal("actual Course receipt not pinned before assignment")
+	}
+	provenance := t19CheckpointBytes(t, ctx, pool, partial.ID)
+	if len(provenance) != 3 || partial.CourseFingerprint != pin.Fingerprint || artifact.Course.Fingerprint != pin.Fingerprint {
+		t.Fatal("partial Course mixed checkpoint fingerprints")
+	}
+	firstPartial := h.studentState(student.StudentID)
+	if firstPartial.ProfileReads <= firstBefore.ProfileReads || firstPartial.MasteryReads <= firstBefore.MasteryReads || firstPartial.AssignmentCutCount != firstBefore.AssignmentCutCount+1 || len(firstPartial.Paths) != len(firstBefore.Paths) || len(firstPartial.Assignments) != len(firstBefore.Assignments) {
+		t.Fatal("assignment fault mutated Student path or assignment")
+	}
+	coursePartial := h.courseState()
+	t19AssertEnsureKey(t, coursePartial, partial.ID, ensure.Result.CourseID)
+	initialGenerationKeys := append([]string(nil), firstGenerator.keys...)
+	if len(initialGenerationKeys) == 0 {
+		t.Fatal("named generation fixture was not called before partial success")
+	}
+
+	h.profile(student.StudentID, []string{"python"}, []string{"typescript"})
+	h.request(http.MethodPost, student.URL+"/__t19/mastery", os.Getenv("T19_STUDENT_TOKEN"), map[string]any{"student_id": student.StudentID, "fixture": "t19-owned-mastered-projection-v1", "policy_version": "student-mastery-v1", "targets": targets}, http.StatusNoContent, nil)
+	changedProfile, err := students.GetPlanningProfile(ctx, student.StudentID)
+	if err != nil {
+		t.Fatal("actual changed profile read failed")
+	}
+	changedMastery, err := students.QueryMastery(ctx, student.StudentID, targets)
+	if err != nil {
+		t.Fatal("named changed mastery projection read failed")
+	}
+	fresh, err := courseplan.BuildDeterministicCourseForIntent(graph, changedProfile, changedMastery, policy, partial.Intent, pedagogy.NewDefaultRegistry())
+	if err != nil || fresh.Fingerprint == pin.Fingerprint || reflect.DeepEqual(changedProfile, pin.Profile) || reflect.DeepEqual(changedMastery, pin.Mastery) {
+		t.Fatal("actual fixture did not change planning-significant live input")
+	}
+	changedBeforeRetry := h.studentState(student.StudentID)
+	h.cut("assignment", false)
+	reconstructedGenerator := &t19GenerationFixture{deny: true}
+	processed, processErr = processRetry(newProcessor(reconstructedGenerator), partial)
+	if !processed || processErr != nil {
+		t.Fatalf("reconstructed actual pinned retry failed: error_type=%T", processErr)
+	}
+	completed := get(first)
+	if completed.Status != domain.CoursePlanCompleted || completed.CourseID != ensure.Result.CourseID || completed.CourseFingerprint != pin.Fingerprint || completed.CourseFingerprint == fresh.Fingerprint || completed.LearningPathID == "" || completed.Attempts != 2 || completed.ResultCode == "" {
+		t.Fatal("actual retry mixed old Course with new live decision")
+	}
+	if !reflect.DeepEqual(provenance, t19CheckpointBytes(t, ctx, pool, completed.ID)) || len(reconstructedGenerator.keys) != 0 || !bytes.Equal(completed.NormalizedContextJSON, partial.NormalizedContextJSON) || !bytes.Equal(completed.GeneratedCourseJSON, partial.GeneratedCourseJSON) {
+		t.Fatal("reconstructed retry changed immutable bytes or regenerated content")
+	}
+	firstAfter := h.studentState(student.StudentID)
+	if firstAfter.ProfileReads != changedBeforeRetry.ProfileReads || firstAfter.MasteryReads != changedBeforeRetry.MasteryReads || firstAfter.PlanningStateReads != changedBeforeRetry.PlanningStateReads {
+		t.Fatal("checkpointed retry reread live Student context")
+	}
+	if len(firstAfter.Paths) != len(firstBefore.Paths)+1 || len(firstAfter.Assignments) != len(firstBefore.Assignments)+1 || !reflect.DeepEqual(coursePartial, h.courseState()) {
+		t.Fatal("retry doubled Course or Student owner effects")
+	}
+	t19AssertHTTPKey(t, firstAfter.AssignmentHTTPKeys, partial.ID, 2)
+	state, err := students.GetLearningPathPlanningState(ctx, student.StudentID, completed.LearningPathID)
+	if err != nil || state.CourseID != ensure.Result.CourseID || state.CourseFingerprint != pin.Fingerprint {
+		t.Fatal("actual Student path does not match pinned Course")
+	}
+	var writeClaim string
+	if pool.QueryRow(ctx, `SELECT write_claim::text FROM course_planning_input_checkpoint WHERE request_id=$1`, partial.ID).Scan(&writeClaim) != nil {
+		t.Fatal("actual claim provenance unavailable")
+	}
+	staleWriter := partial
+	staleWriter.ClaimToken = writeClaim
+	if !errors.Is(store.CheckpointPlanningInput(ctx, staleWriter, pin, clock.Now()), domain.ErrConflict) {
+		t.Fatal("stale completed worker was allowed to write pinned input")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE course_planning_input_checkpoint SET payload_bytes=payload_bytes WHERE request_id=$1`, partial.ID); err == nil {
+		t.Fatal("actual checkpoint accepted mutable update")
+	}
+	if !reflect.DeepEqual(provenance, t19CheckpointBytes(t, ctx, pool, partial.ID)) {
+		t.Fatal("rejected provenance mutation changed bytes")
+	}
+
+	// Construct a separate real owned path, then freeze a REPLAN command. An
+	// owner-side path advance must reject the old fence rather than rebase it.
+	items := make([]domain.LearningPathItem, len(ensure.Result.Lessons))
+	for i, lesson := range ensure.Result.Lessons {
+		status := domain.LearningPathItemPlanned
+		if i == 0 {
+			status = domain.LearningPathItemReady
+		}
+		items[i] = domain.LearningPathItem{ReferenceType: "lesson", ReferenceID: lesson.LessonID, LessonRevisionID: lesson.LessonRevisionID, Position: i, Status: status, Targets: lesson.Targets, ReasonCode: "initial_plan"}
+	}
+	var existing struct {
+		ID string `json:"id"`
+	}
+	h.request(http.MethodPost, student.URL+"/__t19/existing-path", os.Getenv("T19_STUDENT_TOKEN"), map[string]any{"student_id": student.ExistingStudentID, "course_id": ensure.Result.CourseID, "course_fingerprint": pin.Fingerprint, "items": items}, http.StatusOK, &existing)
+	if existing.ID == "" {
+		t.Fatal("actual existing path fixture missing owner identity")
+	}
+	oldState, err := students.GetLearningPathPlanningState(ctx, student.ExistingStudentID, existing.ID)
+	if err != nil {
+		t.Fatal("actual existing path planning read failed")
+	}
+	second := newRequest(student.ExistingStudentID, existing.ID)
+	secondGenerator := &t19GenerationFixture{}
+	h.cut("path", true)
+	defer h.cut("path", false)
+	processed, processErr = newProcessor(secondGenerator).ProcessNext(ctx)
+	if !processed || processErr == nil {
+		t.Fatal("actual path outage did not produce checkpointed retry")
+	}
+	secondPartial := get(second)
+	if secondPartial.Status != domain.CoursePlanPlanning || secondPartial.LearningPathCommand == nil || secondPartial.LearningPathCommand.ExpectedVersion != oldState.PathVersion || secondPartial.CourseID != "" || secondPartial.ResultCode != "" {
+		t.Fatal("actual path retry lost original fence or leaked outcome")
+	}
+	secondPin, err := store.GetPlanningInput(ctx, secondPartial)
+	if err != nil || secondPin.OriginalPath == nil || secondPin.OriginalPath.PathVersion != oldState.PathVersion || secondPin.OriginalLearningPathID != existing.ID {
+		t.Fatal("exact original path input not pinned")
+	}
+	secondProvenance := t19CheckpointBytes(t, ctx, pool, second.ID)
+	commandBytes, err := json.Marshal(secondPartial.LearningPathCommand)
+	if err != nil {
+		t.Fatal("actual path checkpoint encoding failed")
+	}
+	h.request(http.MethodPost, student.URL+"/__t19/advance-path", os.Getenv("T19_STUDENT_TOKEN"), map[string]string{"student_id": student.ExistingStudentID, "path_id": existing.ID}, http.StatusOK, nil)
+	advanced, err := students.GetLearningPathPlanningState(ctx, student.ExistingStudentID, existing.ID)
+	if err != nil || advanced.PathVersion <= oldState.PathVersion {
+		t.Fatal("actual owner path advance did not move fence")
+	}
+	advancedBeforeRetry := h.studentState(student.ExistingStudentID)
+	secondCourseBeforeRetry := h.courseState()
+	h.cut("path", false)
+	secondRetryGenerator := &t19GenerationFixture{deny: true}
+	processed, processErr = processRetry(newProcessor(secondRetryGenerator), secondPartial)
+	if !processed || processErr == nil {
+		t.Fatal("stale pinned path fence was silently applied")
+	}
+	failed := get(second)
+	retainedCommand, err := json.Marshal(failed.LearningPathCommand)
+	if err != nil || failed.Status != domain.CoursePlanFailed || failed.FailureCode != domain.CoursePlanFailurePathConflict || failed.CourseID != "" || failed.ResultCode != "" || !bytes.Equal(retainedCommand, commandBytes) || !reflect.DeepEqual(secondProvenance, t19CheckpointBytes(t, ctx, pool, second.ID)) {
+		t.Fatal("stale retry rebased or discarded immutable command/provenance")
+	}
+	secondAfter := h.studentState(student.ExistingStudentID)
+	if secondAfter.ProfileReads != advancedBeforeRetry.ProfileReads || secondAfter.MasteryReads != advancedBeforeRetry.MasteryReads || secondAfter.PlanningStateReads != advancedBeforeRetry.PlanningStateReads || !reflect.DeepEqual(secondAfter.Paths, advancedBeforeRetry.Paths) || !reflect.DeepEqual(secondAfter.Assignments, advancedBeforeRetry.Assignments) || !reflect.DeepEqual(secondAfter.PathCommands, advancedBeforeRetry.PathCommands) || !reflect.DeepEqual(secondAfter.PathRevisions, advancedBeforeRetry.PathRevisions) || !reflect.DeepEqual(secondAfter.AssignmentRequests, advancedBeforeRetry.AssignmentRequests) || !reflect.DeepEqual(secondAfter.Counts, advancedBeforeRetry.Counts) || !reflect.DeepEqual(secondCourseBeforeRetry, h.courseState()) || len(secondRetryGenerator.keys) != 0 {
+		t.Fatal("stale application refreshed input or mutated protected owner history")
+	}
+	afterFence, err := students.GetLearningPathPlanningState(ctx, student.ExistingStudentID, existing.ID)
+	if err != nil || !reflect.DeepEqual(afterFence, advanced) {
+		t.Fatal("stale application changed owner path after version advance")
+	}
+	t19AssertHTTPKey(t, secondAfter.PathHTTPKeys, second.ID, 2)
+	for _, r := range []domain.CoursePlanRequest{completed, failed} {
+		var n int
+		if pool.QueryRow(ctx, `SELECT count(*) FROM planner_outbox WHERE correlation_id=$1`, r.ID).Scan(&n) != nil || n != 1 {
+			t.Fatal("terminal planning state/event did not commit exactly once")
+		}
+	}
+	t19WriteExclusive(t, resultFile, map[string]any{"classification": "actual Planner Processor/claim/retry/PostgreSQL checkpoints -> registered Course ensure HTTP/PostgreSQL -> registered Student assignment/path HTTP/PostgreSQL; bounded named generation and mastery projection fixtures; no LLM or full-E2E claim", "initial_request_id": completed.ID, "replan_request_id": failed.ID, "course_id": completed.CourseID, "learning_path_id": completed.LearningPathID, "input_hash": pin.InputHash, "artifact_hash": artifact.ArtifactHash, "ensure_receipt_hash": ensure.ReceiptHash, "original_fingerprint": pin.Fingerprint, "changed_live_fingerprint": fresh.Fingerprint, "completed_fingerprint": completed.CourseFingerprint, "generation_keys": initialGenerationKeys, "checkpoint_rows": 3, "immutable_bytes_after_retry": true, "retry_without_live_profile_mastery_or_path_read": true, "ensure_not_repeated_on_retry": true, "stale_worker_rejected": true, "immutable_update_rejected": true, "original_path_version": oldState.PathVersion, "advanced_path_version": advanced.PathVersion, "stale_replan_failure": failed.FailureCode, "path_and_history_unchanged_on_conflict": true, "named_generation_fixture": "t19-bounded-lesson-content-v1", "named_mastery_fixture": "t19-owned-mastered-projection-v1", "limits": "No joint Student atomic planning-significant snapshot or new generic INITIAL mastery/profile fence is claimed."})
+}
+
+type t19Clock struct{}
+
+func (t19Clock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+
+type t19IDs struct{}
+
+func (t19IDs) NewID() string { return uuid.NewString() }
+
+type t19GenerationFixture struct {
+	deny bool
+	keys []string
+}
+
+func (g *t19GenerationFixture) GenerateLesson(_ context.Context, input domainservice.LessonGenerationInput, key string) (domainservice.GeneratedLessonContent, error) {
+	if g.deny {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	g.keys = append(g.keys, key)
+	concept := input.Lesson.Targets[0].Key
+	return domainservice.GeneratedLessonContent{DescriptionMarkdown: "Owned T19 bounded fixture: " + input.Lesson.Title, Examples: []domain.PlannedExample{{Title: "Owned example", DescriptionMarkdown: "A fixed example for retry provenance.", Stacks: []string{"go"}, TargetConcepts: []string{concept}}}, KnowledgeChecks: []domain.PlannedTask{{Title: "Owned knowledge check", DescriptionMarkdown: "Give the fixed fixture response.", ExpectedAnswers: []string{"fixture-response"}}}}, nil
+}
+
+type t19StudentState struct {
+	ProfileReads       int64             `json:"profile_reads"`
+	MasteryReads       int64             `json:"mastery_reads"`
+	PlanningStateReads int64             `json:"planning_state_reads"`
+	AssignmentCutCount int64             `json:"assignment_cut_count"`
+	Paths              []json.RawMessage `json:"paths"`
+	PathCommands       []json.RawMessage `json:"path_commands"`
+	PathRevisions      []json.RawMessage `json:"path_revisions"`
+	AssignmentRequests []json.RawMessage `json:"assignment_requests"`
+	Counts             map[string]int64  `json:"counts"`
+	Assignments        []json.RawMessage `json:"assignments"`
+	AssignmentHTTPKeys []string          `json:"assignment_http_keys"`
+	PathHTTPKeys       []string          `json:"path_http_keys"`
+}
+type t19CourseState struct {
+	Counts   map[string]int64  `json:"counts"`
+	Courses  []json.RawMessage `json:"generated_courses"`
+	Requests []struct {
+		Key         string `json:"idempotency_key"`
+		CourseID    string `json:"course_id"`
+		RequestHash string `json:"request_hash"`
+	} `json:"generated_requests"`
+}
+type t19HTTP struct {
+	t                     *testing.T
+	ctx                   context.Context
+	client                *http.Client
+	studentURL, courseURL string
+}
+
+func (h t19HTTP) request(method, address, token string, body any, status int, output any) {
+	h.t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, e := json.Marshal(body)
+		if e != nil {
+			h.t.Fatal("fixture control encoding failed")
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, e := http.NewRequestWithContext(h.ctx, method, address, reader)
+	if e != nil {
+		h.t.Fatal("owner request construction failed")
+	}
+	req.Header.Set("X-Internal-Token", token)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	response, e := h.client.Do(req)
+	if e != nil {
+		h.t.Fatal("actual owner HTTP request failed")
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || response.StatusCode != status {
+		h.t.Fatalf("actual owner control expected status %d got %d", status, response.StatusCode)
+	}
+	if output != nil && json.Unmarshal(raw, output) != nil {
+		h.t.Fatal("actual owner state decoding failed")
+	}
+}
+func (h t19HTTP) profile(owner string, known, desired []string) {
+	h.request(http.MethodPost, h.studentURL+"/__t19/profile", os.Getenv("T19_STUDENT_TOKEN"), map[string]any{"student_id": owner, "known_stacks": known, "desired_stacks": desired, "goal_code": "go.backend", "direction_code": "backend"}, http.StatusOK, nil)
+}
+func (h t19HTTP) cut(kind string, enabled bool) {
+	h.request(http.MethodPost, h.studentURL+"/__t19/"+kind+"-cut", os.Getenv("T19_STUDENT_TOKEN"), map[string]bool{"enabled": enabled}, http.StatusNoContent, nil)
+}
+func (h t19HTTP) studentState(owner string) t19StudentState {
+	var state t19StudentState
+	h.request(http.MethodGet, h.studentURL+"/__t19/state?student_id="+owner, os.Getenv("T19_STUDENT_TOKEN"), nil, http.StatusOK, &state)
+	return state
+}
+func (h t19HTTP) courseState() t19CourseState {
+	var state t19CourseState
+	h.request(http.MethodGet, h.courseURL+"/__t19/state", os.Getenv("T19_COURSE_TOKEN"), nil, http.StatusOK, &state)
+	return state
+}
+func t19AssertEnsureKey(t *testing.T, state t19CourseState, key, courseID string) {
+	t.Helper()
+	count := 0
+	for _, r := range state.Requests {
+		if r.Key == key {
+			count++
+			if r.CourseID != courseID || r.RequestHash == "" {
+				t.Fatal("actual Course ensure key receipt mismatch")
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatal("actual Course ensure key not persisted exactly once")
+	}
+}
+func t19AssertHTTPKey(t *testing.T, keys []string, key string, want int) {
+	t.Helper()
+	count := 0
+	for _, v := range keys {
+		if v == key {
+			count++
+		}
+	}
+	if count != want {
+		t.Fatalf("actual mutation HTTP key count expected %d got %d", want, count)
+	}
+}
+func t19CheckpointBytes(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id string) map[string][]byte {
+	t.Helper()
+	values := map[string][]byte{}
+	for _, table := range []string{"course_planning_input_checkpoint", "course_planning_generated_checkpoint", "course_planning_ensure_checkpoint"} {
+		var raw []byte
+		if pool.QueryRow(ctx, "SELECT payload_bytes FROM "+table+" WHERE request_id=$1", id).Scan(&raw) != nil {
+			t.Fatal("actual private checkpoint bytes unavailable")
+		}
+		values[table] = raw
+	}
+	return values
+}
+func t19ReadReady(t *testing.T, env string, output any) {
+	t.Helper()
+	raw, e := os.ReadFile(os.Getenv(env))
+	if e != nil || json.Unmarshal(raw, output) != nil {
+		t.Fatal("SETUP: owner metadata unavailable")
+	}
+}
+func t19WriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, e := json.MarshalIndent(value, "", "  ")
+	if e != nil {
+		t.Fatal("safe T19 result encoding failed")
+	}
+	f, e := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		t.Fatal("exclusive T19 result creation failed")
+	}
+	_, writeErr := f.Write(append(raw, '\n'))
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("safe T19 result write failed")
+	}
+	if os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic T19 result publication failed")
+	}
+}

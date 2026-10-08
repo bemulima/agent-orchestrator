@@ -1,0 +1,148 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+type CoursePlanHandler struct {
+	Create          courseplan.Create
+	DiagnosticState courseplan.GetDiagnosticPlanning
+}
+
+func (handler CoursePlanHandler) GetDiagnosticPlanningState(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.URL.RawQuery != "" || r.ContentLength > 0 {
+		writeDiagnosticError(w, domain.ErrMalformed)
+		return
+	}
+	studentID, planID := chi.URLParam(r, "studentID"), chi.URLParam(r, "planID")
+	if !canonicalHandlerUUID(studentID) || !canonicalHandlerUUID(planID) {
+		writeDiagnosticError(w, domain.ErrMalformed)
+		return
+	}
+	state, err := handler.DiagnosticState.Handle(r.Context(), studentID, planID)
+	if err != nil {
+		writeDiagnosticError(w, err)
+		return
+	}
+	writeDiagnosticJSON(w, http.StatusOK, state)
+}
+
+type teacherCoursePlanPayload struct {
+	GoalCode         string                     `json:"goal_code"`
+	LearningPathID   string                     `json:"learning_path_id"`
+	DesiredOutcome   string                     `json:"desired_outcome"`
+	RequestedTargets []domain.TargetRef         `json:"requested_targets"`
+	Constraints      domain.PlanningConstraints `json:"constraints"`
+	AuditRefs        domain.PlanningAuditRefs   `json:"audit_refs"`
+	Reason           domain.PlanningReason      `json:"reason"`
+	DiagnosticPlanID string                     `json:"diagnostic_plan_id"`
+}
+
+type teacherCoursePlanResponse struct {
+	RequestID      string                  `json:"request_id"`
+	GoalCode       string                  `json:"goal_code"`
+	Status         domain.CoursePlanStatus `json:"status"`
+	ResultCode     string                  `json:"result_code,omitempty"`
+	CourseID       string                  `json:"course_id,omitempty"`
+	LearningPathID string                  `json:"learning_path_id,omitempty"`
+	Reused         bool                    `json:"reused"`
+	Attempts       int                     `json:"attempts"`
+	CreatedAt      string                  `json:"created_at"`
+	UpdatedAt      string                  `json:"updated_at"`
+	CompletedAt    string                  `json:"completed_at,omitempty"`
+	Source         domain.PlanningSource   `json:"source"`
+	Reason         domain.PlanningReason   `json:"reason"`
+}
+
+func (handler CoursePlanHandler) CreateTeacherCoursePlan(writer http.ResponseWriter, request *http.Request) {
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+	parsedStudent, err := uuid.Parse(studentID)
+	if err != nil || parsedStudent.String() != studentID {
+		writePrivateCoursePlanError(writer, http.StatusBadRequest, "invalid_student_id")
+		return
+	}
+	parsedKey, err := uuid.Parse(idempotencyKey)
+	if err != nil || parsedKey.String() != idempotencyKey {
+		writePrivateCoursePlanError(writer, http.StatusUnprocessableEntity, "invalid_idempotency_key")
+		return
+	}
+	var payload teacherCoursePlanPayload
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writePrivateCoursePlanError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writePrivateCoursePlanError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return
+	}
+	if payload.Reason == "" {
+		payload.Reason = domain.PlanningReasonInitial
+	}
+	result, created, err := handler.Create.Handle(request.Context(), courseplan.CreateInput{
+		StudentID: studentID, IdempotencyKey: idempotencyKey, GoalCode: payload.GoalCode,
+		LearningPathID:   payload.LearningPathID,
+		DiagnosticPlanID: payload.DiagnosticPlanID,
+		Intent: domain.PlanningIntent{
+			Source: domain.PlanningSourceTeacher, Reason: payload.Reason,
+			DesiredOutcome: payload.DesiredOutcome, RequestedTargets: payload.RequestedTargets,
+			Constraints: payload.Constraints, AuditRefs: payload.AuditRefs,
+		},
+	})
+	if err != nil {
+		writePrivateCoursePlanDomainError(writer, err)
+		return
+	}
+	status := http.StatusAccepted
+	if !created && result.Status != domain.CoursePlanPlanning {
+		status = http.StatusOK
+	}
+	response := teacherCoursePlanResponse{
+		RequestID: result.ID, GoalCode: result.GoalCode, Status: result.Status,
+		ResultCode: result.ResultCode, CourseID: result.CourseID, LearningPathID: result.LearningPathID, Reused: result.Reused,
+		Attempts: result.Attempts, CreatedAt: result.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		UpdatedAt: result.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		Source:    result.Intent.Source, Reason: result.Intent.Reason,
+	}
+	if result.CompletedAt != nil {
+		response.CompletedAt = result.CompletedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
+	}
+	writePrivateCoursePlanJSON(writer, status, response)
+}
+
+func writePrivateCoursePlanDomainError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrValidation):
+		writePrivateCoursePlanError(writer, http.StatusUnprocessableEntity, "invalid_request")
+	case errors.Is(err, domain.ErrConflict):
+		writePrivateCoursePlanError(writer, http.StatusConflict, "idempotency_conflict")
+	case errors.Is(err, domain.ErrNotFound):
+		writePrivateCoursePlanError(writer, http.StatusNotFound, "not_found")
+	case errors.Is(err, domain.ErrForbidden):
+		writePrivateCoursePlanError(writer, http.StatusForbidden, "forbidden")
+	default:
+		writePrivateCoursePlanError(writer, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+func writePrivateCoursePlanError(writer http.ResponseWriter, status int, code string) {
+	writePrivateCoursePlanJSON(writer, status, map[string]any{"error": map[string]string{"code": code}})
+}
+
+func writePrivateCoursePlanJSON(writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(payload)
+}

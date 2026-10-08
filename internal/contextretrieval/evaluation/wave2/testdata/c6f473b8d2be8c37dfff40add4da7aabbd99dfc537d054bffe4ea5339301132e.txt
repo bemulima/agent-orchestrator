@@ -1,0 +1,170 @@
+package usecase
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (runtime *Runtime) Submit(ctx context.Context, command domain.SubmitCommand) (domain.Submission, int, error) {
+	normalized, err := domain.NormalizeSubmitCommand(command)
+	if err != nil {
+		return domain.Submission{}, 0, err
+	}
+	digest, err := domain.CommandDigest(normalized)
+	if err != nil {
+		return domain.Submission{}, 0, err
+	}
+	unlock := runtime.lockInstance(normalized.TaskInstanceID)
+	defer unlock()
+
+	instance, err := runtime.Repository.GetInstance(ctx, normalized.StudentID, normalized.TaskInstanceID)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	intent, err := runtime.Repository.GetIntent(ctx, normalized.TaskInstanceID, normalized.IdempotencyKey)
+	if err == nil {
+		if intent.StudentID != normalized.StudentID || intent.CommandDigest != digest || intent.Scope != normalized.Scope || intent.MilestoneID != normalized.MilestoneID {
+			return domain.Submission{}, 409, domain.ErrIdempotency
+		}
+		if intent.Status == "COMMITTED" {
+			submission, readErr := runtime.Repository.GetSubmission(ctx, intent.TaskInstanceID, intent.SubmissionID)
+			if readErr != nil {
+				return domain.Submission{}, statusFor(readErr), readErr
+			}
+			return submission.PublicProjection(), 202, nil
+		}
+		return runtime.resumeSubmit(ctx, instance, intent)
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.Submission{}, 503, err
+	}
+	if instance.Status != domain.TaskInstanceInProgress {
+		return domain.Submission{}, 409, domain.ErrConflict
+	}
+	if err := validateSubmissionScope(instance, normalized.Scope, normalized.MilestoneID); err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	specification, contractDigest, err := domain.BuildValidationSpecification(instance, normalized.Scope, normalized.MilestoneID)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	specJSON, err := json.Marshal(specification)
+	if err != nil {
+		return domain.Submission{}, 503, err
+	}
+	submissionID, runID := runtime.newID(), runtime.newID()
+	if !domain.IsCanonicalUUID(submissionID) || !domain.IsCanonicalUUID(runID) || submissionID == runID {
+		return domain.Submission{}, 503, fmt.Errorf("invalid generated submission or validation-run identity")
+	}
+	intent = domain.SubmitIntent{TaskInstanceID: instance.ID, StudentID: instance.StudentID,
+		IdempotencyKey: normalized.IdempotencyKey, CommandDigest: digest, SubmissionID: submissionID,
+		ValidationRunID: runID, Scope: normalized.Scope, MilestoneID: normalized.MilestoneID,
+		ValidationContractDigest: contractDigest, ValidationSpecification: specJSON, Status: "INTENT", CreatedAt: runtime.now()}
+	stored, _, err := runtime.Repository.CreateOrLoadIntent(ctx, intent)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	if stored.StudentID != intent.StudentID || stored.CommandDigest != intent.CommandDigest || stored.Scope != intent.Scope || stored.MilestoneID != intent.MilestoneID {
+		return domain.Submission{}, 409, domain.ErrIdempotency
+	}
+	return runtime.resumeSubmit(ctx, instance, stored)
+}
+
+func (runtime *Runtime) resumeSubmit(ctx context.Context, instance domain.TaskInstance, intent domain.SubmitIntent) (domain.Submission, int, error) {
+	if intent.Status == "COMMITTED" {
+		submission, err := runtime.Repository.GetSubmission(ctx, intent.TaskInstanceID, intent.SubmissionID)
+		if err != nil {
+			return domain.Submission{}, statusFor(err), err
+		}
+		return submission.PublicProjection(), 202, nil
+	}
+	if instance.Status != domain.TaskInstanceInProgress || intent.Status == "ABORTED" {
+		return domain.Submission{}, 409, domain.ErrConflict
+	}
+	if intent.TaskInstanceID != instance.ID || intent.StudentID != instance.StudentID || intent.SubmissionID == "" || intent.ValidationRunID == "" {
+		return domain.Submission{}, 503, domain.ErrDependency
+	}
+	if intent.WriteLockID == "" {
+		writeLock, err := runtime.Workspace.LockWrites(ctx, ports.LockWorkspaceWrites{SandboxID: instance.WorkspaceBinding.SandboxID,
+			RequestID: intent.SubmissionID, Mode: "TEMPORARY", SubmissionID: intent.SubmissionID})
+		if err != nil || writeLock.LockID == "" || writeLock.FenceEpoch <= 0 || writeLock.Permanent {
+			return domain.Submission{}, 503, domain.ErrDependency
+		}
+		intent.WriteLockID, intent.FenceEpoch, intent.Status = writeLock.LockID, writeLock.FenceEpoch, "LOCKED"
+		if err := runtime.Repository.SaveIntent(ctx, intent); err != nil {
+			return domain.Submission{}, 503, err
+		}
+	}
+	if intent.Snapshot.SnapshotID == "" {
+		snapshot, err := runtime.Workspace.FreezeSnapshot(ctx, ports.FreezeSnapshot{SandboxID: instance.WorkspaceBinding.SandboxID,
+			SubmissionID: intent.SubmissionID, TaskInstanceID: instance.ID})
+		if err != nil || !validSnapshot(snapshot, instance.WorkspaceBinding.SandboxID) {
+			return domain.Submission{}, 503, domain.ErrDependency
+		}
+		intent.Snapshot, intent.Status = snapshot, "FROZEN"
+		if err := runtime.Repository.SaveIntent(ctx, intent); err != nil {
+			return domain.Submission{}, 503, err
+		}
+	}
+	if !validSnapshot(intent.Snapshot, instance.WorkspaceBinding.SandboxID) {
+		return domain.Submission{}, 503, domain.ErrDependency
+	}
+	pinned, err := runtime.Workspace.ReadPinnedSnapshot(ctx, intent.Snapshot)
+	if err != nil || pinned.Ref != intent.Snapshot {
+		return domain.Submission{}, 503, domain.ErrDependency
+	}
+	now := runtime.now()
+	run := domain.ValidationRun{ID: intent.ValidationRunID, Status: domain.ValidationRunPending}
+	submission := domain.Submission{Schema: domain.SubmissionSchema, ID: intent.SubmissionID, TaskInstanceID: instance.ID,
+		StudentID: instance.StudentID, Scope: intent.Scope, MilestoneID: intent.MilestoneID, Snapshot: intent.Snapshot,
+		WorkspaceDigest: intent.Snapshot.WorkspaceDigest, Status: domain.SubmissionValidating, ValidationRuns: []domain.ValidationRun{run},
+		CreatedAt: now, UpdatedAt: now, ValidationSpecification: append([]byte(nil), intent.ValidationSpecification...),
+		ValidationContractDigest: intent.ValidationContractDigest, RevisionDigest: instance.TaskRevisionDigest,
+		RequiresHumanReview: instance.ReviewRequired, IdempotencyKey: intent.IdempotencyKey, CommandDigest: intent.CommandDigest}
+	intent.Status = "COMMITTED"
+	if err := runtime.Repository.CommitIntent(ctx, intent, submission, run); err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	return submission.PublicProjection(), 202, nil
+}
+
+func validateSubmissionScope(instance domain.TaskInstance, scope, milestoneID string) error {
+	switch scope {
+	case "FINAL":
+		for _, step := range instance.Steps {
+			if step.Required && step.Status != "PASSED" && step.Status != "CHECKPOINTED" {
+				return domain.ErrConflict
+			}
+		}
+		return nil
+	case "MILESTONE":
+		for _, step := range instance.Steps {
+			if !step.Required || step.Status == "PASSED" || step.Status == "CHECKPOINTED" {
+				continue
+			}
+			if step.ID != milestoneID {
+				return domain.ErrConflict
+			}
+			if step.Status != "AVAILABLE" {
+				return domain.ErrConflict
+			}
+			return nil
+		}
+	}
+	return domain.ErrConflict
+}
+
+func validSnapshot(snapshot domain.SnapshotRef, sandboxID string) bool {
+	if sandboxID == "" || snapshot.SandboxID != sandboxID || snapshot.SnapshotID == "" || snapshot.GenerationID == "" || !strings.HasPrefix(snapshot.WorkspaceDigest, "sha256:") {
+		return false
+	}
+	digest, err := hex.DecodeString(strings.TrimPrefix(snapshot.WorkspaceDigest, "sha256:"))
+	return err == nil && len(digest) == 32
+}

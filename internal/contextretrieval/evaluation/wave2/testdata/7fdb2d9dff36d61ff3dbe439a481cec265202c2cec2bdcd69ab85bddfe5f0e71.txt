@@ -1,0 +1,363 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	planningmessages "github.com/bemulima/ms-go-learning-planner/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/hybridreplan"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// Root launches isolated providers and applies owner migrations. The first
+// event is genuine registered Student evidence -> mastery/outbox -> production
+// Student relay. Additional events are explicitly named transport fixtures for
+// burst/lost-ACK tests. They never pretend to be additional learner evidence.
+// Every snapshot read/checkpoint uses actual Student HTTP and actual Planner PG.
+func TestT202ActualHybridTriggerAndSnapshot(t *testing.T) {
+	if os.Getenv("T202_ACTUAL_HYBRID") != "true" {
+		t.Skip("root-owned actual T20.2 gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("PLANNER_T202_DATABASE_URL"))
+	if err != nil || (!infraAcceptanceDatabase(t, cfg, "planner") && (cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_planner_integration_proof")) {
+		t.Fatal("SETUP: exact isolated Planner PG required")
+	}
+	var owner struct {
+		URL         string                   `json:"url"`
+		Token       string                   `json:"token"`
+		StudentID   string                   `json:"student_id"`
+		PathID      string                   `json:"path_id"`
+		Targets     []domain.HybridTargetRef `json:"targets"`
+		SnapshotRef string                   `json:"snapshot_ref"`
+		EventID     string                   `json:"event_id"`
+	}
+	t202ReadJSON(t, os.Getenv("T202_OWNER_READY_FILE"), &owner)
+	address, e := url.Parse(owner.URL)
+	if e != nil || address.Scheme != "http" || address.Hostname() != "127.0.0.1" || address.User != nil || address.Path != "" || owner.Token == "" {
+		t.Fatal("SETUP: dedicated loopback Student owner required")
+	}
+	natsURL := os.Getenv("T202_NATS_URL")
+	broker, e := url.Parse(natsURL)
+	if e != nil || (!infraAcceptanceNATS(t, natsURL) && (broker.Scheme != "nats" || broker.Hostname() != "127.0.0.1" || broker.Port() != "59000")) {
+		t.Fatal("SETUP: isolated actual broker required")
+	}
+	raw, err := os.ReadFile(os.Getenv("T202_OWNER_EVENT_FILE"))
+	if err != nil {
+		t.Fatal("SETUP: committed owner event file required")
+	}
+	official, err := domain.DecodePlanningStateChangedEvent(raw)
+	if err != nil || official.StudentID != owner.StudentID || official.Data.LearningPathID != owner.PathID || official.EventID != owner.EventID {
+		t.Fatal("SETUP: original committed owner envelope mismatch")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = pool.Ping(ctx); err != nil {
+		t.Fatal("SETUP: Planner PG unavailable")
+	}
+	infraAcceptanceDatabaseIdentity(t, ctx, pool)
+	store := postgres.Store{Pool: pool}
+	trigger := hybridreplan.TriggerProcessor{Jobs: store}
+	httpClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	student := studentclient.Client{BaseURL: owner.URL, WriteToken: owner.Token, HTTPClient: httpClient}
+	snapshotRequest := domain.HybridSnapshotRequest{Targets: official.Data.Targets, TriggerContext: domain.HybridSnapshotTrigger{Kind: official.Data.TriggerKind, Reason: "Actual T20.2 owner baseline", CorrelationID: official.EventID}}
+	baseline, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, snapshotRequest)
+	if err != nil {
+		t.Fatalf("actual registered owner baseline: %v", err)
+	}
+	processor := hybridreplan.SnapshotProcessor{Jobs: store, Students: student, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	connection, err := natsgo.Connect(natsURL, natsgo.Name("t202-actual-owner-proof"))
+	if err != nil {
+		t.Fatal("SETUP: actual broker unavailable")
+	}
+	defer connection.Close()
+	js, err := connection.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Planner consumer is offline while the actual owner relay publishes the
+	// genuine postcommit fact. JetStream retains it until this consumer starts.
+	relayReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, owner.URL+"/__t202/relay", bytes.NewBufferString("{}"))
+	relayReq.Header.Set("X-Internal-Token", owner.Token)
+	relayReq.Header.Set("Content-Type", "application/json")
+	relayResponse, err := httpClient.Do(relayReq)
+	if err != nil {
+		t.Fatalf("production Student relay: %v", err)
+	}
+	var relayResult struct {
+		Claimed   int  `json:"claimed"`
+		Published bool `json:"published"`
+	}
+	decodeErr := json.NewDecoder(relayResponse.Body).Decode(&relayResult)
+	relayResponse.Body.Close()
+	if relayResponse.StatusCode != http.StatusOK || decodeErr != nil || !relayResult.Published {
+		t.Fatalf("production Student outbox publication failed status=%d claimed=%d", relayResponse.StatusCode, relayResult.Claimed)
+	}
+	consumer, err := planningmessages.NewPlanningStateConsumer(ctx, natsURL, trigger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { consumer.Close() }()
+	t202Await(t, ctx, 5*time.Second, func() bool { return t202InboxCount(t, ctx, pool, official.EventID) == 1 })
+	beforeGeneration := t202Generation(t, ctx, pool, owner.StudentID, owner.PathID)
+	current, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, snapshotRequest)
+	if err != nil || !reflect.DeepEqual(current.Path, baseline.Path) {
+		t.Fatalf("event alone changed Student path: %v", err)
+	}
+	t202ProcessUntilDone(t, ctx, processor, pool, owner.StudentID, owner.PathID)
+	if count := t202JobCount(t, ctx, pool, owner.StudentID, owner.PathID); count != 1 {
+		t.Fatalf("one authoritative snapshot produced %d jobs", count)
+	}
+	t.Log("genuine Student outbox -> actual broker -> durable Planner inbox -> actual coherent Student snapshot -> real snapshot job passed")
+
+	// Transport fixture: repeat the identical original owner payload without a
+	// publisher dedupe header so the actual consumer exercises receipt replay.
+	t202Publish(t, js, official, false)
+	t202Await(t, ctx, 5*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumPending == 0 && info.NumAckPending == 0
+	})
+	if generation := t202Generation(t, ctx, pool, owner.StudentID, owner.PathID); generation != beforeGeneration {
+		t.Fatalf("duplicate receipt created generation %d from %d", generation, beforeGeneration)
+	}
+	if processed, err := processor.ProcessNext(ctx); err != nil || processed {
+		t.Fatalf("duplicate event created work processed=%v err=%v", processed, err)
+	}
+
+	// Named transport-burst fixtures reuse only the real owner/path/target
+	// references. No new Evidence/Mastery rows or path mutations are fabricated.
+	burst := make([]domain.PlanningStateChangedEvent, 5)
+	for i := range burst {
+		burst[i] = t202TransportFixture(official)
+		t202Publish(t, js, burst[i], true)
+	}
+	t202Await(t, ctx, 5*time.Second, func() bool {
+		for _, event := range burst {
+			if t202InboxCount(t, ctx, pool, event.EventID) != 1 {
+				return false
+			}
+		}
+		return true
+	})
+	t202ProcessUntilDone(t, ctx, processor, pool, owner.StudentID, owner.PathID)
+	if count := t202JobCount(t, ctx, pool, owner.StudentID, owner.PathID); count != 1 {
+		t.Fatalf("burst created %d jobs for unchanged coherent state", count)
+	}
+	t202Await(t, ctx, 5*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumPending == 0 && info.NumAckPending == 0
+	})
+	consumer.Close()
+	t202Await(t, ctx, 3*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumWaiting == 0
+	})
+
+	// Real delivery loss after durable ingress: receive a named transport fact,
+	// commit through the actual Store, then close its broker connection without
+	// ACK. The production consumer must recover and replay the immutable receipt.
+	lost := t202TransportFixture(official)
+	t202Publish(t, js, lost, true)
+	lostConnection, err := natsgo.Connect(natsURL, natsgo.Name("t202-lost-ack-after-owner-receipt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lostJS, err := lostConnection.JetStream()
+	if err != nil {
+		lostConnection.Close()
+		t.Fatal(err)
+	}
+	subscription, err := lostJS.PullSubscribe(domain.SubjectPlanningStateChanged, planningmessages.HybridReplanDurable, natsgo.Bind(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable), natsgo.ManualAck())
+	if err != nil {
+		lostConnection.Close()
+		t.Fatal(err)
+	}
+	delivered, err := subscription.Fetch(1, natsgo.MaxWait(3*time.Second))
+	if err != nil || len(delivered) != 1 {
+		lostConnection.Close()
+		t.Fatalf("actual lost-ACK delivery: %v", err)
+	}
+	decoded, err := planningmessages.DecodePlanningStateMessage(delivered[0])
+	if err != nil || decoded.EventID != lost.EventID {
+		lostConnection.Close()
+		t.Fatal("lost-ACK fixture delivery mismatched")
+	}
+	if created, err := trigger.ReceivePlanningStateEvent(ctx, decoded); err != nil || !created {
+		lostConnection.Close()
+		t.Fatalf("actual pre-ACK durable commit created=%v err=%v", created, err)
+	}
+	lostGeneration := t202Generation(t, ctx, pool, owner.StudentID, owner.PathID)
+	manualInfo, err := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+	if err != nil {
+		lostConnection.Close()
+		t.Fatal(err)
+	}
+	manualDelivery := manualInfo.Delivered.Consumer
+	lostConnection.Close()
+	consumer, err = planningmessages.NewPlanningStateConsumer(ctx, natsURL, trigger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t202Await(t, ctx, 40*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumAckPending == 0 && info.NumPending == 0 && info.Delivered.Consumer > manualDelivery
+	})
+	if t202InboxCount(t, ctx, pool, lost.EventID) != 1 || t202Generation(t, ctx, pool, owner.StudentID, owner.PathID) != lostGeneration {
+		t.Fatal("lost ACK duplicated durable receipt/generation")
+	}
+	t202ProcessUntilDone(t, ctx, processor, pool, owner.StudentID, owner.PathID)
+	if count := t202JobCount(t, ctx, pool, owner.StudentID, owner.PathID); count != 1 {
+		t.Fatalf("redelivery created %d snapshot jobs", count)
+	}
+	t.Log("actual consumer restart/lost-ACK redelivery recovered exactly one receipt and snapshot job")
+
+	// Actual network outage at the Student read boundary leaves durable work.
+	outage := t202TransportFixture(official)
+	t202Publish(t, js, outage, true)
+	t202Await(t, ctx, 5*time.Second, func() bool { return t202InboxCount(t, ctx, pool, outage.EventID) == 1 })
+	offline := processor
+	offline.Students = studentclient.Client{BaseURL: "http://127.0.0.1:1", WriteToken: owner.Token, HTTPClient: &http.Client{Timeout: 200 * time.Millisecond}}
+	if processed, err := offline.ProcessNext(ctx); !processed || !errors.Is(err, domain.ErrUpstreamUnavailable) {
+		t.Fatalf("actual owner outage processed=%v err=%v", processed, err)
+	}
+	if !t202Pending(t, ctx, pool, owner.StudentID, owner.PathID) || t202JobCount(t, ctx, pool, owner.StudentID, owner.PathID) != 1 {
+		t.Fatal("owner outage lost queued work or created job")
+	}
+	restarted := processor
+	t202ProcessUntilDone(t, ctx, restarted, pool, owner.StudentID, owner.PathID)
+	final, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, snapshotRequest)
+	if err != nil || !reflect.DeepEqual(final.Path, baseline.Path) {
+		t.Fatalf("snapshot-only chain mutated Student path: %v", err)
+	}
+	if output := os.Getenv("PLANNER_T20_SNAPSHOT_FILE"); output != "" {
+		var jobRaw []byte
+		if err = pool.QueryRow(ctx, `SELECT snapshot_json::text FROM hybrid_evaluation_job WHERE student_id=$1 AND learning_path_id=$2 ORDER BY created_at DESC LIMIT 1`, owner.StudentID, owner.PathID).Scan(&jobRaw); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(output, jobRaw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if output := os.Getenv("T202_PLANNER_RESULT_FILE"); output != "" {
+		result := map[string]any{"official_owner_event_id": official.EventID, "registered_student_http": true, "student_production_outbox_relay": true, "actual_jetstream_consumer": true, "planner_real_postgres": true, "snapshot_jobs": t202JobCount(t, ctx, pool, owner.StudentID, owner.PathID), "path_version_before": baseline.Path.Version, "path_version_after": final.Path.Version, "duplicate_deduped": true, "burst_coalesced": true, "lost_ack_recovered": true, "owner_outage_recovered": true, "evaluation_performed": false, "path_mutations": 0, "named_transport_fixtures": []string{"five distinct burst facts using committed owner references", "one lost-ACK fact using committed owner references", "one outage fact using committed owner references", "one identical owner-envelope duplicate without publisher dedupe header"}}
+		encoded, _ := json.MarshalIndent(result, "", "  ")
+		if err = os.WriteFile(output, encoded, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func t202ReadJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, value) != nil {
+		t.Fatal("SETUP: owner fixture unavailable")
+	}
+}
+func t202Await(t *testing.T, ctx context.Context, limit time.Duration, check func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if check() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("actual owner proof context expired")
+		case <-deadline.C:
+			t.Fatal("actual owner proof condition timed out")
+		case <-ticker.C:
+		}
+	}
+}
+func t202InboxCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id string) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hybrid_planning_state_inbox WHERE event_id=$1`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+func t202JobCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sid, pid string) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hybrid_evaluation_job WHERE student_id=$1 AND learning_path_id=$2`, sid, pid).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+func t202Generation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sid, pid string) int64 {
+	t.Helper()
+	var generation int64
+	if err := pool.QueryRow(ctx, `SELECT generation FROM hybrid_evaluation_work WHERE student_id=$1 AND learning_path_id=$2`, sid, pid).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	return generation
+}
+func t202Pending(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sid, pid string) bool {
+	t.Helper()
+	var pending bool
+	if err := pool.QueryRow(ctx, `SELECT generation>processed_generation FROM hybrid_evaluation_work WHERE student_id=$1 AND learning_path_id=$2`, sid, pid).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
+}
+func t202ProcessUntilDone(t *testing.T, ctx context.Context, p hybridreplan.SnapshotProcessor, pool *pgxpool.Pool, sid, pid string) {
+	t.Helper()
+	t202Await(t, ctx, 10*time.Second, func() bool {
+		if !t202Pending(t, ctx, pool, sid, pid) {
+			return true
+		}
+		if _, err := p.ProcessNext(ctx); err != nil {
+			t.Fatalf("actual coherent snapshot checkpoint: %v", err)
+		}
+		return !t202Pending(t, ctx, pool, sid, pid)
+	})
+}
+func t202TransportFixture(owner domain.PlanningStateChangedEvent) domain.PlanningStateChangedEvent {
+	e := owner
+	e.Data.TriggerIdentity = uuid.NewString()
+	e.CausationID = e.Data.TriggerIdentity
+	e.EventID = domain.PlanningStateChangedEventID(e.StudentID, e.Data.LearningPathID, e.Data.TriggerKind, e.Data.TriggerIdentity)
+	e.OccurredAt = time.Now().UTC().Truncate(time.Microsecond)
+	return e
+}
+func t202Publish(t *testing.T, js natsgo.JetStreamContext, event domain.PlanningStateChangedEvent, publisherDedupe bool) {
+	t.Helper()
+	raw, _ := json.Marshal(event)
+	message := natsgo.NewMsg(domain.SubjectPlanningStateChanged)
+	message.Data = raw
+	message.Header.Set("X-Event-ID", event.EventID)
+	message.Header.Set("X-Correlation-ID", event.CorrelationID)
+	message.Header.Set("X-Causation-ID", event.CausationID)
+	message.Header.Set("X-Schema-Version", "1")
+	if publisherDedupe {
+		message.Header.Set(natsgo.MsgIdHdr, event.EventID)
+	}
+	if _, err := js.PublishMsg(message); err != nil {
+		t.Fatalf("actual broker fixture publish: %v", err)
+	}
+}

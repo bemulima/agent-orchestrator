@@ -1,0 +1,194 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+// This test owns a random disposable schema through the approved integration
+// entrypoint. Provider values below are explicit synthetic persistence fixtures;
+// the separate HTTP chain proof exercises actual Sandbox/validator providers.
+func TestT12PostgresSafeFeedbackSurvivesRestartRetryAndNewSubmission(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	instance, _, err := repository.CreateOrLoadStart(ctx, fixtureInstance())
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status, instance.LearningActionID = domain.TaskInstanceInProgress, testUUID(20)
+	instance.WorkspaceBinding = domain.WorkspaceBinding{SandboxID: "sandbox-1", Available: true}
+	instance.CurrentStep = &instance.Steps[0]
+	instance, err = repository.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := t12CommitFeedbackFixture(t, repository, instance, 80)
+	pending := ports.PendingValidation{TaskInstanceID: instance.ID, StudentID: instance.StudentID, SubmissionID: submission.ID, RunID: submission.ValidationRuns[0].ID}
+	validator := &t12FeedbackValidator{outcome: domain.OutcomeError}
+	runtime := usecase.Runtime{Repository: repository, Validator: validator, Workspace: t12FeedbackWorkspace{}, NewID: func() string { return testUUID(90) }}
+	if err := runtime.ProcessValidation(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	repository = NewRepository(db)
+	runtime.Repository = repository
+	failedTechnical, err := repository.GetSubmission(ctx, instance.ID, submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRun := failedTechnical.ValidationRuns[0]
+	if firstRun.SafeSummary == nil || firstRun.Outcome != domain.OutcomeError || failedTechnical.Status != domain.SubmissionValidating || firstRun.ErrorClassification != "VALIDATOR_UNAVAILABLE" {
+		t.Fatalf("technical result not durable: %+v", failedTechnical)
+	}
+	teacher, err := runtime.TeacherValidation(ctx, instance.ID, instance.StudentID)
+	if err != nil || !teacher.Available || teacher.TeacherExplanation == nil || len(teacher.TeacherExplanation.BlockingIssues) != 1 || teacher.TeacherExplanation.BlockingIssues[0].Code != "VALIDATOR_UNAVAILABLE" {
+		t.Fatalf("restarted Teacher technical result = %+v %v", teacher, err)
+	}
+	retry, err := runtime.RetryValidation(ctx, firstRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.CurrentValidationSummary != nil || retry.ValidationRuns[0].SafeSummary != nil || retry.ValidationRuns[1].SafeSummary != nil {
+		t.Fatal("pending retry exposed old/current internal summary")
+	}
+	teacher, err = runtime.TeacherValidation(ctx, instance.ID, instance.StudentID)
+	if err != nil || teacher.Available || teacher.TeacherExplanation != nil {
+		t.Fatal("pending retry reused old Teacher summary")
+	}
+	validator.outcome = domain.OutcomeFail
+	pending.RunID = testUUID(90)
+	if err := runtime.ProcessValidation(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	repository = NewRepository(db)
+	runtime.Repository = repository
+	durableFailure, err := repository.GetSubmission(ctx, instance.ID, submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safe := durableFailure.PublicProjection().CurrentValidationSummary
+	if safe == nil || safe.Outcome != domain.OutcomeFail || safe.ValidationRunID != pending.RunID || len(safe.Stages) != 1 || len(safe.Stages[0].Issues) != 1 || safe.Stages[0].Issues[0].Code != "MISSING_ELEMENT" || safe.Stages[0].Issues[0].Message != domain.SafeSemanticIssueMessage {
+		t.Fatalf("official safe FAIL not durable: %+v", safe)
+	}
+	originalTechnicalJSON, _ := json.Marshal(firstRun)
+	reloadedTechnicalJSON, _ := json.Marshal(durableFailure.ValidationRuns[0])
+	if !jsonEqual(originalTechnicalJSON, reloadedTechnicalJSON) {
+		t.Fatal("retry changed immutable historical ERROR run")
+	}
+	var payload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM practice_validation_runs WHERE id=$1`, pending.RunID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), "safe_summary") || strings.Contains(string(payload), "PRIVATE_EVALUATION_CANARY") {
+		t.Fatalf("run JSON omitted safe detail or stored private output: %s", payload)
+	}
+	public, _ := json.Marshal(durableFailure.PublicProjection())
+	if strings.Contains(string(public), "safe_summary") || strings.Contains(string(public), "PRIVATE_EVALUATION_CANARY") {
+		t.Fatalf("public detail leaked internal/raw content: %s", public)
+	}
+	teacher, err = runtime.TeacherValidation(ctx, instance.ID, instance.StudentID)
+	if err != nil || !teacher.Available || len(teacher.TeacherExplanation.BlockingIssues) != 1 || teacher.TeacherExplanation.BlockingIssues[0].StageID != "html" {
+		t.Fatalf("restarted Teacher FAIL = %+v %v", teacher, err)
+	}
+	savedDigest := teacher.TeacherExplanation.SourceDigest
+	restarted := usecase.Runtime{Repository: NewRepository(db)}
+	teacher, err = restarted.TeacherValidation(ctx, instance.ID, instance.StudentID)
+	if err != nil || teacher.TeacherExplanation.SourceDigest != savedDigest {
+		t.Fatal("Teacher source digest changed across runtime reconstruction")
+	}
+	loadedInstance, err := repository.GetInstance(ctx, instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedRun := durableFailure.ValidationRuns[1]
+	copied := *mutatedRun.SafeSummary
+	mutatedRun.SafeSummary = &copied
+	mutatedRun.SafeSummary.Stages = nil
+	if err := repository.CompleteValidation(ctx, durableFailure, mutatedRun, loadedInstance); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("terminal safe feedback mutation = %v, want conflict", err)
+	}
+	// A new submission keeps previous immutable history, but cannot inherit it.
+	newSubmission := t12CommitFeedbackFixture(t, repository, loadedInstance, 100)
+	newCurrent, err := repository.GetSubmission(ctx, instance.ID, newSubmission.ID)
+	if err != nil || newCurrent.PublicProjection().CurrentValidationSummary != nil {
+		t.Fatal("new submission inherited old feedback")
+	}
+	teacher, err = runtime.TeacherValidation(ctx, instance.ID, instance.StudentID)
+	if err != nil || teacher.Available {
+		t.Fatal("new submission inherited previous Teacher feedback")
+	}
+	validator.outcome = domain.OutcomePass
+	pending.SubmissionID, pending.RunID = newSubmission.ID, newSubmission.ValidationRuns[0].ID
+	if err := runtime.ProcessValidation(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	persistedPass, err := NewRepository(db).GetSubmission(ctx, instance.ID, newSubmission.ID)
+	if err != nil || persistedPass.PublicProjection().CurrentValidationSummary == nil || persistedPass.PublicProjection().CurrentValidationSummary.Outcome != domain.OutcomePass {
+		t.Fatalf("new PASS summary not durable: %+v %v", persistedPass, err)
+	}
+	historical, err := NewRepository(db).GetSubmission(ctx, instance.ID, submission.ID)
+	if err != nil || historical.PublicProjection().CurrentValidationSummary == nil || historical.PublicProjection().CurrentValidationSummary.Outcome != domain.OutcomeFail || historical.Snapshot != submission.Snapshot {
+		t.Fatal("new submission changed historical failure/snapshot")
+	}
+	if _, err := NewRepository(db).GetInstance(ctx, testUUID(999), instance.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("foreign owner read = %v", err)
+	}
+}
+
+func t12CommitFeedbackFixture(t *testing.T, repository *Repository, instance domain.TaskInstance, base int) domain.Submission {
+	t.Helper()
+	ctx := context.Background()
+	intent := fixtureIntent(instance)
+	intent.IdempotencyKey, intent.SubmissionID, intent.ValidationRunID = testUUID(base), testUUID(base+1), testUUID(base+2)
+	intent.Scope, intent.MilestoneID = "MILESTONE", instance.Steps[0].ID
+	stored, _, err := repository.CreateOrLoadIntent(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.Status, stored.WriteLockID, stored.FenceEpoch = "LOCKED", "t12-synthetic-lock", 7
+	if err := repository.SaveIntent(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Snapshot = domain.SnapshotRef{SandboxID: instance.WorkspaceBinding.SandboxID, SnapshotID: "t12-snapshot-" + testUUID(base), GenerationID: "t12-generation-" + testUUID(base), WorkspaceDigest: "sha256:" + strings.Repeat("e", 64)}
+	stored.Status = "FROZEN"
+	if err := repository.SaveIntent(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.ValidationRun{ID: stored.ValidationRunID, Status: domain.ValidationRunPending}
+	submission := fixtureSubmission(instance, stored, run)
+	submission.MilestoneID = intent.MilestoneID
+	stored.Status = "COMMITTED"
+	if err := repository.CommitIntent(ctx, stored, submission, run); err != nil {
+		t.Fatal(err)
+	}
+	return submission
+}
+
+type t12FeedbackValidator struct{ outcome domain.ValidationOutcome }
+
+func (validator *t12FeedbackValidator) ValidateOfficialSubmission(_ context.Context, input ports.OfficialValidationRequest) (domain.ValidationResult, error) {
+	if validator.outcome == domain.OutcomeError {
+		return domain.ValidationResult{}, context.DeadlineExceeded
+	}
+	result := domain.ValidationResult{TaskInstanceID: input.TaskInstanceID, SubmissionID: input.SubmissionID, ValidationRunID: input.ValidationRunID, RevisionDigest: input.RevisionDigest, ValidationContractDigest: input.ValidationContractDigest, Snapshot: input.Snapshot, Outcome: validator.outcome}
+	stage := domain.ValidationStage{StageID: "html", Required: true, Outcome: string(validator.outcome)}
+	if validator.outcome == domain.OutcomeFail {
+		stage.Issues = []domain.ValidationIssue{{Code: "MISSING_ELEMENT", Message: "PRIVATE_EVALUATION_CANARY /private/solution.html"}}
+	}
+	result.Stages = []domain.ValidationStage{stage}
+	return result, nil
+}
+
+type t12FeedbackWorkspace struct{ ports.WorkspacePort }
+
+func (t12FeedbackWorkspace) UnlockWrites(_ context.Context, input ports.UnlockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	return ports.WorkspaceWriteLock{LockID: input.LockID, FenceEpoch: 8}, nil
+}

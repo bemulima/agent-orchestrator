@@ -1,0 +1,303 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+// The existing Client must expose the registered coherent Student boundary;
+// several independent legacy reads cannot implement the Hybrid snapshot port.
+func TestT20CoherentSnapshotClientBoundaryExists(t *testing.T) {
+	if _, ok := reflect.TypeOf(Client{}).MethodByName("GetHybridPlanningSnapshot"); !ok {
+		t.Fatal("Student client has no exact-path coherent Hybrid snapshot boundary")
+	}
+}
+
+type hybridRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f hybridRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func hybridSnapshotFixture(t *testing.T) (domain.HybridPlanningSnapshot, domain.HybridSnapshotRequest) {
+	t.Helper()
+	sid, pid, cid, iid, lid := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"
+	target := domain.HybridTargetRef{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}
+	request := domain.HybridSnapshotRequest{Targets: []domain.HybridTargetRef{target}, TriggerContext: domain.HybridSnapshotTrigger{Kind: "objective_evidence", Reason: "committed owner state"}}
+	signal := domain.HybridSnapshotSignal{Status: "DERIVED_BY_PLANNER", ReasonCode: "PLANNER_POLICY_HYBRID_V1"}
+	s := domain.HybridPlanningSnapshot{Schema: domain.HybridSnapshotSchema, StudentID: sid, LearningPathID: pid, CapturedAt: time.Date(2026, 10, 5, 1, 2, 3, 0, time.UTC), RequestedTargets: request.Targets, TriggerContext: request.TriggerContext,
+		Profile: domain.HybridSnapshotProfile{ProfileVersion: domain.StudentPlanningProfileVersion, OwnerVersion: 1, DirectionCode: "backend", SelfAssessedExperience: "beginner", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 120, PreferredPace: "normal"},
+		Path:    domain.HybridSnapshotPath{ID: pid, CourseID: cid, GoalCode: "go.backend", CourseFingerprint: "fixture-course-fingerprint", PolicyVersion: "student-learning-path-v1", PlannerPolicyVersion: domain.PlannerVersion, Status: "ACTIVE", Version: 1, JourneyVersion: 1, Items: []domain.HybridSnapshotItem{{ID: iid, ReferenceType: "lesson", ReferenceID: lid, Position: 0, Status: domain.LearningPathItemPlanned, Targets: []domain.HybridTargetRef{target}, FrozenRequirements: []domain.HybridLessonRequirement{}}}},
+		Mastery: []domain.HybridSnapshotMastery{{Target: target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion}}, Evidence: []domain.HybridEvidenceReference{}, ActivityFacts: []domain.HybridSnapshotActivityFact{}, CourseBindings: []domain.HybridCourseActionBinding{}, PracticeBindings: []domain.HybridPracticeBinding{}, Availability: domain.HybridSnapshotAvailability{EvidenceQuality: signal, Stability: signal, RuntimeHold: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "RUNTIME_HOLD_NOT_OBSERVED"}, AutomaticAdaptation: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "AUTOMATIC_ADAPTATION_NOT_DEFINED"}, StudentPinning: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "STUDENT_PINNING_NOT_DEFINED"}},
+	}
+	var err error
+	s.References, err = domain.HybridSnapshotReferencesFor(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, request
+}
+
+func TestHybridSnapshotClientUsesExactOwnerContourAndPreservesReadOnlyWire(t *testing.T) {
+	snapshot, input := hybridSnapshotFixture(t)
+	raw, _ := json.Marshal(snapshot)
+	calls := 0
+	client := Client{BaseURL: "http://student-owner", ReadToken: "general-read-denied", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+		calls++
+		expected := "/internal/v1/students/" + snapshot.StudentID + "/learning-paths/" + snapshot.LearningPathID + "/planning-snapshot"
+		if r.Method != http.MethodPost || r.URL.Path != expected || r.Header.Get("X-Internal-Token") != "planner-only" || r.Header.Get("Idempotency-Key") != "" {
+			t.Fatalf("wrong owner boundary: %s %s headers=%v", r.Method, r.URL.Path, r.Header)
+		}
+		var got domain.HybridSnapshotRequest
+		if json.NewDecoder(r.Body).Decode(&got) != nil || !reflect.DeepEqual(got, input) {
+			t.Fatal("snapshot input changed")
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+	})}}
+	got, err := client.GetHybridPlanningSnapshot(context.Background(), snapshot.StudentID, snapshot.LearningPathID, input)
+	if err != nil || !reflect.DeepEqual(got, snapshot) || calls != 1 {
+		t.Fatalf("snapshot=%+v calls=%d err=%v", got, calls, err)
+	}
+}
+
+func TestHybridSnapshotClientRejectsMalformedOrUnavailableRequiredOwnerState(t *testing.T) {
+	base, input := hybridSnapshotFixture(t)
+	for _, tc := range []struct {
+		name        string
+		mutate      func(*domain.HybridPlanningSnapshot)
+		rewrite     func(string) string
+		contentType string
+		status      int
+		expected    error
+	}{
+		{name: "schema", mutate: func(s *domain.HybridPlanningSnapshot) { s.Schema = "wrong" }, expected: domain.ErrUpstreamInvalid},
+		{name: "ownership", mutate: func(s *domain.HybridPlanningSnapshot) { s.StudentID = "66666666-6666-4666-8666-666666666666" }, expected: domain.ErrUpstreamInvalid},
+		{name: "missing mastery", mutate: func(s *domain.HybridPlanningSnapshot) { s.Mastery = nil }, expected: domain.ErrUpstreamInvalid},
+		{name: "hash tamper", mutate: func(s *domain.HybridPlanningSnapshot) { s.Path.Version++ }, expected: domain.ErrUpstreamInvalid},
+		{name: "quality unavailable", mutate: func(s *domain.HybridPlanningSnapshot) { s.Availability.EvidenceQuality.Status = "UNAVAILABLE" }, expected: domain.ErrUpstreamInvalid},
+		{name: "raw body", rewrite: func(raw string) string {
+			return strings.Replace(raw, `"evidence":[]`, `"evidence":[],"source_code":"private"`, 1)
+		}, expected: domain.ErrUpstreamInvalid},
+		{name: "duplicate key", rewrite: func(raw string) string { return strings.Replace(raw, `"schema":`, `"schema":"wrong","schema":`, 1) }, expected: domain.ErrUpstreamInvalid},
+		{name: "casing", rewrite: func(raw string) string { return strings.Replace(raw, `"schema":`, `"Schema":`, 1) }, expected: domain.ErrUpstreamInvalid},
+		{name: "trailing value", rewrite: func(raw string) string { return raw + ` {}` }, expected: domain.ErrUpstreamInvalid},
+		{name: "media type", contentType: "text/plain", expected: domain.ErrUpstreamInvalid},
+		{name: "owner outage", status: 503, expected: domain.ErrUpstreamUnavailable},
+		{name: "owner conflict", status: 409, expected: domain.ErrConflict},
+		{name: "owner forbidden", status: 403, expected: domain.ErrForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base
+			if tc.mutate != nil {
+				tc.mutate(&s)
+			}
+			encoded, _ := json.Marshal(s)
+			raw := string(encoded)
+			if tc.rewrite != nil {
+				raw = tc.rewrite(raw)
+			}
+			ct := tc.contentType
+			if ct == "" {
+				ct = "application/json"
+			}
+			status := tc.status
+			if status == 0 {
+				status = 200
+			}
+			client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{ct}}, Body: io.NopCloser(strings.NewReader(raw))}, nil
+			})}}
+			if _, err := client.GetHybridPlanningSnapshot(context.Background(), base.StudentID, base.LearningPathID, input); !errors.Is(err, tc.expected) {
+				t.Fatalf("err=%v expected=%v", err, tc.expected)
+			}
+		})
+	}
+}
+
+func TestHybridSnapshotRequestRejectsBeforeIOAndPreservesLegacyIdentity(t *testing.T) {
+	s, input := hybridSnapshotFixture(t)
+	calls := 0
+	client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) { calls++; return nil, errors.New("must not call") })}}
+	input.Targets = nil
+	if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); !errors.Is(err, domain.ErrValidation) || calls != 0 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	input.Targets = []domain.HybridTargetRef{{Type: domain.TargetConcept, Key: "legacy.opaque", Version: ""}}
+	if _, err := domain.NormalizeHybridSnapshotRequest(input); err != nil {
+		t.Fatal("legacy exact empty version rejected")
+	}
+	input.Targets[0].Version = strings.Repeat("x", 128)
+	if _, err := domain.NormalizeHybridSnapshotRequest(input); err != nil {
+		t.Fatal("existing version envelope rejected")
+	}
+	input.Targets = append(input.Targets, input.Targets[0])
+	if _, err := domain.NormalizeHybridSnapshotRequest(input); err == nil {
+		t.Fatal("duplicate target accepted")
+	}
+}
+
+func TestHybridSnapshotRejectsDigestConsistentInvalidProvenanceAndProtectedBindings(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*domain.HybridPlanningSnapshot)
+	}{
+		{"invalid task UUID", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].TaskID = "task-a" }},
+		{"mismatched action", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].LearningActionID = s.LearningPathID }},
+		{"kind mismatch", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].Kind = "assisted_application" }},
+		{"zero hints with level", func(s *domain.HybridPlanningSnapshot) { v := 1; s.Evidence[0].MaxHintLevel = &v }},
+		{"negative hints", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].HintsUsed = -1 }},
+		{"unknown surface", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].SurfaceClassification = "invented" }},
+		{"unrequested target", func(s *domain.HybridPlanningSnapshot) { s.Evidence[0].Target.Key = "unrequested" }},
+		{"duplicate evidence", func(s *domain.HybridPlanningSnapshot) { s.Evidence = append(s.Evidence, s.Evidence[0]) }},
+		{"missing frozen requirement identity", func(s *domain.HybridPlanningSnapshot) {
+			s.Path.Items[0].LessonRevisionID = s.Path.Items[0].ReferenceID
+			s.Path.Items[0].FrozenRequirements = []domain.HybridLessonRequirement{{Type: "task_passed", Required: true}}
+		}},
+		{"unbound activity fact", func(s *domain.HybridPlanningSnapshot) {
+			s.ActivityFacts = []domain.HybridSnapshotActivityFact{{ItemID: s.Path.Items[0].ID, Type: "theory_acknowledged", FactID: s.StudentID, OccurredAt: s.CapturedAt}}
+		}},
+		{"invalid course binding", func(s *domain.HybridPlanningSnapshot) { s.CourseBindings = []domain.HybridCourseActionBinding{{}} }},
+		{"invalid practice lifecycle", func(s *domain.HybridPlanningSnapshot) {
+			s.PracticeBindings = []domain.HybridPracticeBinding{{LearningActionID: s.StudentID, TaskInstanceID: s.StudentID, TaskRevisionID: s.StudentID, TaskRevisionDigest: "sha256:" + strings.Repeat("a", 64), LearningPathID: s.LearningPathID, LifecycleStatus: "invented"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, input := hybridSnapshotFixture(t)
+			s.Evidence = []domain.HybridEvidenceReference{{SourceKind: "course_answer", EvidenceID: s.StudentID, LearningActionID: s.StudentID, TaskID: s.Path.Items[0].ReferenceID, Target: input.Targets[0], EvidenceClass: "application", Outcome: "passed", SupportContext: "independent", Kind: "independent_application", TeacherPolicyVersion: "teacher-support-v1", MasteryPolicyVersion: domain.StudentMasteryPolicyVersion, OccurredAt: s.CapturedAt}}
+			tc.mutate(&s)
+			s.References, _ = domain.HybridSnapshotReferencesFor(s)
+			raw, _ := json.Marshal(s)
+			client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+			})}}
+			if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); !errors.Is(err, domain.ErrUpstreamInvalid) {
+				t.Fatalf("digest-consistent invalid owner projection admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestHybridSnapshotRejectsNullOrMissingRequiredWireScalar(t *testing.T) {
+	for _, rewrite := range []func(string) string{
+		func(raw string) string { return strings.Replace(raw, `"position":0`, `"position":null`, 1) },
+		func(raw string) string { return strings.Replace(raw, `"position":0,`, "", 1) },
+		func(raw string) string { return strings.Replace(raw, `"mastery_score":0`, `"mastery_score":null`, 1) },
+	} {
+		s, input := hybridSnapshotFixture(t)
+		encoded, _ := json.Marshal(s)
+		raw := rewrite(string(encoded))
+		client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(raw))}, nil
+		})}}
+		if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); !errors.Is(err, domain.ErrUpstreamInvalid) {
+			t.Fatalf("null/missing scalar admitted: %v", err)
+		}
+	}
+}
+
+func TestHybridSnapshotAcceptsValidFrozenRequirementsAndOwnerBindings(t *testing.T) {
+	s, input := hybridSnapshotFixture(t)
+	item := &s.Path.Items[0]
+	ids := []string{"66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777", "88888888-8888-4888-8888-888888888888", "99999999-9999-4999-8999-999999999999"}
+	item.LessonRevisionID = ids[0]
+	item.FrozenRequirements = []domain.HybridLessonRequirement{
+		{ID: ids[1], ActivityID: ids[1], Type: "quiz_passed", Required: true, SourceReference: domain.HybridLessonSourceReference{ID: ids[2], RevisionID: ids[0]}, Satisfied: true},
+		{ID: ids[2], ActivityID: ids[2], Type: "practice_completed", SourceReference: domain.HybridLessonSourceReference{ID: ids[3], RevisionID: ids[3]}},
+	}
+	closed := s.CapturedAt.Add(time.Second)
+	s.CourseBindings = []domain.HybridCourseActionBinding{{LearningActionID: s.StudentID, AnswerID: ids[1], TaskID: ids[2], LearningPathItemID: item.ID, RequirementID: ids[1], LifecycleStatus: "CLOSED", AnswerStatus: 5, LearningTargets: input.Targets, OpenedAt: s.CapturedAt, ClosedAt: &closed}}
+	s.PracticeBindings = []domain.HybridPracticeBinding{{LearningActionID: ids[0], TaskInstanceID: ids[1], TaskRevisionID: ids[3], TaskRevisionDigest: "sha256:" + strings.Repeat("a", 64), LearningPathID: s.LearningPathID, LearningPathItemID: item.ID, RequirementID: ids[2], SurfaceClassification: "practice", LifecycleStatus: "OPEN", LearningTargets: input.Targets, LearningPathVersionReservation: 1, LearningPathPositionReservation: 0}}
+	s.ActivityFacts = []domain.HybridSnapshotActivityFact{{ItemID: item.ID, RequirementID: ids[1], Type: "quiz_passed", SourceID: ids[2], SourceRevisionID: ids[0], FactID: ids[1], OccurredAt: s.CapturedAt}}
+	s.Evidence = []domain.HybridEvidenceReference{{SourceKind: "course_answer", EvidenceID: s.StudentID, LearningActionID: s.StudentID, TaskID: ids[2], Target: input.Targets[0], EvidenceClass: "knowledge_check", Outcome: "passed", SupportContext: "independent", Kind: "independent_understanding", TeacherPolicyVersion: "teacher-support-v1", MasteryPolicyVersion: domain.StudentMasteryPolicyVersion, OccurredAt: closed}}
+	s.References, _ = domain.HybridSnapshotReferencesFor(s)
+	raw, _ := json.Marshal(s)
+	client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+	})}}
+	if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); err != nil {
+		t.Fatalf("valid frozen owner correlations rejected: %v", err)
+	}
+}
+
+func TestHybridSnapshotLegacyEmptyVersionKeepsStudentWireIdentity(t *testing.T) {
+	s, input := hybridSnapshotFixture(t)
+	input.Targets[0].Version = ""
+	s.RequestedTargets = input.Targets
+	s.Mastery[0].Target = input.Targets[0]
+	s.Path.Items[0].Targets = input.Targets
+	s.References, _ = domain.HybridSnapshotReferencesFor(s)
+	raw, _ := json.Marshal(s)
+	if strings.Contains(string(raw), `"version":""`) {
+		t.Fatal("legacy identity includes a key Student omits")
+	}
+	client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+	})}}
+	if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); err != nil {
+		t.Fatalf("exact legacy snapshot rejected: %v", err)
+	}
+}
+
+func TestHybridSnapshotOptionalIntentStrictWhitelist(t *testing.T) {
+	base, input := hybridSnapshotFixture(t)
+	base.PendingIntent = &domain.HybridLearningIntentProjection{IntentID: "66666666-6666-4666-8666-666666666666", StudentID: base.StudentID, LearningPathID: base.LearningPathID, ExpectedPathRevision: base.Path.Version, Kind: "CHANGE_GOAL", CreatedAt: base.CapturedAt, RequestedChange: domain.HybridRequestedChange{Scope: domain.HybridScopeIdentity{GoalCode: "go.advanced", DirectionCode: base.Profile.DirectionCode, DesiredStacks: []string{"go"}}, Mutations: []domain.HybridFutureMutation{}}}
+	base.References, _ = domain.HybridSnapshotReferencesFor(base)
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]any)
+		valid  bool
+	}{
+		{name: "accepted bound projection", valid: true},
+		{name: "explicit null", mutate: func(m map[string]any) { m["pending_intent"] = nil }},
+		{name: "required kind missing", mutate: func(m map[string]any) { delete(m["pending_intent"].(map[string]any), "kind") }},
+		{name: "private raw body", mutate: func(m map[string]any) { m["pending_intent"].(map[string]any)["raw_body"] = "private" }},
+		{name: "missing mutations", mutate: func(m map[string]any) {
+			delete(m["pending_intent"].(map[string]any)["requested_change"].(map[string]any), "mutations")
+		}},
+		{name: "null desired stacks", mutate: func(m map[string]any) {
+			m["pending_intent"].(map[string]any)["requested_change"].(map[string]any)["scope"].(map[string]any)["desired_stacks"] = nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(base)
+			var fields map[string]any
+			json.Unmarshal(raw, &fields)
+			if tc.mutate != nil {
+				tc.mutate(fields)
+			}
+			raw, _ = json.Marshal(fields)
+			client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+			})}}
+			got, err := client.GetHybridPlanningSnapshot(context.Background(), base.StudentID, base.LearningPathID, input)
+			if tc.valid {
+				if err != nil || !reflect.DeepEqual(got, base) {
+					t.Fatalf("bound whitelist %+v err=%v", got, err)
+				}
+			} else if !errors.Is(err, domain.ErrUpstreamInvalid) {
+				t.Fatalf("malformed projection accepted err=%v", err)
+			}
+		})
+	}
+	for _, mutate := range []func(*domain.HybridLearningIntentProjection){func(p *domain.HybridLearningIntentProjection) { p.ExpectedPathRevision++ }, func(p *domain.HybridLearningIntentProjection) { p.StudentID = "77777777-7777-4777-8777-777777777777" }, func(p *domain.HybridLearningIntentProjection) { p.Kind = "fabricated_consent" }} {
+		s := base
+		intent := *s.PendingIntent
+		mutate(&intent)
+		s.PendingIntent = &intent
+		s.References, _ = domain.HybridSnapshotReferencesFor(s)
+		raw, _ := json.Marshal(s)
+		client := Client{BaseURL: "http://student-owner", WriteToken: "planner-only", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+		})}}
+		if _, err := client.GetHybridPlanningSnapshot(context.Background(), s.StudentID, s.LearningPathID, input); !errors.Is(err, domain.ErrUpstreamInvalid) {
+			t.Fatal("digest-consistent unbound intent accepted")
+		}
+	}
+}

@@ -1,0 +1,189 @@
+package domain
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestProjectAuthoringFlowTransitionShapeAndPublicationBoundary(t *testing.T) {
+	flow := projectAuthoringFlowFixture(t)
+	if flow.Status != ProjectAuthoringProposed || flow.TZAuthoringJobID != "" || flow.Publication != nil {
+		t.Fatalf("unexpected proposed flow: %#v", flow)
+	}
+	encoded, err := json.Marshal(flow.AuthoringRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{flow.StudentID, flow.LearningPathID, "mastery", "profile", "sandbox"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("authoring request leaked %q: %s", forbidden, encoded)
+		}
+	}
+	now := flow.CreatedAt.Add(time.Minute)
+	flow.ConfirmationIdempotencyKey = "66666666-6666-4666-8666-666666666666"
+	flow.ConfirmationDigest, _ = ProjectConfirmationDigest(flow)
+	flow.ConfirmedAt = &now
+	flow.Status = ProjectAuthoringConfirmed
+	flow.Version++
+	flow.UpdatedAt = now
+	if _, err := NormalizeProjectAuthoringFlow(flow); err != nil {
+		t.Fatalf("confirmed: %v", err)
+	}
+	flow.Status = ProjectAuthoringAuthoring
+	flow.Version++
+	if _, err := NormalizeProjectAuthoringFlow(flow); err != nil {
+		t.Fatalf("authoring before TZ checkpoint: %v", err)
+	}
+	flow.TZAuthoringJobID = "77777777-7777-4777-8777-777777777777"
+	flow.TZJobStatus = TZAuthoringReady
+	flow.ReadyBlueprintDigest = digestOf("a")
+	flow.ReadyCandidateDigest = digestOf("b")
+	flow.ReadyContractDigest = digestOf("c")
+	flow.ReadyCapabilitiesDigest = digestOf("d")
+	flow.ReadyVerificationDigest = digestOf("e")
+	flow.ReadyAt = &now
+	flow.Status = ProjectAuthoringReady
+	flow.Version++
+	if _, err := NormalizeProjectAuthoringFlow(flow); err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	withoutExplicitPublish := flow
+	withoutExplicitPublish.Status = ProjectAuthoringPublished
+	if _, err := NormalizeProjectAuthoringFlow(withoutExplicitPublish); err == nil {
+		t.Fatal("READY became PUBLISHED without explicit publication receipt")
+	}
+	flow.PublicationIdempotencyKey = "88888888-8888-4888-8888-888888888888"
+	flow.PublicationRequestDigest, _ = ProjectPublicationRequestDigest(flow)
+	flow.PublicationRequestedAt = &now
+	receipt := ProjectPublicationReceiptV1{
+		Schema: TZPublicationResultSchemaV1, RevisionID: "99999999-9999-4999-8999-999999999999",
+		FamilyKey: "go-project", VariantKey: "default", RevisionNumber: 1,
+		BlueprintDigest: flow.ReadyBlueprintDigest, CandidateDigest: flow.ReadyCandidateDigest,
+		ContractDigest: flow.ReadyContractDigest, CapabilitiesDigest: flow.ReadyCapabilitiesDigest,
+		AuthoringJobID: flow.TZAuthoringJobID,
+	}
+	flow.Publication = &receipt
+	flow.PublicationReceiptDigest, _ = ProjectPublicationReceiptDigest(receipt)
+	flow.PublishedAt = &now
+	flow.Status = ProjectAuthoringPublished
+	flow.Version++
+	if _, err := NormalizeProjectAuthoringFlow(flow); err != nil {
+		t.Fatalf("published: %v", err)
+	}
+}
+
+func TestProjectAuthoringOwnerSnapshotRejectsStalePathAndCorruptImmutableInput(t *testing.T) {
+	flow := projectAuthoringFlowFixture(t)
+	profile, path := projectAuthoringOwnerFixture()
+	if err := ValidateProjectOwnerSnapshot(flow, profile, path); err != nil {
+		t.Fatalf("valid owner snapshot: %v", err)
+	}
+	path.PathVersion++
+	if err := ValidateProjectOwnerSnapshot(flow, profile, path); err == nil {
+		t.Fatal("changed path version was accepted")
+	}
+	corrupt := flow
+	corrupt.Input.Targets[0].Key = "go.changed"
+	if _, err := NormalizeProjectAuthoringFlow(corrupt); err == nil {
+		t.Fatal("changed immutable authoring input retained its digest")
+	}
+}
+
+func TestProjectAuthoringOwnerSnapshotRejectsChangedAuthoringProfileWithUnchangedPath(t *testing.T) {
+	flow := projectAuthoringFlowFixture(t)
+	profile, path := projectAuthoringOwnerFixture()
+
+	languageChanged := profile
+	languageChanged.PreferredLanguage = "en"
+	languageChanged.OnboardingVersion++
+	if err := ValidateProjectOwnerSnapshot(flow, languageChanged, path); err != ErrConflict {
+		t.Fatalf("changed authoring locale err=%v, want conflict", err)
+	}
+
+	stacksChanged := profile
+	stacksChanged.DesiredStacks = []string{"go", "postgresql"}
+	stacksChanged.OnboardingVersion++
+	if err := ValidateProjectOwnerSnapshot(flow, stacksChanged, path); err != ErrConflict {
+		t.Fatalf("changed desired stacks err=%v, want conflict", err)
+	}
+}
+
+func TestProjectAuthoringProfileDigestIsCanonicalAndBoundsTZStackCodes(t *testing.T) {
+	profile, path := projectAuthoringOwnerFixture()
+	profile.DesiredStacks = []string{" JavaScript ", "js", "Golang"}
+	flow, err := NewProjectAuthoringFlow(
+		"11111111-1111-4111-8111-111111111111", path.StudentID, path.LearningPathID,
+		"55555555-5555-4555-8555-555555555555", profile, path,
+		time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(flow.Input.Stacks, ",") != "go,javascript" {
+		t.Fatalf("canonical stacks=%v", flow.Input.Stacks)
+	}
+	replay := profile
+	replay.DesiredStacks = []string{"golang", "ecmascript"}
+	replayDigest, err := ProjectAuthoringProfileDigest(replay)
+	if err != nil || replayDigest != flow.AuthoringProfileDigest {
+		t.Fatalf("canonical replay digest=%q err=%v, want %q", replayDigest, err, flow.AuthoringProfileDigest)
+	}
+	unrelated := profile
+	unrelated.KnownStacks = []string{"rust"}
+	unrelated.WeeklyMinutes = 480
+	unrelated.PreferredPace = "intensive"
+	unrelatedDigest, err := ProjectAuthoringProfileDigest(unrelated)
+	if err != nil || unrelatedDigest != flow.AuthoringProfileDigest {
+		t.Fatalf("unrelated fields entered authoring digest=%q err=%v, want %q", unrelatedDigest, err, flow.AuthoringProfileDigest)
+	}
+	tooLong := profile
+	tooLong.DesiredStacks = []string{strings.Repeat("x", 65)}
+	if _, err := NewProjectAuthoringFlow(
+		"11111111-1111-4111-8111-111111111111", path.StudentID, path.LearningPathID,
+		"55555555-5555-4555-8555-555555555555", tooLong, path,
+		time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+	); err != ErrValidation {
+		t.Fatalf("65-byte TZ stack err=%v, want validation", err)
+	}
+}
+
+func projectAuthoringFlowFixture(t *testing.T) ProjectAuthoringFlow {
+	t.Helper()
+	profile, path := projectAuthoringOwnerFixture()
+	flow, err := NewProjectAuthoringFlow(
+		"11111111-1111-4111-8111-111111111111", path.StudentID, path.LearningPathID,
+		"55555555-5555-4555-8555-555555555555", profile, path,
+		time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return flow
+}
+
+func projectAuthoringOwnerFixture() (StudentPlanningProfile, LearningPathPlanningState) {
+	now := time.Date(2026, 9, 5, 11, 0, 0, 0, time.UTC)
+	studentID := "22222222-2222-4222-8222-222222222222"
+	pathID := "33333333-3333-4333-8333-333333333333"
+	courseID := "44444444-4444-4444-8444-444444444444"
+	profile := StudentPlanningProfile{
+		DirectionCode: "backend", SelfAssessedExperience: "junior", KnownStacks: []string{"sql"},
+		DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru",
+		WeeklyMinutes: 240, PreferredPace: "standard", ProfileVersion: StudentPlanningProfileVersion,
+		OnboardingVersion: 2, LearningPathVersion: 7, LearningPathCourseID: courseID,
+		LearningPathGoalCode: "go.backend", LearningPathRevision: "course-fingerprint-v1",
+	}
+	path := LearningPathPlanningState{
+		Schema: LearningPathPlanningStateSchema, StudentID: studentID, LearningPathID: pathID,
+		CourseID: courseID, GoalCode: "go.backend", CourseFingerprint: "course-fingerprint-v1",
+		Status: "ACTIVE", IsPrimary: true, IsSelected: true, PathVersion: 7, JourneyVersion: 9,
+		PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "initial",
+		Items:     []LearningPathItem{{ReferenceType: "lesson", ReferenceID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Position: 0, Status: LearningPathItemReady, Targets: []TargetRef{{Type: TargetCapability, Key: "go.http", Version: "v1"}}, ReasonCode: "first_current_gap"}},
+		UpdatedAt: now,
+	}
+	return profile, path
+}
+
+func digestOf(character string) string { return "sha256:" + strings.Repeat(character, 64) }

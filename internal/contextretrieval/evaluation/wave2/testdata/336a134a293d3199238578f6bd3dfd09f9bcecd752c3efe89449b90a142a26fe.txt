@@ -1,0 +1,146 @@
+package hybridreplan
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+// EvaluationProcessor has no Student application port. It persists a semantic
+// consequence; applying that consequence belongs to the later owner boundary.
+type EvaluationProcessor struct {
+	Consequences repository.HybridConsequences
+	Policies     repository.PolicyRepository
+	Graphs       repository.GoalGraphRepository
+	Clock        Clock
+	LeaseTTL     time.Duration
+	RetryDelay   time.Duration
+}
+
+func (p EvaluationProcessor) ProcessNext(ctx context.Context) (bool, error) {
+	if p.Consequences == nil || p.Policies == nil || p.Graphs == nil || p.Clock == nil || p.LeaseTTL <= 0 || p.RetryDelay <= 0 {
+		return false, domain.ErrValidation
+	}
+	work, claimed, err := p.Consequences.ClaimHybridConsequenceEvaluation(ctx, p.Clock.Now().UTC(), p.LeaseTTL)
+	if err != nil || !claimed {
+		return false, err
+	}
+	fail := func(cause error) (bool, error) {
+		return true, errors.Join(cause, p.Consequences.ReleaseHybridConsequenceEvaluation(ctx, work, p.Clock.Now().UTC().Add(p.RetryDelay)))
+	}
+	remaining := work.LeaseUntil.Sub(p.Clock.Now().UTC())
+	if remaining <= 0 {
+		return fail(domain.ErrConflict)
+	}
+	if remaining > p.LeaseTTL {
+		return fail(domain.ErrValidation)
+	}
+	workContext, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	leaseValid := func() error {
+		if err := workContext.Err(); err != nil {
+			return err
+		}
+		if !work.LeaseUntil.After(p.Clock.Now().UTC()) {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	job := work.Job
+	request := domain.HybridSnapshotRequest{Targets: job.Snapshot.RequestedTargets, TriggerContext: job.Snapshot.TriggerContext}
+	if strings.TrimSpace(job.ID) == "" || strings.TrimSpace(work.ClaimToken) == "" || job.PolicyVersion != domain.HybridReplanPolicyVersion || job.SnapshotRef != job.Snapshot.References.SnapshotRef || domain.ValidateHybridPlanningSnapshot(job.Snapshot, job.StudentID, job.LearningPathID, request) != nil {
+		return fail(domain.ErrValidation)
+	}
+	if err := leaseValid(); err != nil {
+		return fail(err)
+	}
+	if work.Inputs == nil {
+		policy, err := p.Policies.GetActivePolicyBundle(workContext)
+		if err != nil {
+			return fail(err)
+		}
+		if err := leaseValid(); err != nil {
+			return fail(err)
+		}
+		graph, err := p.Graphs.GetPublishedGoalGraph(workContext, job.Snapshot.Path.GoalCode)
+		var projection domain.HybridPrerequisiteGraph
+		if errors.Is(err, domain.ErrNotFound) {
+			projection = domain.HybridPrerequisiteGraph{GoalCode: job.Snapshot.Path.GoalCode, Targets: []domain.HybridPrerequisiteTarget{}}
+		} else if err != nil {
+			return fail(err)
+		} else {
+			projection, err = domain.ProjectHybridPrerequisiteGraph(graph)
+			if err != nil {
+				return fail(err)
+			}
+			if projection.GoalCode != job.Snapshot.Path.GoalCode {
+				return fail(domain.ErrUpstreamInvalid)
+			}
+		}
+		if err := leaseValid(); err != nil {
+			return fail(err)
+		}
+		pinned, err := p.Consequences.CheckpointHybridConsequenceInputs(workContext, work, policy, projection)
+		if err != nil {
+			return fail(err)
+		}
+		if pinned.Job.ID != job.ID || pinned.ClaimToken != work.ClaimToken || pinned.Inputs == nil {
+			return fail(domain.ErrUpstreamInvalid)
+		}
+		// The repository returns durable first-observation pins; do not evaluate
+		// against the temporary policy or graph values read above.
+		work.Inputs = pinned.Inputs
+	}
+	if err := leaseValid(); err != nil {
+		return fail(err)
+	}
+	consequence, err := domain.EvaluateHybridSnapshot(job.Snapshot, *work.Inputs)
+	if err != nil {
+		return fail(err)
+	}
+	if err := leaseValid(); err != nil {
+		return fail(err)
+	}
+	if _, err := p.Consequences.CompleteHybridConsequenceEvaluation(workContext, work, consequence); err != nil {
+		return fail(err)
+	}
+	return true, nil
+}
+
+type EvaluationWorker struct {
+	Processor    EvaluationProcessor
+	PollInterval time.Duration
+	Logger       *slog.Logger
+}
+
+func (w EvaluationWorker) Run(ctx context.Context) {
+	interval := w.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	logger := w.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		processed, err := w.Processor.ProcessNext(ctx)
+		if err != nil {
+			logger.ErrorContext(ctx, "hybrid planning consequence evaluation failed", "error", err)
+		}
+		if processed && err == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

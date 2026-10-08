@@ -1,0 +1,302 @@
+# HTTP contract
+
+Teacher-only `GET /internal/students/{studentID}/diagnostic-assessment-plans/{planID}/planning-state`
+returns `diagnostic-planning-state.v1`: exact plan ID, binding goal/direction,
+onboarding version, and optional request (`request_id`, `status`, optional
+`result_code`, `failure_code`, `learning_path_id`). No request omits the member.
+Exact owner is checked; foreign plans return 404, ambiguous/conflicting records
+409. Query/body are forbidden; responses are no-store. This GET creates no work.
+
+Diagnostic-linked Teacher INITIAL POST requires `Idempotency-Key=diagnostic_plan_id`.
+Replay retains one request identity. Only `FAILED/ATTEMPTS_EXHAUSTED` explicitly
+resumes that request. Other failures, COMPLETED and NO_GAP replay unchanged.
+
+Diagnostic initial allocation adds paired `expected_onboarding_version` and
+`expected_direction_code`. Student replays its existing request receipt first;
+fresh allocation locks and checks authoritative onboarding version/direction/goal.
+Its exact plain-text `409 diagnostic_context_stale` becomes permanent
+`DIAGNOSTIC_PLAN_INVALID`, whereas ambiguous transport retries the frozen body.
+
+## API authentication
+
+API routes trust gateway-provided `X-User-ID` and `X-User-Role`. Only `STUDENT` and `STUDENT_PRO` may create or read their planning requests. The service must not be exposed without the trusted gateway boundary.
+
+## Create Course plan
+
+`POST /api/learning-planner/v1/course-plans` requires a UUID `Idempotency-Key` header and body:
+
+```json
+{
+  "goal_code": "go.backend",
+  "desired_outcome": "Build a production Go HTTP API",
+  "requested_targets": [
+    {"type": "capability", "key": "go.http-service", "version": "v1"}
+  ],
+  "constraints": {
+    "language": "ru",
+    "weekly_minutes": 240,
+    "preferred_pace": "standard",
+    "deadline": "2026-12-01",
+    "project_context": "Optional bounded context"
+  },
+  "reason": "INITIAL"
+}
+```
+
+`desired_outcome` defaults to `goal_code` for the public Student route.
+Requested targets must exist in the published goal graph; Planner includes
+their complete transitive prerequisite closure. Callers cannot provide
+mastery. `INITIAL` must omit `learning_path_id`; Student allocates a new path
+later. `REPLAN` must provide an owned exact path UUID. The path participates in
+the idempotency request hash, so the same key cannot be retargeted. A stored
+`INITIAL` may expose its resolved path after allocation.
+
+It returns `202` for a new or still-running request, `200` for an idempotent replay of a terminal request, `409` when the same key is reused with a different body, and `422` for invalid input.
+
+## Read Course plan
+
+`GET /api/learning-planner/v1/course-plans/{requestID}` returns only a request owned by the authenticated Student. Responses expose request ID, goal, status, optional result code, optional `course_id`, optional resolved `learning_path_id`, reuse flag, attempts, and timestamps. They never expose normalized planning context, mastery detail, prompt data, or internal failure detail.
+
+## Exact competency resolution
+
+`POST /internal/learning-targets/resolve` requires the exact shared
+`X-Internal-Token` and a strict body:
+
+```json
+{
+  "schema": "learning-target-resolution-request.v1",
+  "targets": [
+    {"type": "capability", "key": "go.http-service", "version": "v1"}
+  ]
+}
+```
+
+It accepts 1–100 unique exact `(type, key, version)` references and returns
+`learning-target-resolution.v1` with `resolved` and `missing` arrays in request
+order. Resolution never aliases names, selects a latest version, or derives a
+competency from generated text. Unknown fields and malformed identities return
+`422`.
+
+`POST /internal/learning-targets/candidates` uses the same general internal
+token and accepts `learning-target-candidate-request.v1` with zero to sixteen
+normalized stack codes. It returns at most 200 canonical definitions and their
+prerequisite identities as `learning-target-candidates.v1`. An empty stack list
+returns the bounded catalog vocabulary. This is authoring discovery only: TZ
+Planner must still pass every selected identity through exact resolution.
+
+## Teacher delegation and private health
+
+`POST /internal/students/{studentID}/course-plans` requires the exact dedicated
+`TEACHER_SERVICE_INTERNAL_TOKEN`, a UUID `Idempotency-Key`, and the same planning
+intent fields. Bounded `audit_refs` are optional; `source_message_id` requires
+its owning `dialog_id`. It records `source=TEACHER` and returns the same
+asynchronous status shape. The general internal token is not accepted on this
+route.
+
+`POST /internal/students/{studentID}/learning-readiness` uses the same exact
+dedicated Teacher token and is separately gated by
+`PLANNER_GRAPH_READINESS_ENABLED`, which defaults to `false`. The strict body
+is capped at 16 KiB:
+
+```json
+{
+  "schema": "learning-readiness-request.v1",
+  "expected_state_ref": {"kind": "accepted_draft", "version": 4}
+}
+```
+
+`expected_state_ref` is optional; when supplied it must exactly match the
+Student snapshot or the request returns `409`. The endpoint accepts no profile,
+goal, graph, stack, language, mastery, or content input. It requires no
+idempotency key, performs no write, and returns `Cache-Control: no-store`.
+
+Planner reads Student
+`GET /internal/students/{studentID}/planning-readiness` under the general read
+token and strictly validates `student-planning-readiness-snapshot.v1`. The
+result is exact `learning-readiness.v1` with `READY`, `NOT_READY`, or
+`NEEDS_CLARIFICATION`, closed reason codes, resolver and Student state
+versions, `readiness_scope=PUBLISHED_GRAPH_RESOLUTION`, `executable=false`, and
+`content_status=NOT_CREATED`. A `READY` result contains only the exact
+published `{code,version,graph_version}`; it never contains a prospective
+Course, Learning Path, or Lesson identity. An existing active Student path
+wins and is returned unchanged as an observational
+`NOT_READY/ACTIVE_PATH_EXISTS` reference.
+
+### Durable onboarding plan handoff v1
+
+`POST /internal/students/{studentID}/onboarding-plan-handoffs` requires the
+new dedicated `TEACHER_ONBOARDING_HANDOFF_INTERNAL_TOKEN` and exactly one
+byte-canonical UUID `Idempotency-Key` (no whitespace); general, legacy
+Teacher, and Practice tokens are rejected.
+The request is strict JSON capped at 16 KiB:
+
+```json
+{
+  "schema": "teacher-onboarding-plan-handoff-request.v1",
+  "expected_state_ref": {"kind": "accepted_draft", "version": 4},
+  "dialog_id": "33333333-3333-4333-8333-333333333333",
+  "teacher_job_id": "44444444-4444-4444-8444-444444444444"
+}
+```
+
+Planner owns no supplied onboarding facts: it re-reads the authoritative
+Student readiness snapshot and accepts only an exact S6 `READY` result whose
+state ref matches. First acceptance returns `201`; an exact same-key/hash
+replay returns `200` with `replayed=true`. The strict response is
+`teacher-onboarding-plan-handoff.v1`:
+
+```json
+{
+  "schema": "teacher-onboarding-plan-handoff.v1",
+  "handoff_id": "66666666-6666-4666-8666-666666666666",
+  "status": "ACCEPTED",
+  "state_ref": {"kind": "accepted_draft", "version": 4},
+  "goal": {"code": "programming.foundation", "version": "v1", "graph_version": "programming-foundation-graph-v1"},
+  "execution_status": "NOT_STARTED",
+  "content_status": "NOT_CREATED",
+  "readiness_observed_at": "2026-09-11T00:00:00Z",
+  "replayed": false
+}
+```
+
+`PLANNER_ONBOARDING_HANDOFF_ENABLED=false` is the default. It permits only an
+exact durable replay and otherwise returns `503 capability_disabled` before a
+Student or graph read. Enabling it requires
+`PLANNER_GRAPH_READINESS_ENABLED=true`. `409` is `idempotency_conflict`,
+`state_changed`, or `active_path_exists`; non-ready/clarification outcomes are
+`422 not_ready`. Responses are `application/json` and `Cache-Control: no-store`.
+`readiness_observed_at` is the canonical UTC instant when Planner observed the
+authoritative readiness result; it is at or before the receipt creation time.
+`ACCEPTED` is a historical, non-executable admission at that observation point,
+not a reservation or proof that no active path exists now. S9 must re-read and
+atomically reserve Student state immediately before any effect. The receipt is
+not a planning job and never creates a Course, path, lesson, content, outbox
+event, or message.
+
+`GET /internal/health` requires the exact shared `X-Internal-Token` and reports process readiness only.
+
+## Practice learning route and lazy material
+
+The following routes require the exact dedicated
+`PRACTICE_TASK_SERVICE_INTERNAL_TOKEN`; the general and Teacher tokens are
+rejected.
+
+`POST /internal/practice-learning-routes` requires a task-instance UUID
+`Idempotency-Key` equal to `task_instance_id` and a strict
+`practice-learning-route-request.v1`. It accepts the Student identity, exact
+TaskRevision identity/digest, locale, and ordered Step learning requirements.
+It returns `201` for the first immutable resolution and `200` for a replay as
+`student-task-learning-snapshot.v1`. Reusing the task instance with a different
+normalized request returns `409`.
+
+`POST /internal/practice-learning-routes/{routeID}/steps/{stepID}/readiness-reconciliations`
+requires the same dedicated token, a canonical UUID `Idempotency-Key`, and a
+strict `practice-learning-readiness-reconcile.v1` body with exact TaskInstance,
+Student, revision/digest, route/digest, and step identities. Planner loads the
+immutable route by ID, reads the Student's current mastery through its Student
+adapter, and applies Planner's existing requirement policy. It returns a
+persisted `practice-learning-readiness-receipt.v1` with `READY` or `NOT_READY`,
+the learner-state digest, mastery-policy version, and observation time. A
+same-key/same-payload retry returns the original receipt; changed payload under
+the same key returns `409`. Wrong instance, revision, route, or digest is
+rejected before a readiness decision is persisted.
+
+`POST /internal/practice-learning-materials/{materialKey}/ensure` requires the
+material's deterministic UUID as `Idempotency-Key` and strict
+`practice-learning-material-ensure-request.v1` containing `route_id` and
+`route_digest`. It returns `practice-learning-material.v1` with the Course-owned
+`course_id`/`lesson_id`. A key outside that frozen route is rejected.
+
+## Downstream private contracts
+
+Planner currently expects:
+
+- Student `GET /internal/students/{studentID}/learner-overview`;
+- Student `GET /internal/students/{studentID}/planning-readiness`;
+- Student `POST /internal/students/{studentID}/mastery/query`;
+- Student `PUT /internal/students/{studentID}/courses/{courseID}/assignment`;
+- Student `PUT /internal/students/{studentID}/learning-path` only for idempotent new-path allocation, with UUID `planning_request_id` and `Idempotency-Key`; Planner captures the returned path ID/version;
+- Student `GET /internal/students/{studentID}/learning-paths/{pathID}/planning-state` returning `student-learning-path-planning-state.v1`;
+- Student `PUT /internal/students/{studentID}/learning-paths/{pathID}` with strict `student-learning-path-replan.v1` and Student-owned reconciliation;
+- Student `PUT /internal/students/{studentID}/learning-paths/{pathID}/completion` with strict `student-learning-path-no-gap.v1`;
+- AI Prompt `POST /api/v1/prompts/execute-confidential` with exact template and response schema `course.lesson-content.v1`;
+- Course `POST /internal/generated-courses`, an atomic ensure command that reuses the exact fingerprint or creates it once.
+- Student `POST /internal/v1/students/{studentID}/diagnostic-assessments/{planID}/reserve` and `GET /internal/v1/students/{studentID}/diagnostic-assessments/{attemptID}/result`; both use the fixed shared `diagnostic-assessment-plan.v1` containing only the agreed bootstrap context fields in addition to the fixed plan.
+
+## Diagnostic bootstrap
+
+`POST /api/learning-planner/v1/diagnostic-assessment-plans` requires a canonical
+UUID `Idempotency-Key`, `application/json`, and the strict 16 KiB
+`diagnostic-assessment-bootstrap.v1` body. Its response is the no-store
+`diagnostic-assessment-bootstrap-result.v1` with only plan/attempt identity,
+revision, digest, onboarding version, and creation time. The actor is taken
+only from `RequireStudent`; Course, goal, direction, task, score, band, and
+placement fields are rejected. The former raw private issue route is not
+registered. Teacher's private aggregate-only placement routes remain unchanged.
+
+Teacher's private Course-plan command may include optional `diagnostic_plan_id`
+only for `INITIAL`. Planner validates immutable ownership, current onboarding,
+binding, and placement before normal planning; the ID is never returned in a
+Course-plan response, event, Course/Student payload, or path command.
+
+Practice materialization uses the same Course command with one complete active
+Lesson and fingerprint version `practice-material-fingerprint-v1`; route
+resolution itself makes no Course or AI call.
+
+Student reads use Student's general internal token. Student assignment/path
+writes use a separate dedicated Learning Planner token; one credential cannot
+be configured for both contours. Course writes use Course's dedicated Learning
+Planner token. A general internal or Teacher-facing token is rejected by write
+routes. Exact path identity is carried by the URL and is deliberately omitted
+from the strict replan/completion JSON body. Both commands use the planning
+request UUID as `planning_request_id` and `Idempotency-Key`, and return bounded
+`student-learning-path-command-result.v1`. Planner persists the immutable
+normalized body, expected path version, exact identities, and semantic hash
+before the PUT. After transport ambiguity it repeats that checkpoint without
+rereading path state. Its private planned outcome is not returned as
+`result_code`, `course_id`, or `reused` until Student success is confirmed. A
+delivered Student `409` is terminal
+`LEARNING_PATH_COMMAND_CONFLICT`, not retryable; malformed or cross-path
+receipts terminate as `LEARNING_PATH_COMMAND_INVALID_RESPONSE`.
+
+The generated Course document is limited to 16 MiB after JSON serialization.
+Planner rejects an oversized draft before calling Course. Worker claims are
+renewed before every bounded downstream generation/read/write operation, and
+`WORKER_LEASE_TTL` must exceed the downstream HTTP timeout.
+The owning Student and Course repositories contain the corresponding additive
+contracts, but their migrations and deployment configuration must be rolled out before this service.
+
+## Teacher project authoring flow
+
+These dedicated-Teacher routes are not public: create at
+`POST /internal/students/{studentID}/learning-paths/{pathID}/project-authoring-flows`,
+current recovery at `GET /internal/students/{studentID}/learning-paths/{pathID}/project-authoring-flows/current`,
+owner-scoped read at `GET /internal/students/{studentID}/project-authoring-flows/{flowID}`,
+and schema-only `POST .../{flowID}/confirm` and `POST .../{flowID}/publish`.
+Every command requires its own canonical UUID `Idempotency-Key` and strict
+`application/json`. Unknown ownership, Course, target, profile/mastery, runtime,
+Sandbox, or Start fields are rejected.
+
+Create derives the exact current path snapshot, authoring-profile version/digest,
+and bounded TZ v2 request from Student owner state. Confirmation makes the durable flow worker-eligible.
+Current recovery accepts no query or body, reloads that same current selected ACTIVE owner state, and returns only a non-FAILED flow with every frozen path/profile provenance field equal; it returns 404 when no such flow exists.
+Every create, current, get, confirm, and publish `project-authoring-flow.v1`
+response also contains required `locale`, the exact `en` or `ru` already frozen
+in the immutable validated `Input.Locale`; the response never recalculates it
+from a profile and never accepts it from the caller.
+Verified TZ READY output is submitted through `/stage`, returning STAGED and a private staging receipt. The publish command returns conflict until Practice acceptance and publication have an implemented proof contract. The safe response contains owner provenance, digests and staging receipt; authored content and private verifier data remain excluded.
+
+The dedicated TZ client disables redirects, caps request results, requires JSON,
+rejects unknown job/receipt fields, and verifies blueprint and verification
+receipt digests. A lost create is recovered by exact POST replay; a checkpointed
+404 is accepted only when that replay returns the identical TZ job UUID. No
+Planner port exists for Practice Start or Sandbox creation.
+
+Lesson assignment cutover adds `lesson_revision_id` to Course ensure lesson
+bindings and forwards it in Student allocation/replan items and onboarding
+materialization lessons. Student planning-state items additionally carry optional
+`learning_path_item_id`; Planner preserves exact existing assignment identities.
+Frozen requirements remain Student-owned and absent from Planner commands.
+
+
+Project authoring staging lifecycle: verified TZ READY candidates are submitted through `POST /internal/v1/authoring-jobs/{id}/stage`. Planner validates the exact `practice-task-staging-receipt.v1`, job identity, candidate/blueprint digests and verified artifact digests, then durably records `STAGED` and the immutable receipt. Staging creates no public revision. The existing Planner `/publish` command fails closed for generated, READY and STAGED candidates because Practice-owned acceptance and post-acceptance publication integration are deferred. Historical publication receipts remain readable; staging never writes a publication receipt or PUBLISHED.

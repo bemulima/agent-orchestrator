@@ -1,0 +1,281 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+// This is a synthetic completed-fact delivery fixture, not a full learner chain.
+// Repository transitions preserve normal atomic completion/outbox constraints;
+// Sandbox and validator bindings/results are explicitly synthetic fixtures.
+func t11EnqueueSyntheticCompletion(t *testing.T, repository *Repository, base int, studentID string, poison bool) ports.OutboxMessage {
+	t.Helper()
+	ctx := context.Background()
+	instance := fixtureInstance()
+	instance.ID, instance.StudentID = testUUID(base+1), studentID
+	created, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance = created
+	instance.Status = domain.TaskInstanceInProgress
+	instance.Provisioning = domain.ProvisioningReceipts{StudentReserved: true, RouteResolved: true, WorkspaceCreated: true, StudentOpened: true}
+	instance.LearningActionID = testUUID(base + 20)
+	instance.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: "synthetic-sandbox", Available: true}
+	instance, err = repository.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := fixtureIntent(instance)
+	intent.IdempotencyKey, intent.SubmissionID, intent.ValidationRunID = testUUID(base+10), testUUID(base+11), testUUID(base+12)
+	intent, _, err = repository.CreateOrLoadIntent(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.Status, intent.WriteLockID, intent.FenceEpoch = "LOCKED", "synthetic-lock", 1
+	if err := repository.SaveIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intent.Status = "FROZEN"
+	intent.Snapshot = domain.SnapshotRef{SandboxID: "synthetic-sandbox", SnapshotID: "synthetic-snapshot", GenerationID: "synthetic-generation", WorkspaceDigest: "sha256:" + strings.Repeat("e", 64)}
+	if err := repository.SaveIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.ValidationRun{ID: intent.ValidationRunID, Status: domain.ValidationRunPending}
+	submission := fixtureSubmission(instance, intent, run)
+	intent.Status = "COMMITTED"
+	if err := repository.CommitIntent(ctx, intent, submission, run); err != nil {
+		t.Fatal(err)
+	}
+	instance, err = repository.GetInstance(ctx, studentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repository.SetRunRunning(ctx, run.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	run.Status, run.Outcome, run.StartedAt, run.FinishedAt = domain.ValidationRunPassed, domain.OutcomePass, timePtr(now), timePtr(now)
+	submission.Status, submission.CompletedAt, submission.UpdatedAt = domain.SubmissionPassed, timePtr(now), now
+	submission.ValidationRuns = []domain.ValidationRun{run}
+	instance.Status = domain.TaskInstanceFinalizing
+	instance.Steps[0].Status = "PASSED"
+	instance.Progress = domain.Progress{PassedSteps: 1, TotalSteps: 1, Percentage: 100}
+	instance.FinalSubmissionID = submission.ID
+	if err := repository.CompleteValidation(ctx, submission, run, instance); err != nil {
+		t.Fatal(err)
+	}
+	instance.Status, instance.CompletedAt, instance.UpdatedAt = domain.TaskInstanceCompleted, timePtr(now), now
+	fields := map[string]any{
+		"schema": usecase.EvidenceSchemaV2, "evidence_id": submission.ID, "submission_id": submission.ID,
+		"student_id": studentID, "task_instance_id": instance.ID, "task_revision_id": instance.TaskRevisionID,
+		"task_revision_digest": instance.TaskRevisionDigest, "workspace_digest": submission.WorkspaceDigest,
+		"learning_action_id": instance.LearningActionID, "outcome": "passed", "assistance_policy_version": "practice-task-assistance-policy.v1",
+		"hints_used": 0, "teacher_assistance_used": false, "occurred_at": now, "policy_version": usecase.EvidencePolicyV2,
+		"evidence": []ports.TargetEvidence{{Target: domain.Target{Type: "concept", Key: "loops", Version: "v1"}, Correctness: 1, Independence: 1, Confidence: 1, StepIDs: []string{instance.Steps[0].ID}}},
+	}
+	if poison {
+		fields["schema"] = "explicit-poison-fixture"
+	}
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteInstanceAndEnqueueEvidence(ctx, instance, submission, payload); err != nil {
+		t.Fatal(err)
+	}
+	return ports.OutboxMessage{ID: submission.ID, SubmissionID: submission.ID, StudentID: studentID, Payload: payload}
+}
+
+type t11AcceptingEvidence struct{ calls []string }
+
+func (provider *t11AcceptingEvidence) ApplyPassedEvidence(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+	provider.calls = append(provider.calls, input.EvidenceID)
+	return ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: input.EvidenceID, LearningActionID: input.LearningActionID, Accepted: true, PolicyVersion: usecase.StudentReceiptPolicyV1}, nil
+}
+
+func TestT11PostgresOutboxRecoveryPreservesFIFOAndIndependentProgress(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	poison := t11EnqueueSyntheticCompletion(t, repository, 0x1000, testUUID(0x2000), true)
+	later := t11EnqueueSyntheticCompletion(t, repository, 0x1100, poison.StudentID, false)
+	other := t11EnqueueSyntheticCompletion(t, repository, 0x1200, testUUID(0x2100), false)
+	pending, err := repository.PendingEvidence(ctx, 10)
+	if err != nil || len(pending) != 2 || pending[0].ID != poison.ID || pending[0].StudentID != poison.StudentID || pending[1].ID != other.ID {
+		t.Fatalf("trusted student heads not selected: %+v err=%v", pending, err)
+	}
+	provider := &t11AcceptingEvidence{}
+	runtime := usecase.Runtime{Repository: repository, Evidence: provider}
+	count, err := runtime.DispatchEvidence(ctx, 10)
+	var summary *usecase.EvidenceDispatchError
+	if count != 1 || !errors.As(err, &summary) || len(summary.Failures) != 1 || summary.Failures[0].Code != ports.EvidenceFailurePayloadInvalid || len(provider.calls) != 1 || provider.calls[0] != other.ID {
+		t.Fatalf("recovery count=%d err=%v calls=%v", count, err, provider.calls)
+	}
+	// Reconstruct both process-local objects; durable scheduling still suppresses
+	// the poison, and its delayed head still prevents the student's later fact.
+	restarted := NewRepository(db)
+	pending, err = restarted.PendingEvidence(ctx, 1)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("delayed head overtaken after reconstruction: %+v %v", pending, err)
+	}
+	t11AssertFailure(t, db, poison.ID, 1, 2*time.Second, ports.EvidenceFailurePayloadInvalid)
+	t11AssertFact(t, db, poison, false)
+	t11AssertFact(t, db, later, false)
+	t11AssertFact(t, db, other, true)
+	for _, statement := range []string{
+		`UPDATE practice_student_evidence_outbox SET payload='{}'::json WHERE id=$1`,
+		`UPDATE practice_student_evidence_outbox SET submission_id='00000000-0000-4000-8000-000000001999' WHERE id=$1`,
+	} {
+		if _, err := db.ExecContext(ctx, statement, poison.ID); err == nil {
+			t.Fatal("immutable fact mutation accepted")
+		}
+	}
+	var completed int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM practice_task_instances WHERE status='COMPLETED'`).Scan(&completed); err != nil || completed != 3 {
+		t.Fatalf("delivery altered completion: %d %v", completed, err)
+	}
+}
+
+func TestT11PostgresLimitOneFairnessWithEligiblePoison(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	poison := t11EnqueueSyntheticCompletion(t, repository, 0x3000, testUUID(0x4000), true)
+	other := t11EnqueueSyntheticCompletion(t, repository, 0x3100, testUUID(0x4100), false)
+	provider := &t11AcceptingEvidence{}
+	runtime := usecase.Runtime{Repository: repository, Evidence: provider}
+	if count, err := runtime.DispatchEvidence(ctx, 1); count != 0 || err == nil {
+		t.Fatal("expected durable poison failure")
+	}
+	// Explicit technical-clock fixture makes the poison eligible again without
+	// touching identity/payload: attempt age must allow the untouched other head.
+	if _, err := db.ExecContext(ctx, `UPDATE practice_student_evidence_outbox SET next_attempt_at=CURRENT_TIMESTAMP-interval '1 second' WHERE id=$1`, poison.ID); err != nil {
+		t.Fatal(err)
+	}
+	restarted := usecase.Runtime{Repository: NewRepository(db), Evidence: provider}
+	if count, err := restarted.DispatchEvidence(ctx, 1); count != 1 || err != nil || len(provider.calls) != 1 || provider.calls[0] != other.ID {
+		t.Fatalf("eligible poison starved independent student: %d %v calls=%v", count, err, provider.calls)
+	}
+	if count, err := restarted.DispatchEvidence(ctx, 1); count != 0 || err == nil {
+		t.Fatal("poison was repaired or skipped permanently")
+	}
+	t11AssertFailure(t, db, poison.ID, 2, 4*time.Second, ports.EvidenceFailurePayloadInvalid)
+	t11AssertFact(t, db, poison, false)
+}
+
+func TestT11PostgresBoundedRetryAndLateFailure(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	fact := t11EnqueueSyntheticCompletion(t, repository, 0x5000, testUUID(0x6000), false)
+	at := time.Now().UTC()
+	for attempt := 1; attempt <= 20; attempt++ {
+		if err := repository.MarkEvidenceFailed(ctx, fact.ID, at, ports.EvidenceFailureProviderUnavailable); err != nil {
+			t.Fatal(err)
+		}
+		delay := 2 * time.Second
+		for i := 1; i < attempt && delay < 5*time.Minute; i++ {
+			delay *= 2
+		}
+		if delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+		t11AssertFailure(t, db, fact.ID, attempt, delay, ports.EvidenceFailureProviderUnavailable)
+	}
+	for _, code := range []string{"", "private provider response", "EVIDENCE_PERMANENT_SKIP"} {
+		if err := repository.MarkEvidenceFailed(ctx, fact.ID, at, code); !errors.Is(err, domain.ErrInvalid) {
+			t.Fatal("unsafe failure classification accepted")
+		}
+	}
+	if err := repository.MarkEvidenceFailed(ctx, testUUID(0x9999), at, ports.EvidenceFailureReceiptMismatch); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("missing failure fact accepted")
+	}
+	if err := repository.MarkEvidenceDelivered(ctx, fact.ID, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewRepository(db).MarkEvidenceFailed(ctx, fact.ID, at.Add(time.Hour), ports.EvidenceFailureDeliveryMarker); err != nil {
+		t.Fatal(err)
+	}
+	t11AssertFailure(t, db, fact.ID, 20, 5*time.Minute, ports.EvidenceFailureProviderUnavailable)
+	t11AssertFact(t, db, fact, true)
+	pending, err := repository.PendingEvidence(ctx, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatal("late failure revived delivered fact")
+	}
+}
+
+func TestT11PostgresRecoveryMigrationUpDownUpPreservesFacts(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	pending := t11EnqueueSyntheticCompletion(t, repository, 0x7000, testUUID(0x8000), true)
+	delivered := t11EnqueueSyntheticCompletion(t, repository, 0x7100, testUUID(0x8100), false)
+	now := time.Now().UTC()
+	if err := repository.MarkEvidenceFailed(ctx, pending.ID, now, ports.EvidenceFailurePayloadInvalid); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.MarkEvidenceDelivered(ctx, delivered.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, direction := range []string{"down", "up"} {
+		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "db", "migrations", "004_practice_evidence_delivery_recovery."+direction+".sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, string(migration)); err != nil {
+			t.Fatalf("actual 004 %s: %v", direction, err)
+		}
+		t11AssertFact(t, db, pending, false)
+		t11AssertFact(t, db, delivered, true)
+		var attempts int
+		if err := db.QueryRowContext(ctx, `SELECT attempts FROM practice_student_evidence_outbox WHERE id=$1`, pending.ID).Scan(&attempts); err != nil || attempts != 1 {
+			t.Fatal("rollback altered original attempts counter")
+		}
+	}
+	var metadata int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM practice_student_evidence_outbox WHERE last_attempt_at IS NOT NULL OR next_attempt_at IS NOT NULL OR last_failure_code IS NOT NULL`).Scan(&metadata); err != nil || metadata != 0 {
+		t.Fatal("rollback unexpectedly retained recovery metadata")
+	}
+	heads, err := NewRepository(db).PendingEvidence(ctx, 10)
+	if err != nil || len(heads) != 1 || heads[0].ID != pending.ID {
+		t.Fatalf("up/down/up recovery facts lost: %+v %v", heads, err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE practice_student_evidence_outbox SET payload='{}'::json WHERE id=$1`, pending.ID); err == nil {
+		t.Fatal("rollback removed immutable payload trigger")
+	}
+}
+
+func t11AssertFailure(t *testing.T, db *sql.DB, id string, attempts int, delay time.Duration, code string) {
+	t.Helper()
+	var gotAttempts int
+	var last, next time.Time
+	var gotCode string
+	if err := db.QueryRowContext(context.Background(), `SELECT attempts,last_attempt_at,next_attempt_at,last_failure_code FROM practice_student_evidence_outbox WHERE id=$1`, id).Scan(&gotAttempts, &last, &next, &gotCode); err != nil {
+		t.Fatal(err)
+	}
+	if gotAttempts != attempts || next.Sub(last) != delay || gotCode != code {
+		t.Fatalf("durable retry metadata attempts=%d delay=%s code=%s", gotAttempts, next.Sub(last), gotCode)
+	}
+}
+func t11AssertFact(t *testing.T, db *sql.DB, fact ports.OutboxMessage, delivered bool) {
+	t.Helper()
+	var id, submission string
+	var payload []byte
+	var acknowledged bool
+	if err := db.QueryRowContext(context.Background(), `SELECT id,submission_id,payload,delivered_at IS NOT NULL FROM practice_student_evidence_outbox WHERE id=$1`, fact.ID).Scan(&id, &submission, &payload, &acknowledged); err != nil {
+		t.Fatal(err)
+	}
+	if id != fact.ID || submission != fact.SubmissionID || string(payload) != string(fact.Payload) || acknowledged != delivered {
+		t.Fatal("immutable delivery fact or ACK changed")
+	}
+}

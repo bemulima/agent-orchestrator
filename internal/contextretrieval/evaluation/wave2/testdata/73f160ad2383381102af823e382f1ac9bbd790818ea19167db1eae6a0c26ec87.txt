@@ -1,0 +1,762 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	courseclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/course"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	diagnosticnats "github.com/bemulima/ms-go-learning-planner/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/diagnosticplan"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// This finite harness uses owner-registered Course/Student HTTP providers and
+// their actual PostgreSQL/scorer/outbox implementations. Root alone provisions
+// databases and the dedicated stream. No result, outbox or placement is seeded.
+// The only fixture write here is the exact rollout binding through its actual
+// append-only repository. No browser, Teacher recovery, planning worker or
+// Student path/mastery writer participates in the automatic placement phase.
+func TestT18ActualDiagnosticPlacement(t *testing.T) {
+	if os.Getenv("T18_ACTUAL_PLACEMENT") != "true" {
+		t.Skip("owned actual T18 placement gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("PLANNER_TEST_DATABASE_URL"))
+	if err != nil || (!infraAcceptanceDatabase(t, cfg, "planner") && (cfg.ConnConfig.Database != "remediation_t18_planner_test" || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998)) {
+		t.Fatal("SETUP: exact owned Planner database required")
+	}
+	var student struct {
+		URL               string `json:"url"`
+		StudentID         string `json:"student_id"`
+		GoalCode          string `json:"goal_code"`
+		DirectionCode     string `json:"direction_code"`
+		OnboardingVersion int64  `json:"onboarding_version"`
+	}
+	var course struct {
+		URL      string `json:"url"`
+		CourseID string `json:"course_id"`
+	}
+	t18ActualReadMetadata(t, "T18_STUDENT_READY_FILE", &student)
+	t18ActualReadMetadata(t, "T18_COURSE_READY_FILE", &course)
+	for _, address := range []string{student.URL, course.URL} {
+		u, parseErr := url.Parse(address)
+		if parseErr != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Path != "" {
+			t.Fatal("SETUP: owned loopback providers required")
+		}
+	}
+	broker, err := url.Parse(os.Getenv("T18_NATS_URL"))
+	if err != nil || (!infraAcceptanceNATS(t, os.Getenv("T18_NATS_URL")) && (broker.Scheme != "nats" || broker.Hostname() != "127.0.0.1" || broker.User != nil)) {
+		t.Fatal("SETUP: dedicated loopback broker required")
+	}
+	for _, names := range [][2]string{{"T18_STUDENT_TOKEN", "T18_STUDENT_PLANNER_TOKEN"}, {"T18_COURSE_TOKEN", "T18_COURSE_CATALOG_TOKEN"}} {
+		if os.Getenv(names[0]) == "" || os.Getenv(names[1]) == "" || os.Getenv(names[0]) == os.Getenv(names[1]) {
+			t.Fatal("SETUP: distinct owner credentials required")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal("SETUP: Planner pool unavailable")
+	}
+	defer pool.Close()
+	var database string
+	if pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database) != nil || database != cfg.ConnConfig.Database {
+		t.Fatal("SETUP: exact Planner database unavailable")
+	}
+	infraAcceptanceDatabaseIdentity(t, ctx, pool)
+	nc, err := natsgo.Connect(broker.String(), natsgo.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatal("SETUP: dedicated NATS unavailable")
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal("SETUP: actual JetStream unavailable")
+	}
+	stream, err := js.StreamInfo(diagnosticnats.DiagnosticResultStream, natsgo.Context(ctx))
+	if err != nil || len(stream.Config.Subjects) != 1 || stream.Config.Subjects[0] != domain.SubjectDiagnosticResultCommitted || stream.Config.Retention != natsgo.WorkQueuePolicy {
+		t.Fatal("SETUP: dedicated owned diagnostic stream required")
+	}
+	client := &http.Client{Timeout: 40 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	h := t18ActualHTTP{t: t, ctx: ctx, client: client, studentURL: student.URL, courseURL: course.URL, studentID: student.StudentID}
+	store := postgres.Store{Pool: pool}
+	clock := t18ActualClock{}
+	students := studentclient.Client{BaseURL: student.URL, ReadToken: os.Getenv("T18_STUDENT_TOKEN"), WriteToken: os.Getenv("T18_STUDENT_PLANNER_TOKEN"), HTTPClient: client}
+	courses := courseclient.Client{BaseURL: course.URL, InternalToken: os.Getenv("T18_COURSE_TOKEN"), DiagnosticCatalogToken: os.Getenv("T18_COURSE_CATALOG_TOKEN"), HTTPClient: client}
+	binding, bindingErr := store.GetLatestDiagnosticBootstrapBinding(ctx, student.GoalCode, student.DirectionCode)
+	if errors.Is(bindingErr, domain.ErrNotFound) {
+		binding = domain.DiagnosticBootstrapBinding{GoalCode: student.GoalCode, DirectionCode: student.DirectionCode, CourseID: course.CourseID, BindingRevision: 1, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, Active: true, CreatedAt: clock.Now()}
+		binding.BindingDigest, err = domain.DiagnosticBootstrapBindingDigest(binding)
+		if err != nil {
+			t.Fatal("binding digest failed")
+		}
+		binding, _, bindingErr = store.ProvisionDiagnosticBootstrapBinding(ctx, binding)
+	}
+	if bindingErr != nil || binding.CourseID != course.CourseID || !binding.Active {
+		t.Fatal("SETUP: exact rollout binding unavailable")
+	}
+	issuer := diagnosticplan.Issuer{Plans: store, Reservations: store, Placements: store, Students: students, Courses: courses, Clock: clock}
+	bootstrap := diagnosticplan.Bootstrap{Issuer: issuer, Plans: store, Receipts: store, Students: students, Clock: clock}
+	processor := diagnosticplan.PlacementConsumer{Plans: store, Placements: store, Students: students, Clock: clock}
+	// A prior failed harness may leave an actual committed owner result pending.
+	// Recover through the production durable before taking the repeat baseline;
+	// Issuer correctly requires the prior immutable placement for a retake.
+	startupRecoveredPending := false
+	contextDigest, digestErr := domain.DiagnosticBootstrapContextDigest(student.StudentID, student.OnboardingVersion, binding)
+	if digestErr != nil {
+		t.Fatal("bootstrap recovery context unavailable")
+	}
+	if latest, latestErr := store.GetLatest(ctx, student.StudentID, course.CourseID, contextDigest); latestErr == nil {
+		if _, placementErr := store.GetDiagnosticPlacement(ctx, latest.Plan.ID); errors.Is(placementErr, domain.ErrNotFound) {
+			result, readErr := students.GetDiagnosticAssessmentResult(ctx, student.StudentID, latest.Plan.ID)
+			if readErr != nil {
+				t.Fatalf("pending owner result recovery read failed: error_type=%T", readErr)
+			}
+			if domain.ValidateDiagnosticResult(result, latest.Plan) != nil {
+				t.Fatal("pending owner result recovery binding failed")
+			}
+			recovery, recoverErr := diagnosticnats.NewDiagnosticResultConsumer(ctx, broker.String(), processor)
+			if recoverErr != nil {
+				t.Fatal("pending actual consumer recovery constructor failed")
+			}
+			t18ActualEventually(t, 40*time.Second, func() bool {
+				placement, placementErr := processor.Get(ctx, student.StudentID, latest.Plan.ID)
+				return placementErr == nil && placement.ResultDigest == result.ResultDigest
+			}, "prior actual committed-result placement recovery")
+			t18ActualEventually(t, 10*time.Second, func() bool {
+				info, infoErr := js.ConsumerInfo(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable, natsgo.Context(ctx))
+				return infoErr == nil && info.NumAckPending == 0 && info.NumPending == 0
+			}, "prior actual pending deliveries settled")
+			recovery.Close()
+			startupRecoveredPending = true
+		} else if placementErr != nil {
+			t.Fatal("prior placement recovery read failed")
+		}
+	} else if !errors.Is(latestErr, domain.ErrNotFound) {
+		t.Fatal("prior frozen plan recovery read failed")
+	}
+	before := h.state()
+	baselinePlacements := t18ActualCount(t, ctx, pool, `SELECT count(*) FROM diagnostic_assessment_placement_decision WHERE student_id=$1`, student.StudentID)
+	assertNoLearning := func() {
+		state := h.state()
+		for _, key := range []string{"learning_actions", "learning_evidence", "target_mastery", "learning_paths", "course_assignments", "lesson_facts"} {
+			if state[key] != before[key] || state[key] != 0 {
+				t.Fatalf("unexpected Student fact in %s", key)
+			}
+		}
+		if t18ActualCount(t, ctx, pool, `SELECT count(*) FROM course_plan_request WHERE student_id=$1`, student.StudentID) != 0 || t18ActualCount(t, ctx, pool, `SELECT count(*) FROM planner_outbox WHERE student_id=$1`, student.StudentID) != 0 {
+			t.Fatal("placement implicitly created planning intent")
+		}
+	}
+	newPlan := func() domain.DiagnosticAssessmentPlan {
+		contextDigest, digestErr := domain.DiagnosticBootstrapContextDigest(student.StudentID, student.OnboardingVersion, binding)
+		if digestErr != nil {
+			t.Fatal("bootstrap context failed")
+		}
+		input := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: student.OnboardingVersion}
+		if latest, latestErr := store.GetLatest(ctx, student.StudentID, course.CourseID, contextDigest); latestErr == nil {
+			revision := latest.Plan.PlanRevision
+			input.ExpectedPreviousRevision = &revision
+		} else if !errors.Is(latestErr, domain.ErrNotFound) {
+			t.Fatal("latest plan unavailable")
+		}
+		key := uuid.NewString()
+		issued, created, issueErr := bootstrap.Start(ctx, student.StudentID, key, input)
+		if issueErr != nil || !created {
+			t.Fatalf("actual bootstrap/reservation failed: created=%t error_type=%T error=%v", created, issueErr, issueErr)
+		}
+		replayed, replayCreated, replayErr := bootstrap.Start(ctx, student.StudentID, key, input)
+		if replayErr != nil || replayCreated || replayed != issued {
+			t.Fatal("bootstrap receipt replay changed")
+		}
+		record, recordErr := store.GetDiagnosticByID(ctx, issued.PlanID)
+		if recordErr != nil || domain.ValidateDiagnosticPlanRecord(record) != nil {
+			t.Fatal("actual frozen plan missing")
+		}
+		return record.Plan
+	}
+
+	first := newPlan()
+	// Task DTOs deliberately omit Course identity, so the actual Student client
+	// requires the registered Course lesson read too. Verify the complete read
+	// composition before handing an otherwise unusable attempt to the browser.
+	var lessonProjection struct {
+		ID       string `json:"id"`
+		CourseID string `json:"course_id"`
+	}
+	h.request(http.MethodGet, course.URL+"/internal/lesson/get-internal-lesson/"+first.Assessments[0].LessonID, os.Getenv("T18_COURSE_TOKEN"), "", nil, http.StatusOK, &lessonProjection)
+	if lessonProjection.ID != first.Assessments[0].LessonID || lessonProjection.CourseID != first.CourseID {
+		t.Fatal("actual Course lesson identity read unavailable")
+	}
+	h.request(http.MethodGet, student.URL+"/api/v1/student/diagnostic-assessments/"+first.ID+"/tasks/"+first.Assessments[0].TaskID, "", "", nil, http.StatusOK, nil)
+	var firstResult domain.DiagnosticAssessmentResult
+	resultFile := os.Getenv("T18_ACTUAL_RESULT_FILE")
+	browserMode := os.Getenv("T18_BROWSER_COMPLETE") == "true"
+	_, markerErr := os.Stat(filepath.Join(filepath.Dir(resultFile), "green-browser-request"))
+	_, doneErr := os.Stat(filepath.Join(filepath.Dir(resultFile), "browser-done"))
+	browserMode = browserMode || (markerErr == nil && os.IsNotExist(doneErr))
+	if browserMode {
+		ready, done := os.Getenv("T18_BROWSER_READY_FILE"), os.Getenv("T18_BROWSER_DONE_FILE")
+		if ready == "" {
+			ready = filepath.Join(filepath.Dir(resultFile), "browser-ready.json")
+		}
+		if done == "" {
+			done = filepath.Join(filepath.Dir(resultFile), "browser-done")
+		}
+		if ready == "" || done == "" {
+			t.Fatal("SETUP: browser orchestration files required")
+		}
+		if _, statErr := os.Lstat(done); !os.IsNotExist(statErr) {
+			t.Fatal("SETUP: browser completion marker must be absent")
+		}
+		t18ActualWriteExclusive(t, ready, map[string]any{"student_url": student.URL, "student_id": student.StudentID, "course_id": course.CourseID, "plan_id": first.ID, "attempt_id": first.ID, "plan_revision": first.PlanRevision, "onboarding_version": student.OnboardingVersion, "plan_digest": first.PlanDigest})
+		t.Log("actual reserved attempt ready for mounted browser; waiting for root browser-close marker")
+		t18ActualEventually(t, 300*time.Second, func() bool { _, statErr := os.Stat(done); return statErr == nil }, "browser completion/close marker")
+		firstResult, err = students.GetDiagnosticAssessmentResult(ctx, student.StudentID, first.ID)
+		if err != nil {
+			t.Fatalf("mounted browser official result read failed: error_type=%T owner_not_found=%t owner_unavailable=%t", err, errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrUpstreamUnavailable))
+		}
+		if domain.ValidateDiagnosticResult(firstResult, first) != nil {
+			t.Fatal("mounted browser official result frozen-plan binding failed")
+		}
+	} else {
+		firstResult = h.complete(first)
+	}
+	if _, err = store.GetDiagnosticPlacement(ctx, first.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("placement appeared before consumer")
+	}
+	completed := h.state()
+	if completed["results"] != before["results"]+1 || completed["outbox"] != before["outbox"]+1 {
+		t.Fatal("actual HTTP completion did not commit one result and event")
+	}
+	// Reloads are reads only: they cannot trigger Planner or change Student facts.
+	for i := 0; i < 3; i++ {
+		h.request(http.MethodGet, student.URL+"/api/v1/student/diagnostic-assessments/"+first.ID, "", "", nil, http.StatusOK, nil)
+	}
+	if !reflect.DeepEqual(completed, h.state()) {
+		t.Fatal("read-only reload changed Student facts")
+	}
+	assertNoLearning()
+	// Exercise fresh frozen-plan rejection before publishing the legitimate
+	// owner event. MaxAckPending=1 intentionally prevents a queued new delivery
+	// from bypassing a legitimate NAK delivery; the oracle preserves that limit.
+	negative := domain.DiagnosticResultCommittedEvent{
+		EventID: domain.DiagnosticResultCommittedEventID(first.ID), EventType: domain.SubjectDiagnosticResultCommitted,
+		CorrelationID: first.ID, CausationID: uuid.NewString(), StudentID: first.StudentID,
+		OccurredAt: firstResult.CompletedAt, SchemaVersion: domain.DiagnosticResultCommittedSchemaV1,
+		Data: domain.DiagnosticResultCommittedData{PlanID: first.ID, PlanRevision: first.PlanRevision, PlanDigest: "sha256:" + strings.Repeat("0", 64), ResultDigest: firstResult.ResultDigest},
+	}
+	negativeAck, err := js.PublishMsg(t18ActualEventMessage(t, negative), natsgo.Context(ctx))
+	if err != nil {
+		t.Fatal("fresh frozen-plan mismatch publication failed")
+	}
+	negativeObserver := &t18ActualObserver{processor: processor}
+	negativeConsumer, err := diagnosticnats.NewDiagnosticResultConsumer(ctx, broker.String(), negativeObserver)
+	if err != nil {
+		t.Fatal("fresh mismatch actual consumer constructor failed")
+	}
+	t18ActualEventually(t, 10*time.Second, func() bool { return negativeObserver.rejected(first.ID) }, "fresh frozen-plan admission rejection")
+	// TERM stops redelivery; it is not a successful processing ACK and does not
+	// require raw WorkQueue message deletion. Observe actual durable settlement.
+	t18ActualEventually(t, 5*time.Second, func() bool {
+		info, infoErr := js.ConsumerInfo(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable, natsgo.Context(ctx))
+		return infoErr == nil && info.NumAckPending == 0 && info.NumPending == 0 && info.Delivered.Stream >= negativeAck.Sequence
+	}, "fresh mismatch broker TERM settlement")
+	negativeConsumer.Close()
+	freshTerminated := negativeObserver.rejected(first.ID)
+	if _, err = store.GetDiagnosticPlacement(ctx, first.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("fresh mismatched event created placement")
+	}
+	assertNoLearning()
+	// Cut the relay's perception of success only after the actual publisher has
+	// received a real JetStream PubACK. The immutable outbox remains pending,
+	// while the original broker delivery already exists without a consumer.
+	publicationBefore, err := js.StreamInfo(diagnosticnats.DiagnosticResultStream, natsgo.Context(ctx))
+	if err != nil {
+		t.Fatal("actual stream before publish cut unavailable")
+	}
+	h.request(http.MethodPost, student.URL+"/__t18/publish-cut", os.Getenv("T18_STUDENT_TOKEN"), "", map[string]bool{"enabled": true}, http.StatusNoContent, nil)
+	t18ActualEventually(t, 20*time.Second, func() bool {
+		var outcome struct {
+			Succeeded bool `json:"delivery_succeeded"`
+		}
+		status := h.request(http.MethodPost, student.URL+"/__t18/relay", os.Getenv("T18_STUDENT_TOKEN"), "", map[string]any{}, 0, &outcome)
+		state := h.state()
+		if state["actual_cut_used"] == before["actual_cut_used"] {
+			if status != http.StatusOK || !outcome.Succeeded {
+				t.Fatal("owner relay failed before actual own publication cut")
+			}
+			return false
+		}
+		if state["actual_cut_used"] != before["actual_cut_used"]+1 || status != http.StatusServiceUnavailable || outcome.Succeeded || state["published"] != before["published"] {
+			t.Fatal("actual PubACK ambiguity did not retain pending owner outbox")
+		}
+		return true
+	}, "actual successful publisher followed by lost relay acknowledgement")
+	publicationCut, err := js.StreamInfo(diagnosticnats.DiagnosticResultStream, natsgo.Context(ctx))
+	if err != nil {
+		t.Fatal("actual stream after publish cut unavailable")
+	}
+	var publishedMessage *natsgo.RawStreamMsg
+	for sequence := publicationBefore.State.LastSeq + 1; sequence <= publicationCut.State.LastSeq; sequence++ {
+		candidate, readErr := js.GetMsg(diagnosticnats.DiagnosticResultStream, sequence, natsgo.Context(ctx))
+		if readErr != nil {
+			t.Fatal("actual pending publication read failed")
+		}
+		if candidate.Header.Get("X-Correlation-ID") == first.ID {
+			if publishedMessage != nil {
+				t.Fatal("publish cut produced duplicate broker messages")
+			}
+			publishedMessage = candidate
+		}
+	}
+	if publishedMessage == nil {
+		t.Fatal("real publisher cut did not leave own broker message")
+	}
+	publicationEnvelope := natsgo.NewMsg(publishedMessage.Subject)
+	publicationEnvelope.Header, publicationEnvelope.Data = publishedMessage.Header, publishedMessage.Data
+	firstEvent, err := diagnosticnats.DecodeDiagnosticResultMessage(publicationEnvelope)
+	if err != nil || firstEvent.EventID != domain.DiagnosticResultCommittedEventID(first.ID) || publishedMessage.Header.Get(natsgo.MsgIdHdr) != firstEvent.EventID || firstEvent.Data.ResultDigest != firstResult.ResultDigest {
+		t.Fatal("actual publish ambiguity envelope identity mismatch")
+	}
+	h.relayUntil(before["published"] + 1)
+	publicationRetried, err := js.StreamInfo(diagnosticnats.DiagnosticResultStream, natsgo.Context(ctx))
+	if err != nil || publicationRetried.State.LastSeq != publicationCut.State.LastSeq || publicationRetried.State.Msgs != publicationCut.State.Msgs {
+		t.Fatal("publisher retry did not broker-deduplicate the stable event")
+	}
+	publicationWire, err := js.GetMsg(diagnosticnats.DiagnosticResultStream, publishedMessage.Sequence, natsgo.Context(ctx))
+	if err != nil || !bytes.Equal(publicationWire.Data, publishedMessage.Data) || !reflect.DeepEqual(publicationWire.Header, publishedMessage.Header) {
+		t.Fatal("publisher retry changed original broker wire")
+	}
+	stream, err = js.StreamInfo(diagnosticnats.DiagnosticResultStream, natsgo.Context(ctx))
+	if err != nil || stream.State.Msgs < 1 {
+		t.Fatal("actual committed event not pending in JetStream")
+	}
+	h.outage(true)
+	defer h.outage(false)
+	observed := &t18ActualObserver{processor: processor}
+	consumer, err := diagnosticnats.NewDiagnosticResultConsumer(ctx, broker.String(), observed)
+	if err != nil {
+		t.Fatal("actual consumer constructor failed")
+	}
+	t18ActualEventually(t, 15*time.Second, func() bool { return observed.has(first.ID, true, false) }, "transient owner failure/NAK")
+	consumer.Close()
+	if _, err = store.GetDiagnosticPlacement(ctx, first.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("Student outage created placement")
+	}
+	h.outage(false)
+	consumer, err = diagnosticnats.NewDiagnosticResultConsumer(ctx, broker.String(), observed)
+	if err != nil {
+		t.Fatal("actual consumer reconstruction failed")
+	}
+	t18ActualEventually(t, 20*time.Second, func() bool { return observed.has(first.ID, false, true) }, "automatic placement after consumer restart")
+	t18ActualAwaitACK(t, ctx, broker.String())
+	consumer.Close()
+	firstDecision, err := processor.Get(ctx, student.StudentID, first.ID)
+	if err != nil || firstDecision.ResultDigest != firstResult.ResultDigest {
+		t.Fatal("actual placement binding failed")
+	}
+	assertNoLearning()
+
+	// A new actual retake supplies the commit/lost-ACK fault. The manual driver
+	// uses the exact production decoder and processor; only ACK is withheld.
+	second := newPlan()
+	secondResult := h.complete(second)
+	h.relayUntil(before["published"] + 2)
+	sub, err := js.PullSubscribe(domain.SubjectDiagnosticResultCommitted, diagnosticnats.DiagnosticPlacementDurable, natsgo.Bind(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable), natsgo.ManualAck())
+	if err != nil {
+		t.Fatal("actual fixed durable binding failed")
+	}
+	message := t18ActualFetchOwn(t, ctx, sub, second.ID, processor)
+	metadata, err := message.Metadata()
+	if err != nil || metadata.Stream != diagnosticnats.DiagnosticResultStream || metadata.Consumer != diagnosticnats.DiagnosticPlacementDurable {
+		t.Fatal("actual delivery metadata mismatch")
+	}
+	event, err := diagnosticnats.DecodeDiagnosticResultMessage(message)
+	if err != nil || event.Data.ResultDigest != secondResult.ResultDigest {
+		t.Fatal("actual producer envelope/digest mismatch")
+	}
+	decision, created, err := processor.ProcessCommittedResult(ctx, event)
+	if err != nil || !created {
+		t.Fatal("actual consumer commit before lost ACK failed")
+	}
+	if err = sub.Unsubscribe(); err != nil {
+		t.Fatal("lost ACK subscription close failed")
+	}
+	nc.Close() // No ACK/NAK/TERM; server retains the actual delivery until AckWait.
+	h.outage(true)
+	replayObserver := &t18ActualObserver{processor: processor}
+	consumer, err = diagnosticnats.NewDiagnosticResultConsumer(ctx, broker.String(), replayObserver)
+	if err != nil {
+		t.Fatal("lost ACK consumer reconstruction failed")
+	}
+	t.Log("placement committed; ACK intentionally lost; awaiting natural fixed 30-second redelivery")
+	t18ActualEventually(t, 45*time.Second, func() bool { return replayObserver.has(second.ID, false, false) }, "natural redelivery committed receipt replay while Student unavailable")
+	t18ActualAwaitACK(t, ctx, broker.String())
+	consumer.Close()
+	replayedDecision, err := processor.Get(ctx, student.StudentID, second.ID)
+	if err != nil || replayedDecision != decision {
+		t.Fatal("lost ACK redelivery changed immutable placement")
+	}
+	h.outage(false)
+
+	// Force a wire duplicate without the broker deduplication header. Semantic
+	// dedupe must therefore come from the immutable PostgreSQL placement.
+	nc, err = natsgo.Connect(broker.String(), natsgo.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatal("dedicated broker reconnect failed")
+	}
+	defer nc.Close()
+	js, err = nc.JetStream()
+	if err != nil {
+		t.Fatal("JetStream reconnect failed")
+	}
+	sub, err = js.PullSubscribe(domain.SubjectDiagnosticResultCommitted, diagnosticnats.DiagnosticPlacementDurable, natsgo.Bind(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable), natsgo.ManualAck())
+	if err != nil {
+		t.Fatal("fixed durable rebind failed")
+	}
+	defer func() {
+		if closeErr := sub.Unsubscribe(); closeErr != nil && !errors.Is(closeErr, natsgo.ErrBadSubscription) {
+			t.Error("durable unsubscribe failed")
+		}
+	}()
+	duplicate := t18ActualEventMessage(t, event)
+	if _, err = js.PublishMsg(duplicate, natsgo.Context(ctx)); err != nil {
+		t.Fatal("duplicate publish failed")
+	}
+	duplicateDelivery := t18ActualFetchOwn(t, ctx, sub, second.ID, processor)
+	if err = diagnosticnats.HandleDiagnosticResultMessage(ctx, duplicateDelivery, processor); err != nil {
+		t.Fatal("duplicate delivery was not safely ACKed")
+	}
+	// Same event identity with a different result digest must TERM, not replay.
+	bad := event
+	bad.Data.ResultDigest = "sha256:" + strings.Repeat("0", 64)
+	if _, err = js.PublishMsg(t18ActualEventMessage(t, bad), natsgo.Context(ctx)); err != nil {
+		t.Fatal("mismatched reference test publish failed")
+	}
+	badDelivery := t18ActualFetchOwn(t, ctx, sub, second.ID, processor)
+	if !errors.Is(diagnosticnats.HandleDiagnosticResultMessage(ctx, badDelivery, processor), domain.ErrValidation) {
+		t.Fatal("payload mismatch not rejected")
+	}
+	malformed := t18ActualEventMessage(t, event)
+	malformed.Header.Add("X-Event-ID", event.EventID)
+	if _, err = js.PublishMsg(malformed, natsgo.Context(ctx)); err != nil {
+		t.Fatal("malformed header test publish failed")
+	}
+	badDelivery = t18ActualFetchOwn(t, ctx, sub, second.ID, processor)
+	if !errors.Is(diagnosticnats.HandleDiagnosticResultMessage(ctx, badDelivery, processor), domain.ErrValidation) {
+		t.Fatal("duplicate header not rejected")
+	}
+	finalDecision, err := processor.Get(ctx, student.StudentID, second.ID)
+	if err != nil || finalDecision != decision || t18ActualCount(t, ctx, pool, `SELECT count(*) FROM diagnostic_assessment_placement_decision WHERE student_id=$1`, student.StudentID) != baselinePlacements+2 {
+		t.Fatal("duplicate/invalid delivery changed placement facts")
+	}
+	final := h.state()
+	if final["attempts"] != before["attempts"]+2 || final["results"] != before["results"]+2 || final["submissions"] != before["submissions"]+int64(len(first.Assessments)+len(second.Assessments)) || final["outbox"] != before["outbox"]+2 || final["published"] != before["published"]+2 {
+		t.Fatal("delivery faults doubled Student completion facts")
+	}
+	for _, pair := range []struct {
+		plan   domain.DiagnosticAssessmentPlan
+		result domain.DiagnosticAssessmentResult
+	}{{first, firstResult}, {second, secondResult}} {
+		actual, readErr := students.GetDiagnosticAssessmentResult(ctx, student.StudentID, pair.plan.ID)
+		if readErr != nil || actual != pair.result {
+			t.Fatal("delivery/reload changed official Student result")
+		}
+	}
+	assertNoLearning()
+	t18ActualEventually(t, 5*time.Second, func() bool {
+		info, infoErr := js.ConsumerInfo(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable, natsgo.Context(ctx))
+		return infoErr == nil && info.NumAckPending == 0
+	}, "duplicate/invalid deliveries settled")
+	if resultFile == "" {
+		t.Fatal("SETUP: actual safe result path required")
+	}
+	t18ActualWriteExclusive(t, resultFile, map[string]any{"classification": "actual owner-registered HTTP/scorer/PostgreSQL/outbox/JetStream and Planner PostgreSQL placement; curated Course fixture; no authoring claim", "student_id": student.StudentID, "first_plan_id": first.ID, "second_plan_id": second.ID, "first_route": firstDecision.RouteCode, "second_route": decision.RouteCode, "first_decision_digest": firstDecision.DecisionDigest, "second_decision_digest": decision.DecisionDigest, "browser_completion": browserMode, "browser_recovery_participated": false, "automatic_consumer_after_outage_restart": true, "lost_ack_natural_redelivery": true, "durable_ack_wait_seconds": 30, "producer_publish_ack_ambiguity": true, "producer_publish_cut_delta": final["actual_cut_used"] - before["actual_cut_used"], "producer_event_id": firstEvent.EventID, "producer_message_sequence": publishedMessage.Sequence, "producer_retry_same_wire_and_broker_sequence": true, "fresh_frozen_plan_mismatch_terminated": freshTerminated, "valid_event_consumed_after_fresh_negative": true, "startup_recovered_prior_pending_result": startupRecoveredPending, "duplicate_acked": true, "payload_mismatch_terminated": true, "duplicate_header_terminated": true, "read_only_reload_unchanged": true, "official_results_unchanged": true, "before": before, "after": final, "placement_delta": 2, "course_plan_requests": 0, "implicit_student_learning_facts": 0})
+}
+
+type t18ActualClock struct{}
+
+func (t18ActualClock) Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+
+type t18ActualObservation struct {
+	planID          string
+	failed, created bool
+}
+type t18ActualObserver struct {
+	processor       diagnosticplan.PlacementConsumer
+	mu              sync.Mutex
+	calls           []t18ActualObservation
+	rejectedPlanIDs []string
+}
+
+func (o *t18ActualObserver) ProcessCommittedResult(ctx context.Context, event domain.DiagnosticResultCommittedEvent) (domain.DiagnosticPlacement, bool, error) {
+	decision, created, err := o.processor.ProcessCommittedResult(ctx, event)
+	o.mu.Lock()
+	if errors.Is(err, domain.ErrValidation) {
+		o.rejectedPlanIDs = append(o.rejectedPlanIDs, event.Data.PlanID)
+	}
+	// The outage witness must represent a retryable actual owner error, not a
+	// validation failure which the transport would permanently terminate.
+	if err == nil || errors.Is(err, domain.ErrUpstreamUnavailable) {
+		o.calls = append(o.calls, t18ActualObservation{event.Data.PlanID, errors.Is(err, domain.ErrUpstreamUnavailable), created})
+	}
+	o.mu.Unlock()
+	return decision, created, err
+}
+func (o *t18ActualObserver) has(planID string, failed, created bool) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, call := range o.calls {
+		if call == (t18ActualObservation{planID, failed, created}) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *t18ActualObserver) rejected(planID string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, rejectedID := range o.rejectedPlanIDs {
+		if rejectedID == planID {
+			return true
+		}
+	}
+	return false
+}
+
+type t18ActualHTTP struct {
+	t                                *testing.T
+	ctx                              context.Context
+	client                           *http.Client
+	studentURL, courseURL, studentID string
+}
+
+func (h t18ActualHTTP) request(method, address, token, key string, body any, status int, output any) int {
+	h.t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			h.t.Fatal("request encoding failed")
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(h.ctx, method, address, reader)
+	if err != nil {
+		h.t.Fatal("owner request construction failed")
+	}
+	req.Header.Set("X-User-ID", h.studentID)
+	req.Header.Set("X-User-Role", "STUDENT")
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("X-Internal-Token", token)
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	response, err := h.client.Do(req)
+	if err != nil {
+		h.t.Fatal("owner HTTP request failed")
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || (status != 0 && response.StatusCode != status) {
+		h.t.Fatalf("owner HTTP method %s expected status %d, got %d", method, status, response.StatusCode)
+	}
+	if output != nil && json.Unmarshal(raw, output) != nil {
+		h.t.Fatal("owner response decoding failed")
+	}
+	return response.StatusCode
+}
+func (h t18ActualHTTP) state() map[string]int64 {
+	var raw map[string]json.RawMessage
+	h.request(http.MethodGet, h.studentURL+"/__t18/state", os.Getenv("T18_STUDENT_TOKEN"), "", nil, http.StatusOK, &raw)
+	state := map[string]int64{}
+	for _, key := range []string{"attempts", "results", "submissions", "outbox", "published", "actual_cut_used", "learning_actions", "learning_evidence", "target_mastery", "learning_paths", "course_assignments", "lesson_facts"} {
+		var count int64
+		if json.Unmarshal(raw[key], &count) != nil {
+			h.t.Fatal("actual Student fact projection missing")
+		}
+		state[key] = count
+	}
+	return state
+}
+func (h t18ActualHTTP) outage(enabled bool) {
+	h.request(http.MethodPost, h.studentURL+"/__t18/outage", os.Getenv("T18_STUDENT_TOKEN"), "", map[string]bool{"enabled": enabled}, http.StatusNoContent, nil)
+}
+func (h t18ActualHTTP) relayUntil(published int64) {
+	t18ActualEventually(h.t, 20*time.Second, func() bool {
+		h.request(http.MethodPost, h.studentURL+"/__t18/relay", os.Getenv("T18_STUDENT_TOKEN"), "", map[string]any{}, http.StatusOK, nil)
+		return h.state()["published"] == published
+	}, "actual owner outbox publication")
+}
+func (h t18ActualHTTP) complete(plan domain.DiagnosticAssessmentPlan) domain.DiagnosticAssessmentResult {
+	for _, item := range plan.Assessments {
+		// Correctness stays inside this trusted test client. No answers/keys are
+		// returned as metadata, logged, copied to Planner, or put into events.
+		var task struct {
+			ID    string `json:"id"`
+			Tests []struct {
+				ID       string `json:"id"`
+				Kind     string `json:"kind"`
+				Variants []struct {
+					ID        string `json:"id"`
+					IsCorrect bool   `json:"is_correct"`
+				} `json:"variants"`
+			} `json:"tests"`
+		}
+		h.request(http.MethodGet, h.courseURL+"/internal/task/get-internal-task/"+item.TaskID, os.Getenv("T18_COURSE_TOKEN"), "", nil, http.StatusOK, &task)
+		if task.ID != item.TaskID || len(task.Tests) == 0 {
+			h.t.Fatal("actual trusted Course quiz missing")
+		}
+		answers := []map[string]string{}
+		for _, question := range task.Tests {
+			variantID := ""
+			for _, variant := range question.Variants {
+				if variant.IsCorrect {
+					if variantID != "" {
+						h.t.Fatal("curated single-choice fixture has ambiguous key")
+					}
+					variantID = variant.ID
+				}
+			}
+			if question.Kind != "single_choice" || variantID == "" {
+				h.t.Fatal("curated supported single-choice fixture required")
+			}
+			answers = append(answers, map[string]string{"test_id": question.ID, "variant_id": variantID})
+		}
+		h.request(http.MethodPost, h.studentURL+"/api/v1/student/diagnostic-assessments/"+plan.ID+"/tasks/"+item.TaskID+"/submit", "", uuid.NewString(), map[string]any{"answers": answers}, http.StatusOK, nil)
+	}
+	key := uuid.NewString()
+	var result, replay domain.DiagnosticAssessmentResult
+	address := h.studentURL + "/api/v1/student/diagnostic-assessments/" + plan.ID + "/complete"
+	h.request(http.MethodPost, address, "", key, map[string]any{}, http.StatusOK, &result)
+	h.request(http.MethodPost, address, "", key, map[string]any{}, http.StatusOK, &replay)
+	if replay != result || domain.ValidateDiagnosticResult(result, plan) != nil || result.Correct != len(plan.Assessments) {
+		h.t.Fatal("actual registered completion/scorer/replay failed")
+	}
+	return result
+}
+func t18ActualFetchOwn(t *testing.T, ctx context.Context, sub *natsgo.Subscription, planID string, processor diagnosticplan.PlacementConsumer) *natsgo.Msg {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		messages, err := sub.Fetch(1, natsgo.MaxWait(time.Second))
+		if errors.Is(err, natsgo.ErrTimeout) {
+			continue
+		}
+		if err != nil || len(messages) != 1 {
+			t.Fatal("actual durable fetch failed")
+		}
+		message := messages[0]
+		if message.Header.Get("X-Correlation-ID") == planID {
+			return message
+		}
+		_ = diagnosticnats.HandleDiagnosticResultMessage(ctx, message, processor)
+	}
+	t.Fatal("actual own result delivery unavailable")
+	return nil
+}
+func t18ActualEventMessage(t *testing.T, event domain.DiagnosticResultCommittedEvent) *natsgo.Msg {
+	t.Helper()
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal("safe event encoding failed")
+	}
+	message := natsgo.NewMsg(domain.SubjectDiagnosticResultCommitted)
+	message.Data = raw
+	message.Header.Set("X-Event-ID", event.EventID)
+	message.Header.Set("X-Correlation-ID", event.CorrelationID)
+	message.Header.Set("X-Causation-ID", event.CausationID)
+	message.Header.Set("X-Schema-Version", "1")
+	return message
+}
+func t18ActualCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query, studentID string) int64 {
+	t.Helper()
+	var count int64
+	if pool.QueryRow(ctx, query, studentID).Scan(&count) != nil {
+		t.Fatal("actual Planner fact read failed")
+	}
+	return count
+}
+func t18ActualEventually(t *testing.T, limit time.Duration, check func() bool, label string) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", label)
+}
+func t18ActualReadMetadata(t *testing.T, env string, output any) {
+	t.Helper()
+	raw, err := os.ReadFile(os.Getenv(env))
+	if err != nil || json.Unmarshal(raw, output) != nil {
+		t.Fatal("SETUP: safe owned provider metadata unavailable")
+	}
+}
+func t18ActualWriteExclusive(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal("safe evidence encoding failed")
+	}
+	file, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal("exclusive safe evidence creation failed")
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("safe evidence write failed")
+	}
+	if os.Link(path+".tmp", path) != nil || os.Remove(path+".tmp") != nil {
+		t.Fatal("exclusive atomic evidence publication failed")
+	}
+}
+
+// Observe broker settlement independently of the processing callback: success
+// in PostgreSQL must be followed by the actual durable ACK before shutdown.
+func t18ActualAwaitACK(t *testing.T, ctx context.Context, brokerURL string) {
+	t.Helper()
+	connection, err := natsgo.Connect(brokerURL, natsgo.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatal("ACK observer connection unavailable")
+	}
+	defer connection.Close()
+	js, err := connection.JetStream()
+	if err != nil {
+		t.Fatal("ACK observer JetStream unavailable")
+	}
+	t18ActualEventually(t, 5*time.Second, func() bool {
+		info, err := js.ConsumerInfo(diagnosticnats.DiagnosticResultStream, diagnosticnats.DiagnosticPlacementDurable, natsgo.Context(ctx))
+		return err == nil && info.NumAckPending == 0
+	}, "actual durable ACK after committed placement")
+}

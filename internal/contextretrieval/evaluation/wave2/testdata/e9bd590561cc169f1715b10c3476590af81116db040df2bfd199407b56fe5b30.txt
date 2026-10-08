@@ -1,0 +1,501 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (repository *Repository) CreateOrLoadIntent(ctx context.Context, intent domain.SubmitIntent) (domain.SubmitIntent, bool, error) {
+	if err := repository.ready(); err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	if err := validateIntent(intent); err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var studentID string
+	var status domain.TaskInstanceStatus
+	err = tx.QueryRowContext(ctx, `SELECT student_id,status FROM practice_task_instances WHERE id=$1 FOR UPDATE`, intent.TaskInstanceID).Scan(&studentID, &status)
+	if err != nil {
+		return domain.SubmitIntent{}, false, translateError(err)
+	}
+	if studentID != intent.StudentID {
+		return domain.SubmitIntent{}, false, domain.ErrNotFound
+	}
+	var existing domain.SubmitIntent
+	err = scanIntent(tx.QueryRowContext(ctx, `SELECT payload FROM practice_submit_intents WHERE task_instance_id=$1 AND idempotency_key=$2`, intent.TaskInstanceID, intent.IdempotencyKey), &existing)
+	if err == nil {
+		if !sameIntentCommand(existing, intent) {
+			return domain.SubmitIntent{}, false, domain.ErrIdempotency
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.SubmitIntent{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.SubmitIntent{}, false, err
+	}
+	if status != domain.TaskInstanceInProgress {
+		return domain.SubmitIntent{}, false, domain.ErrConflict
+	}
+	if !emptySnapshot(intent.Snapshot) || intent.WriteLockID != "" || intent.FenceEpoch != 0 {
+		return domain.SubmitIntent{}, false, domain.ErrInvalid
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM practice_submissions WHERE task_instance_id=$1 AND status IN ('VALIDATING','REVIEW_REQUIRED')`, intent.TaskInstanceID).Scan(&active); err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	if active != 0 {
+		return domain.SubmitIntent{}, false, domain.ErrConflict
+	}
+	intent.Status = "INTENT"
+	intent.UpdatedAt = intent.CreatedAt.UTC()
+	payload, err := json.Marshal(intent)
+	if err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_submit_intents
+    (task_instance_id,student_id,idempotency_key,command_digest,submission_id,validation_run_id,scope,milestone_id,
+     validation_contract_digest,validation_specification,status,snapshot,write_lock_id,fence_epoch,created_at,payload,updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13,$14,$15,$16::jsonb,$15)`,
+		intent.TaskInstanceID, intent.StudentID, intent.IdempotencyKey, intent.CommandDigest, intent.SubmissionID,
+		intent.ValidationRunID, intent.Scope, nullableUUID(intent.MilestoneID), intent.ValidationContractDigest,
+		intent.ValidationSpecification, intent.Status, nullableJSON(intent.Snapshot), nullableString(intent.WriteLockID),
+		intent.FenceEpoch, intent.CreatedAt.UTC(), payload)
+	if err != nil {
+		return domain.SubmitIntent{}, false, translateError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.SubmitIntent{}, false, err
+	}
+	return intent, true, nil
+}
+
+func validateIntent(intent domain.SubmitIntent) error {
+	if !domain.IsCanonicalUUID(intent.TaskInstanceID) || !domain.IsCanonicalUUID(intent.StudentID) ||
+		!domain.IsCanonicalUUID(intent.IdempotencyKey) || !domain.IsCanonicalUUID(intent.SubmissionID) ||
+		!domain.IsCanonicalUUID(intent.ValidationRunID) || intent.SubmissionID == intent.ValidationRunID ||
+		intent.Scope != "FINAL" && intent.Scope != "MILESTONE" ||
+		intent.Scope == "FINAL" && intent.MilestoneID != "" ||
+		intent.Scope == "MILESTONE" && !domain.IsCanonicalUUID(intent.MilestoneID) ||
+		!validDigest(intent.CommandDigest) || !validDigest(intent.ValidationContractDigest) ||
+		!json.Valid(intent.ValidationSpecification) || intent.CreatedAt.IsZero() {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
+func validDigest(value string) bool {
+	if len(value) != 71 || value[:7] != "sha256:" {
+		return false
+	}
+	for _, char := range value[7:] {
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func nullableJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func (repository *Repository) SaveIntent(ctx context.Context, intent domain.SubmitIntent) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM practice_submit_intents
+WHERE task_instance_id=$1 AND idempotency_key=$2 FOR UPDATE`, intent.TaskInstanceID, intent.IdempotencyKey).Scan(&raw)
+	if err != nil {
+		return translateError(err)
+	}
+	var current domain.SubmitIntent
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return fmt.Errorf("decode persisted SubmitIntent: %w", err)
+	}
+	if !sameIntentCommand(current, intent) || !validIntentAdvance(current, intent) {
+		return domain.ErrConflict
+	}
+	if current.Status == intent.Status && current.Snapshot == intent.Snapshot && current.WriteLockID == intent.WriteLockID && current.FenceEpoch == intent.FenceEpoch {
+		return tx.Commit()
+	}
+	intent.UpdatedAt = time.Now().UTC()
+	payload, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_submit_intents SET status=$3,snapshot=$4::jsonb,write_lock_id=$5,
+fence_epoch=$6,payload=$7::jsonb,updated_at=$8 WHERE task_instance_id=$1 AND idempotency_key=$2`,
+		intent.TaskInstanceID, intent.IdempotencyKey, intent.Status, nullableJSON(intent.Snapshot), nullableString(intent.WriteLockID), intent.FenceEpoch, payload, intent.UpdatedAt)
+	if err != nil {
+		return translateError(err)
+	}
+	return tx.Commit()
+}
+
+func validIntentAdvance(current, next domain.SubmitIntent) bool {
+	if current.TaskInstanceID != next.TaskInstanceID || current.StudentID != next.StudentID || current.IdempotencyKey != next.IdempotencyKey ||
+		current.CommandDigest != next.CommandDigest || current.SubmissionID != next.SubmissionID || current.ValidationRunID != next.ValidationRunID ||
+		current.Scope != next.Scope || current.MilestoneID != next.MilestoneID || current.ValidationContractDigest != next.ValidationContractDigest ||
+		!equalJSON(current.ValidationSpecification, next.ValidationSpecification) || next.FenceEpoch < current.FenceEpoch {
+		return false
+	}
+	if !emptySnapshot(current.Snapshot) && current.Snapshot != next.Snapshot {
+		return false
+	}
+	if emptySnapshot(current.Snapshot) && !emptySnapshot(next.Snapshot) && !(current.Status == "LOCKED" && next.Status == "FROZEN") {
+		return false
+	}
+	if current.WriteLockID != "" && current.WriteLockID != next.WriteLockID {
+		return false
+	}
+	if current.WriteLockID == "" && next.WriteLockID != "" && !(current.Status == "INTENT" && next.Status == "LOCKED" && next.FenceEpoch > 0) {
+		return false
+	}
+	if next.Status == "LOCKED" && (next.WriteLockID == "" || !emptySnapshot(next.Snapshot)) {
+		return false
+	}
+	if next.Status == "FROZEN" && (next.WriteLockID == "" || emptySnapshot(next.Snapshot)) {
+		return false
+	}
+	if current.Status != next.Status {
+		switch current.Status {
+		case "INTENT":
+			return next.Status == "LOCKED" || next.Status == "ABORTED"
+		case "LOCKED":
+			return next.Status == "FROZEN" || next.Status == "ABORTED"
+		case "FROZEN":
+			return next.Status == "COMMITTED" || next.Status == "ABORTED"
+		}
+	}
+	return current.Status == next.Status
+}
+
+func sameIntentCommand(left, right domain.SubmitIntent) bool {
+	return left.TaskInstanceID == right.TaskInstanceID && left.StudentID == right.StudentID &&
+		left.IdempotencyKey == right.IdempotencyKey && left.CommandDigest == right.CommandDigest &&
+		left.Scope == right.Scope && left.MilestoneID == right.MilestoneID &&
+		left.ValidationContractDigest == right.ValidationContractDigest && equalJSON(left.ValidationSpecification, right.ValidationSpecification)
+}
+
+func emptySnapshot(ref domain.SnapshotRef) bool {
+	return ref.SandboxID == "" && ref.SnapshotID == "" && ref.GenerationID == "" && ref.WorkspaceDigest == ""
+}
+
+func equalJSON(left, right json.RawMessage) bool {
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func scanIntent(row interface{ Scan(...any) error }, intent *domain.SubmitIntent) error {
+	var payload []byte
+	if err := row.Scan(&payload); err != nil {
+		return translateError(err)
+	}
+	if err := json.Unmarshal(payload, intent); err != nil {
+		return fmt.Errorf("decode persisted SubmitIntent: %w", err)
+	}
+	return nil
+}
+
+func (repository *Repository) GetIntent(ctx context.Context, taskInstanceID, idempotencyKey string) (domain.SubmitIntent, error) {
+	if err := repository.ready(); err != nil {
+		return domain.SubmitIntent{}, err
+	}
+	var intent domain.SubmitIntent
+	err := scanIntent(repository.db.QueryRowContext(ctx, `SELECT payload FROM practice_submit_intents WHERE task_instance_id=$1 AND idempotency_key=$2`, taskInstanceID, idempotencyKey), &intent)
+	return intent, err
+}
+
+func (repository *Repository) CommitIntent(ctx context.Context, intent domain.SubmitIntent, submission domain.Submission, run domain.ValidationRun) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var intentRaw []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM practice_submit_intents WHERE task_instance_id=$1 AND idempotency_key=$2 FOR UPDATE`, intent.TaskInstanceID, intent.IdempotencyKey).Scan(&intentRaw)
+	if err != nil {
+		return translateError(err)
+	}
+	var storedIntent domain.SubmitIntent
+	if err := json.Unmarshal(intentRaw, &storedIntent); err != nil {
+		return fmt.Errorf("decode persisted SubmitIntent: %w", err)
+	}
+	if !sameIntentCommand(storedIntent, intent) || storedIntent.SubmissionID != intent.SubmissionID ||
+		storedIntent.ValidationRunID != intent.ValidationRunID || storedIntent.Snapshot != intent.Snapshot ||
+		storedIntent.WriteLockID != intent.WriteLockID || storedIntent.FenceEpoch != intent.FenceEpoch || !intentSubmissionMatches(storedIntent, submission, run) {
+		return domain.ErrConflict
+	}
+	if storedIntent.Status == "COMMITTED" {
+		var storedRunID, storedWorkspaceDigest, storedRevisionDigest, storedContractDigest string
+		var storedSnapshot []byte
+		err := tx.QueryRowContext(ctx, `SELECT current_run_id,workspace_digest,revision_digest,validation_contract_digest,snapshot
+FROM practice_submissions WHERE task_instance_id=$1 AND id=$2`, intent.TaskInstanceID, intent.SubmissionID).Scan(
+			&storedRunID, &storedWorkspaceDigest, &storedRevisionDigest, &storedContractDigest, &storedSnapshot)
+		if err != nil {
+			return translateError(err)
+		}
+		var snapshot domain.SnapshotRef
+		if json.Unmarshal(storedSnapshot, &snapshot) != nil || storedRunID != run.ID || storedRunID != storedIntent.ValidationRunID ||
+			storedIntent.SubmissionID != intent.SubmissionID || snapshot != submission.Snapshot || storedWorkspaceDigest != submission.WorkspaceDigest ||
+			storedRevisionDigest != submission.RevisionDigest || storedContractDigest != submission.ValidationContractDigest {
+			return domain.ErrConflict
+		}
+		return tx.Commit()
+	}
+	if storedIntent.Status != "FROZEN" || emptySnapshot(storedIntent.Snapshot) || storedIntent.Snapshot != submission.Snapshot ||
+		submission.Status != domain.SubmissionValidating || run.Status != domain.ValidationRunPending || len(submission.ValidationRuns) != 1 || submission.ValidationRuns[0].ID != run.ID {
+		return domain.ErrConflict
+	}
+	instance, err := instanceForUpdate(ctx, tx, intent.TaskInstanceID)
+	if err != nil {
+		return err
+	}
+	if instance.StudentID != intent.StudentID || instance.Status != domain.TaskInstanceInProgress ||
+		submission.TaskInstanceID != instance.ID || submission.StudentID != instance.StudentID || submission.RevisionDigest != instance.TaskRevisionDigest ||
+		instance.WorkspaceBinding.SandboxID != submission.Snapshot.SandboxID ||
+		submission.WorkspaceDigest != submission.Snapshot.WorkspaceDigest || !equalJSON(submission.ValidationSpecification, intent.ValidationSpecification) ||
+		submission.ValidationContractDigest != intent.ValidationContractDigest || submission.IdempotencyKey != intent.IdempotencyKey || submission.CommandDigest != intent.CommandDigest ||
+		submission.Scope != intent.Scope || submission.MilestoneID != intent.MilestoneID {
+		return domain.ErrConflict
+	}
+	// IN_PROGRESS may retain the last terminal Submission for history/Teacher
+	// projection. Only an active official result blocks the next Submit.
+	if instance.CurrentSubmissionID != "" {
+		var previous domain.SubmissionStatus
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM practice_submissions WHERE task_instance_id=$1 AND id=$2`, instance.ID, instance.CurrentSubmissionID).Scan(&previous); err != nil {
+			return translateError(err)
+		}
+		if !terminalSubmissionAllowsNext(previous) {
+			return domain.ErrConflict
+		}
+	}
+	if !validSnapshotRef(submission.Snapshot) {
+		return domain.ErrInvalid
+	}
+	encodedSubmission, err := marshalSubmission(submission)
+	if err != nil {
+		return err
+	}
+	encodedRun, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_submissions
+    (id,task_instance_id,student_id,idempotency_key,command_digest,scope,milestone_id,status,snapshot,workspace_digest,
+     revision_digest,validation_contract_digest,validation_specification,current_run_id,requires_human_review,payload,created_at,updated_at,completed_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,$14,$15,$16::jsonb,$17,$18,$19)`,
+		submission.ID, submission.TaskInstanceID, submission.StudentID, submission.IdempotencyKey, submission.CommandDigest,
+		submission.Scope, nullableUUID(submission.MilestoneID), submission.Status, mustJSON(submission.Snapshot), submission.WorkspaceDigest,
+		submission.RevisionDigest, submission.ValidationContractDigest, submission.ValidationSpecification, run.ID,
+		submission.RequiresHumanReview, encodedSubmission, submission.CreatedAt.UTC(), submission.UpdatedAt.UTC(), nullableTime(submission.CompletedAt))
+	if err != nil {
+		return translateError(err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_validation_runs
+    (id,task_instance_id,submission_id,ordinal,status,outcome,started_at,finished_at,payload,created_at,updated_at)
+VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8::jsonb,$9,$9)`, run.ID, instance.ID, submission.ID, run.Status,
+		nullableString(string(run.Outcome)), nullableTime(run.StartedAt), nullableTime(run.FinishedAt), encodedRun, submission.CreatedAt.UTC())
+	if err != nil {
+		return translateError(err)
+	}
+	instance.Status = domain.TaskInstanceValidating
+	instance.CurrentSubmissionID = submission.ID
+	instance.UpdatedAt = submission.UpdatedAt
+	instance.Version++
+	encodedInstance, err := marshalInstance(instance)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_task_instances SET status=$2,current_submission_id=$3,version=$4,payload=$5::jsonb,updated_at=$6 WHERE id=$1`,
+		instance.ID, instance.Status, instance.CurrentSubmissionID, instance.Version, encodedInstance, instance.UpdatedAt.UTC())
+	if err != nil {
+		return err
+	}
+	storedIntent.Status = "COMMITTED"
+	storedIntent.UpdatedAt = time.Now().UTC()
+	encodedIntent, err := json.Marshal(storedIntent)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_submit_intents SET status='COMMITTED',payload=$3::jsonb,updated_at=$4
+WHERE task_instance_id=$1 AND idempotency_key=$2`, storedIntent.TaskInstanceID, storedIntent.IdempotencyKey, encodedIntent, storedIntent.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	return translateError(tx.Commit())
+}
+
+func intentSubmissionMatches(intent domain.SubmitIntent, submission domain.Submission, run domain.ValidationRun) bool {
+	return intent.TaskInstanceID == submission.TaskInstanceID && intent.StudentID == submission.StudentID &&
+		intent.SubmissionID == submission.ID && intent.ValidationRunID == run.ID && intent.Scope == submission.Scope &&
+		intent.MilestoneID == submission.MilestoneID && intent.IdempotencyKey == submission.IdempotencyKey &&
+		intent.CommandDigest == submission.CommandDigest && intent.ValidationContractDigest == submission.ValidationContractDigest
+}
+
+func validSnapshotRef(snapshot domain.SnapshotRef) bool {
+	return snapshot.SandboxID != "" && snapshot.SnapshotID != "" && snapshot.GenerationID != "" && validDigest(snapshot.WorkspaceDigest)
+}
+
+func mustJSON(value any) []byte {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return []byte(`null`)
+	}
+	return encoded
+}
+
+func instanceForUpdate(ctx context.Context, tx *sql.Tx, id string) (domain.TaskInstance, error) {
+	var raw []byte
+	var version int64
+	if err := tx.QueryRowContext(ctx, `SELECT payload,version FROM practice_task_instances WHERE id=$1 FOR UPDATE`, id).Scan(&raw, &version); err != nil {
+		return domain.TaskInstance{}, translateError(err)
+	}
+	instance, err := unmarshalInstance(raw)
+	if err != nil {
+		return domain.TaskInstance{}, fmt.Errorf("decode persisted TaskInstance: %w", err)
+	}
+	instance.Version = version
+	return instance, nil
+}
+
+func (repository *Repository) GetSubmission(ctx context.Context, taskInstanceID, submissionID string) (domain.Submission, error) {
+	if err := repository.ready(); err != nil {
+		return domain.Submission{}, err
+	}
+	var raw []byte
+	err := repository.db.QueryRowContext(ctx, `SELECT payload FROM practice_submissions WHERE task_instance_id=$1 AND id=$2`, taskInstanceID, submissionID).Scan(&raw)
+	if err != nil {
+		return domain.Submission{}, translateError(err)
+	}
+	submission, err := unmarshalSubmission(raw)
+	if err != nil {
+		return domain.Submission{}, fmt.Errorf("decode persisted Submission: %w", err)
+	}
+	submission.ValidationRuns, err = repository.validationRuns(ctx, submission.ID)
+	return submission, err
+}
+
+func (repository *Repository) validationRuns(ctx context.Context, submissionID string) ([]domain.ValidationRun, error) {
+	rows, err := repository.db.QueryContext(ctx, `SELECT payload FROM practice_validation_runs WHERE submission_id=$1 ORDER BY ordinal`, submissionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := make([]domain.ValidationRun, 0)
+	for rows.Next() {
+		var raw []byte
+		var run domain.ValidationRun
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &run); err != nil {
+			return nil, fmt.Errorf("decode persisted ValidationRun: %w", err)
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func (repository *Repository) ListSubmissions(ctx context.Context, taskInstanceID, cursor string, limit int) ([]domain.Submission, string, error) {
+	if err := repository.ready(); err != nil {
+		return nil, "", err
+	}
+	if limit < 1 || limit > 100 {
+		return nil, "", domain.ErrInvalid
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = repository.db.QueryContext(ctx, `SELECT payload,created_at,id FROM practice_submissions
+WHERE task_instance_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2`, taskInstanceID, limit+1)
+	} else {
+		at, id, parseErr := parseSubmissionCursor(cursor)
+		if parseErr != nil {
+			return nil, "", parseErr
+		}
+		rows, err = repository.db.QueryContext(ctx, `SELECT payload,created_at,id FROM practice_submissions
+WHERE task_instance_id=$1 AND (created_at,id)<($2,$3) ORDER BY created_at DESC,id DESC LIMIT $4`, taskInstanceID, at, id, limit+1)
+	}
+	if err != nil {
+		return nil, "", translateError(err)
+	}
+	defer rows.Close()
+	type pageItem struct {
+		value domain.Submission
+		at    time.Time
+		id    string
+	}
+	items := make([]pageItem, 0, limit+1)
+	for rows.Next() {
+		var raw []byte
+		var item pageItem
+		if err := rows.Scan(&raw, &item.at, &item.id); err != nil {
+			return nil, "", err
+		}
+		item.value, err = unmarshalSubmission(raw)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode persisted Submission: %w", err)
+		}
+		item.value.ValidationRuns, err = repository.validationRuns(ctx, item.value.ID)
+		if err != nil {
+			return nil, "", err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(items) > limit {
+		items = items[:limit]
+		last := items[len(items)-1]
+		next = formatSubmissionCursor(last.at, last.id)
+	}
+	result := make([]domain.Submission, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.value)
+	}
+	return result, next, nil
+}
+
+func terminalSubmissionAllowsNext(status domain.SubmissionStatus) bool {
+	return status == domain.SubmissionPassed || status == domain.SubmissionFailed || status == domain.SubmissionChangesRequested
+}

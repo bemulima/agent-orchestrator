@@ -1,0 +1,302 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+type bootstrapRepo struct {
+	binding        domain.DiagnosticBootstrapBinding
+	receipts       map[string]domain.DiagnosticBootstrapReceipt
+	insertConflict bool
+}
+
+func (r *bootstrapRepo) GetLatestDiagnosticBootstrapBinding(context.Context, string, string) (domain.DiagnosticBootstrapBinding, error) {
+	if r.binding.CourseID == "" {
+		return domain.DiagnosticBootstrapBinding{}, domain.ErrNotFound
+	}
+	return r.binding, nil
+}
+func (r *bootstrapRepo) GetDiagnosticBootstrapReceipt(_ context.Context, s, k string) (domain.DiagnosticBootstrapReceipt, error) {
+	v, ok := r.receipts[s+k]
+	if !ok {
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrNotFound
+	}
+	return v, nil
+}
+func (r *bootstrapRepo) InsertDiagnosticBootstrapReceipt(_ context.Context, v domain.DiagnosticBootstrapReceipt) (domain.DiagnosticBootstrapReceipt, error) {
+	if r.insertConflict {
+		r.insertConflict = false
+		r.receipts[v.StudentID+v.IdempotencyKey] = v
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrConflict
+	}
+	if _, ok := r.receipts[v.StudentID+v.IdempotencyKey]; ok {
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrConflict
+	}
+	r.receipts[v.StudentID+v.IdempotencyKey] = v
+	return v, nil
+}
+
+type bootstrapProfileStudent struct {
+	profile domain.StudentPlanningProfile
+	calls   int
+}
+
+func (s *bootstrapProfileStudent) GetPlanningProfile(context.Context, string) (domain.StudentPlanningProfile, error) {
+	s.calls++
+	return s.profile, nil
+}
+func (*bootstrapProfileStudent) QueryMastery(context.Context, string, []domain.TargetRef) ([]domain.TargetMastery, error) {
+	return nil, errors.New("unexpected")
+}
+func (*bootstrapProfileStudent) AssignCourse(context.Context, string, string, string, string) error {
+	return errors.New("unexpected")
+}
+func (*bootstrapProfileStudent) CreateLearningPath(context.Context, string, string, domain.LearningPathReplacement) (domain.LearningPathAllocation, error) {
+	return domain.LearningPathAllocation{}, errors.New("unexpected")
+}
+func (*bootstrapProfileStudent) GetLearningPathPlanningState(context.Context, string, string) (domain.LearningPathPlanningState, error) {
+	return domain.LearningPathPlanningState{}, errors.New("unexpected")
+}
+func (*bootstrapProfileStudent) ReplanLearningPath(context.Context, string, string, domain.LearningPathReplan) (domain.LearningPathCommandResult, error) {
+	return domain.LearningPathCommandResult{}, errors.New("unexpected")
+}
+func (*bootstrapProfileStudent) CompleteLearningPath(context.Context, string, string, domain.LearningPathCompletion) (domain.LearningPathCommandResult, error) {
+	return domain.LearningPathCommandResult{}, errors.New("unexpected")
+}
+
+func bootstrapBinding(course string, active bool) domain.DiagnosticBootstrapBinding {
+	b := domain.DiagnosticBootstrapBinding{GoalCode: "go.backend", DirectionCode: "backend", CourseID: course, BindingRevision: 1, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, Active: active, CreatedAt: testClock{}.Now()}
+	b.BindingDigest, _ = domain.DiagnosticBootstrapBindingDigest(b)
+	return b
+}
+func bootstrapCatalog(course string) domain.DiagnosticAssessmentCatalog {
+	c := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for n := 0; n < 3; n++ {
+		c.Assessments = append(c.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: testClock{}.Now(), LessonOrder: n})
+	}
+	return c
+}
+func TestBootstrapReceiptReplaySkipsAllDownstream(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	courseClient := &countedCourse{catalog: bootstrapCatalog(course)}
+	reserve := &countedStudent{}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: courseClient, Students: reserve, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, created, err := b.Start(context.Background(), student, key, in); err != nil || !created {
+		t.Fatalf("first %v %v", created, err)
+	}
+	profile.calls, courseClient.calls, reserve.calls = 0, 0, 0
+	if _, created, err := b.Start(context.Background(), student, key, in); err != nil || created {
+		t.Fatalf("replay %v %v", created, err)
+	}
+	if profile.calls != 0 || courseClient.calls != 0 || reserve.calls != 0 {
+		t.Fatalf("replay called downstream profile=%d course=%d reserve=%d", profile.calls, courseClient.calls, reserve.calls)
+	}
+}
+
+func TestBootstrapRecoversLostReceiptFromStoredPlanWithoutRebinding(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	catalog := &countedCourse{catalog: bootstrapCatalog(course)}
+	reserve := &countedStudent{}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: catalog, Students: reserve, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, _, err := b.Start(context.Background(), student, key, in); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash boundary after plan+Student reservation but before local receipt commit.
+	receipts.receipts = map[string]domain.DiagnosticBootstrapReceipt{}
+	receipts.binding = bootstrapBinding("66666666-6666-6666-6666-666666666666", true)
+	profile.calls, catalog.calls, reserve.calls = 0, 0, 0
+	got, created, err := b.Start(context.Background(), student, key, in)
+	if err != nil || created {
+		t.Fatalf("recover %v %v", created, err)
+	}
+	if got.PlanID == "" || profile.calls != 0 || catalog.calls != 0 || reserve.calls != 0 {
+		t.Fatalf("recovery rebound: %#v p=%d c=%d r=%d", got, profile.calls, catalog.calls, reserve.calls)
+	}
+}
+
+func TestBootstrapReplayConflictAndCorruptionFailBeforeDownstream(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	catalog := &countedCourse{catalog: bootstrapCatalog(course)}
+	reserve := &countedStudent{}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: catalog, Students: reserve, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, _, err := b.Start(context.Background(), student, key, in); err != nil {
+		t.Fatal(err)
+	}
+	profile.calls, catalog.calls, reserve.calls = 0, 0, 0
+	if _, _, err := b.Start(context.Background(), student, key, domain.DiagnosticAssessmentBootstrapRequestV1{Schema: in.Schema, ExpectedOnboardingVersion: 8}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("hash conflict=%v", err)
+	}
+	if profile.calls != 0 || catalog.calls != 0 || reserve.calls != 0 {
+		t.Fatal("conflict called downstream")
+	}
+	replay := receipts.receipts[student+key]
+	replay.PlanDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	receipts.receipts[student+key] = replay
+	if _, _, err := b.Start(context.Background(), student, key, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("corrupt receipt=%v", err)
+	}
+	if profile.calls != 0 || catalog.calls != 0 || reserve.calls != 0 {
+		t.Fatal("corrupt receipt called downstream")
+	}
+}
+
+func TestBootstrapCorruptStoredBindingAndOnboardingMismatchFailClosed(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	catalog := &countedCourse{catalog: bootstrapCatalog(course)}
+	reserve := &countedStudent{}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: catalog, Students: reserve, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, _, err := b.Start(context.Background(), student, key, in); err != nil {
+		t.Fatal(err)
+	}
+	receipts.receipts = map[string]domain.DiagnosticBootstrapReceipt{}
+	record := plans.byKey[student+key]
+	record.BindingGoalCode = " Goal "
+	plans.byKey[student+key] = record
+	profile.calls, catalog.calls, reserve.calls = 0, 0, 0
+	if _, _, err := b.Start(context.Background(), student, key, in); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("corrupt record=%v", err)
+	}
+	if profile.calls != 0 || catalog.calls != 0 || reserve.calls != 0 {
+		t.Fatal("corrupt record called downstream")
+	}
+	plans.byKey = map[string]domain.DiagnosticAssessmentPlanRecord{}
+	profile.profile.OnboardingVersion = 8
+	if _, _, err := b.Start(context.Background(), student, "44444444-4444-4444-4444-444444444444", in); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("version mismatch=%v", err)
+	}
+	if catalog.calls != 0 || reserve.calls != 0 {
+		t.Fatal("version mismatch called binding/course/reserve")
+	}
+}
+func TestBootstrapFailsClosedForMissingOrInactiveBinding(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	_ = course
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	receipts := &bootstrapRepo{receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: &countedCourse{}, Students: &countedStudent{}, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, _, err := b.Start(context.Background(), student, key, in); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("missing=%v", err)
+	}
+	receipts.binding = bootstrapBinding("22222222-2222-2222-2222-222222222222", false)
+	if _, _, err := b.Start(context.Background(), student, key, in); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("inactive=%v", err)
+	}
+}
+
+func TestBootstrapBindingRevisionStartsNewContextAtRevisionOne(t *testing.T) {
+	student, course := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	c := &countedCourse{catalog: bootstrapCatalog(course)}
+	s := &countedStudent{}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: c, Students: s, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	first, _, err := b.Start(context.Background(), student, "33333333-3333-3333-3333-333333333333", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBinding := bootstrapBinding(course, true)
+	secondBinding.BindingRevision = 2
+	secondBinding.BindingDigest, _ = domain.DiagnosticBootstrapBindingDigest(secondBinding)
+	receipts.binding = secondBinding
+	second, _, err := b.Start(context.Background(), student, "44444444-4444-4444-4444-444444444444", in)
+	if err != nil || second.PlanRevision != 1 || second.PlanID == first.PlanID {
+		t.Fatalf("context change %#v first=%#v err=%v", second, first, err)
+	}
+}
+
+func TestBootstrapSameContextRetakeRequiresPlacement(t *testing.T) {
+	student, course := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	key := "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}}
+	c := &countedCourse{catalog: bootstrapCatalog(course)}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: c, Students: &countedStudent{}, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	first, _, err := b.Start(context.Background(), student, key, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := 1
+	if _, _, err := b.Start(context.Background(), student, "44444444-4444-4444-4444-444444444444", domain.DiagnosticAssessmentBootstrapRequestV1{Schema: in.Schema, ExpectedOnboardingVersion: 7, ExpectedPreviousRevision: &expected}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("unplaced=%v", err)
+	}
+	record := plans.byKey[student+key]
+	p := record.Plan
+	result := domain.DiagnosticAssessmentResult{Schema: domain.DiagnosticAssessmentResultSchemaV1, StudentID: student, CourseID: course, CourseContentRevision: p.CourseRevision, PolicyVersion: p.PolicyVersion, AttemptID: p.ID, PlanID: p.ID, PlanRevision: 1, Correct: 2, Total: 3, Percent: 66, Band: "CORE", BandPolicyVersion: domain.DiagnosticAssessmentBandPolicyV1, PlanDigest: p.PlanDigest, CompletedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)}
+	result.ResultDigest, _ = domain.DiagnosticResultDigest(result)
+	if _, _, err := (PlacementConsumer{Plans: plans, Placements: plans, Students: &resultStudent{result: result}, Clock: testClock{}}).Consume(context.Background(), student, p.ID, p.ID, domain.DiagnosticPlacementConsumeRequest{Schema: domain.DiagnosticPlacementConsumeSchemaV1}); err != nil {
+		t.Fatal(err)
+	}
+	second, created, err := b.Start(context.Background(), student, "44444444-4444-4444-4444-444444444444", domain.DiagnosticAssessmentBootstrapRequestV1{Schema: in.Schema, ExpectedOnboardingVersion: 7, ExpectedPreviousRevision: &expected})
+	if err != nil || !created || second.PlanRevision != 2 || second.PlanID == first.PlanID {
+		t.Fatalf("retake %#v %v %v", second, created, err)
+	}
+}
+
+func TestBootstrapReceiptConflictWinnerValidation(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	plans := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	profile := &bootstrapProfileStudent{profile: domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "advanced", DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 30, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 7}}
+	receipts := &bootstrapRepo{binding: bootstrapBinding(course, true), receipts: map[string]domain.DiagnosticBootstrapReceipt{}, insertConflict: true}
+	b := Bootstrap{Issuer: Issuer{Plans: plans, Reservations: plans, Placements: plans, Courses: &countedCourse{catalog: bootstrapCatalog(course)}, Students: &countedStudent{}, Clock: testClock{}}, Plans: plans, Receipts: receipts, Students: profile, Clock: testClock{}}
+	in := domain.DiagnosticAssessmentBootstrapRequestV1{Schema: domain.DiagnosticAssessmentBootstrapRequestSchemaV1, ExpectedOnboardingVersion: 7}
+	if _, created, err := b.Start(context.Background(), student, key, in); err != nil || !created {
+		t.Fatalf("winner %v %v", created, err)
+	}
+	winner := receipts.receipts[student+key]
+	winner.RequestHash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	receipts.receipts[student+key] = winner
+	if _, _, err := b.Start(context.Background(), student, key, in); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("different winner=%v", err)
+	}
+}
+func TestDiagnosticBootstrapBindingDigestGolden(t *testing.T) {
+	b := domain.DiagnosticBootstrapBinding{GoalCode: "go.backend", DirectionCode: "backend", CourseID: "22222222-2222-2222-2222-222222222222", BindingRevision: 1, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, Active: true, CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	got, err := domain.DiagnosticBootstrapBindingDigest(b)
+	if err != nil || got != "sha256:592fc1566dc151457c9995119db3944648f6c21732962e5cc924eaa3f416ea84" {
+		t.Fatalf("digest=%s err=%v", got, err)
+	}
+}
+
+func TestDiagnosticPlanDigestStudentOrderGolden(t *testing.T) {
+	p := domain.DiagnosticAssessmentPlan{Schema: domain.DiagnosticAssessmentPlanSchemaV1, ID: "11111111-1111-4111-8111-111111111111", StudentID: "22222222-2222-4222-8222-222222222222", CourseID: "33333333-3333-4333-8333-333333333333", PlanRevision: 1, PolicyVersion: domain.DiagnosticFixedPolicyV1, OnboardingVersion: 1, BootstrapPolicyVersion: domain.DiagnosticBootstrapPolicyV1, BootstrapContextDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", CourseRevision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Assessments: []domain.DiagnosticAssessment{{LessonID: "44444444-4444-4444-8444-444444444444", TaskID: "55555555-5555-4555-8555-555555555555", TaskVersion: 1, UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), LessonOrder: 1, TaskOrder: 2, LearningTargets: []domain.TargetRef{{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}}}}}
+	got, err := domain.DiagnosticPlanDigest(p)
+	if err != nil || got != "sha256:557a690eb6a6455adbd65bccd3b60c0e792a702ad3cea67c218583b3a045ff8d" {
+		t.Fatalf("digest=%s err=%v", got, err)
+	}
+}
+
+func TestIssuerRejectsWellFormedButForgedBindingDigest(t *testing.T) {
+	in := bootstrapInput("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", nil)
+	in.BindingDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if _, err := domain.NormalizeDiagnosticPlanRequest(in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("forged digest=%v", err)
+	}
+}

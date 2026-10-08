@@ -1,0 +1,153 @@
+package aiprompt
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+)
+
+const templateCode = "practice-task.authoring-candidate.v1"
+const templateVersion = 2
+const maximumResponseBytes int64 = 4 << 20
+
+type Client struct {
+	BaseURL, InternalToken string
+	HTTPClient             *http.Client
+}
+
+func (client Client) Generate(ctx context.Context, input domain.GenerationInput) (domain.AuthoringCandidateV1, error) {
+	if input.JobID == "" || input.Policy.TechnicalTaskSchema != domain.TechnicalTaskSchemaV1 || client.BaseURL == "" || client.InternalToken == "" {
+		return domain.AuthoringCandidateV1{}, errors.New("AI authoring client is not configured")
+	}
+	manifestText := input.Request.Manifest
+	if input.Request.PreparedSourceTask != nil {
+		manifestText = input.Request.PreparedSourceTask.Content
+	}
+	manifestEnvelope := map[string]any{
+		"text": manifestText, "source": input.Request.Source,
+		"classification_hints": input.Request.Hints, "mode": input.Request.Mode,
+		"manifest_digest": input.ManifestDigest,
+	}
+	if input.Request.Orchestration != nil {
+		manifestEnvelope["orchestration"] = input.Request.Orchestration
+	}
+	if input.Request.PreparedSourceTask != nil {
+		manifestEnvelope["prepared_source_task"] = input.Request.PreparedSourceTask
+	}
+	payload, err := json.Marshal(map[string]any{
+		"idempotency_key": input.JobID, "template_code": templateCode, "language_code": input.Request.Locale,
+		"variables": map[string]any{
+			"manifest_envelope": manifestEnvelope,
+			"authoring_policy": map[string]any{
+				"planner_version": input.Policy.PlannerVersion, "generation_policy_version": input.Policy.GenerationPolicyVersion,
+				"tone": input.Policy.Tone, "methodology": input.Policy.Methodology, "skill_refs": input.Policy.SkillRefs,
+				"technical_task_contract": map[string]any{
+					"schema": input.Policy.TechnicalTaskSchema,
+					"fields": []string{"goal", "student_instruction", "expected_result", "concepts", "steps", "verification"},
+					"source_paths": map[string]any{
+						"goal": "blueprint.scenario.goal", "student_instruction": "blueprint.scenario + blueprint.source.educational_adaptation",
+						"expected_result": "blueprint.acceptance", "concepts": "blueprint.milestones.steps.learning_requirements",
+						"steps": "blueprint.milestones.steps", "verification": "blueprint.evaluation",
+					},
+					"rules": []string{"educational_adaptation_is_student_description", "student_instruction_excludes_solutions", "steps_are_internal", "actions_are_optional", "verification_covers_expected_result"},
+				},
+			},
+			"runtime_profiles":        input.RuntimeProfiles,
+			"learning_target_catalog": input.LearningTargets,
+		},
+	})
+	if err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(client.BaseURL, "/")+"/api/v1/prompts/execute-confidential", bytes.NewReader(payload))
+	if err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.httpClient().Do(request)
+	if err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	defer response.Body.Close()
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumResponseBytes+1))
+	if err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	if int64(len(contents)) > maximumResponseBytes {
+		return domain.AuthoringCandidateV1{}, errors.New("AI authoring response exceeds limit")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return domain.AuthoringCandidateV1{}, fmt.Errorf("AI authoring returned status %d", response.StatusCode)
+	}
+	var envelope struct {
+		ExecutionID        string          `json:"execution_id"`
+		IdempotencyKey     string          `json:"idempotency_key"`
+		TemplateCode       string          `json:"template_code"`
+		TemplateVersion    int             `json:"template_version"`
+		ProviderCode       string          `json:"provider_code"`
+		ProviderModel      string          `json:"provider_model"`
+		LanguageCode       string          `json:"language_code"`
+		ResponseSchemaCode string          `json:"response_schema_code"`
+		ParsedResponse     json.RawMessage `json:"parsed_response"`
+		Cached             bool            `json:"cached"`
+		CreatedAt          time.Time       `json:"created_at"`
+		ExpiresAt          time.Time       `json:"expires_at"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || envelope.IdempotencyKey != input.JobID || envelope.TemplateCode != templateCode || envelope.ResponseSchemaCode != templateCode || envelope.TemplateVersion != templateVersion || envelope.ProviderCode == "" || envelope.ProviderModel == "" || !envelope.ExpiresAt.After(envelope.CreatedAt) {
+		return domain.AuthoringCandidateV1{}, domain.ErrValidation
+	}
+	candidate, err := domain.DecodeCandidateShape(envelope.ParsedResponse)
+	if err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	candidate.Blueprint.Source = domain.SourceProvenance{
+		SourceType:            input.Request.Source.Type,
+		SourceURL:             input.Request.Source.URL,
+		OriginalManifestHash:  input.ManifestDigest,
+		Company:               input.Request.Source.Company,
+		License:               input.Request.Source.License,
+		Anonymized:            input.Request.Source.Anonymized,
+		EducationalAdaptation: candidate.Blueprint.Source.EducationalAdaptation,
+	}
+	candidate.Blueprint.Generation.PlannerVersion = input.Policy.PlannerVersion
+	candidate.Blueprint.Generation.GenerationPolicyVersion = input.Policy.GenerationPolicyVersion
+	candidate.Blueprint.Generation.Method = "ai"
+	candidate.Blueprint.Generation.PromptTemplateRef = input.Policy.PromptTemplateRef
+	candidate.Blueprint.Generation.Tone = input.Policy.Tone
+	candidate.Blueprint.Generation.Methodology = input.Policy.Methodology
+	candidate.Blueprint.Generation.SkillRefs = append([]string(nil), input.Policy.SkillRefs...)
+	candidate.Blueprint.Generation.GenerationJobID = input.JobID
+	candidate.Blueprint.Generation.InputDigest = input.ManifestDigest
+	candidate.Blueprint.Generation.ModelProvider = envelope.ProviderCode
+	candidate.Blueprint.Generation.ModelID = envelope.ProviderModel
+	// Classification is trusted caller intent, never model-authored output.
+	candidate.Blueprint.Classification.SurfaceClassification = input.Request.TrustedSurfaceClassification()
+	if err := candidate.Validate(); err != nil {
+		return domain.AuthoringCandidateV1{}, err
+	}
+	return candidate, nil
+}
+
+func (client Client) httpClient() *http.Client {
+	if client.HTTPClient != nil {
+		return client.HTTPClient
+	}
+	return &http.Client{Timeout: 120 * time.Second}
+}
+
+var _ domain.CandidateGenerator = Client{}

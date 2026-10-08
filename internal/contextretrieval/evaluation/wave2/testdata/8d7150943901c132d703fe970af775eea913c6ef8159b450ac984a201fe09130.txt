@@ -1,0 +1,135 @@
+//go:build integration
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	courseclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/course"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/practiceroute"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// This is an owned loopback proof server, not the production main service.
+// Student mastery and content generation are named fixtures. Planner routing,
+// composition, receipt persistence and downstream Course HTTP are real.
+func TestT08ReadinessHTTPProvider(t *testing.T) {
+	dsn := os.Getenv("T08_PLANNER_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("owned T08 provider env absent")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil || !strings.HasPrefix(cfg.ConnConfig.Database, "remediation_t07_") || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") {
+		t.Fatal("requires owned Planner test database")
+	}
+	var fixture struct {
+		Schema    string           `json:"schema"`
+		StudentID string           `json:"student_id"`
+		Target    domain.TargetRef `json:"target"`
+	}
+	b, err := os.ReadFile(os.Getenv("T08_RUNTIME_PROVIDER_FIXTURE_FILE"))
+	if err != nil || json.Unmarshal(b, &fixture) != nil || fixture.Schema != "t08-workspace-provider-fixture.v1" {
+		t.Fatal("invalid owned T08 fixture")
+	}
+	if os.Getenv("T08_PLANNER_TOKEN") == "" || os.Getenv("T08_COURSE_TOKEN") == "" {
+		t.Fatal("test credentials required without disclosure")
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := postgres.Store{Pool: pool}
+	mastery := &t08NamedMasteryFixture{studentID: fixture.StudentID, target: fixture.Target, phaseFile: os.Getenv("T08_MASTERY_PHASE_FILE")}
+	generator := &t08NamedContentGeneratorFixture{}
+	handler := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		PracticeLearning: privatehandlers.PracticeLearningHandler{
+			Routes:    newPracticeLearningResolver(store, mastery, systemClock{}),
+			Materials: practiceroute.Materializer{Routes: store, Catalog: store, Generator: generator, Courses: courseclient.Client{BaseURL: os.Getenv("T08_COURSE_URL"), InternalToken: os.Getenv("T08_COURSE_TOKEN"), HTTPClient: &http.Client{Timeout: 5 * time.Second}}},
+		}, PracticeToken: os.Getenv("T08_PLANNER_TOKEN"),
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ready, _ := json.Marshal(map[string]string{"base_url": server.URL, "classification": "actual Planner production factory/router/PostgreSQL; named Student and generator fixtures"})
+	if err := os.WriteFile(os.Getenv("T08_PLANNER_READY_FILE"), ready, 0600); err != nil {
+		t.Fatal(err)
+	}
+	timer := time.NewTimer(15 * time.Minute)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			t.Fatal("owned proof stop signal timed out")
+		case <-ticker.C:
+			if _, err := os.Stat(os.Getenv("T08_PLANNER_STOP_FILE")); err == nil {
+				summary, _ := json.Marshal(map[string]any{"mastery_fixture_calls": mastery.calls.Load(), "content_generator_fixture_calls": generator.calls.Load(), "full_live_e2e": false})
+				if err := os.WriteFile(os.Getenv("T08_PLANNER_RESULT_FILE"), summary, 0600); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+		}
+	}
+}
+
+type t08NamedMasteryFixture struct {
+	studentID string
+	target    domain.TargetRef
+	phaseFile string
+	calls     atomic.Uint64
+}
+
+func (f *t08NamedMasteryFixture) QueryMastery(_ context.Context, studentID string, targets []domain.TargetRef) ([]domain.TargetMastery, error) {
+	f.calls.Add(1)
+	if studentID != f.studentID || len(targets) != 1 || targets[0] != f.target {
+		return nil, errors.New("owned mastery fixture identity mismatch")
+	}
+	b, err := os.ReadFile(f.phaseFile)
+	if err != nil {
+		return nil, err
+	}
+	m := domain.TargetMastery{Target: f.target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion}
+	switch strings.TrimSpace(string(b)) {
+	case "UNKNOWN":
+	case "MASTERED":
+		m.State = domain.MasteryMastered
+		m.MasteryScore = .91
+		m.Confidence = .92
+	default:
+		return nil, errors.New("invalid owned mastery phase")
+	}
+	return []domain.TargetMastery{m}, nil
+}
+
+type t08NamedContentGeneratorFixture struct{ calls atomic.Uint64 }
+
+func (f *t08NamedContentGeneratorFixture) GenerateLesson(_ context.Context, input domainservice.LessonGenerationInput, _ string) (domainservice.GeneratedLessonContent, error) {
+	f.calls.Add(1)
+	if len(input.Lesson.Targets) != 1 {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	return domainservice.GeneratedLessonContent{
+		DescriptionMarkdown: "Owned deterministic prerequisite lesson fixture: events invoke handlers.",
+		Examples:            []domain.PlannedExample{{Title: "Owned event example", DescriptionMarkdown: "Register a handler for an event.", Stacks: []string{"javascript"}, TargetConcepts: []string{input.Lesson.Targets[0].Key}}},
+		KnowledgeChecks:     []domain.PlannedTask{{Title: "Owned check", DescriptionMarkdown: "Name the handler trigger.", ExpectedAnswers: []string{"event"}}},
+	}, nil
+}

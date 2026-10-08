@@ -1,0 +1,133 @@
+package postgres
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.HybridReplanning = Store{}
+
+func (s Store) ReceivePlanningStateEvent(ctx context.Context, e domain.PlanningStateChangedEvent) (bool, error) {
+	if s.Pool == nil || domain.ValidatePlanningStateChangedEvent(e) != nil {
+		return false, domain.ErrValidation
+	}
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return false, err
+	}
+	digest := sha256.Sum256(raw)
+	hash := "sha256:" + hex.EncodeToString(digest[:])
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx, `INSERT INTO hybrid_planning_state_inbox(event_id,student_id,learning_path_id,payload_hash,event_json) VALUES($1,$2,$3,$4,$5) ON CONFLICT(event_id) DO NOTHING`, e.EventID, e.StudentID, e.Data.LearningPathID, hash, raw)
+	if err != nil {
+		return false, err
+	}
+	if result.RowsAffected() == 0 {
+		var stored string
+		if err = tx.QueryRow(ctx, `SELECT payload_hash FROM hybrid_planning_state_inbox WHERE event_id=$1`, e.EventID).Scan(&stored); err != nil {
+			return false, err
+		}
+		if stored != hash {
+			return false, domain.ErrConflict
+		}
+		return false, tx.Commit(ctx)
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_evaluation_work(student_id,learning_path_id,generation,latest_event_id) VALUES($1,$2,1,$3) ON CONFLICT(student_id,learning_path_id) DO UPDATE SET generation=hybrid_evaluation_work.generation+1,latest_event_id=EXCLUDED.latest_event_id,next_attempt_at=clock_timestamp(),local_reason=NULL`, e.StudentID, e.Data.LearningPathID, e.EventID)
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+func (s Store) ClaimHybridEvaluationWork(ctx context.Context, now time.Time, ttl time.Duration) (domain.HybridEvaluationWork, bool, error) {
+	var w domain.HybridEvaluationWork
+	if s.Pool == nil || now.IsZero() || ttl <= 0 {
+		return w, false, domain.ErrValidation
+	}
+	token := uuid.NewString()
+	var raw []byte
+	err := s.Pool.QueryRow(ctx, `WITH candidate AS (SELECT student_id,learning_path_id FROM hybrid_evaluation_work WHERE generation>processed_generation AND next_attempt_at<=$1 AND (lease_until IS NULL OR lease_until<=$1) ORDER BY next_attempt_at,student_id,learning_path_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE hybrid_evaluation_work w SET claim_token=$2,lease_until=$3 FROM candidate c WHERE w.student_id=c.student_id AND w.learning_path_id=c.learning_path_id RETURNING w.*) SELECT c.student_id::text,c.learning_path_id::text,c.generation,c.claim_token::text,c.lease_until,i.event_json,COALESCE(c.local_reason,'') FROM claimed c JOIN hybrid_planning_state_inbox i ON i.event_id=c.latest_event_id`, now.UTC(), token, now.Add(ttl).UTC()).Scan(&w.StudentID, &w.LearningPathID, &w.Generation, &w.ClaimToken, &w.LeaseUntil, &raw, &w.LocalReason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return w, false, nil
+	}
+	if err != nil {
+		return w, false, err
+	}
+	w.LatestEvent, err = domain.DecodePlanningStateChangedEvent(raw)
+	if err != nil {
+		return w, false, err
+	}
+	w.Targets = append([]domain.HybridTargetRef{}, w.LatestEvent.Data.Targets...)
+	return w, true, nil
+}
+
+func (s Store) CheckpointHybridSnapshot(ctx context.Context, w domain.HybridEvaluationWork, snapshot domain.HybridPlanningSnapshot, policy string) (string, error) {
+	if s.Pool == nil || policy != domain.HybridReplanPolicyVersion || w.Generation < 1 || w.ClaimToken == "" {
+		return "", domain.ErrValidation
+	}
+	request := domain.HybridSnapshotRequest{Targets: snapshot.RequestedTargets, TriggerContext: snapshot.TriggerContext}
+	if domain.ValidateHybridPlanningSnapshot(snapshot, w.StudentID, w.LearningPathID, request) != nil {
+		return "", domain.ErrValidation
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil || len(raw) > domain.MaximumHybridSnapshotResponseBytes {
+		return "", domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	var generation int64
+	err = tx.QueryRow(ctx, `SELECT generation FROM hybrid_evaluation_work WHERE student_id=$1 AND learning_path_id=$2 AND claim_token=$3 AND lease_until>clock_timestamp() FOR UPDATE`, w.StudentID, w.LearningPathID, w.ClaimToken).Scan(&generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrConflict
+	}
+	if err != nil {
+		return "", err
+	}
+	if w.Generation > generation {
+		return "", domain.ErrConflict
+	}
+	id := uuid.NewSHA1(uuid.NameSpaceURL, []byte("hybrid-evaluation:"+w.StudentID+":"+w.LearningPathID+":"+snapshot.References.SnapshotRef+":"+policy)).String()
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_evaluation_job(id,student_id,learning_path_id,snapshot_ref,policy_version,snapshot_json) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(student_id,learning_path_id,snapshot_ref,policy_version) DO NOTHING`, id, w.StudentID, w.LearningPathID, snapshot.References.SnapshotRef, policy, raw)
+	if err != nil {
+		return "", err
+	}
+	// Even with a new event during the owner HTTP read, only the claimed watermark is processed.
+	_, err = tx.Exec(ctx, `UPDATE hybrid_evaluation_work SET processed_generation=GREATEST(processed_generation,$4),claim_token=NULL,lease_until=NULL,local_reason=CASE WHEN generation=$4 THEN NULL ELSE local_reason END WHERE student_id=$1 AND learning_path_id=$2 AND claim_token=$3`, w.StudentID, w.LearningPathID, w.ClaimToken, w.Generation)
+	if err != nil {
+		return "", err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (s Store) ReleaseHybridEvaluationWork(ctx context.Context, w domain.HybridEvaluationWork, retryAt time.Time) error {
+	if s.Pool == nil || retryAt.IsZero() || w.ClaimToken == "" {
+		return domain.ErrValidation
+	}
+	result, err := s.Pool.Exec(ctx, `UPDATE hybrid_evaluation_work SET claim_token=NULL,lease_until=NULL,next_attempt_at=CASE WHEN generation>$4 THEN clock_timestamp() ELSE $5 END WHERE student_id=$1 AND learning_path_id=$2 AND claim_token=$3`, w.StudentID, w.LearningPathID, w.ClaimToken, w.Generation, retryAt.UTC())
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}

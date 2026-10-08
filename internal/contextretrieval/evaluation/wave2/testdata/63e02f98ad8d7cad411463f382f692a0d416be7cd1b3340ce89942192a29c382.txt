@@ -1,0 +1,218 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+// GetHybridPlanningSnapshot uses Student's dedicated Planner contour. It never
+// combines legacy path/profile/mastery reads into a synthetic observation.
+func (client Client) GetHybridPlanningSnapshot(ctx context.Context, studentID, pathID string, input domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+	request, err := domain.NormalizeHybridSnapshotRequest(input)
+	if err != nil || !isCanonicalUUID(studentID) || !isCanonicalUUID(pathID) {
+		return domain.HybridPlanningSnapshot{}, domain.ErrValidation
+	}
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.WriteToken) == "" || client.HTTPClient == nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamUnavailable
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrValidation
+	}
+	endpoint := strings.TrimRight(client.BaseURL, "/") + "/internal/v1/students/" + url.PathEscape(studentID) + "/learning-paths/" + url.PathEscape(pathID) + "/planning-snapshot"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return domain.HybridPlanningSnapshot{}, err
+	}
+	req.Header.Set("X-Internal-Token", client.WriteToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	response, err := client.HTTPClient.Do(req)
+	if err != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			return domain.HybridPlanningSnapshot{}, domain.ErrNotFound
+		case http.StatusForbidden, http.StatusUnauthorized:
+			return domain.HybridPlanningSnapshot{}, domain.ErrForbidden
+		case http.StatusConflict:
+			return domain.HybridPlanningSnapshot{}, domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domain.HybridPlanningSnapshot{}, domain.ErrValidation
+		default:
+			return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamUnavailable
+		}
+	}
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, domain.MaximumHybridSnapshotResponseBytes+1))
+	if err != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamUnavailable
+	}
+	if len(raw) > domain.MaximumHybridSnapshotResponseBytes {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	if err := validateHybridJSONEnvelope(raw); err != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	if err := validateHybridJSONShape(raw, reflect.TypeOf(domain.HybridPlanningSnapshot{}), ""); err != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	var snapshot domain.HybridPlanningSnapshot
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&snapshot) != nil {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamInvalid
+	}
+	if err := domain.ValidateHybridPlanningSnapshot(snapshot, studentID, pathID, request); err != nil {
+		return domain.HybridPlanningSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// encoding/json alone accepts duplicate object keys; owner provenance must not
+// depend on which decoder happens to win a repeated field.
+func validateHybridJSONEnvelope(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var visit func(int) error
+	visit = func(depth int) error {
+		if depth > 32 {
+			return domain.ErrUpstreamInvalid
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := map[string]bool{}
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok || key != strings.ToLower(key) || seen[key] {
+					return domain.ErrUpstreamInvalid
+				}
+				seen[key] = true
+				if err = visit(depth + 1); err != nil {
+					return err
+				}
+			}
+			close, err := decoder.Token()
+			if err != nil || close != json.Delim('}') {
+				return domain.ErrUpstreamInvalid
+			}
+		case '[':
+			for decoder.More() {
+				if err := visit(depth + 1); err != nil {
+					return err
+				}
+			}
+			close, err := decoder.Token()
+			if err != nil || close != json.Delim(']') {
+				return domain.ErrUpstreamInvalid
+			}
+		default:
+			return domain.ErrUpstreamInvalid
+		}
+		return nil
+	}
+	if err := visit(0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return domain.ErrUpstreamInvalid
+	}
+	return nil
+}
+
+var _ domainservice.HybridStudentSnapshotService = Client{}
+
+// Every nonoptional field must really exist on the owner wire. A missing or
+// null zero-valued scalar cannot silently become an apparently valid counter.
+func validateHybridJSONShape(raw json.RawMessage, typ reflect.Type, path string) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		switch path {
+		case "availability.evidence_quality.value", "availability.stability.value", "availability.runtime_hold.value", "availability.automatic_adaptation.value", "availability.student_pinning.value":
+			return nil
+		}
+		return domain.ErrUpstreamInvalid
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.PkgPath() == "time" && typ.Name() == "Time" {
+		return nil
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			return domain.ErrUpstreamInvalid
+		}
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			tag := field.Tag.Get("json")
+			parts := strings.Split(tag, ",")
+			key := parts[0]
+			if key == "-" {
+				continue
+			}
+			if key == "" {
+				key = field.Name
+			}
+			value, ok := fields[key]
+			optional := len(parts) > 1 && parts[1] == "omitempty"
+			if !ok {
+				if optional {
+					continue
+				}
+				return domain.ErrUpstreamInvalid
+			}
+			childPath := key
+			if path != "" {
+				childPath = path + "." + key
+			}
+			if err := validateHybridJSONShape(value, field.Type, childPath); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil || values == nil {
+			return domain.ErrUpstreamInvalid
+		}
+		for _, value := range values {
+			if err := validateHybridJSONShape(value, typ.Elem(), path+"[]"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

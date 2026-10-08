@@ -1,0 +1,122 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+func committedFixture(t *testing.T) (PlacementConsumer, *testRepo, *resultStudent, domain.DiagnosticAssessmentPlan) {
+	t.Helper()
+	student, course := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	repo := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	plan, _, err := issueForTest(repo, issueCatalog(course, 3), testClock{}).Issue(context.Background(), "33333333-3333-3333-3333-333333333333", bootstrapInput(student, course, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := domain.DiagnosticAssessmentResult{Schema: domain.DiagnosticAssessmentResultSchemaV1, StudentID: student, CourseID: course, CourseContentRevision: plan.CourseRevision, PolicyVersion: plan.PolicyVersion, AttemptID: plan.ID, PlanID: plan.ID, PlanRevision: plan.PlanRevision, Correct: 2, Total: 3, Percent: 66, Band: "CORE", BandPolicyVersion: domain.DiagnosticAssessmentBandPolicyV1, PlanDigest: plan.PlanDigest, CompletedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)}
+	result.ResultDigest, _ = domain.DiagnosticResultDigest(result)
+	students := &resultStudent{result: result}
+	return PlacementConsumer{Plans: repo, Placements: repo, Students: students, Clock: testClock{}}, repo, students, plan
+}
+
+func committedEvent(plan domain.DiagnosticAssessmentPlan, result domain.DiagnosticAssessmentResult) domain.DiagnosticResultCommittedEvent {
+	return domain.DiagnosticResultCommittedEvent{EventID: domain.DiagnosticResultCommittedEventID(plan.ID), EventType: domain.SubjectDiagnosticResultCommitted, CorrelationID: plan.ID, CausationID: "66666666-6666-4666-8666-666666666666", StudentID: plan.StudentID, OccurredAt: result.CompletedAt, SchemaVersion: 1, Data: domain.DiagnosticResultCommittedData{PlanID: plan.ID, PlanRevision: plan.PlanRevision, PlanDigest: plan.PlanDigest, ResultDigest: result.ResultDigest}}
+}
+
+// The initial RED dispatched through the original HTTP Consume boundary and
+// demonstrated an unvalidated event digest could persist a placement. GREEN
+// now dispatches through the dedicated committed-event admission boundary.
+func TestCommittedTriggerRejectsResultDigestBeforePlacementWrite(t *testing.T) {
+	consumer, repo, students, plan := committedFixture(t)
+	event := committedEvent(plan, students.result)
+	event.Data.ResultDigest = "sha256:" + strings.Repeat("b", 64)
+	_, _, err := consumer.ProcessCommittedResult(context.Background(), event)
+	if !errors.Is(err, domain.ErrValidation) || len(repo.placements) != 0 || students.calls != 1 {
+		t.Fatalf("wrote=%d student_reads=%d err=%v", len(repo.placements), students.calls, err)
+	}
+}
+
+func TestCommittedResultPersistsExistingRouteAndReplaysDuringOwnerOutage(t *testing.T) {
+	consumer, repo, students, plan := committedFixture(t)
+	event := committedEvent(plan, students.result)
+	first, created, err := consumer.ProcessCommittedResult(context.Background(), event)
+	if err != nil || !created || first.RouteCode != "START_CORE" || len(repo.placements) != 1 || students.calls != 1 {
+		t.Fatalf("created=%v route=%s receipts=%d reads=%d err=%v", created, first.RouteCode, len(repo.placements), students.calls, err)
+	}
+	consumer.Students = unavailableCommittedStudent{resultStudent: students}
+	second, created, err := consumer.ProcessCommittedResult(context.Background(), event)
+	if err != nil || created || first != second || students.calls != 1 {
+		t.Fatalf("replay created=%v unchanged=%v reads=%d err=%v", created, first == second, students.calls, err)
+	}
+	event.Data.ResultDigest = "sha256:" + strings.Repeat("c", 64)
+	if _, _, err := consumer.ProcessCommittedResult(context.Background(), event); !errors.Is(err, domain.ErrValidation) || students.calls != 1 {
+		t.Fatalf("stored reference mismatch err=%v reads=%d", err, students.calls)
+	}
+}
+
+func TestCommittedResultRejectsForeignPlanRefsAndTimestampWithoutWrite(t *testing.T) {
+	for _, name := range []string{"student", "revision", "plan_digest", "completed_at", "event_id", "causation_id", "unknown_plan"} {
+		t.Run(name, func(t *testing.T) {
+			consumer, repo, students, plan := committedFixture(t)
+			event := committedEvent(plan, students.result)
+			switch name {
+			case "student":
+				event.StudentID = "77777777-7777-4777-8777-777777777777"
+			case "revision":
+				event.Data.PlanRevision++
+			case "plan_digest":
+				event.Data.PlanDigest = "sha256:" + strings.Repeat("c", 64)
+			case "completed_at":
+				event.OccurredAt = event.OccurredAt.Add(time.Microsecond)
+			case "event_id":
+				event.EventID = event.CausationID
+			case "causation_id":
+				event.CausationID = ""
+			case "unknown_plan":
+				event.Data.PlanID = event.CausationID
+				event.CorrelationID = event.Data.PlanID
+				event.EventID = domain.DiagnosticResultCommittedEventID(event.Data.PlanID)
+			}
+			if _, _, err := consumer.ProcessCommittedResult(context.Background(), event); !errors.Is(err, domain.ErrValidation) || len(repo.placements) != 0 {
+				t.Fatalf("receipts=%d err=%v", len(repo.placements), err)
+			}
+		})
+	}
+}
+
+type unavailableCommittedStudent struct{ *resultStudent }
+
+func (s unavailableCommittedStudent) GetDiagnosticAssessmentResult(context.Context, string, string) (domain.DiagnosticAssessmentResult, error) {
+	return domain.DiagnosticAssessmentResult{}, domain.ErrUpstreamUnavailable
+}
+
+func TestCommittedResultOwnerFailureRetriesWithoutReceipt(t *testing.T) {
+	consumer, repo, students, plan := committedFixture(t)
+	event := committedEvent(plan, students.result)
+	consumer.Students = unavailableCommittedStudent{students}
+	if _, _, err := consumer.ProcessCommittedResult(context.Background(), event); !errors.Is(err, domain.ErrUpstreamUnavailable) || len(repo.placements) != 0 {
+		t.Fatalf("receipts=%d err=%v", len(repo.placements), err)
+	}
+	consumer.Students = students
+	if _, created, err := consumer.ProcessCommittedResult(context.Background(), event); err != nil || !created || len(repo.placements) != 1 {
+		t.Fatalf("created=%v receipts=%d err=%v", created, len(repo.placements), err)
+	}
+}
+
+type failedPlacementWrite struct{ *testRepo }
+
+func (r failedPlacementWrite) InsertDiagnosticPlacement(context.Context, domain.DiagnosticPlacementRecord) (domain.DiagnosticPlacementRecord, error) {
+	return domain.DiagnosticPlacementRecord{}, errors.New("placement persistence unavailable")
+}
+func TestCommittedResultPersistenceFailureDoesNotComplete(t *testing.T) {
+	consumer, repo, students, plan := committedFixture(t)
+	consumer.Placements = failedPlacementWrite{repo}
+	if _, created, err := consumer.ProcessCommittedResult(context.Background(), committedEvent(plan, students.result)); err == nil || created || len(repo.placements) != 0 {
+		t.Fatalf("created=%v receipts=%d err=%v", created, len(repo.placements), err)
+	}
+}

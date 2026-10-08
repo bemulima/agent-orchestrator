@@ -1,0 +1,637 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/google/uuid"
+)
+
+const maximumResponseBytes = 1 << 20
+const maximumPlanningReadinessResponseBytes = 16 << 10
+
+const learnerOverviewVersion = "student-learner-overview-v2"
+
+type Client struct {
+	BaseURL    string
+	ReadToken  string
+	WriteToken string
+	HTTPClient *http.Client
+}
+
+type planningReadinessSnapshotWire struct {
+	Schema         string                          `json:"schema"`
+	StudentID      string                          `json:"student_id"`
+	StateRef       domain.StudentReadinessStateRef `json:"state_ref"`
+	LearningIntent json.RawMessage                 `json:"learning_intent"`
+	Profile        planningReadinessProfileWire    `json:"profile"`
+	ActivePath     json.RawMessage                 `json:"active_path"`
+}
+
+type planningReadinessProfileWire struct {
+	DirectionCode          json.RawMessage             `json:"direction_code"`
+	SelfAssessedExperience json.RawMessage             `json:"self_assessed_experience"`
+	KnownStacks            planningReadinessStacksWire `json:"known_stacks"`
+	DesiredStacks          planningReadinessStacksWire `json:"desired_stacks"`
+	PreferredLanguage      json.RawMessage             `json:"preferred_language"`
+	ContentLanguage        json.RawMessage             `json:"content_language"`
+	WeeklyMinutes          json.RawMessage             `json:"weekly_minutes"`
+	PreferredPace          json.RawMessage             `json:"preferred_pace"`
+}
+
+type planningReadinessStacksWire struct {
+	State  string          `json:"state"`
+	Values json.RawMessage `json:"values"`
+}
+
+func (client Client) GetPlanningReadiness(ctx context.Context, studentID string) (domain.StudentPlanningReadinessSnapshot, error) {
+	if !isCanonicalUUID(studentID) {
+		return domain.StudentPlanningReadinessSnapshot{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/planning-readiness"
+	var wire planningReadinessSnapshotWire
+	if err := client.doStrictReadinessGET(ctx, requestURL, &wire); err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	snapshot, err := readinessSnapshotFromWire(wire)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	snapshot, err = domain.NormalizeStudentPlanningReadinessSnapshot(snapshot)
+	if err != nil || snapshot.StudentID != studentID {
+		return domain.StudentPlanningReadinessSnapshot{}, domain.ErrValidation
+	}
+	return snapshot, nil
+}
+
+func readinessSnapshotFromWire(wire planningReadinessSnapshotWire) (domain.StudentPlanningReadinessSnapshot, error) {
+	direction, err := decodeOptionalReadiness[string](wire.Profile.DirectionCode)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	experience, err := decodeOptionalReadiness[string](wire.Profile.SelfAssessedExperience)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	intent, err := decodeOptionalReadiness[domain.StudentReadinessLearningIntent](wire.LearningIntent)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	preferredLanguage, err := decodeOptionalReadiness[domain.StudentReadinessLanguage](wire.Profile.PreferredLanguage)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	contentLanguage, err := decodeOptionalReadiness[domain.StudentReadinessLanguage](wire.Profile.ContentLanguage)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	weeklyMinutes, err := decodeOptionalReadiness[int](wire.Profile.WeeklyMinutes)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	preferredPace, err := decodeOptionalReadiness[string](wire.Profile.PreferredPace)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	activePath, err := decodeOptionalReadiness[domain.StudentReadinessActivePath](wire.ActivePath)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	known, err := readinessStacksFromWire(wire.Profile.KnownStacks)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	desired, err := readinessStacksFromWire(wire.Profile.DesiredStacks)
+	if err != nil {
+		return domain.StudentPlanningReadinessSnapshot{}, err
+	}
+	snapshot := domain.StudentPlanningReadinessSnapshot{
+		Schema: wire.Schema, StudentID: wire.StudentID, StateRef: wire.StateRef,
+		LearningIntent: intent, ActivePath: activePath,
+		Profile: domain.StudentReadinessProfile{
+			KnownStacks: known, DesiredStacks: desired,
+			PreferredLanguage: preferredLanguage, ContentLanguage: contentLanguage,
+			WeeklyMinutes: weeklyMinutes, PreferredPace: preferredPace,
+		},
+	}
+	if direction != nil {
+		snapshot.Profile.DirectionCode = *direction
+	}
+	if experience != nil {
+		snapshot.Profile.SelfAssessedExperience = *experience
+	}
+	return snapshot, nil
+}
+
+func readinessStacksFromWire(wire planningReadinessStacksWire) (domain.StudentReadinessStackValues, error) {
+	result := domain.StudentReadinessStackValues{State: wire.State, ValuesPresent: wire.Values != nil}
+	if wire.Values != nil {
+		if err := decodeStrictReadinessJSON(wire.Values, &result.Values); err != nil || result.Values == nil {
+			return domain.StudentReadinessStackValues{}, domain.ErrValidation
+		}
+	}
+	return result, nil
+}
+
+func decodeOptionalReadiness[T any](raw json.RawMessage) (*T, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	var result T
+	if err := decodeStrictReadinessJSON(raw, &result); err != nil {
+		return nil, domain.ErrValidation
+	}
+	return &result, nil
+}
+
+func decodeStrictReadinessJSON(raw []byte, target any) error {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return domain.ErrValidation
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+func (client Client) doStrictReadinessGET(ctx context.Context, requestURL string, response any) error {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.ReadToken) == "" || client.HTTPClient == nil {
+		return errors.New("student client is not configured")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("X-Internal-Token", client.ReadToken)
+	request.Header.Set("Accept", "application/json")
+	httpResponse, err := client.HTTPClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = httpResponse.Body.Close() }()
+	contents, err := io.ReadAll(io.LimitReader(httpResponse.Body, maximumPlanningReadinessResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(contents) > maximumPlanningReadinessResponseBytes {
+		return errors.New("student planning readiness response exceeds limit")
+	}
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		switch httpResponse.StatusCode {
+		case http.StatusNotFound:
+			return domain.ErrNotFound
+		case http.StatusConflict:
+			return domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domain.ErrValidation
+		default:
+			return fmt.Errorf("student returned status %d", httpResponse.StatusCode)
+		}
+	}
+	if err := decodeStrictReadinessJSON(contents, response); err != nil {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+func (client Client) GetPlanningProfile(ctx context.Context, studentID string) (domain.StudentPlanningProfile, error) {
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.StudentPlanningProfile{}, domain.ErrValidation
+	}
+	var response struct {
+		StudentID  string `json:"student_id"`
+		Version    string `json:"version"`
+		Onboarding *struct {
+			Version                int64    `json:"version"`
+			DirectionCode          string   `json:"direction_code"`
+			SelfAssessedExperience string   `json:"self_assessed_experience"`
+			KnownStacks            []string `json:"known_stacks"`
+			DesiredStacks          []string `json:"desired_stacks"`
+			GoalCode               string   `json:"goal_code"`
+			PreferredLanguage      string   `json:"preferred_language"`
+			WeeklyMinutes          int      `json:"weekly_minutes"`
+			PreferredPace          string   `json:"preferred_pace"`
+			ProfileVersion         string   `json:"profile_version"`
+		} `json:"onboarding"`
+		LearningPath *struct {
+			CourseID          string `json:"course_id"`
+			GoalCode          string `json:"goal_code"`
+			CourseFingerprint string `json:"course_fingerprint"`
+			Version           int64  `json:"version"`
+		} `json:"learning_path"`
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" + url.PathEscape(studentID) + "/learner-overview"
+	if err := client.doJSON(ctx, http.MethodGet, requestURL, client.ReadToken, "", nil, &response); err != nil {
+		return domain.StudentPlanningProfile{}, err
+	}
+	if response.StudentID != studentID || response.Version != learnerOverviewVersion {
+		return domain.StudentPlanningProfile{}, domain.ErrValidation
+	}
+	if response.Onboarding == nil {
+		return domain.StudentPlanningProfile{}, domain.ErrNotFound
+	}
+	if response.Onboarding.Version < 1 {
+		return domain.StudentPlanningProfile{}, domain.ErrValidation
+	}
+	profile, err := domain.NormalizeStudentPlanningProfile(domain.StudentPlanningProfile{
+		DirectionCode:          response.Onboarding.DirectionCode,
+		SelfAssessedExperience: response.Onboarding.SelfAssessedExperience,
+		KnownStacks:            response.Onboarding.KnownStacks, DesiredStacks: response.Onboarding.DesiredStacks,
+		GoalCode: response.Onboarding.GoalCode, PreferredLanguage: response.Onboarding.PreferredLanguage,
+		WeeklyMinutes: response.Onboarding.WeeklyMinutes, PreferredPace: response.Onboarding.PreferredPace,
+		ProfileVersion:    response.Onboarding.ProfileVersion,
+		OnboardingVersion: response.Onboarding.Version,
+	})
+	if err != nil {
+		return domain.StudentPlanningProfile{}, err
+	}
+	if response.LearningPath != nil {
+		if response.LearningPath.Version < 1 {
+			return domain.StudentPlanningProfile{}, domain.ErrValidation
+		}
+		profile.LearningPathVersion = response.LearningPath.Version
+		profile.LearningPathCourseID = strings.TrimSpace(response.LearningPath.CourseID)
+		profile.LearningPathGoalCode = strings.ToLower(strings.TrimSpace(response.LearningPath.GoalCode))
+		profile.LearningPathRevision = strings.TrimSpace(response.LearningPath.CourseFingerprint)
+	}
+	return profile, nil
+}
+
+func (client Client) QueryMastery(
+	ctx context.Context,
+	studentID string,
+	targets []domain.TargetRef,
+) ([]domain.TargetMastery, error) {
+	if _, err := uuid.Parse(studentID); err != nil || len(targets) == 0 || len(targets) > 100 {
+		return nil, domain.ErrValidation
+	}
+	var response struct {
+		Items []domain.TargetMastery `json:"items"`
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" + url.PathEscape(studentID) + "/mastery/query"
+	if err := client.doJSON(ctx, http.MethodPost, requestURL, client.ReadToken, "", map[string]any{"targets": targets}, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Items) != len(targets) {
+		return nil, domain.ErrValidation
+	}
+	return response.Items, nil
+}
+
+func (client Client) AssignCourse(
+	ctx context.Context,
+	studentID string,
+	courseID string,
+	planningRequestID string,
+	idempotencyKey string,
+) error {
+	if _, studentErr := uuid.Parse(studentID); studentErr != nil {
+		return domain.ErrValidation
+	}
+	if _, courseErr := uuid.Parse(courseID); courseErr != nil {
+		return domain.ErrValidation
+	}
+	if _, requestErr := uuid.Parse(planningRequestID); requestErr != nil {
+		return domain.ErrValidation
+	}
+	if _, keyErr := uuid.Parse(idempotencyKey); keyErr != nil {
+		return domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/courses/" + url.PathEscape(courseID) + "/assignment"
+	return client.doJSON(ctx, http.MethodPut, requestURL, client.WriteToken, idempotencyKey, map[string]any{
+		"planning_request_id": planningRequestID,
+		"assigned_by":         "learning_planner",
+	}, nil)
+}
+
+func (client Client) CreateLearningPath(
+	ctx context.Context,
+	studentID string,
+	idempotencyKey string,
+	replacement domain.LearningPathReplacement,
+) (domain.LearningPathAllocation, error) {
+	if _, err := uuid.Parse(studentID); err != nil || replacement.ExpectedVersion != 0 || len(replacement.Items) == 0 {
+		return domain.LearningPathAllocation{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domain.LearningPathAllocation{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(replacement.PlanningRequestID); err != nil {
+		return domain.LearningPathAllocation{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/learning-path"
+	var response struct {
+		ID                string `json:"id"`
+		StudentID         string `json:"student_id"`
+		CourseID          string `json:"course_id"`
+		GoalCode          string `json:"goal_code"`
+		CourseFingerprint string `json:"course_fingerprint"`
+		Version           int64  `json:"version"`
+	}
+	if err := client.doJSON(ctx, http.MethodPut, requestURL, client.WriteToken, idempotencyKey, replacement, &response); err != nil {
+		return domain.LearningPathAllocation{}, err
+	}
+	allocation, err := domain.NormalizeLearningPathAllocation(domain.LearningPathAllocation{
+		LearningPathID: response.ID, StudentID: response.StudentID, CourseID: response.CourseID,
+		GoalCode: response.GoalCode, CourseFingerprint: response.CourseFingerprint, PathVersion: response.Version,
+	})
+	if err != nil || allocation.StudentID != studentID || allocation.CourseID != replacement.CourseID ||
+		allocation.GoalCode != strings.ToLower(strings.TrimSpace(replacement.GoalCode)) ||
+		allocation.CourseFingerprint != strings.TrimSpace(replacement.CourseFingerprint) {
+		return domain.LearningPathAllocation{}, domain.ErrValidation
+	}
+	return allocation, nil
+}
+
+func (client Client) GetLearningPathPlanningState(
+	ctx context.Context,
+	studentID string,
+	learningPathID string,
+) (domain.LearningPathPlanningState, error) {
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.LearningPathPlanningState{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(learningPathID); err != nil {
+		return domain.LearningPathPlanningState{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/learning-paths/" + url.PathEscape(learningPathID) + "/planning-state"
+	var state domain.LearningPathPlanningState
+	if err := client.doJSON(ctx, http.MethodGet, requestURL, client.WriteToken, "", nil, &state); err != nil {
+		return domain.LearningPathPlanningState{}, err
+	}
+	state, err := domain.NormalizeLearningPathPlanningState(state)
+	if err != nil || state.StudentID != studentID || state.LearningPathID != learningPathID {
+		return domain.LearningPathPlanningState{}, domain.ErrValidation
+	}
+	return state, nil
+}
+
+func (client Client) ReplanLearningPath(
+	ctx context.Context,
+	studentID string,
+	idempotencyKey string,
+	replan domain.LearningPathReplan,
+) (domain.LearningPathCommandResult, error) {
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	replan, err := domain.NormalizeLearningPathReplan(replan)
+	if err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(replan.PlanningRequestID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/learning-paths/" + url.PathEscape(replanPathID(replan))
+	return client.applyLearningPathCommand(ctx, requestURL, idempotencyKey, replan.PlanningRequestID, "REPLAN", studentID, replanPathID(replan), replan)
+}
+
+func (client Client) CompleteLearningPath(
+	ctx context.Context,
+	studentID string,
+	idempotencyKey string,
+	completion domain.LearningPathCompletion,
+) (domain.LearningPathCommandResult, error) {
+	if _, err := uuid.Parse(studentID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	completion, err := domain.NormalizeLearningPathCompletion(completion)
+	if err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(completion.PlanningRequestID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	pathID := strings.TrimSpace(completion.LearningPathID)
+	if _, err := uuid.Parse(pathID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/students/" +
+		url.PathEscape(studentID) + "/learning-paths/" + url.PathEscape(pathID) + "/completion"
+	return client.applyLearningPathCommand(ctx, requestURL, idempotencyKey, completion.PlanningRequestID, "NO_GAP", studentID, pathID, completion)
+}
+
+// ReserveDiagnosticAssessment delivers Planner's immutable fixed plan to the
+// Student-owned placement boundary. It is replay-safe on plan.ID only.
+func (client Client) ReserveDiagnosticAssessment(ctx context.Context, studentID string, plan domain.DiagnosticAssessmentPlan) (domain.DiagnosticAssessmentReservation, error) {
+	if domain.ValidateDiagnosticPlan(plan) != nil || studentID != plan.StudentID {
+		return domain.DiagnosticAssessmentReservation{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/v1/students/" + url.PathEscape(studentID) + "/diagnostic-assessments/" + url.PathEscape(plan.ID) + "/reserve"
+	var receipt domain.DiagnosticAssessmentReservation
+	if err := client.doDiagnosticJSON(ctx, http.MethodPost, requestURL, plan.ID, plan, &receipt); err != nil {
+		return domain.DiagnosticAssessmentReservation{}, err
+	}
+	if err := domain.ValidateDiagnosticReservation(receipt, plan); err != nil {
+		return domain.DiagnosticAssessmentReservation{}, domain.ErrUpstreamInvalid
+	}
+	return receipt, nil
+}
+
+func (client Client) GetDiagnosticAssessmentResult(ctx context.Context, studentID string, attemptID string) (domain.DiagnosticAssessmentResult, error) {
+	if !isCanonicalUUID(studentID) || !isCanonicalUUID(attemptID) {
+		return domain.DiagnosticAssessmentResult{}, domain.ErrValidation
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/internal/v1/students/" + url.PathEscape(studentID) + "/diagnostic-assessments/" + url.PathEscape(attemptID) + "/result"
+	var result domain.DiagnosticAssessmentResult
+	if err := client.doDiagnosticJSON(ctx, http.MethodGet, requestURL, "", nil, &result); err != nil {
+		return domain.DiagnosticAssessmentResult{}, err
+	}
+	return result, nil
+}
+
+func replanPathID(replan domain.LearningPathReplan) string {
+	return strings.TrimSpace(replan.LearningPathID)
+}
+
+func (client Client) applyLearningPathCommand(
+	ctx context.Context,
+	requestURL string,
+	idempotencyKey string,
+	planningRequestID string,
+	command string,
+	studentID string,
+	learningPathID string,
+	payload any,
+) (domain.LearningPathCommandResult, error) {
+	if _, err := uuid.Parse(learningPathID); err != nil {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	var result domain.LearningPathCommandResult
+	if err := client.doJSON(ctx, http.MethodPut, requestURL, client.WriteToken, idempotencyKey, payload, &result); err != nil {
+		return domain.LearningPathCommandResult{}, err
+	}
+	result, err := domain.NormalizeLearningPathCommandResult(result)
+	if err != nil || result.PlanningRequestID != planningRequestID || result.Command != command ||
+		result.State.StudentID != studentID || result.State.LearningPathID != learningPathID {
+		return domain.LearningPathCommandResult{}, domain.ErrValidation
+	}
+	return result, nil
+}
+
+func (client Client) doJSON(
+	ctx context.Context,
+	method string,
+	requestURL string,
+	token string,
+	idempotencyKey string,
+	payload any,
+	response any,
+) error {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(token) == "" || client.HTTPClient == nil {
+		return errors.New("student client is not configured")
+	}
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, requestURL, body)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("X-Internal-Token", token)
+	request.Header.Set("Accept", "application/json")
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	httpResponse, err := client.HTTPClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = httpResponse.Body.Close() }()
+	limited := io.LimitReader(httpResponse.Body, maximumResponseBytes+1)
+	contents, err := io.ReadAll(limited)
+	if err != nil {
+		return err
+	}
+	if len(contents) > maximumResponseBytes {
+		return errors.New("student response exceeds limit")
+	}
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		switch httpResponse.StatusCode {
+		case http.StatusNotFound:
+			return domain.ErrNotFound
+		case http.StatusConflict:
+			if strings.TrimSpace(string(contents)) == "diagnostic_context_stale" {
+				return domain.ErrDiagnosticContextStale
+			}
+			return domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domain.ErrValidation
+		default:
+			return fmt.Errorf("student returned status %d", httpResponse.StatusCode)
+		}
+	}
+	if response == nil {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	if err := decoder.Decode(response); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (client Client) doDiagnosticJSON(ctx context.Context, method, requestURL, idempotencyKey string, payload any, response any) error {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.WriteToken) == "" || client.HTTPClient == nil {
+		return errors.New("student diagnostic client is not configured")
+	}
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Internal-Token", client.WriteToken)
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	noRedirect := *client.HTTPClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	res, err := noRedirect.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = res.Body.Close() }()
+	contents, err := io.ReadAll(io.LimitReader(res.Body, maximumResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(contents) > maximumResponseBytes {
+		return domain.ErrUpstreamInvalid
+	}
+	if res.StatusCode == http.StatusNotFound {
+		return domain.ErrNotFound
+	}
+	if res.StatusCode >= 500 {
+		return domain.ErrUpstreamUnavailable
+	}
+	if res.StatusCode != http.StatusOK {
+		return domain.ErrUpstreamInvalid
+	}
+	media, _, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
+	if err != nil || media != "application/json" {
+		return domain.ErrUpstreamInvalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(response); err != nil {
+		return domain.ErrUpstreamInvalid
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.ErrUpstreamInvalid
+	}
+	return nil
+}
+
+func isCanonicalUUID(raw string) bool {
+	value, err := uuid.Parse(raw)
+	return err == nil && value.String() == raw
+}
+
+var _ domainservice.StudentService = Client{}
+var _ domainservice.StudentPlanningReadinessService = Client{}
+var _ domainservice.DiagnosticAssessmentStudentService = Client{}

@@ -1,0 +1,175 @@
+package student
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	svc "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+const admissionRequestSchema = "student-onboarding-path-admission-request.v1"
+const admissionMaterializationSchema = "student-onboarding-path-admission-materialization.v1"
+const admissionResultSchema = "student-onboarding-path-materialization.v1"
+
+func (c Client) ReserveOnboardingPathExecution(ctx context.Context, h domain.OnboardingPlanHandoffRecord, executionID, key string) (svc.OnboardingPathAdmission, error) {
+	body := map[string]any{"schema": admissionRequestSchema, "handoff_id": h.HandoffID, "execution_id": executionID, "expected_state_ref": h.StateRef, "goal": h.Goal}
+	var out admissionResponse
+	err := c.doAdmission(ctx, http.MethodPost, "/students/"+url.PathEscape(h.StudentID)+"/onboarding-path-admissions", key, body, &out)
+	if err != nil {
+		return svc.OnboardingPathAdmission{}, err
+	}
+	if err := out.validate(h.StudentID, h.HandoffID, executionID, h.StateRef, h.Goal); err != nil {
+		return svc.OnboardingPathAdmission{}, domain.ErrValidation
+	}
+	return svc.OnboardingPathAdmission{AdmissionID: out.AdmissionID, Fence: out.Fence, Replayed: out.Replayed, ExpiresAt: out.ExpiresAt}, nil
+}
+func (c Client) RenewOnboardingPathExecution(ctx context.Context, handoff domain.OnboardingPlanHandoffRecord, admission string, fence int64, execution, key string) (svc.OnboardingPathAdmission, error) {
+	var out admissionResponse
+	err := c.doAdmission(ctx, http.MethodPost, "/students/"+url.PathEscape(handoff.StudentID)+"/onboarding-path-admissions/"+url.PathEscape(admission)+"/renewal", key, map[string]any{"schema": "student-onboarding-path-admission-renewal.v1", "execution_id": execution, "fence": fence}, &out)
+	if err != nil {
+		return svc.OnboardingPathAdmission{}, err
+	}
+	if err := out.validate(handoff.StudentID, handoff.HandoffID, execution, handoff.StateRef, handoff.Goal); err != nil || out.AdmissionID != admission || out.Fence < fence {
+		return svc.OnboardingPathAdmission{}, domain.ErrValidation
+	}
+	return svc.OnboardingPathAdmission{AdmissionID: out.AdmissionID, Fence: out.Fence, Replayed: out.Replayed, ExpiresAt: out.ExpiresAt}, nil
+}
+func (c Client) MaterializeOnboardingPathExecution(ctx context.Context, in svc.OnboardingPathMaterialization) (svc.OnboardingPathMaterialization, error) {
+	var out materializationResponse
+	lessons := make([]map[string]any, len(in.Lessons))
+	for i, l := range in.Lessons {
+		lessons[i] = map[string]any{"lesson_id": l.LessonID, "lesson_revision_id": l.LessonRevisionID, "targets": l.Targets}
+	}
+	body := map[string]any{"schema": admissionMaterializationSchema, "execution_id": in.ExecutionID, "fence": in.Fence, "course": map[string]any{"course_id": in.CourseID, "course_fingerprint": in.CourseFingerprint, "planner_policy_version": in.PlannerPolicyVersion, "reason_code": in.ReasonCode, "reason_summary": in.ReasonSummary}, "lessons": lessons}
+	err := c.doAdmission(ctx, http.MethodPut, "/students/"+url.PathEscape(in.StudentID)+"/onboarding-path-admissions/"+url.PathEscape(in.AdmissionID)+"/materialization", in.IdempotencyKey, body, &out)
+	if err != nil {
+		return in, err
+	}
+	if out.Schema != admissionResultSchema || out.Status != "MATERIALIZED" || out.AdmissionID != in.AdmissionID || out.CourseID != in.CourseID || !isCanonicalUUID(out.AssignmentID) || !isCanonicalUUID(out.LearningPathID) || !isCanonicalUUID(out.FirstLessonID) || out.LearningPathVersion < 1 || out.JourneyVersion < 1 {
+		return in, domain.ErrValidation
+	}
+	in.Status = "PATH_READY"
+	in.LearningPathID = out.LearningPathID
+	in.FirstLessonID = out.FirstLessonID
+	in.Replayed = out.Replayed
+	return in, nil
+}
+func (c Client) AbortOnboardingPathExecution(ctx context.Context, handoff domain.OnboardingPlanHandoffRecord, admission string, fence int64, execution, reason, key string) error {
+	var out admissionResponse
+	if err := c.doAdmission(ctx, http.MethodPost, "/students/"+url.PathEscape(handoff.StudentID)+"/onboarding-path-admissions/"+url.PathEscape(admission)+"/abort", key, map[string]any{"schema": "student-onboarding-path-admission-abort.v1", "execution_id": execution, "fence": fence, "reason": reason}, &out); err != nil {
+		return err
+	}
+	if out.Schema != "student-onboarding-path-admission.v1" || out.StudentID != handoff.StudentID || out.HandoffID != handoff.HandoffID || out.ExecutionID != execution || out.StateRef != handoff.StateRef || out.Goal != handoff.Goal || out.AdmissionID != admission || out.Status != "ABORTED" || out.Fence != fence || out.ExpiresAt.IsZero() {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+type admissionResponse struct {
+	Schema      string                          `json:"schema"`
+	AdmissionID string                          `json:"admission_id"`
+	StudentID   string                          `json:"student_id"`
+	HandoffID   string                          `json:"handoff_id"`
+	ExecutionID string                          `json:"execution_id"`
+	StateRef    domain.StudentReadinessStateRef `json:"state_ref"`
+	Goal        domain.LearningReadinessGoal    `json:"goal"`
+	Status      string                          `json:"status"`
+	Fence       int64                           `json:"fence"`
+	ExpiresAt   time.Time                       `json:"expires_at"`
+	Replayed    bool                            `json:"replayed"`
+}
+
+type materializationResponse struct {
+	Schema              string `json:"schema"`
+	AdmissionID         string `json:"admission_id"`
+	Status              string `json:"status"`
+	CourseID            string `json:"course_id"`
+	AssignmentID        string `json:"assignment_id"`
+	LearningPathID      string `json:"learning_path_id"`
+	FirstLessonID       string `json:"first_lesson_id"`
+	LearningPathVersion int64  `json:"learning_path_version"`
+	JourneyVersion      int64  `json:"journey_version"`
+	Replayed            bool   `json:"replayed"`
+}
+
+func (out admissionResponse) validate(student, handoff, execution string, state domain.StudentReadinessStateRef, goal domain.LearningReadinessGoal) error {
+	if out.Schema != "student-onboarding-path-admission.v1" || !isCanonicalUUID(out.AdmissionID) || !isCanonicalUUID(out.StudentID) || !isCanonicalUUID(out.HandoffID) || !isCanonicalUUID(out.ExecutionID) || out.StudentID != student || out.ExecutionID != execution || out.Status != "RESERVED" || out.Fence < 1 || out.ExpiresAt.IsZero() {
+		return domain.ErrValidation
+	}
+	if handoff != "" && (out.HandoffID != handoff || out.StateRef != state || out.Goal != goal) {
+		return domain.ErrValidation
+	}
+	return nil
+}
+func (c Client) doAdmission(ctx context.Context, method, path, key string, body any, out any) error {
+	if c.BaseURL == "" || c.WriteToken == "" || c.HTTPClient == nil || !isCanonicalUUID(key) {
+		return domain.ErrValidation
+	}
+	b, e := json.Marshal(body)
+	if e != nil {
+		return e
+	}
+	r, e := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.BaseURL, "/")+"/internal"+path, bytes.NewReader(b))
+	if e != nil {
+		return e
+	}
+	r.Header.Set("X-Internal-Token", c.WriteToken)
+	r.Header.Set("Idempotency-Key", key)
+	r.Header.Set("Content-Type", "application/json")
+	resp, e := c.HTTPClient.Do(r)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	raw, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if e != nil {
+		return e
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == 409 {
+			var failure struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(raw, &failure) == nil {
+				switch failure.Error.Code {
+				case "state_changed":
+					return domain.ErrStateChanged
+				case "active_path_exists":
+					return domain.ErrActivePathExists
+				}
+			}
+			return domain.ErrConflict
+		}
+		if resp.StatusCode == 422 {
+			return domain.ErrValidation
+		}
+		return fmt.Errorf("student admission returned status %d", resp.StatusCode)
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if e = d.Decode(out); e != nil {
+		return domain.ErrValidation
+	}
+	if e = d.Decode(&struct{}{}); !errors.Is(e, io.EOF) {
+		return domain.ErrValidation
+	}
+	if replay, ok := out.(interface{ isAdmissionReplay() bool }); ok {
+		if (resp.StatusCode == http.StatusOK) != replay.isAdmissionReplay() {
+			return domain.ErrValidation
+		}
+	}
+	return nil
+}
+
+func (out *admissionResponse) isAdmissionReplay() bool       { return out.Replayed }
+func (out *materializationResponse) isAdmissionReplay() bool { return out.Replayed }

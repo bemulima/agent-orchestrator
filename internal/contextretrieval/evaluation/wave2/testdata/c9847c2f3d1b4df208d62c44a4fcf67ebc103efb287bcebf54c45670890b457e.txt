@@ -1,0 +1,221 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	runtimehttp "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+)
+
+// TestT13ServeAssistanceHTTP is a root-gated actual Runtime HTTP/PG fixture.
+// The revision/route/IN_PROGRESS instance is synthetic test data; no Start,
+// official submission, validator PASS, Student event or live provider is claimed.
+// The private control endpoint changes ONLY this synthetic lifecycle through
+// explicitly declared synthetic SQL. Schema-required submission/run FK anchors
+// remain PENDING/VALIDATING, with no official outcome, grading or outbox evidence.
+// Lifecycle values are test inputs, never completion proof; owner is immutable.
+func TestT13ServeAssistanceHTTP(t *testing.T) {
+	if os.Getenv("T13_SERVE_RUNTIME") != "true" {
+		t.Skip("owned T13 Runtime fixture gate absent")
+	}
+	ready, stop, result := os.Getenv("T13_RUNTIME_READY_FILE"), os.Getenv("T13_RUNTIME_STOP_FILE"), os.Getenv("T13_RUNTIME_RESULT_FILE")
+	internal, teacher := os.Getenv("T13_RUNTIME_TOKEN"), os.Getenv("T13_TEACHER_TOKEN")
+	if ready == "" || stop == "" || result == "" || internal == "" || teacher == "" || internal == teacher {
+		t.Fatal("missing or unscoped Runtime fixture configuration")
+	}
+	if _, e := os.Stat(stop); !errors.Is(e, os.ErrNotExist) {
+		t.Fatal("stop marker must be absent")
+	}
+	repo, db := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	instance.ID, instance.StudentID, instance.TaskRevisionID, instance.SolutionVariantID = t12FeedbackUUID(t), t12FeedbackUUID(t), t12FeedbackUUID(t), t12FeedbackUUID(t)
+	instance.LearningActionID = t12FeedbackUUID(t)
+	instance.Steps[0].ID = t12FeedbackUUID(t)
+	instance.CurrentStep = &instance.Steps[0]
+	instance.RevisionSummary.RevisionID, instance.RevisionSummary.VariantID = instance.TaskRevisionID, instance.SolutionVariantID
+	instance.RevisionEnvelope.Revision.ID = instance.TaskRevisionID
+	instance.RevisionSummary.Title, instance.RevisionSummary.Type = "Synthetic assistance fixture", "BUILD"
+	instance.RevisionSummary.PublishedAt = time.Now().UTC()
+	instance.StartCommandDigest = "sha256:" + strings.Repeat("e", 64)
+	var err error
+	instance, _, err = repo.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal("synthetic instance persistence failed")
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance, err = repo.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal("synthetic lifecycle seed failed")
+	}
+	anchorSubmission, anchorRun, anchorKey := t12FeedbackUUID(t), t12FeedbackUUID(t), t12FeedbackUUID(t)
+	var mu sync.Mutex
+	snapshot := func() (map[string]any, error) {
+		loaded, e := NewRepository(db).GetInstance(ctx, instance.StudentID, instance.ID)
+		if e != nil {
+			return nil, e
+		}
+		var count, submissionAnchors, runAnchors, officialOutcomes, evidence int
+		if e = db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM practice_assistance_receipts WHERE task_instance_id=$1),(SELECT count(*) FROM practice_submissions WHERE task_instance_id=$1 AND status='VALIDATING'),(SELECT count(*) FROM practice_validation_runs WHERE task_instance_id=$1 AND status='PENDING'),(SELECT count(*) FROM practice_validation_runs WHERE task_instance_id=$1 AND outcome IS NOT NULL),(SELECT count(*) FROM practice_student_evidence_outbox WHERE task_instance_id=$1)`, instance.ID).Scan(&count, &submissionAnchors, &runAnchors, &officialOutcomes, &evidence); e != nil {
+			return nil, e
+		}
+		rows, e := db.QueryContext(ctx, `SELECT receipt FROM practice_assistance_receipts WHERE task_instance_id=$1 ORDER BY usage_id`, instance.ID)
+		if e != nil {
+			return nil, e
+		}
+		defer rows.Close()
+		receipts := []json.RawMessage{}
+		for rows.Next() {
+			var raw []byte
+			if e = rows.Scan(&raw); e != nil {
+				return nil, e
+			}
+			receipts = append(receipts, json.RawMessage(raw))
+		}
+		if e = rows.Err(); e != nil {
+			return nil, e
+		}
+		return map[string]any{"student_id": loaded.StudentID, "task_instance_id": loaded.ID, "status": loaded.Status, "version": loaded.Version, "receipt_count": count, "hints_used": loaded.HintsUsed, "teacher_assistance_used": loaded.TeacherAssistanceUsed, "receipts": receipts, "synthetic_validating_submission_anchor_count": submissionAnchors, "synthetic_pending_run_anchor_count": runAnchors, "official_outcome_count": officialOutcomes, "evidence_outbox_count": evidence, "classification": "synthetic lifecycle SQL with pending FK anchors; no validation or completion proof"}, nil
+	}
+	writeResponse := func(w http.ResponseWriter, value any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	production := (&runtimehttp.Server{Runtime: &usecase.Runtime{Repository: NewRepository(db)}, InternalToken: internal, TeacherToken: teacher}).Handler()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__t13/control", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != internal {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var command struct {
+			Action string                    `json:"action"`
+			Status domain.TaskInstanceStatus `json:"status"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&command) != nil || command.Action != "lifecycle" || (command.Status != domain.TaskInstanceInReview && command.Status != domain.TaskInstanceCompleted) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		current, e := NewRepository(db).GetInstance(r.Context(), instance.StudentID, instance.ID)
+		if e != nil || current.StudentID != instance.StudentID {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// This is deliberately synthetic lifecycle fixture SQL. Canonical
+		// transitions require official validation/review and cannot be used
+		// without fabricating grading. The isolated row keeps its immutable
+		// binding; FK anchors have no PASS/FAIL/ERROR outcome or evidence.
+		transaction, e := db.BeginTx(r.Context(), nil)
+		if e != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer transaction.Rollback()
+		digest := "sha256:" + strings.Repeat("f", 64)
+		_, e = transaction.ExecContext(r.Context(), `INSERT INTO practice_submissions
+         (id,task_instance_id,student_id,idempotency_key,command_digest,scope,status,snapshot,workspace_digest,revision_digest,validation_contract_digest,validation_specification,current_run_id,payload,created_at,updated_at)
+         VALUES($1,$2,$3,$4,$5,'FINAL','VALIDATING','{}'::jsonb,$5,$6,$5,'{"synthetic_t13_lifecycle_fk_anchor":true}'::jsonb,$7,'{"synthetic_t13_lifecycle_fk_anchor":true}'::jsonb,$8,$8) ON CONFLICT(id) DO NOTHING`, anchorSubmission, instance.ID, instance.StudentID, anchorKey, digest, instance.TaskRevisionDigest, anchorRun, time.Now().UTC())
+		if e == nil {
+			_, e = transaction.ExecContext(r.Context(), `INSERT INTO practice_validation_runs(id,task_instance_id,submission_id,ordinal,status,payload) VALUES($1,$2,$3,1,'PENDING','{"synthetic_t13_lifecycle_fk_anchor":true}'::jsonb) ON CONFLICT(id) DO NOTHING`, anchorRun, instance.ID, anchorSubmission)
+		}
+		current.Status = command.Status
+		current.CurrentSubmissionID = anchorSubmission
+		current.Version++
+		current.UpdatedAt = time.Now().UTC()
+		if command.Status == domain.TaskInstanceCompleted {
+			current.FinalSubmissionID = anchorSubmission
+			at := current.UpdatedAt
+			current.CompletedAt = &at
+		}
+		encoded, encodeErr := marshalInstance(current)
+		if e == nil {
+			e = encodeErr
+		}
+		if e == nil {
+			_, e = transaction.ExecContext(r.Context(), `UPDATE practice_task_instances SET status=$3,current_submission_id=$4,final_submission_id=$5,completed_at=$6,version=$7,payload=$8::jsonb,updated_at=$9 WHERE id=$1 AND student_id=$2`, instance.ID, instance.StudentID, current.Status, anchorSubmission, nullableUUID(current.FinalSubmissionID), nullableTime(current.CompletedAt), current.Version, encoded, current.UpdatedAt)
+		}
+		if e == nil {
+			e = transaction.Commit()
+		}
+		if e != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		safe, e := snapshot()
+		if e != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeResponse(w, safe)
+	})
+	mux.HandleFunc("GET /__t13/inspect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != internal {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		safe, e := snapshot()
+		if e != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeResponse(w, safe)
+	})
+	mux.Handle("/", production)
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal("owned Runtime listener unavailable")
+	}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	defer server.Close()
+	errorsCh := make(chan error, 1)
+	go func() { errorsCh <- server.Serve(listener) }()
+	var schema string
+	if db.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema) != nil {
+		t.Fatal("owned schema lookup failed")
+	}
+	t12FeedbackWriteJSON(t, ready, map[string]any{"url": "http://" + listener.Addr().String(), "student_id": instance.StudentID, "task_instance_id": instance.ID, "learning_action_id": instance.LearningActionID, "step_id": instance.Steps[0].ID, "database_schema": schema, "classification": "actual Runtime registered HTTP/usecase/PostgreSQL; synthetic frozen IN_PROGRESS instance; synthetic lifecycle SQL with PENDING/VALIDATING FK anchors only; no Start, official outcome, validation execution, evidence or completion proof"})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
+	for {
+		select {
+		case e := <-errorsCh:
+			if !errors.Is(e, http.ErrServerClosed) {
+				t.Fatal("owned Runtime listener failed")
+			}
+			return
+		case <-deadline.C:
+			t.Fatal("owned Runtime fixture deadline exceeded")
+		case <-ticker.C:
+			if _, e := os.Stat(stop); e == nil {
+				safe, e := snapshot()
+				if e != nil {
+					t.Fatal("safe Runtime result read failed")
+				}
+				t12FeedbackWriteJSON(t, result, safe)
+				return
+			} else if !errors.Is(e, os.ErrNotExist) {
+				t.Fatal("stop marker read failed")
+			}
+		}
+	}
+}

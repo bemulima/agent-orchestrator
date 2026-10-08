@@ -1,0 +1,519 @@
+package courseplan
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+// Reconstruct the processor from only the repository's retained retry state.
+// Course succeeded before Student went down; the learner changed in between.
+func TestPinnedPlanRetryKeepsGeneratedCourseFingerprintAfterLearnerChanges(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requests := &processorRequestRepository{claimed: planningRequest(now)}
+	student := &changingMasteryStudent{processorStudentService: &processorStudentService{profile: testPlanningProfile(), assignmentErr: errors.New("assignment outage")}}
+	course := &recordingCheckpointCourse{processorCourseService: &processorCourseService{result: domain.EnsureCourseResult{CourseID: "33333333-3333-4333-8333-333333333333", Lessons: []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}}}}}
+	p := testProcessor(now, requests, student.processorStudentService, course.processorCourseService)
+	p.Students, p.Courses = student, course
+	if processed, err := p.ProcessNext(context.Background()); !processed || err == nil || requests.retried == nil || course.calls != 1 {
+		t.Fatalf("first attempt did not reach Course partial success and persisted retry: processed=%v err=%v", processed, err)
+	}
+	first := *requests.retried
+	var original domain.GeneratedCourse
+	if err := json.Unmarshal(first.GeneratedCourseJSON, &original); err != nil || original.Fingerprint == "" {
+		t.Fatalf("retained generated Course: %v", err)
+	}
+	requests.claimed = first
+	student.assignmentErr = nil
+	student.profile.PreferredLanguage = "en"
+	student.masterFirst = true
+	reconstructed := testProcessor(now.Add(time.Second), requests, student.processorStudentService, course.processorCourseService)
+	reconstructed.Students, reconstructed.Courses = student, course
+	if processed, err := reconstructed.ProcessNext(context.Background()); !processed || err != nil || requests.completed == nil {
+		t.Fatalf("reconstructed retry: processed=%v err=%v", processed, err)
+	}
+	if requests.completed.CourseFingerprint != original.Fingerprint || string(requests.completed.NormalizedContextJSON) != string(first.NormalizedContextJSON) || student.created.CourseFingerprint != original.Fingerprint {
+		t.Fatalf("old generated Course paired with newer planning identity: Course=%s persisted=%s Student=%s old_context=%s new_context=%s", original.Fingerprint, requests.completed.CourseFingerprint, student.created.CourseFingerprint, first.NormalizedContextJSON, requests.completed.NormalizedContextJSON)
+	}
+}
+
+type changingMasteryStudent struct {
+	*processorStudentService
+	masterFirst bool
+}
+
+func (s *changingMasteryStudent) QueryMastery(ctx context.Context, studentID string, targets []domain.TargetRef) ([]domain.TargetMastery, error) {
+	items, err := s.processorStudentService.QueryMastery(ctx, studentID, targets)
+	if s.masterFirst && len(items) > 0 {
+		items[0].State = domain.MasteryMastered
+		items[0].Confidence = 1
+		items[0].MasteryScore = 1
+	}
+	return items, err
+}
+
+type recordingCheckpointCourse struct {
+	*processorCourseService
+	drafts []domain.GeneratedCourse
+}
+
+func (s *recordingCheckpointCourse) EnsureCourse(ctx context.Context, draft domain.GeneratedCourse, key string) (domain.EnsureCourseResult, error) {
+	s.drafts = append(s.drafts, draft)
+	return s.processorCourseService.EnsureCourse(ctx, draft, key)
+}
+
+func (r *processorRequestRepository) GetPlanningInput(_ context.Context, request domain.CoursePlanRequest) (domain.PlanningInputCheckpoint, error) {
+	if r.pinReadErr != nil {
+		return domain.PlanningInputCheckpoint{}, r.pinReadErr
+	}
+	if r.planningInput == nil {
+		return domain.PlanningInputCheckpoint{}, domain.ErrNotFound
+	}
+	return *r.planningInput, r.planningInput.Validate(request)
+}
+func (r *processorRequestRepository) CheckpointPlanningInput(_ context.Context, request domain.CoursePlanRequest, input domain.PlanningInputCheckpoint, _ time.Time) error {
+	r.planningPinCalls++
+	if err := input.Validate(request); err != nil {
+		return err
+	}
+	if r.pinErr == nil || r.persistPinOnErr {
+		cloned := cloneCheckpoint(input)
+		r.planningInput = &cloned
+	}
+	if r.loseLeaseAfter == "input" {
+		r.renewErr = domain.ErrConflict
+	}
+	return r.pinErr
+}
+func (r *processorRequestRepository) GetGeneratedCourse(_ context.Context, _ domain.CoursePlanRequest) (domain.GeneratedCourseCheckpoint, error) {
+	if r.artifactReadErr != nil {
+		return domain.GeneratedCourseCheckpoint{}, r.artifactReadErr
+	}
+	if r.generatedCheckpoint == nil {
+		return domain.GeneratedCourseCheckpoint{}, domain.ErrNotFound
+	}
+	return *r.generatedCheckpoint, nil
+}
+func (r *processorRequestRepository) CheckpointGeneratedCourse(_ context.Context, _ domain.CoursePlanRequest, artifact domain.GeneratedCourseCheckpoint, _ time.Time) error {
+	r.artifactPinCalls++
+	if r.artifactErr == nil || r.persistArtifactOnErr {
+		cloned := cloneCheckpoint(artifact)
+		r.generatedCheckpoint = &cloned
+	}
+	if r.loseLeaseAfter == "artifact" {
+		r.renewErr = domain.ErrConflict
+	}
+	return r.artifactErr
+}
+func (r *processorRequestRepository) GetCourseEnsure(_ context.Context, _ domain.CoursePlanRequest) (domain.CourseEnsureCheckpoint, error) {
+	if r.ensureReadErr != nil {
+		return domain.CourseEnsureCheckpoint{}, r.ensureReadErr
+	}
+	if r.ensureCheckpoint == nil {
+		return domain.CourseEnsureCheckpoint{}, domain.ErrNotFound
+	}
+	return *r.ensureCheckpoint, nil
+}
+func (r *processorRequestRepository) CheckpointCourseEnsure(_ context.Context, _ domain.CoursePlanRequest, receipt domain.CourseEnsureCheckpoint, _ time.Time) error {
+	r.ensurePinCalls++
+	if r.ensureErr == nil || r.persistEnsureOnErr {
+		cloned := cloneCheckpoint(receipt)
+		r.ensureCheckpoint = &cloned
+	}
+	if r.loseLeaseAfter == "receipt" {
+		r.renewErr = domain.ErrConflict
+	}
+	return r.ensureErr
+}
+func cloneCheckpoint[T any](input T) T {
+	raw, err := json.Marshal(input)
+	if err != nil {
+		panic(err)
+	}
+	var output T
+	if err := json.Unmarshal(raw, &output); err != nil {
+		panic(err)
+	}
+	return output
+}
+
+func checkpointFixture(now time.Time) (*processorRequestRepository, *processorStudentService, *processorCourseService, Processor) {
+	r := &processorRequestRepository{claimed: planningRequest(now)}
+	s := &processorStudentService{profile: testPlanningProfile()}
+	c := &processorCourseService{result: domain.EnsureCourseResult{CourseID: "33333333-3333-4333-8333-333333333333", Lessons: []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444"}}}}
+	return r, s, c, testProcessor(now, r, s, c)
+}
+
+type checkpointGenerator struct {
+	calls    int
+	failAt   int
+	keys     []string
+	contexts []string
+}
+
+func (g *checkpointGenerator) GenerateLesson(ctx context.Context, input domainservice.LessonGenerationInput, key string) (domainservice.GeneratedLessonContent, error) {
+	g.calls++
+	g.keys = append(g.keys, key)
+	raw, _ := json.Marshal(input.CourseContext)
+	g.contexts = append(g.contexts, string(raw))
+	if g.calls == g.failAt {
+		return domainservice.GeneratedLessonContent{}, errors.New("provider outage")
+	}
+	return (processorContentGenerator{}).GenerateLesson(ctx, input, key)
+}
+
+func TestPinnedCheckpointsStopEffectsBeforeDurableBoundary(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, stage := range []string{"input", "artifact", "receipt"} {
+		t.Run(stage, func(t *testing.T) {
+			r, s, c, p := checkpointFixture(now)
+			g := &checkpointGenerator{}
+			p.Generator = g
+			outage := errors.New("checkpoint write unavailable")
+			switch stage {
+			case "input":
+				r.pinErr = outage
+			case "artifact":
+				r.artifactErr = outage
+			case "receipt":
+				r.ensureErr = outage
+			}
+			processed, err := p.ProcessNext(context.Background())
+			if !processed || !errors.Is(err, outage) || s.assignmentCalls != 0 || s.createCalls != 0 || r.completed != nil {
+				t.Fatalf("checkpoint outage crossed Student boundary: err=%v student=%#v", err, s)
+			}
+			if stage == "input" && (g.calls != 0 || c.calls != 0) {
+				t.Fatal("generation before durable first input")
+			}
+			if stage == "artifact" && (g.calls == 0 || c.calls != 0) {
+				t.Fatal("Course before durable generated artifact")
+			}
+			if stage == "receipt" && c.calls != 1 {
+				t.Fatal("receipt case did not reach successful Course ensure")
+			}
+		})
+	}
+}
+
+func TestPinnedReconstructionAfterAmbiguousCheckpointCommits(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, stage := range []string{"input", "artifact", "receipt"} {
+		t.Run(stage, func(t *testing.T) {
+			r, s, c, p := checkpointFixture(now)
+			g := &checkpointGenerator{}
+			p.Generator = g
+			outage := errors.New("response lost after durable checkpoint")
+			switch stage {
+			case "input":
+				r.pinErr = outage
+				r.persistPinOnErr = true
+			case "artifact":
+				r.artifactErr = outage
+				r.persistArtifactOnErr = true
+			case "receipt":
+				r.ensureErr = outage
+				r.persistEnsureOnErr = true
+			}
+			if _, err := p.ProcessNext(context.Background()); !errors.Is(err, outage) {
+				t.Fatalf("first checkpoint boundary: %v", err)
+			}
+			input := cloneCheckpoint(*r.planningInput)
+			callsBefore := g.calls
+			s.profile.PreferredLanguage = "en"
+			s.allMastered = true
+			r.pinErr = nil
+			r.artifactErr = nil
+			r.ensureErr = nil
+			rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+			rebuilt.Generator = g
+			rebuilt.Graphs = &countingGraphRepository{}
+			rebuilt.Policies = &countingPolicyRepository{}
+			if _, err := rebuilt.ProcessNext(context.Background()); err != nil || r.completed == nil {
+				t.Fatalf("resume committed %s: %v", stage, err)
+			}
+			if s.profileCalls != 1 || s.masteryCalls != 1 || r.planningPinCalls != 1 || r.completed.CourseFingerprint != input.Fingerprint || string(r.completed.NormalizedContextJSON) != string(input.NormalizedContext) {
+				t.Fatalf("reconstructed first decision drifted: student=%#v result=%#v", s, r.completed)
+			}
+			if stage != "input" && g.calls != callsBefore {
+				t.Fatal("durable generated artifact called provider again")
+			}
+			if c.calls != 1 {
+				t.Fatalf("durable receipt was re-ensured: calls=%d", c.calls)
+			}
+		})
+	}
+}
+
+func TestPinnedPartialGenerationReplaysSameKeysAndFirstInput(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r, s, c, p := checkpointFixture(now)
+	g := &checkpointGenerator{failAt: 2}
+	p.Generator = g
+	if _, err := p.ProcessNext(context.Background()); err == nil || r.retried == nil || r.planningInput == nil || r.generatedCheckpoint != nil || c.calls != 0 {
+		t.Fatalf("partial generation escaped boundary: err=%v repo=%#v", err, r)
+	}
+	original := cloneCheckpoint(*r.planningInput)
+	s.profile.PreferredLanguage = "en"
+	s.allMastered = true
+	rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+	rebuilt.Generator = g
+	if _, err := rebuilt.ProcessNext(context.Background()); err != nil || r.completed == nil {
+		t.Fatalf("partial-generation retry: %v", err)
+	}
+	if len(g.keys) != 4 || g.keys[0] != g.keys[2] || g.keys[1] != g.keys[3] || g.contexts[0] != g.contexts[2] || g.contexts[1] != g.contexts[3] || r.completed.CourseFingerprint != original.Fingerprint || s.profileCalls != 1 || s.masteryCalls != 1 {
+		t.Fatalf("partial generation reinterpreted pinned lesson identity: %#v", g)
+	}
+}
+
+func TestPinnedExactPathRetainsOriginalExpectedVersionBeforeCommandCheckpoint(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r, s, c, p := checkpointFixture(now)
+	r.claimed.Intent.Reason = domain.PlanningReasonReplan
+	r.claimed.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	s.assignmentErr = errors.New("assignment unavailable")
+	if _, err := p.ProcessNext(context.Background()); err == nil || r.retried == nil || r.planningInput == nil || r.checkpointed != nil {
+		t.Fatalf("first partial Course attempt: %v", err)
+	}
+	s.planningState = processorPlanningState(r.claimed.StudentID, r.claimed.LearningPathID, r.claimed.GoalCode)
+	s.planningState.PathVersion = 99
+	s.assignmentErr = nil
+	s.replanErr = domain.ErrConflict
+	rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+	if _, err := rebuilt.ProcessNext(context.Background()); err == nil || r.failureCode != domain.CoursePlanFailurePathConflict || s.replan.ExpectedVersion != 3 || s.planningStateCalls != 1 || c.calls != 1 {
+		t.Fatalf("stale pinned replan rebased: err=%v replan=%#v failure=%s", err, s.replan, r.failureCode)
+	}
+}
+
+func TestPinnedNoGapRetainsOriginalDecisionAfterFailedTerminalWrite(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r, s, c, p := checkpointFixture(now)
+	s.allMastered = true
+	r.completeErr = errors.New("terminal unavailable")
+	if _, err := p.ProcessNext(context.Background()); err == nil || r.planningInput == nil {
+		t.Fatalf("first no-gap decision: %v", err)
+	}
+	s.allMastered = false
+	s.profile.PreferredLanguage = "en"
+	r.completeErr = nil
+	rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+	if _, err := rebuilt.ProcessNext(context.Background()); err != nil || r.completed == nil || r.completed.ResultCode != domain.CoursePlanResultNoGap || c.calls != 0 || s.createCalls != 0 || s.masteryCalls != 1 {
+		t.Fatalf("no-gap retry reinterpreted input: %v", err)
+	}
+}
+
+func TestPinnedReadTamperAndLegacyGeneratedDraftFailClosed(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, kind := range []string{"input", "artifact", "receipt", "legacy"} {
+		t.Run(kind, func(t *testing.T) {
+			r, s, c, p := checkpointFixture(now)
+			if kind == "legacy" {
+				r.claimed.GeneratedCourseJSON = json.RawMessage(`{"course_fingerprint":"old"}`)
+			} else {
+				s.assignmentErr = errors.New("assignment unavailable")
+				if _, err := p.ProcessNext(context.Background()); err == nil || r.ensureCheckpoint == nil {
+					t.Fatalf("prepare pinned partial success: %v", err)
+				}
+				s.assignmentErr = nil
+				switch kind {
+				case "input":
+					r.planningInput.Profile.PreferredLanguage = "en"
+				case "artifact":
+					r.generatedCheckpoint.Course.Title = "tampered"
+				case "receipt":
+					r.ensureCheckpoint.Result.CourseID = "55555555-5555-4555-8555-555555555555"
+				}
+			}
+			assignments := s.assignmentCalls
+			creates := s.createCalls
+			ensures := c.calls
+			rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+			if _, err := rebuilt.ProcessNext(context.Background()); err == nil || r.failed == nil || r.completed != nil || s.assignmentCalls != assignments || s.createCalls != creates || c.calls != ensures {
+				t.Fatalf("tampered %s produced effects: err=%v", kind, err)
+			}
+			if kind == "legacy" && r.failureCode != "LEGACY_GENERATED_COURSE_UNBOUND" {
+				t.Fatalf("legacy draft guessed provenance: %s", r.failureCode)
+			}
+		})
+	}
+}
+
+func TestPinnedLeaseLossStopsAtEachDownstreamBoundary(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, stage := range []string{"input", "artifact", "receipt"} {
+		t.Run(stage, func(t *testing.T) {
+			r, s, c, p := checkpointFixture(now)
+			g := &checkpointGenerator{}
+			p.Generator = g
+			r.loseLeaseAfter = stage
+			if _, err := p.ProcessNext(context.Background()); !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("lost lease at %s: %v", stage, err)
+			}
+			if r.retried != nil || r.failed != nil || r.completed != nil || s.assignmentCalls != 0 || s.createCalls != 0 {
+				t.Fatal("stale worker crossed Student/state boundary")
+			}
+			if stage == "input" && (g.calls != 0 || c.calls != 0) {
+				t.Fatal("stale worker generated after pin")
+			}
+			if stage == "artifact" && c.calls != 0 {
+				t.Fatal("stale worker ensured after artifact")
+			}
+		})
+	}
+}
+
+type pinnedInitialAllocationRepository struct {
+	checkpoint     *domain.InitialAllocationCheckpoint
+	checkpointErr  error
+	persistOnError bool
+	calls          int
+}
+
+func (r *pinnedInitialAllocationRepository) GetInitialAllocation(context.Context, domain.CoursePlanRequest) (domain.InitialAllocationCheckpoint, error) {
+	if r.checkpoint == nil {
+		return domain.InitialAllocationCheckpoint{}, domain.ErrNotFound
+	}
+	return *r.checkpoint, nil
+}
+func (r *pinnedInitialAllocationRepository) CheckpointInitialAllocation(_ context.Context, _ domain.CoursePlanRequest, c domain.InitialAllocationCheckpoint, _ time.Time) error {
+	r.calls++
+	if r.checkpointErr == nil || r.persistOnError {
+		cloned := cloneCheckpoint(c)
+		r.checkpoint = &cloned
+	}
+	return r.checkpointErr
+}
+func (*pinnedInitialAllocationRepository) ResumeDiagnosticPlanning(context.Context, string, string, time.Time) (domain.CoursePlanRequest, error) {
+	return domain.CoursePlanRequest{}, errors.New("unused")
+}
+
+func TestPinnedDiagnosticRetryRetainsOriginalOnboardingDirectionFence(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r, s, c, p := checkpointFixture(now)
+	r.claimed.Intent.Source = domain.PlanningSourceTeacher
+	r.claimed.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+	s.profile = diagnosticProfile(1)
+	record := diagnosticRecordForCoursePlan(t, r.claimed.StudentID, r.claimed.DiagnosticPlanID)
+	diagnostic := &diagnosticProcessorRepository{plan: record, placement: diagnosticPlacementForCoursePlan(t, record.Plan)}
+	allocations := &pinnedInitialAllocationRepository{checkpointErr: errors.New("allocation checkpoint outage")}
+	p.DiagnosticPlans = diagnostic
+	p.DiagnosticPlacements = diagnostic
+	p.InitialAllocations = allocations
+	if _, err := p.ProcessNext(context.Background()); err == nil || r.ensureCheckpoint == nil || s.assignmentCalls != 0 {
+		t.Fatalf("diagnostic partial Course attempt: %v", err)
+	}
+	s.profile.OnboardingVersion = 2
+	s.profile.DirectionCode = "frontend"
+	s.createErr = domain.ErrDiagnosticContextStale
+	allocations.checkpointErr = nil
+	diagnostic.planErr = errors.New("must not reread diagnostic")
+	diagnostic.placementErr = diagnostic.planErr
+	rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+	rebuilt.DiagnosticPlans = diagnostic
+	rebuilt.DiagnosticPlacements = diagnostic
+	rebuilt.InitialAllocations = allocations
+	if _, err := rebuilt.ProcessNext(context.Background()); err == nil || r.failureCode != "DIAGNOSTIC_PLAN_INVALID" || s.created.ExpectedOnboardingVersion != 1 || s.created.ExpectedDirectionCode != "backend" || s.profileCalls != 1 || s.masteryCalls != 1 || diagnostic.planCalls != 1 || diagnostic.placementCalls != 1 || c.calls != 1 {
+		t.Fatalf("diagnostic original fence refreshed: err=%v replacement=%#v", err, s.created)
+	}
+}
+
+func TestPinnedStudentCheckpointReplayRestoresFirstAuditAfterCrash(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, kind := range []string{"initial", "replan"} {
+		t.Run(kind, func(t *testing.T) {
+			r, s, c, p := checkpointFixture(now)
+			outage := errors.New("response lost after command checkpoint commit")
+			allocations := &pinnedInitialAllocationRepository{checkpointErr: outage, persistOnError: true}
+			if kind == "initial" {
+				r.claimed.Intent.Source = domain.PlanningSourceTeacher
+				r.claimed.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+				s.profile = diagnosticProfile(1)
+				record := diagnosticRecordForCoursePlan(t, r.claimed.StudentID, r.claimed.DiagnosticPlanID)
+				diagnostic := &diagnosticProcessorRepository{plan: record, placement: diagnosticPlacementForCoursePlan(t, record.Plan)}
+				p.DiagnosticPlans = diagnostic
+				p.DiagnosticPlacements = diagnostic
+				p.InitialAllocations = allocations
+			} else {
+				r.claimed.Intent.Reason = domain.PlanningReasonReplan
+				r.claimed.LearningPathID = "77777777-7777-4777-8777-777777777777"
+				r.checkpointErr = outage
+				r.persistCheckpointOnErr = true
+			}
+			if _, err := p.ProcessNext(context.Background()); !errors.Is(err, outage) || r.retried != nil || r.completed != nil {
+				t.Fatalf("crash checkpoint boundary: %v", err)
+			}
+			original := cloneCheckpoint(*r.planningInput)
+			// Job audit headers may be absent or stale at this crash boundary; the
+			// durable private input remains authoritative, while the command is fixed.
+			r.claimed.CourseFingerprint = ""
+			r.claimed.NormalizedContextJSON = nil
+			allocations.checkpointErr = nil
+			r.checkpointErr = nil
+			s.profile.PreferredLanguage = "en"
+			s.allMastered = true
+			rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+			rebuilt.InitialAllocations = allocations
+			if _, err := rebuilt.ProcessNext(context.Background()); err != nil || r.completed == nil {
+				t.Fatalf("checkpoint reconstruction: %v", err)
+			}
+			if r.completed.CourseFingerprint != original.Fingerprint || string(r.completed.NormalizedContextJSON) != string(original.NormalizedContext) || s.profileCalls != 1 || s.masteryCalls != 1 || c.calls != 1 {
+				t.Fatalf("Student command replay lost original audit: result=%#v", r.completed)
+			}
+			if kind == "initial" && (allocations.calls != 1 || s.created.CourseFingerprint != original.Fingerprint || s.created.ExpectedOnboardingVersion != 1) {
+				t.Fatal("initial checkpoint body rebuilt")
+			}
+			if kind == "replan" && (r.checkpointCalls != 1 || s.replan.CourseFingerprint != original.Fingerprint || s.replan.ExpectedVersion != 3) {
+				t.Fatal("path checkpoint body rebuilt")
+			}
+		})
+	}
+}
+
+type mutableCheckpointGraph struct {
+	graph domain.GoalGraph
+	calls int
+}
+
+func (g *mutableCheckpointGraph) GetPublishedGoalGraph(context.Context, string) (domain.GoalGraph, error) {
+	g.calls++
+	return g.graph, nil
+}
+
+type mutableCheckpointPolicy struct {
+	policy domain.PolicyBundle
+	calls  int
+}
+
+func (p *mutableCheckpointPolicy) GetActivePolicyBundle(context.Context) (domain.PolicyBundle, error) {
+	p.calls++
+	return p.policy, nil
+}
+
+func TestPinnedRetryKeepsFirstGraphAndPolicyAfterPublishedVersionsChange(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r, s, c, p := checkpointFixture(now)
+	graphs := &mutableCheckpointGraph{graph: testGoalGraph()}
+	policies := &mutableCheckpointPolicy{policy: testPolicyBundle()}
+	p.Graphs = graphs
+	p.Policies = policies
+	s.assignmentErr = errors.New("assignment outage")
+	if _, err := p.ProcessNext(context.Background()); err == nil || r.retried == nil {
+		t.Fatalf("partial Course success: %v", err)
+	}
+	first := cloneCheckpoint(*r.planningInput)
+	graphs.graph.Goal.GraphVersion = "graph-v2"
+	graphs.graph.Goal.Title = "Changed published goal"
+	policies.policy.PlannerVersion = "course-planner-v2"
+	policies.policy.GenerationPolicy = "shared-v2"
+	s.assignmentErr = nil
+	rebuilt := testProcessor(now.Add(time.Second), r, s, c)
+	rebuilt.Graphs = graphs
+	rebuilt.Policies = policies
+	if _, err := rebuilt.ProcessNext(context.Background()); err != nil || r.completed == nil || graphs.calls != 1 || policies.calls != 1 || c.calls != 1 || s.created.PlannerPolicyVersion != first.Policy.PlannerVersion || r.completed.CourseFingerprint != first.Fingerprint || string(r.completed.NormalizedContextJSON) != string(first.NormalizedContext) {
+		t.Fatalf("published versions replaced first decision: %v", err)
+	}
+}

@@ -494,9 +494,9 @@ func (f legacyRoutingCatalogFS) Open(name string) (fs.File, error) {
 	}
 	text := string(raw)
 	if strings.HasSuffix(name, "manifest.yaml") {
-		text = strings.Replace(text, "version: 1.3.1", "version: 1.3.0", 1)
+		text = strings.Replace(text, "version: 1.3.2", "version: 1.3.0", 1)
 	} else {
-		text = strings.Replace(text, ", internal/infrastructure/http/**]", "]", 1)
+		text = strings.Replace(text, ", internal/infrastructure/http/**, internal/infrastructure/adapters/**]", "]", 1)
 	}
 	return fstest.MapFS{name: &fstest.MapFile{Data: []byte(text)}}.Open(name)
 }

@@ -1,0 +1,213 @@
+package diagnosticplan
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	service "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/google/uuid"
+	"sort"
+	"strconv"
+	"time"
+)
+
+type Clock interface{ Now() time.Time }
+type Issuer struct {
+	Plans        repository.DiagnosticAssessmentPlanRepository
+	Reservations repository.DiagnosticAssessmentReservationRepository
+	Placements   repository.DiagnosticPlacementRepository
+	Courses      service.DiagnosticCourseCatalogService
+	Students     service.DiagnosticAssessmentStudentService
+	Clock        Clock
+}
+
+func (i Issuer) Issue(ctx context.Context, key string, input domain.DiagnosticAssessmentPlanRequestV1) (domain.DiagnosticAssessmentPlan, bool, error) {
+	if i.Plans == nil || i.Reservations == nil || i.Placements == nil || i.Courses == nil || i.Students == nil || i.Clock == nil || !canonicalUUID(key) {
+		return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+	}
+	normalized, err := domain.NormalizeDiagnosticPlanRequest(input)
+	if err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	hash, err := digest(normalized)
+	if err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	if normalized.RequestHash != "" {
+		hash = normalized.RequestHash
+	}
+	if prior, err := i.Plans.GetByStudentKey(ctx, normalized.StudentID, key); err == nil {
+		if domain.ValidateDiagnosticPlan(prior.Plan) != nil {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+		}
+		if prior.RequestHash != hash {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+		}
+		if err := i.ensureReservation(ctx, prior.Plan); err != nil {
+			return domain.DiagnosticAssessmentPlan{}, false, err
+		}
+		return prior.Plan, false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	revision := 1
+	if prior, err := i.Plans.GetLatest(ctx, normalized.StudentID, normalized.CourseID, normalized.BootstrapContextDigest); err == nil {
+		if domain.ValidateDiagnosticPlan(prior.Plan) != nil {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+		}
+		if normalized.ExpectedPreviousRevision == nil || *normalized.ExpectedPreviousRevision != prior.Plan.PlanRevision {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+		}
+		if i.Placements == nil {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+		}
+		placement, placementErr := i.Placements.GetDiagnosticPlacement(ctx, prior.Plan.ID)
+		if errors.Is(placementErr, domain.ErrNotFound) {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+		}
+		if placementErr != nil {
+			return domain.DiagnosticAssessmentPlan{}, false, placementErr
+		}
+		if domain.ValidateStoredDiagnosticPlacement(placement.Decision, prior.Plan, placement.RequestID, placement.RequestHash, placement.Decision.DecisionDigest) != nil {
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+		}
+		revision = prior.Plan.PlanRevision + 1
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	} else if normalized.ExpectedPreviousRevision != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+	}
+	catalog, err := i.Courses.GetDiagnosticAssessmentCatalog(ctx, normalized.CourseID)
+	if err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	if catalog.CourseID != normalized.CourseID {
+		return domain.DiagnosticAssessmentPlan{}, false, domain.ErrValidation
+	}
+	chosen, err := selectFixed(catalog.Assessments)
+	if err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	plan := domain.DiagnosticAssessmentPlan{Schema: domain.DiagnosticAssessmentPlanSchemaV1, ID: diagnosticPlanID(normalized.StudentID, normalized.CourseID, catalog.Revision, normalized.BootstrapContextDigest, revision), StudentID: normalized.StudentID, CourseID: normalized.CourseID, PlanRevision: revision, PolicyVersion: domain.DiagnosticFixedPolicyV1, CourseRevision: catalog.Revision, OnboardingVersion: normalized.OnboardingVersion, BootstrapPolicyVersion: normalized.BootstrapPolicyVersion, BootstrapContextDigest: normalized.BootstrapContextDigest, Assessments: chosen, CreatedAt: i.Clock.Now().UTC().Truncate(time.Microsecond)}
+	plan.PlanDigest, err = domain.DiagnosticPlanDigest(plan)
+	if err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	stored, err := i.Plans.Insert(ctx, domain.DiagnosticAssessmentPlanRecord{IdempotencyKey: key, RequestHash: hash, Plan: plan, BindingRevision: normalized.BindingRevision, BindingDigest: normalized.BindingDigest, BindingGoalCode: normalized.BindingGoalCode, BindingDirectionCode: normalized.BindingDirectionCode, BindingCreatedAt: normalized.BindingCreatedAt})
+	if err != nil {
+		if errors.Is(err, domain.ErrConflict) { // a concurrent winner may have committed after our preflight
+			stored, err = i.Plans.GetByStudentKey(ctx, normalized.StudentID, key)
+			if err == nil && stored.RequestHash == hash && domain.ValidateDiagnosticPlan(stored.Plan) == nil {
+				if err := i.ensureReservation(ctx, stored.Plan); err != nil {
+					return domain.DiagnosticAssessmentPlan{}, false, err
+				}
+				return stored.Plan, false, nil
+			}
+			return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+		}
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	if stored.RequestHash != hash || stored.IdempotencyKey != key {
+		return domain.DiagnosticAssessmentPlan{}, false, domain.ErrConflict
+	}
+	if err := i.ensureReservation(ctx, stored.Plan); err != nil {
+		return domain.DiagnosticAssessmentPlan{}, false, err
+	}
+	return stored.Plan, true, nil
+}
+
+func (i Issuer) ensureReservation(ctx context.Context, plan domain.DiagnosticAssessmentPlan) error {
+	if stored, err := i.Reservations.GetDiagnosticReservation(ctx, plan.ID); err == nil {
+		if domain.ValidateStoredDiagnosticReservation(stored, plan) != nil {
+			return domain.ErrValidation
+		}
+		return nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return err
+	}
+	receipt, err := i.Students.ReserveDiagnosticAssessment(ctx, plan.StudentID, plan)
+	if err != nil {
+		return err
+	}
+	if domain.ValidateDiagnosticReservation(receipt, plan) != nil {
+		return domain.ErrUpstreamInvalid
+	}
+	digest, err := domain.DiagnosticReservationDigest(receipt)
+	if err != nil {
+		return err
+	}
+	record := domain.DiagnosticAssessmentReservationRecord{StudentID: plan.StudentID, CourseID: plan.CourseID, AttemptID: plan.ID, Reservation: receipt, ReservationDigest: digest, ReceivedAt: i.Clock.Now().UTC().Truncate(time.Microsecond)}
+	stored, err := i.Reservations.InsertDiagnosticReservation(ctx, record)
+	if errors.Is(err, domain.ErrConflict) {
+		stored, err = i.Reservations.GetDiagnosticReservation(ctx, plan.ID)
+	}
+	if err != nil {
+		return err
+	}
+	if domain.ValidateStoredDiagnosticReservation(stored, plan) != nil {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+func (i Issuer) EnsureReservation(ctx context.Context, plan domain.DiagnosticAssessmentPlan) error {
+	return i.ensureReservation(ctx, plan)
+}
+
+func diagnosticPlanID(studentID, courseID, courseRevision, contextDigest string, revision int) string {
+	// The historical pre-bootstrap formula was never deployed. Context is now a
+	// named identity component, so onboarding/binding changes start at revision 1.
+	seed := studentID + "\x00" + courseID + "\x00" + courseRevision + "\x00" + contextDigest + "\x00" + strconv.Itoa(revision)
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
+}
+
+func canonicalUUID(raw string) bool {
+	parsed, err := uuid.Parse(raw)
+	return err == nil && parsed.String() == raw
+}
+
+// selectFixed is stable and content-spread: sorted catalogue positions are sampled over its whole range.
+func selectFixed(in []domain.DiagnosticAssessment) ([]domain.DiagnosticAssessment, error) {
+	in = domain.CanonicalDiagnosticAssessments(in)
+	if len(in) < 3 {
+		return nil, domain.ErrValidation
+	}
+	n := len(in)
+	want := 5
+	if n < 5 {
+		want = n
+	}
+	out := make([]domain.DiagnosticAssessment, 0, want)
+	seen := map[string]bool{}
+	for slot := 0; slot < want; slot++ {
+		idx := slot * (n - 1) / (want - 1)
+		a := in[idx]
+		if seen[a.TaskID] {
+			return nil, domain.ErrValidation
+		}
+		seen[a.TaskID] = true
+		out = append(out, a)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].LessonOrder != out[b].LessonOrder {
+			return out[a].LessonOrder < out[b].LessonOrder
+		}
+		if out[a].TaskOrder != out[b].TaskOrder {
+			return out[a].TaskOrder < out[b].TaskOrder
+		}
+		return out[a].TaskID < out[b].TaskID
+	})
+	return out, nil
+}
+func digest(v any) (string, error) {
+	b, e := json.Marshal(v)
+	if e != nil {
+		return "", e
+	}
+	s := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(s[:]), nil
+}

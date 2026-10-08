@@ -1,0 +1,235 @@
+package projectauthoring
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+type Processor struct {
+	Flows       repository.ProjectAuthoringFlowRepository
+	Students    domainservice.ProjectAuthoringStudentService
+	TZ          domainservice.ProjectAuthoringTZService
+	IDs         IDGenerator
+	Clock       Clock
+	LeaseTTL    time.Duration
+	MaxAttempts int
+}
+
+func (processor Processor) ProcessNext(ctx context.Context) (bool, error) {
+	if processor.Flows == nil || processor.Students == nil || processor.TZ == nil || processor.IDs == nil ||
+		processor.Clock == nil || processor.LeaseTTL <= 0 || processor.MaxAttempts < 1 {
+		return false, domain.ErrValidation
+	}
+	now := processor.now()
+	flow, err := processor.Flows.ClaimNextProjectAuthoringFlow(ctx, processor.IDs.NewID(), now, now.Add(processor.LeaseTTL))
+	if errors.Is(err, domain.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if flow.Status == domain.ProjectAuthoringReady && flow.PublicationRequestedAt != nil {
+		err = processor.publish(ctx, flow)
+	} else if flow.Status == domain.ProjectAuthoringAuthoring {
+		err = processor.author(ctx, flow)
+	} else {
+		err = fmt.Errorf("%w: unclaimable project authoring state", domain.ErrValidation)
+	}
+	return true, err
+}
+
+func (processor Processor) author(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	if err := processor.renew(ctx, flow); err != nil {
+		return err
+	}
+	if err := processor.validateOwner(ctx, flow); err != nil {
+		return processor.handleOwnerError(ctx, flow, err)
+	}
+	if err := processor.renew(ctx, flow); err != nil {
+		return err
+	}
+	job, err := processor.loadOrCreateTZJob(ctx, flow)
+	if err != nil {
+		return processor.handleTZError(ctx, flow, err)
+	}
+	if flow.TZAuthoringJobID == "" {
+		flow, err = processor.Flows.CheckpointTZAuthoringJob(
+			ctx, flow, flow.ClaimToken, job.ID, job.Status, processor.now(),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateTZJobForFlow(job, flow); err != nil {
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+	}
+	if job.Publication != nil {
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+	}
+	switch job.Status {
+	case domain.TZAuthoringReady, domain.TZAuthoringStaged:
+		if err := processor.validateOwner(ctx, flow); err != nil {
+			return processor.handleOwnerError(ctx, flow, err)
+		}
+		return processor.stageReady(ctx, flow, job)
+	case domain.TZAuthoringFailed:
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZFailed)
+	case domain.TZAuthoringPlanned, domain.TZAuthoringGenerating, domain.TZAuthoringVerifying:
+		if err := processor.renew(ctx, flow); err != nil {
+			return err
+		}
+		job, err = processor.TZ.ResumeAuthoringJob(ctx, job.ID)
+		if err != nil {
+			return processor.handleTZError(ctx, flow, err)
+		}
+		if err := validateTZJobForFlow(job, flow); err != nil {
+			return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+		}
+		if job.Publication != nil {
+			return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+		}
+		if job.Status == domain.TZAuthoringReady || job.Status == domain.TZAuthoringStaged {
+			if err := processor.validateOwner(ctx, flow); err != nil {
+				return processor.handleOwnerError(ctx, flow, err)
+			}
+			return processor.stageReady(ctx, flow, job)
+		}
+		if job.Status == domain.TZAuthoringFailed {
+			return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZFailed)
+		}
+		return processor.retry(ctx, flow)
+	default:
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+	}
+}
+
+func (processor Processor) publish(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	// No Practice acceptance/publication proof is implemented in this owner.
+	// A legacy pending publication must never submit or publish a candidate.
+	return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+}
+
+func (processor Processor) stageReady(ctx context.Context, flow domain.ProjectAuthoringFlow, job domain.TZAuthoringJob) error {
+	verified := job
+	if job.Status == domain.TZAuthoringReady {
+		if err := processor.renew(ctx, flow); err != nil {
+			return err
+		}
+		var err error
+		job, err = processor.TZ.StageAuthoringJob(ctx, job.ID)
+		if err != nil {
+			return processor.handleTZError(ctx, flow, err)
+		}
+	}
+	if validateTZJobForFlow(job, flow) != nil || job.Status != domain.TZAuthoringStaged || job.Staging == nil ||
+		job.ID != verified.ID || job.BlueprintDigest != verified.BlueprintDigest || job.CandidateDigest != verified.CandidateDigest ||
+		job.ContractDigest != verified.ContractDigest || job.CapabilitiesDigest != verified.CapabilitiesDigest || job.VerificationDigest != verified.VerificationDigest {
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+	}
+	if err := processor.validateOwner(ctx, flow); err != nil {
+		return processor.handleOwnerError(ctx, flow, err)
+	}
+	return processor.Flows.MarkProjectAuthoringStaged(ctx, flow, flow.ClaimToken, job, processor.now())
+}
+
+func (processor Processor) loadOrCreateTZJob(ctx context.Context, flow domain.ProjectAuthoringFlow) (domain.TZAuthoringJob, error) {
+	if flow.TZAuthoringJobID == "" {
+		return processor.TZ.EnsureAuthoringJob(ctx, flow.ID, flow.AuthoringRequest)
+	}
+	job, err := processor.TZ.GetAuthoringJob(ctx, flow.TZAuthoringJobID)
+	if !errors.Is(err, domain.ErrNotFound) {
+		return job, err
+	}
+	// A checkpointed locator returning 404 is recovered only by replaying the
+	// exact create command. TZ owns the idempotency receipt and must return the
+	// same authoring job identity; Planner never invents a replacement.
+	job, err = processor.TZ.EnsureAuthoringJob(ctx, flow.ID, flow.AuthoringRequest)
+	if err != nil {
+		return domain.TZAuthoringJob{}, err
+	}
+	if job.ID != flow.TZAuthoringJobID {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	return job, nil
+}
+
+func (processor Processor) validateOwner(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	profile, err := processor.Students.GetPlanningProfile(ctx, flow.StudentID)
+	if err != nil {
+		return err
+	}
+	path, err := processor.Students.GetLearningPathPlanningState(ctx, flow.StudentID, flow.LearningPathID)
+	if err != nil {
+		return err
+	}
+	return domain.ValidateProjectOwnerSnapshot(flow, profile, path)
+}
+
+func (processor Processor) renew(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	now := processor.now()
+	return processor.Flows.RenewProjectAuthoringClaim(
+		ctx, flow.ID, flow.ClaimToken, flow.Version, now, now.Add(processor.LeaseTTL),
+	)
+}
+
+func (processor Processor) handleOwnerError(ctx context.Context, flow domain.ProjectAuthoringFlow, err error) error {
+	switch {
+	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrNotFound):
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureOwnerStale)
+	case errors.Is(err, domain.ErrValidation), errors.Is(err, domain.ErrUpstreamInvalid):
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureOwnerInvalid)
+	default:
+		return processor.retry(ctx, flow)
+	}
+}
+
+func (processor Processor) handleTZError(ctx context.Context, flow domain.ProjectAuthoringFlow, err error) error {
+	switch {
+	case errors.Is(err, domain.ErrValidation), errors.Is(err, domain.ErrUpstreamInvalid):
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureTZInvalid)
+	default:
+		return processor.retry(ctx, flow)
+	}
+}
+
+func (processor Processor) retry(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	if flow.Attempts >= processor.MaxAttempts {
+		return processor.fail(ctx, flow, domain.ProjectAuthoringFailureAttempts)
+	}
+	now := processor.now()
+	delay := time.Second << min(flow.Attempts-1, 6)
+	if err := processor.Flows.RetryProjectAuthoring(ctx, flow, flow.ClaimToken, now.Add(delay), now); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (processor Processor) fail(ctx context.Context, flow domain.ProjectAuthoringFlow, code string) error {
+	return processor.Flows.FailProjectAuthoring(ctx, flow, flow.ClaimToken, code, processor.now())
+}
+
+func (processor Processor) now() time.Time {
+	return processor.Clock.Now().UTC().Truncate(time.Microsecond)
+}
+
+func validateTZJobForFlow(job domain.TZAuthoringJob, flow domain.ProjectAuthoringFlow) error {
+	if domain.ValidateTZAuthoringJob(job) != nil || (flow.TZAuthoringJobID != "" && job.ID != flow.TZAuthoringJobID) ||
+		job.Intent != flow.AuthoringRequest.Orchestration {
+		return domain.ErrValidation
+	}
+	if flow.ReadyAt != nil && (job.BlueprintDigest != flow.ReadyBlueprintDigest ||
+		job.CandidateDigest != flow.ReadyCandidateDigest || job.ContractDigest != flow.ReadyContractDigest ||
+		job.CapabilitiesDigest != flow.ReadyCapabilitiesDigest || job.VerificationDigest != flow.ReadyVerificationDigest) {
+		return domain.ErrValidation
+	}
+	if job.Publication != nil && domain.ValidateProjectPublicationReceipt(*job.Publication, flow) != nil {
+		return domain.ErrValidation
+	}
+	return nil
+}

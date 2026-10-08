@@ -1,0 +1,97 @@
+# Architecture
+
+`ms-go-learning-planner` owns design-time Course planning and task-specific learning resolution. It turns a Student- or Teacher-originated planning intent, one Student-owned onboarding profile, a reviewed versioned goal/target/prerequisite graph, and exact Student-owned mastery projections into a deterministic Course design. It also resolves immutable Step competency requirements into a student-specific route receipt. It calculates versioned fingerprints, generates bounded lesson artifacts through AI Prompt, and asks Course to reuse or atomically persist canonical content.
+
+It owns the planning graph, route calculation, idempotency receipt, and generation workflow, not canonical Course hierarchy rows, the Practice-owned frozen snapshot, or Student state. Course remains the content source of truth after persistence; Student remains the source of onboarding and mastery; Practice owns the task instance and frozen route; Teacher remains the owner of runtime teaching. There is no separate Knowledge Tree service and no snapshot node between Course and Module.
+
+## Layers
+
+- `internal/domain` defines planning entities and ports.
+- `internal/usecase` owns request idempotency, requested-target closure, mastery filtering, deterministic ordering, route/fingerprint calculation, lazy content generation, Course/Student synchronization, workers, and outbox relay.
+- `internal/usecase/readiness` owns the stateless, closed exact mapping from one Student readiness snapshot to one published graph reference.
+- `internal/transport/http/api/v1` exposes Student course-plan commands and owner-scoped reads.
+- `internal/transport/http/private` exposes health, bounded canonical target discovery, exact target resolution, dedicated Practice route/material commands, and the dedicated Teacher delegation command.
+- `internal/infrastructure/persistence/postgres` owns repositories.
+- `internal/infrastructure/http/{student,course,aiprompt,tzplanner}` own service clients; `internal/infrastructure/messaging/nats` owns event publication only.
+- `cmd/ms-go-learning-planner` is the composition root.
+
+## Read-only graph readiness
+
+The Teacher-only readiness route is a separate default-off flow. It reads one
+strict bounded Student snapshot, gives an existing active path precedence, and
+otherwise applies the closed v1 resolver before loading one exact published
+goal graph. The same pure topology validator used by Course planning rejects
+external prerequisites, self-edges, cycles, invalid transitions, and placement
+conflicts. The flow has no Course, mastery, model, outbox, assignment, path
+command, or lesson dependency and cannot create identifiers or content.
+
+## Durable Teacher onboarding handoff
+
+The S8 handoff is an immutable, historical admission receipt for one exact
+Student readiness observation. It is non-executable: it creates no Course,
+Learning Path, lesson, content, worker, outbox event, or message. A future S9
+executor must independently re-read and atomically reserve Student state
+immediately before any effect; an `ACCEPTED` receipt is not a reservation or a
+current no-active-path assertion.
+
+## Deterministic flow
+
+1. Persist an idempotent `PLANNING` request.
+2. Load the published goal graph, select the requested targets plus their transitive prerequisites, and load the active policy bundle.
+3. For a `REPLAN` (or a retried `INITIAL` whose allocation was already checkpointed), read Student planning state by exact `(student_id, learning_path_id)`. Independently read onboarding and exact mastery; never use the singular selected/primary path projection as the mutation target.
+4. Validate graph identities and cycles, then topologically order targets.
+5. Skip only policy-qualified objective `MASTERED` targets; include `UNKNOWN`.
+6. Build canonical shared-course fingerprint input. Free-text outcome, project context, deadlines, audit references, Student ID, timestamps, and request identity are excluded so they cannot leak into shared Course content or churn an unchanged replan.
+7. Generate every lesson with a deterministic per-lesson idempotency key through `course.lesson-content.v1`; retain the successful draft on the planning request for retry.
+8. Ask Course to reuse or atomically create one private `ACTIVE` Course with `ACTIVE` Lessons, examples, and safe knowledge checks.
+9. Ask Student to idempotently assign the Course as a separate lifecycle command. For `INITIAL`, ask Student to allocate exactly one path using the planning request/idempotency identity, then checkpoint the returned path ID before any later side effect. Before every exact-path `REPLAN` or `NO_GAP`, compare-and-set one immutable command checkpoint with its expected path version, exact normalized body, identities, hash, and private planned outcome. Dispatch only after that write. A retry with a checkpoint bypasses graph/mastery/Course/path-state reads and sends the identical command so Student receipt replay resolves a lost success response. Public result fields remain unset until confirmed Student success; a delivered `409` terminates as `LEARNING_PATH_COMMAND_CONFLICT` without exposing that planned outcome.
+10. For `NO_GAP`, complete only the exact supplied/checkpointed path; an unallocated `INITIAL` creates no path. Complete or fail the request and insert its schema-v2 terminal event in the same PostgreSQL transaction. A separate relay publishes the event at least once.
+
+## Frozen practice route and lazy material
+
+1. Practice submits the exact TaskRevision/Step requirements with the task instance and Student identities. The task instance UUID is also the idempotency key.
+2. Planner resolves every exact target, reads objective mastery, and applies the active versioned mastery/pedagogy policies. Unknown targets fail closed.
+3. `required` gaps block, `recommended` and `optional` gaps do not block, and `adaptive` gaps return `CHALLENGE_OR_LEARN`. Only objective `MASTERED` evidence meeting both requirement threshold and confidence policy is satisfied.
+4. Planner stores one immutable resolution receipt and returns `student-task-learning-snapshot.v1`. Replays never re-read newer mastery. Practice persists this result as the canonical frozen task snapshot.
+5. Every unsatisfied item contains a deterministic target+locale+policy material fingerprint and generation UUID. No content is generated during route resolution.
+6. When Practice explicitly ensures an item, Planner verifies that it belongs to the stored route, generates one typed lesson with the deterministic key, and calls Course's atomic generated-Course command. Course stores a complete one-Lesson private Course or returns the compatible existing fingerprint.
+
+## Path-backed project authoring
+
+Teacher's private create command names only the Student and exact Learning Path
+in the URL. Planner revalidates the current selected Student-owned path and
+freezes bounded goal, locale, desired-stack, and ordered target references plus
+an opaque path digest. It also freezes the authoritative onboarding version and
+an opaque digest over only the normalized locale and TZ-canonical desired stack
+codes that influence authoring. The same profile/path provenance must still
+match before authoring, READY acceptance, and publication. Confirmation is an immutable receipt. A CAS worker then
+submits the stored PII-free `tz-planning-request.v2`, using the flow UUID as TZ
+idempotency key and correlation ID; lost responses replay that exact command.
+Teacher may recover a lost locator only through a fresh exact path/profile
+provenance lookup, which never exposes a stale flow. A database partial unique
+identity coalesces different create keys for one live snapshot without changing
+the winning flow's original key.
+
+Planner stores the TZ job locator, verified artifact digests and private staging receipt, never authored content or private fixtures. Verified READY output is staged through TZ and durably recorded as STAGED. Practice owns acceptance and publication; integration after acceptance is deferred. The existing publish command fails closed for generated candidates. Historical publication receipts remain readable and never start runtime.
+
+## Accepted Hybrid Replanning business architecture (Problem #4)
+
+[HYBRID MASTERY → REPLANNING ARCHITECTURE DECISION](hybrid-mastery-replanning.md)
+is authoritative for Evidence/Mastery-driven adaptation. Planner owns evaluation,
+planning policy, `NO_CHANGE` / `REPLAN_NEEDED`, and the desired mutation. Student
+supplies authoritative snapshots and owns safe-boundary validation, atomic
+application, Path revisions, and provenance. Mastery updates never directly
+rewrite the route. Completed history and active work, including existing Practice
+TaskInstances, are protected.
+
+This accepted target architecture does not claim new runtime capabilities or
+change the current contracts described above. Problems #1–3 stay closed;
+`OUT_OF_SCOPE_DEPENDENCY: NEXT_BEST_ACTION` is separate. Problem #4 is fully closed:
+pause/resume is optional with ordinary-boundary fallback; planning significance
+combines Mastery, Confidence, Evidence quality, and Stability; goal/scope/active-work
+changes require explicit intent. Activity/Revision owners confirm INVALID, Runtime
+owners confirm IMPOSSIBLE, Planner decides the consequence, and Student applies
+learner/Path state. Numerical thresholds remain configurable policy parameters.
+
+
+Project authoring staging lifecycle: verified TZ READY candidates are submitted through `POST /internal/v1/authoring-jobs/{id}/stage`. Planner validates the exact `practice-task-staging-receipt.v1`, job identity, candidate/blueprint digests and verified artifact digests, then durably records `STAGED` and the immutable receipt. Staging creates no public revision. The existing Planner `/publish` command fails closed for generated, READY and STAGED candidates because Practice-owned acceptance and post-acceptance publication integration are deferred. Historical publication receipts remain readable; staging never writes a publication receipt or PUBLISHED.

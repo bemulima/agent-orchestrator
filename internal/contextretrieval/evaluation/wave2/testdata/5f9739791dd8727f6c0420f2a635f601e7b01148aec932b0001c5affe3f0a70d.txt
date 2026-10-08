@@ -1,0 +1,200 @@
+package projectauthoring
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+type IDGenerator interface{ NewID() string }
+type Clock interface{ Now() time.Time }
+
+type Commands struct {
+	Flows    repository.ProjectAuthoringFlowRepository
+	Students domainservice.ProjectAuthoringStudentService
+	IDs      IDGenerator
+	Clock    Clock
+}
+
+func (commands Commands) Create(
+	ctx context.Context,
+	studentID, learningPathID, idempotencyKey string,
+	request domain.ProjectAuthoringCreateRequestV1,
+) (domain.ProjectAuthoringFlow, bool, error) {
+	if commands.Flows == nil || commands.Students == nil || commands.IDs == nil || commands.Clock == nil ||
+		request.Schema != domain.ProjectAuthoringCreateSchemaV1 {
+		return domain.ProjectAuthoringFlow{}, false, domain.ErrValidation
+	}
+	if stored, err := commands.Flows.GetProjectAuthoringFlowByKey(ctx, studentID, idempotencyKey); err == nil {
+		expected, digestErr := domain.ProjectAuthoringDigest(struct {
+			Schema         string `json:"schema"`
+			StudentID      string `json:"student_id"`
+			LearningPathID string `json:"learning_path_id"`
+		}{domain.ProjectAuthoringCreateSchemaV1, studentID, learningPathID})
+		if digestErr != nil || stored.LearningPathID != learningPathID || stored.RequestHash != expected {
+			return domain.ProjectAuthoringFlow{}, false, domain.ErrConflict
+		}
+		return stored, false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	profile, err := commands.Students.GetPlanningProfile(ctx, studentID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	path, err := commands.Students.GetLearningPathPlanningState(ctx, studentID, learningPathID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	flow, err := domain.NewProjectAuthoringFlow(
+		commands.IDs.NewID(), studentID, learningPathID, idempotencyKey, profile, path,
+		commands.Clock.Now().UTC().Truncate(time.Microsecond),
+	)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	stored, created, err := commands.Flows.CreateOrGetProjectAuthoringFlow(ctx, flow)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, false, err
+	}
+	if !sameProjectAuthoringSnapshot(stored, flow) {
+		return domain.ProjectAuthoringFlow{}, false, domain.ErrConflict
+	}
+	return stored, created, nil
+}
+
+func (commands Commands) Get(ctx context.Context, studentID, flowID string) (domain.ProjectAuthoringFlow, error) {
+	if commands.Flows == nil {
+		return domain.ProjectAuthoringFlow{}, domain.ErrValidation
+	}
+	return commands.Flows.GetProjectAuthoringFlow(ctx, studentID, flowID)
+}
+
+// GetCurrent recovers the non-failed flow for exactly the current owner snapshot.
+// It deliberately derives provenance from fresh Student reads rather than using a
+// locator or a latest-flow query, so stale projects can never be returned.
+func (commands Commands) GetCurrent(ctx context.Context, studentID, learningPathID string) (domain.ProjectAuthoringFlow, error) {
+	if commands.Flows == nil || commands.Students == nil {
+		return domain.ProjectAuthoringFlow{}, domain.ErrValidation
+	}
+	profile, err := commands.Students.GetPlanningProfile(ctx, studentID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	path, err := commands.Students.GetLearningPathPlanningState(ctx, studentID, learningPathID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if err := domain.ValidateCurrentProjectAuthoringOwnerState(profile, path); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	pathDigest, err := domain.ProjectPathSnapshotDigest(path)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	profileDigest, err := domain.ProjectAuthoringProfileDigest(profile)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	return commands.Flows.GetCurrentProjectAuthoringFlow(
+		ctx, studentID, learningPathID, path.PathVersion, pathDigest, profile.OnboardingVersion, profileDigest,
+	)
+}
+
+func sameProjectAuthoringSnapshot(left, right domain.ProjectAuthoringFlow) bool {
+	return left.RequestHash == right.RequestHash &&
+		left.StudentID == right.StudentID &&
+		left.LearningPathID == right.LearningPathID &&
+		left.LearningPathVersion == right.LearningPathVersion &&
+		left.PathSnapshotDigest == right.PathSnapshotDigest &&
+		left.AuthoringProfileVersion == right.AuthoringProfileVersion &&
+		left.AuthoringProfileDigest == right.AuthoringProfileDigest
+}
+
+func (commands Commands) Confirm(
+	ctx context.Context,
+	studentID, flowID, idempotencyKey string,
+	request domain.ProjectAuthoringConfirmRequestV1,
+) (domain.ProjectAuthoringFlow, error) {
+	if commands.Flows == nil || commands.Students == nil || commands.Clock == nil ||
+		request.Schema != domain.ProjectAuthoringConfirmSchemaV1 {
+		return domain.ProjectAuthoringFlow{}, domain.ErrValidation
+	}
+	flow, err := commands.Flows.GetProjectAuthoringFlow(ctx, studentID, flowID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	digest, err := domain.ProjectConfirmationDigest(flow)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if flow.ConfirmationIdempotencyKey != "" {
+		if flow.ConfirmationIdempotencyKey != idempotencyKey || flow.ConfirmationDigest != digest {
+			return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+		}
+		return flow, nil
+	}
+	if flow.Status != domain.ProjectAuthoringProposed {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	if err := commands.validateOwner(ctx, flow); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	return commands.Flows.ConfirmProjectAuthoringFlow(
+		ctx, studentID, flowID, idempotencyKey, digest,
+		commands.Clock.Now().UTC().Truncate(time.Microsecond),
+	)
+}
+
+func (commands Commands) RequestPublication(
+	ctx context.Context,
+	studentID, flowID, idempotencyKey string,
+	request domain.ProjectAuthoringPublishRequestV1,
+) (domain.ProjectAuthoringFlow, error) {
+	if commands.Flows == nil || commands.Students == nil || commands.Clock == nil ||
+		request.Schema != domain.ProjectAuthoringPublishSchemaV1 {
+		return domain.ProjectAuthoringFlow{}, domain.ErrValidation
+	}
+	flow, err := commands.Flows.GetProjectAuthoringFlow(ctx, studentID, flowID)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	digest, err := domain.ProjectPublicationRequestDigest(flow)
+	if err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	if flow.PublicationIdempotencyKey != "" {
+		if flow.Status != domain.ProjectAuthoringPublished || flow.Publication == nil || domain.ValidateProjectPublicationReceipt(*flow.Publication, flow) != nil {
+			return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+		}
+		if flow.PublicationIdempotencyKey != idempotencyKey || flow.PublicationRequestDigest != digest {
+			return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+		}
+		return flow, nil
+	}
+	if flow.Status != domain.ProjectAuthoringReady {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	if err := commands.validateOwner(ctx, flow); err != nil {
+		return domain.ProjectAuthoringFlow{}, err
+	}
+	// Generated and staged candidates have no Practice-owned acceptance proof.
+	// Publication integration is deferred until that proof has a typed contract.
+	return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+}
+
+func (commands Commands) validateOwner(ctx context.Context, flow domain.ProjectAuthoringFlow) error {
+	profile, err := commands.Students.GetPlanningProfile(ctx, flow.StudentID)
+	if err != nil {
+		return err
+	}
+	path, err := commands.Students.GetLearningPathPlanningState(ctx, flow.StudentID, flow.LearningPathID)
+	if err != nil {
+		return err
+	}
+	return domain.ValidateProjectOwnerSnapshot(flow, profile, path)
+}

@@ -1,0 +1,135 @@
+package practiceroute
+
+import (
+	"context"
+	"encoding/json"
+	"regexp"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/google/uuid"
+)
+
+var materialKeyPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type Materializer struct {
+	Routes    repository.PracticeLearningRouteRepository
+	Catalog   repository.PracticeLearningCatalog
+	Generator domainservice.ContentGenerator
+	Courses   domainservice.CourseService
+}
+
+func (materializer Materializer) Ensure(
+	ctx context.Context,
+	idempotencyKey string,
+	materialKey string,
+	request domain.PracticeMaterialEnsureRequestV1,
+) (domain.PracticeMaterialResultV1, error) {
+	request.Schema = strings.TrimSpace(request.Schema)
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	request.RouteDigest = strings.ToLower(strings.TrimSpace(request.RouteDigest))
+	materialKey = strings.ToLower(strings.TrimSpace(materialKey))
+	if materializer.Routes == nil || materializer.Catalog == nil || materializer.Generator == nil || materializer.Courses == nil ||
+		request.Schema != domain.PracticeMaterialEnsureRequestSchemaV1 || !materialKeyPattern.MatchString(materialKey) {
+		return domain.PracticeMaterialResultV1{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(request.RouteID); err != nil {
+		return domain.PracticeMaterialResultV1{}, domain.ErrValidation
+	}
+	record, err := materializer.Routes.GetByID(ctx, request.RouteID)
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	if record.Route.RouteDigest != request.RouteDigest {
+		return domain.PracticeMaterialResultV1{}, domain.ErrConflict
+	}
+	material, found := findRouteMaterial(record.Route, materialKey)
+	if !found || strings.TrimSpace(idempotencyKey) != material.GenerationKey {
+		return domain.PracticeMaterialResultV1{}, domain.ErrValidation
+	}
+	definitions, err := materializer.Catalog.ResolveDefinitions(ctx, []domain.TargetRef{material.Target})
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	indexed, err := indexDefinitions([]domain.TargetRef{material.Target}, definitions)
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	definition := indexed[domain.TargetIdentity(material.Target)]
+	course, contextJSON, err := materialCoursePlan(material, definition)
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	course, err = courseplan.GenerateCourseContent(ctx, materializer.Generator, material.GenerationKey, course, contextJSON)
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	ensured, err := materializer.Courses.EnsureCourse(ctx, course, material.GenerationKey)
+	if err != nil {
+		return domain.PracticeMaterialResultV1{}, err
+	}
+	if len(ensured.Lessons) != 1 || len(ensured.Lessons[0].Targets) != 1 ||
+		domain.TargetIdentity(ensured.Lessons[0].Targets[0]) != domain.TargetIdentity(material.Target) {
+		return domain.PracticeMaterialResultV1{}, domain.ErrValidation
+	}
+	return domain.PracticeMaterialResultV1{
+		Schema: domain.PracticeMaterialResultSchemaV1, MaterialKey: material.Key, Target: material.Target,
+		CourseID: ensured.CourseID, LessonID: ensured.Lessons[0].LessonID, Reused: ensured.Reused,
+	}, nil
+}
+
+func findRouteMaterial(route domain.PracticeLearningRoute, key string) (domain.LearningMaterialRef, bool) {
+	var result domain.LearningMaterialRef
+	found := false
+	for _, step := range route.Steps {
+		for _, requirement := range step.Requirements {
+			if requirement.Material == nil || requirement.Material.Key != key {
+				continue
+			}
+			if found && !sameMaterialRef(result, *requirement.Material) {
+				return domain.LearningMaterialRef{}, false
+			}
+			result, found = *requirement.Material, true
+		}
+	}
+	return result, found
+}
+
+func sameMaterialRef(left, right domain.LearningMaterialRef) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func materialCoursePlan(material domain.LearningMaterialRef, definition domain.LearningTargetDefinition) (domain.GeneratedCourse, json.RawMessage, error) {
+	code := "practice-" + material.Key[:16]
+	course := domain.GeneratedCourse{
+		Fingerprint: material.Key, FingerprintVersion: material.FingerprintVersion,
+		GoalCode: "practice-prerequisite", GoalVersion: "v1", Title: definition.Title,
+		Description: definition.Description, Language: material.Locale,
+		Status: domain.CourseStatusActiveBuilding, CatalogVisible: false,
+		PlannerVersion: material.PlannerVersion, PedagogyProfile: material.PedagogyProfile,
+		PresentationStyle: material.PresentationStyle, GenerationPolicy: material.GenerationPolicy,
+		Modules: []domain.PlannedModule{{
+			Code: "practice", Title: "Practice prerequisites", Order: 0,
+			Sections: []domain.PlannedSection{{
+				Code: string(material.Target.Type), Title: "Required knowledge", Order: 0,
+				Lessons: []domain.PlannedLesson{{
+					Code: code, Title: definition.Title, Excerpt: definition.Description, Order: 0,
+					Status: domain.LessonStatusPlanned, Targets: []domain.TargetRef{material.Target},
+					Prerequisites:      append([]domain.TargetRef(nil), definition.Prerequisites...),
+					PedagogyStrategies: append([]domain.PedagogyStrategyRef(nil), material.PedagogyStrategies...),
+				}},
+			}},
+		}},
+	}
+	contextJSON, err := json.Marshal(map[string]any{
+		"schema": "practice-learning-material-context.v1", "target": definition,
+		"planner_version": material.PlannerVersion, "pedagogy_profile": material.PedagogyProfile,
+		"presentation_style": material.PresentationStyle, "generation_policy": material.GenerationPolicy,
+	})
+	return course, contextJSON, err
+}

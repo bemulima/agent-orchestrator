@@ -1,0 +1,994 @@
+package courseplan
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+)
+
+func TestProcessorCompletesOnlyAfterCourseAssignment(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requestRepository := &processorRequestRepository{claimed: planningRequest(now)}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons: []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0,
+			Targets: []domain.TargetRef{{Type: domain.TargetConcept, Key: "go.variables", Version: "v1"}}}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("process next: %v", err)
+	}
+	if !processed || requestRepository.completed == nil {
+		t.Fatal("expected completed request")
+	}
+	if student.assignmentCalls != 1 || student.assignmentRequestID != requestRepository.claimed.ID ||
+		student.assignmentKey != requestRepository.claimed.ID {
+		t.Fatalf("assignment was not idempotent: %#v", student)
+	}
+	if course.idempotencyKey != requestRepository.claimed.ID {
+		t.Fatalf("course ensure key = %q", course.idempotencyKey)
+	}
+	if requestRepository.completed.CourseID != course.result.CourseID ||
+		requestRepository.completed.ResultCode != domain.CoursePlanResultCreated ||
+		requestRepository.completed.LearningPathID != "77777777-7777-4777-8777-777777777777" {
+		t.Fatalf("unexpected completed request: %#v", requestRepository.completed)
+	}
+	if student.createCalls != 1 || requestRepository.resolvedLearningPathID != requestRepository.completed.LearningPathID ||
+		len(requestRepository.operations) != 2 || requestRepository.operations[0] != "resolve_learning_path" ||
+		requestRepository.operations[1] != "complete" {
+		t.Fatalf("allocated path was not checkpointed before completion: student=%#v repository=%#v", student, requestRepository)
+	}
+	if requestRepository.renewCalls < 1 {
+		t.Fatal("expected the processor to renew its claim during downstream work")
+	}
+}
+
+func TestProcessorRetriesAssignmentWithoutCompleting(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requestRepository := &processorRequestRepository{claimed: planningRequest(now)}
+	student := &processorStudentService{profile: testPlanningProfile(), assignmentErr: errors.New("student unavailable")}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons: []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0,
+			Targets: []domain.TargetRef{{Type: domain.TargetConcept, Key: "go.variables", Version: "v1"}}}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err == nil {
+		t.Fatalf("expected processed retry error, got processed=%v err=%v", processed, err)
+	}
+	if requestRepository.completed != nil || requestRepository.retried == nil {
+		t.Fatal("assignment failure must retry without completing")
+	}
+	if requestRepository.retryNow != now || requestRepository.retryAt != now.Add(time.Second) {
+		t.Fatalf("unexpected retry schedule: now=%v at=%v", requestRepository.retryNow, requestRepository.retryAt)
+	}
+	if requestRepository.retried.CourseFingerprint == "" || len(requestRepository.retried.NormalizedContextJSON) == 0 {
+		t.Fatal("retry did not retain deterministic audit context")
+	}
+}
+
+func TestProcessorNoGapDoesNotCreateOrAssignCourse(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requestRepository := &processorRequestRepository{claimed: planningRequest(now)}
+	student := &processorStudentService{profile: testPlanningProfile(), allMastered: true}
+	course := &processorCourseService{}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("process no-gap request: processed=%v err=%v", processed, err)
+	}
+	if course.calls != 0 || student.assignmentCalls != 0 || student.completionCalls != 0 {
+		t.Fatalf("no-gap request called downstream mutation: course=%d assignment=%d", course.calls, student.assignmentCalls)
+	}
+	if requestRepository.completed == nil || requestRepository.completed.ResultCode != domain.CoursePlanResultNoGap ||
+		requestRepository.completed.CourseID != "" {
+		t.Fatalf("unexpected no-gap result: %#v", requestRepository.completed)
+	}
+}
+
+func TestProcessorNoGapCompletesMatchingCurrentLearningPath(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.RequestHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	request.Intent.Source = domain.PlanningSourceTeacher
+	request.Intent.Reason = domain.PlanningReasonInitial
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{profile: testPlanningProfile(), allMastered: true}
+	processor := testProcessor(now, requestRepository, student, &processorCourseService{})
+
+	processed, err := processor.ProcessNext(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("process no-gap replan: processed=%v err=%v", processed, err)
+	}
+	if student.planningStateCalls != 1 || student.planningStatePathID != request.LearningPathID ||
+		student.completionCalls != 1 || student.completion.LearningPathID != request.LearningPathID ||
+		student.completion.ExpectedVersion != 3 ||
+		student.completion.CourseFingerprint != "existing-fingerprint" ||
+		student.completion.ReasonCode != "mastery_no_gap" || student.completion.Schema != domain.LearningPathNoGapRequestSchema {
+		t.Fatalf("unexpected path completion: calls=%d payload=%#v", student.completionCalls, student.completion)
+	}
+	if requestRepository.checkpointCalls != 1 || requestRepository.completed == nil ||
+		requestRepository.completed.LearningPathCommand == nil ||
+		requestRepository.completed.LearningPathCommand.Command != domain.LearningPathCommandNoGap {
+		t.Fatalf("NO_GAP was not checkpointed and retained: %#v", requestRepository)
+	}
+}
+
+func TestProcessorRejectsCrossGoalExactPath(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.Intent.Reason = domain.PlanningReasonReplan
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{profile: testPlanningProfile(), allMastered: true}
+	student.planningState = processorPlanningState(request.StudentID, request.LearningPathID, "python.backend")
+	processor := testProcessor(now, requestRepository, student, &processorCourseService{})
+
+	processed, err := processor.ProcessNext(context.Background())
+	if err == nil || !processed || requestRepository.failed == nil {
+		t.Fatalf("cross-goal path should fail: processed=%v err=%v failed=%#v", processed, err, requestRepository.failed)
+	}
+	if student.completionCalls != 0 || student.replanCalls != 0 || student.createCalls != 0 {
+		t.Fatalf("cross-goal path was mutated: %#v", student)
+	}
+}
+
+func TestProcessorReplansOnlyRequestedExactPathAndTerminatesKnownConflict(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.Intent.Reason = domain.PlanningReasonReplan
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{claimed: request}
+	profile := testPlanningProfile()
+	profile.LearningPathCourseID = "66666666-6666-4666-8666-666666666666"
+	profile.LearningPathGoalCode = "another.selected.path"
+	profile.LearningPathRevision = "selected-path-fingerprint"
+	profile.LearningPathVersion = 12
+	student := &processorStudentService{profile: profile, replanErr: domain.ErrConflict}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons:  []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err == nil || requestRepository.failed == nil || requestRepository.retried != nil ||
+		requestRepository.completed != nil || requestRepository.failureCode != domain.CoursePlanFailurePathConflict {
+		t.Fatalf("stale replan should terminate: processed=%v err=%v repository=%#v", processed, err, requestRepository)
+	}
+	if student.planningStatePathID != request.LearningPathID || student.replanCalls != 1 ||
+		student.replan.LearningPathID != request.LearningPathID || student.replan.ExpectedVersion != 3 ||
+		student.createCalls != 0 {
+		t.Fatalf("replan escaped exact path: %#v", student)
+	}
+	if requestRepository.failed.LearningPathCommand == nil || requestRepository.checkpointCalls != 1 {
+		t.Fatalf("terminal conflict lost checkpoint audit: %#v", requestRepository)
+	}
+	if requestRepository.failed.ResultCode != "" || requestRepository.failed.CourseID != "" || requestRepository.failed.Reused {
+		t.Fatalf("terminal conflict exposed an unconfirmed planned outcome: %#v", requestRepository.failed)
+	}
+	if requestRepository.failed.LearningPathCommand.PlannedCourseID != course.result.CourseID ||
+		requestRepository.failed.LearningPathCommand.PlannedResultCode != domain.CoursePlanResultCreated {
+		t.Fatalf("terminal conflict lost private planned-outcome audit: %#v", requestRepository.failed.LearningPathCommand)
+	}
+}
+
+func TestProcessorLostSuccessResponseRetriesIdenticalCheckpointWithoutStateReread(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.Intent.Reason = domain.PlanningReasonReplan
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{
+		profile: testPlanningProfile(), replanErrors: []error{errors.New("success response lost"), nil},
+	}
+	student.replanHook = func(domain.LearningPathReplan) {
+		if requestRepository.checkpointed == nil {
+			t.Fatal("Student command was sent before durable checkpoint")
+		}
+	}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons:  []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err == nil || requestRepository.retried == nil || requestRepository.checkpointed == nil {
+		t.Fatalf("ambiguous first delivery was not checkpointed for retry: processed=%v err=%v repository=%#v", processed, err, requestRepository)
+	}
+	if requestRepository.retried.ResultCode != "" || requestRepository.retried.CourseID != "" || requestRepository.retried.Reused {
+		t.Fatalf("transport ambiguity exposed an unconfirmed planned outcome: %#v", requestRepository.retried)
+	}
+	if requestRepository.retried.LearningPathCommand == nil ||
+		requestRepository.retried.LearningPathCommand.PlannedCourseID != course.result.CourseID {
+		t.Fatalf("transport ambiguity lost private planned outcome: %#v", requestRepository.retried)
+	}
+	firstCheckpoint := *requestRepository.checkpointed
+	firstCommand := student.replans[0]
+	student.planningState.PathVersion = 99
+	requestRepository.retried = nil
+
+	processed, err = processor.ProcessNext(context.Background())
+	if !processed || err != nil || requestRepository.completed == nil || student.replanCalls != 2 {
+		t.Fatalf("checkpoint replay did not complete: processed=%v err=%v student=%#v repository=%#v", processed, err, student, requestRepository)
+	}
+	if student.planningStateCalls != 1 || course.calls != 1 || requestRepository.checkpointCalls != 1 ||
+		!reflect.DeepEqual(firstCommand, student.replans[1]) ||
+		firstCheckpoint.PayloadHash != requestRepository.completed.LearningPathCommand.PayloadHash ||
+		requestRepository.completed.LearningPathCommand.ExpectedVersion != firstCommand.ExpectedVersion ||
+		requestRepository.completed.ResultCode != domain.CoursePlanResultCreated ||
+		requestRepository.completed.CourseID != course.result.CourseID {
+		t.Fatalf("retry rebuilt or drifted checkpoint: first=%#v second=%#v student=%#v repository=%#v",
+			firstCommand, student.replans[1], student, requestRepository)
+	}
+}
+
+func TestProcessorDiagnosticCheckpointReplaySkipsDiagnosticProfileGraphAndMasteryReads(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.RequestHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	request.Intent.Reason = domain.PlanningReasonReplan
+	request.ResultCode = domain.CoursePlanResultCreated
+	request.CourseID = "88888888-8888-4888-8888-888888888888"
+	checkpoint, err := domain.NewLearningPathReplanCheckpoint(request, domain.LearningPathReplan{Schema: domain.LearningPathReplanRequestSchema, LearningPathID: request.LearningPathID, PlanningRequestID: request.ID, CourseID: "88888888-8888-4888-8888-888888888888", GoalCode: request.GoalCode, CourseFingerprint: "existing-fingerprint", PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Existing path", ExpectedVersion: 1, Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: "99999999-9999-4999-8999-999999999999", Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "initial_plan"}}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+	request.LearningPathCommand = &checkpoint
+	repo := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	course := &processorCourseService{}
+	diagnostic := &countingDiagnosticRepo{}
+	processor := testProcessor(now, repo, student, course)
+	processor.DiagnosticPlans = diagnostic
+	processor.DiagnosticPlacements = diagnostic
+	graphs := &countingGraphRepository{}
+	policies := &countingPolicyRepository{}
+	processor.Graphs = graphs
+	processor.Policies = policies
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err != nil || repo.completed == nil || student.replanCalls != 1 ||
+		diagnostic.planCalls != 0 || diagnostic.placementCalls != 0 || student.profileCalls != 0 || student.masteryCalls != 0 ||
+		student.planningStateCalls != 0 || graphs.calls != 0 || policies.calls != 0 || course.calls != 0 ||
+		student.assignmentCalls != 0 || student.createCalls != 0 {
+		t.Fatalf("checkpoint reread diagnostic=%#v student=%#v graphs=%#v policies=%#v course=%#v repository=%#v err=%v", diagnostic, student, graphs, policies, course, repo, err)
+	}
+}
+
+func TestProcessorDiagnosticLinkValidationFailureMatrixHasNoDownstreamMutation(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	studentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	planID := "33333333-3333-4333-8333-333333333333"
+	valid := diagnosticRecordForCoursePlan(t, studentID, planID)
+	placement := diagnosticPlacementForCoursePlan(t, valid.Plan)
+	foreign := valid
+	foreign.Plan.StudentID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	foreign.Plan.PlanDigest, _ = domain.DiagnosticPlanDigest(foreign.Plan)
+	corrupt := valid
+	corrupt.BindingGoalCode = " Goal "
+
+	for _, tc := range []struct {
+		name        string
+		plan        domain.DiagnosticAssessmentPlanRecord
+		planErr     error
+		placement   domain.DiagnosticPlacementRecord
+		placeErr    error
+		profile     domain.StudentPlanningProfile
+		retry       bool
+		readProfile bool
+	}{
+		{name: "plan not found is terminal", planErr: domain.ErrNotFound},
+		{name: "plan transport error retries", planErr: errors.New("planner unavailable"), retry: true},
+		{name: "placement not found retries", plan: valid, placeErr: domain.ErrNotFound, retry: true},
+		{name: "placement transport error retries", plan: valid, placeErr: errors.New("placement unavailable"), retry: true},
+		{name: "foreign plan is terminal", plan: foreign},
+		{name: "corrupt private binding is terminal", plan: corrupt},
+		{name: "stale onboarding is terminal", plan: valid, placement: placement, profile: diagnosticProfile(2), readProfile: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := planningRequest(now)
+			request.RequestHash = strings.Repeat("a", 64)
+			request.Intent.Source = domain.PlanningSourceTeacher
+			request.Intent.Reason = domain.PlanningReasonInitial
+			request.DiagnosticPlanID = planID
+			requests := &processorRequestRepository{claimed: request}
+			profile := diagnosticProfile(1)
+			if tc.profile.ProfileVersion != "" {
+				profile = tc.profile
+			}
+			student := &processorStudentService{profile: profile}
+			course := &processorCourseService{}
+			diagnostic := &diagnosticProcessorRepository{plan: tc.plan, planErr: tc.planErr, placement: tc.placement, placementErr: tc.placeErr}
+			processor := testProcessor(now, requests, student, course)
+			processor.DiagnosticPlans = diagnostic
+			processor.DiagnosticPlacements = diagnostic
+
+			processed, err := processor.ProcessNext(context.Background())
+			if !processed || err == nil {
+				t.Fatalf("processed=%v err=%v", processed, err)
+			}
+			if tc.retry {
+				if requests.retried == nil || requests.failed != nil {
+					t.Fatalf("retryable diagnostic dependency was not retried: %#v", requests)
+				}
+			} else if requests.failed == nil || requests.failureCode != "DIAGNOSTIC_PLAN_INVALID" || requests.retried != nil {
+				t.Fatalf("invalid diagnostic link was not terminal: %#v", requests)
+			}
+			if course.calls != 0 || student.assignmentCalls != 0 || student.createCalls != 0 || student.replanCalls != 0 || student.completionCalls != 0 {
+				t.Fatalf("diagnostic rejection mutated downstream: student=%#v course=%#v", student, course)
+			}
+			if !tc.readProfile && (student.profileCalls != 0 || student.masteryCalls != 0) {
+				t.Fatalf("early diagnostic rejection read Student profile/mastery: %#v", student)
+			}
+		})
+	}
+}
+
+func diagnosticProfile(onboardingVersion int64) domain.StudentPlanningProfile {
+	profile := testPlanningProfile()
+	profile.OnboardingVersion = onboardingVersion
+	return profile
+}
+
+func diagnosticRecordForCoursePlan(t *testing.T, studentID, planID string) domain.DiagnosticAssessmentPlanRecord {
+	t.Helper()
+	created := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	binding := domain.DiagnosticBootstrapBinding{
+		GoalCode: "go.backend", DirectionCode: "backend", CourseID: "44444444-4444-4444-8444-444444444444",
+		BindingRevision: 1, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, Active: true, CreatedAt: created,
+	}
+	var err error
+	binding.BindingDigest, err = domain.DiagnosticBootstrapBindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := domain.DiagnosticAssessmentPlan{
+		Schema: domain.DiagnosticAssessmentPlanSchemaV1, ID: planID, StudentID: studentID, CourseID: binding.CourseID,
+		PlanRevision: 1, PolicyVersion: domain.DiagnosticFixedPolicyV1, CourseRevision: "sha256:" + strings.Repeat("b", 64),
+		OnboardingVersion: 1, BootstrapPolicyVersion: domain.DiagnosticBootstrapPolicyV1,
+		BootstrapContextDigest: "sha256:" + strings.Repeat("c", 64), CreatedAt: created,
+	}
+	for index := 0; index < 3; index++ {
+		plan.Assessments = append(plan.Assessments, domain.DiagnosticAssessment{
+			LessonID: fmt.Sprintf("55555555-5555-4555-8555-%012d", index),
+			TaskID:   fmt.Sprintf("66666666-6666-4666-8666-%012d", index), TaskVersion: 1,
+			UpdatedAt: created, LessonOrder: index,
+		})
+	}
+	plan.PlanDigest, err = domain.DiagnosticPlanDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return domain.DiagnosticAssessmentPlanRecord{
+		IdempotencyKey: "77777777-7777-4777-8777-777777777777", RequestHash: "sha256:" + strings.Repeat("d", 64), Plan: plan,
+		BindingRevision: binding.BindingRevision, BindingDigest: binding.BindingDigest, BindingGoalCode: binding.GoalCode,
+		BindingDirectionCode: binding.DirectionCode, BindingCreatedAt: binding.CreatedAt,
+	}
+}
+
+func diagnosticPlacementForCoursePlan(t *testing.T, plan domain.DiagnosticAssessmentPlan) domain.DiagnosticPlacementRecord {
+	t.Helper()
+	completed := time.Date(2026, 9, 1, 9, 1, 0, 0, time.UTC)
+	result := domain.DiagnosticAssessmentResult{
+		Schema: domain.DiagnosticAssessmentResultSchemaV1, StudentID: plan.StudentID, CourseID: plan.CourseID,
+		CourseContentRevision: plan.CourseRevision, PolicyVersion: plan.PolicyVersion, AttemptID: plan.ID, PlanID: plan.ID,
+		PlanRevision: plan.PlanRevision, Correct: 3, Total: 3, Percent: 100, Band: "ADVANCED",
+		BandPolicyVersion: domain.DiagnosticAssessmentBandPolicyV1, PlanDigest: plan.PlanDigest, CompletedAt: completed,
+	}
+	var err error
+	result.ResultDigest, err = domain.DiagnosticResultDigest(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := domain.DiagnosticPlacement{
+		Schema: domain.DiagnosticPlacementSchemaV1, StudentID: result.StudentID, CourseID: result.CourseID,
+		CourseContentRevision: result.CourseContentRevision, PolicyVersion: result.PolicyVersion, AttemptID: result.AttemptID,
+		PlanID: result.PlanID, PlanRevision: result.PlanRevision, Correct: result.Correct, Total: result.Total,
+		Percent: result.Percent, Band: result.Band, BandPolicyVersion: result.BandPolicyVersion, PlanDigest: result.PlanDigest,
+		ResultDigest: result.ResultDigest, ResultCompletedAt: completed, RouteCode: "START_ADVANCED",
+		RoutePolicyVersion: domain.DiagnosticPlacementRoutePolicyV1, DecidedAt: completed.Add(time.Minute),
+	}
+	decision.DecisionDigest, err = domain.DiagnosticPlacementDigest(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := domain.DiagnosticPlacementConsumeHash(plan.StudentID, plan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return domain.DiagnosticPlacementRecord{RequestID: plan.ID, RequestHash: hash, Decision: decision}
+}
+
+type diagnosticProcessorRepository struct {
+	plan                      domain.DiagnosticAssessmentPlanRecord
+	planErr                   error
+	placement                 domain.DiagnosticPlacementRecord
+	placementErr              error
+	planCalls, placementCalls int
+}
+
+func (r *diagnosticProcessorRepository) GetByStudentKey(context.Context, string, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+}
+func (r *diagnosticProcessorRepository) GetDiagnosticByID(context.Context, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	r.planCalls++
+	return r.plan, r.planErr
+}
+func (r *diagnosticProcessorRepository) GetLatest(context.Context, string, string, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+}
+func (r *diagnosticProcessorRepository) Insert(context.Context, domain.DiagnosticAssessmentPlanRecord) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, errors.New("unused")
+}
+func (r *diagnosticProcessorRepository) GetDiagnosticPlacement(context.Context, string) (domain.DiagnosticPlacementRecord, error) {
+	r.placementCalls++
+	return r.placement, r.placementErr
+}
+func (r *diagnosticProcessorRepository) InsertDiagnosticPlacement(context.Context, domain.DiagnosticPlacementRecord) (domain.DiagnosticPlacementRecord, error) {
+	return domain.DiagnosticPlacementRecord{}, errors.New("unused")
+}
+
+type countingDiagnosticRepo struct{ planCalls, placementCalls int }
+
+type countingGraphRepository struct{ calls int }
+
+func (r *countingGraphRepository) GetPublishedGoalGraph(context.Context, string) (domain.GoalGraph, error) {
+	r.calls++
+	return domain.GoalGraph{}, errors.New("must not read")
+}
+
+type countingPolicyRepository struct{ calls int }
+
+func (r *countingPolicyRepository) GetActivePolicyBundle(context.Context) (domain.PolicyBundle, error) {
+	r.calls++
+	return domain.PolicyBundle{}, errors.New("must not read")
+}
+
+func (r *countingDiagnosticRepo) GetByStudentKey(context.Context, string, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+}
+func (r *countingDiagnosticRepo) GetDiagnosticByID(context.Context, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	r.planCalls++
+	return domain.DiagnosticAssessmentPlanRecord{}, errors.New("must not read")
+}
+func (r *countingDiagnosticRepo) GetLatest(context.Context, string, string, string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+}
+func (r *countingDiagnosticRepo) Insert(context.Context, domain.DiagnosticAssessmentPlanRecord) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return domain.DiagnosticAssessmentPlanRecord{}, errors.New("unused")
+}
+func (r *countingDiagnosticRepo) GetDiagnosticPlacement(context.Context, string) (domain.DiagnosticPlacementRecord, error) {
+	r.placementCalls++
+	return domain.DiagnosticPlacementRecord{}, errors.New("must not read")
+}
+func (r *countingDiagnosticRepo) InsertDiagnosticPlacement(context.Context, domain.DiagnosticPlacementRecord) (domain.DiagnosticPlacementRecord, error) {
+	return domain.DiagnosticPlacementRecord{}, errors.New("unused")
+}
+
+func TestProcessorCrashAfterDurableCheckpointResumesWithoutRebuilding(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.Intent.Reason = domain.PlanningReasonReplan
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{
+		claimed: request, checkpointErr: errors.New("connection lost after commit"), persistCheckpointOnErr: true,
+	}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons:  []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err == nil || requestRepository.checkpointed == nil || student.replanCalls != 0 {
+		t.Fatalf("checkpoint crash boundary was unsafe: processed=%v err=%v student=%#v repository=%#v", processed, err, student, requestRepository)
+	}
+	requestRepository.checkpointErr = nil
+	processed, err = processor.ProcessNext(context.Background())
+	if !processed || err != nil || student.replanCalls != 1 || student.planningStateCalls != 1 ||
+		course.calls != 1 || requestRepository.checkpointCalls != 1 || requestRepository.completed == nil {
+		t.Fatalf("durable checkpoint was rebuilt instead of resumed: processed=%v err=%v student=%#v repository=%#v", processed, err, student, requestRepository)
+	}
+}
+
+func TestProcessorResolvedInitialRetryUsesExactPathWithoutAllocatingAgain(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	requestRepository := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons:  []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if err != nil || !processed || requestRepository.completed == nil {
+		t.Fatalf("resume allocated initial request: processed=%v err=%v", processed, err)
+	}
+	if student.planningStateCalls != 1 || student.replanCalls != 1 || student.createCalls != 0 ||
+		requestRepository.completed.LearningPathID != request.LearningPathID ||
+		student.replan.ReasonCode != "initial_plan" {
+		t.Fatalf("retry did not resume exact stored path: student=%#v completed=%#v", student, requestRepository.completed)
+	}
+}
+
+func TestProcessorCrashAfterAllocationResumesSameInitialPathWithoutReasonDrift(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requestRepository := &processorRequestRepository{
+		claimed: planningRequest(now), completeErr: errors.New("terminal write unavailable"),
+	}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	course := &processorCourseService{result: domain.EnsureCourseResult{
+		CourseID: "33333333-3333-4333-8333-333333333333",
+		Lessons:  []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0}},
+	}}
+	processor := testProcessor(now, requestRepository, student, course)
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || err == nil || student.createCalls != 1 || requestRepository.resolvedLearningPathID == "" {
+		t.Fatalf("first attempt did not stop after checkpointed allocation: processed=%v err=%v student=%#v repository=%#v", processed, err, student, requestRepository)
+	}
+	requestRepository.completeErr = nil
+	processed, err = processor.ProcessNext(context.Background())
+	if !processed || err != nil || student.createCalls != 2 || student.replanCalls != 0 ||
+		student.planningStateCalls != 0 || course.calls != 1 ||
+		requestRepository.planningInput.OriginalPath != nil || requestRepository.planningInput.OriginalLearningPathID != "" ||
+		student.created.CourseFingerprint != student.planningState.CourseFingerprint ||
+		student.created.ReasonCode != "initial_plan" || requestRepository.completed == nil ||
+		requestRepository.completed.LearningPathID != requestRepository.resolvedLearningPathID {
+		t.Fatalf("retry drifted from allocated initial path: processed=%v err=%v student=%#v repository=%#v", processed, err, student, requestRepository)
+	}
+}
+
+func TestProcessorStopsImmediatelyWhenClaimRenewalFails(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	requestRepository := &processorRequestRepository{
+		claimed: planningRequest(now), renewErr: domain.ErrConflict,
+	}
+	student := &processorStudentService{profile: testPlanningProfile()}
+	processor := testProcessor(now, requestRepository, student, &processorCourseService{})
+
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("lost claim: processed=%v err=%v", processed, err)
+	}
+	if requestRepository.completed != nil || requestRepository.retried != nil || requestRepository.failed != nil {
+		t.Fatal("a worker that lost its claim must not change request state")
+	}
+	if student.assignmentCalls != 0 || student.completionCalls != 0 {
+		t.Fatal("a worker that lost its claim must not mutate Student")
+	}
+}
+
+func testProcessor(
+	now time.Time,
+	requests *processorRequestRepository,
+	student *processorStudentService,
+	course *processorCourseService,
+) Processor {
+	return Processor{
+		Requests: requests, Graphs: processorGraphRepository{}, Policies: processorPolicyRepository{},
+		Students: student, Courses: course, IDs: fixedIDs{"22222222-2222-4222-8222-222222222222"},
+		Generator: processorContentGenerator{},
+		Clock:     fixedClock{now}, Strategies: pedagogy.NewDefaultRegistry(), LeaseTTL: 30 * time.Second, MaxAttempts: 5,
+	}
+}
+
+type processorContentGenerator struct{}
+
+func (processorContentGenerator) GenerateLesson(
+	_ context.Context,
+	input domainservice.LessonGenerationInput,
+	_ string,
+) (domainservice.GeneratedLessonContent, error) {
+	return domainservice.GeneratedLessonContent{
+		DescriptionMarkdown: "Lesson content for " + input.Lesson.Title,
+		Examples: []domain.PlannedExample{{
+			Title: "Example", DescriptionMarkdown: "Example body", Stacks: []string{"go"},
+			TargetConcepts: []string{"go.basics"},
+		}},
+		KnowledgeChecks: []domain.PlannedTask{{
+			Title: "Check", DescriptionMarkdown: "What is the answer?", ExpectedAnswers: []string{"answer"},
+		}},
+	}, nil
+}
+
+func planningRequest(now time.Time) domain.CoursePlanRequest {
+	return domain.CoursePlanRequest{
+		ID: "11111111-1111-4111-8111-111111111111", StudentID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		IdempotencyKey: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", RequestHash: strings.Repeat("a", 64), GoalCode: "go.backend",
+		Intent: domain.PlanningIntent{Source: domain.PlanningSourceStudent, Reason: domain.PlanningReasonInitial,
+			DesiredOutcome: "Go backend"},
+		Status: domain.CoursePlanPlanning, Attempts: 1, CreatedAt: now, UpdatedAt: now, NextAttemptAt: now,
+	}
+}
+
+type fixedIDs struct{ value string }
+
+func (ids fixedIDs) NewID() string { return ids.value }
+
+type fixedClock struct{ value time.Time }
+
+func (clock fixedClock) Now() time.Time { return clock.value }
+
+type processorRequestRepository struct {
+	claimed                domain.CoursePlanRequest
+	completed              *domain.CoursePlanRequest
+	retried                *domain.CoursePlanRequest
+	failed                 *domain.CoursePlanRequest
+	retryAt                time.Time
+	retryNow               time.Time
+	renewCalls             int
+	renewErr               error
+	resolvedLearningPathID string
+	operations             []string
+	completeErr            error
+	completeCalls          int
+	checkpointed           *domain.LearningPathCommandCheckpoint
+	checkpointCalls        int
+	checkpointErr          error
+	persistCheckpointOnErr bool
+	failureCode            string
+	loseLeaseAfter         string
+	planningInput          *domain.PlanningInputCheckpoint
+	generatedCheckpoint    *domain.GeneratedCourseCheckpoint
+	ensureCheckpoint       *domain.CourseEnsureCheckpoint
+	pinErr                 error
+	artifactErr            error
+	ensureErr              error
+	pinReadErr             error
+	artifactReadErr        error
+	ensureReadErr          error
+	persistPinOnErr        bool
+	persistArtifactOnErr   bool
+	persistEnsureOnErr     bool
+	planningPinCalls       int
+	artifactPinCalls       int
+	ensurePinCalls         int
+}
+
+func (repository *processorRequestRepository) CreateOrGet(
+	context.Context,
+	domain.CoursePlanRequest,
+) (domain.CoursePlanRequest, bool, error) {
+	return domain.CoursePlanRequest{}, false, errors.New("not implemented")
+}
+
+func (repository *processorRequestRepository) GetForStudent(
+	context.Context,
+	string,
+	string,
+) (domain.CoursePlanRequest, error) {
+	return domain.CoursePlanRequest{}, errors.New("not implemented")
+}
+
+func (repository *processorRequestRepository) ClaimNext(
+	_ context.Context,
+	claimToken string,
+	_ time.Time,
+	_ time.Time,
+) (domain.CoursePlanRequest, error) {
+	result := repository.claimed
+	result.ClaimToken = claimToken
+	return result, nil
+}
+
+func (repository *processorRequestRepository) RenewClaim(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ time.Time,
+	_ time.Time,
+) error {
+	repository.renewCalls++
+	return repository.renewErr
+}
+
+func (repository *processorRequestRepository) ResolveLearningPath(
+	_ context.Context,
+	_ string,
+	_ string,
+	learningPathID string,
+	_ time.Time,
+) error {
+	repository.resolvedLearningPathID = learningPathID
+	repository.claimed.LearningPathID = learningPathID
+	repository.operations = append(repository.operations, "resolve_learning_path")
+	return nil
+}
+
+func (repository *processorRequestRepository) CheckpointLearningPathCommand(
+	_ context.Context,
+	request domain.CoursePlanRequest,
+	_ string,
+	_ time.Time,
+) error {
+	repository.checkpointCalls++
+	if request.LearningPathCommand == nil {
+		return domain.ErrValidation
+	}
+	if repository.checkpointErr == nil || repository.persistCheckpointOnErr {
+		checkpoint := *request.LearningPathCommand
+		checkpoint.Payload = append([]byte(nil), checkpoint.Payload...)
+		repository.checkpointed = &checkpoint
+		repository.claimed = request
+		repository.operations = append(repository.operations, "checkpoint_learning_path_command")
+	}
+	return repository.checkpointErr
+}
+
+func (repository *processorRequestRepository) Complete(
+	_ context.Context,
+	request domain.CoursePlanRequest,
+	_ string,
+	_ time.Time,
+) error {
+	repository.completeCalls++
+	if repository.completeErr != nil {
+		return repository.completeErr
+	}
+	repository.completed = &request
+	repository.operations = append(repository.operations, "complete")
+	return nil
+}
+
+func (repository *processorRequestRepository) Retry(
+	_ context.Context,
+	request domain.CoursePlanRequest,
+	_ string,
+	nextAttemptAt time.Time,
+	now time.Time,
+) error {
+	repository.retried = &request
+	repository.claimed = request
+	repository.retryAt = nextAttemptAt
+	repository.retryNow = now
+	return nil
+}
+
+func (repository *processorRequestRepository) Fail(
+	_ context.Context,
+	request domain.CoursePlanRequest,
+	_ string,
+	failureCode string,
+	_ time.Time,
+) error {
+	repository.failed = &request
+	repository.failureCode = failureCode
+	repository.operations = append(repository.operations, "fail")
+	return nil
+}
+
+type processorGraphRepository struct{}
+
+func (processorGraphRepository) GetPublishedGoalGraph(context.Context, string) (domain.GoalGraph, error) {
+	return testGoalGraph(), nil
+}
+
+type processorPolicyRepository struct{}
+
+func (processorPolicyRepository) GetActivePolicyBundle(context.Context) (domain.PolicyBundle, error) {
+	return testPolicyBundle(), nil
+}
+
+type processorStudentService struct {
+	profile             domain.StudentPlanningProfile
+	profileCalls        int
+	masteryCalls        int
+	allMastered         bool
+	assignmentErr       error
+	assignmentCalls     int
+	assignmentRequestID string
+	assignmentKey       string
+	completionCalls     int
+	completion          domain.LearningPathCompletion
+	planningState       domain.LearningPathPlanningState
+	planningStateCalls  int
+	planningStatePathID string
+	createCalls         int
+	createErr           error
+	created             domain.LearningPathReplacement
+	allocation          domain.LearningPathAllocation
+	replanCalls         int
+	replan              domain.LearningPathReplan
+	replanErr           error
+	replans             []domain.LearningPathReplan
+	replanErrors        []error
+	replanHook          func(domain.LearningPathReplan)
+}
+
+func (service *processorStudentService) GetPlanningProfile(
+	context.Context,
+	string,
+) (domain.StudentPlanningProfile, error) {
+	service.profileCalls++
+	return service.profile, nil
+}
+
+func (service *processorStudentService) QueryMastery(
+	_ context.Context,
+	_ string,
+	targets []domain.TargetRef,
+) ([]domain.TargetMastery, error) {
+	service.masteryCalls++
+	result := make([]domain.TargetMastery, len(targets))
+	for index, target := range targets {
+		result[index] = domain.TargetMastery{
+			Target: target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion,
+		}
+		if service.allMastered {
+			result[index].State = domain.MasteryMastered
+			result[index].MasteryScore = 1
+			result[index].Confidence = 1
+		}
+	}
+	return result, nil
+}
+
+func (service *processorStudentService) AssignCourse(
+	_ context.Context,
+	_ string,
+	_ string,
+	planningRequestID string,
+	idempotencyKey string,
+) error {
+	service.assignmentCalls++
+	service.assignmentRequestID = planningRequestID
+	service.assignmentKey = idempotencyKey
+	return service.assignmentErr
+}
+
+func (service *processorStudentService) CreateLearningPath(
+	_ context.Context,
+	studentID string,
+	_ string,
+	replacement domain.LearningPathReplacement,
+) (domain.LearningPathAllocation, error) {
+	service.createCalls++
+	service.created = replacement
+	if service.createErr != nil {
+		return domain.LearningPathAllocation{}, service.createErr
+	}
+	if service.allocation.LearningPathID != "" {
+		return service.allocation, nil
+	}
+	allocation := domain.LearningPathAllocation{
+		LearningPathID: "77777777-7777-4777-8777-777777777777", StudentID: studentID,
+		CourseID: replacement.CourseID, GoalCode: replacement.GoalCode,
+		CourseFingerprint: replacement.CourseFingerprint, PathVersion: 1,
+	}
+	service.planningState = domain.LearningPathPlanningState{
+		Schema: domain.LearningPathPlanningStateSchema, StudentID: studentID, LearningPathID: allocation.LearningPathID,
+		CourseID: replacement.CourseID, GoalCode: replacement.GoalCode, CourseFingerprint: replacement.CourseFingerprint,
+		Status: "ACTIVE", IsPrimary: true, IsSelected: true, PathVersion: 1, JourneyVersion: 1,
+		PlannerPolicyVersion: replacement.PlannerPolicyVersion, ReasonCode: replacement.ReasonCode,
+		ReasonSummary: replacement.ReasonSummary, Items: append([]domain.LearningPathItem(nil), replacement.Items...),
+		UpdatedAt: time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC),
+	}
+	return allocation, nil
+}
+
+func (service *processorStudentService) GetLearningPathPlanningState(
+	_ context.Context,
+	studentID string,
+	learningPathID string,
+) (domain.LearningPathPlanningState, error) {
+	service.planningStateCalls++
+	service.planningStatePathID = learningPathID
+	if service.planningState.LearningPathID != "" {
+		return service.planningState, nil
+	}
+	return processorPlanningState(studentID, learningPathID, "go.backend"), nil
+}
+
+func (service *processorStudentService) ReplanLearningPath(
+	_ context.Context,
+	_ string,
+	_ string,
+	replan domain.LearningPathReplan,
+) (domain.LearningPathCommandResult, error) {
+	service.replanCalls++
+	service.replan = replan
+	service.replans = append(service.replans, replan)
+	if service.replanHook != nil {
+		service.replanHook(replan)
+	}
+	if len(service.replanErrors) > 0 {
+		err := service.replanErrors[0]
+		service.replanErrors = service.replanErrors[1:]
+		return domain.LearningPathCommandResult{}, err
+	}
+	return domain.LearningPathCommandResult{}, service.replanErr
+}
+
+func (service *processorStudentService) CompleteLearningPath(
+	_ context.Context,
+	_ string,
+	_ string,
+	completion domain.LearningPathCompletion,
+) (domain.LearningPathCommandResult, error) {
+	service.completionCalls++
+	service.completion = completion
+	return domain.LearningPathCommandResult{}, nil
+}
+
+func processorPlanningState(studentID, learningPathID, goalCode string) domain.LearningPathPlanningState {
+	return domain.LearningPathPlanningState{
+		Schema: domain.LearningPathPlanningStateSchema, StudentID: studentID, LearningPathID: learningPathID,
+		CourseID: "88888888-8888-4888-8888-888888888888", GoalCode: goalCode,
+		CourseFingerprint: "existing-fingerprint", Status: "ACTIVE", PathVersion: 3, JourneyVersion: 5,
+		PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "Existing path",
+		Items: []domain.LearningPathItem{{
+			ReferenceType: "lesson", ReferenceID: "99999999-9999-4999-8999-999999999999",
+			Position: 0, Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap",
+		}},
+		UpdatedAt: time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC),
+	}
+}
+
+type processorCourseService struct {
+	result         domain.EnsureCourseResult
+	calls          int
+	idempotencyKey string
+}
+
+func (service *processorCourseService) EnsureCourse(
+	_ context.Context,
+	draft domain.GeneratedCourse,
+	idempotencyKey string,
+) (domain.EnsureCourseResult, error) {
+	service.calls++
+	service.idempotencyKey = idempotencyKey
+	// Model the Course contract: one ordered binding for every ensured lesson.
+	var lessons []domain.PlannedLesson
+	for _, module := range draft.Modules {
+		for _, section := range module.Sections {
+			lessons = append(lessons, section.Lessons...)
+		}
+	}
+	for index, lesson := range lessons {
+		if index >= len(service.result.Lessons) {
+			service.result.Lessons = append(service.result.Lessons, domain.CourseLessonBinding{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", index+1)})
+		}
+		service.result.Lessons[index].Order = index
+		service.result.Lessons[index].Targets = append([]domain.TargetRef(nil), lesson.Targets...)
+	}
+	return service.result, nil
+}
+
+func TestReplanKeepsRepeatedExactRevisionAssignmentsAndDoesNotReuseChangedRevision(t *testing.T) {
+	old := []domain.LearningPathItem{
+		{LearningPathItemID: "item-a", ReferenceType: "lesson", ReferenceID: "lesson", LessonRevisionID: "r10"},
+		{LearningPathItemID: "item-b", ReferenceType: "lesson", ReferenceID: "lesson", LessonRevisionID: "r10"},
+	}
+	desired := []domain.LearningPathItem{
+		{ReferenceType: "lesson", ReferenceID: "lesson", LessonRevisionID: "r10"},
+		{ReferenceType: "lesson", ReferenceID: "lesson", LessonRevisionID: "r10"},
+		{ReferenceType: "lesson", ReferenceID: "lesson", LessonRevisionID: "r11"},
+	}
+	got := preserveAssignmentIdentities(desired, old)
+	if got[0].LearningPathItemID != "item-a" || got[1].LearningPathItemID != "item-b" || got[2].LearningPathItemID != "" {
+		t.Fatalf("assignment occurrence/revision mismatch: %#v", got)
+	}
+}

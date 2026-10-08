@@ -1,0 +1,108 @@
+package onboardinghandoff
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/readiness"
+)
+
+type IDGenerator interface{ NewID() string }
+type Clock interface{ Now() time.Time }
+
+type AcceptInput struct {
+	StudentID      string
+	IdempotencyKey string
+	Request        domain.TeacherOnboardingPlanHandoffRequest
+}
+
+// Acceptor records a bounded, non-executable handoff only after the existing
+// authoritative Student snapshot and S6 resolver return an exact READY graph.
+type Acceptor struct {
+	Enabled   bool
+	Receipts  repository.OnboardingPlanHandoffRepository
+	Readiness readiness.Resolver
+	IDs       IDGenerator
+	Clock     Clock
+}
+
+func (acceptor Acceptor) Handle(ctx context.Context, input AcceptInput) (domain.TeacherOnboardingPlanHandoff, bool, error) {
+	if acceptor.Receipts == nil || acceptor.IDs == nil || acceptor.Clock == nil ||
+		!domain.ValidLearningReadinessStudentID(input.StudentID) || !validUUID(input.IdempotencyKey) {
+		return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrValidation
+	}
+	request, err := domain.NormalizeTeacherOnboardingPlanHandoffRequest(input.Request)
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	requestHash, err := domain.NewTeacherOnboardingPlanHandoffRequestHash(input.StudentID, request)
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	existing, err := acceptor.Receipts.GetByStudentAndIdempotency(ctx, input.StudentID, input.IdempotencyKey)
+	if err == nil {
+		if existing.RequestHash != requestHash {
+			return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrConflict
+		}
+		response, responseErr := domain.OnboardingPlanHandoffResponse(existing, true)
+		return response, false, responseErr
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	if !acceptor.Enabled {
+		// A disabled capability may replay a durable exact receipt above, but it
+		// must never read Student or graph state for a new request.
+		return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrFeatureDisabled
+	}
+	readinessResult, err := acceptor.Readiness.Handle(ctx, readiness.ResolveInput{
+		StudentID: input.StudentID,
+		Request:   domain.LearningReadinessRequest{Schema: domain.LearningReadinessRequestSchema, ExpectedStateRef: &request.ExpectedStateRef},
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrStateChanged
+		}
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	if readinessResult.Result == domain.LearningReadinessNotReady && readinessResult.ActivePath != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrActivePathExists
+	}
+	if readinessResult.Result != domain.LearningReadinessReady || readinessResult.Goal == nil ||
+		readinessResult.StateRef != request.ExpectedStateRef || readinessResult.Executable ||
+		readinessResult.ContentStatus != domain.ReadinessContentNotCreated {
+		return domain.TeacherOnboardingPlanHandoff{}, false, domain.ErrNotReady
+	}
+	// ACCEPTED records this immediately observed authoritative result. It does
+	// not reserve future absence of a Student-owned active path.
+	// PostgreSQL timestamptz persists microsecond precision. Normalize before
+	// insertion so the first 201 and a later durable replay expose exactly the
+	// same canonical timestamps.
+	readinessObservedAt := acceptor.Clock.Now().UTC().Truncate(time.Microsecond)
+	createdAt := acceptor.Clock.Now().UTC().Truncate(time.Microsecond)
+	if createdAt.Before(readinessObservedAt) {
+		createdAt = readinessObservedAt
+	}
+	record, err := domain.NormalizeOnboardingPlanHandoffRecord(domain.OnboardingPlanHandoffRecord{
+		HandoffID: acceptor.IDs.NewID(), StudentID: input.StudentID, IdempotencyKey: input.IdempotencyKey,
+		RequestHash: requestHash, StateRef: readinessResult.StateRef, DialogID: request.DialogID,
+		TeacherJobID: request.TeacherJobID, Goal: *readinessResult.Goal,
+		ReadinessObservedAt: readinessObservedAt, CreatedAt: createdAt,
+	})
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	stored, created, err := acceptor.Receipts.CreateOrGetOnboardingPlanHandoff(ctx, record)
+	if err != nil {
+		return domain.TeacherOnboardingPlanHandoff{}, false, err
+	}
+	response, err := domain.OnboardingPlanHandoffResponse(stored, !created)
+	return response, created, err
+}
+
+func validUUID(input string) bool {
+	return domain.ValidLearningReadinessStudentID(input)
+}

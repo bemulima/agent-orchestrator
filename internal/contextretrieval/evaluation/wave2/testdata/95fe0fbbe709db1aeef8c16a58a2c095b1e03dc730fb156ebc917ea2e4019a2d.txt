@@ -1,0 +1,144 @@
+package student
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+func hybridApplicationFixture(t *testing.T) (domain.HybridConsequence, domain.HybridApplicationReceipt) {
+	t.Helper()
+	s, _ := hybridSnapshotFixture(t)
+	policy := domain.PolicyBundle{PlannerVersion: domain.PlannerVersion, PedagogyProfile: domain.DefaultPedagogyProfile, PresentationStyle: domain.DefaultPresentationStyle, GenerationPolicy: domain.DefaultGenerationPolicy, MasterySkipConfidence: .8, PedagogyStrategies: []domain.PedagogyStrategyVersion{{Code: "explicit_instruction", Version: 1, Config: json.RawMessage(`{}`)}}}
+	inputs, err := domain.NormalizeHybridConsequenceInputs(policy, domain.HybridPrerequisiteGraph{Targets: []domain.HybridPrerequisiteTarget{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := domain.EvaluateHybridSnapshot(s, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := domain.HybridConsequencePayloadHash(c)
+	return c, domain.HybridApplicationReceipt{ConsequenceID: c.ConsequenceID, PayloadHash: hash, LearningPathID: c.LearningPathID, PreviousRevision: c.ExpectedPathRevision, ResultingRevision: c.ExpectedPathRevision, Status: "NO_CHANGE", CommittedAt: time.Date(2026, 10, 5, 1, 3, 0, 0, time.UTC)}
+}
+func hybridApplicationClient(raw []byte, status int, transport func(*http.Request)) Client {
+	return Client{BaseURL: "http://student-owner", ReadToken: "general-read", WriteToken: "planner-dedicated", HTTPClient: &http.Client{Transport: hybridRoundTrip(func(request *http.Request) (*http.Response, error) {
+		if transport != nil {
+			transport(request)
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+	})}}
+}
+
+func TestHybridApplicationClientExactRegisteredOwnerBoundary(t *testing.T) {
+	c, receipt := hybridApplicationFixture(t)
+	raw, _ := json.Marshal(receipt)
+	calls := 0
+	client := hybridApplicationClient(raw, 200, func(request *http.Request) {
+		calls++
+		expected := "/internal/v1/students/" + c.StudentID + "/learning-paths/" + c.LearningPathID + "/hybrid-consequences"
+		if request.Method != "POST" || request.URL.Path != expected || request.Header.Get("X-Internal-Token") != "planner-dedicated" || request.Header.Get("Idempotency-Key") != "" || request.Header.Get("X-Learner-Intent") != "" {
+			t.Fatalf("wrong apply owner boundary %+v", request)
+		}
+		var got domain.HybridConsequence
+		if json.NewDecoder(request.Body).Decode(&got) != nil || !reflect.DeepEqual(got, c) {
+			t.Fatal("immutable consequence changed on wire")
+		}
+	})
+	got, err := client.ApplyHybridConsequence(context.Background(), c)
+	if err != nil || calls != 1 || !reflect.DeepEqual(got, receipt) {
+		t.Fatalf("receipt=%+v err=%v", got, err)
+	}
+}
+func TestHybridApplicationClientStrictReceipts(t *testing.T) {
+	c, r := hybridApplicationFixture(t)
+	for _, tc := range []struct {
+		name    string
+		modify  func(*domain.HybridApplicationReceipt)
+		rewrite func(string) string
+	}{
+		{name: "wrong consequence", modify: func(r *domain.HybridApplicationReceipt) { r.ConsequenceID = "77777777-7777-4777-8777-777777777777" }},
+		{name: "wrong path", modify: func(r *domain.HybridApplicationReceipt) { r.LearningPathID = "77777777-7777-4777-8777-777777777777" }},
+		{name: "wrong payload", modify: func(r *domain.HybridApplicationReceipt) { r.PayloadHash = "sha256:" + strings.Repeat("0", 64) }},
+		{name: "wrong previous revision", modify: func(r *domain.HybridApplicationReceipt) { r.PreviousRevision++ }},
+		{name: "nochange advanced revision", modify: func(r *domain.HybridApplicationReceipt) { r.ResultingRevision++ }},
+		{name: "unrecognized status", modify: func(r *domain.HybridApplicationReceipt) { r.Status = "DONE" }},
+		{name: "applied nochange", modify: func(r *domain.HybridApplicationReceipt) { r.Status = "APPLIED"; r.ResultingRevision++ }},
+		{name: "zero committed", modify: func(r *domain.HybridApplicationReceipt) { r.CommittedAt = time.Time{} }},
+		{name: "unknown private payload", rewrite: func(raw string) string { return strings.TrimSuffix(raw, "}") + `,"private_evidence":"body"}` }},
+		{name: "missing revision", rewrite: func(raw string) string { return strings.Replace(raw, `"previous_revision":1,`, "", 1) }},
+		{name: "explicit null scalar", rewrite: func(raw string) string {
+			return strings.Replace(raw, `"previous_revision":1`, `"previous_revision":null`, 1)
+		}},
+		{name: "duplicate key", rewrite: func(raw string) string { return strings.TrimSuffix(raw, "}") + `,"status":"NO_CHANGE"}` }},
+		{name: "wrong case", rewrite: func(raw string) string { return strings.Replace(raw, `"status"`, `"Status"`, 1) }},
+		{name: "trailing document", rewrite: func(raw string) string { return raw + `{}` }},
+		{name: "oversized response", rewrite: func(raw string) string { return raw + strings.Repeat(" ", maximumHybridApplicationResponseBytes) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			receipt := r
+			if tc.modify != nil {
+				tc.modify(&receipt)
+			}
+			raw, _ := json.Marshal(receipt)
+			if tc.rewrite != nil {
+				raw = []byte(tc.rewrite(string(raw)))
+			}
+			client := hybridApplicationClient(raw, 200, nil)
+			if _, err := client.ApplyHybridConsequence(context.Background(), c); !errors.Is(err, domain.ErrUpstreamInvalid) {
+				t.Fatalf("invalid receipt accepted err=%v", err)
+			}
+		})
+	}
+}
+func TestHybridApplicationClientTypedErrorCodes(t *testing.T) {
+	c, _ := hybridApplicationFixture(t)
+	for _, tc := range []struct {
+		status   int
+		code     string
+		expected error
+	}{{409, "HYBRID_STALE", domain.ErrHybridApplicationStale}, {409, "HYBRID_INTENT_REQUIRED", domain.ErrHybridApplicationIntentRequired}, {409, "HYBRID_UNSAFE", domain.ErrHybridApplicationUnsafe}, {409, "HYBRID_CONFLICT", domain.ErrConflict}, {422, "HYBRID_UNSUPPORTED", domain.ErrHybridApplicationUnsupported}, {422, "HYBRID_INVALID", domain.ErrValidation}, {404, "HYBRID_NOT_FOUND", domain.ErrNotFound}, {403, "HYBRID_FORBIDDEN", domain.ErrForbidden}, {500, "HYBRID_UNAVAILABLE", domain.ErrUpstreamUnavailable}, {409, "unrecognized", domain.ErrUpstreamInvalid}, {422, "HYBRID_STALE", domain.ErrUpstreamInvalid}} {
+		raw, _ := json.Marshal(map[string]string{"error": tc.code})
+		client := hybridApplicationClient(raw, tc.status, nil)
+		if _, err := client.ApplyHybridConsequence(context.Background(), c); !errors.Is(err, tc.expected) {
+			t.Fatalf("status=%d code=%s err=%v", tc.status, tc.code, err)
+		}
+	}
+	for _, raw := range []string{`{"error":"HYBRID_STALE","error":"HYBRID_STALE"}`, `{"error":"HYBRID_STALE","extra":true}`, `{"error":null}`, `{}`} {
+		client := hybridApplicationClient([]byte(raw), 409, nil)
+		if _, err := client.ApplyHybridConsequence(context.Background(), c); !errors.Is(err, domain.ErrUpstreamInvalid) {
+			t.Fatal("untrusted malformed409 became stale proof")
+		}
+	}
+}
+func TestHybridApplicationClientWaitingAndAppliedReplanReceipt(t *testing.T) {
+	c, r := hybridApplicationFixture(t)
+	c.Outcome = domain.HybridOutcomeReplanNeeded
+	c.ApplicationMode = domain.HybridApplicationRequiresIntent
+	c.IntentID = "66666666-6666-4666-8666-666666666666"
+	c.RequiredIntentKind = "CHANGE_GOAL"
+	c.DesiredScope.GoalCode = "go.advanced"
+	c.ReasonCodes = []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}
+	r.PayloadHash, _ = domain.HybridConsequencePayloadHash(c)
+	for _, status := range []string{"WAITING_SAFE_BOUNDARY", "APPLIED"} {
+		r.Status = status
+		r.ResultingRevision = r.PreviousRevision
+		if status == "APPLIED" {
+			r.ResultingRevision++
+		}
+		raw, _ := json.Marshal(r)
+		client := hybridApplicationClient(raw, 200, nil)
+		got, err := client.ApplyHybridConsequence(context.Background(), c)
+		if err != nil || got.Status != status {
+			t.Fatalf("valid owner status%s err=%v", status, err)
+		}
+	}
+}

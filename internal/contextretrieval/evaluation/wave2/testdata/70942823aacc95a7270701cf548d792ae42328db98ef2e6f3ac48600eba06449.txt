@@ -1,0 +1,334 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/hybridreplan"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type t204Owner struct {
+	URL          string                   `json:"url"`
+	Token        string                   `json:"token"`
+	GeneralToken string                   `json:"general_token"`
+	TeacherToken string                   `json:"teacher_token"`
+	StudentID    string                   `json:"student_id"`
+	PathID       string                   `json:"path_id"`
+	Targets      []domain.HybridTargetRef `json:"targets"`
+	SnapshotRef  string                   `json:"snapshot_ref"`
+}
+type t204OwnerState struct {
+	Path         json.RawMessage `json:"path"`
+	Revisions    int             `json:"revisions"`
+	Applications int             `json:"applications"`
+	Receipts     int             `json:"receipts"`
+	Intents      int             `json:"intents"`
+	IntentEvents int             `json:"intent_events"`
+}
+type t204Path struct {
+	ID      string           `json:"id"`
+	Version int64            `json:"version"`
+	Items   []map[string]any `json:"items"`
+}
+
+// Root supplies actual official ingress → Student outbox → JetStream →
+// snapshot jobs. Both evaluator and delivery below are production workers;
+// initial/final mastery, jobs, consequences and receipts are never seeded.
+func TestT204ActualHybridApplication(t *testing.T) {
+	if os.Getenv("T204_ACTUAL_HYBRID") != "true" {
+		t.Skip("root-owned actual T20.4 gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("PLANNER_T20_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_planner_integration_proof" {
+		t.Fatal("SETUP: exact isolated Planner database required")
+	}
+	var owner, low t204Owner
+	t203ReadJSON(t, os.Getenv("T204_OWNER_READY_FILE"), &owner)
+	t203ReadJSON(t, os.Getenv("T204_NO_CHANGE_READY_FILE"), &low)
+	address, err := url.Parse(owner.URL)
+	if err != nil || address.Scheme != "http" || address.Hostname() != "127.0.0.1" || address.Port() == "" || address.User != nil || address.Path != "" || address.RawQuery != "" || address.Fragment != "" || owner.Token == "" || owner.GeneralToken == "" || owner.TeacherToken == "" || low.StudentID == owner.StudentID {
+		t.Fatal("SETUP: actual finite owner provider and separate official low-evidence fixture required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := postgres.Store{Pool: pool}
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	student := studentclient.Client{BaseURL: owner.URL, WriteToken: owner.Token, HTTPClient: httpClient}
+	job := func(o t204Owner) string {
+		var id string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM hybrid_evaluation_job WHERE student_id=$1 AND learning_path_id=$2 AND snapshot_ref=$3 AND policy_version=$4`, o.StudentID, o.PathID, o.SnapshotRef, domain.HybridReplanPolicyVersion).Scan(&id); err != nil {
+			t.Fatalf("SETUP: actual broker-produced owner snapshot job unavailable: %v", err)
+		}
+		return id
+	}
+	positiveJob, lowJob := job(owner), job(low)
+	evaluator := hybridreplan.EvaluationProcessor{Consequences: store, Policies: store, Graphs: store, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	readConsequence := func(id string) domain.HybridConsequenceReceipt {
+		for i := 0; i < 128; i++ {
+			r, err := store.GetHybridConsequence(ctx, id)
+			if err == nil {
+				return r
+			}
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatal(err)
+			}
+			processed, err := evaluator.ProcessNext(ctx)
+			if err != nil || !processed {
+				t.Fatalf("actual evaluator processed=%v err=%v", processed, err)
+			}
+		}
+		t.Fatal("bounded evaluator did not commit genuine owner job")
+		return domain.HybridConsequenceReceipt{}
+	}
+	positive, noChange := readConsequence(positiveJob), readConsequence(lowJob)
+	c := positive.Consequence
+	if c.Outcome != domain.HybridOutcomeReplanNeeded || c.ApplicationMode != domain.HybridApplicationAuto || len(c.Mutations) != 1 || c.Mutations[0].Kind != "SKIP_REDUNDANT_PENDING_ITEM" || noChange.Consequence.Outcome != domain.HybridOutcomeNoChange {
+		t.Fatal("SETUP: real positive future-skip and real NO_CHANGE required")
+	}
+	getState := func(sid, pid string) t204OwnerState {
+		endpoint := owner.URL + "/__t204/state?student_id=" + url.QueryEscape(sid) + "&path_id=" + url.QueryEscape(pid)
+		raw, status := t204HTTP(t, ctx, httpClient, http.MethodGet, endpoint, owner.Token, "", "", nil)
+		var s t204OwnerState
+		if status != 200 || json.Unmarshal(raw, &s) != nil {
+			t.Fatalf("actual readonly owner observation status=%d body=%s", status, raw)
+		}
+		return s
+	}
+	before, lowBefore := getState(owner.StudentID, owner.PathID), getState(low.StudentID, low.PathID)
+	var initial t204Path
+	if json.Unmarshal(before.Path, &initial) != nil || initial.Version != c.ExpectedPathRevision || len(initial.Items) != 2 || initial.Items[0]["status"] != "READY" || initial.Items[1]["status"] != "PLANNED" || initial.Items[1]["learning_path_item_id"] != c.Mutations[0].ItemID {
+		t.Fatal("SETUP: real READY/current and PLANNED/future owner path required")
+	}
+	applyURL := owner.URL + "/internal/v1/students/" + owner.StudentID + "/learning-paths/" + owner.PathID + "/hybrid-consequences"
+	for _, token := range []string{"", owner.GeneralToken, owner.TeacherToken} {
+		_, status := t204HTTP(t, ctx, httpClient, http.MethodPost, applyURL, token, "", "", c)
+		if status != 403 && status != 401 {
+			t.Fatalf("general/Teacher/absent application token unexpectedly admitted: %d", status)
+		}
+	}
+	wrongURL := owner.URL + "/internal/v1/students/" + uuid.NewString() + "/learning-paths/" + owner.PathID + "/hybrid-consequences"
+	_, status := t204HTTP(t, ctx, httpClient, http.MethodPost, wrongURL, owner.Token, "", "", c)
+	if status != 422 && status != 400 {
+		t.Fatalf("wrong URL learner unexpectedly admitted: %d", status)
+	}
+	if !reflect.DeepEqual(before, getState(owner.StudentID, owner.PathID)) {
+		t.Fatal("unauthorized application boundary partially wrote owner state")
+	}
+	worker := hybridreplan.ApplicationProcessor{Applications: store, Students: student, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	readResult := func(id string) (domain.HybridApplicationReceipt, bool) {
+		var raw []byte
+		var status string
+		err := pool.QueryRow(ctx, `SELECT status,owner_receipt_json FROM hybrid_application_result WHERE consequence_id=$1`, id).Scan(&status, &raw)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.HybridApplicationReceipt{}, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var r domain.HybridApplicationReceipt
+		if json.Unmarshal(raw, &r) != nil || r.Status != status {
+			t.Fatalf("actual terminal Student receipt missing status=%s", status)
+		}
+		return r, true
+	}
+	var applied, unchanged domain.HybridApplicationReceipt
+	var positiveDone, lowDone bool
+	for i := 0; i < 256; i++ {
+		applied, positiveDone = readResult(c.ConsequenceID)
+		unchanged, lowDone = readResult(noChange.Consequence.ConsequenceID)
+		if positiveDone && lowDone {
+			break
+		}
+		processed, err := worker.ProcessNext(ctx)
+		if err != nil {
+			t.Fatalf("real delivery worker processed=%v err=%v; root must park unrelated older delivery metadata", processed, err)
+		}
+		if !processed {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !positiveDone || !lowDone || domain.ValidateHybridApplicationReceipt(applied, c) != nil || applied.Status != "APPLIED" || domain.ValidateHybridApplicationReceipt(unchanged, noChange.Consequence) != nil || unchanged.Status != "NO_CHANGE" {
+		t.Fatalf("actual delivery did not commit both exact owner receipts applied=%+v nochange=%+v", applied, unchanged)
+	}
+	after, lowAfter := getState(owner.StudentID, owner.PathID), getState(low.StudentID, low.PathID)
+	var resulting t204Path
+	if json.Unmarshal(after.Path, &resulting) != nil || resulting.ID != initial.ID || resulting.Version != initial.Version+1 || len(resulting.Items) != 2 || !reflect.DeepEqual(initial.Items[0], resulting.Items[0]) || resulting.Items[1]["status"] != "SKIPPED_MASTERED" || resulting.Items[1]["learning_path_item_id"] != initial.Items[1]["learning_path_item_id"] || after.Revisions != before.Revisions+1 || after.Applications != before.Applications+1 || after.Receipts != before.Receipts+1 {
+		t.Fatalf("actual positive owner revision or protected READY/future identity failed before=%s after=%s", before.Path, after.Path)
+	}
+	initial.Items[1]["status"] = "SKIPPED_MASTERED"
+	if !reflect.DeepEqual(initial.Items[1], resulting.Items[1]) {
+		t.Fatal("future skip rewrote immutable item identity/targets/frozen requirements")
+	}
+	if !bytes.Equal(lowBefore.Path, lowAfter.Path) || lowAfter.Revisions != lowBefore.Revisions || lowAfter.Applications != lowBefore.Applications+1 || lowAfter.Receipts != lowBefore.Receipts+1 {
+		t.Fatal("actual NO_CHANGE changed owner path or revision")
+	}
+	for i := 0; i < 3; i++ {
+		r, err := student.ApplyHybridConsequence(ctx, c)
+		if err != nil || !reflect.DeepEqual(r, applied) {
+			t.Fatalf("exact registered receipt replay after revision changed: %v", err)
+		}
+	}
+	changed := c
+	changed.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+	_, status = t204HTTP(t, ctx, httpClient, http.MethodPost, applyURL, owner.Token, "", "", changed)
+	if status != 409 {
+		t.Fatalf("same consequence ID changed payload must conflict: %d", status)
+	}
+	// Named negative applicability commands, never used to prove evaluation or
+	// successful mutation. Each differs from the genuine consequence only in
+	// stale identity/revision and must have zero admitted/partial owner writes.
+	for i := 1; i <= 2; i++ {
+		stale := c
+		stale.SnapshotRef = "sha256:" + strings.Repeat(string(rune('0'+i)), 64)
+		stale.ConsequenceID = domain.HybridConsequenceID(stale.StudentID, stale.LearningPathID, stale.SnapshotRef, stale.PolicyVersion)
+		stale.ExpectedPathRevision = resulting.Version
+		if i == 2 {
+			stale.ExpectedPathRevision--
+		}
+		_, status = t204HTTP(t, ctx, httpClient, http.MethodPost, applyURL, owner.Token, "", "", stale)
+		if status != 409 {
+			t.Fatalf("named stale snapshot/revision command unexpectedly admitted: %d", status)
+		}
+	}
+	if !reflect.DeepEqual(after, getState(owner.StudentID, owner.PathID)) {
+		t.Fatal("replay/conflict/stale command partially mutated owner state")
+	}
+	// Reconstruct production repository/client/worker. Terminal work remains
+	// completed and immutable; reading both durable results returns exact bytes.
+	restarted := hybridreplan.ApplicationProcessor{Applications: postgres.Store{Pool: pool}, Students: studentclient.Client{BaseURL: owner.URL, WriteToken: owner.Token, HTTPClient: httpClient}, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	processed, err := restarted.ProcessNext(ctx)
+	if err != nil || processed {
+		t.Fatalf("reconstructed worker must find both selected commands terminal (other fixture delivery parked by root): processed=%v err=%v", processed, err)
+	}
+	for _, r := range []domain.HybridApplicationReceipt{applied, unchanged} {
+		replay, found := readResult(r.ConsequenceID)
+		var completed bool
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT w.completed,(SELECT count(*) FROM hybrid_application_result WHERE consequence_id=w.consequence_id) FROM hybrid_application_work w WHERE w.consequence_id=$1`, r.ConsequenceID).Scan(&completed, &count); err != nil || !completed || count != 1 || !found || !reflect.DeepEqual(replay, r) {
+			t.Fatal("reconstructed delivery lost immutable terminal result")
+		}
+	}
+	// Real public learner intent commands use the registered production role
+	// contour. Gateway identity headers are explicitly named upstream fixture.
+	intentID := uuid.NewString()
+	intentSnapshotRequest := domain.HybridSnapshotRequest{Targets: owner.Targets, TriggerContext: domain.HybridSnapshotTrigger{Kind: "hybrid_owner_validation", Reason: "actual registered public learner intent"}}
+	intentBeforeSnapshot, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, intentSnapshotRequest)
+	if err != nil || intentBeforeSnapshot.PendingIntent != nil {
+		t.Fatalf("actual pre-intent coherent snapshot: %v", err)
+	}
+	input := map[string]any{"intent_id": intentID, "expected_path_revision": resulting.Version, "kind": "CANCEL_ACTIVE_ACTIVITY", "requested_change": domain.HybridRequestedChange{Scope: c.BaselineScope, Mutations: []domain.HybridFutureMutation{{Kind: "CANCEL_ACTIVE_ACTIVITY", ItemID: initial.Items[0]["learning_path_item_id"].(string)}}}}
+	intentURL := owner.URL + "/api/v1/student/learning-paths/" + owner.PathID + "/learning-intents"
+	for _, actor := range []struct{ id, role string }{{owner.StudentID, "TEACHER"}, {uuid.NewString(), "STUDENT"}} {
+		_, status = t204HTTP(t, ctx, httpClient, http.MethodPost, intentURL, "", actor.id, actor.role, input)
+		if status != 403 && status != 404 {
+			t.Fatalf("nonowner public intent unexpectedly admitted: %d", status)
+		}
+	}
+	if !reflect.DeepEqual(after, getState(owner.StudentID, owner.PathID)) {
+		t.Fatal("denied public intent partially wrote owner state")
+	}
+	intentReceipt, status := t204HTTP(t, ctx, httpClient, http.MethodPost, intentURL, "", owner.StudentID, "STUDENT", input)
+	if status != 200 {
+		t.Fatalf("registered explicit learner intent status=%d body=%s", status, intentReceipt)
+	}
+	for i := 0; i < 2; i++ {
+		replay, status := t204HTTP(t, ctx, httpClient, http.MethodPost, intentURL, "", owner.StudentID, "STUDENT", input)
+		if status != 200 || !bytes.Equal(replay, intentReceipt) {
+			t.Fatal("public explicit intent receipt replay changed")
+		}
+	}
+	getReceipt, status := t204HTTP(t, ctx, httpClient, http.MethodGet, intentURL+"/"+intentID, "", owner.StudentID, "STUDENT", nil)
+	if status != 200 || !bytes.Equal(getReceipt, intentReceipt) {
+		t.Fatal("public intent GET did not return immutable owner receipt")
+	}
+	input["kind"] = "REPLACE_ACTIVE_ACTIVITY"
+	_, status = t204HTTP(t, ctx, httpClient, http.MethodPost, intentURL, "", owner.StudentID, "STUDENT", input)
+	if status != 409 && status != 422 {
+		t.Fatalf("same intent changed payload unexpectedly admitted: %d", status)
+	}
+	intentAfter := getState(owner.StudentID, owner.PathID)
+	if !bytes.Equal(after.Path, intentAfter.Path) || intentAfter.Revisions != after.Revisions || intentAfter.Intents != after.Intents+1 || intentAfter.IntentEvents != after.IntentEvents+1 || intentAfter.Applications != after.Applications || intentAfter.Receipts != after.Receipts {
+		t.Fatal("explicit intent creation altered current path/history or duplicated receipt")
+	}
+	intentAfterSnapshot, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, intentSnapshotRequest)
+	if err != nil || intentAfterSnapshot.PendingIntent == nil || intentAfterSnapshot.PendingIntent.IntentID != intentID || intentAfterSnapshot.References.SnapshotRef == intentBeforeSnapshot.References.SnapshotRef || !reflect.DeepEqual(intentAfterSnapshot.Path, intentBeforeSnapshot.Path) {
+		t.Fatalf("actual registered public intent did not enter coherent semantic snapshot without path mutation: %v", err)
+	}
+	resultPath := os.Getenv("T204_RESULT_FILE")
+	if resultPath == "" {
+		t.Fatal("SETUP: fresh result export required")
+	}
+	raw, err := json.MarshalIndent(map[string]any{"positive_job_id": positiveJob, "no_change_job_id": lowJob, "applied_receipt": applied, "no_change_receipt": unchanged, "positive_revision_delta": 1, "no_change_revision_delta": 0, "protected_ready_preserved": true, "exact_registered_receipt_replay": true, "wrong_actor_tokens_denied": true, "stale_snapshot_revision_zero_partial_writes": true, "public_explicit_intent_receipt": json.RawMessage(intentReceipt), "public_intent_revision_delta": 0, "real_evaluator_and_application_processors": true, "actual_registered_student_owner": true, "upstream_doubles": "official legacy Practice bundles and gateway auth identity headers; no Runtime validation executed"}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.Write(append(raw, '\n'))
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("actual result export failed")
+	}
+	t.Log("PASS genuine broker jobs → real evaluator/application workers → actual registered Student PG APPLIED(+1)/NO_CHANGE(+0); protected READY; exact replay; stale denied; public intent actual owner receipt without revision")
+}
+
+func t204HTTP(t *testing.T, ctx context.Context, client *http.Client, method, endpoint, token, actor, role string, input any) ([]byte, int) {
+	t.Helper()
+	var body []byte
+	if input != nil {
+		var err error
+		body, err = json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("X-Internal-Token", token)
+	}
+	if actor != "" {
+		req.Header.Set("X-User-ID", actor)
+		req.Header.Set("X-User-Role", role)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw, res.StatusCode
+}

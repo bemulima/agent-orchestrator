@@ -1,0 +1,184 @@
+package usecase
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type passedEvidenceWire struct {
+	Schema                  string                 `json:"schema"`
+	EvidenceID              string                 `json:"evidence_id"`
+	LearningActionID        string                 `json:"learning_action_id"`
+	LearningPathItemID      string                 `json:"learning_path_item_id,omitempty"`
+	RequirementID           string                 `json:"requirement_id,omitempty"`
+	StudentID               string                 `json:"student_id"`
+	TaskInstanceID          string                 `json:"task_instance_id"`
+	TaskRevisionID          string                 `json:"task_revision_id"`
+	TaskRevisionDigest      string                 `json:"task_revision_digest"`
+	WorkspaceDigest         string                 `json:"workspace_digest"`
+	SubmissionID            string                 `json:"submission_id"`
+	Outcome                 string                 `json:"outcome"`
+	AssistancePolicyVersion string                 `json:"assistance_policy_version"`
+	HintsUsed               int                    `json:"hints_used"`
+	MaxHintLevel            *int                   `json:"max_hint_level,omitempty"`
+	TeacherAssistanceUsed   bool                   `json:"teacher_assistance_used"`
+	Evidence                []ports.TargetEvidence `json:"evidence"`
+	OccurredAt              time.Time              `json:"occurred_at"`
+	PolicyVersion           string                 `json:"policy_version"`
+}
+
+// EvidenceDeliveryFailure contains only immutable identity and a fixed safe code.
+type EvidenceDeliveryFailure struct {
+	MessageID string
+	Code      string
+}
+
+type EvidenceDispatchError struct{ Failures []EvidenceDeliveryFailure }
+
+func (err *EvidenceDispatchError) Error() string {
+	return fmt.Sprintf("evidence delivery failed for %d message(s)", len(err.Failures))
+}
+func (err *EvidenceDispatchError) Unwrap() error { return domain.ErrDependency }
+
+func (runtime *Runtime) DispatchEvidence(ctx context.Context, limit int) (int, error) {
+	if limit < 1 || limit > 100 {
+		return 0, domain.ErrInvalid
+	}
+	messages, err := runtime.Repository.PendingEvidence(ctx, limit)
+	if err != nil {
+		return 0, err
+	}
+	delivered := 0
+	failures := &EvidenceDispatchError{}
+	failedStudents := map[string]bool{}
+	for _, message := range messages {
+		if err := ctx.Err(); err != nil {
+			return delivered, errors.Join(dispatchFailure(failures), err)
+		}
+		// Repository supplies only heads. Keep causality even for an alternate port
+		// implementation returning more than one message for a student.
+		if failedStudents[message.StudentID] {
+			continue
+		}
+		passed, decodeErr := DecodePassedEvidence(message.Payload)
+		code := ""
+		if decodeErr != nil {
+			code = ports.EvidenceFailurePayloadInvalid
+		} else if message.SubmissionID != passed.SubmissionID || message.ID != passed.EvidenceID ||
+			!domain.IsCanonicalUUID(message.StudentID) || message.StudentID != passed.StudentID {
+			code = ports.EvidenceFailureIdentityMismatch
+		} else {
+			receipt, providerErr := runtime.Evidence.ApplyPassedEvidence(ctx, passed)
+			if err := ctx.Err(); err != nil {
+				return delivered, errors.Join(dispatchFailure(failures), err)
+			}
+			if providerErr != nil {
+				code = ports.EvidenceFailureProviderUnavailable
+			} else if receipt.Schema != "student-practice-evidence-receipt.v2" || !receipt.Accepted || receipt.EvidenceID != passed.EvidenceID ||
+				receipt.LearningActionID != passed.LearningActionID || receipt.PolicyVersion != StudentReceiptPolicyV1 {
+				code = ports.EvidenceFailureReceiptMismatch
+			} else if markerErr := runtime.Repository.MarkEvidenceDelivered(ctx, message.ID, runtime.now()); markerErr != nil {
+				code = ports.EvidenceFailureDeliveryMarker
+			}
+		}
+		if code == "" {
+			delivered++
+		}
+		if err := ctx.Err(); err != nil {
+			return delivered, errors.Join(dispatchFailure(failures), err)
+		}
+		if code != "" {
+			failures.Failures = append(failures.Failures, EvidenceDeliveryFailure{MessageID: message.ID, Code: code})
+			if err := runtime.Repository.MarkEvidenceFailed(ctx, message.ID, runtime.now(), code); err != nil {
+				return delivered, errors.Join(failures, fmt.Errorf("persist evidence delivery failure: %w", err))
+			}
+			failedStudents[message.StudentID] = true
+			continue
+		}
+	}
+	return delivered, dispatchFailure(failures)
+}
+
+func dispatchFailure(failures *EvidenceDispatchError) error {
+	if len(failures.Failures) == 0 {
+		return nil
+	}
+	return failures
+}
+
+func DecodePassedEvidence(raw json.RawMessage) (ports.PassedEvidence, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var wire passedEvidenceWire
+	if err := decoder.Decode(&wire); err != nil {
+		return ports.PassedEvidence{}, domain.ErrInvalid
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return ports.PassedEvidence{}, domain.ErrInvalid
+	}
+	if wire.Schema != EvidenceSchemaV2 || wire.PolicyVersion != EvidencePolicyV2 || wire.Outcome != "passed" || !domain.ValidRequirementCorrelation(wire.LearningPathItemID, wire.RequirementID) ||
+		!domain.IsCanonicalUUID(wire.EvidenceID) || wire.EvidenceID != wire.SubmissionID || !domain.IsCanonicalUUID(wire.LearningActionID) ||
+		!domain.IsCanonicalUUID(wire.StudentID) || !domain.IsCanonicalUUID(wire.TaskInstanceID) || !domain.IsCanonicalUUID(wire.TaskRevisionID) ||
+		!validEvidenceDigest(wire.TaskRevisionDigest) || !validEvidenceDigest(wire.WorkspaceDigest) || wire.AssistancePolicyVersion == "" ||
+		wire.HintsUsed < 0 || wire.HintsUsed > 1000 || wire.OccurredAt.IsZero() || len(wire.Evidence) == 0 || len(wire.Evidence) > 100 {
+		return ports.PassedEvidence{}, domain.ErrInvalid
+	}
+	if (wire.HintsUsed == 0) != (wire.MaxHintLevel == nil) || wire.MaxHintLevel != nil && (*wire.MaxHintLevel < 1 || *wire.MaxHintLevel > 7) {
+		return ports.PassedEvidence{}, domain.ErrInvalid
+	}
+	seenTargets, seenSteps := map[string]struct{}{}, map[string]struct{}{}
+	targets := make([]domain.Target, 0, len(wire.Evidence))
+	steps := make([]string, 0)
+	for _, item := range wire.Evidence {
+		if (item.Target.Type != "concept" && item.Target.Type != "capability") || item.Target.Key == "" || item.Target.Version == "" ||
+			item.Correctness < 0 || item.Correctness > 1 || item.Independence < 0 || item.Independence > 1 || item.Confidence < 0 || item.Confidence > 1 ||
+			len(item.StepIDs) == 0 || len(item.StepIDs) > 100 {
+			return ports.PassedEvidence{}, domain.ErrInvalid
+		}
+		identity := item.Target.Type + "\x00" + item.Target.Key + "\x00" + item.Target.Version
+		if _, duplicate := seenTargets[identity]; duplicate {
+			return ports.PassedEvidence{}, domain.ErrInvalid
+		}
+		seenTargets[identity] = struct{}{}
+		targets = append(targets, item.Target)
+		perTargetSteps := map[string]struct{}{}
+		for _, stepID := range item.StepIDs {
+			if strings.TrimSpace(stepID) != stepID || stepID == "" {
+				return ports.PassedEvidence{}, domain.ErrInvalid
+			}
+			if _, duplicate := perTargetSteps[stepID]; duplicate {
+				return ports.PassedEvidence{}, domain.ErrInvalid
+			}
+			perTargetSteps[stepID] = struct{}{}
+			if _, exists := seenSteps[stepID]; !exists {
+				seenSteps[stepID] = struct{}{}
+				steps = append(steps, stepID)
+			}
+		}
+	}
+	return ports.PassedEvidence{EvidenceID: wire.EvidenceID, LearningActionID: wire.LearningActionID,
+		LearningPathItemID: wire.LearningPathItemID, RequirementID: wire.RequirementID, StudentID: wire.StudentID, TaskInstanceID: wire.TaskInstanceID, TaskRevisionID: wire.TaskRevisionID,
+		TaskRevisionDigest: wire.TaskRevisionDigest, WorkspaceDigest: wire.WorkspaceDigest, SubmissionID: wire.SubmissionID,
+		Targets: targets, Steps: steps, HintsUsed: wire.HintsUsed, MaxHintLevel: wire.MaxHintLevel,
+		TeacherAssistanceUsed: wire.TeacherAssistanceUsed, AssistancePolicyVersion: wire.AssistancePolicyVersion,
+		Evidence: wire.Evidence, OccurredAt: wire.OccurredAt.UTC()}, nil
+}
+
+func validEvidenceDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	digest, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil && len(digest) == 32
+}

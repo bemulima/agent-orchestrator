@@ -1,0 +1,316 @@
+package courseplan
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+)
+
+func TestBuildDeterministicCourseIsOrderStableAndMergesLessonTargets(t *testing.T) {
+	graph := testGoalGraph()
+	profile := testPlanningProfile()
+	mastery := unknownMastery(graph.Targets)
+	policy := testPolicyBundle()
+
+	first, err := BuildDeterministicCourse(graph, profile, mastery, policy, pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatalf("build first course: %v", err)
+	}
+	reverseTargets(graph.Targets)
+	reverseMastery(mastery)
+	profile.KnownStacks = []string{"sql", "php", "php"}
+	second, err := BuildDeterministicCourse(graph, profile, mastery, policy, pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatalf("build second course: %v", err)
+	}
+	if first.Fingerprint != second.Fingerprint {
+		t.Fatalf("fingerprint changed with input order: %s != %s", first.Fingerprint, second.Fingerprint)
+	}
+	const expectedFingerprint = "2b5770eddfce2db6d59f8124e3c3467863f7e3a3adfc42edad197c85478ca654"
+	if first.Fingerprint != expectedFingerprint {
+		t.Fatalf("course fingerprint contract changed: %s", first.Fingerprint)
+	}
+	if string(first.NormalizedContext) != string(second.NormalizedContext) {
+		t.Fatalf("normalized context changed with input order\n%s\n%s", first.NormalizedContext, second.NormalizedContext)
+	}
+	if first.Course.Status != "ACTIVE_BUILDING" || first.Course.CatalogVisible {
+		t.Fatalf("unexpected course visibility: %#v", first.Course)
+	}
+	lessons := first.Course.Modules[0].Sections[0].Lessons
+	if len(lessons) != 1 || len(lessons[0].Targets) != 2 {
+		t.Fatalf("expected two targets merged into one lesson, got %#v", lessons)
+	}
+	if lessons[0].Status != "PLANNED" {
+		t.Fatalf("expected planned lesson, got %q", lessons[0].Status)
+	}
+	wantStrategies := []domain.PedagogyStrategyRef{
+		{Code: "explicit_instruction", Version: 1},
+		{Code: "retrieval_practice", Version: 1},
+		{Code: "prior_knowledge_bridge", Version: 1},
+		{Code: "compare_contrast", Version: 1},
+	}
+	if encoded(lessons[0].PedagogyStrategies) != encoded(wantStrategies) {
+		t.Fatalf("unexpected strategies: %#v", lessons[0].PedagogyStrategies)
+	}
+}
+
+func TestCourseFingerprintIgnoresFreeTextIntentAndAuditReferences(t *testing.T) {
+	graph := testGoalGraph()
+	profile := testPlanningProfile()
+	mastery := unknownMastery(graph.Targets)
+	policy := testPolicyBundle()
+	first, err := BuildDeterministicCourseForIntent(graph, profile, mastery, policy, domain.PlanningIntent{
+		Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial,
+		DesiredOutcome: "Build a production API",
+		Constraints:    domain.PlanningConstraints{ProjectContext: "private project alpha", Deadline: "2026-12-01"},
+		AuditRefs:      domain.PlanningAuditRefs{DialogID: "11111111-1111-4111-8111-111111111111"},
+	}, pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatalf("first plan: %v", err)
+	}
+	second, err := BuildDeterministicCourseForIntent(graph, profile, mastery, policy, domain.PlanningIntent{
+		Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonReplan,
+		DesiredOutcome: "Continue after a completed session",
+		Constraints:    domain.PlanningConstraints{ProjectContext: "different private project", Deadline: "2027-01-01"},
+		AuditRefs:      domain.PlanningAuditRefs{DialogID: "22222222-2222-4222-8222-222222222222"},
+	}, pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatalf("second plan: %v", err)
+	}
+	if first.Fingerprint != second.Fingerprint || string(first.NormalizedContext) != string(second.NormalizedContext) {
+		t.Fatalf("free-text intent churned shared course fingerprint: %s != %s", first.Fingerprint, second.Fingerprint)
+	}
+}
+
+func TestBuildDeterministicCourseSkipsOnlyConfidentMastery(t *testing.T) {
+	graph := testGoalGraph()
+	profile := testPlanningProfile()
+	mastery := unknownMastery(graph.Targets)
+	mastery[0].State = domain.MasteryMastered
+	mastery[0].MasteryScore = 1
+	mastery[0].Confidence = 0.79
+
+	lowConfidence, err := BuildDeterministicCourse(
+		graph, profile, mastery, testPolicyBundle(), pedagogy.NewDefaultRegistry(),
+	)
+	if err != nil {
+		t.Fatalf("build low-confidence course: %v", err)
+	}
+	if len(lowConfidence.GapTargets) != len(graph.Targets) {
+		t.Fatalf("low-confidence self state skipped a target: %#v", lowConfidence.GapTargets)
+	}
+
+	mastery[0].Confidence = 0.80
+	highConfidence, err := BuildDeterministicCourse(
+		graph, profile, mastery, testPolicyBundle(), pedagogy.NewDefaultRegistry(),
+	)
+	if err != nil {
+		t.Fatalf("build high-confidence course: %v", err)
+	}
+	if len(highConfidence.GapTargets) != len(graph.Targets)-1 {
+		t.Fatalf("qualified mastery was not skipped: %#v", highConfidence.GapTargets)
+	}
+	for _, target := range highConfidence.GapTargets {
+		if domain.TargetIdentity(target) == domain.TargetIdentity(mastery[0].Target) {
+			t.Fatalf("mastered target remains in gap: %#v", target)
+		}
+	}
+}
+
+func TestCourseFingerprintReusesEquivalentIncludeDecision(t *testing.T) {
+	graph := testGoalGraph()
+	profile := testPlanningProfile()
+	unknown := unknownMastery(graph.Targets)
+	first, err := BuildDeterministicCourse(
+		graph, profile, unknown, testPolicyBundle(), pedagogy.NewDefaultRegistry(),
+	)
+	if err != nil {
+		t.Fatalf("build unknown course: %v", err)
+	}
+	partial := unknownMastery(graph.Targets)
+	partial[0].State = domain.MasteryApplied
+	partial[0].MasteryScore = 0.70
+	partial[0].Confidence = 0.95
+	second, err := BuildDeterministicCourse(
+		graph, profile, partial, testPolicyBundle(), pedagogy.NewDefaultRegistry(),
+	)
+	if err != nil {
+		t.Fatalf("build partial course: %v", err)
+	}
+	if first.Fingerprint != second.Fingerprint {
+		t.Fatalf("equivalent include decisions did not reuse: %s != %s", first.Fingerprint, second.Fingerprint)
+	}
+	partial[0].State = domain.MasteryMastered
+	partial[0].MasteryScore = 1
+	partial[0].Confidence = 0.80
+	third, err := BuildDeterministicCourse(
+		graph, profile, partial, testPolicyBundle(), pedagogy.NewDefaultRegistry(),
+	)
+	if err != nil {
+		t.Fatalf("build skip course: %v", err)
+	}
+	if first.Fingerprint == third.Fingerprint {
+		t.Fatal("skip decision did not change fingerprint")
+	}
+}
+
+func TestDiagnosticRouteChangesOnlyEntryPedagogyFingerprint(t *testing.T) {
+	graph, profile, policy := testGoalGraph(), testPlanningProfile(), testPolicyBundle()
+	mastery := unknownMastery(graph.Targets)
+	intent := domain.PlanningIntent{Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial, DesiredOutcome: "Go backend"}
+	foundation, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_FOUNDATION", pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_CORE", pedagogy.NewDefaultRegistry())
+	if err != nil || foundation.Fingerprint == core.Fingerprint || len(foundation.GapTargets) != len(core.GapTargets) {
+		t.Fatalf("route=%v fingerprints=%s/%s", err, foundation.Fingerprint, core.Fingerprint)
+	}
+	advanced, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_ADVANCED", pedagogy.NewDefaultRegistry())
+	if err != nil || advanced.Fingerprint == core.Fingerprint {
+		t.Fatalf("advanced=%v", err)
+	}
+}
+
+func TestDiagnosticRouteExactStrategyOrderClosureAndMasterySkips(t *testing.T) {
+	graph := testGoalGraph()
+	profile := testPlanningProfile()
+	policy := testPolicyBundle()
+	mastery := unknownMastery(graph.Targets)
+	intent := domain.PlanningIntent{Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial, DesiredOutcome: "Go"}
+	foundation, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_FOUNDATION", pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_CORE", pedagogy.NewDefaultRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	strategies := func(r DeterministicResult) []string {
+		out := []string{}
+		for _, m := range r.Course.Modules {
+			for _, s := range m.Sections {
+				for _, l := range s.Lessons {
+					for _, p := range l.PedagogyStrategies {
+						out = append(out, p.Code)
+					}
+				}
+			}
+		}
+		return out
+	}
+	fs, cs := strategies(foundation), strategies(core)
+	if len(fs) < 2 || fs[0] != "explicit_instruction" || fs[1] != "retrieval_practice" || len(cs) < 2 || cs[0] != "retrieval_practice" || cs[1] != "explicit_instruction" {
+		t.Fatalf("strategy order foundation=%v core=%v", fs, cs)
+	}
+	if len(foundation.GapTargets) != len(graph.Targets) || len(core.GapTargets) != len(graph.Targets) {
+		t.Fatal("diagnostic route changed closure")
+	}
+	mastery[0].State = domain.MasteryMastered
+	mastery[0].Confidence = 1
+	skipped, err := BuildDeterministicCourseForDiagnosticRoute(graph, profile, mastery, policy, intent, "START_ADVANCED", pedagogy.NewDefaultRegistry())
+	if err != nil || len(skipped.GapTargets) != len(graph.Targets)-1 {
+		t.Fatalf("mastery skip invariant err=%v gaps=%d", err, len(skipped.GapTargets))
+	}
+}
+
+func TestBuildDeterministicCourseRejectsCycle(t *testing.T) {
+	graph := testGoalGraph()
+	graph.Targets[0].Prerequisites = []domain.TargetRef{graph.Targets[2].Ref}
+	_, err := BuildDeterministicCourse(
+		graph, testPlanningProfile(), unknownMastery(graph.Targets), testPolicyBundle(),
+		pedagogy.NewDefaultRegistry(),
+	)
+	if err == nil {
+		t.Fatal("expected cyclic graph to fail")
+	}
+}
+
+func testGoalGraph() domain.GoalGraph {
+	first := domain.TargetRef{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}
+	second := domain.TargetRef{Type: domain.TargetCapability, Key: "go.errors", Version: "v1"}
+	third := domain.TargetRef{Type: domain.TargetCapability, Key: "go.interfaces", Version: "v1"}
+	return domain.GoalGraph{
+		Goal: domain.LearningGoal{
+			Code: "go.backend", Version: "v1", GraphVersion: "graph-v1",
+			Title: "Go Backend", Description: "Learn Go backend foundations.",
+		},
+		Targets: []domain.LearningTarget{
+			{
+				Ref: first, Title: "Syntax", ModuleCode: "foundation", ModuleTitle: "Foundation", ModuleOrder: 0,
+				SectionCode: "language", SectionTitle: "Language", SectionOrder: 0,
+				LessonCode: "language-basics", LessonTitle: "Language Basics", LessonExcerpt: "Core syntax and errors.", LessonOrder: 0,
+			},
+			{
+				Ref: second, Title: "Errors", Prerequisites: []domain.TargetRef{first},
+				ModuleCode: "foundation", ModuleTitle: "Foundation", ModuleOrder: 0,
+				SectionCode: "language", SectionTitle: "Language", SectionOrder: 0,
+				LessonCode: "language-basics", LessonTitle: "Language Basics", LessonExcerpt: "Core syntax and errors.", LessonOrder: 0,
+			},
+			{
+				Ref: third, Title: "Interfaces", Prerequisites: []domain.TargetRef{second},
+				ModuleCode: "foundation", ModuleTitle: "Foundation", ModuleOrder: 0,
+				SectionCode: "design", SectionTitle: "Design", SectionOrder: 1,
+				LessonCode: "interfaces", LessonTitle: "Interfaces", LessonExcerpt: "Small consumer-owned contracts.", LessonOrder: 0,
+			},
+		},
+		Transitions: []domain.TransitionKnowledge{
+			{
+				SourceStack: "php", Target: second, Similarity: "Failures are control flow.",
+				Difference: "Errors are explicit values.", AnalogyBoundary: "No stack unwinding.",
+				CommonMistakes: []string{"ignoring returned errors"},
+			},
+		},
+	}
+}
+
+func testPlanningProfile() domain.StudentPlanningProfile {
+	return domain.StudentPlanningProfile{
+		DirectionCode: "backend", SelfAssessedExperience: "advanced", KnownStacks: []string{"php", "sql"},
+		DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru",
+		WeeklyMinutes: 300, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion,
+	}
+}
+
+func testPolicyBundle() domain.PolicyBundle {
+	return domain.PolicyBundle{
+		PlannerVersion: domain.PlannerVersion, PedagogyProfile: domain.DefaultPedagogyProfile,
+		PresentationStyle: domain.DefaultPresentationStyle, GenerationPolicy: domain.DefaultGenerationPolicy,
+		MasterySkipConfidence: domain.DefaultMasteryConfidence,
+		PedagogyStrategies: []domain.PedagogyStrategyVersion{
+			{Code: "compare_contrast", Version: 1, Priority: 70, Config: json.RawMessage(`{}`)},
+			{Code: "prior_knowledge_bridge", Version: 1, Priority: 80, Config: json.RawMessage(`{}`)},
+			{Code: "retrieval_practice", Version: 1, Priority: 90, Config: json.RawMessage(`{}`)},
+			{Code: "explicit_instruction", Version: 1, Priority: 100, Config: json.RawMessage(`{}`)},
+		},
+	}
+}
+
+func unknownMastery(targets []domain.LearningTarget) []domain.TargetMastery {
+	result := make([]domain.TargetMastery, len(targets))
+	for index, target := range targets {
+		result[index] = domain.TargetMastery{
+			Target: target.Ref, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion,
+		}
+	}
+	return result
+}
+
+func reverseTargets(targets []domain.LearningTarget) {
+	for left, right := 0, len(targets)-1; left < right; left, right = left+1, right-1 {
+		targets[left], targets[right] = targets[right], targets[left]
+	}
+}
+
+func reverseMastery(mastery []domain.TargetMastery) {
+	for left, right := 0, len(mastery)-1; left < right; left, right = left+1, right-1 {
+		mastery[left], mastery[right] = mastery[right], mastery[left]
+	}
+}
+
+func encoded(value any) string {
+	result, _ := json.Marshal(value)
+	return string(result)
+}

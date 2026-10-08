@@ -1,0 +1,163 @@
+package httptransport
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type teacherAssistanceReceiptRepository struct {
+	ports.Repository
+	instance domain.TaskInstance
+	receipt  ports.AssistanceReceipt
+	digest   string
+}
+
+func (repository *teacherAssistanceReceiptRepository) GetInstance(_ context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if studentID != repository.instance.StudentID || instanceID != repository.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return repository.instance, nil
+}
+func (repository *teacherAssistanceReceiptRepository) GetAssistance(_ context.Context, studentID, instanceID, usageID string) (ports.AssistanceReceipt, string, error) {
+	if studentID != repository.instance.StudentID || instanceID != repository.instance.ID || usageID != repository.receipt.UsageID {
+		return ports.AssistanceReceipt{}, "", domain.ErrNotFound
+	}
+	return repository.receipt, repository.digest, nil
+}
+func (repository *teacherAssistanceReceiptRepository) RecordAssistance(_ context.Context, instance domain.TaskInstance, receipt ports.AssistanceReceipt, digest string) (domain.TaskInstance, ports.AssistanceReceipt, bool, error) {
+	if repository.receipt.UsageID != "" {
+		if digest != repository.digest {
+			return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrIdempotency
+		}
+		return repository.instance, repository.receipt, false, nil
+	}
+	repository.instance, repository.receipt, repository.digest = instance, receipt, digest
+	return instance, receipt, true, nil
+}
+
+func TestTeacherAssistanceResponsePreservesLegacyWireAndStoredReceipt(t *testing.T) {
+	const studentID = "11111111-1111-4111-8111-111111111111"
+	const instanceID = "22222222-2222-4222-8222-222222222222"
+	const usageID = "55555555-5555-4555-8555-555555555555"
+	repository := &teacherAssistanceReceiptRepository{instance: domain.TaskInstance{ID: instanceID, StudentID: studentID, LearningActionID: "44444444-4444-4444-8444-444444444444", Status: domain.TaskInstanceInProgress, Steps: []domain.Step{{ID: "step-1"}}}}
+	occurred := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+	server := &Server{Runtime: &usecase.Runtime{Repository: repository, Now: func() time.Time { return occurred }}, InternalToken: "runtime-placeholder", TeacherToken: "teacher-placeholder"}
+	handler := server.Handler()
+	body := `{"usage_id":"` + usageID + `","student_id":"` + studentID + `","assistance":{"schema":"practice-task-assistance-usage.v1","step_id":"step-1","kind":"TEACHER_EXPLANATION"}}`
+	requestReceipt := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/internal/task-instances/"+instanceID+"/teacher-assistance", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Internal-Token", "teacher-placeholder")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d response=%s", response.Code, response.Body.String())
+		}
+		return response
+	}
+	first := requestReceipt()
+	// This is the strict response contour of the existing Teacher client.
+	var legacy struct {
+		ID             string    `json:"id"`
+		TaskInstanceID string    `json:"task_instance_id"`
+		StudentID      string    `json:"student_id"`
+		StepID         string    `json:"step_id"`
+		Kind           string    `json:"kind"`
+		HintLevel      *int      `json:"hint_level,omitempty"`
+		PolicyVersion  string    `json:"policy_version"`
+		CreatedAt      time.Time `json:"created_at"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(first.Body.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&legacy); err != nil {
+		t.Fatalf("strict legacy Teacher decoder rejected receipt: %v; response=%s", err, first.Body.String())
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		t.Fatalf("trailing JSON: %v", err)
+	}
+	if legacy.ID != usageID || legacy.StudentID != studentID || legacy.TaskInstanceID != instanceID || legacy.StepID != "step-1" || legacy.Kind != "TEACHER_EXPLANATION" || legacy.HintLevel != nil || legacy.PolicyVersion != usecase.AssistancePolicyVersion || !legacy.CreatedAt.Equal(occurred) {
+		t.Fatalf("legacy identity drift: %+v", legacy)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(first.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"schema", "usage_id", "occurred_at"} {
+		if _, ok := fields[forbidden]; ok {
+			t.Fatalf("internal receipt field leaked: %s", forbidden)
+		}
+	}
+	if len(fields) != 7 {
+		t.Fatalf("unexpected legacy field count: %d", len(fields))
+	}
+	stored := repository.receipt
+	persistedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]json.RawMessage
+	if err := json.Unmarshal(persistedJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"schema", "usage_id", "occurred_at"} {
+		if _, ok := persisted[required]; !ok {
+			t.Fatalf("internal stored receipt changed: missing %s", required)
+		}
+	}
+	if stored.Schema != "practice-task-assistance-usage.v1" || stored.UsageID != usageID || !stored.OccurredAt.Equal(occurred) || !repository.instance.TeacherAssistanceUsed || repository.instance.Status != domain.TaskInstanceInProgress {
+		t.Fatalf("stored receipt or lifecycle changed: %+v", stored)
+	}
+	second := requestReceipt()
+	if !bytes.Equal(first.Body.Bytes(), second.Body.Bytes()) {
+		t.Fatalf("duplicate wire receipt changed: first=%s second=%s", first.Body.String(), second.Body.String())
+	}
+	if repository.receipt != stored {
+		t.Fatal("duplicate changed persisted receipt")
+	}
+
+}
+
+func TestTeacherAssistanceHintResponsePreservesHintLevel(t *testing.T) {
+	const studentID = "11111111-1111-4111-8111-111111111111"
+	const instanceID = "22222222-2222-4222-8222-222222222222"
+	const usageID = "55555555-5555-4555-8555-555555555555"
+	repository := &teacherAssistanceReceiptRepository{instance: domain.TaskInstance{ID: instanceID, StudentID: studentID, LearningActionID: "44444444-4444-4444-8444-444444444444", Status: domain.TaskInstanceInProgress, Steps: []domain.Step{{ID: "step-1"}}}}
+	occurred := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+	server := &Server{Runtime: &usecase.Runtime{Repository: repository, Now: func() time.Time { return occurred }}, TeacherToken: "teacher-placeholder"}
+	body := `{"usage_id":"` + usageID + `","student_id":"` + studentID + `","assistance":{"schema":"practice-task-assistance-usage.v1","step_id":"step-1","kind":"HINT","hint_level":2}}`
+	request := httptest.NewRequest(http.MethodPost, "/internal/task-instances/"+instanceID+"/teacher-assistance", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Internal-Token", "teacher-placeholder")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d response=%s", response.Code, response.Body.String())
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 8 || string(fields["hint_level"]) != "2" || string(fields["kind"]) != `"HINT"` || string(fields["id"]) != `"`+usageID+`"` {
+		t.Fatalf("hint response drift: %s", response.Body.String())
+	}
+	for _, forbidden := range []string{"schema", "usage_id", "occurred_at"} {
+		if _, ok := fields[forbidden]; ok {
+			t.Fatalf("internal receipt field leaked: %s", forbidden)
+		}
+	}
+	if repository.receipt.HintLevel != 2 || repository.instance.HintsUsed != 1 || repository.instance.MaxHintLevel == nil || *repository.instance.MaxHintLevel != 2 {
+		t.Fatalf("stored hint behavior changed: receipt=%+v instance=%+v", repository.receipt, repository.instance)
+	}
+
+}

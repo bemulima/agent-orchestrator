@@ -1,0 +1,460 @@
+package domain
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"time"
+)
+
+type RevisionProjection struct {
+	Digest         string
+	Summary        RevisionSummary
+	Steps          []Step
+	Targets        []Target
+	RuntimeProfile json.RawMessage
+	StarterFiles   []WorkspaceFile
+	VariantID      string
+	ReviewRequired bool
+}
+
+type catalogRuntimeContext struct {
+	ExecutionProjectionSchema string `json:"execution_projection_schema"`
+	TaskTypeSchema            string `json:"task_type_schema"`
+	TaskType                  string `json:"task_type"`
+	PracticeTask              struct {
+		ID           string          `json:"id"`
+		Slug         string          `json:"slug"`
+		Title        string          `json:"title"`
+		LanguageCode string          `json:"language_code"`
+		Blueprint    json.RawMessage `json:"blueprint_json"`
+	} `json:"practice_task"`
+	Milestones []catalogMilestone `json:"practice_task_milestones"`
+	Variants   []catalogVariant   `json:"solution_variants"`
+}
+
+type catalogMilestone struct {
+	ID                      string          `json:"id"`
+	PracticeTaskMilestoneID string          `json:"practice_task_milestone_id"`
+	Title                   string          `json:"title"`
+	Description             *string         `json:"description"`
+	SortOrder               int             `json:"sort_order"`
+	PartSortOrder           int             `json:"part_sort_order"`
+	Required                bool            `json:"is_required"`
+	Active                  bool            `json:"is_active"`
+	AcceptanceCriteria      json.RawMessage `json:"acceptance_criteria_json"`
+	ConfigJSON              json.RawMessage `json:"config_json"`
+	ValidationContract      json.RawMessage `json:"validation_contract_json"`
+	RuntimeProfile          json.RawMessage `json:"runtime_profile_json"`
+	ExecutionSpec           json.RawMessage `json:"execution_spec"`
+	StarterWorkspace        json.RawMessage `json:"starter_workspace_json"`
+	Targets                 []Target        `json:"learning_targets"`
+}
+
+type catalogStepExecutionSpec struct {
+	Schema       string   `json:"schema"`
+	Deliverables []string `json:"deliverables"`
+}
+
+type catalogVariant struct {
+	ID                string                    `json:"id"`
+	Code              string                    `json:"code"`
+	Title             string                    `json:"title"`
+	Topology          string                    `json:"topology"`
+	SortOrder         int                       `json:"sort_order"`
+	Active            bool                      `json:"is_active"`
+	ReviewPolicy      json.RawMessage           `json:"review_policy_json"`
+	MilestoneIDs      []string                  `json:"milestone_ids"`
+	MilestoneBindings []catalogVariantMilestone `json:"milestone_bindings"`
+}
+
+type catalogVariantMilestone struct {
+	MilestoneID string `json:"practice_task_part_milestone_id"`
+	SortOrder   int    `json:"sort_order"`
+	Required    bool   `json:"is_required"`
+}
+
+type catalogEvaluationContext struct {
+	Milestones []catalogMilestoneEvaluation `json:"milestones"`
+}
+
+type catalogMilestoneEvaluation struct {
+	MilestoneID           string   `json:"practice_task_runtime_milestone_id"`
+	TestSuiteRef          *string  `json:"test_suite_ref"`
+	ReferenceSolutionRef  *string  `json:"reference_solution_ref"`
+	NegativeFixtureRefs   []string `json:"negative_fixture_refs"`
+	VerificationRunnerRef *string  `json:"verification_runner_ref"`
+}
+
+type catalogStarterWorkspace struct {
+	Files []WorkspaceFile `json:"files"`
+}
+
+type catalogRuntimeProfile struct {
+	CodeStructureTypeCode string          `json:"code_structure_type_code"`
+	ComposeConfig         json.RawMessage `json:"compose_config"`
+}
+
+type catalogReviewPolicy struct {
+	Version  int `json:"version"`
+	AIReview struct {
+		Mode          string `json:"mode"`
+		OnUnavailable string `json:"on_unavailable"`
+		MaxInputBytes int    `json:"max_input_bytes"`
+	} `json:"ai_review"`
+	MentorReview struct {
+		Mode string `json:"mode"`
+	} `json:"mentor_review"`
+}
+
+type catalogAcceptance struct {
+	ID           string `json:"id"`
+	Text         string `json:"text"`
+	EvidenceKind string `json:"evidence_kind"`
+}
+
+// ProjectPublishedRevision validates and freezes the safe and private views of
+// one exact published revision. It never follows a mutable "current" pointer.
+func ProjectPublishedRevision(envelope RevisionEnvelope, options ...string) (RevisionProjection, error) {
+	selectedVariantID, surface := "", "practice"
+	if len(options) > 0 {
+		selectedVariantID = options[0]
+	}
+	if len(options) > 1 {
+		surface = options[1]
+	}
+	if surface != "practice" && surface != "project" {
+		return RevisionProjection{}, ErrInvalid
+	}
+	if envelope.Schema != "practice-task-execution-envelope.v1" || envelope.RevisionDigestSchema != RevisionDigestV1 ||
+		!IsCanonicalUUID(envelope.Revision.ID) || !IsCanonicalUUID(envelope.Revision.PracticeTaskID) || envelope.Revision.RevisionNumber < 1 || envelope.Revision.PublishedAt.IsZero() ||
+		!canonicalDigest.MatchString(envelope.RevisionDigest) || envelope.RevisionDigest != envelope.ComputedDigest() {
+		return RevisionProjection{}, fmt.Errorf("%w: envelope identity or digest mismatch", ErrAuthoringDefect)
+	}
+	var runtime catalogRuntimeContext
+	var evaluation catalogEvaluationContext
+	if err := json.Unmarshal(envelope.RuntimeContext, &runtime); err != nil {
+		return RevisionProjection{}, fmt.Errorf("%w: invalid runtime context: %v", ErrAuthoringDefect, err)
+	}
+	if err := json.Unmarshal(envelope.EvaluationContext, &evaluation); err != nil {
+		return RevisionProjection{}, fmt.Errorf("%w: invalid evaluation context: %v", ErrAuthoringDefect, err)
+	}
+	if runtime.PracticeTask.ID != envelope.Revision.PracticeTaskID || strings.TrimSpace(runtime.PracticeTask.Title) == "" || strings.TrimSpace(runtime.PracticeTask.Slug) == "" || len(runtime.Milestones) == 0 {
+		return RevisionProjection{}, fmt.Errorf("%w: revision runtime identity or milestones are incomplete", ErrAuthoringDefect)
+	}
+	if runtime.ExecutionProjectionSchema != "practice-task-runtime-projection.v2" || runtime.TaskTypeSchema != "practice-task-type.v1" || !supportedPracticeTaskType(runtime.TaskType) {
+		return RevisionProjection{}, fmt.Errorf("%w: revision runtime task_type is missing or unsupported", ErrAuthoringDefect)
+	}
+
+	activeVariants := make([]catalogVariant, 0, len(runtime.Variants))
+	for _, variant := range runtime.Variants {
+		if variant.Active {
+			activeVariants = append(activeVariants, variant)
+		}
+	}
+	if len(activeVariants) == 0 {
+		return RevisionProjection{}, fmt.Errorf("%w: revision has no active solution variant", ErrAuthoringDefect)
+	}
+	sort.SliceStable(activeVariants, func(i, j int) bool { return activeVariants[i].SortOrder < activeVariants[j].SortOrder })
+	selected := activeVariants[0]
+	if selectedVariantID != "" {
+		found := false
+		for _, variant := range activeVariants {
+			if variant.ID == selectedVariantID {
+				selected, found = variant, true
+				break
+			}
+		}
+		if !found {
+			return RevisionProjection{}, fmt.Errorf("%w: selected variant is not active in this exact revision", ErrAuthoringDefect)
+		}
+	} else if len(activeVariants) != 1 {
+		return RevisionProjection{}, ErrVariantRequired
+	}
+	if !IsCanonicalUUID(selected.ID) || strings.TrimSpace(selected.Code) == "" || len(selected.MilestoneBindings) == 0 {
+		return RevisionProjection{}, fmt.Errorf("%w: selected variant has no valid ordered milestone bindings", ErrAuthoringDefect)
+	}
+	policy := catalogReviewPolicy{}
+	if len(bytes.TrimSpace(selected.ReviewPolicy)) > 0 && !bytes.Equal(bytes.TrimSpace(selected.ReviewPolicy), []byte("null")) {
+		if err := strictUnmarshal(selected.ReviewPolicy, &policy); err != nil || policy.Version != 1 || (policy.MentorReview.Mode != "required" && policy.MentorReview.Mode != "disabled") {
+			return RevisionProjection{}, fmt.Errorf("%w: selected variant review policy is invalid", ErrAuthoringDefect)
+		}
+	}
+
+	milestoneByID := make(map[string]catalogMilestone, len(runtime.Milestones))
+	for _, milestone := range runtime.Milestones {
+		if !milestone.Active {
+			continue
+		}
+		id := milestone.ID
+		if id == "" {
+			id = milestone.PracticeTaskMilestoneID
+		}
+		if !IsCanonicalUUID(id) {
+			return RevisionProjection{}, fmt.Errorf("%w: invalid milestone identity", ErrAuthoringDefect)
+		}
+		if _, duplicate := milestoneByID[id]; duplicate {
+			return RevisionProjection{}, fmt.Errorf("%w: duplicate milestone identity", ErrAuthoringDefect)
+		}
+		milestoneByID[id] = milestone
+	}
+	assetsByMilestone := make(map[string]catalogMilestoneEvaluation, len(evaluation.Milestones))
+	for _, item := range evaluation.Milestones {
+		assetsByMilestone[item.MilestoneID] = item
+	}
+	bindings := append([]catalogVariantMilestone(nil), selected.MilestoneBindings...)
+	sort.SliceStable(bindings, func(i, j int) bool { return bindings[i].SortOrder < bindings[j].SortOrder })
+	steps := make([]Step, 0, len(bindings))
+	var targets []Target
+	var primaryProfile json.RawMessage
+	var primaryProfileCanonical []byte
+	var primaryStarter []WorkspaceFile
+	seenSteps := make(map[string]struct{}, len(bindings))
+	for index, binding := range bindings {
+		id := binding.MilestoneID
+		milestone, ok := milestoneByID[id]
+		if !ok {
+			return RevisionProjection{}, fmt.Errorf("%w: variant references an absent/inactive milestone", ErrAuthoringDefect)
+		}
+		if _, duplicate := seenSteps[id]; duplicate {
+			return RevisionProjection{}, fmt.Errorf("%w: duplicate variant milestone binding", ErrAuthoringDefect)
+		}
+		seenSteps[id] = struct{}{}
+		if len(milestone.Targets) == 0 {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s has no learning targets", ErrAuthoringDefect, id)
+		}
+		if binding.Required && (strings.TrimSpace(milestone.Title) == "" || milestone.Description == nil || strings.TrimSpace(*milestone.Description) == "") {
+			return RevisionProjection{}, fmt.Errorf("%w: required milestone %s has no learner-facing title or objective", ErrAuthoringDefect, id)
+		}
+		var executionSpec catalogStepExecutionSpec
+		if !json.Valid(milestone.ExecutionSpec) || strictUnmarshal(milestone.ExecutionSpec, &executionSpec) != nil || executionSpec.Schema != "practice-step-execution-spec.v1" || executionSpec.Deliverables == nil {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s has no complete versioned execution spec", ErrAuthoringDefect, id)
+		}
+		for _, deliverable := range executionSpec.Deliverables {
+			if deliverable == "" || deliverable != strings.TrimSpace(deliverable) || len(deliverable) > 512 {
+				return RevisionProjection{}, fmt.Errorf("%w: milestone %s has an invalid deliverable", ErrAuthoringDefect, id)
+			}
+		}
+		for _, target := range milestone.Targets {
+			if (target.Type != "concept" && target.Type != "capability") || strings.TrimSpace(target.Key) == "" || strings.TrimSpace(target.Version) == "" || target.Version != strings.TrimSpace(target.Version) {
+				return RevisionProjection{}, fmt.Errorf("%w: milestone %s has an unversioned or invalid learning target", ErrAuthoringDefect, id)
+			}
+			targets = append(targets, target)
+		}
+		contract := json.RawMessage(milestone.ValidationContract)
+		if binding.Required && !validContractObject(contract) {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s has no usable validation contract", ErrAuthoringDefect, id)
+		}
+		assetRow, assetExists := assetsByMilestone[id]
+		if binding.Required && (!assetExists || assetRow.TestSuiteRef == nil || strings.TrimSpace(*assetRow.TestSuiteRef) == "") {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s has no private test suite reference", ErrAuthoringDefect, id)
+		}
+		profile, profileCanonical, err := normalizeRuntimeProfile(milestone.RuntimeProfile)
+		if err != nil && binding.Required {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s: %v", ErrAuthoringDefect, id, err)
+		}
+		if binding.Required {
+			if len(primaryProfile) == 0 {
+				primaryProfile, primaryProfileCanonical = profile, profileCanonical
+			} else if !bytes.Equal(primaryProfileCanonical, profileCanonical) {
+				return RevisionProjection{}, fmt.Errorf("%w: required milestones have incompatible runtime profiles", ErrAuthoringDefect)
+			}
+		}
+		starter, err := parseStarterFiles(milestone.StarterWorkspace)
+		if err != nil {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s starter workspace: %v", ErrAuthoringDefect, id, err)
+		}
+		if index == 0 && binding.Required {
+			primaryStarter = starter
+		}
+		acceptance, acceptanceErr := projectAcceptance(id, milestone.AcceptanceCriteria)
+		if acceptanceErr != nil {
+			return RevisionProjection{}, fmt.Errorf("%w: milestone %s acceptance criteria are invalid", ErrAuthoringDefect, id)
+		}
+		objective := ""
+		if milestone.Description != nil {
+			objective = strings.TrimSpace(*milestone.Description)
+		}
+		asset := EvaluationAssets{NegativeFixtureRefs: append([]string(nil), assetRow.NegativeFixtureRefs...)}
+		if assetRow.TestSuiteRef != nil {
+			asset.TestSuiteRef = *assetRow.TestSuiteRef
+		}
+		if assetRow.ReferenceSolutionRef != nil {
+			asset.ReferenceSolutionRef = *assetRow.ReferenceSolutionRef
+		}
+		if assetRow.VerificationRunnerRef != nil {
+			asset.VerificationRunnerRef = *assetRow.VerificationRunnerRef
+		}
+		steps = append(steps, Step{ID: id, Title: strings.TrimSpace(milestone.Title), Objective: objective, Deliverables: append([]string(nil), executionSpec.Deliverables...),
+			Acceptance: acceptance, MilestoneOrder: milestone.PartSortOrder, StepOrder: milestone.SortOrder,
+			Required: binding.Required, Status: "AVAILABLE", Targets: append([]Target(nil), milestone.Targets...),
+			ValidationContract: contract, EvaluationAssets: asset, RuntimeProfile: profile, StarterFiles: starter})
+		_ = index
+	}
+	if len(steps) == 0 || len(targets) == 0 || len(primaryProfile) == 0 {
+		return RevisionProjection{}, fmt.Errorf("%w: selected variant has no executable required workspace", ErrAuthoringDefect)
+	}
+	for _, step := range steps {
+		if step.Required {
+			profile, canonical, err := normalizeRuntimeProfile(step.RuntimeProfile)
+			if err != nil || !bytes.Equal(canonical, primaryProfileCanonical) {
+				return RevisionProjection{}, fmt.Errorf("%w: required milestone runtime profile mismatch", ErrAuthoringDefect)
+			}
+			_ = profile
+		}
+	}
+	summary := RevisionSummary{Schema: "practice-task-revision-summary.v2", RevisionID: envelope.Revision.ID, Digest: envelope.RevisionDigest,
+		FamilyKey: runtime.PracticeTask.Slug, VariantKey: selected.Code, VariantID: selected.ID, RevisionNumber: envelope.Revision.RevisionNumber,
+		Surface: surface, Title: runtime.PracticeTask.Title, Type: runtime.TaskType, PublishedAt: envelope.Revision.PublishedAt.UTC()}
+	return RevisionProjection{Digest: envelope.RevisionDigest, Summary: summary, Steps: steps, Targets: targets,
+		RuntimeProfile: primaryProfile, StarterFiles: primaryStarter, VariantID: selected.ID, ReviewRequired: policy.MentorReview.Mode == "required"}, nil
+}
+
+func supportedPracticeTaskType(value string) bool {
+	switch value {
+	case "BUILD", "FEATURE", "BUGFIX", "DEBUG", "REFACTOR", "TESTING", "CODE_REVIEW", "INTERVIEW", "INCIDENT", "PERFORMANCE", "MIGRATION", "ARCHITECTURE", "DATABASE", "REVERSE_ENGINEERING":
+		return true
+	default:
+		return false
+	}
+}
+
+func validContractObject(raw json.RawMessage) bool {
+	var value map[string]json.RawMessage
+	if json.Unmarshal(raw, &value) != nil || len(value) == 0 {
+		return false
+	}
+	var required int
+	for _, key := range []string{"checks", "stages", "criteria", "validators", "rules"} {
+		items, exists := value[key]
+		if !exists {
+			continue
+		}
+		var array []json.RawMessage
+		if json.Unmarshal(items, &array) == nil {
+			required += len(array)
+		}
+	}
+	return required > 0
+}
+
+func normalizeRuntimeProfile(raw json.RawMessage) (json.RawMessage, []byte, error) {
+	var profile catalogRuntimeProfile
+	if err := strictUnmarshal(raw, &profile); err != nil {
+		return nil, nil, fmt.Errorf("invalid runtime profile")
+	}
+	if strings.TrimSpace(profile.CodeStructureTypeCode) == "" || !json.Valid(profile.ComposeConfig) {
+		return nil, nil, fmt.Errorf("runtime profile fields are required")
+	}
+	var compose map[string]json.RawMessage
+	if json.Unmarshal(profile.ComposeConfig, &compose) != nil {
+		return nil, nil, fmt.Errorf("compose_config must be an object")
+	}
+	canonicalRaw, err := json.Marshal(profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	canonical, err := CanonicalJSON(canonicalRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return append(json.RawMessage(nil), canonicalRaw...), canonical, nil
+}
+
+func parseStarterFiles(raw json.RawMessage) ([]WorkspaceFile, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
+		return nil, nil
+	}
+	var workspace catalogStarterWorkspace
+	if err := json.Unmarshal(raw, &workspace); err != nil {
+		return nil, fmt.Errorf("invalid starter workspace")
+	}
+	seen := map[string]struct{}{}
+	for _, file := range workspace.Files {
+		path := strings.TrimSpace(file.Path)
+		if path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "..") || path != file.Path {
+			return nil, fmt.Errorf("invalid starter path")
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return nil, fmt.Errorf("duplicate starter path")
+		}
+		seen[path] = struct{}{}
+	}
+	return workspace.Files, nil
+}
+
+func projectAcceptance(stepID string, raw json.RawMessage) ([]Acceptance, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, fmt.Errorf("acceptance checklist is absent")
+	}
+	var generic []json.RawMessage
+	if trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &generic); err != nil {
+			return nil, err
+		}
+	} else {
+		var envelope struct {
+			Checklist []json.RawMessage `json:"checklist"`
+		}
+		if err := json.Unmarshal(trimmed, &envelope); err != nil || envelope.Checklist == nil {
+			return nil, fmt.Errorf("acceptance checklist is absent")
+		}
+		generic = envelope.Checklist
+	}
+	acceptance := make([]Acceptance, 0, len(generic))
+	seenIDs := make(map[string]struct{}, len(generic))
+	for index, item := range generic {
+		entry := Acceptance{EvidenceKind: "validation"}
+		var text string
+		if err := json.Unmarshal(item, &text); err != nil {
+			var typed struct {
+				ID           string `json:"id"`
+				Text         string `json:"text"`
+				EvidenceKind string `json:"evidence_kind"`
+			}
+			if err := json.Unmarshal(item, &typed); err != nil {
+				return nil, err
+			}
+			text = typed.Text
+			entry.ID = strings.TrimSpace(typed.ID)
+			if typed.EvidenceKind != "" {
+				entry.EvidenceKind = strings.TrimSpace(typed.EvidenceKind)
+			}
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil, fmt.Errorf("acceptance checklist item is empty")
+		}
+		if entry.ID == "" {
+			entry.ID = fmt.Sprintf("%s.acceptance-%03d", stepID, index+1)
+		}
+		if len(entry.ID) > 128 || entry.EvidenceKind != "validation" {
+			return nil, fmt.Errorf("acceptance identity or evidence kind is invalid")
+		}
+		if _, duplicate := seenIDs[entry.ID]; duplicate {
+			return nil, fmt.Errorf("acceptance identity is duplicated")
+		}
+		seenIDs[entry.ID] = struct{}{}
+		entry.Text = text
+		acceptance = append(acceptance, entry)
+	}
+	return acceptance, nil
+}
+
+func strictUnmarshal(raw []byte, output any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("trailing JSON")
+	}
+	return nil
+}
+
+func ValidRevisionPublishedAt(value time.Time) bool { return !value.IsZero() }

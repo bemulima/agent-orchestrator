@@ -1,0 +1,336 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (repository *Repository) CompleteInstanceAndEnqueueEvidence(ctx context.Context, instance domain.TaskInstance, submission domain.Submission, evidence json.RawMessage) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if instance.ID == "" || submission.ID == "" || !json.Valid(evidence) || instance.Status != domain.TaskInstanceCompleted ||
+		submission.Status != domain.SubmissionPassed || submission.Scope != "FINAL" || instance.FinalSubmissionID != submission.ID ||
+		instance.CurrentSubmissionID != submission.ID || instance.CompletedAt == nil || instance.CompletedAt.IsZero() ||
+		submission.CompletedAt == nil || submission.CompletedAt.IsZero() || submission.TaskInstanceID != instance.ID ||
+		submission.StudentID != instance.StudentID || !validDigest(submission.WorkspaceDigest) || submission.WorkspaceDigest != submission.Snapshot.WorkspaceDigest {
+		return domain.ErrInvalid
+	}
+	if len(submission.ValidationRuns) == 0 {
+		return domain.ErrConflict
+	}
+	run := submission.ValidationRuns[len(submission.ValidationRuns)-1]
+	if err := validateTerminalRun(run); err != nil || run.Status != domain.ValidationRunPassed || run.Outcome != domain.OutcomePass ||
+		evidenceIdentityMismatch(evidence, instance, submission) {
+		return domain.ErrConflict
+	}
+	if submission.RequiresHumanReview && (submission.HumanReview == nil || submission.HumanReview.Decision != "APPROVE" || submission.HumanReview.ReviewerID == "") {
+		return domain.ErrConflict
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	currentInstance, err := instanceForUpdate(ctx, tx, instance.ID)
+	if err != nil {
+		return err
+	}
+	currentSubmission, currentRunID, err := submissionForUpdate(ctx, tx, submission.TaskInstanceID, submission.ID)
+	if err != nil {
+		return err
+	}
+	if currentInstance.StudentID != instance.StudentID || currentInstance.CurrentSubmissionID != submission.ID ||
+		currentInstance.FinalSubmissionID != "" && currentInstance.FinalSubmissionID != submission.ID ||
+		currentInstance.Status != domain.TaskInstanceValidating && currentInstance.Status != domain.TaskInstanceFinalizing && currentInstance.Status != domain.TaskInstanceInReview && currentInstance.Status != domain.TaskInstanceCompleted ||
+		currentRunID != run.ID || !sameSubmissionBinding(currentSubmission, submission) ||
+		currentSubmission.Status != domain.SubmissionValidating && currentSubmission.Status != domain.SubmissionReviewRequired && currentSubmission.Status != domain.SubmissionPassed ||
+		currentInstance.WorkspaceBinding.SandboxID != submission.Snapshot.SandboxID {
+		return domain.ErrConflict
+	}
+	if !sameCompletionBinding(currentInstance, instance) || !validProgressProjection(instance) || !allRequiredStepsPassed(instance) {
+		return domain.ErrConflict
+	}
+	if currentInstance.Status == domain.TaskInstanceInReview && (!currentSubmission.RequiresHumanReview || submission.HumanReview == nil || submission.HumanReview.Decision != "APPROVE") {
+		return domain.ErrConflict
+	}
+	if currentInstance.Status == domain.TaskInstanceValidating && currentSubmission.RequiresHumanReview {
+		return domain.ErrConflict
+	}
+	if currentInstance.Status == domain.TaskInstanceValidating && currentSubmission.Status != domain.SubmissionValidating ||
+		currentInstance.Status == domain.TaskInstanceInReview && currentSubmission.Status != domain.SubmissionReviewRequired ||
+		currentInstance.Status == domain.TaskInstanceFinalizing && currentSubmission.Status != domain.SubmissionPassed {
+		return domain.ErrConflict
+	}
+	if currentInstance.Status == domain.TaskInstanceFinalizing && currentSubmission.RequiresHumanReview && currentSubmission.Status != domain.SubmissionPassed {
+		return domain.ErrConflict
+	}
+	if currentInstance.Status == domain.TaskInstanceCompleted {
+		if currentSubmission.Status != domain.SubmissionPassed || currentInstance.CompletedAt == nil ||
+			!currentInstance.CompletedAt.Equal(*instance.CompletedAt) || currentRunStatus(currentSubmission) != domain.ValidationRunPassed {
+			return domain.ErrConflict
+		}
+		var storedPayload []byte
+		err := tx.QueryRowContext(ctx, `SELECT payload FROM practice_student_evidence_outbox WHERE submission_id=$1`, submission.ID).Scan(&storedPayload)
+		if err != nil {
+			return translateError(err)
+		}
+		if string(storedPayload) != string(evidence) || currentInstance.FinalSubmissionID != submission.ID {
+			return domain.ErrConflict
+		}
+		candidateInstance := instance
+		candidateInstance.Version = currentInstance.Version
+		if !sameInstance(currentInstance, candidateInstance) || !sameSubmission(currentSubmission, submission) {
+			return domain.ErrConflict
+		}
+		return tx.Commit()
+	}
+	if currentSubmission.Status == domain.SubmissionPassed && currentRunStatus(currentSubmission) != domain.ValidationRunPassed {
+		return domain.ErrConflict
+	}
+	var storedRun domain.ValidationRun
+	if len(currentSubmission.ValidationRuns) == 0 || currentSubmission.ValidationRuns[len(currentSubmission.ValidationRuns)-1].ID != run.ID {
+		return domain.ErrConflict
+	}
+	storedRun = currentSubmission.ValidationRuns[len(currentSubmission.ValidationRuns)-1]
+	if storedRun.Status != domain.ValidationRunPending && storedRun.Status != domain.ValidationRunRunning &&
+		!(storedRun.Status == domain.ValidationRunPassed && storedRun.Outcome == domain.OutcomePass) {
+		return domain.ErrConflict
+	}
+	encodedRun, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	if storedRun.Status != domain.ValidationRunPassed {
+		_, err = tx.ExecContext(ctx, `UPDATE practice_validation_runs SET status='PASSED',outcome='PASS',error_classification=NULL,started_at=$2,finished_at=$3,payload=$4::jsonb,updated_at=$3
+WHERE id=$1 AND status IN ('PENDING','RUNNING')`, run.ID, nullableTime(run.StartedAt), nullableTime(run.FinishedAt), encodedRun)
+		if err != nil {
+			return translateError(err)
+		}
+	} else if !equalJSON(mustJSON(storedRun), encodedRun) {
+		return domain.ErrConflict
+	}
+	currentSubmission.Status = domain.SubmissionPassed
+	currentSubmission.CompletedAt = submission.CompletedAt
+	currentSubmission.UpdatedAt = submission.UpdatedAt
+	currentSubmission.HumanReview = submission.HumanReview
+	if len(currentSubmission.ValidationRuns) > 0 {
+		currentSubmission.ValidationRuns[len(currentSubmission.ValidationRuns)-1] = run
+	}
+	encodedSubmission, err := marshalSubmission(currentSubmission)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_submissions SET status='PASSED',payload=$2::jsonb,updated_at=$3,completed_at=$4
+WHERE task_instance_id=$1 AND id=$5 AND current_run_id=$6`, submission.TaskInstanceID, encodedSubmission,
+		currentSubmission.UpdatedAt.UTC(), nullableTime(currentSubmission.CompletedAt), submission.ID, run.ID)
+	if err != nil {
+		return translateError(err)
+	}
+	if submission.HumanReview != nil && submission.HumanReview.Decision == "APPROVE" {
+		reviewRaw, err := json.Marshal(*submission.HumanReview)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO practice_review_events(submission_id,task_instance_id,reviewer_id,decision,feedback,reviewed_at,payload)
+VALUES ($1,$2,$3,'APPROVE',$4,$5,$6::jsonb) ON CONFLICT (submission_id) DO NOTHING`, submission.ID, submission.TaskInstanceID,
+			submission.HumanReview.ReviewerID, submission.HumanReview.Feedback, submission.HumanReview.ReviewedAt.UTC(), reviewRaw)
+		if err != nil {
+			return translateError(err)
+		}
+		var reviewPayload []byte
+		if err := tx.QueryRowContext(ctx, `SELECT payload FROM practice_review_events WHERE submission_id=$1`, submission.ID).Scan(&reviewPayload); err != nil {
+			return err
+		}
+		if !equalJSON(reviewPayload, reviewRaw) {
+			return domain.ErrConflict
+		}
+	}
+	instance.Version = currentInstance.Version + 1
+	instanceRaw, err := marshalInstance(instance)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_task_instances SET status='COMPLETED',current_submission_id=$2,final_submission_id=$3,
+version=$4,payload=$5::jsonb,updated_at=$6,completed_at=$7 WHERE id=$1 AND version=$8`, instance.ID,
+		submission.ID, submission.ID, instance.Version, instanceRaw, instance.UpdatedAt.UTC(), nullableTime(instance.CompletedAt), currentInstance.Version)
+	if err != nil {
+		return translateError(err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_student_evidence_outbox(id,task_instance_id,submission_id,payload)
+VALUES ($1,$2,$1,$3::json) ON CONFLICT (submission_id) DO NOTHING`, submission.ID, instance.ID, []byte(evidence))
+	if err != nil {
+		return translateError(err)
+	}
+	var storedPayload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT payload FROM practice_student_evidence_outbox WHERE submission_id=$1`, submission.ID).Scan(&storedPayload); err != nil {
+		return err
+	}
+	if string(storedPayload) != string(evidence) {
+		return domain.ErrConflict
+	}
+	return translateError(tx.Commit())
+}
+
+func currentRunStatus(submission domain.Submission) domain.ValidationRunStatus {
+	if len(submission.ValidationRuns) == 0 {
+		return ""
+	}
+	return submission.ValidationRuns[len(submission.ValidationRuns)-1].Status
+}
+
+func sameCompletionBinding(current, next domain.TaskInstance) bool {
+	return current.ID == next.ID && current.StudentID == next.StudentID && current.TaskRevisionID == next.TaskRevisionID &&
+		current.TaskRevisionDigest == next.TaskRevisionDigest && current.StartCommandDigest == next.StartCommandDigest &&
+		current.SurfaceClassification == next.SurfaceClassification && current.Locale == next.Locale &&
+		current.LearningPathID == next.LearningPathID && current.LearningPathItemID == next.LearningPathItemID && current.RequirementID == next.RequirementID && current.SolutionVariantID == next.SolutionVariantID && current.StartedAt.Equal(next.StartedAt) &&
+		sameRevisionBinding(current, next) && sameFrozenSteps(current.Steps, next.Steps) &&
+		(current.LearningActionID == "" || current.LearningActionID == next.LearningActionID) &&
+		(current.WorkspaceBinding.SandboxID == "" || current.WorkspaceBinding.SandboxID == next.WorkspaceBinding.SandboxID) &&
+		(current.LearningRoute.ID == "" || sameRoute(current.LearningRoute, next.LearningRoute))
+}
+
+func allRequiredStepsPassed(instance domain.TaskInstance) bool {
+	found := false
+	for _, step := range instance.Steps {
+		if !step.Required {
+			continue
+		}
+		found = true
+		if step.Status != "PASSED" {
+			return false
+		}
+	}
+	return found
+}
+
+func evidenceIdentityMismatch(raw json.RawMessage, instance domain.TaskInstance, submission domain.Submission) bool {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(raw, &payload) != nil {
+		return true
+	}
+	for field, expected := range map[string]string{"learning_path_item_id": instance.LearningPathItemID, "requirement_id": instance.RequirementID} {
+		var actual string
+		if encoded, exists := payload[field]; exists {
+			if json.Unmarshal(encoded, &actual) != nil {
+				return true
+			}
+		}
+		if actual != expected {
+			return true
+		}
+	}
+	for field, expected := range map[string]string{"evidence_id": submission.ID, "submission_id": submission.ID,
+		"task_instance_id": instance.ID, "student_id": instance.StudentID} {
+		encoded, exists := payload[field]
+		if !exists {
+			continue
+		}
+		var actual string
+		if json.Unmarshal(encoded, &actual) != nil || actual != expected {
+			return true
+		}
+	}
+	return false
+}
+
+func (repository *Repository) PendingEvidence(ctx context.Context, limit int) ([]ports.OutboxMessage, error) {
+	if err := repository.ready(); err != nil {
+		return nil, err
+	}
+	if limit < 1 || limit > 100 {
+		return nil, domain.ErrInvalid
+	}
+	rows, err := repository.db.QueryContext(ctx, `SELECT outbox.id,outbox.submission_id,instance.student_id,outbox.payload,outbox.attempts
+FROM practice_student_evidence_outbox AS outbox
+JOIN practice_task_instances AS instance ON instance.id=outbox.task_instance_id
+WHERE outbox.delivered_at IS NULL
+ AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= CURRENT_TIMESTAMP)
+ AND NOT EXISTS (
+  SELECT 1 FROM practice_student_evidence_outbox AS earlier
+  JOIN practice_task_instances AS owner ON owner.id=earlier.task_instance_id
+  WHERE earlier.delivered_at IS NULL AND owner.student_id=instance.student_id
+   AND (earlier.created_at,earlier.id) < (outbox.created_at,outbox.id)
+ )
+ORDER BY COALESCE(outbox.last_attempt_at,outbox.created_at),outbox.created_at,outbox.id LIMIT $1`, limit)
+	if err != nil {
+		return nil, translateError(err)
+	}
+	defer rows.Close()
+	result := make([]ports.OutboxMessage, 0, limit)
+	for rows.Next() {
+		var item ports.OutboxMessage
+		var payload []byte
+		if err := rows.Scan(&item.ID, &item.SubmissionID, &item.StudentID, &payload, &item.Attempts); err != nil {
+			return nil, err
+		}
+		item.Payload = append(json.RawMessage(nil), payload...)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (repository *Repository) MarkEvidenceDelivered(ctx context.Context, messageID string, at time.Time) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if !domain.IsCanonicalUUID(messageID) || at.IsZero() {
+		return domain.ErrInvalid
+	}
+	result, err := repository.db.ExecContext(ctx, `UPDATE practice_student_evidence_outbox SET delivered_at=COALESCE(delivered_at,$2)
+WHERE id=$1`, messageID, at.UTC())
+	if err != nil {
+		return translateError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// MarkEvidenceFailed persists technical retry state without changing the fact.
+// A late failure after an ACK is a no-op, so it cannot revive delivered evidence.
+func (repository *Repository) MarkEvidenceFailed(ctx context.Context, messageID string, at time.Time, code string) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if !domain.IsCanonicalUUID(messageID) || at.IsZero() {
+		return domain.ErrInvalid
+	}
+	switch code {
+	case ports.EvidenceFailurePayloadInvalid, ports.EvidenceFailureIdentityMismatch,
+		ports.EvidenceFailureProviderUnavailable, ports.EvidenceFailureReceiptMismatch, ports.EvidenceFailureDeliveryMarker:
+	default:
+		return domain.ErrInvalid
+	}
+	result, err := repository.db.ExecContext(ctx, `UPDATE practice_student_evidence_outbox
+SET attempts=LEAST(attempts::bigint+1,2147483647)::integer,
+ last_attempt_at=$2::timestamptz, next_attempt_at=$2::timestamptz + make_interval(secs => LEAST(300,2 * power(2,LEAST(attempts,8)))::double precision),
+ last_failure_code=$3 WHERE id=$1 AND delivered_at IS NULL`, messageID, at.UTC(), code)
+	if err != nil {
+		return translateError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		return nil
+	}
+	var delivered bool
+	if err := repository.db.QueryRowContext(ctx, `SELECT delivered_at IS NOT NULL FROM practice_student_evidence_outbox WHERE id=$1`, messageID).Scan(&delivered); err != nil {
+		return translateError(err)
+	}
+	if !delivered {
+		return domain.ErrConflict
+	}
+	return nil
+}

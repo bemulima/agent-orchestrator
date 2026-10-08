@@ -1,0 +1,168 @@
+# Production rollout checklist
+
+This checklist prepares the first coordinated Learning Planner rollout. It does
+not authorize running migrations, changing secrets, provisioning NATS, or
+starting production workloads.
+
+## 1. Secrets and service configuration
+
+Provision distinct non-default secrets and keep both sides of every boundary
+identical:
+
+- Planner `STUDENT_SERVICE_INTERNAL_TOKEN` = Student's general
+  `COURSE_SERVICE_INTERNAL_TOKEN` used by read-only internal projections;
+- Planner `STUDENT_SERVICE_LEARNING_PLANNER_TOKEN` = Student
+  `LEARNING_PLANNER_INTERNAL_TOKEN` used only by assignment/path commands;
+- Planner `COURSE_SERVICE_INTERNAL_TOKEN` = Course
+  `LEARNING_PLANNER_INTERNAL_TOKEN`;
+- Planner `COURSE_DIAGNOSTIC_CATALOG_TOKEN` = Course
+  `DIAGNOSTIC_CATALOG_INTERNAL_TOKEN`; it is distinct from the generated-Course write token.
+- Teacher `LEARNING_PLANNER_INTERNAL_TOKEN` = Planner
+  `TEACHER_SERVICE_INTERNAL_TOKEN`;
+- Teacher `LEARNING_PLANNER_TEACHER_TOKEN` = Planner
+  `TEACHER_ONBOARDING_HANDOFF_INTERNAL_TOKEN`; this new secret must be distinct
+  from all general, legacy Teacher, Practice, and downstream write tokens;
+- Practice `LEARNING_PLANNER_INTERNAL_TOKEN` = Planner
+  `PRACTICE_TASK_SERVICE_INTERNAL_TOKEN`;
+- Planner `AI_PROMPT_SERVICE_INTERNAL_TOKEN` = AI Prompt internal token.
+- Planner `TZ_PLANNER_INTERNAL_TOKEN` = TZ Planner's internal authoring token;
+  keep it distinct and configure `TZ_PLANNER_SERVICE_URL`. The project-authoring
+  worker lease must be strictly longer than its TZ HTTP timeout.
+
+Do not reuse Student's general read token for Planner writes. Configure Planner's
+PostgreSQL, NATS, downstream URLs, timeouts, worker lease, and outbox settings.
+Keep `PLANNER_GRAPH_READINESS_ENABLED=false` through migration and compatible
+Student deployment.
+Configure Gateway's Learning Planner upstream and Teacher's Learning Planner
+base URL before switching traffic.
+
+Keep `PLANNER_ONBOARDING_HANDOFF_ENABLED=false` through migration `009` and
+the compatible Teacher deployment. Enable it only after both the dedicated
+handoff secret and `PLANNER_GRAPH_READINESS_ENABLED=true` are present. While
+disabled, only exact stored handoff replays are served; unseen requests fail
+before Planner reads Student. To serve a disabled-state replay, the dedicated
+handoff secret must still be configured; omitting it is S6-compatible but the
+private route rejects every request. Whenever configured, that secret must be
+distinct from every other Planner service token, including while the handoff
+flag is off. An S8 receipt is historical only; any
+future executable S9 step must independently re-read and atomically reserve
+Student state before effects.
+
+`PLANNER_ONBOARDING_PATH_EXECUTION_ENABLED=false` is a separate S9 gate. Do
+not enable it merely because handoff admission is enabled: deploy Student's
+atomic admission/materialization owner contract and Planner migration `010`
+first. S9 uses only the bounded `planner-onboarding-path-authoring-input.v1`
+and confidential `course.lesson-content.v1`; it does not fall back to a legacy
+course-plan request or invented Student preferences.
+
+## 2. Data contracts
+
+Back up each database and apply additive migrations with the repository-owned
+runner and `ON_ERROR_STOP` semantics:
+
+1. AI Prompt `005_course_lesson_confidential_contract.sql`, then provision and
+   activate `course.lesson-content.v1` version 1 for every enabled language;
+2. Course migrations through `052`;
+3. Student migrations through `028`, including
+   multi-path/context, idempotent new-path allocation, and exact-path command receipts;
+4. Learning Planner migrations through `015_project_authoring_flow.up.sql`;
+5. Teacher `013_create_course_plan_notification_inbox.up.sql`.
+
+Validate schema constraints and active AI Prompt versions before deploying any
+caller. No migration in this sequence transfers content, mastery, or path
+ownership between databases.
+
+Apply Learning Planner `008_programming_foundation_graph.up.sql` only after the
+preceding Planner migrations. Deploy Student's strict planning-readiness read
+before enabling Planner graph readiness. Validate the Teacher-token route with
+the flag still off (it must make no Student/database call), then enable the flag
+in a separately reversible configuration change.
+
+## 3. Messaging
+
+Apply `infra/messaging/streams/learning-planner-events.json` through the shared
+bootstrap process. Verify stream `LEARNING_PLANNER_EVENTS` owns exactly
+`course.plan.completed`, `course.plan.failed`, and the exact S9 subject
+`planner.onboarding-path.outcome.v1` (not a wildcard), uses file storage, a
+seven-day maximum age, and a ten-minute duplicate window. Keep
+`PLANNER_ONBOARDING_PATH_EXECUTION_ENABLED=false` until that exact stream
+contract and the durable Teacher consumer are deployed.
+
+## 4. Deployment order
+
+1. Deploy compatible AI Prompt, Course, and Student revisions, including the
+   exact-path Planner-only contracts.
+2. Deploy v2-tolerant Teacher and any other planning-outcome consumers while
+   Planner still emits v1.
+3. Apply Planner migrations through `015`, then deploy Learning Planner with its HTTP
+   worker and transactional outbox relay; old v1 rows remain publishable and
+   new outcomes use v2.
+4. Deploy Teacher producer changes that may send exact-path `REPLAN` requests.
+5. Deploy/activate the Gateway Learning Planner proxy.
+6. After Course/Student dependencies and Planner `013` are live, provision reviewed exact active diagnostic binding rows out of band (no migration seed IDs), then enable diagnostic student traffic only after dependency readiness checks pass. The disposable V2-R0 command and safe receipt contract are documented in [V2 diagnostic bootstrap provisioning](v2-diagnostic-bootstrap-provisioning.md); it creates only the closed `first-job/backend` binding and never creates learner state.
+
+7. After immutable placement exists, verify one Teacher `INITIAL` diagnostic-linked Course-plan command validates the current Student onboarding/binding context before normal planning; no diagnostic ID is emitted downstream.
+8. Deploy TZ Planner's compatible v2 create/read/resume/explicit-publish routes
+   and Practice's verified publication consumer before enabling Teacher project
+   recommendations. Practice Start and Sandbox rollout remain independent.
+9. Before enabling project recommendations, verify migration `015` exposes
+   immutable `authoring_profile_version` and `authoring_profile_digest` columns,
+   the live immutable-snapshot partial unique index, and exercise language/desired-stack
+   staleness with an unchanged path plus lost-locator current recovery; no TZ call
+   may occur from a newly stale flow and no stale flow may be returned.
+10. `project-authoring-flow.v1` locale is a pre-release coordinated lockstep
+    initial deployment: keep project-authoring traffic disabled until Planner,
+    Teacher, and the Next consumer all require the frozen `en|ru` field. Do not
+    run a mixed-version rollout or compatibility fallback.
+
+The NATS publisher connects lazily, so a broker interruption must not make
+Planner's HTTP readiness fail. Outbox rows remain retryable until JetStream
+acknowledges them.
+
+## 5. Live acceptance
+
+Use a non-production student first and verify:
+
+1. a Student-source request returns one stable `request_id` and replays by the
+   same idempotency key;
+2. a Teacher-source request works both with and without Dialog audit references;
+3. requested targets include their complete prerequisite closure;
+4. AI Prompt returns strict typed lesson content and Course publishes one
+   complete private `ACTIVE` hierarchy;
+5. Student receives one idempotent Course assignment and allocates one exact
+   path; retry after allocation returns the same path ID and does not drift the
+   `initial_plan` reason;
+6. `REPLAN` changes only its requested path even when another path is selected
+   or primary; simulate a lost success response and verify retry sends the same
+   body/version/identities without rereading state, while a delivered stale
+   `409` terminates with `LEARNING_PATH_COMMAND_CONFLICT`; neither transport
+   ambiguity nor conflict exposes the private planned Course/result;
+7. an identical effective route causes no path or journey version churn;
+8. `NO_GAP` completes only the exact requested path, while an unallocated
+   `INITIAL` creates no path;
+9. terminal v2 events carry the optional path ID, survive a temporary NATS
+   outage, and are deduplicated while older v1 rows still publish;
+10. a Teacher-originated Dialog request produces exactly one bounded outcome
+   notification, while a request without Dialog creates no synthetic message.
+11. completed and failed exact-path requests clear claim/lease state but retain
+    the immutable command checkpoint for private audit; terminal events contain
+    the failure code when applicable and never contain checkpoint payload/hash.
+12. provision exact active diagnostic bindings out of band (this repository
+   seeds none); issue a bootstrap plan twice with the same key (identical
+   receipt), then verify a changed body or new key conflicts and no Student
+   mastery/path state changes.
+13. verify the Student reservation replay recovers a lost Planner response,
+    then consume a completed aggregate result once and replay the identical
+    immutable placement decision without contacting Student; verify a retake is
+    rejected until that decision exists and receives a distinct revision/ID.
+14. create/replay one project flow on an exact current path, confirm it once,
+    recover one lost TZ create response by exact replay, and verify READY stores
+    only digests without publication;
+15. explicitly request publication and recover a lost response as one identical
+    Practice revision receipt. Verify no Practice Start, Sandbox, Student
+    progress, or path-item completion call occurred.
+
+Confirm logs and databases contain no prompt variables, raw provider response,
+mastery detail in events, or chain-of-thought. Roll back application revisions
+before considering database down migrations; destructive rollback requires a
+separate reviewed procedure.

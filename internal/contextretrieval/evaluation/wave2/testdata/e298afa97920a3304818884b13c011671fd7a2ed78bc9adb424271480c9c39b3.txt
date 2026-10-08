@@ -1,0 +1,234 @@
+package courseplan
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+// Legacy commands remain independently replayable. New commands also restore
+// the first decision's audit bytes after a crash before Retry or Complete.
+func (processor Processor) restorePinnedAudit(ctx context.Context, request *domain.CoursePlanRequest) error {
+	checkpoints, ok := processor.Requests.(repository.PinnedCoursePlanRepository)
+	if !ok {
+		return nil
+	}
+	input, err := checkpoints.GetPlanningInput(ctx, *request)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			return processor.failPermanent(ctx, *request, "PLANNING_INPUT_CHECKPOINT_INVALID")
+		}
+		return processor.handleFailure(ctx, *request, "PLANNING_INPUT_CHECKPOINT_UNAVAILABLE", err)
+	}
+	if input.Validate(*request) != nil {
+		return processor.failPermanent(ctx, *request, "PLANNING_INPUT_CHECKPOINT_INVALID")
+	}
+	request.CourseFingerprint = input.Fingerprint
+	request.FingerprintVersion = domain.CourseFingerprintVersion
+	request.NormalizedContextJSON = append(json.RawMessage(nil), input.NormalizedContext...)
+	return nil
+}
+
+// processPinned consumes the durable first observation. It never refreshes the
+// decision from live owner state; Student remains responsible for application fences.
+func (processor Processor) processPinned(ctx context.Context, request *domain.CoursePlanRequest, input domain.PlanningInputCheckpoint, checkpoints repository.PinnedCoursePlanRepository) error {
+	result := DeterministicResult{Course: input.Draft, Fingerprint: input.Fingerprint, NormalizedContext: input.NormalizedContext, GapTargets: input.GapTargets}
+	policy := input.Policy
+	learningPathState := input.OriginalPath
+	request.CourseFingerprint = result.Fingerprint
+	request.FingerprintVersion = domain.CourseFingerprintVersion
+	request.NormalizedContextJSON = result.NormalizedContext
+	if len(result.GapTargets) == 0 {
+		if learningPathState != nil {
+			request.ResultCode = domain.CoursePlanResultNoGap
+			command := domain.LearningPathCompletion{
+				Schema: domain.LearningPathNoGapRequestSchema, LearningPathID: learningPathState.LearningPathID,
+				PlanningRequestID: request.ID, CourseID: learningPathState.CourseID,
+				GoalCode: request.GoalCode, CourseFingerprint: learningPathState.CourseFingerprint,
+				PlannerPolicyVersion: policy.PlannerVersion, ReasonCode: "mastery_no_gap",
+				ReasonSummary: request.Intent.DesiredOutcome, ExpectedVersion: learningPathState.PathVersion,
+			}
+			checkpoint, checkpointErr := domain.NewLearningPathNoGapCheckpoint(
+				*request, command, processor.Clock.Now().UTC(),
+			)
+			if checkpointErr != nil {
+				return processor.failPermanent(ctx, *request, domain.CoursePlanFailureCheckpoint)
+			}
+			return processor.checkpointAndDispatchLearningPathCommand(ctx, request, checkpoint)
+		}
+		request.ResultCode = domain.CoursePlanResultNoGap
+		if err := processor.renewClaim(ctx, *request); err != nil {
+			return err
+		}
+		return processor.Requests.Complete(ctx, *request, request.ClaimToken, processor.Clock.Now().UTC())
+	}
+	artifact, err := checkpoints.GetGeneratedCourse(ctx, *request)
+	if errors.Is(err, domain.ErrNotFound) {
+		// Enrichment mutates nested lesson slices. Keep the pinned draft immutable.
+		rawDraft, cloneErr := json.Marshal(input.Draft)
+		var generationDraft domain.GeneratedCourse
+		if cloneErr != nil || json.Unmarshal(rawDraft, &generationDraft) != nil {
+			return processor.failPermanent(ctx, *request, "PLANNING_INPUT_CHECKPOINT_INVALID")
+		}
+		generatedCourse, generationErr := GenerateCourseContent(ctx, processor.Generator, request.ID, generationDraft, input.NormalizedContext,
+			func(ctx context.Context) error { return processor.renewClaim(ctx, *request) })
+		if generationErr != nil {
+			if errors.Is(generationErr, domain.ErrConflict) {
+				return generationErr
+			}
+			return processor.handleFailure(ctx, *request, "CONTENT_GENERATION_UNAVAILABLE", generationErr)
+		}
+		artifact, err = domain.NewGeneratedCourseCheckpoint(input, generatedCourse)
+		if err != nil {
+			return processor.failPermanent(ctx, *request, "GENERATED_COURSE_CHECKPOINT_INVALID")
+		}
+		if err := processor.renewClaim(ctx, *request); err != nil {
+			return err
+		}
+		if err := checkpoints.CheckpointGeneratedCourse(ctx, *request, artifact, processor.Clock.Now().UTC()); err != nil {
+			return err
+		}
+	} else if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			return processor.failPermanent(ctx, *request, "GENERATED_COURSE_CHECKPOINT_INVALID")
+		}
+		return processor.handleFailure(ctx, *request, "GENERATED_COURSE_CHECKPOINT_UNAVAILABLE", err)
+	}
+	if artifact.Validate(input) != nil {
+		return processor.failPermanent(ctx, *request, "GENERATED_COURSE_CHECKPOINT_INVALID")
+	}
+	request.GeneratedCourseJSON, err = json.Marshal(artifact.Course)
+	if err != nil {
+		return processor.failPermanent(ctx, *request, "GENERATED_COURSE_CHECKPOINT_INVALID")
+	}
+	receipt, err := checkpoints.GetCourseEnsure(ctx, *request)
+	if errors.Is(err, domain.ErrNotFound) {
+		if err := processor.renewClaim(ctx, *request); err != nil {
+			return err
+		}
+		courseResult, ensureErr := processor.Courses.EnsureCourse(ctx, artifact.Course, request.ID)
+		if ensureErr != nil {
+			return processor.handleFailure(ctx, *request, "COURSE_UNAVAILABLE", ensureErr)
+		}
+		receipt, err = domain.NewCourseEnsureCheckpoint(input, artifact, courseResult)
+		if err != nil {
+			return processor.handleFailure(ctx, *request, "COURSE_INVALID_RESPONSE", err)
+		}
+		if err := processor.renewClaim(ctx, *request); err != nil {
+			return err
+		}
+		if err := checkpoints.CheckpointCourseEnsure(ctx, *request, receipt, processor.Clock.Now().UTC()); err != nil {
+			return err
+		}
+	} else if err != nil {
+		if errors.Is(err, domain.ErrValidation) {
+			return processor.failPermanent(ctx, *request, "COURSE_ENSURE_CHECKPOINT_INVALID")
+		}
+		return processor.handleFailure(ctx, *request, "COURSE_ENSURE_CHECKPOINT_UNAVAILABLE", err)
+	}
+	if receipt.Validate(input, artifact) != nil {
+		return processor.failPermanent(ctx, *request, "COURSE_ENSURE_CHECKPOINT_INVALID")
+	}
+	courseResult := receipt.Result
+	if err := processor.renewClaim(ctx, *request); err != nil {
+		return err
+	}
+	if request.DiagnosticPlanID == "" {
+		if err := processor.Students.AssignCourse(ctx, request.StudentID, courseResult.CourseID, request.ID, request.ID); err != nil {
+			return processor.handleFailure(ctx, *request, "ASSIGNMENT_UNAVAILABLE", err)
+		}
+	}
+	items := make([]domain.LearningPathItem, len(courseResult.Lessons))
+	for index, lesson := range courseResult.Lessons {
+		status := domain.LearningPathItemPlanned
+		reason := "prerequisite_sequence"
+		if index == 0 {
+			status = domain.LearningPathItemReady
+			reason = "first_current_gap"
+		}
+		items[index] = domain.LearningPathItem{
+			ReferenceType: "lesson", ReferenceID: lesson.LessonID, LessonRevisionID: lesson.LessonRevisionID, Position: index,
+			Status: status, Targets: lesson.Targets, ReasonCode: reason,
+		}
+	}
+	reasonCode := "initial_plan"
+	if request.Intent.Reason == domain.PlanningReasonReplan {
+		reasonCode = "mastery_replan"
+	}
+	if err := processor.renewClaim(ctx, *request); err != nil {
+		return err
+	}
+	if learningPathState != nil {
+		items = preserveAssignmentIdentities(items, learningPathState.Items)
+		command := domain.LearningPathReplan{
+			Schema: domain.LearningPathReplanRequestSchema, LearningPathID: learningPathState.LearningPathID,
+			PlanningRequestID: request.ID, CourseID: courseResult.CourseID, GoalCode: request.GoalCode,
+			CourseFingerprint: result.Fingerprint, PlannerPolicyVersion: policy.PlannerVersion,
+			ReasonCode: reasonCode, ReasonSummary: request.Intent.DesiredOutcome,
+			ExpectedVersion: learningPathState.PathVersion, Items: items,
+		}
+		request.CourseID = courseResult.CourseID
+		request.Reused = courseResult.Reused
+		if courseResult.Reused {
+			request.ResultCode = domain.CoursePlanResultReused
+		} else {
+			request.ResultCode = domain.CoursePlanResultCreated
+		}
+		checkpoint, checkpointErr := domain.NewLearningPathReplanCheckpoint(
+			*request, command, processor.Clock.Now().UTC(),
+		)
+		if checkpointErr != nil {
+			return processor.failPermanent(ctx, *request, domain.CoursePlanFailureCheckpoint)
+		}
+		return processor.checkpointAndDispatchLearningPathCommand(ctx, request, checkpoint)
+	} else {
+		if request.DiagnosticPlanID != "" {
+			if processor.InitialAllocations == nil {
+				return processor.failPermanent(ctx, *request, "INITIAL_ALLOCATION_CHECKPOINT_INVALID")
+			}
+			checkpoint := domain.InitialAllocationCheckpoint{StudentID: request.StudentID, RequestID: request.ID, DiagnosticPlanID: request.DiagnosticPlanID, Reused: courseResult.Reused, Replacement: domain.LearningPathReplacement{PlanningRequestID: request.ID, CourseID: courseResult.CourseID, GoalCode: request.GoalCode, CourseFingerprint: result.Fingerprint, PlannerPolicyVersion: policy.PlannerVersion, ReasonCode: reasonCode, ReasonSummary: request.Intent.DesiredOutcome, ExpectedVersion: 0, Items: items}}
+			checkpoint.Replacement.ExpectedOnboardingVersion = input.ExpectedOnboardingVersion
+			checkpoint.Replacement.ExpectedDirectionCode = input.ExpectedDirectionCode
+			if err := processor.InitialAllocations.CheckpointInitialAllocation(ctx, *request, checkpoint, processor.Clock.Now().UTC()); err != nil {
+				return err
+			}
+			return processor.dispatchInitialAllocation(ctx, request, checkpoint)
+		}
+		allocation, err := processor.Students.CreateLearningPath(ctx, request.StudentID, request.ID, domain.LearningPathReplacement{
+			PlanningRequestID: request.ID, CourseID: courseResult.CourseID, GoalCode: request.GoalCode,
+			CourseFingerprint: result.Fingerprint, PlannerPolicyVersion: policy.PlannerVersion,
+			ReasonCode: reasonCode, ReasonSummary: request.Intent.DesiredOutcome, ExpectedVersion: 0, Items: items,
+		})
+		if err != nil {
+			return processor.handleFailure(ctx, *request, "LEARNING_PATH_UNAVAILABLE", err)
+		}
+		if allocation.StudentID != request.StudentID || allocation.CourseID != courseResult.CourseID ||
+			allocation.GoalCode != request.GoalCode || allocation.CourseFingerprint != input.Fingerprint ||
+			allocation.LearningPathID == "" || (request.LearningPathID != "" && request.LearningPathID != allocation.LearningPathID) {
+			return processor.failPermanent(ctx, *request, "INITIAL_ALLOCATION_RECEIPT_INVALID")
+		}
+		request.LearningPathID = allocation.LearningPathID
+		if err := processor.Requests.ResolveLearningPath(
+			ctx, request.ID, request.ClaimToken, request.LearningPathID, processor.Clock.Now().UTC(),
+		); err != nil {
+			return err
+		}
+	}
+	request.CourseID = courseResult.CourseID
+	request.Reused = courseResult.Reused
+	if courseResult.Reused {
+		request.ResultCode = domain.CoursePlanResultReused
+	} else {
+		request.ResultCode = domain.CoursePlanResultCreated
+	}
+	if err := processor.renewClaim(ctx, *request); err != nil {
+		return err
+	}
+	return processor.Requests.Complete(ctx, *request, request.ClaimToken, processor.Clock.Now().UTC())
+}

@@ -1,0 +1,90 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type ReadinessReconciliationResult struct {
+	Schema   string                          `json:"schema"`
+	Instance domain.TaskInstance             `json:"instance"`
+	Receipt  domain.LearningReadinessReceipt `json:"receipt"`
+}
+
+func (runtime *Runtime) ReconcileStepReadiness(ctx context.Context, studentID, instanceID, stepID, idempotencyKey string) (ReadinessReconciliationResult, int, error) {
+	if !domain.IsCanonicalUUID(studentID) || !domain.IsCanonicalUUID(instanceID) || !domain.IsCanonicalUUID(idempotencyKey) || stepID == "" {
+		return ReadinessReconciliationResult{}, 400, domain.ErrInvalid
+	}
+	unlock := runtime.lockInstance(instanceID)
+	defer unlock()
+
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return ReadinessReconciliationResult{}, statusFor(err), err
+	}
+	if instance.Status != domain.TaskInstanceInProgress {
+		return ReadinessReconciliationResult{}, 409, domain.ErrConflict
+	}
+	var stepIndex = -1
+	for index := range instance.Steps {
+		if instance.Steps[index].ID == stepID {
+			stepIndex = index
+			break
+		}
+	}
+	if stepIndex < 0 {
+		return ReadinessReconciliationResult{}, 404, domain.ErrNotFound
+	}
+	step := instance.Steps[stepIndex]
+	if !step.Required || (step.Status != "LEARNING_REQUIRED" && step.Status != "AVAILABLE") {
+		return ReadinessReconciliationResult{}, 409, domain.ErrConflict
+	}
+	commandDigest, err := domain.CommandDigest(struct {
+		Schema         string `json:"schema"`
+		StudentID      string `json:"student_id"`
+		TaskInstanceID string `json:"task_instance_id"`
+		StepID         string `json:"step_id"`
+	}{"practice-step-readiness-reconcile.v1", studentID, instanceID, stepID})
+	if err != nil {
+		return ReadinessReconciliationResult{}, 500, err
+	}
+	if _, err := runtime.Repository.CreateOrLoadCommandReceipt(ctx, idempotencyKey, instance.ID, "readiness-reconcile", commandDigest); err != nil {
+		return ReadinessReconciliationResult{}, statusFor(err), err
+	}
+	receipt, err := runtime.Planner.ReconcileReadiness(ctx, ports.ReconcileLearningReadiness{
+		IdempotencyKey: idempotencyKey, TaskInstanceID: instance.ID, StudentID: instance.StudentID,
+		TaskRevisionID: instance.TaskRevisionID, RevisionDigest: instance.TaskRevisionDigest,
+		RouteID: instance.LearningRoute.ID, RouteDigest: instance.LearningRoute.RouteDigest, StepID: step.ID,
+	})
+	if err != nil {
+		return ReadinessReconciliationResult{}, statusFor(err), err
+	}
+	if !domain.ValidLearningReadinessReceipt(receipt) || receipt.TaskInstanceID != instance.ID || receipt.StudentID != instance.StudentID ||
+		receipt.TaskRevisionID != instance.TaskRevisionID || receipt.TaskRevisionDigest != instance.TaskRevisionDigest ||
+		receipt.RouteID != instance.LearningRoute.ID || receipt.RouteDigest != instance.LearningRoute.RouteDigest || receipt.StepID != step.ID {
+		return ReadinessReconciliationResult{}, 503, domain.ErrDependency
+	}
+	if step.ReadinessReceipt != nil && step.ReadinessIdempotencyKey == idempotencyKey && step.ReadinessReceipt.ID != receipt.ID {
+		return ReadinessReconciliationResult{}, 503, domain.ErrDependency
+	}
+	if step.ReadinessReceipt == nil || step.ReadinessReceipt.ID != receipt.ID || step.ReadinessIdempotencyKey != idempotencyKey {
+		instance.Steps[stepIndex].ReadinessReceipt = &receipt
+		instance.Steps[stepIndex].ReadinessIdempotencyKey = idempotencyKey
+		if receipt.Decision == "READY" && instance.Steps[stepIndex].Status == "LEARNING_REQUIRED" {
+			instance.Steps[stepIndex].Status = "AVAILABLE"
+		}
+		instance.UpdatedAt = runtime.now()
+		setCurrentStep(&instance)
+		instance, err = runtime.Repository.SaveInstance(ctx, instance)
+		if err != nil {
+			if errors.Is(err, domain.ErrConflict) {
+				return ReadinessReconciliationResult{}, 409, domain.ErrConflict
+			}
+			return ReadinessReconciliationResult{}, statusFor(err), err
+		}
+	}
+	return ReadinessReconciliationResult{Schema: "practice-step-readiness-reconciliation.v1", Instance: instance.PublicProjection(), Receipt: receipt}, 200, nil
+}

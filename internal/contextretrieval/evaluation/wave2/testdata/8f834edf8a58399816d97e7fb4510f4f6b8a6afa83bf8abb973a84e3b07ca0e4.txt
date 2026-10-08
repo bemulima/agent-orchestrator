@@ -1,0 +1,278 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type submitRepositoryFake struct {
+	ports.Repository
+	instance       domain.TaskInstance
+	intent         domain.SubmitIntent
+	submission     domain.Submission
+	order          *[]string
+	failSaveStatus string
+	commits        int
+}
+
+type submitIDGenerator struct{ ids []string }
+
+func (generator *submitIDGenerator) next() string {
+	value := generator.ids[0]
+	generator.ids = generator.ids[1:]
+	return value
+}
+
+func (repository *submitRepositoryFake) GetInstance(_ context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if studentID != repository.instance.StudentID || instanceID != repository.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return repository.instance, nil
+}
+
+func (repository *submitRepositoryFake) GetIntent(_ context.Context, taskInstanceID, idempotencyKey string) (domain.SubmitIntent, error) {
+	if repository.intent.TaskInstanceID == taskInstanceID && repository.intent.IdempotencyKey == idempotencyKey {
+		return repository.intent, nil
+	}
+	return domain.SubmitIntent{}, domain.ErrNotFound
+}
+
+func (repository *submitRepositoryFake) CreateOrLoadIntent(_ context.Context, intent domain.SubmitIntent) (domain.SubmitIntent, bool, error) {
+	*repository.order = append(*repository.order, "intent")
+	repository.intent = intent
+	return intent, true, nil
+}
+
+func (repository *submitRepositoryFake) SaveIntent(_ context.Context, intent domain.SubmitIntent) error {
+	*repository.order = append(*repository.order, "save-intent")
+	if intent.Status == repository.failSaveStatus {
+		repository.failSaveStatus = ""
+		return errors.New("process stopped after provider receipt before intent save")
+	}
+	repository.intent = intent
+	return nil
+}
+
+func (repository *submitRepositoryFake) CommitIntent(_ context.Context, intent domain.SubmitIntent, submission domain.Submission, _ domain.ValidationRun) error {
+	*repository.order = append(*repository.order, "commit")
+	repository.intent, repository.submission = intent, submission
+	repository.commits++
+	return nil
+}
+
+func (repository *submitRepositoryFake) GetSubmission(_ context.Context, taskInstanceID, submissionID string) (domain.Submission, error) {
+	if repository.submission.TaskInstanceID == taskInstanceID && repository.submission.ID == submissionID {
+		return repository.submission, nil
+	}
+	return domain.Submission{}, domain.ErrNotFound
+}
+
+type submitWorkspaceFake struct {
+	order   *[]string
+	ref     domain.SnapshotRef
+	locks   []ports.LockWorkspaceWrites
+	freezes []ports.FreezeSnapshot
+}
+
+func (workspace *submitWorkspaceFake) CreateOrResumeWorkspace(context.Context, ports.CreateWorkspace) (domain.WorkspaceBinding, error) {
+	panic("not used")
+}
+func (workspace *submitWorkspaceFake) FreezeSnapshot(_ context.Context, input ports.FreezeSnapshot) (domain.SnapshotRef, error) {
+	*workspace.order = append(*workspace.order, "freeze")
+	workspace.freezes = append(workspace.freezes, input)
+	return workspace.ref, nil
+}
+func (workspace *submitWorkspaceFake) ReadPinnedSnapshot(_ context.Context, ref domain.SnapshotRef) (ports.WorkspaceSnapshot, error) {
+	*workspace.order = append(*workspace.order, "read")
+	return ports.WorkspaceSnapshot{Ref: ref, Files: []domain.WorkspaceFile{{Path: "main.go", Content: "package main"}}}, nil
+}
+func (workspace *submitWorkspaceFake) LockWrites(_ context.Context, input ports.LockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	*workspace.order = append(*workspace.order, "lock")
+	workspace.locks = append(workspace.locks, input)
+	return ports.WorkspaceWriteLock{LockID: input.RequestID, FenceEpoch: 7}, nil
+}
+func (workspace *submitWorkspaceFake) UnlockWrites(context.Context, ports.UnlockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	panic("not used")
+}
+func (workspace *submitWorkspaceFake) RestoreWorkspace(context.Context, ports.RestoreWorkspace) (domain.WorkspaceBinding, error) {
+	panic("not used")
+}
+
+func TestSubmitPersistsIntentBeforeLockFreezeAndPinnedRead(t *testing.T) {
+	order := []string{}
+	now := time.Date(2026, 10, 2, 1, 2, 3, 0, time.UTC)
+	instance := submitReadyInstance()
+	ref := domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: "snapshot-1", GenerationID: "generation-1", WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	repository := &submitRepositoryFake{instance: instance, order: &order}
+	workspace := &submitWorkspaceFake{order: &order, ref: ref}
+	ids := &submitIDGenerator{ids: []string{"00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000012"}}
+	runtime := Runtime{Repository: repository, Workspace: workspace, Now: func() time.Time { return now }, NewID: ids.next}
+	command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+		IdempotencyKey: "00000000-0000-4000-8000-000000000011", Scope: "FINAL"}
+	submission, status, err := runtime.Submit(context.Background(), command)
+	if err != nil {
+		t.Fatalf("Submit failed: %v", err)
+	}
+	if status != 202 || submission.Status != domain.SubmissionValidating || submission.Snapshot != ref || len(submission.ValidationRuns) != 1 {
+		t.Fatalf("unexpected submit response: status=%d submission=%+v", status, submission)
+	}
+	wantOrder := []string{"intent", "lock", "save-intent", "freeze", "save-intent", "read", "commit"}
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("side-effect order = %v, want %v", order, wantOrder)
+	}
+}
+
+func TestSubmitRejectsNonNextMilestoneBeforeDurableIntent(t *testing.T) {
+	order := []string{}
+	instance := submitReadyInstance()
+	instance.Steps = append(instance.Steps, domain.Step{ID: "00000000-0000-4000-8000-000000000013", Required: true, Status: "AVAILABLE"})
+	repository := &submitRepositoryFake{instance: instance, order: &order}
+	runtime := Runtime{Repository: repository}
+	command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+		IdempotencyKey: "00000000-0000-4000-8000-000000000011", Scope: "MILESTONE", MilestoneID: "00000000-0000-4000-8000-000000000014"}
+	_, _, err := runtime.Submit(context.Background(), command)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("non-next milestone should conflict, got %v", err)
+	}
+	if len(order) != 0 {
+		t.Fatalf("invalid command caused durable or external side effects: %v", order)
+	}
+}
+
+func TestFinalSubmitAcceptsPreviouslyCheckpointedRequiredMilestone(t *testing.T) {
+	order := []string{}
+	now := time.Date(2026, 10, 2, 1, 2, 3, 0, time.UTC)
+	instance := submitReadyInstance()
+	instance.Steps[0].Status = "CHECKPOINTED"
+	ref := domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: "snapshot-1", GenerationID: "generation-1", WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	repository := &submitRepositoryFake{instance: instance, order: &order}
+	workspace := &submitWorkspaceFake{order: &order, ref: ref}
+	ids := &submitIDGenerator{ids: []string{"00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000012"}}
+	runtime := Runtime{Repository: repository, Workspace: workspace, Now: func() time.Time { return now }, NewID: ids.next}
+	command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+		IdempotencyKey: "00000000-0000-4000-8000-000000000011", Scope: "FINAL"}
+	if _, status, err := runtime.Submit(context.Background(), command); err != nil || status != 202 {
+		t.Fatalf("final submit after checkpoint should be accepted: status=%d error=%v", status, err)
+	}
+}
+
+func TestSubmitRecoversProviderReceiptBeforeIntentSaveAcrossRestart(t *testing.T) {
+	for _, cut := range []struct {
+		status          string
+		persistedStatus string
+		lockCalls       int
+		freezeCalls     int
+	}{
+		{status: "LOCKED", persistedStatus: "INTENT", lockCalls: 2, freezeCalls: 1},
+		{status: "FROZEN", persistedStatus: "LOCKED", lockCalls: 1, freezeCalls: 2},
+	} {
+		t.Run(cut.status, func(t *testing.T) {
+			order := []string{}
+			instance := submitReadyInstance()
+			const submissionID = "00000000-0000-4000-8000-000000000010"
+			const runID = "00000000-0000-4000-8000-000000000012"
+			ref := domain.SnapshotRef{SandboxID: instance.WorkspaceBinding.SandboxID, SnapshotID: submissionID,
+				GenerationID: "gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+			repository := &submitRepositoryFake{instance: instance, order: &order, failSaveStatus: cut.status}
+			workspace := &submitWorkspaceFake{order: &order, ref: ref}
+			ids := &submitIDGenerator{ids: []string{submissionID, runID}}
+			command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+				IdempotencyKey: "00000000-0000-4000-8000-000000000011", Scope: "FINAL"}
+			first := Runtime{Repository: repository, Workspace: workspace, NewID: ids.next}
+			if _, status, err := first.Submit(context.Background(), command); err == nil || status != 503 {
+				t.Fatalf("cut after %s: status=%d err=%v", cut.status, status, err)
+			}
+			if repository.intent.Status != cut.persistedStatus || repository.commits != 0 {
+				t.Fatalf("unexpected durable state at cut: %+v commits=%d", repository.intent, repository.commits)
+			}
+			// A new Runtime has no process-local locks or ID-generator state. Its
+			// only recovery inputs are the durable intent and provider receipts.
+			restarted := Runtime{Repository: repository, Workspace: workspace, NewID: func() string { t.Fatal("recovery generated a new identity"); return "" }}
+			submission, status, err := restarted.Submit(context.Background(), command)
+			if err != nil || status != 202 || submission.ID != submissionID || submission.Snapshot != ref ||
+				len(submission.ValidationRuns) != 1 || submission.ValidationRuns[0].ID != runID || repository.commits != 1 {
+				t.Fatalf("restart recovery: status=%d err=%v submission=%+v commits=%d", status, err, submission, repository.commits)
+			}
+			if len(workspace.locks) != cut.lockCalls || len(workspace.freezes) != cut.freezeCalls || repository.intent.WriteLockID != submissionID {
+				t.Fatalf("receipt reuse: locks=%+v freezes=%+v intent=%+v", workspace.locks, workspace.freezes, repository.intent)
+			}
+			for _, request := range workspace.locks {
+				if request.RequestID != submissionID || request.SubmissionID != submissionID || request.Mode != "TEMPORARY" {
+					t.Fatalf("unstable lock identity: %+v", request)
+				}
+			}
+			for _, request := range workspace.freezes {
+				if request.SubmissionID != submissionID || request.TaskInstanceID != instance.ID || request.SandboxID != ref.SandboxID {
+					t.Fatalf("unstable freeze identity: %+v", request)
+				}
+			}
+			before := len(order)
+			replayed, _, err := restarted.Submit(context.Background(), command)
+			if err != nil || replayed.ID != submission.ID || len(order) != before || repository.commits != 1 {
+				t.Fatalf("committed replay changed result or repeated effects: %+v err=%v", replayed, err)
+			}
+			changed := command
+			changed.Scope, changed.MilestoneID = "MILESTONE", instance.Steps[0].ID
+			if _, status, err := restarted.Submit(context.Background(), changed); status != 409 || !errors.Is(err, domain.ErrIdempotency) || len(order) != before {
+				t.Fatalf("changed payload replay: status=%d err=%v effects=%v", status, err, order[before:])
+			}
+		})
+	}
+}
+
+func TestSubmitPendingIntentDoesNotExecuteAfterCancellationOrAbort(t *testing.T) {
+	for _, scenario := range []string{"cancelled", "aborted"} {
+		t.Run(scenario, func(t *testing.T) {
+			order := []string{}
+			instance := submitReadyInstance()
+			command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID,
+				IdempotencyKey: "00000000-0000-4000-8000-000000000011", Scope: "FINAL"}
+			digest, err := domain.CommandDigest(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			intent := domain.SubmitIntent{TaskInstanceID: instance.ID, StudentID: instance.StudentID, IdempotencyKey: command.IdempotencyKey,
+				CommandDigest: digest, SubmissionID: "00000000-0000-4000-8000-000000000010", ValidationRunID: "00000000-0000-4000-8000-000000000012",
+				Scope: "FINAL", Status: "LOCKED", WriteLockID: "00000000-0000-4000-8000-000000000010", FenceEpoch: 7}
+			if scenario == "cancelled" {
+				instance.Status = domain.TaskInstanceCancelled
+			} else {
+				intent.Status = "ABORTED"
+			}
+			repository := &submitRepositoryFake{instance: instance, intent: intent, order: &order}
+			workspace := &submitWorkspaceFake{order: &order, ref: domain.SnapshotRef{SandboxID: instance.WorkspaceBinding.SandboxID,
+				SnapshotID: intent.SubmissionID, GenerationID: "gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+			runtime := Runtime{Repository: repository, Workspace: workspace}
+			if _, status, err := runtime.Submit(context.Background(), command); status != 409 || !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("closed intent must conflict: status=%d err=%v", status, err)
+			}
+			if len(order) != 0 {
+				t.Fatalf("closed intent executed provider or persistence effects: %v", order)
+			}
+		})
+	}
+}
+
+func submitReadyInstance() domain.TaskInstance {
+	studentID := "00000000-0000-4000-8000-000000000001"
+	instanceID := "00000000-0000-4000-8000-000000000002"
+	revisionID := "00000000-0000-4000-8000-000000000003"
+	stepID := "00000000-0000-4000-8000-000000000005"
+	return domain.TaskInstance{ID: instanceID, StudentID: studentID, TaskRevisionID: revisionID,
+		TaskRevisionDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Status:             domain.TaskInstanceInProgress, LearningActionID: "00000000-0000-4000-8000-000000000004",
+		WorkspaceBinding: domain.WorkspaceBinding{SandboxID: "sandbox-1", Available: true},
+		Steps: []domain.Step{{ID: stepID, Required: true, Status: "PASSED", Targets: []domain.Target{{Type: "concept", Key: "go.errors", Version: "v1"}},
+			ValidationContract: json.RawMessage(`{"schema":"contract.v1"}`), EvaluationAssets: domain.EvaluationAssets{TestSuiteRef: "suite://one"},
+			RuntimeProfile: json.RawMessage(`{"code_structure_type_code":"HTML_BASIC_DOCUMENT","compose_config":{}}`)}},
+		RevisionEnvelope: domain.RevisionEnvelope{RuntimeContext: json.RawMessage(`{}`)},
+		StartedAt:        time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)}
+}

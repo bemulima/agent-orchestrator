@@ -1,0 +1,1131 @@
+package usecase
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/memory"
+)
+
+var testRuntimeRef = domain.RuntimeProfileRef{Code: "web-static", Version: "v1", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+
+type generatorStub struct {
+	calls     int
+	candidate domain.AuthoringCandidateV1
+	err       error
+	input     domain.GenerationInput
+}
+
+func (stub *generatorStub) Generate(_ context.Context, input domain.GenerationInput) (domain.AuthoringCandidateV1, error) {
+	stub.calls++
+	stub.input = input
+	return stub.candidate, stub.err
+}
+
+type competencyStub struct {
+	err          error
+	discoveryErr error
+	got          []domain.LearningTargetRef
+	stacks       []string
+	targets      []domain.LearningTargetDescriptor
+}
+
+func (stub *competencyStub) DiscoverTargets(_ context.Context, stacks []string) ([]domain.LearningTargetDescriptor, error) {
+	stub.stacks = append([]string(nil), stacks...)
+	if stub.discoveryErr != nil {
+		return nil, stub.discoveryErr
+	}
+	if len(stub.targets) > 0 {
+		return append([]domain.LearningTargetDescriptor(nil), stub.targets...), nil
+	}
+	return []domain.LearningTargetDescriptor{{
+		Ref:   domain.LearningTargetRef{Type: "capability", Key: "javascript.dom-events", Version: "v1"},
+		Title: "DOM events", Description: "Handle browser events",
+	}}, nil
+}
+
+func (stub *competencyStub) ResolveExactTargets(_ context.Context, targets []domain.LearningTargetRef) error {
+	stub.got = targets
+	return stub.err
+}
+
+type profileStub struct{ err error }
+
+func (stub profileStub) ListRuntimeProfiles(context.Context) ([]domain.RuntimeProfileDescriptor, error) {
+	return []domain.RuntimeProfileDescriptor{{Ref: testRuntimeRef, SupportedCodeStructureTypes: []string{"HTML_BASIC_DOCUMENT"}, NetworkPolicy: "preview-only"}}, stub.err
+}
+
+type validationStub struct {
+	passed           bool
+	omitLastCase     bool
+	malformedDigests bool
+}
+
+func (stub validationStub) InspectContract(context.Context, json.RawMessage) (domain.ContractInspection, error) {
+	contractDigest, capabilitiesDigest := verificationTestDigest("b"), verificationTestDigest("c")
+	if stub.malformedDigests {
+		contractDigest, capabilitiesDigest = "sha256:contract", "sha256:capabilities"
+	}
+	return domain.ContractInspection{Schema: "validation-contract-inspection.v1", ContractKind: "workspace_contract", ContractVersion: 1, ContractDigest: contractDigest, CapabilitiesDigest: capabilitiesDigest, Runnable: true}, nil
+}
+func (stub validationStub) VerifyContract(_ context.Context, request domain.VerificationRequestV1) (domain.VerificationReceiptV1, error) {
+	cases := make([]domain.VerificationCaseResult, 0, len(request.Cases))
+	for index, item := range request.Cases {
+		if stub.omitLastCase && index == len(request.Cases)-1 {
+			continue
+		}
+		expected := item.Kind == "reference"
+		cases = append(cases, domain.VerificationCaseResult{ID: item.ID, Kind: item.Kind, ExpectedPassed: expected, ActualPassed: expected, ResultDigest: verificationTestDigest("1")})
+	}
+	receipt := domain.VerificationReceiptV1{Schema: domain.VerificationReceiptSchemaV1, BlueprintDigest: request.BlueprintDigest, RuntimeProfileDigest: request.RuntimeProfileDigest, ContractDigest: verificationTestDigest("b"), CapabilitiesDigest: verificationTestDigest("c"), Passed: stub.passed, Cases: cases, VerifiedAt: time.Date(2026, 9, 1, 1, 0, 0, 0, time.UTC)}
+	var err error
+	receipt.ReceiptDigest, err = verificationReceiptDigest(receipt)
+	if err != nil {
+		return domain.VerificationReceiptV1{}, err
+	}
+	return receipt, nil
+}
+
+func verificationTestDigest(character string) string {
+	return "sha256:" + strings.Repeat(character, 64)
+}
+
+type workspaceStub struct{ created, deleted []string }
+
+func (stub *workspaceStub) CreateVerificationWorkspace(_ context.Context, _ domain.RuntimeProfileRef, _ domain.WorkspaceFixture, _ time.Duration) (domain.VerificationWorkspace, error) {
+	id := fmt.Sprintf("fixture-%d", len(stub.created)+1)
+	stub.created = append(stub.created, id)
+	return domain.VerificationWorkspace{ID: id, RootPath: "/workspaces/" + id}, nil
+}
+func (stub *workspaceStub) DeleteVerificationWorkspace(_ context.Context, id string) error {
+	stub.deleted = append(stub.deleted, id)
+	return nil
+}
+
+type stagerStub struct {
+	calls    int
+	jobID    string
+	artifact domain.AuthoringArtifact
+}
+
+func (stub *stagerStub) Stage(_ context.Context, jobID string, artifact domain.AuthoringArtifact) (domain.StagingReceiptV1, error) {
+	stub.calls++
+	stub.jobID = jobID
+	stub.artifact = artifact
+	blueprintDigest, err := jsonDigest(artifact.Candidate.Blueprint)
+	if err != nil {
+		return domain.StagingReceiptV1{}, err
+	}
+	return domain.StagingReceiptV1{
+		Schema: "practice-task-staging-receipt.v1", StagedID: "22222222-2222-4222-8222-222222222222",
+		State: "staged", Created: true, CreatedAt: time.Date(2026, 9, 1, 1, 0, 0, 0, time.UTC),
+		FamilyKey: artifact.Candidate.Blueprint.Identity.FamilyKey, VariantKey: artifact.Candidate.Blueprint.Identity.VariantKey,
+		BlueprintDigest: blueprintDigest, CandidateDigest: artifact.CandidateDigest, AuthoringJobID: jobID,
+	}, nil
+}
+
+func TestPlannerProducesVerifiedArtifactOnceForIdempotentReplay(t *testing.T) {
+	repository := memory.NewJobRepository()
+	generator := &generatorStub{candidate: validCandidate()}
+	competencies := &competencyStub{}
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, generator, competencies, validationStub{passed: true}, workspaces)
+	request := validRequest("Крестики-нолики на HTML/CSS/JavaScript")
+	job, created, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if !created || job.Status != domain.JobStatusReady || job.Artifact == nil || !job.Artifact.Verification.Passed {
+		t.Fatalf("unexpected job: %+v", job)
+	}
+	if generator.calls != 1 || len(competencies.got) != 1 || len(workspaces.created) != 3 || len(workspaces.deleted) != 3 {
+		t.Fatalf("pipeline calls: generator=%d targets=%v created=%v deleted=%v", generator.calls, competencies.got, workspaces.created, workspaces.deleted)
+	}
+	if len(generator.input.LearningTargets) != 1 || generator.input.LearningTargets[0].Ref.Key != "javascript.dom-events" {
+		t.Fatalf("generator did not receive canonical target catalog: %+v", generator.input.LearningTargets)
+	}
+	replayed, created, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request)
+	if err != nil || created || replayed.ID != job.ID || generator.calls != 1 {
+		t.Fatalf("replay=%+v created=%v calls=%d err=%v", replayed, created, generator.calls, err)
+	}
+	if replayed.Artifact.Candidate.Blueprint.Source.OriginalManifestHash != replayed.RequestHash || replayed.Artifact.Candidate.Blueprint.Generation.GenerationJobID != job.ID {
+		t.Fatalf("provenance was not enforced")
+	}
+}
+
+func TestV1RequestDefaultsTrustedSurfaceToPracticeAndOverridesModel(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Classification.SurfaceClassification = domain.SurfaceClassificationProject
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil || job.Artifact == nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	if job.Request.Orchestration != nil || job.Artifact.Candidate.Blueprint.Classification.SurfaceClassification != domain.SurfaceClassificationPractice {
+		t.Fatalf("v1 trusted default was not enforced: request=%+v classification=%+v", job.Request, job.Artifact.Candidate.Blueprint.Classification)
+	}
+}
+
+func TestPreparedSourceTaskRunsThroughExistingPipelineAndPreservesSnapshotProvenance(t *testing.T) {
+	repository := memory.NewJobRepository()
+	generator := &generatorStub{candidate: validCandidate()}
+	competencies := &competencyStub{}
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, generator, competencies, validationStub{passed: true}, workspaces)
+	task := validPreparedSourceTask()
+	request := domain.PlanningRequestV1{Schema: domain.PlanningRequestSchemaV3, Mode: "private", Locale: "en", Source: domain.PlanningSource{Type: "github_repository", URL: task.Source.RepositoryURL, Company: "Acme"}, Hints: domain.ClassificationHint{Stacks: []string{"javascript"}}, PreparedSourceTask: &task}
+	job, created, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request)
+	if err != nil || !created || job.Status != domain.JobStatusReady || job.Artifact == nil || !job.Artifact.Verification.Passed {
+		t.Fatalf("job=%+v created=%t err=%v", job, created, err)
+	}
+	if generator.calls != 1 || generator.input.Request.PreparedSourceTask == nil || generator.input.Request.Manifest != "" || len(competencies.stacks) != 1 || competencies.stacks[0] != "javascript" {
+		t.Fatalf("typed task did not enter existing generator/target pipeline: input=%+v stacks=%v", generator.input.Request, competencies.stacks)
+	}
+	source := job.Artifact.Candidate.Blueprint.Source
+	if source.SourceType != "github_repository" || source.SourceCommitSHA != task.Source.CommitSHA || source.SourcePath != task.Source.Path || source.SourceLocator != task.Source.Locator {
+		t.Fatalf("exact repository provenance was not retained: %+v", source)
+	}
+	if _, err := planner.GetTechnicalTask(context.Background(), job.ID); err != nil {
+		t.Fatalf("READY task is not projected as technical-task.v1: %v", err)
+	}
+}
+
+func TestPreparedSourceTaskValidationAndHashingAreStrict(t *testing.T) {
+	task := validPreparedSourceTask()
+	request := domain.PlanningRequestV1{Schema: domain.PlanningRequestSchemaV3, Mode: "private", Locale: "en", Source: domain.PlanningSource{Type: "github_repository", URL: task.Source.RepositoryURL}, PreparedSourceTask: &task}
+	_, firstHash, err := normalizePlanningRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := task
+	changed.Source.CommitSHA = strings.Repeat("b", 40)
+	request.PreparedSourceTask = &changed
+	_, secondHash, err := normalizePlanningRequest(request)
+	if err != nil || firstHash == secondHash {
+		t.Fatalf("typed source change was not hashed: first=%s second=%s err=%v", firstHash, secondHash, err)
+	}
+	changed.Source.Path = "../outside"
+	request.PreparedSourceTask = &changed
+	if _, _, err := normalizePlanningRequest(request); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("unsafe path error=%v", err)
+	}
+	changed = task
+	changed.ContentHash = "sha256:bad"
+	request.PreparedSourceTask = &changed
+	if _, _, err := normalizePlanningRequest(request); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("bad content hash error=%v", err)
+	}
+	changed = task
+	changed.Source.RepositoryURL = "https://github.com/../tasks"
+	request.PreparedSourceTask = &changed
+	request.Source.URL = changed.Source.RepositoryURL
+	if _, _, err := normalizePlanningRequest(request); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("dot-segment repository error=%v", err)
+	}
+}
+
+func validPreparedSourceTask() domain.PreparedSourceTaskV1 {
+	content := "Implement a cache"
+	digest := sha256.Sum256([]byte(content))
+	return domain.PreparedSourceTaskV1{SchemaVersion: "prepared-source-task.v1", Source: domain.PreparedSourceReferenceV1{Provider: "github", RepositoryURL: "https://github.com/acme/tasks", CommitSHA: strings.Repeat("a", 40), Path: "tasks/one/README.md", Locator: "heading:1"}, Title: "Cache", Content: content, Metadata: map[string]any{"company": "Acme", "stack_hints": []any{"javascript"}}, ContentHash: "sha256:" + hex.EncodeToString(digest[:])}
+}
+
+func TestV2ProjectIntentIsHashedPersistedReplayedAndStagedExactly(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Classification.SurfaceClassification = domain.SurfaceClassificationPractice
+	candidate.Blueprint.Difficulty.DerivedLevel = "junior"
+	generator := &generatorStub{candidate: candidate}
+	stager := &stagerStub{}
+	planner := newTestPlanner(repository, generator, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	planner.Stager = stager
+	request := validV2Request("project task", domain.SurfaceClassificationProject, "junior")
+	job, created, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request)
+	if err != nil || !created || job.Artifact == nil || job.Request.Orchestration == nil {
+		t.Fatalf("job=%+v created=%t err=%v", job, created, err)
+	}
+	if job.Request.Orchestration.CorrelationID != request.Orchestration.CorrelationID ||
+		job.Artifact.Candidate.Blueprint.Classification.SurfaceClassification != domain.SurfaceClassificationProject ||
+		job.Artifact.Candidate.Blueprint.Difficulty.DerivedLevel != "junior" || stager.calls != 0 {
+		t.Fatalf("trusted intent was not preserved through READY: job=%+v calls=%d", job, stager.calls)
+	}
+	replayed, replayCreated, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request)
+	if err != nil || replayCreated || replayed.ID != job.ID || generator.calls != 1 {
+		t.Fatalf("exact v2 replay: job=%+v created=%t calls=%d err=%v", replayed, replayCreated, generator.calls, err)
+	}
+	changed := request
+	changed.Orchestration = copyOrchestrationIntent(request.Orchestration)
+	changed.Orchestration.Trigger = domain.AuthoringTriggerPlannerRecommendation
+	if _, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", changed); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("changed orchestration intent reused idempotency key: %v", err)
+	}
+	staged, err := planner.Stage(context.Background(), job.ID)
+	if err != nil || staged.Staging == nil || staged.Status != domain.JobStatusStaged || stager.calls != 1 ||
+		stager.artifact.Candidate.Blueprint.Classification.SurfaceClassification != domain.SurfaceClassificationProject {
+		t.Fatalf("exact project surface was not staged privately: job=%+v artifact=%+v calls=%d err=%v", staged, stager.artifact, stager.calls, err)
+	}
+}
+
+func TestV2DesiredDifficultyMismatchFailsBeforeVerification(t *testing.T) {
+	repository := memory.NewJobRepository()
+	workspaces := &workspaceStub{}
+	candidate := validCandidate()
+	candidate.Blueprint.Difficulty.DerivedLevel = "beginner"
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111",
+		validV2Request("advanced project", domain.SurfaceClassificationProject, "senior"))
+	if !errors.Is(err, domain.ErrValidation) || job.FailureCode != "candidate_difficulty_mismatch" || len(workspaces.created) != 0 {
+		t.Fatalf("difficulty mismatch crossed the quality gate: job=%+v workspaces=%v err=%v", job, workspaces.created, err)
+	}
+}
+
+func TestV2IntentParticipatesInCanonicalRequestHashWhileV1HashIsCompatible(t *testing.T) {
+	v1 := validRequest("stable request")
+	normalizedV1, v1Hash, err := normalizePlanningRequest(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type legacyPlanningRequestV1 struct {
+		Schema   string                    `json:"schema"`
+		Mode     string                    `json:"mode"`
+		Manifest string                    `json:"manifest"`
+		Locale   string                    `json:"locale"`
+		Source   domain.PlanningSource     `json:"source"`
+		Hints    domain.ClassificationHint `json:"classification_hints"`
+	}
+	legacyJSON, err := json.Marshal(legacyPlanningRequestV1{
+		Schema: normalizedV1.Schema, Mode: normalizedV1.Mode, Manifest: normalizedV1.Manifest,
+		Locale: normalizedV1.Locale, Source: normalizedV1.Source, Hints: normalizedV1.Hints,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := sha256.Sum256(legacyJSON)
+	if v1Hash != "sha256:"+hex.EncodeToString(legacyDigest[:]) {
+		t.Fatalf("v1 canonical hash changed: got=%s legacy=%s", v1Hash, hex.EncodeToString(legacyDigest[:]))
+	}
+	v2 := validV2Request("stable request", domain.SurfaceClassificationProject, "junior")
+	_, firstHash, err := normalizePlanningRequest(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2.Orchestration = copyOrchestrationIntent(v2.Orchestration)
+	v2.Orchestration.SurfaceClassification = domain.SurfaceClassificationPractice
+	_, secondHash, err := normalizePlanningRequest(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash == secondHash {
+		t.Fatal("surface classification was omitted from the v2 request hash")
+	}
+}
+
+func TestPlanningRequestVersionStrictlyBindsOrchestrationIntent(t *testing.T) {
+	v1WithIntent := validRequest("task")
+	v1WithIntent.Orchestration = validV2Request("task", domain.SurfaceClassificationProject, "junior").Orchestration
+	cases := []struct {
+		name    string
+		request domain.PlanningRequestV1
+	}{
+		{name: "v1 with v2 field", request: v1WithIntent},
+		{name: "v2 without intent", request: func() domain.PlanningRequestV1 {
+			request := validRequest("task")
+			request.Schema = domain.PlanningRequestSchemaV2
+			return request
+		}()},
+		{name: "unknown intent schema", request: func() domain.PlanningRequestV1 {
+			request := validV2Request("task", domain.SurfaceClassificationProject, "junior")
+			request.Orchestration.Schema = "learning-workspace-authoring-intent.v2"
+			return request
+		}()},
+		{name: "unknown trigger", request: func() domain.PlanningRequestV1 {
+			request := validV2Request("task", domain.SurfaceClassificationProject, "junior")
+			request.Orchestration.Trigger = "teacher_chat"
+			return request
+		}()},
+		{name: "invalid correlation", request: func() domain.PlanningRequestV1 {
+			request := validV2Request("task", domain.SurfaceClassificationProject, "junior")
+			request.Orchestration.CorrelationID = "student-42"
+			return request
+		}()},
+		{name: "unknown surface", request: func() domain.PlanningRequestV1 { return validV2Request("task", "course", "junior") }()},
+		{name: "unknown difficulty", request: func() domain.PlanningRequestV1 {
+			return validV2Request("task", domain.SurfaceClassificationProject, "expert")
+		}()},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := normalizePlanningRequest(test.request); !errors.Is(err, domain.ErrValidation) {
+				t.Fatalf("invalid intent accepted: %+v err=%v", test.request, err)
+			}
+		})
+	}
+	var v1WithNullIntent domain.PlanningRequestV1
+	if err := json.Unmarshal([]byte(`{"schema":"tz-planning-request.v1","mode":"private","manifest":"task","locale":"ru","source":{"type":"user_intent","anonymized":false},"classification_hints":{},"orchestration":null}`), &v1WithNullIntent); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normalizePlanningRequest(v1WithNullIntent); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("v1 accepted an explicitly present orchestration field: %v", err)
+	}
+	var v2WithEmptyDifficulty domain.PlanningRequestV1
+	if err := json.Unmarshal([]byte(`{"schema":"tz-planning-request.v2","mode":"private","manifest":"task","locale":"ru","source":{"type":"user_intent","anonymized":false},"classification_hints":{},"orchestration":{"schema":"learning-workspace-authoring-intent.v1","trigger":"student_project","correlation_id":"99999999-9999-4999-8999-999999999999","surface_classification":"project","desired_difficulty_level":""}}`), &v2WithEmptyDifficulty); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normalizePlanningRequest(v2WithEmptyDifficulty); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("v2 accepted an explicitly empty desired difficulty: %v", err)
+	}
+}
+
+func TestPlannerRejectsIdempotencyKeyReuseWithDifferentManifest(t *testing.T) {
+	repository := memory.NewJobRepository()
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	_, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("second"))
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected conflict, got %v", err)
+	}
+}
+
+func TestPlanningRequestNormalizesCommonStackAliasesBeforeCatalogDiscovery(t *testing.T) {
+	repository := memory.NewJobRepository()
+	competencies := &competencyStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, competencies, validationStub{passed: true}, &workspaceStub{})
+	request := validRequest("tic-tac-toe")
+	request.Hints.Stacks = []string{"JS", "HTML5", "css3", "js"}
+	if _, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", request); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(competencies.stacks, ",") != "css,html,javascript" {
+		t.Fatalf("discovery stacks=%v", competencies.stacks)
+	}
+}
+
+func TestReadyJobStagesIdempotentlyInPractice(t *testing.T) {
+	repository := memory.NewJobRepository()
+	stager := &stagerStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	planner.Stager = stager
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := planner.Stage(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if stager.calls != 1 || stager.jobID != job.ID || staged.Staging == nil || staged.Status != domain.JobStatusStaged {
+		t.Fatalf("unexpected staging: calls=%d job=%q receipt=%+v", stager.calls, stager.jobID, staged.Staging)
+	}
+	replayed, err := planner.Stage(context.Background(), job.ID)
+	if err != nil || stager.calls != 1 || replayed.Staging == nil || replayed.Staging.StagedID != staged.Staging.StagedID {
+		t.Fatalf("staging replay was not local and stable: calls=%d replay=%+v err=%v", stager.calls, replayed.Staging, err)
+	}
+}
+
+// Non-nil configured ports that count and reject every call distinguish a
+// terminal replay from fresh authoring with unavailable downstream providers.
+type t222UnitReplayTrap struct {
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (trap *t222UnitReplayTrap) called(port string) error {
+	trap.mu.Lock()
+	defer trap.mu.Unlock()
+	if trap.calls == nil {
+		trap.calls = map[string]int{}
+	}
+	trap.calls[port]++
+	return domain.ErrNotRunnable
+}
+
+func (trap *t222UnitReplayTrap) Generate(context.Context, domain.GenerationInput) (domain.AuthoringCandidateV1, error) {
+	return domain.AuthoringCandidateV1{}, trap.called("generator")
+}
+func (trap *t222UnitReplayTrap) DiscoverTargets(context.Context, []string) ([]domain.LearningTargetDescriptor, error) {
+	return nil, trap.called("target_discovery")
+}
+func (trap *t222UnitReplayTrap) ResolveExactTargets(context.Context, []domain.LearningTargetRef) error {
+	return trap.called("target_resolution")
+}
+func (trap *t222UnitReplayTrap) ListRuntimeProfiles(context.Context) ([]domain.RuntimeProfileDescriptor, error) {
+	return nil, trap.called("profiles")
+}
+func (trap *t222UnitReplayTrap) InspectContract(context.Context, json.RawMessage) (domain.ContractInspection, error) {
+	return domain.ContractInspection{}, trap.called("inspection")
+}
+func (trap *t222UnitReplayTrap) VerifyContract(context.Context, domain.VerificationRequestV1) (domain.VerificationReceiptV1, error) {
+	return domain.VerificationReceiptV1{}, trap.called("verification")
+}
+func (trap *t222UnitReplayTrap) CreateVerificationWorkspace(context.Context, domain.RuntimeProfileRef, domain.WorkspaceFixture, time.Duration) (domain.VerificationWorkspace, error) {
+	return domain.VerificationWorkspace{}, trap.called("workspace_create")
+}
+func (trap *t222UnitReplayTrap) DeleteVerificationWorkspace(context.Context, string) error {
+	return trap.called("workspace_delete")
+}
+func (trap *t222UnitReplayTrap) Stage(context.Context, string, domain.AuthoringArtifact) (domain.StagingReceiptV1, error) {
+	return domain.StagingReceiptV1{}, trap.called("stager")
+}
+
+func t222UnitJobBytes(t *testing.T, job domain.PlanningJob) []byte {
+	t.Helper()
+	result, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestT222StagedPlanAndProcessReplayPreserveCommittedResult(t *testing.T) {
+	task := validPreparedSourceTask()
+	for _, test := range []struct {
+		name          string
+		request       domain.PlanningRequestV1
+		priorFailures int
+	}{
+		{name: "v1", request: validRequest("named staged replay input")},
+		{name: "v2_attempt_five", request: validV2Request("named staged replay project", domain.SurfaceClassificationProject, "beginner"), priorFailures: 4},
+		{name: "prepared_source_v3", request: domain.PlanningRequestV1{Schema: domain.PlanningRequestSchemaV3, Mode: "private", Locale: "en", Source: domain.PlanningSource{Type: "github_repository", URL: task.Source.RepositoryURL}, PreparedSourceTask: &task}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			repository := memory.NewJobRepository()
+			generator := &generatorStub{candidate: validCandidate()}
+			stager := &stagerStub{}
+			seed := newTestPlanner(repository, generator, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+			seed.Stager = stager
+			key := "11111111-1111-4111-8111-111111111111"
+			if test.priorFailures > 0 {
+				normalized, requestHash, err := normalizePlanningRequest(test.request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				job, _, err := repository.Ensure(ctx, domain.PlanningJob{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", IdempotencyKey: key, RequestHash: requestHash, Request: normalized, Status: domain.JobStatusPlanned, CreatedAt: seed.now(), UpdatedAt: seed.now()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := 0; i < test.priorFailures; i++ {
+					token := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+					if _, err := repository.Claim(ctx, job.ID, token, seed.now(), time.Minute); err != nil {
+						t.Fatal(err)
+					}
+					if err := repository.SaveFailed(ctx, job.ID, token, "named_prior_failure", seed.now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			ready, _, err := seed.Plan(ctx, key, test.request)
+			if err != nil || ready.Status != domain.JobStatusReady || ready.Artifact == nil {
+				t.Fatalf("real Planner seed failed: status=%s err=%v", ready.Status, err)
+			}
+			staged, err := seed.Stage(ctx, ready.ID)
+			if err != nil || staged.Status != domain.JobStatusStaged || staged.Staging == nil || staged.Attempts != test.priorFailures+1 || generator.calls != 1 || stager.calls != 1 {
+				t.Fatalf("real Planner staging seed failed: status=%s attempts=%d generator=%d stager=%d err=%v", staged.Status, staged.Attempts, generator.calls, stager.calls, err)
+			}
+			before := t222UnitJobBytes(t, staged)
+			trap := &t222UnitReplayTrap{}
+			reconstructed := newTestPlanner(repository, trap, trap, trap, trap)
+			reconstructed.Profiles, reconstructed.Stager = trap, trap
+			reconstructed.Now = func() time.Time { return seed.now().Add(24 * time.Hour) }
+			replayed, created, err := reconstructed.Plan(ctx, staged.IdempotencyKey, staged.Request)
+			if err != nil || created || !bytes.Equal(t222UnitJobBytes(t, replayed), before) {
+				t.Errorf("Plan did not replay the complete stored STAGED result: status=%s created=%t err=%v", replayed.Status, created, err)
+			}
+			resumed, err := reconstructed.Process(ctx, staged.ID)
+			if err != nil || !bytes.Equal(t222UnitJobBytes(t, resumed), before) {
+				t.Errorf("Process did not replay the complete stored STAGED result: status=%s err=%v", resumed.Status, err)
+			}
+			stageReplay, err := reconstructed.Stage(ctx, staged.ID)
+			if err != nil || !bytes.Equal(t222UnitJobBytes(t, stageReplay), before) {
+				t.Errorf("existing Stage replay changed: status=%s err=%v", stageReplay.Status, err)
+			}
+			changed := staged.Request
+			changed.Locale = "en"
+			if staged.Request.Locale == "en" {
+				changed.Locale = "ru"
+			}
+			if _, _, err := reconstructed.Plan(ctx, key, changed); !errors.Is(err, domain.ErrConflict) {
+				t.Errorf("changed normalized request did not conflict: %v", err)
+			}
+			stored, err := repository.Get(ctx, staged.ID)
+			if err != nil || !bytes.Equal(t222UnitJobBytes(t, stored), before) {
+				t.Error("terminal replay changed artifact, staging receipt, attempts, lease or owner times")
+			}
+			if len(trap.calls) != 0 || generator.calls != 1 || stager.calls != 1 {
+				t.Errorf("terminal replay invoked downstream ports: %v seed generator=%d stager=%d", trap.calls, generator.calls, stager.calls)
+			}
+		})
+	}
+}
+
+func TestT222NonterminalLeaseCapAndFailedRetryRemainUnchanged(t *testing.T) {
+	for _, state := range []string{"held_lease", "attempt_cap"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			repository := memory.NewJobRepository()
+			request, hash, err := normalizePlanningRequest(validRequest("named nonterminal input"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			trap := &t222UnitReplayTrap{}
+			planner := newTestPlanner(repository, trap, trap, trap, trap)
+			planner.Profiles = trap
+			job, _, err := repository.Ensure(ctx, domain.PlanningJob{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", IdempotencyKey: "11111111-1111-4111-8111-111111111111", RequestHash: hash, Request: request, Status: domain.JobStatusPlanned, CreatedAt: planner.now(), UpdatedAt: planner.now()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := 1
+			want := domain.ErrLeaseHeld
+			if state == "attempt_cap" {
+				limit, want = 5, domain.ErrConflict
+			}
+			for i := 0; i < limit; i++ {
+				token := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+				if _, err := repository.Claim(ctx, job.ID, token, planner.now(), time.Hour); err != nil {
+					t.Fatal(err)
+				}
+				if state == "attempt_cap" {
+					if err := repository.SaveFailed(ctx, job.ID, token, "named_prior_failure", planner.now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			before, err := repository.Get(ctx, job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := planner.Process(ctx, job.ID); !errors.Is(err, want) {
+				t.Errorf("nonterminal protection changed: %v", err)
+			}
+			after, err := repository.Get(ctx, job.ID)
+			if err != nil || !bytes.Equal(t222UnitJobBytes(t, before), t222UnitJobBytes(t, after)) || len(trap.calls) != 0 {
+				t.Error("rejected nonterminal invocation changed state or invoked authoring")
+			}
+		})
+	}
+	t.Run("failed_retry", func(t *testing.T) {
+		repository := memory.NewJobRepository()
+		generator := &generatorStub{candidate: validCandidate(), err: domain.ErrNotRunnable}
+		planner := newTestPlanner(repository, generator, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+		key := "11111111-1111-4111-8111-111111111111"
+		failed, _, err := planner.Plan(context.Background(), key, validRequest("named retry input"))
+		if !errors.Is(err, domain.ErrNotRunnable) || failed.Status != domain.JobStatusFailed || failed.Attempts != 1 {
+			t.Fatalf("failed seed did not persist: status=%s attempts=%d err=%v", failed.Status, failed.Attempts, err)
+		}
+		generator.err = nil
+		retried, created, err := planner.Plan(context.Background(), key, failed.Request)
+		if err != nil || created || retried.ID != failed.ID || retried.Status != domain.JobStatusReady || retried.Attempts != 2 || generator.calls != 2 {
+			t.Fatalf("nonterminal failure retry changed: status=%s attempts=%d calls=%d err=%v", retried.Status, retried.Attempts, generator.calls, err)
+		}
+	})
+}
+
+func TestPlannerFailsClosedBeforeVerificationWhenCompetencyIsUnknown(t *testing.T) {
+	repository := memory.NewJobRepository()
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{err: domain.ErrNotFound}, validationStub{passed: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected target failure, got %v", err)
+	}
+	stored, getErr := repository.Get(context.Background(), job.ID)
+	if getErr == nil {
+		_ = stored
+	}
+	// Plan returns no partial artifact on failure; the durable job is found by idempotent replay.
+	replayed, _, replayErr := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(replayErr, domain.ErrNotFound) || replayed.Artifact != nil || len(workspaces.created) != 0 {
+		t.Fatalf("failure leaked artifact or provisioned workspace: job=%+v err=%v", replayed, replayErr)
+	}
+}
+
+func TestPlannerRejectsLearningTargetOutsideDiscoveredVocabulary(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Milestones[0].Steps[0].LearningRequirements[0].Target = domain.LearningTargetRef{Type: "capability", Key: "javascript.event-state", Version: "v1"}
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrNotRunnable) || job.FailureCode != "competency_resolution_failed" || len(workspaces.created) != 0 {
+		t.Fatalf("job=%+v workspaces=%v err=%v", job, workspaces.created, err)
+	}
+}
+
+func TestPlannerRejectsMalformedInspectionDigests(t *testing.T) {
+	repository := memory.NewJobRepository()
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{}, validationStub{passed: true, malformedDigests: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrNotRunnable) || job.FailureCode != "validation_capability_missing" || len(workspaces.created) != 0 {
+		t.Fatalf("job=%+v workspaces=%v err=%v", job, workspaces.created, err)
+	}
+}
+
+func TestPlannerRejectsReceiptMissingSubmittedNegativeFixture(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.PrivateEvaluation.Negatives = append(candidate.PrivateEvaluation.Negatives, domain.NamedFixture{ID: "broken-second", Workspace: candidate.PrivateEvaluation.Negatives[0].Workspace})
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true, omitLastCase: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrNotRunnable) || job.FailureCode != "executable_verification_rejected" || len(workspaces.created) != 4 || len(workspaces.deleted) != 4 {
+		t.Fatalf("job=%+v workspaces=%v/%v err=%v", job, workspaces.created, workspaces.deleted, err)
+	}
+}
+
+func TestVerificationReceiptDigestIsContentAddressed(t *testing.T) {
+	inspection := domain.ContractInspection{ContractDigest: verificationTestDigest("b"), CapabilitiesDigest: verificationTestDigest("c")}
+	expectedCases := []domain.VerificationCase{{ID: "starter", Kind: "starter"}, {ID: "reference", Kind: "reference"}, {ID: "negative", Kind: "negative"}}
+	receipt := domain.VerificationReceiptV1{
+		Schema: domain.VerificationReceiptSchemaV1, BlueprintDigest: verificationTestDigest("a"), RuntimeProfileDigest: verificationTestDigest("d"),
+		ContractDigest: inspection.ContractDigest, CapabilitiesDigest: inspection.CapabilitiesDigest, Passed: true,
+		Cases:      []domain.VerificationCaseResult{{ID: "starter", Kind: "starter", ResultDigest: verificationTestDigest("1")}, {ID: "reference", Kind: "reference", ExpectedPassed: true, ActualPassed: true, ResultDigest: verificationTestDigest("2")}, {ID: "negative", Kind: "negative", ResultDigest: verificationTestDigest("3")}},
+		VerifiedAt: time.Date(2026, 9, 1, 1, 0, 0, 0, time.UTC),
+	}
+	var err error
+	receipt.ReceiptDigest, err = verificationReceiptDigest(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validVerificationReceipt(receipt, receipt.BlueprintDigest, receipt.RuntimeProfileDigest, inspection, expectedCases) {
+		t.Fatal("valid content-addressed receipt was rejected")
+	}
+	receipt.ReceiptDigest = verificationTestDigest("f")
+	if validVerificationReceipt(receipt, receipt.BlueprintDigest, receipt.RuntimeProfileDigest, inspection, expectedCases) {
+		t.Fatal("receipt with forged digest was accepted")
+	}
+}
+
+func TestPlannerRejectsCandidateWithoutPracticeRequiredRole(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Scenario.Roles = nil
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrValidation) || job.FailureCode != "candidate_quality_gate_failed" || len(workspaces.created) != 0 {
+		t.Fatalf("job=%+v workspaces=%v err=%v", job, workspaces.created, err)
+	}
+}
+
+func TestPlannerRejectsPracticeInvalidLearningTargetPath(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Milestones[0].Steps[0].LearningRequirements[0].Target.Key = "javascript//dom-events"
+	workspaces := &workspaceStub{}
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, workspaces)
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrValidation) || job.FailureCode != "candidate_quality_gate_failed" || len(workspaces.created) != 0 {
+		t.Fatalf("job=%+v workspaces=%v err=%v", job, workspaces.created, err)
+	}
+}
+
+func TestPlannerCanonicalizesPracticeDigestFieldsBeforeReady(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Classification.Domains = []string{" Frontend "}
+	candidate.Blueprint.Classification.Stacks = []string{" HTML ", "CSS", "JavaScript"}
+	candidate.Blueprint.Scenario.Title = "  Крестики-нолики  "
+	candidate.Blueprint.Scenario.Roles = []string{" frontend_developer "}
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil || job.Artifact == nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	blueprint := job.Artifact.Candidate.Blueprint
+	if blueprint.Scenario.Title != "Крестики-нолики" || blueprint.Scenario.Roles[0] != "frontend_developer" || strings.Join(blueprint.Classification.Stacks, ",") != "html,css,javascript" {
+		t.Fatalf("candidate was not canonicalized: %+v", blueprint)
+	}
+	expectedDigest, digestErr := job.Artifact.Candidate.Digest()
+	if digestErr != nil || job.Artifact.CandidateDigest != expectedDigest {
+		t.Fatalf("candidate digest=%q want=%q err=%v", job.Artifact.CandidateDigest, expectedDigest, digestErr)
+	}
+}
+
+func TestCandidateDigestCanonicalizesEmbeddedJSONForDurableJSONBStorage(t *testing.T) {
+	first := validCandidate()
+	first.PrivateEvaluation.CodeStructure = json.RawMessage(`{"version":1,"kind":"workspace_contract","stages":[{"id":"browser","engine":"browser.runtime","mode":"final"}]}`)
+	second := first
+	second.PrivateEvaluation.CodeStructure = json.RawMessage("{ \"stages\" : [ { \"mode\": \"final\", \"engine\": \"browser.runtime\", \"id\": \"browser\" } ], \"kind\": \"workspace_contract\", \"version\": 1 }")
+	firstDigest, firstErr := first.Digest()
+	secondDigest, secondErr := second.Digest()
+	if firstErr != nil || secondErr != nil || firstDigest != secondDigest {
+		t.Fatalf("semantically equivalent embedded JSON changed candidate digest: first=%s second=%s errors=%v/%v", firstDigest, secondDigest, firstErr, secondErr)
+	}
+}
+
+func TestPlannerBuildsMachineReadableTechnicalTaskInOneGenerationPass(t *testing.T) {
+	repository := memory.NewJobRepository()
+	generator := &generatorStub{candidate: validCandidate()}
+	planner := newTestPlanner(repository, generator, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := planner.GetTechnicalTask(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 1 || task.Schema != domain.TechnicalTaskSchemaV1 || task.SchemaVersion != 1 || task.Goal == "" || len(task.StudentInstruction.Requirements) != 1 || len(task.ExpectedResult.Outcomes) != 1 || len(task.Concepts) != 1 || len(task.Steps) != 1 || task.Steps[0].Order != 1 || len(task.Verification) != 1 {
+		t.Fatalf("calls=%d task=%+v", generator.calls, task)
+	}
+}
+
+func TestPlannerTopologicallyOrdersForwardListedStepWithoutAnotherGenerationPass(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	first := &candidate.Blueprint.Milestones[0].Steps[0]
+	first.Dependencies = []string{"s-later"}
+	candidate.Blueprint.Milestones[0].Steps = append(candidate.Blueprint.Milestones[0].Steps, domain.Step{
+		ID: "s-later", Title: "Проверка", Objective: "Проверить результат", Deliverables: []string{"Проверенный результат"},
+		AcceptanceIDs: []string{"acc-board"}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 10,
+	})
+	generator := &generatorStub{candidate: candidate}
+	planner := newTestPlanner(repository, generator, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	task, err := planner.GetTechnicalTask(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 1 || len(task.Steps) != 2 || task.Steps[0].ID != "s-later" || task.Steps[1].ID != first.ID {
+		t.Fatalf("calls=%d steps=%+v", generator.calls, task.Steps)
+	}
+}
+
+func TestPlannerTopologicallyOrdersForwardListedMilestone(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Milestones[0].Dependencies = []string{"m-prerequisite"}
+	candidate.Blueprint.Milestones = append(candidate.Blueprint.Milestones, domain.Milestone{
+		ID: "m-prerequisite", Title: "Подготовка", Objective: "Подготовить основу", AcceptanceIDs: []string{"acc-board"},
+		Steps: []domain.Step{{
+			ID: "s-prerequisite", Title: "Подготовить основу", Objective: "Создать основу поля", Deliverables: []string{"Основа"},
+			AcceptanceIDs: []string{"acc-board"}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 10,
+		}},
+	})
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	task, err := planner.GetTechnicalTask(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(task.Steps) != 2 || task.Steps[0].ID != "s-prerequisite" || task.Steps[0].MilestoneOrder != 1 || task.Steps[1].ID != "s-board" || task.Steps[1].MilestoneOrder != 2 {
+		t.Fatalf("steps=%+v", task.Steps)
+	}
+}
+
+func TestPlannerAllowsIndependentMilestonesToInterleaveThroughStepDependencies(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Milestones[0].Steps = append(candidate.Blueprint.Milestones[0].Steps, domain.Step{
+		ID: "s-a2", Title: "Завершить первое направление", Objective: "Завершить первое направление", Dependencies: []string{"s-b1"}, Deliverables: []string{"Результат A2"},
+		AcceptanceIDs: []string{"acc-board"}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 10,
+	})
+	candidate.Blueprint.Milestones = append(candidate.Blueprint.Milestones, domain.Milestone{
+		ID: "m-second", Title: "Второе направление", Objective: "Выполнить независимое направление", AcceptanceIDs: []string{"acc-board"},
+		Steps: []domain.Step{
+			{ID: "s-b1", Title: "Начать второе направление", Objective: "Начать второе направление", Deliverables: []string{"Результат B1"}, AcceptanceIDs: []string{"acc-board"}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 10},
+			{ID: "s-b2", Title: "Завершить второе направление", Objective: "Завершить второе направление", Dependencies: []string{"s-board"}, Deliverables: []string{"Результат B2"}, AcceptanceIDs: []string{"acc-board"}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 10},
+		},
+	})
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	task, err := planner.GetTechnicalTask(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"s-board", "s-b1", "s-b2", "s-a2"}
+	for index, id := range want {
+		if task.Steps[index].ID != id || task.Steps[index].Order != index+1 {
+			t.Fatalf("steps=%+v", task.Steps)
+		}
+	}
+}
+
+func TestPlannerRejectsReferenceSolutionLeakedIntoStudentInstruction(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	solution := strings.Repeat("exact-reference-implementation;", 4)
+	candidate.Blueprint.Source.EducationalAdaptation = "Не показывать студенту: " + solution
+	candidate.PrivateEvaluation.Reference.Files[1].Content = solution
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrValidation) || job.FailureCode != "technical_task_quality_gate_failed" {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+}
+
+func TestPlannerRejectsShortReferenceSolutionLeakedIntoStudentInstruction(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	solution := "return 42"
+	candidate.Blueprint.Source.EducationalAdaptation = "Для решения используйте " + solution
+	candidate.PrivateEvaluation.Reference.Files[1].Content = solution
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if !errors.Is(err, domain.ErrValidation) || job.FailureCode != "technical_task_quality_gate_failed" {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+}
+
+func TestTechnicalTaskMissingDescriptionFallsBackToPublicRequirement(t *testing.T) {
+	repository := memory.NewJobRepository()
+	candidate := validCandidate()
+	candidate.Blueprint.Source.EducationalAdaptation = ""
+	candidate.Blueprint.Scenario.Goal = "Внутренняя педагогическая цель"
+	planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	task, err := planner.GetTechnicalTask(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.StudentInstruction.Description != candidate.Blueprint.Scenario.Requirements[0].Text || task.StudentInstruction.Description == candidate.Blueprint.Scenario.Goal {
+		t.Fatalf("unsafe legacy description fallback: %q", task.StudentInstruction.Description)
+	}
+}
+
+func TestTechnicalTaskProjectionSurvivesLegacyArtifactJSONRoundTrip(t *testing.T) {
+	repository := memory.NewJobRepository()
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil || job.Artifact == nil {
+		t.Fatalf("plan: job=%+v err=%v", job, err)
+	}
+	want, err := domain.BuildTechnicalTaskV1(job.Artifact.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := json.Marshal(job.Artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), "technical_task") {
+		t.Fatalf("derived task must not duplicate persisted blueprint: %s", persisted)
+	}
+	var restored domain.AuthoringArtifact
+	if err := json.Unmarshal(persisted, &restored); err != nil {
+		t.Fatal(err)
+	}
+	got, err := domain.BuildTechnicalTaskV1(restored.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, _ := json.Marshal(want)
+	gotJSON, _ := json.Marshal(got)
+	if string(wantJSON) != string(gotJSON) {
+		t.Fatalf("persistence round trip changed task:\n%s\n%s", wantJSON, gotJSON)
+	}
+}
+
+func TestLegacyV1ReadyArtifactRemainsReadableButCannotPublishWithoutVerifiedSurface(t *testing.T) {
+	repository := memory.NewJobRepository()
+	request, requestHash, err := normalizePlanningRequest(validRequest("legacy task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	job := domain.PlanningJob{
+		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", IdempotencyKey: "11111111-1111-4111-8111-111111111111",
+		RequestHash: requestHash, Request: request, Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, _, err := repository.Ensure(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	const token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	if _, err := repository.Claim(context.Background(), job.ID, token, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	candidate := validCandidate()
+	planner := newTestPlanner(repository, &generatorStub{}, &competencyStub{}, validationStub{}, &workspaceStub{})
+	planner.enforceProvenance(&candidate, job)
+	candidate.Blueprint.Classification.SurfaceClassification = ""
+	if err := repository.SaveReady(context.Background(), job.ID, token, domain.AuthoringArtifact{Candidate: candidate}, now); err != nil {
+		t.Fatal(err)
+	}
+	stager := &stagerStub{}
+	planner.Stager = stager
+	if _, err := planner.GetTechnicalTask(context.Background(), job.ID); err != nil {
+		t.Fatalf("legacy TechnicalTask projection: %v", err)
+	}
+	if _, err := planner.Stage(context.Background(), job.ID); !errors.Is(err, domain.ErrValidation) || stager.calls != 0 {
+		t.Fatalf("unverified legacy surface was staged: calls=%d err=%v", stager.calls, err)
+	}
+	stored, err := repository.Get(context.Background(), job.ID)
+	if err != nil || stored.Artifact.Candidate.Blueprint.Classification.SurfaceClassification != "" {
+		t.Fatalf("read projection mutated stored artifact: job=%+v err=%v", stored, err)
+	}
+}
+
+func TestTechnicalTaskProjectionDoesNotMutatePersistedCandidate(t *testing.T) {
+	repository := memory.NewJobRepository()
+	planner := newTestPlanner(repository, &generatorStub{candidate: validCandidate()}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	job, _, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("task"))
+	if err != nil || job.Artifact == nil {
+		t.Fatalf("plan: job=%+v err=%v", job, err)
+	}
+	candidate := job.Artifact.Candidate
+	candidate.Blueprint.Scenario.Title = "  Доска задач  "
+	before, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := domain.BuildTechnicalTaskV1(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("projection mutated source candidate:\n%s\n%s", before, after)
+	}
+	if task.StudentInstruction.Title != "Доска задач" {
+		t.Fatalf("projected title was not normalized: %q", task.StudentInstruction.Title)
+	}
+}
+
+type leaseObservingRepository struct {
+	domain.JobRepository
+	renewed chan struct{}
+	once    sync.Once
+}
+
+func (repository *leaseObservingRepository) RenewLease(ctx context.Context, id, token string, now time.Time, lease time.Duration) error {
+	err := repository.JobRepository.RenewLease(ctx, id, token, now, lease)
+	if err == nil {
+		repository.once.Do(func() { close(repository.renewed) })
+	}
+	return err
+}
+
+type blockingGenerator struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (generator blockingGenerator) Generate(ctx context.Context, _ domain.GenerationInput) (domain.AuthoringCandidateV1, error) {
+	close(generator.started)
+	select {
+	case <-ctx.Done():
+		return domain.AuthoringCandidateV1{}, ctx.Err()
+	case <-generator.release:
+		return validCandidate(), nil
+	}
+}
+
+func TestPlannerRenewsLeaseDuringLongRunningGeneration(t *testing.T) {
+	base := memory.NewJobRepository()
+	repository := &leaseObservingRepository{JobRepository: base, renewed: make(chan struct{})}
+	request, requestHash, err := normalizePlanningRequest(validRequest("long task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	now := time.Now().UTC()
+	if _, _, err := repository.Ensure(context.Background(), domain.PlanningJob{ID: jobID, IdempotencyKey: "11111111-1111-4111-8111-111111111111", RequestHash: requestHash, Request: request, Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	planner := newTestPlanner(repository, blockingGenerator{started: started, release: release}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+	planner.Now = nil
+	planner.LeaseDuration = 200 * time.Millisecond
+	planner.LeaseRenewInterval = 20 * time.Millisecond
+	result := make(chan error, 1)
+	go func() {
+		_, processErr := planner.Process(context.Background(), jobID)
+		result <- processErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("generation did not start")
+	}
+	select {
+	case <-repository.renewed:
+	case <-time.After(time.Second):
+		t.Fatal("lease was not renewed")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if _, err := base.Claim(context.Background(), jobID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", time.Now().UTC(), time.Second); !errors.Is(err, domain.ErrLeaseHeld) {
+		t.Fatalf("concurrent claim after original lease expiry: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("process: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("process did not finish")
+	}
+}
+
+func newTestPlanner(repository domain.JobRepository, generator domain.CandidateGenerator, competencies domain.CompetencyResolver, validation domain.ValidationAuthoringClient, workspaces domain.VerificationWorkspaceClient) Planner {
+	return Planner{Jobs: repository, Generator: generator, Competencies: competencies, Profiles: profileStub{}, Validation: validation, Workspaces: workspaces, Policy: domain.GenerationPolicy{PlannerVersion: "tz-planner-v1", GenerationPolicyVersion: "task-authoring-v1", TechnicalTaskSchema: domain.TechnicalTaskSchemaV1, PromptTemplateRef: "practice-task.authoring-candidate.v1@2", Tone: "supportive_direct", Methodology: "incremental_evidence_first", SkillRefs: []string{"task_analysis.v1", "step_decomposition.v1", "evaluation_design.v1"}}, Now: func() time.Time { return time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC) }}
+}
+func validRequest(manifest string) domain.PlanningRequestV1 {
+	return domain.PlanningRequestV1{Schema: domain.PlanningRequestSchemaV1, Mode: "private", Manifest: manifest, Locale: "ru", Source: domain.PlanningSource{Type: "user_intent"}}
+}
+
+func validV2Request(manifest, surface, difficulty string) domain.PlanningRequestV1 {
+	request := validRequest(manifest)
+	request.Schema = domain.PlanningRequestSchemaV2
+	request.Orchestration = &domain.AuthoringOrchestrationIntentV1{
+		Schema: domain.AuthoringOrchestrationIntentSchemaV1, Trigger: domain.AuthoringTriggerStudentProject,
+		CorrelationID: "99999999-9999-4999-8999-999999999999", SurfaceClassification: surface,
+		DesiredDifficultyLevel: difficulty,
+	}
+	return request
+}
+
+func copyOrchestrationIntent(input *domain.AuthoringOrchestrationIntentV1) *domain.AuthoringOrchestrationIntentV1 {
+	if input == nil {
+		return nil
+	}
+	copy := *input
+	return &copy
+}
+
+func validCandidate() domain.AuthoringCandidateV1 {
+	return domain.AuthoringCandidateV1{Schema: domain.AuthoringCandidateSchemaV1, Blueprint: domain.TaskBlueprintV1{
+		Schema: domain.TaskBlueprintSchemaV1, Identity: domain.BlueprintIdentity{FamilyKey: "tic-tac-toe", VariantKey: "html-css-js-beginner"}, Classification: domain.Classification{TaskType: "BUILD", SurfaceClassification: domain.SurfaceClassificationPractice, Domains: []string{"frontend"}, Stacks: []string{"html", "css", "javascript"}, Topology: "frontend"}, Difficulty: domain.Difficulty{Implementation: 2, Algorithms: 2, Architecture: 1, Debugging: 2, Ambiguity: 1, Autonomy: 2, DerivedLevel: "beginner"},
+		Scenario:   domain.Scenario{Title: "Крестики-нолики", Goal: "Создать интерактивную игру", Roles: []string{"frontend_developer"}, Requirements: []domain.Requirement{{ID: "req-board", Text: "Поле содержит девять игровых клеток"}}, NonGoals: []string{"Сетевой multiplayer"}},
+		Acceptance: []domain.AcceptanceCriterion{{ID: "acc-board", Text: "На поле ровно девять клеток", EvidenceKind: "deterministic"}},
+		Milestones: []domain.Milestone{{ID: "m-board", Title: "Игровое поле", Objective: "Показать поле", AcceptanceIDs: []string{"acc-board"}, Steps: []domain.Step{{ID: "s-board", Title: "Разметка поля", Objective: "Создать поле 3x3", Deliverables: []string{"index.html"}, AcceptanceIDs: []string{"acc-board"}, LearningRequirements: []domain.LearningRequirement{{ID: "learn-dom", Target: domain.LearningTargetRef{Type: "capability", Key: "javascript.dom-events", Version: "v1"}, Policy: "required", MasteryThreshold: .7}}, ValidationRequirementIDs: []string{"check-board"}, EstimatedEffortMinutes: 30}}}},
+		Runtime: domain.RuntimeSpec{CodeStructureTypeCode: "HTML_BASIC_DOCUMENT", ProfileRef: testRuntimeRef, StarterWorkspace: domain.StarterWorkspace{
+			Files:         []domain.WorkspaceFile{{Path: "index.html", Content: "<main id=board></main>"}, {Path: "app.js", Content: ""}},
+			ReadOnlyFiles: []string{}, EditableFiles: []string{"index.html", "app.js"}, Entrypoints: []string{"index.html"},
+			PreviewConfig: map[string]any{}, Meta: map[string]any{},
+		}},
+		Evaluation:       domain.EvaluationSpec{Validator: domain.ValidatorSpec{Version: 1, Checks: []domain.ValidatorCheck{{ID: "check-board", Kind: "browser_behavior", Visibility: "private", AcceptanceIDs: []string{"acc-board"}}}}, Review: domain.ReviewPolicy{Version: 2, DeterministicRequired: true, AI: domain.ReviewMode{Mode: "optional"}, Human: domain.ReviewMode{Mode: "on_uncertain"}}},
+		AssistancePolicy: domain.AssistancePolicy{Version: 1, MaxHintLevel: 3, Teacher: domain.TeacherPolicy{MayExplain: true}, Debugging: domain.DebuggingPolicy{MayPointToArea: true}}, Traceability: []domain.TraceabilityLink{{RequirementID: "req-board", AcceptanceIDs: []string{"acc-board"}, ValidatorCheckIDs: []string{"check-board"}, LearningRequirementIDs: []string{"learn-dom"}}},
+		Source: domain.SourceProvenance{SourceType: "user_intent", OriginalManifestHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, Generation: domain.GenerationMetadata{PlannerVersion: "x", GenerationPolicyVersion: "x", Method: "model", Tone: "x", Methodology: "x", SkillRefs: []string{"x"}, PromptTemplateRef: "x", ModelProvider: "test", ModelID: "test", GenerationJobID: "x", InputDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}, PrivateEvaluation: domain.PrivateEvaluationBundle{CodeStructure: json.RawMessage(`{"version":1,"kind":"workspace_contract","stages":[{"id":"browser","engine":"browser.runtime","mode":"final"}]}`), Reference: domain.WorkspaceFixture{Files: []domain.WorkspaceFile{{Path: "index.html", Content: "<main id=board><button></button></main>"}, {Path: "app.js", Content: "play()"}}}, Negatives: []domain.NamedFixture{{ID: "broken", Workspace: domain.WorkspaceFixture{Files: []domain.WorkspaceFile{{Path: "index.html", Content: "<main></main>"}, {Path: "app.js", Content: ""}}}}}}}
+}

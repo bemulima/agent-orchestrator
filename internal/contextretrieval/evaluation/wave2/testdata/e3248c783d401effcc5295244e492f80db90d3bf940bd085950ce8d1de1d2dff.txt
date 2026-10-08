@@ -1,0 +1,335 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type validationRepositoryFake struct {
+	ports.Repository
+	instance      domain.TaskInstance
+	submission    domain.Submission
+	intent        domain.SubmitIntent
+	runStarted    bool
+	completed     bool
+	enqueued      bool
+	retryCreated  bool
+	evidence      json.RawMessage
+	finalInstance domain.TaskInstance
+}
+
+func (repository *validationRepositoryFake) GetInstanceByID(_ context.Context, id string) (domain.TaskInstance, error) {
+	if id != repository.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return repository.instance, nil
+}
+func (repository *validationRepositoryFake) GetSubmission(_ context.Context, taskInstanceID, submissionID string) (domain.Submission, error) {
+	if taskInstanceID != repository.submission.TaskInstanceID || submissionID != repository.submission.ID {
+		return domain.Submission{}, domain.ErrNotFound
+	}
+	return repository.submission, nil
+}
+func (repository *validationRepositoryFake) GetValidationContextByRunID(_ context.Context, runID string) (domain.TaskInstance, domain.Submission, error) {
+	for _, run := range repository.submission.ValidationRuns {
+		if run.ID == runID {
+			return repository.instance, repository.submission, nil
+		}
+	}
+	return domain.TaskInstance{}, domain.Submission{}, domain.ErrNotFound
+}
+func (repository *validationRepositoryFake) GetIntent(_ context.Context, _, _ string) (domain.SubmitIntent, error) {
+	return repository.intent, nil
+}
+func (repository *validationRepositoryFake) SetRunRunning(context.Context, string, time.Time) error {
+	repository.runStarted = true
+	return nil
+}
+func (repository *validationRepositoryFake) CompleteValidation(_ context.Context, submission domain.Submission, _ domain.ValidationRun, instance domain.TaskInstance) error {
+	repository.completed = true
+	repository.submission, repository.instance = submission, instance
+	return nil
+}
+func (repository *validationRepositoryFake) CompleteInstanceAndEnqueueEvidence(_ context.Context, instance domain.TaskInstance, submission domain.Submission, payload json.RawMessage) error {
+	repository.enqueued = true
+	repository.finalInstance, repository.submission, repository.evidence = instance, submission, payload
+	return nil
+}
+func (repository *validationRepositoryFake) CreateValidationRetry(_ context.Context, submission domain.Submission, _ domain.ValidationRun) error {
+	repository.retryCreated = true
+	repository.submission = submission
+	return nil
+}
+
+type validationWorkspaceFake struct {
+	locks   []ports.LockWorkspaceWrites
+	unlocks []ports.UnlockWorkspaceWrites
+}
+
+func (workspace *validationWorkspaceFake) CreateOrResumeWorkspace(context.Context, ports.CreateWorkspace) (domain.WorkspaceBinding, error) {
+	panic("not used")
+}
+func (workspace *validationWorkspaceFake) FreezeSnapshot(context.Context, ports.FreezeSnapshot) (domain.SnapshotRef, error) {
+	panic("not used")
+}
+func (workspace *validationWorkspaceFake) ReadPinnedSnapshot(context.Context, domain.SnapshotRef) (ports.WorkspaceSnapshot, error) {
+	panic("not used")
+}
+func (workspace *validationWorkspaceFake) LockWrites(_ context.Context, input ports.LockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	workspace.locks = append(workspace.locks, input)
+	return ports.WorkspaceWriteLock{LockID: "permanent-lock", FenceEpoch: 9, Permanent: input.Mode == "PERMANENT"}, nil
+}
+func (workspace *validationWorkspaceFake) UnlockWrites(_ context.Context, input ports.UnlockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	workspace.unlocks = append(workspace.unlocks, input)
+	return ports.WorkspaceWriteLock{LockID: input.LockID, FenceEpoch: 8}, nil
+}
+func (workspace *validationWorkspaceFake) RestoreWorkspace(context.Context, ports.RestoreWorkspace) (domain.WorkspaceBinding, error) {
+	panic("not used")
+}
+
+type validationPortFake struct {
+	result domain.ValidationResult
+	err    error
+}
+
+type validationSequenceFake struct {
+	requests []ports.OfficialValidationRequest
+	failNext bool
+}
+
+func (validator *validationSequenceFake) ValidateOfficialSubmission(_ context.Context, input ports.OfficialValidationRequest) (domain.ValidationResult, error) {
+	validator.requests = append(validator.requests, input)
+	if validator.failNext {
+		validator.failNext = false
+		return domain.ValidationResult{}, context.DeadlineExceeded
+	}
+	return validationResultForIdentity(input), nil
+}
+
+func (validator validationPortFake) ValidateOfficialSubmission(context.Context, ports.OfficialValidationRequest) (domain.ValidationResult, error) {
+	return validator.result, validator.err
+}
+
+func TestMismatchedValidationEchoBecomesErrorAndKeepsFence(t *testing.T) {
+	instance, submission, pending := validationFixtures()
+	repository := &validationRepositoryFake{instance: instance, submission: submission, intent: domain.SubmitIntent{WriteLockID: "temporary-lock", FenceEpoch: 7}}
+	workspace := &validationWorkspaceFake{}
+	result := validationResultFor(instance, submission, pending.RunID)
+	result.SubmissionID = "00000000-0000-4000-8000-000000000099"
+	runtime := Runtime{Repository: repository, Workspace: workspace, Validator: validationPortFake{result: result}, Now: func() time.Time { return time.Date(2026, 10, 2, 2, 0, 0, 0, time.UTC) }}
+	if err := runtime.ProcessValidation(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if !repository.runStarted || !repository.completed || repository.submission.ValidationRuns[0].Status != domain.ValidationRunError ||
+		repository.submission.ValidationRuns[0].ErrorClassification != ClassificationProtocol || len(workspace.unlocks) != 0 {
+		t.Fatalf("mismatched validator response did not fail closed: repository=%+v workspace=%+v", repository, workspace)
+	}
+}
+
+func TestValidationErrorRetryUsesSamePinnedSnapshotAndNeverCreatesFailureEvidence(t *testing.T) {
+	instance, submission, pending := validationFixtures()
+	instance.Steps[0].Status = "AVAILABLE"
+	repository := &validationRepositoryFake{instance: instance, submission: submission, intent: domain.SubmitIntent{WriteLockID: "temporary-lock", FenceEpoch: 7}}
+	workspace := &validationWorkspaceFake{}
+	validator := &validationSequenceFake{failNext: true}
+	runtime := Runtime{Repository: repository, Workspace: workspace, Validator: validator,
+		NewID: func() string { return "00000000-0000-4000-8000-000000000021" },
+		Now:   func() time.Time { return time.Date(2026, 10, 2, 2, 0, 0, 0, time.UTC) }}
+	if err := runtime.ProcessValidation(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if repository.submission.Status != domain.SubmissionValidating || repository.instance.Status != domain.TaskInstanceValidating ||
+		repository.submission.ValidationRuns[0].Status != domain.ValidationRunError || repository.enqueued || len(repository.evidence) != 0 || len(workspace.unlocks) != 0 {
+		t.Fatalf("technical ERROR changed learner result or emitted evidence: submission=%+v instance=%+v", repository.submission, repository.instance)
+	}
+	firstSnapshot := repository.submission.Snapshot
+	if firstSnapshot != submission.Snapshot {
+		t.Fatalf("first run snapshot = %+v, want pinned S1 %+v", firstSnapshot, submission.Snapshot)
+	}
+	if _, err := runtime.RetryValidation(context.Background(), pending.RunID); err != nil {
+		t.Fatalf("retry same Submission after ERROR: %v", err)
+	}
+	newRunID := repository.submission.ValidationRuns[1].ID
+	newPending := pending
+	newPending.RunID = newRunID
+	if err := runtime.ProcessValidation(context.Background(), newPending); err != nil {
+		t.Fatal(err)
+	}
+	if len(validator.requests) != 2 || validator.requests[0].Snapshot != firstSnapshot || validator.requests[1].Snapshot != firstSnapshot ||
+		validator.requests[0].Snapshot.WorkspaceDigest != validator.requests[1].Snapshot.WorkspaceDigest ||
+		validator.requests[0].ValidationRunID == validator.requests[1].ValidationRunID {
+		t.Fatalf("validation retry did not retain immutable S1: %+v", validator.requests)
+	}
+	if repository.submission.ValidationRuns[0].Status != domain.ValidationRunError || repository.submission.ValidationRuns[1].Status != domain.ValidationRunPassed ||
+		repository.submission.ID != submission.ID || repository.instance.Status != domain.TaskInstanceInProgress {
+		t.Fatalf("retry did not preserve one Submission and produce a successful later run: %+v %+v", repository.submission, repository.instance)
+	}
+}
+
+func TestFinalPassCompletesAndEnqueuesDeterministicEvidenceAfterPermanentFence(t *testing.T) {
+	instance, submission, pending := validationFixtures()
+	instance.Status = domain.TaskInstanceValidating
+	instance.CurrentSubmissionID = submission.ID
+	instance.Steps[0].Status = "PASSED"
+	instance.AssistancePolicyVersion = AssistancePolicyVersion
+	submission.Scope, submission.Status = "FINAL", domain.SubmissionValidating
+	submission.ValidationRuns[0].Status = domain.ValidationRunPending
+	submission.RequiresHumanReview = false
+	repository := &validationRepositoryFake{instance: instance, submission: submission,
+		intent: domain.SubmitIntent{WriteLockID: "temporary-lock", FenceEpoch: 7}}
+	workspace := &validationWorkspaceFake{}
+	result := validationResultFor(instance, submission, pending.RunID)
+	result.Outcome = domain.OutcomePass
+	runtime := Runtime{Repository: repository, Workspace: workspace, Validator: validationPortFake{result: result}, Now: func() time.Time { return time.Date(2026, 10, 2, 2, 0, 0, 0, time.UTC) }}
+	if err := runtime.ProcessValidation(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(workspace.locks) != 1 || workspace.locks[0].Mode != "PERMANENT" || repository.completed || !repository.enqueued || repository.finalInstance.Status != domain.TaskInstanceCompleted {
+		t.Fatalf("final PASS did not complete behind permanent lock: workspace=%+v repository=%+v", workspace, repository)
+	}
+	var payload struct {
+		Schema             string                 `json:"schema"`
+		Evidence           []ports.TargetEvidence `json:"evidence"`
+		Outcome            string                 `json:"outcome"`
+		Policy             string                 `json:"policy_version"`
+		EvidenceID         string                 `json:"evidence_id"`
+		LearningActionID   string                 `json:"learning_action_id"`
+		TaskRevisionDigest string                 `json:"task_revision_digest"`
+		WorkspaceDigest    string                 `json:"workspace_digest"`
+	}
+	if err := json.Unmarshal(repository.evidence, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Schema != EvidenceSchemaV2 || payload.Outcome != "passed" || payload.Policy != EvidencePolicyV2 || payload.EvidenceID != submission.ID ||
+		payload.LearningActionID != instance.LearningActionID || payload.TaskRevisionDigest != instance.TaskRevisionDigest || payload.WorkspaceDigest != submission.WorkspaceDigest ||
+		len(payload.Evidence) != 1 || payload.Evidence[0].Correctness != 1 || payload.Evidence[0].Confidence != 1 || payload.Evidence[0].Independence != 1 {
+		t.Fatalf("unexpected Student evidence payload: %+v", payload)
+	}
+}
+
+func TestRetryValidationRequiresPathRunToBeLatestErroredRun(t *testing.T) {
+	instance, submission, pending := validationFixtures()
+	submission.ValidationRuns[0].Status = domain.ValidationRunError
+	olderRunID := "00000000-0000-4000-8000-000000000098"
+	submission.ValidationRuns = append([]domain.ValidationRun{{ID: olderRunID, Status: domain.ValidationRunError}}, submission.ValidationRuns...)
+	repository := &validationRepositoryFake{instance: instance, submission: submission}
+	runtime := Runtime{Repository: repository, NewID: func() string { return "00000000-0000-4000-8000-000000000021" }}
+	if _, err := runtime.RetryValidation(context.Background(), olderRunID); err == nil || repository.retryCreated {
+		t.Fatal("retry accepted a path run ID that is not the latest errored run")
+	}
+	if _, err := runtime.RetryValidation(context.Background(), pending.RunID); err != nil || !repository.retryCreated {
+		t.Fatalf("retry rejected the latest errored run: %v", err)
+	}
+}
+
+func validationFixtures() (domain.TaskInstance, domain.Submission, ports.PendingValidation) {
+	instanceID := "00000000-0000-4000-8000-000000000002"
+	studentID := "00000000-0000-4000-8000-000000000001"
+	submissionID := "00000000-0000-4000-8000-000000000010"
+	runID := "00000000-0000-4000-8000-000000000011"
+	instance := domain.TaskInstance{ID: instanceID, StudentID: studentID, TaskRevisionID: "00000000-0000-4000-8000-000000000003",
+		TaskRevisionDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", LearningActionID: "00000000-0000-4000-8000-000000000004",
+		Status: domain.TaskInstanceValidating, CurrentSubmissionID: submissionID, WorkspaceBinding: domain.WorkspaceBinding{SandboxID: "sandbox-1"},
+		Steps: []domain.Step{{ID: "00000000-0000-4000-8000-000000000005", Required: true, Status: "PASSED", Targets: []domain.Target{{Type: "concept", Key: "go.errors", Version: "v1"}}}}}
+	submission := domain.Submission{ID: submissionID, TaskInstanceID: instanceID, StudentID: studentID, Scope: "MILESTONE", Status: domain.SubmissionValidating,
+		MilestoneID: instance.Steps[0].ID, Snapshot: domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: "snapshot-1", GenerationID: "generation-1", WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RevisionDigest: instance.TaskRevisionDigest,
+		ValidationContractDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", ValidationSpecification: json.RawMessage(`{"schema":"practice-validation-specification.v1"}`),
+		IdempotencyKey: "00000000-0000-4000-8000-000000000012", ValidationRuns: []domain.ValidationRun{{ID: runID, Status: domain.ValidationRunPending}}}
+	return instance, submission, ports.PendingValidation{TaskInstanceID: instanceID, StudentID: studentID, SubmissionID: submissionID, RunID: runID}
+}
+
+func validationResultFor(instance domain.TaskInstance, submission domain.Submission, runID string) domain.ValidationResult {
+	return domain.ValidationResult{TaskInstanceID: instance.ID, SubmissionID: submission.ID, ValidationRunID: runID,
+		RevisionDigest: instance.TaskRevisionDigest, ValidationContractDigest: submission.ValidationContractDigest,
+		Snapshot: submission.Snapshot, Outcome: domain.OutcomePass}
+}
+
+func validationResultForIdentity(input ports.OfficialValidationRequest) domain.ValidationResult {
+	return domain.ValidationResult{TaskInstanceID: input.TaskInstanceID, SubmissionID: input.SubmissionID, ValidationRunID: input.ValidationRunID,
+		RevisionDigest: input.RevisionDigest, ValidationContractDigest: input.ValidationContractDigest,
+		Snapshot: input.Snapshot, Outcome: domain.OutcomePass}
+}
+
+// TestT12OfficialStagesSurvivePersistence uses the existing result API and a
+// JSON reconstruction to reproduce lost provider stages before production edits.
+func TestT12OfficialStagesSurvivePersistence(t *testing.T) {
+	instance, submission, pending := validationFixtures()
+	repository := &validationRepositoryFake{instance: instance, submission: submission, intent: domain.SubmitIntent{WriteLockID: "temporary-lock", FenceEpoch: 7}}
+	result := validationResultFor(instance, submission, pending.RunID)
+	result.Outcome = domain.OutcomeFail
+	result.Stages = []domain.ValidationStage{{StageID: "html-structure", Required: true, Outcome: "FAIL", Issues: []domain.ValidationIssue{{Code: "MISSING_ELEMENT", Message: "PRIVATE_EVALUATION_CANARY"}}}}
+	runtime := Runtime{Repository: repository, Workspace: &validationWorkspaceFake{}, Validator: validationPortFake{result: result}}
+	if err := runtime.ProcessValidation(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(repository.submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reloaded domain.Submission
+	if err := json.Unmarshal(encoded, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	public, err := json.Marshal(reloaded.PublicProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected struct {
+		Current *struct {
+			RunID  string                   `json:"validation_run_id"`
+			Stages []domain.ValidationStage `json:"stages"`
+		} `json:"current_validation_summary"`
+	}
+	if err := json.Unmarshal(public, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.Current == nil || projected.Current.RunID != pending.RunID || len(projected.Current.Stages) != 1 {
+		t.Fatalf("official FAIL stages discarded after reconstruction: %s", public)
+	}
+	if projected.Current.Stages[0].Issues[0].Message == "PRIVATE_EVALUATION_CANARY" {
+		t.Fatal("raw validator message exposed")
+	}
+}
+
+func TestT12ValidationUnknownClassAndWrongIdentityDiscardProviderDetails(t *testing.T) {
+	for _, mode := range []string{"unknown error class", "class on pass", "wrong snapshot", "provider error"} {
+		t.Run(mode, func(t *testing.T) {
+			instance, submission, pending := validationFixtures()
+			repository := &validationRepositoryFake{instance: instance, submission: submission}
+			result := validationResultFor(instance, submission, pending.RunID)
+			result.Stages = []domain.ValidationStage{{StageID: "html", Required: true, Outcome: "FAIL", Issues: []domain.ValidationIssue{{Code: "MISSING", Message: "PRIVATE_CANARY"}}}}
+			validator := validationPortFake{result: result}
+			switch mode {
+			case "unknown error class":
+				validator.result.Outcome = domain.OutcomeError
+				validator.result.ErrorClassification = "PRIVATE_CANARY"
+			case "class on pass":
+				validator.result.ErrorClassification = "PRIVATE_CANARY"
+			case "wrong snapshot":
+				validator.result.Snapshot.SnapshotID = "foreign-snapshot"
+			case "provider error":
+				validator.err = fmt.Errorf("PRIVATE_CANARY validator output")
+			}
+			runtime := Runtime{Repository: repository, Validator: validator}
+			if err := runtime.ProcessValidation(context.Background(), pending); err != nil {
+				t.Fatal(err)
+			}
+			run := repository.submission.ValidationRuns[0]
+			if run.Outcome != domain.OutcomeError || run.SafeSummary == nil || len(run.SafeSummary.Stages) != 0 || run.SafeSummary.ErrorClassification == nil || *run.SafeSummary.ErrorClassification != run.ErrorClassification {
+				t.Fatalf("invalid provider result was accepted: %+v", run)
+			}
+			encoded, _ := json.Marshal(repository.submission)
+			if strings.Contains(string(encoded), "PRIVATE_CANARY") || strings.Contains(string(encoded), "foreign-snapshot") {
+				t.Fatalf("untrusted result details were retained: %s", encoded)
+			}
+		})
+	}
+}

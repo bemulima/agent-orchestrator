@@ -1,0 +1,120 @@
+BEGIN;
+
+ALTER TABLE planner_outbox DROP CONSTRAINT planner_outbox_subject_check;
+ALTER TABLE planner_outbox ADD CONSTRAINT planner_outbox_subject_check
+CHECK (subject IN ('course.plan.completed', 'course.plan.failed', 'planner.onboarding-path.outcome.v1'));
+
+CREATE TABLE onboarding_path_execution (
+    execution_id uuid PRIMARY KEY,
+    handoff_id uuid NOT NULL UNIQUE REFERENCES teacher_onboarding_plan_handoff(handoff_id),
+    request_hash char(64) NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+    status varchar(24) NOT NULL CHECK (status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN','PATH_READY','ACTIVE_PATH_EXISTS','STATE_CHANGED','FAILED')),
+    snapshot_json jsonb,
+    snapshot_hash char(64),
+    generated_course_json jsonb,
+    generated_course_hash char(64),
+    course_id uuid,
+    course_reused boolean,
+    course_lesson_bindings_json jsonb,
+    admission_id uuid,
+    admission_fence bigint,
+    admission_expires_at timestamptz,
+    reserve_key uuid NOT NULL UNIQUE,
+    student_command_id uuid NOT NULL UNIQUE,
+    student_command_hash char(64),
+    learning_path_id uuid,
+    first_lesson_id uuid,
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    claim_token uuid,
+    lease_until timestamptz,
+    next_attempt_at timestamptz NOT NULL,
+    failure_code varchar(64) NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    completed_at timestamptz,
+    CHECK ((snapshot_json IS NULL) = (snapshot_hash IS NULL)),
+    CHECK ((generated_course_json IS NULL) = (generated_course_hash IS NULL)),
+    CHECK ((course_id IS NULL) = (course_reused IS NULL)),
+    CHECK ((course_id IS NULL) = (course_lesson_bindings_json IS NULL)),
+    CHECK ((admission_id IS NULL) = (admission_fence IS NULL)),
+    CHECK ((admission_id IS NULL) = (admission_expires_at IS NULL)),
+    CHECK ((status <> 'PATH_READY') OR (course_id IS NOT NULL AND learning_path_id IS NOT NULL AND first_lesson_id IS NOT NULL AND completed_at IS NOT NULL)),
+    CHECK ((status NOT IN ('ACTIVE_PATH_EXISTS','STATE_CHANGED','FAILED')) OR (completed_at IS NOT NULL)),
+    CHECK ((status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN')) OR (claim_token IS NULL AND lease_until IS NULL)),
+    CHECK (updated_at >= created_at)
+);
+
+CREATE INDEX onboarding_path_execution_claim_idx ON onboarding_path_execution(status, next_attempt_at, created_at)
+WHERE status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN');
+
+CREATE TABLE onboarding_path_execution_lesson_content (
+    execution_id uuid NOT NULL REFERENCES onboarding_path_execution(execution_id),
+    lesson_index integer NOT NULL CHECK (lesson_index >= 0),
+    module_code varchar(64) NOT NULL,
+    section_code varchar(64) NOT NULL,
+    lesson_code varchar(64) NOT NULL,
+    ai_idempotency_key uuid NOT NULL,
+    content_json jsonb NOT NULL,
+    content_hash char(64) NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+    created_at timestamptz NOT NULL,
+    PRIMARY KEY (execution_id, lesson_index),
+    UNIQUE (execution_id, ai_idempotency_key)
+);
+
+CREATE OR REPLACE FUNCTION protect_onboarding_path_execution() RETURNS trigger AS $$
+BEGIN
+  IF OLD.execution_id<>NEW.execution_id OR OLD.handoff_id<>NEW.handoff_id OR OLD.request_hash<>NEW.request_hash OR OLD.student_command_id<>NEW.student_command_id OR OLD.reserve_key<>NEW.reserve_key THEN
+    RAISE EXCEPTION 'onboarding path execution identity is immutable';
+  END IF;
+  IF OLD.admission_id IS NOT NULL AND NEW.admission_id IS DISTINCT FROM OLD.admission_id THEN
+    RAISE EXCEPTION 'onboarding path execution admission is write-once';
+  END IF;
+  IF OLD.admission_fence IS NOT NULL AND (NEW.admission_fence < OLD.admission_fence OR NEW.admission_expires_at IS NULL) THEN
+    RAISE EXCEPTION 'onboarding path execution admission fence is monotonic';
+  END IF;
+  IF OLD.snapshot_json IS NOT NULL AND (NEW.snapshot_json IS DISTINCT FROM OLD.snapshot_json OR NEW.snapshot_hash IS DISTINCT FROM OLD.snapshot_hash) THEN
+    RAISE EXCEPTION 'onboarding path execution snapshot is write-once';
+  END IF;
+  IF OLD.generated_course_json IS NOT NULL AND (NEW.generated_course_json IS DISTINCT FROM OLD.generated_course_json OR NEW.generated_course_hash IS DISTINCT FROM OLD.generated_course_hash) THEN
+    RAISE EXCEPTION 'onboarding path execution course is write-once';
+  END IF;
+  IF OLD.course_id IS NOT NULL AND (NEW.course_id IS DISTINCT FROM OLD.course_id OR NEW.course_reused IS DISTINCT FROM OLD.course_reused) THEN
+    RAISE EXCEPTION 'onboarding path execution Course receipt is write-once';
+  END IF;
+  IF OLD.course_lesson_bindings_json IS NOT NULL AND NEW.course_lesson_bindings_json IS DISTINCT FROM OLD.course_lesson_bindings_json THEN
+    RAISE EXCEPTION 'onboarding path execution Course bindings are write-once';
+  END IF;
+  IF OLD.learning_path_id IS NOT NULL AND (NEW.learning_path_id IS DISTINCT FROM OLD.learning_path_id OR NEW.first_lesson_id IS DISTINCT FROM OLD.first_lesson_id) THEN
+    RAISE EXCEPTION 'onboarding path execution Student receipt is write-once';
+  END IF;
+  IF OLD.completed_at IS NOT NULL THEN RAISE EXCEPTION 'onboarding path execution is terminal'; END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_protect_onboarding_path_execution BEFORE UPDATE ON onboarding_path_execution FOR EACH ROW EXECUTE FUNCTION protect_onboarding_path_execution();
+
+CREATE OR REPLACE FUNCTION prevent_onboarding_path_execution_delete() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'onboarding path execution evidence is immutable';
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_prevent_onboarding_path_execution_delete BEFORE DELETE ON onboarding_path_execution FOR EACH ROW EXECUTE FUNCTION prevent_onboarding_path_execution_delete();
+
+CREATE OR REPLACE FUNCTION prevent_onboarding_path_execution_truncate() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'onboarding path execution evidence is immutable';
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_prevent_onboarding_path_execution_truncate BEFORE TRUNCATE ON onboarding_path_execution FOR EACH STATEMENT EXECUTE FUNCTION prevent_onboarding_path_execution_truncate();
+
+CREATE OR REPLACE FUNCTION protect_onboarding_path_execution_lesson_content() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP='DELETE' THEN RAISE EXCEPTION 'onboarding path lesson content evidence is immutable'; END IF;
+  IF OLD.execution_id IS DISTINCT FROM NEW.execution_id OR OLD.lesson_index IS DISTINCT FROM NEW.lesson_index OR OLD.module_code IS DISTINCT FROM NEW.module_code OR OLD.section_code IS DISTINCT FROM NEW.section_code OR OLD.lesson_code IS DISTINCT FROM NEW.lesson_code OR OLD.ai_idempotency_key IS DISTINCT FROM NEW.ai_idempotency_key OR OLD.content_json IS DISTINCT FROM NEW.content_json OR OLD.content_hash IS DISTINCT FROM NEW.content_hash OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
+    RAISE EXCEPTION 'onboarding path lesson content evidence is immutable';
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_protect_onboarding_path_execution_lesson_content BEFORE UPDATE OR DELETE ON onboarding_path_execution_lesson_content FOR EACH ROW EXECUTE FUNCTION protect_onboarding_path_execution_lesson_content();
+CREATE OR REPLACE FUNCTION prevent_onboarding_path_execution_lesson_content_truncate() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'onboarding path lesson content evidence is immutable'; END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_prevent_onboarding_path_execution_lesson_content_truncate BEFORE TRUNCATE ON onboarding_path_execution_lesson_content FOR EACH STATEMENT EXECUTE FUNCTION prevent_onboarding_path_execution_lesson_content_truncate();
+
+COMMIT;

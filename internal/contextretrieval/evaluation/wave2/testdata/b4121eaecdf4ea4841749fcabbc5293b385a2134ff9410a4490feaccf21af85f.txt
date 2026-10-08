@@ -1,0 +1,77 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/config"
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/aiprompt"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/competency"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/practice"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/runtimecatalog"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/sandbox"
+	validationclient "github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/validation"
+	postgresrepo "github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/postgres"
+	httptransport "github.com/bemulima/ms-go-tz-planner/internal/transport/http"
+	"github.com/bemulima/ms-go-tz-planner/internal/usecase"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const authoringHTTPWriteTimeout = 20 * time.Minute
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = pool.Ping(pingCtx)
+	cancel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	planner := usecase.Planner{
+		Jobs:         postgresrepo.JobRepository{Pool: pool},
+		Generator:    aiprompt.Client{BaseURL: cfg.AIPromptURL, InternalToken: cfg.AIPromptToken},
+		Competencies: competency.Client{BaseURL: cfg.LearningPlannerURL, InternalToken: cfg.LearningPlannerToken},
+		Profiles:     runtimecatalog.Client{BaseURL: cfg.SandboxURL, InternalToken: cfg.SandboxToken},
+		Validation:   validationclient.Client{BaseURL: cfg.ValidationURL, InternalToken: cfg.ValidationToken},
+		Workspaces:   sandbox.Client{BaseURL: cfg.SandboxURL, InternalToken: cfg.SandboxToken},
+		Stager:       practice.Client{BaseURL: cfg.PracticeURL, StagingToken: cfg.PracticeStagingToken},
+		Policy: domain.GenerationPolicy{
+			PlannerVersion: "tz-planner-v1", GenerationPolicyVersion: "task-authoring-v1",
+			TechnicalTaskSchema: domain.TechnicalTaskSchemaV1, PromptTemplateRef: "practice-task.authoring-candidate.v1@2",
+			Tone: "supportive_direct", Methodology: "incremental_evidence_first",
+			SkillRefs: []string{"task_analysis.v1", "meaningful_variant_design.v1", "step_decomposition.v1", "competency_mapping.v1", "evaluation_design.v1", "traceability_audit.v1"},
+		},
+	}
+	handler := httptransport.Handler{Planner: planner, InternalToken: cfg.InternalAPIToken, Health: pool}
+	server := &http.Server{Addr: net.JoinHostPort(cfg.HTTPHost, strconv.Itoa(cfg.HTTPPort)), Handler: handler.Router(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: authoringHTTPWriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
+}

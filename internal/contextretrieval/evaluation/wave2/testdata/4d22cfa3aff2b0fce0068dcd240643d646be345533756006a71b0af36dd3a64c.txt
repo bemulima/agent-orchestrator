@@ -1,0 +1,263 @@
+package httptransport
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+)
+
+const maximumRequestBytes int64 = 1 << 20
+
+type Handler struct {
+	Planner       PlanningService
+	InternalToken string
+	Health        HealthChecker
+}
+
+type PlanningService interface {
+	Plan(context.Context, string, domain.PlanningRequestV1) (domain.PlanningJob, bool, error)
+	Get(context.Context, string) (domain.PlanningJob, error)
+	Process(context.Context, string) (domain.PlanningJob, error)
+	Stage(context.Context, string) (domain.PlanningJob, error)
+	GetTechnicalTask(context.Context, string) (domain.TechnicalTaskV1, error)
+	GetStudentTechnicalTask(context.Context, string) (domain.StudentTechnicalTaskViewV1, error)
+}
+
+type HealthChecker interface {
+	Ping(context.Context) error
+}
+
+func (handler Handler) Router() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /internal/health", handler.auth(handler.health))
+	mux.HandleFunc("POST /internal/v1/authoring-jobs", handler.auth(handler.create))
+	mux.HandleFunc("POST /internal/v1/source-authoring-jobs", handler.auth(handler.sourceCreate))
+	mux.HandleFunc("GET /internal/v1/authoring-jobs/{id}", handler.auth(handler.get))
+	mux.HandleFunc("GET /internal/v1/authoring-jobs/{id}/technical-task", handler.auth(handler.technicalTask))
+	mux.HandleFunc("GET /internal/v1/authoring-jobs/{id}/student-view", handler.auth(handler.studentTechnicalTask))
+	mux.HandleFunc("POST /internal/v1/authoring-jobs/{id}/resume", handler.auth(handler.resume))
+	mux.HandleFunc("POST /internal/v1/authoring-jobs/{id}/stage", handler.auth(handler.stage))
+	return http.MaxBytesHandler(mux, maximumRequestBytes)
+}
+
+func (handler Handler) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		provided := request.Header.Get("X-Internal-Token")
+		if handler.InternalToken == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(handler.InternalToken)) != 1 {
+			writeJSON(writer, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			return
+		}
+		next(writer, request)
+	}
+}
+
+func (handler Handler) health(writer http.ResponseWriter, request *http.Request) {
+	if handler.Health == nil || handler.Health.Ping(request.Context()) != nil {
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (handler Handler) create(writer http.ResponseWriter, request *http.Request) {
+	var input domain.PlanningRequestV1
+	if err := decodeStrict(request.Body, &input); err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	job, created, err := handler.Planner.Plan(request.Context(), request.Header.Get("Idempotency-Key"), input)
+	if err != nil {
+		handler.writeError(writer, job, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, projectJob(job))
+}
+
+func (handler Handler) sourceCreate(writer http.ResponseWriter, request *http.Request) {
+	var input domain.SourceAuthoringRequestV1
+	if err := decodeStrict(request.Body, &input); err != nil || input.Schema != domain.SourceAuthoringRequestSchemaV1 {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid source authoring request"})
+		return
+	}
+	task := input.PreparedSourceTask
+	company, _ := task.Metadata["company"].(string)
+	license, _ := task.Metadata["license"].(string)
+	requestModel := domain.PlanningRequestV1{
+		Schema: domain.PlanningRequestSchemaV3, Mode: "private", Locale: "en",
+		Source:             domain.PlanningSource{Type: "github_repository", URL: task.Source.RepositoryURL, Company: company, License: license},
+		Hints:              domain.ClassificationHint{Stacks: sourceStackHints(task.Metadata)},
+		PreparedSourceTask: &task,
+	}
+	job, created, err := handler.Planner.Plan(request.Context(), request.Header.Get("Idempotency-Key"), requestModel)
+	if err != nil {
+		handler.writeError(writer, job, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, projectJob(job))
+}
+
+func sourceStackHints(metadata map[string]any) []string {
+	value, ok := metadata["stack_hints"]
+	if !ok {
+		return nil
+	}
+	switch stacks := value.(type) {
+	case []string:
+		return append([]string(nil), stacks...)
+	case []any:
+		result := make([]string, 0, len(stacks))
+		for _, item := range stacks {
+			if stack, ok := item.(string); ok {
+				result = append(result, stack)
+			}
+		}
+		return result
+	case string:
+		parts := strings.Split(stacks, ",")
+		result := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part = strings.TrimSpace(part); part != "" {
+				result = append(result, part)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func (handler Handler) get(writer http.ResponseWriter, request *http.Request) {
+	job, err := handler.Planner.Get(request.Context(), request.PathValue("id"))
+	if err != nil {
+		handler.writeError(writer, domain.PlanningJob{}, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, projectJob(job))
+}
+
+func (handler Handler) technicalTask(writer http.ResponseWriter, request *http.Request) {
+	task, err := handler.Planner.GetTechnicalTask(request.Context(), request.PathValue("id"))
+	if err != nil {
+		handler.writeError(writer, domain.PlanningJob{}, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, task)
+}
+
+func (handler Handler) studentTechnicalTask(writer http.ResponseWriter, request *http.Request) {
+	task, err := handler.Planner.GetStudentTechnicalTask(request.Context(), request.PathValue("id"))
+	if err != nil {
+		handler.writeError(writer, domain.PlanningJob{}, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, task)
+}
+
+func (handler Handler) resume(writer http.ResponseWriter, request *http.Request) {
+	job, err := handler.Planner.Process(request.Context(), request.PathValue("id"))
+	if err != nil {
+		if current, getErr := handler.Planner.Get(request.Context(), request.PathValue("id")); getErr == nil {
+			job = current
+		}
+		handler.writeError(writer, job, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, projectJob(job))
+}
+
+func (handler Handler) stage(writer http.ResponseWriter, request *http.Request) {
+	job, err := handler.Planner.Stage(request.Context(), request.PathValue("id"))
+	if err != nil {
+		handler.writeError(writer, job, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, projectJob(job))
+}
+
+func (handler Handler) writeError(writer http.ResponseWriter, job domain.PlanningJob, err error) {
+	status := http.StatusBadGateway
+	switch {
+	case errors.Is(err, domain.ErrValidation):
+		status = http.StatusUnprocessableEntity
+	case errors.Is(err, domain.ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrLeaseHeld):
+		status = http.StatusConflict
+	case errors.Is(err, domain.ErrNotRunnable):
+		status = http.StatusUnprocessableEntity
+	}
+	payload := map[string]any{"error": "authoring request failed"}
+	if job.ID != "" {
+		payload["job"] = projectJob(job)
+	}
+	writeJSON(writer, status, payload)
+}
+
+type jobProjection struct {
+	ID                 string                                 `json:"id"`
+	Status             domain.JobStatus                       `json:"status"`
+	Attempts           int                                    `json:"attempts"`
+	Orchestration      *domain.AuthoringOrchestrationIntentV1 `json:"orchestration,omitempty"`
+	FailureCode        string                                 `json:"failure_code,omitempty"`
+	Blueprint          *domain.TaskBlueprintV1                `json:"blueprint,omitempty"`
+	CandidateDigest    string                                 `json:"candidate_digest,omitempty"`
+	ContractDigest     string                                 `json:"contract_digest,omitempty"`
+	CapabilitiesDigest string                                 `json:"capabilities_digest,omitempty"`
+	Verification       *domain.VerificationReceiptV1          `json:"verification,omitempty"`
+	Staging            *domain.StagingReceiptV1               `json:"staging,omitempty"`
+}
+
+func projectJob(job domain.PlanningJob) jobProjection {
+	result := jobProjection{ID: job.ID, Status: job.Status, Attempts: job.Attempts, FailureCode: job.FailureCode}
+	if job.Request.Orchestration != nil {
+		orchestration := *job.Request.Orchestration
+		result.Orchestration = &orchestration
+	}
+	if (job.Status == domain.JobStatusReady || job.Status == domain.JobStatusStaged) && job.Artifact != nil {
+		blueprint := job.Artifact.Candidate.Blueprint
+		verification := job.Artifact.Verification
+		result.Blueprint = &blueprint
+		result.CandidateDigest = job.Artifact.CandidateDigest
+		result.ContractDigest = job.Artifact.ContractDigest
+		result.CapabilitiesDigest = job.Artifact.CapabilitiesDigest
+		result.Verification = &verification
+		if job.Staging != nil {
+			staging := *job.Staging
+			result.Staging = &staging
+		}
+	}
+	return result
+}
+
+func decodeStrict(reader io.Reader, output any) error {
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+func writeJSON(writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(payload)
+}

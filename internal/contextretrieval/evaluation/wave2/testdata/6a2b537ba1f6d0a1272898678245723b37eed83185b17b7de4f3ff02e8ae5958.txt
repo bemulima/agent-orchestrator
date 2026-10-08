@@ -1,0 +1,263 @@
+# Practice Runtime V2 — Frozen Contracts
+
+Status: **Barrier 1 contract freeze**  
+Contract owner: `ms-go-practice-runtime`  
+Compatibility target: current `nextjs` Practice V2 client and existing Student, Planner, Sandbox, Validation, and Teacher service boundaries.
+
+This document is the implementation boundary for parallel work. Implementations may add internal fields only when they do not alter the public wire contracts or state semantics below. Changes to a frozen wire contract require stopping at `BLOCKING_CONTRACT_CONFLICT`; do not silently redesign it.
+
+## 1. Ownership and domain states
+
+`ms-go-practice-runtime` owns `TaskInstance`, immutable revision/workspace bindings, milestone progress, Submission, ValidationRun, official result, review events, completion, and the Student evidence outbox. It does not own catalog revisions, LearningAction/evidence/mastery/path state, Sandbox content, learning routes, validation engines, or Teacher decisions. V2 has no `Attempt` entity.
+
+TaskInstance states: `STARTING`, `IN_PROGRESS`, `VALIDATING`, `IN_REVIEW`, `FINALIZING`, `COMPLETED`, `CANCELLED`. Terminal states are `COMPLETED` and `CANCELLED`. Cancellation is allowed only from `STARTING` or `IN_PROGRESS`.
+
+Submission states: `VALIDATING`, `FAILED`, `REVIEW_REQUIRED`, `CHANGES_REQUESTED`, `PASSED`. A checkpoint `PASSED` submission returns its TaskInstance to `IN_PROGRESS`. A final `PASSED` submission requiring mentor approval becomes `REVIEW_REQUIRED`; otherwise it starts `FINALIZING`. `CHANGES_REQUESTED` returns its TaskInstance to `IN_PROGRESS`. Submission snapshot identity/content is immutable.
+
+ValidationRun states: `PENDING`, `RUNNING`, `PASSED`, `FAILED`, `ERROR`. Terminal run results are immutable. `ERROR` leaves its Submission `VALIDATING`; a retry creates a new ValidationRun for the same Submission, pinned snapshot, and validation contract. Only the current run ID may update the Submission.
+
+`PASS` means all required semantic criteria were evaluated successfully and passed. `FAIL` means the required semantic criteria were evaluated successfully and at least one failed. `ERROR` means an authoritative evaluation could not be completed. Validator timeout/unavailable/5xx/connection failure, malformed result, `STAGE_EXECUTION_ERROR`, unsupported configuration, missing/corrupt snapshot, or digest mismatch are `ERROR`, never learner `FAIL`. Invalid Practice Runtime commands return 4xx and create no ValidationRun/result.
+
+## 2. Identity, idempotency, and command semantics
+
+All public mutations require a canonical lowercase UUID `Idempotency-Key`. Start uses that UUID as the TaskInstance ID, preserving the current client requirement that `response.instance.id == Idempotency-Key`. A duplicate key and identical normalized request returns the same resource; a changed request under that key returns `409 idempotency_conflict`. The command digest includes authenticated student identity and all command fields. It does not contain secrets.
+
+Submit keys are scoped to `(task_instance_id, idempotency_key)` and the command digest includes scope and milestone. Duplicate replay returns the original Submission. Different payload, another active Submission, a non-`IN_PROGRESS` instance, an out-of-order required milestone, or a completed instance returns conflict. A client timeout does not imply command failure; callers query by returned IDs/history and retry with the same key.
+
+Each TaskInstance binds one published revision and one stable Sandbox workspace. Start first persists a resumable `STARTING` receipt and immutable revision projection, then performs idempotent Student reserve, Planner route resolution, Sandbox create/resume, and Student open. Replaying Start resumes unfinished provisioning without reading the current revision. Provisioning cannot mark the instance `IN_PROGRESS` until all required receipts match exact identities/digests. A failed new start can be cancelled and its Student LearningAction cancelled with reason `practice_provisioning_failed`.
+
+Submit first persists a per-key intent, including generated Submission and ValidationRun IDs. Sandbox freeze then atomically captures the immutable head and installs the temporary workspace fence before returning. Runtime persists the exact freeze receipt and commits Submission + ValidationRun + `TaskInstance=VALIDATING` together. Recovery replays that freeze and local commit by the same intent; it never substitutes a live workspace. Only one active intent/Submission/review is allowed per TaskInstance.
+
+Completion requires final required milestones passed, final Submission passed, any required human review approved, and Sandbox permanent write-lock acknowledgement. One local transaction moves the instance to `COMPLETED`, records `final_submission_id`, and inserts one Student evidence outbox event. Outbox retries reuse the same final Submission ID as `evidence_id` and the exact stored payload. Student evidence delivery is downstream of the Practice completion commit and cannot reverse completion.
+
+## 3. HTTP conventions and authentication
+
+Practice Runtime listens on port `8080` in the platform network (`PRACTICE_RUNTIME_HOST=ms-go-practice-runtime`, `PRACTICE_RUNTIME_PORT=8080`; local default `http://localhost:8080`). Its public base path is `/api/v2`; Gateway exposes `/api/practice-task/v2` and rewrites that prefix to `/api/v2`. The existing `/api/practice-task/v1` catalog/legacy route remains on the Catalog upstream at port `8092`. Public calls use gateway-authenticated `X-User-ID` and `X-User-Role` claims, overwritten by Gateway. Internal service calls use `X-Internal-Token`; Teacher uses its existing dedicated Teacher token and that token is accepted only on the three Teacher projection/assistance routes. All JSON commands are strict, reject unknown fields/trailing JSON, have bounded bodies, and return `Cache-Control: no-store`.
+
+Standard errors are `{ "error": { "code": "invalid_request|variant_required|not_found|conflict|idempotency_conflict|unavailable" } }`. `400/422` is invalid input, `401/403` is identity/role failure, `404` is absent resource, `409` is state/idempotency conflict, `503` is an unavailable dependency. Dependency failures that occur after durable Submit intent creation are recorded as ValidationRun `ERROR`; they are not converted to a learner failure.
+
+### 3.1 Public Practice Runtime commands and queries
+
+`POST /project-instances` — Start a project-surface execution. `POST /practice-instances` — Start a practice-surface execution. Both require Student identity and `Idempotency-Key`, accept the same body, and return the same envelope. The selected command path supplies the exact Student `surface_classification` (`project` or `practice`); Runtime never infers it from milestone count, title, topology, or prose.
+
+```json
+{
+  "schema": "practice-task-instance-start.v2",
+  "task_revision_id": "<uuid>",
+  "locale": "en",
+  "solution_variant_id": "<uuid>",
+  "learning_path_id": "<uuid>"
+}
+```
+
+`solution_variant_id` and `learning_path_id` are optional. When variant is omitted the exact revision must contain exactly one active variant; with multiple active variants Runtime returns `422 variant_required` and does not start. Runtime never guesses a variant. Runtime also fails closed if the selected ordered milestone bindings do not resolve to a single compatible runtime profile. Response is a `practice-task-instance-started.v2` envelope with `instance` and safe revision summary; it may be `200` (ready) or `202` (`STARTING`). In both cases the instance ID is the idempotency key. Public DTOs contain no private evaluation context, test assets, rubrics, secrets, or raw validator output.
+
+The instance projection is `practice-task-instance.v2` and has this exact shape: `schema`, `id`, `student_id`, `task_revision_id`, `task_revision_digest`, `status`, `surface_classification`, `locale`, `learning_action_id`, optional `learning_path_id` plus exact `{reference_type:"practice",reference_id}` `learning_path_reference`, `workspace_binding`, `learning_route`, ordered `steps`, optional `current_step`, `progress`, optional `current_submission_id`/`final_submission_id`, `started_at`, optional `completed_at`, and `updated_at`. `workspace_binding` is `{schema:"practice-workspace-binding.v2",sandbox_id,available,preview_url?,generation_id?,workspace_digest?}`; it has no file contents or write secret. `learning_route` is the exact safe `student-task-learning-snapshot.v1` receipt. Each step is `{id,title,objective,deliverables,acceptance,milestone_order,step_order,status,required}`; each acceptance entry is `{id,text,evidence_kind}`. Step status is `LOCKED|LEARNING_REQUIRED|AVAILABLE|CHECKPOINTED|PASSED`. `current_step` has the same step fields and cannot be `PASSED`. `progress` is `{passed_steps,total_steps,percentage}` and is derived from persisted required milestone statuses; no FE-calculated authoritative status is accepted. Start envelope is `{schema:"practice-task-instance-started.v2",instance,revision}`. Revision summary is `practice-task-revision-summary.v2` with `schema`, `revision_id`, digest, public family/variant keys, revision number, surface, learner-visible title/type, and publication time. Detail envelope is `{schema:"practice-task-instance-detail.v2",instance,revision}`. List envelope is `{schema:"practice-task-instance-list.v2",items:[instance...],next_cursor?}`. Workspace envelope is `{schema:"practice-task-workspace.v2",instance,revision,current_step?,progress}`.
+
+`GET /task-instances?cursor=&limit=&status=` lists only the caller's instances. `GET /task-instances/{instanceID}` returns `practice-task-instance-detail.v2`; `GET /task-instances/{instanceID}/workspace` returns the same instance/revision/workspace binding plus the safe learning route and current milestone projection. Reads enforce authenticated Student ownership.
+
+`POST /task-instances/{instanceID}/steps/{stepID}/materialize` accepts `{}` and materializes/reuses the Planner-owned route content for that exact frozen step. It does not alter official result state.
+
+`POST /task-instances/{instanceID}/submissions` — official Submit. Requires `Idempotency-Key`.
+
+```json
+{
+  "schema": "practice-task-submit.v2",
+  "scope": "MILESTONE",
+  "milestone_id": "<frozen milestone id>"
+}
+```
+
+For final submission use `scope: "FINAL"` and omit `milestone_id`. For checkpoint submission use `scope: "MILESTONE"` and the exact next frozen milestone ID. Response is `202` with `practice-task-submission.v2`, initially `VALIDATING`. `POST /task-instances/{instanceID}/steps/{stepID}/checkpoints` remains a compatibility command equivalent to a milestone Submit for `stepID`; it requires the same idempotency header and returns the same Submission representation.
+
+Submission projection fields: `schema`, `id`, `task_instance_id`, `student_id`, `scope`, optional `milestone_id`, `snapshot` (the exact Sandbox ref), `workspace_digest`, `status`, ordered safe `validation_runs` summary (`id`, status, outcome/error classification, start/finish timestamps), optional current sanitized validation summary, optional human-review receipt (reviewer ID, decision, feedback, time), `created_at`, optional `completed_at`, and `updated_at`. Schema is `practice-task-submission.v2`. `GET /task-instances/{instanceID}/submissions` returns `practice-task-submission-list.v2` with `items` and optional cursor. Only the current run's safe learner-facing explanation can be included; stage reports are bounded and sanitized.
+
+`POST /task-instances/{instanceID}/cancel` accepts `{ "schema":"practice-task-instance-cancel.v1", "reason":"student_cancelled" }`, requires an idempotency key, and transitions only `STARTING` or `IN_PROGRESS` to `CANCELLED`. It locks Sandbox writes and asks Student to cancel the reserved/open LearningAction with matching reason. Cancellation during `VALIDATING`, `IN_REVIEW`, or `FINALIZING` conflicts.
+
+`GET /task-instances/{instanceID}/submissions?cursor=&limit=` lists history. `GET /task-instances/{instanceID}/submissions/{submissionID}` returns that immutable Submission, snapshot reference, status, safe ValidationRun summary, and sanitized Teacher explanation only where authorized. It never returns snapshot files or private validation contract content.
+
+`POST /task-instances/{instanceID}/submissions/{submissionID}/review` is the human-only review command. It requires a gateway-authenticated `MENTOR` or `ADMIN` role and a reviewer identity. Body:
+
+```json
+{
+  "schema": "practice-human-review-decision.v1",
+  "decision": "APPROVE",
+  "feedback": "bounded learner-safe feedback"
+}
+```
+
+`decision` is `APPROVE` or `CHANGES_REQUESTED`; approval is accepted only for the current final Submission in `REVIEW_REQUIRED`. Teacher's dedicated service token cannot call this route.
+
+### 3.2 Internal recovery and Teacher routes
+
+`POST /internal/v2/validation-runs/{runID}/retry` creates a new run for the same current `VALIDATING` Submission only when its latest run is `ERROR`. It reuses the exact snapshot and validation-contract digests. `POST /internal/v2/task-instances/{instanceID}/provisioning/retry` resumes durable Start receipts. These require the Runtime internal token.
+
+The three existing Teacher client paths stay byte-for-byte compatible under the Teacher token:
+
+* `GET /internal/task-instances/{id}/teacher-context?student_id=...` returns `practice-task-teacher-context.v1`, validated against the exact student, revision, LearningAction and current step. It is a bounded sanitized projection; no Sandbox ID or private criteria.
+* `GET /internal/task-instances/{id}/teacher-validation-explanation?student_id=...` returns `teacher-validation-explanation.v1` with exact student/instance/revision/action and current submission correlation, at most five bounded sanitized issues; unavailable explanation is explicitly unavailable, never fabricated.
+* `POST /internal/task-instances/{id}/teacher-assistance` accepts `{ "usage_id": "<uuid>", "student_id": "<uuid>", "assistance": { "schema": "practice-task-assistance-usage.v1", "step_id": "<frozen step>", "kind": "HINT|TEACHER_QUESTION|TEACHER_EXPLANATION", "hint_level": 1 } }`; the returned receipt echoes ID, student, task, step, kind, policy version and timestamp. `usage_id` is idempotent. Assistance is append-only and affects later Student evidence support context; it cannot mutate result/review state.
+
+## 4. Frozen service-to-service HTTP contracts
+
+### 4.1 Catalog → Practice Runtime: exact immutable revision envelope
+
+Add `GET /internal/catalog/practice-task-revisions/{revisionID}/execution-envelope`, protected by the existing Catalog internal token. Response:
+
+```json
+{
+  "schema": "practice-task-execution-envelope.v1",
+  "revision": { "id": "<uuid>", "practice_task_id": "<uuid>", "revision_number": 17, "published_at": "<RFC3339>" },
+  "revision_digest_schema": "practice-task-revision-digest.v1",
+  "revision_digest": "sha256:<64 lowercase hex>",
+  "runtime_context": {},
+  "evaluation_context": {}
+}
+```
+
+This exact revision route never resolves `current`. Digest preimage is canonical JSON over `{schema:"practice-task-revision-digest.v1", revision_id, revision_number, runtime_context, evaluation_context}`. Canonicalization recursively sorts object keys, preserves array order and JSON scalar values, removes insignificant whitespace, and hashes UTF-8 bytes with SHA-256. Runtime verifies the digest before accepting it and persists the full immutable projection. Start rejects empty/unversioned learning targets and structurally invalid/missing required validation contracts; it does not infer them from prose/tags. Student, Frontend, and Teacher never receive `evaluation_context`.
+
+### 4.2 Practice Runtime → Student: existing Student V2
+
+Use the existing exact routes and schemas; no Student business redesign:
+
+* `PUT /internal/v2/students/{studentID}/practice-learning-actions/{taskInstanceID}` with `Idempotency-Key: {taskInstanceID}` and `student-practice-learning-action-reserve.v1`: body carries exact revision ID/digest, surface (`practice|project`), ordered nonempty versioned targets, optional path ID, LearningAction ID distinct from instance ID, and occurrence time.
+* `GET` the same resource to recover/verify reserve receipt.
+* `POST .../{taskInstanceID}/open` with `student-practice-learning-action-open.v1`; `POST .../cancel` with `student-practice-learning-action-cancel.v1` and reason `practice_provisioning_failed`.
+* `POST .../{taskInstanceID}/evidence` with `Idempotency-Key: evidence_id` and `practice-task-competency-evidence.v2`. `evidence_id == submission_id == final_submission_id`; exact student/instance/revision/digest and workspace digest are required; `outcome="passed"`; ordered versioned evidence targets and step IDs match the reserved action. The request includes assistance policy version, hint count/max level, Teacher assistance boolean, per-target correctness/independence/confidence in `[0,1]`, and occurrence time. Runtime emits only after completion commit; Student applies mastery/path evidence using its existing reducer and returns `student-practice-evidence-receipt.v2`.
+
+For `POST .../cancel`, Student V2 extends the existing cancel command additively: reason `practice_provisioning_failed` is valid only for `RESERVED`; `student_cancelled` is valid for `RESERVED` or `OPEN`. Both close the Student-owned LearningAction as `CANCELLED`, preserve its original target/path reservation, and do not create evidence. Existing callers and the provisioning-failure reason retain their current behavior.
+
+### 4.3 Practice Runtime → Learning Planner: immutable route
+
+Use `POST /internal/practice-learning-routes`, `Idempotency-Key: task_instance_id`, and the existing `practice-learning-route-request.v1` schema:
+
+```json
+{
+  "schema": "practice-learning-route-request.v1",
+  "student_id": "<uuid>", "task_instance_id": "<uuid>",
+  "task_revision_id": "<uuid>", "task_revision_digest": "sha256:<64 lowercase hex>",
+  "locale": "en",
+  "steps": [{"step_id":"<frozen milestone id>","requirements":[{"id":"<stable requirement id>","target":{"type":"concept|capability","key":"<key>","version":"<version>"},"policy":"required","mastery_threshold":0.7}] }]
+}
+```
+
+Catalog learning targets do not author Planner policy/threshold fields. The frozen `practice-learning-route-policy.v1` mapping therefore treats each exact ordered Catalog target as `required` with `mastery_threshold=0.7`; requirement IDs are deterministic per frozen step and target ordinal (`<step_id>.target-<three-digit-ordinal>`). No target, version, policy, or threshold is inferred from prose, tags, mutable Student state, or whichever revision is current. Persist the exact `student-task-learning-snapshot.v1` receipt only after checking task/student/revision/digest/locale identity. Planner remains canonical route owner. Repeating Start sends the same route request/key.
+
+### 4.4 Practice Runtime → Sandbox: exact official workspace boundary
+
+Add internal-token-protected V2 endpoints. All commands are idempotent by `request_id`; identities and digests are exact and lowercase canonical.
+
+* `POST /internal/v2/practice-workspaces` accepts `practice-workspace-create.v2`: request ID = TaskInstance ID, student/instance/revision digest, safe runtime profile and starter files. It returns `practice-workspace-binding.v2` with stable `sandbox_id`, preview metadata and initial atomic generation head. A duplicate identical request returns the same sandbox; a changed payload conflicts.
+* `POST /internal/v2/sandboxes/{sandboxID}/submissions/{submissionID}/freeze` accepts `practice-snapshot-freeze.v2` with request ID = Submission ID and returns `practice-pinned-snapshot.v2`: sandbox/snapshot/generation IDs, workspace digest, file count and pin timestamp. Freeze atomically snapshots exact head, retains generation while pinned, and advances/revokes the write fence. Replay returns the same pinned generation even if a later generation exists.
+* `GET /internal/v2/sandboxes/{sandboxID}/snapshots/{snapshotID}?generation_id=...&workspace_digest=...` reads exactly that retained snapshot, returns `practice-pinned-snapshot-content.v2` and the immutable file list. Any identity/digest mismatch, missing pin, or corrupt content is an error. There is no live-head fallback.
+* `POST /internal/v2/sandboxes/{sandboxID}/write-lock` accepts `practice-write-lock.v2` with request ID, `mode` (`TEMPORARY|PERMANENT`) and optional `submission_id`; response echoes monotonic `fence_epoch`, `lock_id`, and permanence. `DELETE /internal/v2/sandboxes/{sandboxID}/write-lock/{lockID}` with idempotent `practice-write-unlock.v2` releases only the matching temporary lock and returns the new fence epoch. Permanent locks cannot be released. All HTTP/WebSocket editor writes must carry the current fence epoch; stale/missing epochs are rejected. Snapshot freeze installs the temporary lock before it returns. A conclusive FAIL or checkpoint PASS unlocks; final PASS awaiting review remains fenced, `CHANGES_REQUESTED` unlocks, `ERROR` stays fenced while validation is unresolved/retrying, and a completed instance remains permanently locked.
+* `POST /internal/v2/sandboxes/{sandboxID}/restore` accepts `practice-workspace-restore.v2` with `schema`, `request_id`, `task_instance_id`, and exact `snapshot` ref. It rehydrates only a retained pinned generation into the same sandbox/TaskInstance, advances workspace revision and write fence monotonically, and returns the stable binding/current head. Replay by request ID returns the same receipt. It never changes TaskInstance/revision identity.
+
+These request schemas use the following required fields (all reject unknown fields):
+
+* `practice-workspace-create.v2`: `schema`, `request_id`, `student_id`, `task_instance_id`, `task_revision_id`, `revision_digest`, exact `runtime_profile` (`code_structure_type_code`, `compose_config`), and ordered `starter_files` (`path`, `content`), which may be empty only if the selected immutable revision has no starter workspace. `runtime_profile` is copied from the selected frozen milestone projection; Practice/Sandbox must not select the first/current registered profile or infer a code structure. All required selected milestone bindings must carry equivalent code-structure and compose configuration so one stable WorkspaceBinding can serve the TaskInstance.
+* `practice-snapshot-freeze.v2`: `schema`, `request_id`, `task_instance_id`; `request_id` equals `submission_id` in the URL and the current binding must equal `task_instance_id`.
+* `practice-write-lock.v2`: `schema`, `request_id`, `mode`, optional `submission_id`; `request_id` is a stable UUID and replay with a different mode/scope conflicts.
+* `practice-write-unlock.v2`: `schema`, `request_id`; the URL lock ID and current Sandbox binding scope the command.
+* `practice-workspace-restore.v2`: `schema`, `request_id`, `task_instance_id`, `snapshot` with exact `sandbox_id`, `snapshot_id`, `generation_id`, and `workspace_digest`.
+
+Snapshot refs always contain exactly `sandbox_id`, `snapshot_id`, `generation_id`, and `workspace_digest`. Snapshot metadata responses additionally contain `schema`, `revision`, `file_count`, and `pinned_at`; snapshot-content adds immutable ordered `files` (`path`, `content`). All errors use `sandbox_snapshot_unavailable`, `sandbox_snapshot_corrupt`, `sandbox_identity_mismatch`, or `sandbox_fence_conflict` as stable machine classifications for adapter mapping.
+
+Sandbox snapshot retention is durable across Sandbox process restart for as long as the Practice pin exists. Reuse the existing atomic generation store/head and add the smallest pin/index/fence metadata required; do not create a second workspace store.
+
+### 4.5 Practice Runtime → Validation Orchestrator: typed official validation
+
+Add `POST /api/v2/practice-validations`, protected by the Validation internal token. Request schema `practice-validation-request.v2` has this exact top-level shape:
+
+```json
+{
+  "schema":"practice-validation-request.v2",
+  "task_instance_id":"<uuid>", "submission_id":"<uuid>", "validation_run_id":"<uuid>",
+  "revision_digest":"sha256:<64 lowercase hex>",
+  "validation_contract_digest":"sha256:<64 lowercase hex>",
+  "snapshot":{"sandbox_id":"<id>","snapshot_id":"<id>","generation_id":"<id>","workspace_digest":"sha256:<64 lowercase hex>"},
+  "scope":"MILESTONE|FINAL", "milestone_id":"<id, omitted for FINAL>",
+  "validation_specification":{"schema":"practice-validation-specification.v1","runtime_profile":{},"contracts":[{"milestone_id":"<id>","required":true,"validation_contract":{},"evaluation_assets":{"test_suite_ref":"<opaque ref>","reference_solution_ref":"<opaque ref>","negative_fixture_refs":[],"verification_runner_ref":"<opaque ref>"}}]}
+}
+```
+
+The scope-specific specification contains exactly the required executable contract(s), in frozen milestone order. Empty optional private asset fields are omitted. It excludes review policy, AI review contracts, mentor rubrics, and any unrelated private context. The request never contains caller-selected live workspace paths. Validation reads bytes only through Sandbox's exact pinned-snapshot endpoint and verifies all returned identities/digests before executing.
+
+Response schema `practice-validation-result.v2` echoes `task_instance_id`, `submission_id`, `validation_run_id`, `revision_digest`, `validation_contract_digest`, and the full snapshot ref. It has `outcome: PASS|FAIL|ERROR`, optional `error_classification`, and ordered sanitized stage summaries `{stage_id,required,outcome:PASS|FAIL|ERROR|SKIPPED,issues:[{code,message}]}`. Stable error classifications are `VALIDATOR_TIMEOUT`, `VALIDATOR_UNAVAILABLE`, `VALIDATOR_PROTOCOL`, `STAGE_EXECUTION_ERROR`, `SNAPSHOT_UNAVAILABLE`, `SNAPSHOT_CORRUPT`, `SNAPSHOT_DIGEST_MISMATCH`, `UNSUPPORTED_CONFIGURATION`, and `AUTHORING_DEFECT`. HTTP 200 represents a completed attempt including `ERROR`; 400/422 represents invalid request and creates no result. Runtime verifies all echoed identities; malformed or mismatched response is normalized to `ERROR`.
+
+The `practice-validation-contract-digest.v1` preimage is canonical JSON over `{schema, scope, milestone_id?, validation_specification}` using the canonical JSON rules in §4.1. Runtime computes it from the exact frozen contract projection; Validation independently recomputes and rejects mismatch as an evaluation `ERROR`. Unsupported config, timeout, dependency transport/5xx, snapshot failure/corruption/digest mismatch, invalid response, and every `STAGE_EXECUTION_ERROR` (including optional-stage execution errors) yield `ERROR`. Required semantic criterion failure yields `FAIL`. Optional semantic failure does not block a result when every required semantic criterion passes. Zero required executable criteria or malformed immutable contract is `ERROR`/authoring defect. No validation response can set Student learning state or Practice lifecycle directly.
+
+### 4.6 Teacher → Practice Runtime
+
+The existing Teacher context/explanation/assistance HTTP contract in §3.2 is authoritative. Update only Teacher's configured base URL to Practice Runtime. Runtime enforces its dedicated Teacher token only for these paths; token scope grants no Submit, validation retry, review, completion, or Student evidence capability.
+
+## 5. Normalized application ports (no external DTO leakage)
+
+Application/domain depend on semantic interfaces. Concrete HTTP DTOs stay in infrastructure adapters and are mapped at the boundary. The frozen minimum capabilities are:
+
+```go
+type RevisionProvider interface {
+    GetPublishedRevisionEnvelope(ctx context.Context, revisionID string) (RevisionEnvelope, error)
+}
+type LearningActionPort interface {
+    Reserve(ctx context.Context, input ReserveLearningAction) (LearningActionBinding, error)
+    Get(ctx context.Context, studentID, taskInstanceID string) (LearningActionBinding, error)
+    Open(ctx context.Context, input OpenLearningAction) (LearningActionBinding, error)
+    CancelProvisioning(ctx context.Context, input CancelLearningAction) (LearningActionBinding, error)
+}
+type LearningRouteProvider interface {
+    ResolveRoute(ctx context.Context, input ResolveLearningRoute) (LearningRouteReceipt, error)
+    Materialize(ctx context.Context, input MaterializeLearningStep) (LearningMaterialReceipt, error)
+}
+type WorkspacePort interface {
+    CreateOrResumeWorkspace(ctx context.Context, input CreateWorkspace) (WorkspaceBinding, error)
+    FreezeSnapshot(ctx context.Context, input FreezeSnapshot) (WorkspaceSnapshotRef, error)
+    ReadPinnedSnapshot(ctx context.Context, ref WorkspaceSnapshotRef) (WorkspaceSnapshot, error)
+    LockWrites(ctx context.Context, input LockWorkspaceWrites) (WorkspaceWriteLock, error)
+    UnlockWrites(ctx context.Context, input UnlockWorkspaceWrites) (WorkspaceWriteLock, error)
+    RestoreWorkspace(ctx context.Context, input RestoreWorkspace) (WorkspaceBinding, error)
+}
+type ValidationPort interface {
+    ValidateOfficialSubmission(ctx context.Context, input OfficialValidationRequest) (OfficialValidationResult, error)
+}
+type EvidencePort interface {
+    ApplyPassedEvidence(ctx context.Context, input PassedEvidence) (EvidenceReceipt, error)
+}
+```
+
+Normalized domain values include exact IDs/digests and validated enum outcomes, but no `http.Request`, response DTO, chi, pgx, NATS, Sandbox model, Student model, or Validation model. Persistence is behind repository/transaction ports. HTTP errors are normalized into a closed application error set. These interfaces describe capabilities, not imported sibling-service DTO packages.
+
+## 6. Architecture, test, and migration boundaries
+
+The Practice Runtime repository uses the established Go service layout: `cmd/`, `internal/domain`, `internal/application/ports`, `internal/application/usecase`, `internal/infrastructure/{persistence,adapters}`, `internal/transport/http`, and reversible versioned PostgreSQL migrations. Domain/application tests use port fakes. HTTP adapters use `httptest` contract tests. Persistence integration tests use the repository's PostgreSQL test-database convention and are clearly distinguished from unit tests. No legacy Student practice rows are migrated or fabricated into V2 snapshots.
+
+Provider workstreams may implement only the provider contracts in §4, with tests and owned docs. Runtime workstreams may implement only their disjoint packages after this freeze. Shared routers, composition root, Gateway routes/upstream, migration registration, `go.mod`/`go.sum`, and cross-repo verification fixtures are serialized integration files owned by the orchestrator.
+
+Frozen dependency graph:
+
+```mermaid
+flowchart LR
+  FE[NextJS / Gateway] -->|public v2 commands| PR[Practice Runtime]
+  C[Catalog] -->|exact revision envelope| PR
+  PR -->|LearningAction reserve/open/evidence| S[Student]
+  PR -->|immutable route| P[Learning Planner]
+  PR -->|workspace / pinned snapshot / fences| B[Sandbox]
+  PR -->|typed official validation| V[Validation Orchestrator]
+  T[Teacher Agent] <-->|safe context / explanation / assistance| PR
+  H[Human mentor] -->|authorized review decision| PR
+```
+
+## 7. Owner-authorized lesson assignment correlation extension (2026-10-03)
+
+This additive extension is explicitly authorized by the completion architecture owner. Existing V2 callers remain compatible and omit all new fields. The existing task_revision_id means the exact PracticeRevision identity; no second practice_revision_id is introduced.
+
+Start (practice-task-instance-start.v2), TaskInstance projection, Student reserve request/binding, and final practice-task-competency-evidence.v2 accept optional top-level learning_path_item_id and requirement_id. Both are canonical lowercase UUIDs, supplied together or omitted together. Correlated Start/reserve requires learning_path_id. The pair is immutable, participates in Start idempotency, survives stored-instance recovery, and is copied exactly into the final transactional evidence outbox. Student reserve/open/get receipts must echo the same pair. Missing/mismatched identity fails closed. Existing standalone practice learning_path_reference remains a compatibility projection; the new opaque pair identifies the assignment and is interpreted only by Student.
+
+Student owns validating that the item belongs to the authenticated student/path and the requirement belongs to its frozen lesson revision/completion definition, with its exact practice revision matching task_revision_id. Student records satisfaction and reevaluates required requirements; Runtime publishes only its own passed completion fact and never commands path completion or reads/interprets lesson policy. Evidence idempotency remains final_submission_id. The correlation pair must match the original Student LearningAction binding, including delayed or repeated delivery. An uncorrelated legacy fact never implicitly satisfies a lesson requirement.
+
+Input/output owner: Runtime owns execution identity and unchanged completion semantics; Student owns assignment identity/validation and satisfaction. Forbidden responsibility: Runtime does not select a current lesson, infer an assignment from targets/revision, or decide LearningPathItem completion. Mastery replanning remains OUT_OF_SCOPE_DEPENDENCY: MASTERY_REPLANNING.
+
+### 7.1 Existing Student receipt policy clarification
+
+The outgoing practice-task-competency-evidence.v2 request policy_version remains practice-competency-evidence-v2. The existing Student-owned student-practice-evidence-receipt.v2 response reports its applied reducer policy_version=student-mastery-v1. Runtime checks this separate authoritative receipt policy; it neither treats request and receipt policy versions as equal nor rewrites the receipt to a fictitious policy. Delivery still requires exact evidence_id and learning_action_id and accepted=true. This clarification aligns the established Student V2 implementation and does not change mastery ownership or introduce replanning.

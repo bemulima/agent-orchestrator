@@ -1,0 +1,612 @@
+package domain
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	StartSchema                      = "practice-task-instance-start.v2"
+	StartedSchema                    = "practice-task-instance-started.v2"
+	InstanceSchema                   = "practice-task-instance.v2"
+	SubmitSchema                     = "practice-task-submit.v2"
+	SubmissionSchema                 = "practice-task-submission.v2"
+	RevisionDigestV1                 = "practice-task-revision-digest.v1"
+	ValidationDigestV1               = "practice-validation-contract-digest.v1"
+	LearningReadinessMasteryPolicyV1 = "student-mastery-v1"
+)
+
+type TaskInstanceStatus string
+
+const (
+	TaskInstanceStarting   TaskInstanceStatus = "STARTING"
+	TaskInstanceInProgress TaskInstanceStatus = "IN_PROGRESS"
+	TaskInstanceValidating TaskInstanceStatus = "VALIDATING"
+	TaskInstanceInReview   TaskInstanceStatus = "IN_REVIEW"
+	TaskInstanceFinalizing TaskInstanceStatus = "FINALIZING"
+	TaskInstanceCompleted  TaskInstanceStatus = "COMPLETED"
+	TaskInstanceCancelled  TaskInstanceStatus = "CANCELLED"
+)
+
+type SubmissionStatus string
+
+const (
+	SubmissionValidating       SubmissionStatus = "VALIDATING"
+	SubmissionFailed           SubmissionStatus = "FAILED"
+	SubmissionReviewRequired   SubmissionStatus = "REVIEW_REQUIRED"
+	SubmissionChangesRequested SubmissionStatus = "CHANGES_REQUESTED"
+	SubmissionPassed           SubmissionStatus = "PASSED"
+)
+
+type ValidationRunStatus string
+
+const (
+	ValidationRunPending ValidationRunStatus = "PENDING"
+	ValidationRunRunning ValidationRunStatus = "RUNNING"
+	ValidationRunPassed  ValidationRunStatus = "PASSED"
+	ValidationRunFailed  ValidationRunStatus = "FAILED"
+	ValidationRunError   ValidationRunStatus = "ERROR"
+)
+
+type ValidationOutcome string
+
+const (
+	OutcomePass  ValidationOutcome = "PASS"
+	OutcomeFail  ValidationOutcome = "FAIL"
+	OutcomeError ValidationOutcome = "ERROR"
+)
+
+var (
+	ErrInvalid         = errors.New("invalid request")
+	ErrNotFound        = errors.New("not found")
+	ErrConflict        = errors.New("conflict")
+	ErrIdempotency     = errors.New("idempotency conflict")
+	ErrDependency      = errors.New("dependency unavailable")
+	ErrAuthoringDefect = errors.New("invalid immutable revision")
+	ErrVariantRequired = errors.New("solution variant selection is required")
+	canonicalUUID      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	canonicalDigest    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	localePattern      = regexp.MustCompile(`^[a-z]{2}(?:-[a-z0-9]{2,8})?$`)
+)
+
+type StartCommand struct {
+	StudentID             string `json:"student_id"`
+	IdempotencyKey        string `json:"idempotency_key"`
+	TaskRevisionID        string `json:"task_revision_id"`
+	Locale                string `json:"locale"`
+	SurfaceClassification string `json:"-"`
+	SolutionVariantID     string `json:"solution_variant_id,omitempty"`
+	LearningPathID        string `json:"learning_path_id,omitempty"`
+	LearningPathItemID    string `json:"learning_path_item_id,omitempty"`
+	RequirementID         string `json:"requirement_id,omitempty"`
+}
+
+func NormalizeStartCommand(input StartCommand) (StartCommand, error) {
+	if input.StudentID != strings.TrimSpace(input.StudentID) || input.IdempotencyKey != strings.TrimSpace(input.IdempotencyKey) ||
+		input.TaskRevisionID != strings.TrimSpace(input.TaskRevisionID) || input.Locale != strings.TrimSpace(input.Locale) ||
+		input.LearningPathID != strings.TrimSpace(input.LearningPathID) || input.SolutionVariantID != strings.TrimSpace(input.SolutionVariantID) || !IsCanonicalUUID(input.StudentID) ||
+		!IsCanonicalUUID(input.IdempotencyKey) || !IsCanonicalUUID(input.TaskRevisionID) ||
+		(input.LearningPathID != "" && !IsCanonicalUUID(input.LearningPathID)) ||
+		!ValidRequirementCorrelation(input.LearningPathItemID, input.RequirementID) || (input.LearningPathItemID != "" && input.LearningPathID == "") ||
+		(input.SolutionVariantID != "" && !IsCanonicalUUID(input.SolutionVariantID)) ||
+		(input.SurfaceClassification != "practice" && input.SurfaceClassification != "project") {
+		return StartCommand{}, ErrInvalid
+	}
+	input.Locale = strings.ToLower(input.Locale)
+	if !localePattern.MatchString(input.Locale) {
+		return StartCommand{}, ErrInvalid
+	}
+	return input, nil
+}
+
+func IsCanonicalUUID(value string) bool {
+	return canonicalUUID.MatchString(value)
+}
+
+func NormalizeSubmitCommand(input SubmitCommand) (SubmitCommand, error) {
+	if input.TaskInstanceID != strings.TrimSpace(input.TaskInstanceID) || input.StudentID != strings.TrimSpace(input.StudentID) ||
+		input.IdempotencyKey != strings.TrimSpace(input.IdempotencyKey) || input.MilestoneID != strings.TrimSpace(input.MilestoneID) ||
+		!IsCanonicalUUID(input.TaskInstanceID) || !IsCanonicalUUID(input.StudentID) || !IsCanonicalUUID(input.IdempotencyKey) {
+		return SubmitCommand{}, ErrInvalid
+	}
+	switch input.Scope {
+	case "FINAL":
+		if input.MilestoneID != "" {
+			return SubmitCommand{}, ErrInvalid
+		}
+	case "MILESTONE":
+		if !IsCanonicalUUID(input.MilestoneID) {
+			return SubmitCommand{}, ErrInvalid
+		}
+	default:
+		return SubmitCommand{}, ErrInvalid
+	}
+	return input, nil
+}
+
+func CommandDigest(command any) (string, error) {
+	encoded, err := json.Marshal(command)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := CanonicalJSON(encoded)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func StartCommandDigest(command StartCommand) (string, error) {
+	return CommandDigest(struct {
+		StudentID             string `json:"student_id"`
+		IdempotencyKey        string `json:"idempotency_key"`
+		TaskRevisionID        string `json:"task_revision_id"`
+		Locale                string `json:"locale"`
+		SurfaceClassification string `json:"surface_classification"`
+		SolutionVariantID     string `json:"solution_variant_id,omitempty"`
+		LearningPathID        string `json:"learning_path_id,omitempty"`
+		LearningPathItemID    string `json:"learning_path_item_id,omitempty"`
+		RequirementID         string `json:"requirement_id,omitempty"`
+	}{command.StudentID, command.IdempotencyKey, command.TaskRevisionID, command.Locale, command.SurfaceClassification, command.SolutionVariantID, command.LearningPathID, command.LearningPathItemID, command.RequirementID})
+}
+
+func CanTransitionInstance(from, to TaskInstanceStatus) bool {
+	switch from {
+	case TaskInstanceStarting:
+		return to == TaskInstanceInProgress || to == TaskInstanceCancelled
+	case TaskInstanceInProgress:
+		return to == TaskInstanceValidating || to == TaskInstanceCancelled
+	case TaskInstanceValidating:
+		return to == TaskInstanceInProgress || to == TaskInstanceInReview || to == TaskInstanceFinalizing
+	case TaskInstanceInReview:
+		return to == TaskInstanceInProgress || to == TaskInstanceFinalizing
+	case TaskInstanceFinalizing:
+		return to == TaskInstanceCompleted
+	default:
+		return false
+	}
+}
+
+// CanonicalJSON recursively sorts object keys, preserves array order and JSON
+// scalar values, removes insignificant whitespace, and emits UTF-8 JSON.
+func CanonicalJSON(raw json.RawMessage) ([]byte, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, ErrInvalid
+	}
+	return canonicalValue(value)
+}
+
+func canonicalValue(value any) ([]byte, error) {
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		var buffer bytes.Buffer
+		buffer.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				buffer.WriteByte(',')
+			}
+			encodedKey, _ := json.Marshal(key)
+			buffer.Write(encodedKey)
+			buffer.WriteByte(':')
+			encodedValue, err := canonicalValue(typed[key])
+			if err != nil {
+				return nil, err
+			}
+			buffer.Write(encodedValue)
+		}
+		buffer.WriteByte('}')
+		return buffer.Bytes(), nil
+	case []any:
+		var buffer bytes.Buffer
+		buffer.WriteByte('[')
+		for index, item := range typed {
+			if index > 0 {
+				buffer.WriteByte(',')
+			}
+			encoded, err := canonicalValue(item)
+			if err != nil {
+				return nil, err
+			}
+			buffer.Write(encoded)
+		}
+		buffer.WriteByte(']')
+		return buffer.Bytes(), nil
+	case json.Number:
+		if !json.Valid([]byte(typed.String())) {
+			return nil, ErrInvalid
+		}
+		return []byte(typed.String()), nil
+	default:
+		return json.Marshal(typed)
+	}
+}
+
+// Digest hashes a version-tagged canonical payload. The payload is carried as
+// JSON so callers cannot accidentally hash Go map iteration order.
+func Digest(schema string, payload json.RawMessage) string {
+	canonical, err := CanonicalJSON(payload)
+	if err != nil {
+		return ""
+	}
+	var normalized any
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.UseNumber()
+	if decoder.Decode(&normalized) != nil {
+		return ""
+	}
+	preimage, err := json.Marshal(struct {
+		Schema  string `json:"schema"`
+		Payload any    `json:"payload"`
+	}{schema, normalized})
+	if err != nil {
+		return ""
+	}
+	canonicalPreimage, err := CanonicalJSON(preimage)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(canonicalPreimage)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+type RevisionMetadata struct {
+	ID             string    `json:"id"`
+	PracticeTaskID string    `json:"practice_task_id"`
+	RevisionNumber int       `json:"revision_number"`
+	PublishedAt    time.Time `json:"published_at"`
+}
+
+type RevisionEnvelope struct {
+	Schema               string           `json:"schema"`
+	Revision             RevisionMetadata `json:"revision"`
+	RevisionDigestSchema string           `json:"revision_digest_schema"`
+	RevisionDigest       string           `json:"revision_digest"`
+	RuntimeContext       json.RawMessage  `json:"runtime_context"`
+	EvaluationContext    json.RawMessage  `json:"evaluation_context"`
+}
+
+func (envelope RevisionEnvelope) ComputedDigest() string {
+	payload, err := json.Marshal(struct {
+		Schema            string          `json:"schema"`
+		RevisionID        string          `json:"revision_id"`
+		RevisionNumber    int             `json:"revision_number"`
+		RuntimeContext    json.RawMessage `json:"runtime_context"`
+		EvaluationContext json.RawMessage `json:"evaluation_context"`
+	}{RevisionDigestV1, envelope.Revision.ID, envelope.Revision.RevisionNumber, envelope.RuntimeContext, envelope.EvaluationContext})
+	if err != nil {
+		return ""
+	}
+	canonical, err := CanonicalJSON(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(canonical)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+type Target struct {
+	Type    string `json:"type"`
+	Key     string `json:"key"`
+	Version string `json:"version"`
+}
+
+type Step struct {
+	ID                      string                    `json:"id"`
+	Title                   string                    `json:"title"`
+	Objective               string                    `json:"objective"`
+	Deliverables            []string                  `json:"deliverables"`
+	Acceptance              []Acceptance              `json:"acceptance"`
+	MilestoneOrder          int                       `json:"milestone_order"`
+	StepOrder               int                       `json:"step_order"`
+	Required                bool                      `json:"required"`
+	Status                  string                    `json:"status"`
+	Targets                 []Target                  `json:"-"`
+	ValidationContract      json.RawMessage           `json:"-"`
+	EvaluationAssets        EvaluationAssets          `json:"-"`
+	RuntimeProfile          json.RawMessage           `json:"-"`
+	StarterFiles            []WorkspaceFile           `json:"-"`
+	ReadinessReceipt        *LearningReadinessReceipt `json:"-"`
+	ReadinessIdempotencyKey string                    `json:"-"`
+}
+
+type Acceptance struct {
+	ID           string `json:"id"`
+	Text         string `json:"text"`
+	EvidenceKind string `json:"evidence_kind"`
+}
+
+type EvaluationAssets struct {
+	TestSuiteRef          string   `json:"test_suite_ref,omitempty"`
+	ReferenceSolutionRef  string   `json:"reference_solution_ref,omitempty"`
+	NegativeFixtureRefs   []string `json:"negative_fixture_refs,omitempty"`
+	VerificationRunnerRef string   `json:"verification_runner_ref,omitempty"`
+}
+
+type WorkspaceFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type RevisionSummary struct {
+	Schema         string    `json:"schema"`
+	RevisionID     string    `json:"revision_id"`
+	Digest         string    `json:"digest"`
+	FamilyKey      string    `json:"family_key"`
+	VariantKey     string    `json:"variant_key"`
+	VariantID      string    `json:"-"`
+	RevisionNumber int       `json:"revision_number"`
+	Surface        string    `json:"surface"`
+	Title          string    `json:"title"`
+	Type           string    `json:"type"`
+	PublishedAt    time.Time `json:"published_at"`
+}
+
+type WorkspaceBinding struct {
+	Schema          string `json:"schema"`
+	SandboxID       string `json:"sandbox_id"`
+	Available       bool   `json:"available"`
+	PreviewURL      string `json:"preview_url,omitempty"`
+	GenerationID    string `json:"generation_id,omitempty"`
+	WorkspaceDigest string `json:"workspace_digest,omitempty"`
+}
+
+type LearningRouteReceipt struct {
+	Schema             string          `json:"schema"`
+	ID                 string          `json:"id"`
+	TaskInstanceID     string          `json:"task_instance_id"`
+	TaskRevisionID     string          `json:"task_revision_id"`
+	TaskRevisionDigest string          `json:"task_revision_digest"`
+	StudentID          string          `json:"student_id"`
+	Locale             string          `json:"locale"`
+	PlannerVersion     string          `json:"planner_version"`
+	RouteDigest        string          `json:"route_digest"`
+	Steps              json.RawMessage `json:"steps"`
+	CreatedAt          time.Time       `json:"created_at"`
+}
+
+type LearningReadinessReceipt struct {
+	Schema               string    `json:"schema"`
+	ID                   string    `json:"id"`
+	TaskInstanceID       string    `json:"task_instance_id"`
+	StudentID            string    `json:"student_id"`
+	TaskRevisionID       string    `json:"task_revision_id"`
+	TaskRevisionDigest   string    `json:"task_revision_digest"`
+	RouteID              string    `json:"route_id"`
+	RouteDigest          string    `json:"route_digest"`
+	StepID               string    `json:"step_id"`
+	Decision             string    `json:"decision"`
+	LearnerStateDigest   string    `json:"learner_state_digest"`
+	MasteryPolicyVersion string    `json:"mastery_policy_version"`
+	ObservedAt           time.Time `json:"observed_at"`
+}
+
+func ValidLearningReadinessReceipt(receipt LearningReadinessReceipt) bool {
+	return receipt.Schema == "practice-learning-readiness-receipt.v1" && IsCanonicalUUID(receipt.ID) &&
+		IsCanonicalUUID(receipt.TaskInstanceID) && IsCanonicalUUID(receipt.StudentID) &&
+		IsCanonicalUUID(receipt.TaskRevisionID) && IsCanonicalUUID(receipt.RouteID) &&
+		canonicalDigest.MatchString(receipt.TaskRevisionDigest) && canonicalDigest.MatchString(receipt.RouteDigest) &&
+		canonicalDigest.MatchString(receipt.LearnerStateDigest) &&
+		(receipt.Decision == "READY" || receipt.Decision == "NOT_READY") &&
+		receipt.MasteryPolicyVersion == LearningReadinessMasteryPolicyV1 && !receipt.ObservedAt.IsZero()
+}
+
+type LearningPathReference struct {
+	ReferenceType string `json:"reference_type"`
+	ReferenceID   string `json:"reference_id"`
+}
+
+type Progress struct {
+	PassedSteps int     `json:"passed_steps"`
+	TotalSteps  int     `json:"total_steps"`
+	Percentage  float64 `json:"percentage"`
+}
+
+type TaskInstance struct {
+	Schema                  string                 `json:"schema"`
+	ID                      string                 `json:"id"`
+	StudentID               string                 `json:"student_id"`
+	TaskRevisionID          string                 `json:"task_revision_id"`
+	TaskRevisionDigest      string                 `json:"task_revision_digest"`
+	Status                  TaskInstanceStatus     `json:"status"`
+	SurfaceClassification   string                 `json:"surface_classification"`
+	Locale                  string                 `json:"locale"`
+	LearningActionID        string                 `json:"learning_action_id"`
+	LearningPathID          string                 `json:"learning_path_id,omitempty"`
+	LearningPathItemID      string                 `json:"learning_path_item_id,omitempty"`
+	RequirementID           string                 `json:"requirement_id,omitempty"`
+	LearningPathReference   *LearningPathReference `json:"learning_path_reference,omitempty"`
+	SolutionVariantID       string                 `json:"-"`
+	WorkspaceBinding        WorkspaceBinding       `json:"workspace_binding"`
+	LearningRoute           LearningRouteReceipt   `json:"learning_route"`
+	Steps                   []Step                 `json:"steps"`
+	CurrentStep             *Step                  `json:"current_step,omitempty"`
+	Progress                Progress               `json:"progress"`
+	CurrentSubmissionID     string                 `json:"current_submission_id,omitempty"`
+	FinalSubmissionID       string                 `json:"final_submission_id,omitempty"`
+	StartedAt               time.Time              `json:"started_at"`
+	CompletedAt             *time.Time             `json:"completed_at,omitempty"`
+	UpdatedAt               time.Time              `json:"updated_at"`
+	RevisionSummary         RevisionSummary        `json:"-"`
+	RevisionEnvelope        RevisionEnvelope       `json:"-"`
+	StartCommandDigest      string                 `json:"-"`
+	Provisioning            ProvisioningReceipts   `json:"-"`
+	ReviewRequired          bool                   `json:"-"`
+	AssistancePolicyVersion string                 `json:"-"`
+	HintsUsed               int                    `json:"-"`
+	MaxHintLevel            *int                   `json:"-"`
+	TeacherAssistanceUsed   bool                   `json:"-"`
+	Version                 int64                  `json:"-"`
+}
+
+type ProvisioningReceipts struct {
+	StudentReserved  bool `json:"student_reserved"`
+	RouteResolved    bool `json:"route_resolved"`
+	WorkspaceCreated bool `json:"workspace_created"`
+	StudentOpened    bool `json:"student_opened"`
+}
+
+func (instance TaskInstance) PublicProjection() TaskInstance {
+	instance.RevisionSummary = RevisionSummary{}
+	instance.RevisionEnvelope = RevisionEnvelope{}
+	instance.StartCommandDigest = ""
+	instance.Provisioning = ProvisioningReceipts{}
+	instance.ReviewRequired = false
+	instance.AssistancePolicyVersion = ""
+	instance.HintsUsed = 0
+	instance.MaxHintLevel = nil
+	instance.TeacherAssistanceUsed = false
+	return instance
+}
+
+type StartResult struct {
+	Schema   string          `json:"schema"`
+	Instance TaskInstance    `json:"instance"`
+	Revision RevisionSummary `json:"revision"`
+}
+
+type SubmitCommand struct {
+	TaskInstanceID string `json:"task_instance_id"`
+	StudentID      string `json:"student_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Scope          string `json:"scope"`
+	MilestoneID    string `json:"milestone_id,omitempty"`
+}
+
+type SnapshotRef struct {
+	SandboxID       string `json:"sandbox_id"`
+	SnapshotID      string `json:"snapshot_id"`
+	GenerationID    string `json:"generation_id"`
+	WorkspaceDigest string `json:"workspace_digest"`
+}
+
+type ValidationRun struct {
+	SafeSummary         *ValidationSummary  `json:"safe_summary,omitempty"`
+	ID                  string              `json:"id"`
+	Status              ValidationRunStatus `json:"status"`
+	Outcome             ValidationOutcome   `json:"outcome,omitempty"`
+	ErrorClassification string              `json:"error_classification,omitempty"`
+	StartedAt           *time.Time          `json:"started_at,omitempty"`
+	FinishedAt          *time.Time          `json:"finished_at,omitempty"`
+}
+
+type HumanReviewReceipt struct {
+	ReviewerID string    `json:"reviewer_id"`
+	Decision   string    `json:"decision"`
+	Feedback   string    `json:"feedback,omitempty"`
+	ReviewedAt time.Time `json:"reviewed_at"`
+}
+
+type Submission struct {
+	Schema                   string              `json:"schema"`
+	ID                       string              `json:"id"`
+	TaskInstanceID           string              `json:"task_instance_id"`
+	StudentID                string              `json:"student_id"`
+	Scope                    string              `json:"scope"`
+	MilestoneID              string              `json:"milestone_id,omitempty"`
+	Snapshot                 SnapshotRef         `json:"snapshot"`
+	WorkspaceDigest          string              `json:"workspace_digest"`
+	Status                   SubmissionStatus    `json:"status"`
+	ValidationRuns           []ValidationRun     `json:"validation_runs"`
+	CurrentValidationSummary *ValidationSummary  `json:"current_validation_summary,omitempty"`
+	HumanReview              *HumanReviewReceipt `json:"human_review,omitempty"`
+	CreatedAt                time.Time           `json:"created_at"`
+	CompletedAt              *time.Time          `json:"completed_at,omitempty"`
+	UpdatedAt                time.Time           `json:"updated_at"`
+	ValidationSpecification  json.RawMessage     `json:"-"`
+	ValidationContractDigest string              `json:"-"`
+	RevisionDigest           string              `json:"-"`
+	RequiresHumanReview      bool                `json:"-"`
+	IdempotencyKey           string              `json:"-"`
+	CommandDigest            string              `json:"-"`
+}
+
+func (submission Submission) PublicProjection() Submission {
+	submission.CurrentValidationSummary = submission.CurrentSafeValidationSummary()
+	submission.ValidationRuns = append([]ValidationRun(nil), submission.ValidationRuns...)
+	for index := range submission.ValidationRuns {
+		submission.ValidationRuns[index].SafeSummary = nil
+	}
+	submission.ValidationSpecification = nil
+	submission.ValidationContractDigest = ""
+	submission.RevisionDigest = ""
+	submission.RequiresHumanReview = false
+	submission.IdempotencyKey = ""
+	submission.CommandDigest = ""
+	return submission
+}
+
+type SubmitIntent struct {
+	TaskInstanceID           string          `json:"task_instance_id"`
+	StudentID                string          `json:"student_id"`
+	IdempotencyKey           string          `json:"idempotency_key"`
+	CommandDigest            string          `json:"command_digest"`
+	SubmissionID             string          `json:"submission_id"`
+	ValidationRunID          string          `json:"validation_run_id"`
+	Scope                    string          `json:"scope"`
+	MilestoneID              string          `json:"milestone_id,omitempty"`
+	ValidationContractDigest string          `json:"validation_contract_digest"`
+	ValidationSpecification  json.RawMessage `json:"validation_specification"`
+	Status                   string          `json:"status"`
+	CreatedAt                time.Time       `json:"created_at"`
+	Snapshot                 SnapshotRef     `json:"snapshot,omitempty"`
+	WriteLockID              string          `json:"write_lock_id,omitempty"`
+	FenceEpoch               int64           `json:"fence_epoch,omitempty"`
+	UpdatedAt                time.Time       `json:"updated_at,omitempty"`
+}
+
+type ValidationResult struct {
+	TaskInstanceID           string            `json:"task_instance_id"`
+	SubmissionID             string            `json:"submission_id"`
+	ValidationRunID          string            `json:"validation_run_id"`
+	RevisionDigest           string            `json:"revision_digest"`
+	ValidationContractDigest string            `json:"validation_contract_digest"`
+	Snapshot                 SnapshotRef       `json:"snapshot"`
+	Outcome                  ValidationOutcome `json:"outcome"`
+	ErrorClassification      string            `json:"error_classification,omitempty"`
+	Stages                   []ValidationStage `json:"stages,omitempty"`
+}
+
+type ValidationStage struct {
+	StageID  string            `json:"stage_id"`
+	Required bool              `json:"required"`
+	Outcome  string            `json:"outcome"`
+	Issues   []ValidationIssue `json:"issues"`
+}
+
+type ValidationIssue struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type APIError struct {
+	Code string `json:"code"`
+}
+
+func (e APIError) Error() string { return fmt.Sprintf("practice runtime: %s", e.Code) }
+
+// ValidRequirementCorrelation checks opaque Student-owned assignment identity.
+func ValidRequirementCorrelation(itemID, requirementID string) bool {
+	return (itemID == "" && requirementID == "") || (IsCanonicalUUID(itemID) && IsCanonicalUUID(requirementID))
+}

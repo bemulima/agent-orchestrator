@@ -1,0 +1,424 @@
+package hybridreplan
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/google/uuid"
+)
+
+// These are named in-memory port doubles, never actual owner-boundary proof.
+type snapshotTestClock struct{ now time.Time }
+
+func (c *snapshotTestClock) Now() time.Time { return c.now }
+
+type snapshotStudentPort struct {
+	calls int
+	get   func(domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error)
+}
+
+func (s *snapshotStudentPort) GetHybridPlanningSnapshot(_ context.Context, studentID, pathID string, r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+	s.calls++
+	return s.get(r)
+}
+
+type snapshotJobsPort struct {
+	inbox                                    map[string]string
+	work                                     domain.HybridEvaluationWork
+	pending                                  bool
+	retryAt                                  time.Time
+	jobs                                     map[string]domain.HybridEvaluationJob
+	received, claims, checkpoints, releases  int
+	failIngress, failCheckpoint, failRelease error
+	beforeCheckpoint                         func()
+}
+
+func newSnapshotJobsPort() *snapshotJobsPort {
+	return &snapshotJobsPort{inbox: map[string]string{}, jobs: map[string]domain.HybridEvaluationJob{}}
+}
+func (s *snapshotJobsPort) ReceivePlanningStateEvent(_ context.Context, e domain.PlanningStateChangedEvent) (bool, error) {
+	s.received++
+	if s.failIngress != nil {
+		return false, s.failIngress
+	}
+	raw, _ := json.Marshal(e)
+	if old, ok := s.inbox[e.EventID]; ok {
+		if old != string(raw) {
+			return false, domain.ErrConflict
+		}
+		return false, nil
+	}
+	s.inbox[e.EventID] = string(raw)
+	s.work.StudentID = e.StudentID
+	s.work.LearningPathID = e.Data.LearningPathID
+	s.work.LatestEvent = e
+	s.work.Targets = e.Data.Targets
+	s.work.Generation++
+	s.pending = true
+	return true, nil
+}
+func (s *snapshotJobsPort) ClaimHybridEvaluationWork(_ context.Context, now time.Time, ttl time.Duration) (domain.HybridEvaluationWork, bool, error) {
+	s.claims++
+	if !s.pending || now.Before(s.retryAt) || (s.work.ClaimToken != "" && now.Before(s.work.LeaseUntil)) {
+		return domain.HybridEvaluationWork{}, false, nil
+	}
+	s.work.ClaimToken = uuid.NewString()
+	s.work.LeaseUntil = now.Add(ttl)
+	return s.work, true, nil
+}
+func (s *snapshotJobsPort) CheckpointHybridSnapshot(_ context.Context, w domain.HybridEvaluationWork, ss domain.HybridPlanningSnapshot, policy string) (string, error) {
+	s.checkpoints++
+	if s.beforeCheckpoint != nil {
+		s.beforeCheckpoint()
+	}
+	if s.failCheckpoint != nil {
+		return "", s.failCheckpoint
+	}
+	if w.ClaimToken != s.work.ClaimToken {
+		return "", domain.ErrConflict
+	}
+	key := ss.References.SnapshotRef + ":" + policy
+	if _, ok := s.jobs[key]; !ok {
+		s.jobs[key] = domain.HybridEvaluationJob{ID: uuid.NewSHA1(uuid.NameSpaceURL, []byte(key)).String(), StudentID: w.StudentID, LearningPathID: w.LearningPathID, SnapshotRef: ss.References.SnapshotRef, PolicyVersion: policy, Snapshot: ss}
+	}
+	s.pending = s.work.Generation != w.Generation
+	s.work.ClaimToken = ""
+	return s.jobs[key].ID, nil
+}
+func (s *snapshotJobsPort) ReleaseHybridEvaluationWork(_ context.Context, w domain.HybridEvaluationWork, retryAt time.Time) error {
+	s.releases++
+	if s.failRelease != nil {
+		return s.failRelease
+	}
+	if w.ClaimToken != s.work.ClaimToken {
+		return domain.ErrConflict
+	}
+	s.work.ClaimToken = ""
+	s.retryAt = retryAt
+	return nil
+}
+func snapshotID(key string) string { return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String() }
+func snapshotTarget(key string) domain.HybridTargetRef {
+	return domain.HybridTargetRef{Type: domain.TargetConcept, Key: key, Version: "v1"}
+}
+func snapshotEvent(identity string, targets ...domain.HybridTargetRef) domain.PlanningStateChangedEvent {
+	sid, pid, tid := snapshotID("student"), snapshotID("path"), snapshotID(identity)
+	kind := "OBJECTIVE_EVIDENCE"
+	return domain.PlanningStateChangedEvent{EventID: domain.PlanningStateChangedEventID(sid, pid, kind, tid), EventType: domain.SubjectPlanningStateChanged, StudentID: sid, CorrelationID: pid, CausationID: tid, OccurredAt: time.Date(2026, 10, 5, 1, 0, 0, 0, time.UTC), SchemaVersion: 1, Data: domain.PlanningStateChangedData{LearningPathID: pid, PathVersion: 1, TriggerKind: kind, TriggerIdentity: tid, Targets: targets}}
+}
+func snapshotOwnerFixture(r domain.HybridSnapshotRequest, version int64, pathTargets []domain.HybridTargetRef) domain.HybridPlanningSnapshot {
+	derived := domain.HybridSnapshotSignal{Status: "DERIVED_BY_PLANNER", ReasonCode: "PLANNER_POLICY_HYBRID_V1"}
+	s := domain.HybridPlanningSnapshot{Schema: domain.HybridSnapshotSchema, StudentID: snapshotID("student"), LearningPathID: snapshotID("path"), CapturedAt: time.Date(2026, 10, 5, 1, 0, 0, 0, time.UTC), TriggerContext: r.TriggerContext, RequestedTargets: r.Targets,
+		Profile: domain.HybridSnapshotProfile{ProfileVersion: domain.StudentPlanningProfileVersion, OwnerVersion: 1, DirectionCode: "backend", SelfAssessedExperience: "beginner", KnownStacks: []string{}, DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 120, PreferredPace: "normal"},
+		Path:    domain.HybridSnapshotPath{ID: snapshotID("path"), CourseID: snapshotID("course"), GoalCode: "go.backend", CourseFingerprint: "fixture-course", PolicyVersion: "student-learning-path-v1", PlannerPolicyVersion: domain.PlannerVersion, Status: "ACTIVE", Version: version, JourneyVersion: version, Items: []domain.HybridSnapshotItem{{ID: snapshotID("item"), ReferenceType: "lesson", ReferenceID: snapshotID("lesson"), Position: 0, Status: domain.LearningPathItemPlanned, Targets: pathTargets, FrozenRequirements: []domain.HybridLessonRequirement{}}}},
+		Mastery: []domain.HybridSnapshotMastery{}, Evidence: []domain.HybridEvidenceReference{}, ActivityFacts: []domain.HybridSnapshotActivityFact{}, CourseBindings: []domain.HybridCourseActionBinding{}, PracticeBindings: []domain.HybridPracticeBinding{},
+		Availability: domain.HybridSnapshotAvailability{EvidenceQuality: derived, Stability: derived, RuntimeHold: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "RUNTIME_HOLD_NOT_OBSERVED"}, AutomaticAdaptation: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "AUTOMATIC_ADAPTATION_NOT_DEFINED"}, StudentPinning: domain.HybridSnapshotSignal{Status: "UNAVAILABLE", ReasonCode: "STUDENT_PINNING_NOT_DEFINED"}},
+	}
+	for _, target := range r.Targets {
+		s.Mastery = append(s.Mastery, domain.HybridSnapshotMastery{Target: target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion})
+	}
+	s.References, _ = domain.HybridSnapshotReferencesFor(s)
+	return s
+}
+func snapshotProcessorFixture(t *testing.T) (SnapshotProcessor, *snapshotJobsPort, *snapshotStudentPort, *snapshotTestClock) {
+	t.Helper()
+	jobs := newSnapshotJobsPort()
+	clock := &snapshotTestClock{now: time.Date(2026, 10, 5, 1, 0, 0, 0, time.UTC)}
+	students := &snapshotStudentPort{get: func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return snapshotOwnerFixture(r, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")}), nil
+	}}
+	p := SnapshotProcessor{Jobs: jobs, Students: students, Clock: clock, LeaseTTL: time.Minute, RetryDelay: time.Second}
+	return p, jobs, students, clock
+}
+
+func TestSnapshotWorkerCreatesOneDurableSnapshotJobAndNoMutation(t *testing.T) {
+	p, jobs, students, _ := snapshotProcessorFixture(t)
+	event := snapshotEvent("evidence", snapshotTarget("go.syntax"))
+	if _, err := (TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || students.calls != 1 || len(jobs.jobs) != 1 || jobs.pending {
+		t.Fatalf("processed=%v reads=%d jobs=%d pending=%v err=%v", processed, students.calls, len(jobs.jobs), jobs.pending, err)
+	}
+	for _, job := range jobs.jobs {
+		if job.PolicyVersion != domain.HybridReplanPolicyVersion || job.Snapshot.Path.Version != 1 {
+			t.Fatalf("job=%+v", job)
+		}
+	}
+}
+
+func TestTriggerIngressDedupeAndOutageNeverFetchStudent(t *testing.T) {
+	_, jobs, students, _ := snapshotProcessorFixture(t)
+	p := TriggerProcessor{Jobs: jobs}
+	e := snapshotEvent("same-evidence", snapshotTarget("go.syntax"))
+	created, err := p.ReceivePlanningStateEvent(context.Background(), e)
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	created, err = p.ReceivePlanningStateEvent(context.Background(), e)
+	if err != nil || created || students.calls != 0 || jobs.work.Generation != 1 {
+		t.Fatalf("replay created=%v reads=%d generation=%d err=%v", created, students.calls, jobs.work.Generation, err)
+	}
+	e.Data.PathVersion++
+	if _, err := p.ReceivePlanningStateEvent(context.Background(), e); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("same ID changed payload=%v", err)
+	}
+	jobs.failIngress = domain.ErrUpstreamUnavailable
+	e = snapshotEvent("outage", snapshotTarget("go.syntax"))
+	if _, err := p.ReceivePlanningStateEvent(context.Background(), e); !errors.Is(err, domain.ErrUpstreamUnavailable) || students.calls != 0 {
+		t.Fatalf("receipt outage=%v reads=%d", err, students.calls)
+	}
+	e.SchemaVersion = 2
+	calls := jobs.received
+	if _, err := p.ReceivePlanningStateEvent(context.Background(), e); !errors.Is(err, domain.ErrValidation) || jobs.received != calls {
+		t.Fatal("invalid fact reached durable port")
+	}
+}
+
+func TestSnapshotWorkerCoalescesBurstToFreshLatestOwnerState(t *testing.T) {
+	p, jobs, students, _ := snapshotProcessorFixture(t)
+	for i := 0; i < 5; i++ {
+		e := snapshotEvent(strings.Repeat("a", i+1), snapshotTarget("go.syntax"))
+		e.OccurredAt = e.OccurredAt.Add(time.Duration(i) * time.Second)
+		if _, err := (TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return snapshotOwnerFixture(r, 7, []domain.HybridTargetRef{snapshotTarget("go.syntax")}), nil
+	}
+	if _, err := p.ProcessNext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if students.calls != 1 || len(jobs.jobs) != 1 || jobs.work.Generation != 5 || jobs.pending {
+		t.Fatalf("reads=%d jobs=%d work=%+v", students.calls, len(jobs.jobs), jobs.work)
+	}
+	for _, job := range jobs.jobs {
+		if job.Snapshot.Path.Version != 7 || job.Snapshot.TriggerContext.CorrelationID != jobs.work.LatestEvent.EventID {
+			t.Fatalf("not latest coherent owner checkpoint: %+v", job)
+		}
+	}
+}
+
+func TestSnapshotWorkerRefetchesWholeTargetUnionWithoutMixedState(t *testing.T) {
+	p, jobs, students, _ := snapshotProcessorFixture(t)
+	a, b := snapshotTarget("go.a"), snapshotTarget("go.b")
+	(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent("union", a))
+	students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return snapshotOwnerFixture(r, int64(students.calls), []domain.HybridTargetRef{a, b}), nil
+	}
+	if _, err := p.ProcessNext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if students.calls != 2 || len(jobs.jobs) != 1 {
+		t.Fatalf("reads=%d jobs=%d", students.calls, len(jobs.jobs))
+	}
+	for _, job := range jobs.jobs {
+		if job.Snapshot.Path.Version != 2 || len(job.Snapshot.Mastery) != 2 || len(job.Snapshot.RequestedTargets) != 2 {
+			t.Fatalf("mixed/incomplete owner observation: %+v", job.Snapshot)
+		}
+	}
+}
+
+func TestSnapshotWorkerTargetChurnIsBoundedAndRetryable(t *testing.T) {
+	p, jobs, students, _ := snapshotProcessorFixture(t)
+	a := snapshotTarget("go.a")
+	(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent("churn", a))
+	students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return snapshotOwnerFixture(r, 1, []domain.HybridTargetRef{a, snapshotTarget("go." + strings.Repeat("z", students.calls))}), nil
+	}
+	if _, err := p.ProcessNext(context.Background()); !errors.Is(err, domain.ErrStateChanged) {
+		t.Fatalf("churn error=%v", err)
+	}
+	if students.calls != 3 || len(jobs.jobs) != 0 || !jobs.pending || jobs.releases != 1 {
+		t.Fatalf("reads=%d jobs=%d pending=%v releases=%d", students.calls, len(jobs.jobs), jobs.pending, jobs.releases)
+	}
+}
+
+func TestSnapshotWorkerOwnerOutageRetryAndLeaseRestartAreSafe(t *testing.T) {
+	p, jobs, students, clock := snapshotProcessorFixture(t)
+	(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent("outage", snapshotTarget("go.syntax")))
+	students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return domain.HybridPlanningSnapshot{}, domain.ErrUpstreamUnavailable
+	}
+	if _, err := p.ProcessNext(context.Background()); !errors.Is(err, domain.ErrUpstreamUnavailable) || !jobs.pending || len(jobs.jobs) != 0 || jobs.releases != 1 {
+		t.Fatalf("outage state pending=%v releases=%d err=%v", jobs.pending, jobs.releases, err)
+	}
+	if processed, err := p.ProcessNext(context.Background()); err != nil || processed {
+		t.Fatalf("retried before durable retry time: %v %v", processed, err)
+	}
+	clock.now = clock.now.Add(2 * time.Second)
+	students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		return snapshotOwnerFixture(r, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")}), nil
+	}
+	_, claimed, err := jobs.ClaimHybridEvaluationWork(context.Background(), clock.now, p.LeaseTTL)
+	if err != nil || !claimed {
+		t.Fatal("claim fixture failed")
+	}
+	if processed, _ := p.ProcessNext(context.Background()); processed {
+		t.Fatal("restart stole unexpired claim")
+	}
+	clock.now = clock.now.Add(2 * p.LeaseTTL)
+	restarted := p
+	if _, err := restarted.ProcessNext(context.Background()); err != nil || len(jobs.jobs) != 1 || jobs.pending {
+		t.Fatalf("lease restart failed jobs=%d pending=%v err=%v", len(jobs.jobs), jobs.pending, err)
+	}
+}
+
+func TestSnapshotWorkerGenerationRaceAndRepeatedSnapshotKeepOneJob(t *testing.T) {
+	p, jobs, _, _ := snapshotProcessorFixture(t)
+	(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent("first", snapshotTarget("go.syntax")))
+	jobs.beforeCheckpoint = func() {
+		jobs.beforeCheckpoint = nil
+		(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent("new-during-fetch", snapshotTarget("go.syntax")))
+	}
+	if _, err := p.ProcessNext(context.Background()); err != nil || !jobs.pending || jobs.work.Generation != 2 || len(jobs.jobs) != 1 {
+		t.Fatalf("new ingress lost pending=%v gen=%d jobs=%d err=%v", jobs.pending, jobs.work.Generation, len(jobs.jobs), err)
+	}
+	if _, err := p.ProcessNext(context.Background()); err != nil || jobs.pending || len(jobs.jobs) != 1 {
+		t.Fatalf("same snapshot duplicate job=%d pending=%v err=%v", len(jobs.jobs), jobs.pending, err)
+	}
+}
+
+func TestSnapshotWorkerFailsClosedAndKeepsDurableWorkOnInvalidOwnerOrStorageFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		setup    func(*snapshotJobsPort, *snapshotStudentPort)
+		expected error
+	}{
+		{"malformed authoritative response", func(j *snapshotJobsPort, s *snapshotStudentPort) {
+			s.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+				owner := snapshotOwnerFixture(r, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")})
+				owner.Mastery = nil
+				return owner, nil
+			}
+		}, domain.ErrUpstreamInvalid},
+		{"checkpoint storage outage", func(j *snapshotJobsPort, s *snapshotStudentPort) { j.failCheckpoint = domain.ErrUpstreamUnavailable }, domain.ErrUpstreamUnavailable},
+		{"checkpoint and release outage", func(j *snapshotJobsPort, s *snapshotStudentPort) {
+			j.failCheckpoint = domain.ErrUpstreamUnavailable
+			j.failRelease = domain.ErrConflict
+		}, domain.ErrUpstreamUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, jobs, students, clock := snapshotProcessorFixture(t)
+			(TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), snapshotEvent(tc.name, snapshotTarget("go.syntax")))
+			tc.setup(jobs, students)
+			if processed, err := p.ProcessNext(context.Background()); !processed || !errors.Is(err, tc.expected) {
+				t.Fatalf("processed=%v err=%v", processed, err)
+			}
+			if len(jobs.inbox) != 1 || len(jobs.jobs) != 0 || !jobs.pending || jobs.releases != 1 {
+				t.Fatalf("failure lost durable work inbox=%d jobs=%d pending=%v releases=%d", len(jobs.inbox), len(jobs.jobs), jobs.pending, jobs.releases)
+			}
+			jobs.failCheckpoint = nil
+			jobs.failRelease = nil
+			clock.now = clock.now.Add(2 * p.LeaseTTL)
+			students.get = func(r domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+				return snapshotOwnerFixture(r, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")}), nil
+			}
+			restarted := p
+			if _, err := restarted.ProcessNext(context.Background()); err != nil || len(jobs.jobs) != 1 || jobs.pending {
+				t.Fatalf("storage recovery lost job=%d pending=%v err=%v", len(jobs.jobs), jobs.pending, err)
+			}
+		})
+	}
+}
+
+func TestSnapshotWorkerLocalStaleRecoveryRetainsRealFactAndIdentity(t *testing.T) {
+	p, jobs, student, _ := snapshotProcessorFixture(t)
+	event := snapshotEvent("recovery-real-fact", snapshotTarget("go.syntax"))
+	if _, err := (TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	jobs.work.LocalReason = "OWNER_APPLICATION_STALE"
+	student.get = func(request domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		if request.TriggerContext.CorrelationID != event.EventID || request.TriggerContext.Kind != event.Data.TriggerKind || request.TriggerContext.Reason != "Planner recovery after stale owner application" {
+			t.Fatal("local recovery fabricated owner trigger")
+		}
+		return snapshotOwnerFixture(request, 2, request.Targets), nil
+	}
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || len(jobs.inbox) != 1 || jobs.work.LatestEvent.EventID != event.EventID || len(jobs.jobs) != 1 {
+		t.Fatalf("recovery=%v err=%v", processed, err)
+	}
+}
+
+func TestSnapshotWorkerRefetchesBindingOnlyTargetsCoherently(t *testing.T) {
+	for _, kind := range []string{"practice", "course"} {
+		t.Run(kind, func(t *testing.T) {
+			p, jobs, student, _ := snapshotProcessorFixture(t)
+			event := snapshotEvent("binding-only-"+kind, snapshotTarget("go.syntax"))
+			if _, err := (TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			extra := snapshotTarget("go.bound-source-only")
+			student.get = func(request domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+				s := snapshotOwnerFixture(request, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")})
+				if kind == "practice" {
+					revision := snapshotID("bound-practice-revision")
+					s.Path.Items[0].ReferenceType = "practice"
+					s.Path.Items[0].ReferenceID = revision
+					s.PracticeBindings = []domain.HybridPracticeBinding{{LearningActionID: snapshotID("bound-practice-action"), TaskInstanceID: snapshotID("bound-practice-instance"), TaskRevisionID: revision, TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), LearningPathID: s.LearningPathID, SurfaceClassification: "practice", LifecycleStatus: "CLOSED", LearningTargets: []domain.HybridTargetRef{extra}, LearningPathVersionReservation: 1, LearningPathPositionReservation: 0}}
+				} else {
+					item := &s.Path.Items[0]
+					item.LessonRevisionID = snapshotID("bound-lesson-revision")
+					requirement := domain.HybridLessonRequirement{ID: snapshotID("bound-course-requirement"), ActivityID: snapshotID("bound-course-activity"), Type: "task_passed", Required: true, SourceReference: domain.HybridLessonSourceReference{ID: snapshotID("bound-course-task"), RevisionID: snapshotID("bound-course-revision")}}
+					item.FrozenRequirements = []domain.HybridLessonRequirement{requirement}
+					s.CourseBindings = []domain.HybridCourseActionBinding{{LearningActionID: snapshotID("bound-course-action"), AnswerID: snapshotID("bound-course-answer"), TaskID: requirement.SourceReference.ID, LearningPathItemID: item.ID, RequirementID: requirement.ID, LifecycleStatus: "OPEN", AnswerStatus: 1, LearningTargets: []domain.HybridTargetRef{extra}, OpenedAt: s.CapturedAt}}
+				}
+				s.References, _ = domain.HybridSnapshotReferencesFor(s)
+				return s, nil
+			}
+			processed, err := p.ProcessNext(context.Background())
+			if err != nil || !processed || student.calls != 2 || len(jobs.jobs) != 1 {
+				t.Fatalf("binding-only target not refetched reads=%d processed=%v err=%v", student.calls, processed, err)
+			}
+			for _, job := range jobs.jobs {
+				if len(job.Snapshot.RequestedTargets) != 2 || len(job.Snapshot.Mastery) != 2 {
+					t.Fatal("mixed or incomplete binding target observation")
+				}
+			}
+		})
+	}
+}
+func TestSnapshotWorkerCompleteTargetUnionAboveFiveHundredFailsClosed(t *testing.T) {
+	p, jobs, student, _ := snapshotProcessorFixture(t)
+	event := snapshotEvent("oversized-bindings", snapshotTarget("go.syntax"))
+	if _, err := (TriggerProcessor{Jobs: jobs}).ReceivePlanningStateEvent(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	student.get = func(request domain.HybridSnapshotRequest) (domain.HybridPlanningSnapshot, error) {
+		s := snapshotOwnerFixture(request, 1, []domain.HybridTargetRef{snapshotTarget("go.syntax")})
+		for n := 0; n < 6; n++ {
+			revision := snapshotID(fmt.Sprintf("large-binding-revision-%d", n))
+			item := s.Path.Items[0]
+			item.ID = snapshotID(fmt.Sprintf("large-binding-item-%d", n))
+			item.ReferenceType = "practice"
+			item.ReferenceID = revision
+			if n == 0 {
+				item.Position = 0
+				s.Path.Items[0] = item
+			} else {
+				item.Position = n
+				s.Path.Items = append(s.Path.Items, item)
+			}
+			targets := []domain.HybridTargetRef{}
+			for k := 0; k < 100; k++ {
+				targets = append(targets, snapshotTarget(fmt.Sprintf("binding-%d-target-%03d", n, k)))
+			}
+			s.PracticeBindings = append(s.PracticeBindings, domain.HybridPracticeBinding{LearningActionID: snapshotID(fmt.Sprintf("large-action-%d", n)), TaskInstanceID: snapshotID(fmt.Sprintf("large-instance-%d", n)), TaskRevisionID: revision, TaskRevisionDigest: "sha256:" + strings.Repeat("b", 64), LearningPathID: s.LearningPathID, SurfaceClassification: "practice", LifecycleStatus: "CLOSED", LearningTargets: targets, LearningPathVersionReservation: 1, LearningPathPositionReservation: n})
+		}
+		s.References, _ = domain.HybridSnapshotReferencesFor(s)
+		return s, nil
+	}
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrUpstreamInvalid) || len(jobs.jobs) != 0 || !jobs.pending || jobs.releases != 1 {
+		t.Fatalf("oversized complete union accepted jobs=%d pending=%v err=%v", len(jobs.jobs), jobs.pending, err)
+	}
+}

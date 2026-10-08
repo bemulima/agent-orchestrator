@@ -1,0 +1,168 @@
+package postgres_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	plannerpostgres "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root alone runs this actual repository proof after creating a coherent job
+// through the registered Student snapshot boundary. No evidence/mastery/path/job
+// is seeded here; the temporary error trigger is explicitly a DB failure fixture.
+func TestT203HybridConsequencePostgresLifecycle(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("PLANNER_T20_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("PLANNER_T20_DATABASE_URL not configured")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_planner_integration_proof" {
+		t.Fatal("exact isolated T20 planner database required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := plannerpostgres.Store{Pool: pool}
+	work, found, err := store.ClaimHybridConsequenceEvaluation(ctx, time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("SETUP: root must prepare a fresh actual owner snapshot job before this repository proof")
+	}
+	policy, err := store.GetActivePolicyBundle(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.MasterySkipConfidence != domain.DefaultMasteryConfidence {
+		t.Fatalf("existing confidence threshold unexpectedly%v", policy.MasterySkipConfidence)
+	}
+	graph := domain.HybridPrerequisiteGraph{GoalCode: work.Job.Snapshot.Path.GoalCode, Targets: []domain.HybridPrerequisiteTarget{}}
+	ownerGraph, err := store.GetPublishedGoalGraph(ctx, graph.GoalCode)
+	if err == nil {
+		graph.Available = true
+		graph.GoalVersion = ownerGraph.Goal.Version
+		graph.GraphVersion = ownerGraph.Goal.GraphVersion
+		for _, target := range ownerGraph.Targets {
+			row := domain.HybridPrerequisiteTarget{Ref: domain.HybridTargetRef{Type: target.Ref.Type, Key: target.Ref.Key, Version: target.Ref.Version}, Prerequisites: []domain.HybridTargetRef{}}
+			for _, pre := range target.Prerequisites {
+				row.Prerequisites = append(row.Prerequisites, domain.HybridTargetRef{Type: pre.Type, Key: pre.Key, Version: pre.Version})
+			}
+			graph.Targets = append(graph.Targets, row)
+		}
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal(err)
+	}
+	pinned, err := store.CheckpointHybridConsequenceInputs(ctx, work, policy, graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned.Inputs == nil || pinned.Inputs.InputHash == "" {
+		t.Fatal("missing durable policy pin")
+	}
+	firstHash := pinned.Inputs.InputHash
+	if err = store.ReleaseHybridConsequenceEvaluation(ctx, pinned, time.Unix(1, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := plannerpostgres.Store{Pool: pool}
+	again, found, err := restarted.ClaimHybridConsequenceEvaluation(ctx, time.Now().UTC(), time.Minute)
+	if err != nil || !found || again.Job.ID != pinned.Job.ID || again.Inputs == nil || again.Inputs.InputHash != firstHash {
+		t.Fatalf("restart lost pin:%#v %v", again, err)
+	}
+	// Named mutation fixture: a later observed policy cannot overwrite a first pin.
+	changedPolicy := policy
+	changedPolicy.MasterySkipConfidence = .99
+	again, err = restarted.CheckpointHybridConsequenceInputs(ctx, again, changedPolicy, graph)
+	if err != nil || again.Inputs.InputHash != firstHash || again.Inputs.Policy.MasterySkipConfidence != policy.MasterySkipConfidence {
+		t.Fatal("policy activation drift changed pinned evaluator inputs")
+	}
+	consequence, err := domain.EvaluateHybridSnapshot(again.Job.Snapshot, *again.Inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CompleteHybridConsequenceEvaluation(ctx, pinned, consequence); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("retired claim token completed newer evaluation:%v", err)
+	}
+	if err = store.ReleaseHybridConsequenceEvaluation(ctx, pinned, time.Now()); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("retired claim token cleared newer evaluator lease:%v", err)
+	}
+	forged := consequence
+	forged.ReasonCodes = []string{"CONFIDENCE_INSUFFICIENT"}
+	if consequence.ReasonCodes[0] == "CONFIDENCE_INSUFFICIENT" {
+		forged.ReasonCodes = []string{"NO_SIGNIFICANT_CHANGE"}
+	}
+	if domain.ValidateHybridConsequence(forged) == nil {
+		if _, err = restarted.CompleteHybridConsequenceEvaluation(ctx, again, forged); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("non-evaluator result accepted:%v", err)
+		}
+	} else {
+		t.Fatal("forged wire fixture must remain structurally valid")
+	}
+	// Force an actual PostgreSQL insert failure after claim and immutable input read.
+	_, err = pool.Exec(ctx, `CREATE FUNCTION t203_fail_receipt_fixture() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'T203_NAMED_DB_FAILURE_FIXTURE'; END; $$ LANGUAGE plpgsql; CREATE TRIGGER t203_fail_receipt_fixture BEFORE INSERT ON hybrid_consequence_receipt FOR EACH ROW EXECUTE FUNCTION t203_fail_receipt_fixture();`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS t203_fail_receipt_fixture ON hybrid_consequence_receipt; DROP FUNCTION IF EXISTS t203_fail_receipt_fixture();`)
+	}()
+	if _, err = restarted.CompleteHybridConsequenceEvaluation(ctx, again, consequence); err == nil || !strings.Contains(err.Error(), "T203_NAMED_DB_FAILURE_FIXTURE") {
+		t.Fatalf("forced insert failure missing:%v", err)
+	}
+	var receipts int
+	var completed bool
+	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM hybrid_consequence_receipt WHERE job_id=$1),completed FROM hybrid_consequence_work WHERE job_id=$1`, again.Job.ID).Scan(&receipts, &completed); err != nil || receipts != 0 || completed {
+		t.Fatalf("partial consequence after rollback receipts%d completed%v:%v", receipts, completed, err)
+	}
+	if _, err = pool.Exec(ctx, `DROP TRIGGER t203_fail_receipt_fixture ON hybrid_consequence_receipt; DROP FUNCTION t203_fail_receipt_fixture();`); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := restarted.CompleteHybridConsequenceEvaluation(ctx, again, consequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := restarted.CompleteHybridConsequenceEvaluation(ctx, again, consequence)
+	if err != nil || replay.PayloadHash != receipt.PayloadHash || !replay.CommittedAt.Equal(receipt.CommittedAt) {
+		t.Fatalf("lost-ACK receipt replay:%v", err)
+	}
+	changed := consequence
+	changed.ExpectedPathRevision++
+	if _, err = restarted.CompleteHybridConsequenceEvaluation(ctx, again, changed); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("changed payload under same consequenceID:%v", err)
+	}
+	if err = restarted.ReleaseHybridConsequenceEvaluation(ctx, again, time.Now()); !errors.Is(err, domain.ErrConflict) {
+		t.Fatal("completed claim released")
+	}
+	for _, query := range []string{
+		`UPDATE hybrid_consequence_input SET input_hash=input_hash WHERE job_id=$1`,
+		`DELETE FROM hybrid_consequence_input WHERE job_id=$1`,
+		`UPDATE hybrid_consequence_receipt SET payload_hash=payload_hash WHERE job_id=$1`,
+		`DELETE FROM hybrid_consequence_receipt WHERE job_id=$1`,
+	} {
+		if _, err = pool.Exec(ctx, query, again.Job.ID); err == nil {
+			t.Fatalf("immutable input/receipt mutated:%s", query)
+		}
+	}
+	for _, query := range []string{`TRUNCATE hybrid_consequence_input`, `TRUNCATE hybrid_consequence_receipt`, `TRUNCATE hybrid_evaluation_job CASCADE`, `TRUNCATE hybrid_planning_state_inbox CASCADE`} {
+		if _, err = pool.Exec(ctx, query); err == nil {
+			t.Fatalf("durable history truncated:%s", query)
+		}
+	}
+	if stored, err := restarted.GetHybridConsequence(ctx, again.Job.ID); err != nil || stored.PayloadHash != receipt.PayloadHash {
+		t.Fatal("negative guards failed to preserve receipt")
+	}
+	t.Logf("actual job=%s snapshot=%s policy_input_hash=%s consequence=%s outcome=%s durable replay and rollback preserved", again.Job.ID, again.Job.SnapshotRef, firstHash, receipt.Consequence.ConsequenceID, receipt.Consequence.Outcome)
+}

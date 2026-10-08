@@ -1,0 +1,128 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type readinessRepositoryFake struct {
+	ports.Repository
+	instance domain.TaskInstance
+	receipts map[string]string
+	saves    int
+}
+
+func (repository *readinessRepositoryFake) GetInstance(_ context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if studentID != repository.instance.StudentID || instanceID != repository.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return repository.instance, nil
+}
+
+func (repository *readinessRepositoryFake) CreateOrLoadCommandReceipt(_ context.Context, idempotencyKey, instanceID, commandType, digest string) (bool, error) {
+	key := instanceID + ":" + commandType + ":" + idempotencyKey
+	if previous, ok := repository.receipts[key]; ok {
+		if previous != digest {
+			return false, domain.ErrIdempotency
+		}
+		return false, nil
+	}
+	repository.receipts[key] = digest
+	return true, nil
+}
+
+func (repository *readinessRepositoryFake) SaveInstance(_ context.Context, instance domain.TaskInstance) (domain.TaskInstance, error) {
+	repository.saves++
+	instance.Version++
+	repository.instance = instance
+	return instance, nil
+}
+
+type readinessPlannerFake struct {
+	ports.LearningRouteProvider
+	byKey map[string]domain.LearningReadinessReceipt
+	input ports.ReconcileLearningReadiness
+	ready bool
+	calls int
+	wrong bool
+}
+
+func (planner *readinessPlannerFake) ReconcileReadiness(_ context.Context, input ports.ReconcileLearningReadiness) (domain.LearningReadinessReceipt, error) {
+	planner.calls++
+	planner.input = input
+	if receipt, ok := planner.byKey[input.IdempotencyKey]; ok {
+		return receipt, nil
+	}
+	receipt := domain.LearningReadinessReceipt{Schema: "practice-learning-readiness-receipt.v1", ID: "00000000-0000-4000-8000-000000000091",
+		TaskInstanceID: input.TaskInstanceID, StudentID: input.StudentID, TaskRevisionID: input.TaskRevisionID,
+		TaskRevisionDigest: input.RevisionDigest, RouteID: input.RouteID, RouteDigest: input.RouteDigest, StepID: input.StepID,
+		Decision: "NOT_READY", LearnerStateDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		MasteryPolicyVersion: domain.LearningReadinessMasteryPolicyV1, ObservedAt: time.Date(2026, 10, 2, 1, 0, 0, 0, time.UTC)}
+	if planner.ready {
+		receipt.ID = "00000000-0000-4000-8000-000000000092"
+		receipt.Decision = "READY"
+	}
+	if planner.wrong {
+		receipt.TaskRevisionID = "00000000-0000-4000-8000-000000000099"
+	}
+	planner.byKey[input.IdempotencyKey] = receipt
+	return receipt, nil
+}
+
+func TestReconcileStepReadinessUsesPlannerReceiptAndPersistsMonotonicTransition(t *testing.T) {
+	instance := readinessTestInstance()
+	repository := &readinessRepositoryFake{instance: instance, receipts: make(map[string]string)}
+	planner := &readinessPlannerFake{byKey: make(map[string]domain.LearningReadinessReceipt)}
+	runtime := Runtime{Repository: repository, Planner: planner, Now: func() time.Time { return time.Date(2026, 10, 2, 2, 0, 0, 0, time.UTC) }}
+	keyNotReady := "00000000-0000-4000-8000-000000000010"
+	first, status, err := runtime.ReconcileStepReadiness(context.Background(), instance.StudentID, instance.ID, "checkpoint-one", keyNotReady)
+	if err != nil || status != 200 || first.Receipt.Decision != "NOT_READY" || first.Instance.Steps[0].Status != "LEARNING_REQUIRED" {
+		t.Fatalf("NOT_READY result = (%+v, %d, %v)", first, status, err)
+	}
+	replay, status, err := runtime.ReconcileStepReadiness(context.Background(), instance.StudentID, instance.ID, "checkpoint-one", keyNotReady)
+	if err != nil || status != 200 || replay.Receipt.ID != first.Receipt.ID || planner.calls != 2 {
+		t.Fatalf("same-key replay = (%+v, calls=%d, %d, %v)", replay, planner.calls, status, err)
+	}
+	planner.ready = true
+	keyReady := "00000000-0000-4000-8000-000000000011"
+	ready, status, err := runtime.ReconcileStepReadiness(context.Background(), instance.StudentID, instance.ID, "checkpoint-one", keyReady)
+	if err != nil || status != 200 || ready.Receipt.Decision != "READY" || ready.Instance.Steps[0].Status != "AVAILABLE" || repository.saves != 2 {
+		t.Fatalf("READY result = (%+v, saves=%d, %d, %v)", ready, repository.saves, status, err)
+	}
+	if planner.input.TaskRevisionID != instance.TaskRevisionID || planner.input.RouteID != instance.LearningRoute.ID || planner.input.StepID != "checkpoint-one" {
+		t.Fatalf("Planner did not receive exact frozen identity: %+v", planner.input)
+	}
+	if repository.instance.Steps[0].ReadinessReceipt == nil || repository.instance.Steps[0].ReadinessIdempotencyKey != keyReady {
+		t.Fatalf("readiness receipt was not persisted with step: %+v", repository.instance.Steps[0])
+	}
+}
+
+func TestReconcileStepReadinessRejectsWrongPlannerIdentityAndKeyReuse(t *testing.T) {
+	instance := readinessTestInstance()
+	repository := &readinessRepositoryFake{instance: instance, receipts: make(map[string]string)}
+	planner := &readinessPlannerFake{byKey: make(map[string]domain.LearningReadinessReceipt), wrong: true}
+	runtime := Runtime{Repository: repository, Planner: planner}
+	key := "00000000-0000-4000-8000-000000000012"
+	_, status, err := runtime.ReconcileStepReadiness(context.Background(), instance.StudentID, instance.ID, "checkpoint-one", key)
+	if !errors.Is(err, domain.ErrDependency) || status != 503 || repository.saves != 0 {
+		t.Fatalf("wrong Planner identity = (%d, %v), saves=%d", status, err, repository.saves)
+	}
+	planner.wrong = false
+	_, status, err = runtime.ReconcileStepReadiness(context.Background(), instance.StudentID, instance.ID, "checkpoint-two", key)
+	if !errors.Is(err, domain.ErrIdempotency) || status != 409 {
+		t.Fatalf("same key for different step = (%d, %v), want idempotency conflict", status, err)
+	}
+}
+
+func readinessTestInstance() domain.TaskInstance {
+	return domain.TaskInstance{ID: "00000000-0000-4000-8000-000000000001", StudentID: "00000000-0000-4000-8000-000000000002",
+		TaskRevisionID: "00000000-0000-4000-8000-000000000003", TaskRevisionDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Status: domain.TaskInstanceInProgress, LearningRoute: domain.LearningRouteReceipt{ID: "00000000-0000-4000-8000-000000000004",
+			RouteDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+		Steps: []domain.Step{{ID: "checkpoint-one", Required: true, Status: "LEARNING_REQUIRED"}, {ID: "checkpoint-two", Required: true, Status: "LEARNING_REQUIRED"}}}
+}

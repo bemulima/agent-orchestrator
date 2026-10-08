@@ -1,0 +1,745 @@
+package usecase
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+)
+
+const (
+	maximumManifestBytes     = 64 << 10
+	verificationWorkspaceTTL = 15 * time.Minute
+	authoringLease           = 2 * time.Minute
+	leaseRenewTimeout        = 5 * time.Second
+)
+
+var verificationDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var gitCommitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
+type Planner struct {
+	Jobs               domain.JobRepository
+	Generator          domain.CandidateGenerator
+	Competencies       domain.CompetencyResolver
+	Profiles           domain.RuntimeProfileCatalog
+	Validation         domain.ValidationAuthoringClient
+	Workspaces         domain.VerificationWorkspaceClient
+	Stager             domain.PracticeStager
+	Policy             domain.GenerationPolicy
+	Now                func() time.Time
+	LeaseDuration      time.Duration
+	LeaseRenewInterval time.Duration
+}
+
+func (planner Planner) Plan(ctx context.Context, idempotencyKey string, request domain.PlanningRequestV1) (domain.PlanningJob, bool, error) {
+	normalized, requestHash, err := normalizePlanningRequest(request)
+	if err != nil {
+		return domain.PlanningJob{}, false, err
+	}
+	if !validUUID(idempotencyKey) {
+		return domain.PlanningJob{}, false, fmt.Errorf("%w: Idempotency-Key must be a UUID", domain.ErrValidation)
+	}
+	if err := planner.validateDependencies(); err != nil {
+		return domain.PlanningJob{}, false, err
+	}
+	now := planner.now()
+	job := domain.PlanningJob{
+		ID: newUUID(), IdempotencyKey: idempotencyKey, RequestHash: requestHash,
+		Request: normalized, Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now,
+	}
+	stored, created, err := planner.Jobs.Ensure(ctx, job)
+	if err != nil {
+		return domain.PlanningJob{}, false, err
+	}
+	if stored.RequestHash != requestHash {
+		return domain.PlanningJob{}, false, domain.ErrConflict
+	}
+	if stored.Status == domain.JobStatusReady || stored.Status == domain.JobStatusStaged {
+		return stored, false, nil
+	}
+	processed, err := planner.Process(ctx, stored.ID)
+	if err != nil {
+		if current, getErr := planner.Jobs.Get(ctx, stored.ID); getErr == nil {
+			return current, created, err
+		}
+	}
+	return processed, created, err
+}
+
+func (planner Planner) Process(ctx context.Context, jobID string) (domain.PlanningJob, error) {
+	if !validUUID(jobID) {
+		return domain.PlanningJob{}, domain.ErrValidation
+	}
+	if err := planner.validateDependencies(); err != nil {
+		return domain.PlanningJob{}, err
+	}
+	token := newUUID()
+	job, err := planner.Jobs.Claim(ctx, jobID, token, planner.now(), planner.leaseDuration())
+	if err != nil {
+		return domain.PlanningJob{}, err
+	}
+	if job.Status == domain.JobStatusReady || job.Status == domain.JobStatusStaged {
+		return job, nil
+	}
+
+	failureCode := "authoring_failed"
+	failed := true
+	defer func() {
+		if failed {
+			_ = planner.Jobs.SaveFailed(context.Background(), job.ID, token, failureCode, planner.now())
+		}
+	}()
+	pipelineCtx, stopHeartbeat := planner.startLeaseHeartbeat(ctx, job.ID, token)
+	heartbeatStopped := false
+	defer func() {
+		if !heartbeatStopped {
+			_ = stopHeartbeat()
+		}
+	}()
+
+	profiles, err := planner.Profiles.ListRuntimeProfiles(pipelineCtx)
+	if err != nil {
+		failureCode = "runtime_catalog_unavailable"
+		return domain.PlanningJob{}, err
+	}
+	if len(profiles) == 0 {
+		failureCode = "runtime_catalog_empty"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+	learningTargets, err := planner.Competencies.DiscoverTargets(pipelineCtx, job.Request.Hints.Stacks)
+	if err != nil {
+		failureCode = "competency_catalog_unavailable"
+		return domain.PlanningJob{}, err
+	}
+	if len(learningTargets) == 0 {
+		failureCode = "competency_catalog_empty"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+	candidate, err := planner.Generator.Generate(pipelineCtx, domain.GenerationInput{
+		JobID: job.ID, Request: job.Request, ManifestDigest: job.RequestHash, Policy: planner.Policy,
+		RuntimeProfiles: append([]domain.RuntimeProfileDescriptor(nil), profiles...),
+		LearningTargets: append([]domain.LearningTargetDescriptor(nil), learningTargets...),
+	})
+	if err != nil {
+		failureCode = "candidate_generation_failed"
+		return domain.PlanningJob{}, err
+	}
+	planner.enforceProvenance(&candidate, job)
+	if err := candidate.Validate(); err != nil {
+		failureCode = "candidate_quality_gate_failed"
+		return domain.PlanningJob{}, err
+	}
+	if desired := job.Request.DesiredDifficultyLevel(); desired != "" && candidate.Blueprint.Difficulty.DerivedLevel != desired {
+		failureCode = "candidate_difficulty_mismatch"
+		return domain.PlanningJob{}, fmt.Errorf("%w: generated difficulty does not match trusted authoring intent", domain.ErrValidation)
+	}
+	if _, err := domain.BuildTechnicalTaskV1(candidate); err != nil {
+		failureCode = "technical_task_quality_gate_failed"
+		return domain.PlanningJob{}, err
+	}
+
+	targets := domain.BlueprintLearningTargets(candidate.Blueprint)
+	if !learningTargetsOffered(targets, learningTargets) {
+		failureCode = "competency_resolution_failed"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+	if err := planner.Competencies.ResolveExactTargets(pipelineCtx, targets); err != nil {
+		failureCode = "competency_resolution_failed"
+		return domain.PlanningJob{}, err
+	}
+	if !runtimeProfileSupported(candidate.Blueprint.Runtime, profiles) {
+		failureCode = "runtime_profile_unavailable"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+
+	inspection, err := planner.Validation.InspectContract(pipelineCtx, candidate.PrivateEvaluation.CodeStructure)
+	if err != nil {
+		failureCode = "validation_contract_invalid"
+		return domain.PlanningJob{}, err
+	}
+	if !inspection.Runnable || len(inspection.MissingEngines) != 0 || inspection.ContractVersion != 1 || inspection.ContractKind != "workspace_contract" || !verificationDigestPattern.MatchString(inspection.ContractDigest) || !verificationDigestPattern.MatchString(inspection.CapabilitiesDigest) {
+		failureCode = "validation_capability_missing"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+	if err := planner.Jobs.MarkVerifying(pipelineCtx, job.ID, token, planner.now()); err != nil {
+		failureCode = "job_state_conflict"
+		return domain.PlanningJob{}, err
+	}
+
+	blueprintDigest, err := jsonDigest(candidate.Blueprint)
+	if err != nil {
+		return domain.PlanningJob{}, err
+	}
+	verificationCases, cleanup, err := planner.createVerificationCases(pipelineCtx, candidate)
+	if err != nil {
+		failureCode = "verification_workspace_failed"
+		return domain.PlanningJob{}, err
+	}
+	defer cleanup()
+	receipt, err := planner.Validation.VerifyContract(pipelineCtx, domain.VerificationRequestV1{
+		Schema: "validation-contract-verification-request.v1", BlueprintDigest: blueprintDigest,
+		RuntimeProfileDigest: candidate.Blueprint.Runtime.ProfileRef.Digest,
+		CodeStructure:        candidate.PrivateEvaluation.CodeStructure, Cases: verificationCases,
+	})
+	if err != nil {
+		failureCode = "executable_verification_failed"
+		return domain.PlanningJob{}, err
+	}
+	if !validVerificationReceipt(receipt, blueprintDigest, candidate.Blueprint.Runtime.ProfileRef.Digest, inspection, verificationCases) {
+		failureCode = "executable_verification_rejected"
+		return domain.PlanningJob{}, domain.ErrNotRunnable
+	}
+	candidateDigest, err := candidate.Digest()
+	if err != nil {
+		return domain.PlanningJob{}, err
+	}
+	artifact := domain.AuthoringArtifact{
+		Candidate: candidate, CandidateDigest: candidateDigest,
+		CapabilitiesDigest: inspection.CapabilitiesDigest, ContractDigest: inspection.ContractDigest,
+		Verification: receipt,
+	}
+	if err := stopHeartbeat(); err != nil {
+		failureCode = "job_state_conflict"
+		return domain.PlanningJob{}, err
+	}
+	heartbeatStopped = true
+	if err := planner.Jobs.SaveReady(ctx, job.ID, token, artifact, planner.now()); err != nil {
+		failureCode = "job_state_conflict"
+		return domain.PlanningJob{}, err
+	}
+	failed = false
+	return planner.Jobs.Get(ctx, job.ID)
+}
+
+func (planner Planner) Get(ctx context.Context, jobID string) (domain.PlanningJob, error) {
+	if planner.Jobs == nil || !validUUID(jobID) {
+		return domain.PlanningJob{}, domain.ErrValidation
+	}
+	return planner.Jobs.Get(ctx, jobID)
+}
+
+func (planner Planner) GetTechnicalTask(ctx context.Context, jobID string) (domain.TechnicalTaskV1, error) {
+	job, err := planner.Get(ctx, jobID)
+	if err != nil {
+		return domain.TechnicalTaskV1{}, err
+	}
+	if job.Status != domain.JobStatusReady || job.Artifact == nil {
+		return domain.TechnicalTaskV1{}, domain.ErrConflict
+	}
+	candidate := job.Artifact.Candidate
+	// Historical v1 READY rows predate authored surface classification. The
+	// technical-task projection does not expose surface and remains readable;
+	// Practice staging still fails closed because it is bound to verified blueprint.
+	if job.Request.Schema == domain.PlanningRequestSchemaV1 && candidate.Blueprint.Classification.SurfaceClassification == "" {
+		candidate.Blueprint.Classification.SurfaceClassification = domain.SurfaceClassificationPractice
+	}
+	return domain.BuildTechnicalTaskV1(candidate)
+}
+
+func (planner Planner) GetStudentTechnicalTask(ctx context.Context, jobID string) (domain.StudentTechnicalTaskViewV1, error) {
+	task, err := planner.GetTechnicalTask(ctx, jobID)
+	if err != nil {
+		return domain.StudentTechnicalTaskViewV1{}, err
+	}
+	return task.StudentView(), nil
+}
+
+func (planner Planner) Stage(ctx context.Context, jobID string) (domain.PlanningJob, error) {
+	if planner.Jobs == nil || planner.Stager == nil || !validUUID(jobID) {
+		return domain.PlanningJob{}, domain.ErrValidation
+	}
+	job, err := planner.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return domain.PlanningJob{}, err
+	}
+	if job.Status == domain.JobStatusStaged && job.Staging != nil {
+		return job, nil
+	}
+	if job.Status != domain.JobStatusReady || job.Artifact == nil {
+		return domain.PlanningJob{}, domain.ErrConflict
+	}
+	if job.LegacyPublicationPresent {
+		return domain.PlanningJob{}, fmt.Errorf("%w: legacy publication receipt requires explicit reconciliation", domain.ErrConflict)
+	}
+	if job.Artifact.Candidate.Blueprint.Classification.SurfaceClassification != job.Request.TrustedSurfaceClassification() ||
+		(job.Request.DesiredDifficultyLevel() != "" && job.Artifact.Candidate.Blueprint.Difficulty.DerivedLevel != job.Request.DesiredDifficultyLevel()) {
+		return domain.PlanningJob{}, fmt.Errorf("%w: stored artifact does not match trusted authoring intent", domain.ErrValidation)
+	}
+	staging, err := planner.Stager.Stage(ctx, job.ID, *job.Artifact)
+	if err != nil {
+		return domain.PlanningJob{}, err
+	}
+	if !validStagingReceipt(staging, job) {
+		return domain.PlanningJob{}, domain.ErrValidation
+	}
+	if err := planner.Jobs.SaveStaging(ctx, job.ID, staging, planner.now()); err != nil {
+		return domain.PlanningJob{}, err
+	}
+	return planner.Jobs.Get(ctx, job.ID)
+}
+
+func (planner Planner) createVerificationCases(ctx context.Context, candidate domain.AuthoringCandidateV1) ([]domain.VerificationCase, func(), error) {
+	type fixtureCase struct {
+		id, kind string
+		fixture  domain.WorkspaceFixture
+	}
+	fixtures := []fixtureCase{{id: "starter", kind: "starter", fixture: candidate.Blueprint.Runtime.StarterWorkspace.Fixture()}, {id: "reference", kind: "reference", fixture: candidate.PrivateEvaluation.Reference}}
+	for _, negative := range candidate.PrivateEvaluation.Negatives {
+		fixtures = append(fixtures, fixtureCase{id: negative.ID, kind: "negative", fixture: negative.Workspace})
+	}
+	workspaces := make([]domain.VerificationWorkspace, 0, len(fixtures))
+	cleanup := func() {
+		for index := len(workspaces) - 1; index >= 0; index-- {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = planner.Workspaces.DeleteVerificationWorkspace(cleanupCtx, workspaces[index].ID)
+			cancel()
+		}
+	}
+	result := make([]domain.VerificationCase, 0, len(fixtures))
+	for _, item := range fixtures {
+		workspace, err := planner.Workspaces.CreateVerificationWorkspace(ctx, candidate.Blueprint.Runtime.ProfileRef, item.fixture, verificationWorkspaceTTL)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		workspaces = append(workspaces, workspace)
+		result = append(result, domain.VerificationCase{ID: item.id, Kind: item.kind, WorkspaceRoot: workspace.RootPath})
+	}
+	return result, cleanup, nil
+}
+
+func (planner Planner) enforceProvenance(candidate *domain.AuthoringCandidateV1, job domain.PlanningJob) {
+	candidate.Blueprint.Classification.SurfaceClassification = job.Request.TrustedSurfaceClassification()
+	candidate.Blueprint.Source = domain.SourceProvenance{
+		SourceType: job.Request.Source.Type, SourceURL: job.Request.Source.URL,
+		OriginalManifestHash: job.RequestHash, Company: job.Request.Source.Company,
+		License: job.Request.Source.License, Anonymized: job.Request.Source.Anonymized,
+		EducationalAdaptation: candidate.Blueprint.Source.EducationalAdaptation,
+	}
+	if task := job.Request.PreparedSourceTask; task != nil {
+		candidate.Blueprint.Source.SourceCommitSHA = task.Source.CommitSHA
+		candidate.Blueprint.Source.SourcePath = task.Source.Path
+		candidate.Blueprint.Source.SourceLocator = task.Source.Locator
+		if company, ok := task.Metadata["company"].(string); ok {
+			candidate.Blueprint.Source.Company = strings.TrimSpace(company)
+		}
+		if license, ok := task.Metadata["license"].(string); ok {
+			candidate.Blueprint.Source.License = strings.TrimSpace(license)
+		}
+	}
+	candidate.Blueprint.Generation.PlannerVersion = planner.Policy.PlannerVersion
+	candidate.Blueprint.Generation.GenerationPolicyVersion = planner.Policy.GenerationPolicyVersion
+	candidate.Blueprint.Generation.Method = "ai"
+	candidate.Blueprint.Generation.PromptTemplateRef = planner.Policy.PromptTemplateRef
+	candidate.Blueprint.Generation.Tone = planner.Policy.Tone
+	candidate.Blueprint.Generation.Methodology = planner.Policy.Methodology
+	candidate.Blueprint.Generation.SkillRefs = append([]string(nil), planner.Policy.SkillRefs...)
+	candidate.Blueprint.Generation.GenerationJobID = job.ID
+	candidate.Blueprint.Generation.InputDigest = job.RequestHash
+}
+
+func (planner Planner) validateDependencies() error {
+	if planner.Jobs == nil || planner.Generator == nil || planner.Competencies == nil || planner.Profiles == nil || planner.Validation == nil || planner.Workspaces == nil || planner.Policy.PlannerVersion == "" || planner.Policy.GenerationPolicyVersion == "" || planner.Policy.TechnicalTaskSchema != domain.TechnicalTaskSchemaV1 || planner.Policy.PromptTemplateRef == "" {
+		return errors.New("tz planner is not configured")
+	}
+	return nil
+}
+
+func (planner Planner) now() time.Time {
+	if planner.Now != nil {
+		return planner.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func normalizePlanningRequest(request domain.PlanningRequestV1) (domain.PlanningRequestV1, string, error) {
+	if request.Orchestration != nil {
+		orchestration := *request.Orchestration
+		request.Orchestration = &orchestration
+	}
+	request.Schema = strings.TrimSpace(request.Schema)
+	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
+	request.Manifest = strings.TrimSpace(request.Manifest)
+	request.Locale = strings.ToLower(strings.TrimSpace(request.Locale))
+	request.Source.Type = strings.ToLower(strings.TrimSpace(request.Source.Type))
+	request.Source.URL = strings.TrimSpace(request.Source.URL)
+	request.Source.Company = strings.TrimSpace(request.Source.Company)
+	request.Source.License = strings.TrimSpace(request.Source.License)
+	request.Hints.TaskType = strings.ToUpper(strings.TrimSpace(request.Hints.TaskType))
+	preparedSource := request.PreparedSourceTask != nil
+	validVersion := request.Schema == domain.PlanningRequestSchemaV1 || request.Schema == domain.PlanningRequestSchemaV2 || request.Schema == domain.PlanningRequestSchemaV3
+	validInput := request.Manifest != "" && len(request.Manifest) <= maximumManifestBytes && !preparedSource
+	if request.Schema == domain.PlanningRequestSchemaV3 {
+		validInput = preparedSource && request.Manifest == "" && request.Mode == "private"
+	}
+	if !validVersion || !validInput || request.Mode != "private" && request.Mode != "canonical" || request.Locale != "ru" && request.Locale != "en" {
+		return request, "", fmt.Errorf("%w: invalid planning request", domain.ErrValidation)
+	}
+	if request.Schema == domain.PlanningRequestSchemaV3 {
+		if err := validatePreparedSourceTask(*request.PreparedSourceTask, request.Source); err != nil {
+			return request, "", err
+		}
+	} else if preparedSource {
+		return request, "", fmt.Errorf("%w: prepared source tasks require planning request v3", domain.ErrValidation)
+	}
+	if err := normalizeAuthoringOrchestrationIntent(&request); err != nil {
+		return request, "", err
+	}
+	allowedSources := map[string]bool{"user_intent": true, "imported_manifest": true, "github_issue": true, "github_repository": true, "interview": true, "incident": true, "manual": true}
+	if !allowedSources[request.Source.Type] {
+		return request, "", fmt.Errorf("%w: unsupported source type", domain.ErrValidation)
+	}
+	if request.Source.URL != "" {
+		parsed, err := url.Parse(request.Source.URL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+			return request, "", fmt.Errorf("%w: source URL must be an absolute HTTPS URL", domain.ErrValidation)
+		}
+	}
+	stackSet := map[string]struct{}{}
+	stacks := make([]string, 0, len(request.Hints.Stacks))
+	for _, item := range request.Hints.Stacks {
+		item = strings.ToLower(strings.TrimSpace(item))
+		item = canonicalStackCode(item)
+		if item == "" || len(item) > 64 {
+			return request, "", domain.ErrValidation
+		}
+		if _, ok := stackSet[item]; !ok {
+			stackSet[item] = struct{}{}
+			stacks = append(stacks, item)
+		}
+	}
+	sort.Strings(stacks)
+	request.Hints.Stacks = stacks
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return request, "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return request, "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func normalizeAuthoringOrchestrationIntent(request *domain.PlanningRequestV1) error {
+	if request.Schema == domain.PlanningRequestSchemaV1 || request.Schema == domain.PlanningRequestSchemaV3 {
+		if request.HasOrchestrationIntent() {
+			return fmt.Errorf("%w: v1 does not accept orchestration intent", domain.ErrValidation)
+		}
+		return nil
+	}
+	if request.Orchestration == nil {
+		return fmt.Errorf("%w: v2 requires orchestration intent", domain.ErrValidation)
+	}
+	intent := request.Orchestration
+	intent.Schema = strings.TrimSpace(intent.Schema)
+	intent.Trigger = strings.ToLower(strings.TrimSpace(intent.Trigger))
+	intent.CorrelationID = strings.ToLower(strings.TrimSpace(intent.CorrelationID))
+	intent.SurfaceClassification = strings.ToLower(strings.TrimSpace(intent.SurfaceClassification))
+	intent.DesiredDifficultyLevel = strings.ToLower(strings.TrimSpace(intent.DesiredDifficultyLevel))
+	if intent.Schema != domain.AuthoringOrchestrationIntentSchemaV1 || !validUUID(intent.CorrelationID) ||
+		intent.Trigger != domain.AuthoringTriggerPlannerRecommendation && intent.Trigger != domain.AuthoringTriggerStudentProject ||
+		!domain.ValidSurfaceClassification(intent.SurfaceClassification) {
+		return fmt.Errorf("%w: invalid orchestration intent", domain.ErrValidation)
+	}
+	if intent.HasDesiredDifficultyLevel() {
+		allowed := map[string]bool{"beginner": true, "junior": true, "junior_plus": true, "middle": true, "senior": true}
+		if !allowed[intent.DesiredDifficultyLevel] {
+			return fmt.Errorf("%w: invalid desired difficulty", domain.ErrValidation)
+		}
+	}
+	return nil
+}
+
+func validatePreparedSourceTask(task domain.PreparedSourceTaskV1, source domain.PlanningSource) error {
+	if task.SchemaVersion != "prepared-source-task.v1" || task.Source.Provider != "github" || strings.TrimSpace(task.Title) == "" || len(task.Title) > 300 || strings.TrimSpace(task.Content) == "" || len(task.Content) > maximumManifestBytes {
+		return fmt.Errorf("%w: invalid prepared source task", domain.ErrValidation)
+	}
+	if source.Type != "github_repository" || source.URL != task.Source.RepositoryURL {
+		return fmt.Errorf("%w: source provenance does not match prepared task", domain.ErrValidation)
+	}
+	parsed, err := url.Parse(task.Source.RepositoryURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%w: repository URL must be a public GitHub HTTPS URL", domain.ErrValidation)
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) != 2 {
+		return fmt.Errorf("%w: repository URL must contain exactly an owner and repository", domain.ErrValidation)
+	}
+	owner := segments[0]
+	repository := strings.TrimSuffix(segments[1], ".git")
+	if !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(owner) || !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(repository) || owner == "." || owner == ".." || repository == "." || repository == ".." {
+		return fmt.Errorf("%w: repository URL must contain exactly an owner and repository", domain.ErrValidation)
+	}
+	if !gitCommitPattern.MatchString(task.Source.CommitSHA) || task.Source.Path == "" || len(task.Source.Path) > 1000 || path.IsAbs(task.Source.Path) || strings.Contains(task.Source.Path, "\\") || path.Clean(task.Source.Path) != task.Source.Path {
+		return fmt.Errorf("%w: invalid source snapshot provenance", domain.ErrValidation)
+	}
+	for _, segment := range strings.Split(task.Source.Path, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("%w: unsafe source path", domain.ErrValidation)
+		}
+	}
+	if len(task.Source.Locator) > 500 || len(task.Metadata) > 12 {
+		return fmt.Errorf("%w: source metadata exceeds limits", domain.ErrValidation)
+	}
+	for key := range task.Metadata {
+		switch key {
+		case "company", "difficulty", "frequency", "link", "url", "license", "stack_hints":
+		default:
+			return fmt.Errorf("%w: source metadata field is not supported", domain.ErrValidation)
+		}
+	}
+	for key, value := range task.Metadata {
+		if key == "stack_hints" {
+			switch hints := value.(type) {
+			case string:
+				if len(hints) > 500 {
+					return fmt.Errorf("%w: stack hints exceed limit", domain.ErrValidation)
+				}
+			case []any:
+				if len(hints) > 16 {
+					return fmt.Errorf("%w: stack hints exceed limit", domain.ErrValidation)
+				}
+				for _, hint := range hints {
+					stack, ok := hint.(string)
+					if !ok || strings.TrimSpace(stack) == "" || len(stack) > 64 {
+						return fmt.Errorf("%w: invalid stack hint", domain.ErrValidation)
+					}
+				}
+			default:
+				return fmt.Errorf("%w: invalid stack hints", domain.ErrValidation)
+			}
+		} else {
+			switch value.(type) {
+			case string:
+			case float64, json.Number:
+				if key != "difficulty" && key != "frequency" {
+					return fmt.Errorf("%w: invalid source metadata", domain.ErrValidation)
+				}
+			default:
+				return fmt.Errorf("%w: invalid source metadata", domain.ErrValidation)
+			}
+		}
+	}
+	encoded, err := json.Marshal(task.Metadata)
+	if err != nil || len(encoded) > 8192 {
+		return fmt.Errorf("%w: source metadata exceeds limit", domain.ErrValidation)
+	}
+	digest := sha256.Sum256([]byte(task.Content))
+	if task.ContentHash != "sha256:"+hex.EncodeToString(digest[:]) {
+		return fmt.Errorf("%w: source content digest mismatch", domain.ErrValidation)
+	}
+	return nil
+}
+
+func canonicalStackCode(value string) string {
+	switch value {
+	case "js", "ecmascript":
+		return "javascript"
+	case "golang":
+		return "go"
+	case "html5":
+		return "html"
+	case "css3":
+		return "css"
+	default:
+		return value
+	}
+}
+
+func runtimeProfileSupported(runtime domain.RuntimeSpec, profiles []domain.RuntimeProfileDescriptor) bool {
+	for _, profile := range profiles {
+		if profile.Ref == runtime.ProfileRef {
+			for _, code := range profile.SupportedCodeStructureTypes {
+				if code == runtime.CodeStructureTypeCode {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func learningTargetsOffered(selected []domain.LearningTargetRef, catalog []domain.LearningTargetDescriptor) bool {
+	offered := make(map[domain.LearningTargetRef]struct{}, len(catalog))
+	for _, descriptor := range catalog {
+		offered[descriptor.Ref] = struct{}{}
+	}
+	for _, target := range selected {
+		if _, ok := offered[target]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validVerificationReceipt(receipt domain.VerificationReceiptV1, blueprintDigest, runtimeDigest string, inspection domain.ContractInspection, expectedCases []domain.VerificationCase) bool {
+	if receipt.Schema != domain.VerificationReceiptSchemaV1 || !receipt.Passed || receipt.BlueprintDigest != blueprintDigest || receipt.RuntimeProfileDigest != runtimeDigest || receipt.ContractDigest != inspection.ContractDigest || receipt.CapabilitiesDigest != inspection.CapabilitiesDigest || !verificationDigestPattern.MatchString(receipt.ReceiptDigest) || receipt.VerifiedAt.IsZero() {
+		return false
+	}
+	computedReceiptDigest, err := verificationReceiptDigest(receipt)
+	if err != nil || computedReceiptDigest != receipt.ReceiptDigest || len(receipt.Cases) != len(expectedCases) {
+		return false
+	}
+	expected := make(map[string]string, len(expectedCases))
+	for _, item := range expectedCases {
+		if item.ID == "" {
+			return false
+		}
+		if _, duplicate := expected[item.ID]; duplicate {
+			return false
+		}
+		expected[item.ID] = item.Kind
+	}
+	starter, reference, negative := 0, 0, 0
+	ids := make(map[string]struct{}, len(receipt.Cases))
+	for _, item := range receipt.Cases {
+		if item.ID == "" || item.ActualPassed != item.ExpectedPassed || !verificationDigestPattern.MatchString(item.ResultDigest) {
+			return false
+		}
+		if expectedKind, ok := expected[item.ID]; !ok || expectedKind != item.Kind {
+			return false
+		}
+		if _, duplicate := ids[item.ID]; duplicate {
+			return false
+		}
+		ids[item.ID] = struct{}{}
+		switch item.Kind {
+		case "starter":
+			starter++
+			if item.ExpectedPassed {
+				return false
+			}
+		case "reference":
+			reference++
+			if !item.ExpectedPassed {
+				return false
+			}
+		case "negative":
+			negative++
+			if item.ExpectedPassed {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return starter == 1 && reference == 1 && negative >= 1
+}
+
+func verificationReceiptDigest(receipt domain.VerificationReceiptV1) (string, error) {
+	receipt.ReceiptDigest = ""
+	return jsonDigest(receipt)
+}
+
+func (planner Planner) leaseDuration() time.Duration {
+	if planner.LeaseDuration > 0 {
+		return planner.LeaseDuration
+	}
+	return authoringLease
+}
+
+func (planner Planner) leaseRenewInterval() time.Duration {
+	duration := planner.leaseDuration()
+	if planner.LeaseRenewInterval > 0 && planner.LeaseRenewInterval < duration {
+		return planner.LeaseRenewInterval
+	}
+	interval := duration / 3
+	if interval <= 0 {
+		return time.Nanosecond
+	}
+	return interval
+}
+
+func (planner Planner) startLeaseHeartbeat(parent context.Context, jobID, token string) (context.Context, func() error) {
+	pipelineCtx, cancelPipeline := context.WithCancelCause(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	renewalError := make(chan error, 1)
+	var stopOnce sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(planner.leaseRenewInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pipelineCtx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewCtx, cancelRenew := context.WithTimeout(pipelineCtx, leaseRenewTimeout)
+				err := planner.Jobs.RenewLease(renewCtx, jobID, token, planner.now(), planner.leaseDuration())
+				cancelRenew()
+				if err != nil {
+					wrapped := fmt.Errorf("renew authoring lease: %w", err)
+					renewalError <- wrapped
+					cancelPipeline(wrapped)
+					return
+				}
+			}
+		}
+	}()
+	stopHeartbeat := func() error {
+		stopOnce.Do(func() { close(stop) })
+		<-done
+		cancelPipeline(context.Canceled)
+		select {
+		case err := <-renewalError:
+			return err
+		default:
+			return nil
+		}
+	}
+	return pipelineCtx, stopHeartbeat
+}
+
+func validStagingReceipt(receipt domain.StagingReceiptV1, job domain.PlanningJob) bool {
+	if job.Artifact == nil {
+		return false
+	}
+	blueprint := job.Artifact.Candidate.Blueprint
+	blueprintDigest, err := jsonDigest(blueprint)
+	return err == nil && receipt.Schema == "practice-task-staging-receipt.v1" && validUUID(receipt.StagedID) &&
+		receipt.State == "staged" && receipt.AuthoringJobID == job.ID &&
+		receipt.FamilyKey == blueprint.Identity.FamilyKey && receipt.VariantKey == blueprint.Identity.VariantKey &&
+		receipt.BlueprintDigest == blueprintDigest && receipt.CandidateDigest == job.Artifact.CandidateDigest &&
+		!receipt.CreatedAt.IsZero()
+}
+
+func jsonDigest(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func newUUID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		panic(err)
+	}
+	raw[6] = raw[6]&0x0f | 0x40
+	raw[8] = raw[8]&0x3f | 0x80
+	hexed := hex.EncodeToString(raw[:])
+	return hexed[0:8] + "-" + hexed[8:12] + "-" + hexed[12:16] + "-" + hexed[16:20] + "-" + hexed[20:32]
+}
+func validUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	compact := strings.ReplaceAll(value, "-", "")
+	_, err := hex.DecodeString(compact)
+	return err == nil
+}

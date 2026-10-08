@@ -1,0 +1,185 @@
+package http_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/onboardinghandoff"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/readiness"
+)
+
+const handoffRouteKey = "22222222-2222-4222-8222-222222222222"
+
+func TestOnboardingPlanHandoffRouteStrictAuthReplayAndDisabledNoRead(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	receipts := &routeHandoffReceipts{}
+	router := handoffRouter(true, receipts, student)
+	path := "/internal/students/" + readinessRouteStudentID + "/onboarding-plan-handoffs"
+	body := `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":{"kind":"accepted_draft","version":4},"dialog_id":"33333333-3333-4333-8333-333333333333","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`
+	for _, testCase := range []struct {
+		name, token string
+		want        int
+	}{
+		{name: "wrong token", token: "teacher-token", want: http.StatusForbidden},
+		{name: "dedicated token", token: "teacher-handoff-token", want: http.StatusCreated},
+		{name: "exact replay", token: "teacher-handoff-token", want: http.StatusOK},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+			request.Header.Set("X-Internal-Token", testCase.token)
+			request.Header.Set("Idempotency-Key", handoffRouteKey)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.want || response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d cache=%q type=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Header().Get("Content-Type"), response.Body.String())
+			}
+			if testCase.want != http.StatusForbidden {
+				if response.Header().Get("Content-Type") != "application/json" {
+					t.Fatalf("content-type=%q", response.Header().Get("Content-Type"))
+				}
+				var result domain.TeacherOnboardingPlanHandoff
+				if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.Schema != domain.TeacherOnboardingPlanHandoffSchema || result.ExecutionStatus != "NOT_STARTED" || result.ContentStatus != "NOT_CREATED" || result.ReadinessObservedAt.IsZero() || (testCase.want == http.StatusOK) != result.Replayed {
+					t.Fatalf("result=%#v err=%v", result, err)
+				}
+			}
+		})
+	}
+	if student.calls != 1 {
+		t.Fatalf("student calls=%d", student.calls)
+	}
+	student.calls = 0
+	disabled := handoffRouter(false, receipts, student)
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+	request.Header.Set("X-Internal-Token", "teacher-handoff-token")
+	request.Header.Set("Idempotency-Key", handoffRouteKey)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	disabled.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || student.calls != 0 {
+		t.Fatalf("disabled replay status=%d calls=%d body=%s", response.Code, student.calls, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+	request.Header.Set("X-Internal-Token", "teacher-handoff-token")
+	request.Header.Set("Idempotency-Key", "55555555-5555-4555-8555-555555555555")
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	disabled.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || student.calls != 0 {
+		t.Fatalf("disabled new status=%d calls=%d body=%s", response.Code, student.calls, response.Body.String())
+	}
+}
+
+func TestOnboardingPlanHandoffRouteRejectsUntrustedBodyBeforeStudentRead(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	router := handoffRouter(true, &routeHandoffReceipts{}, student)
+	valid := `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":{"kind":"accepted_draft","version":4},"dialog_id":"33333333-3333-4333-8333-333333333333","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{name: "unknown top-level field", body: valid[:len(valid)-1] + `,"goal_code":"go.backend"}`},
+		{name: "unknown nested state-ref field", body: `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":{"kind":"accepted_draft","version":4,"extra":true},"dialog_id":"33333333-3333-4333-8333-333333333333","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`},
+		{name: "trailing JSON", body: valid + `{}`},
+		{name: "null state ref", body: `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":null,"dialog_id":"33333333-3333-4333-8333-333333333333","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`},
+		{name: "oversized body", body: valid + strings.Repeat(" ", 16<<10)},
+		{name: "noncanonical UUID", body: `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":{"kind":"accepted_draft","version":4},"dialog_id":"33333333-3333-4333-8333-33333333333A","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/internal/students/"+readinessRouteStudentID+"/onboarding-plan-handoffs", bytes.NewBufferString(testCase.body))
+			request.Header.Set("X-Internal-Token", "teacher-handoff-token")
+			request.Header.Set("Idempotency-Key", handoffRouteKey)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusUnprocessableEntity || student.calls != 0 {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, student.calls, response.Body.String())
+			}
+			var envelope struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if response.Header().Get("Content-Type") != "application/json" || json.Unmarshal(response.Body.Bytes(), &envelope) != nil || envelope.Error.Code != "invalid_request" {
+				t.Fatalf("content-type=%q body=%s", response.Header().Get("Content-Type"), response.Body.String())
+			}
+		})
+	}
+}
+
+func TestOnboardingPlanHandoffRouteRequiresOneByteCanonicalIdempotencyKey(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	router := handoffRouter(true, &routeHandoffReceipts{}, student)
+	body := `{"schema":"teacher-onboarding-plan-handoff-request.v1","expected_state_ref":{"kind":"accepted_draft","version":4},"dialog_id":"33333333-3333-4333-8333-333333333333","teacher_job_id":"44444444-4444-4444-8444-444444444444"}`
+	for _, testCase := range []struct {
+		name string
+		keys []string
+	}{
+		{name: "whitespace padded", keys: []string{" " + handoffRouteKey + " "}},
+		{name: "duplicate values", keys: []string{handoffRouteKey, "55555555-5555-4555-8555-555555555555"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/internal/students/"+readinessRouteStudentID+"/onboarding-plan-handoffs", bytes.NewBufferString(body))
+			request.Header.Set("X-Internal-Token", "teacher-handoff-token")
+			request.Header["Idempotency-Key"] = testCase.keys
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusUnprocessableEntity || student.calls != 0 || !bytes.Contains(response.Body.Bytes(), []byte(`"invalid_idempotency_key"`)) {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, student.calls, response.Body.String())
+			}
+		})
+	}
+}
+
+func handoffRouter(enabled bool, receipts *routeHandoffReceipts, student *routeReadinessStudent) http.Handler {
+	return transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "general-token", TeacherToken: "teacher-token", TeacherOnboardingHandoffToken: "teacher-handoff-token", PracticeToken: "practice-token",
+		OnboardingPlanHandoff: privatehandlers.OnboardingPlanHandoffHandler{Accept: onboardinghandoff.Acceptor{
+			Enabled: enabled, Receipts: receipts, IDs: routeHandoffIDs{}, Clock: routeHandoffClock{},
+			Readiness: readiness.Resolver{Enabled: true, Students: student, Graphs: &routeReadinessGraphs{}},
+		}},
+	})
+}
+
+type routeHandoffIDs struct{}
+
+func (routeHandoffIDs) NewID() string { return "66666666-6666-4666-8666-666666666666" }
+
+type routeHandoffClock struct{}
+
+func (routeHandoffClock) Now() time.Time { return time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC) }
+
+type routeHandoffReceipts struct {
+	records map[string]domain.OnboardingPlanHandoffRecord
+}
+
+func (stub *routeHandoffReceipts) GetByStudentAndIdempotency(_ context.Context, studentID, key string) (domain.OnboardingPlanHandoffRecord, error) {
+	if stub.records == nil {
+		return domain.OnboardingPlanHandoffRecord{}, domain.ErrNotFound
+	}
+	record, ok := stub.records[studentID+key]
+	if !ok {
+		return domain.OnboardingPlanHandoffRecord{}, domain.ErrNotFound
+	}
+	return record, nil
+}
+func (stub *routeHandoffReceipts) CreateOrGetOnboardingPlanHandoff(_ context.Context, record domain.OnboardingPlanHandoffRecord) (domain.OnboardingPlanHandoffRecord, bool, error) {
+	if stub.records == nil {
+		stub.records = map[string]domain.OnboardingPlanHandoffRecord{}
+	}
+	if prior, ok := stub.records[record.StudentID+record.IdempotencyKey]; ok {
+		return prior, false, nil
+	}
+	stub.records[record.StudentID+record.IdempotencyKey] = record
+	return record, true, nil
+}

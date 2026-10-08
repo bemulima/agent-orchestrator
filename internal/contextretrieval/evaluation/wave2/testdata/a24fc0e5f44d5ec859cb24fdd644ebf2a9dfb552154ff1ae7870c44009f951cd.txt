@@ -1,0 +1,69 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/jackc/pgx/v5"
+	"io"
+	"time"
+)
+
+func (s Store) GetInitialAllocation(ctx context.Context, r domain.CoursePlanRequest) (domain.InitialAllocationCheckpoint, error) {
+	var raw []byte
+	var hash sql.NullString
+	err := s.Pool.QueryRow(ctx, `SELECT initial_allocation_json,initial_allocation_hash FROM course_plan_request WHERE id=$1 AND student_id=$2`, r.ID, r.StudentID).Scan(&raw, &hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.InitialAllocationCheckpoint{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.InitialAllocationCheckpoint{}, err
+	}
+	if len(raw) == 0 && !hash.Valid {
+		return domain.InitialAllocationCheckpoint{}, domain.ErrNotFound
+	}
+	var c domain.InitialAllocationCheckpoint
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if len(raw) > domain.MaximumLearningPathCommandPayloadBytes || decoder.Decode(&c) != nil || decoder.Decode(&struct{}{}) != io.EOF || c.Validate(r) != nil {
+		return c, domain.ErrValidation
+	}
+	want, err := domain.InitialAllocationHash(c)
+	if err != nil || !hash.Valid || want != hash.String {
+		return c, domain.ErrValidation
+	}
+	return c, nil
+}
+
+func (s Store) CheckpointInitialAllocation(ctx context.Context, r domain.CoursePlanRequest, c domain.InitialAllocationCheckpoint, now time.Time) error {
+	if c.Validate(r) != nil {
+		return domain.ErrValidation
+	}
+	hash, err := domain.InitialAllocationHash(c)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	tag, err := s.Pool.Exec(ctx, `UPDATE course_plan_request SET initial_allocation_json=$1,initial_allocation_hash=$2,updated_at=$3 WHERE id=$4 AND student_id=$5 AND status='PLANNING' AND claim_token=$6 AND (initial_allocation_json IS NULL OR initial_allocation_hash=$2)`, raw, hash, now, r.ID, r.StudentID, r.ClaimToken)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (s Store) ResumeDiagnosticPlanning(ctx context.Context, studentID, requestID string, now time.Time) (domain.CoursePlanRequest, error) {
+	_, err := s.Pool.Exec(ctx, `UPDATE course_plan_request SET status='PLANNING',failure_code='',attempts=0,claim_token=NULL,lease_until=NULL,completed_at=NULL,next_attempt_at=$3,updated_at=$3 WHERE id=$1 AND student_id=$2 AND diagnostic_plan_id IS NOT NULL AND idempotency_key=diagnostic_plan_id AND intent_json->>'source'='TEACHER' AND intent_json->>'reason'='INITIAL' AND status='FAILED' AND failure_code='ATTEMPTS_EXHAUSTED'`, requestID, studentID, now)
+	if err != nil {
+		return domain.CoursePlanRequest{}, err
+	}
+	return s.GetForStudent(ctx, studentID, requestID)
+}

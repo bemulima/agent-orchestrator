@@ -1,0 +1,178 @@
+package tzplanner
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+func TestEnsureAuthoringJobUsesExactV2ContractDedicatedTokenAndStrictReadyReceipt(t *testing.T) {
+	flowID := "11111111-1111-4111-8111-111111111111"
+	request := tzRequestFixture(flowID)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, incoming *http.Request) {
+		if incoming.Method != http.MethodPost || incoming.URL.Path != "/internal/v1/authoring-jobs" ||
+			incoming.Header.Get("X-Internal-Token") != "tz-only" || incoming.Header.Get("Idempotency-Key") != flowID ||
+			incoming.Header.Get("Accept") != "application/json" || incoming.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("unexpected request: %s %s headers=%v", incoming.Method, incoming.URL.Path, incoming.Header)
+		}
+		var got domain.TZAuthoringRequestV2
+		decoder := json.NewDecoder(incoming.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil || !reflect.DeepEqual(got, request) {
+			t.Fatalf("request=%+v err=%v", got, err)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(readyProjection(flowID, "22222222-2222-4222-8222-222222222222"))
+	}))
+	defer server.Close()
+	job, err := (Client{BaseURL: server.URL, InternalToken: "tz-only", HTTPClient: server.Client()}).EnsureAuthoringJob(context.Background(), flowID, request)
+	if err != nil || job.Status != domain.TZAuthoringReady || job.Intent.CorrelationID != flowID || job.BlueprintDigest == "" {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+}
+
+func TestTZClientRejectsRedirectUnknownMediaOversizeAndMalformedReceipt(t *testing.T) {
+	flowID := "11111111-1111-4111-8111-111111111111"
+	request := tzRequestFixture(flowID)
+	for _, testCase := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{name: "redirect", handler: func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Location", "http://example.invalid/leak")
+			writer.WriteHeader(http.StatusTemporaryRedirect)
+		}},
+		{name: "wrong media", handler: func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "text/plain")
+			_ = json.NewEncoder(writer).Encode(readyProjection(flowID, "22222222-2222-4222-8222-222222222222"))
+		}},
+		{name: "unknown field", handler: func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"id":"22222222-2222-4222-8222-222222222222","status":"PLANNED","attempts":0,"orchestration":{"schema":"learning-workspace-authoring-intent.v1","trigger":"planner_recommendation","correlation_id":"11111111-1111-4111-8111-111111111111","surface_classification":"project"},"unexpected":true}`))
+		}},
+		{name: "oversize", handler: func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(strings.Repeat("x", int(maximumAuthoringResponseBytes+1))))
+		}},
+		{name: "bad verification digest", handler: func(writer http.ResponseWriter, _ *http.Request) {
+			projection := readyProjection(flowID, "22222222-2222-4222-8222-222222222222")
+			projection.Verification.ReceiptDigest = projectClientDigest("f")
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(projection)
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(testCase.handler)
+			defer server.Close()
+			_, err := (Client{BaseURL: server.URL, InternalToken: "tz-only", HTTPClient: server.Client()}).EnsureAuthoringJob(context.Background(), flowID, request)
+			if err == nil {
+				t.Fatal("unsafe response was accepted")
+			}
+		})
+	}
+}
+
+func TestTZClientClassifies404And5xxForRecovery(t *testing.T) {
+	for _, testCase := range []struct {
+		status int
+		want   error
+	}{{http.StatusNotFound, domain.ErrNotFound}, {http.StatusServiceUnavailable, domain.ErrUpstreamUnavailable}} {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(testCase.status) }))
+		_, err := (Client{BaseURL: server.URL, InternalToken: "tz-only", HTTPClient: server.Client()}).GetAuthoringJob(context.Background(), "22222222-2222-4222-8222-222222222222")
+		server.Close()
+		if !errors.Is(err, testCase.want) {
+			t.Fatalf("status=%d err=%v", testCase.status, err)
+		}
+	}
+}
+
+func tzRequestFixture(flowID string) domain.TZAuthoringRequestV2 {
+	return domain.TZAuthoringRequestV2{
+		Schema: domain.TZPlanningRequestSchemaV2, Mode: "private", Manifest: `{"schema":"planner-project-authoring-manifest.v1"}`, Locale: "ru",
+		Source:        domain.TZAuthoringSource{Type: "user_intent", Anonymized: true},
+		Hints:         domain.TZClassificationHints{Stacks: []string{"go"}},
+		Orchestration: domain.TZAuthoringIntentV1{Schema: domain.TZAuthoringIntentSchemaV1, Trigger: "planner_recommendation", CorrelationID: flowID, SurfaceClassification: "project"},
+	}
+}
+
+func readyProjection(flowID, jobID string) jobProjection {
+	blueprint := json.RawMessage(`{"identity":{"family_key":"go-project"}}`)
+	blueprintDigest := sha256.Sum256(blueprint)
+	receipt := verificationReceiptProjection{
+		Schema: domain.TZVerificationReceiptSchemaV1, BlueprintDigest: "sha256:" + hex.EncodeToString(blueprintDigest[:]),
+		RuntimeProfileDigest: projectClientDigest("9"), ContractDigest: projectClientDigest("c"), CapabilitiesDigest: projectClientDigest("d"), Passed: true,
+		Cases: []verificationCaseProjection{
+			{ID: "starter", Kind: "starter", ExpectedPassed: false, ActualPassed: false, ResultDigest: projectClientDigest("1")},
+			{ID: "reference", Kind: "reference", ExpectedPassed: true, ActualPassed: true, ResultDigest: projectClientDigest("2")},
+			{ID: "negative-1", Kind: "negative", ExpectedPassed: false, ActualPassed: false, ResultDigest: projectClientDigest("3")},
+		},
+		VerifiedAt: time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+	}
+	encoded, _ := json.Marshal(receipt)
+	receiptDigest := sha256.Sum256(encoded)
+	receipt.ReceiptDigest = "sha256:" + hex.EncodeToString(receiptDigest[:])
+	return jobProjection{
+		ID: jobID, Status: domain.TZAuthoringReady, Attempts: 1,
+		Orchestration: &domain.TZAuthoringIntentV1{Schema: domain.TZAuthoringIntentSchemaV1, Trigger: "planner_recommendation", CorrelationID: flowID, SurfaceClassification: "project"},
+		Blueprint:     blueprint, CandidateDigest: projectClientDigest("b"), ContractDigest: receipt.ContractDigest,
+		CapabilitiesDigest: receipt.CapabilitiesDigest, Verification: &receipt,
+	}
+}
+
+func projectClientDigest(character string) string { return "sha256:" + strings.Repeat(character, 64) }
+
+func TestStageUsesProviderReceiptAndRejectsMismatchedStaging(t *testing.T) {
+	flowID, jobID := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	for _, bad := range []string{"valid", "job", "digest", "identity", "state", "missing"} {
+		t.Run(bad, func(t *testing.T) {
+			projection := readyProjection(flowID, jobID)
+			projection.Blueprint = json.RawMessage(`{"identity":{"family_key":"go-project","variant_key":"default"}}`)
+			bh := sha256.Sum256(projection.Blueprint)
+			projection.Verification.BlueprintDigest = "sha256:" + hex.EncodeToString(bh[:])
+			projection.Verification.ReceiptDigest = ""
+			encoded, _ := json.Marshal(projection.Verification)
+			rh := sha256.Sum256(encoded)
+			projection.Verification.ReceiptDigest = "sha256:" + hex.EncodeToString(rh[:])
+			projection.Status = domain.TZAuthoringStaged
+			projection.Staging = &domain.ProjectStagingReceiptV1{Schema: "practice-task-staging-receipt.v1", StagedID: flowID, AuthoringJobID: jobID, State: "staged", FamilyKey: "go-project", VariantKey: "default", CandidateDigest: projection.CandidateDigest, BlueprintDigest: projection.Verification.BlueprintDigest, CreatedAt: time.Now().UTC()}
+			switch bad {
+			case "job":
+				projection.Staging.AuthoringJobID = flowID
+			case "digest":
+				projection.Staging.CandidateDigest = projectClientDigest("f")
+			case "identity":
+				projection.Staging.VariantKey = "different"
+			case "state":
+				projection.Staging.State = "published"
+			case "missing":
+				projection.Staging = nil
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/authoring-jobs/"+jobID+"/stage" || r.Header.Get("X-Internal-Token") != "tz-only" {
+					t.Fatalf("wrong stage request: %s %s", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(projection)
+			}))
+			defer server.Close()
+			job, err := (Client{BaseURL: server.URL, InternalToken: "tz-only", HTTPClient: server.Client()}).StageAuthoringJob(context.Background(), jobID)
+			if bad == "valid" {
+				if err != nil || job.Status != domain.TZAuthoringStaged || job.Staging == nil || job.Publication != nil {
+					t.Fatalf("stage=%+v err=%v", job, err)
+				}
+			} else if err == nil {
+				t.Fatal("invalid stage accepted")
+			}
+		})
+	}
+}

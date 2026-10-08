@@ -1,0 +1,331 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type evidenceRepositoryFake struct {
+	ports.Repository
+	messages     []ports.OutboxMessage
+	delivered    []string
+	failed       []EvidenceDeliveryFailure
+	failureErr   error
+	markerErrors map[string]error
+}
+
+func (repository *evidenceRepositoryFake) PendingEvidence(context.Context, int) ([]ports.OutboxMessage, error) {
+	return repository.messages, nil
+}
+func (repository *evidenceRepositoryFake) MarkEvidenceDelivered(_ context.Context, id string, _ time.Time) error {
+	if err := repository.markerErrors[id]; err != nil {
+		return err
+	}
+	repository.delivered = append(repository.delivered, id)
+	return nil
+}
+
+func (repository *evidenceRepositoryFake) MarkEvidenceFailed(_ context.Context, id string, _ time.Time, code string) error {
+	repository.failed = append(repository.failed, EvidenceDeliveryFailure{MessageID: id, Code: code})
+	return repository.failureErr
+}
+
+type evidencePortFake struct {
+	called  []ports.PassedEvidence
+	receipt ports.EvidenceReceipt
+	err     error
+}
+
+func (port *evidencePortFake) ApplyPassedEvidence(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+	port.called = append(port.called, input)
+	return port.receipt, port.err
+}
+
+func TestEvidenceOutboxWorkerMapsImmutablePayloadAndMarksOnlyCorrelatedReceipt(t *testing.T) {
+	payload := validEvidencePayload()
+	repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{{StudentID: "00000000-0000-4000-8000-000000000001", ID: "00000000-0000-4000-8000-000000000010", SubmissionID: "00000000-0000-4000-8000-000000000010", Payload: payload}}}
+	evidence := &evidencePortFake{receipt: ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: "00000000-0000-4000-8000-000000000010", LearningActionID: "00000000-0000-4000-8000-000000000004", Accepted: true, PolicyVersion: StudentReceiptPolicyV1}}
+	runtime := Runtime{Repository: repository, Evidence: evidence, Now: func() time.Time { return time.Date(2026, 10, 2, 3, 0, 0, 0, time.UTC) }}
+	count, err := runtime.DispatchEvidence(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("DispatchEvidence failed: %v", err)
+	}
+	if count != 1 || len(repository.delivered) != 1 || repository.delivered[0] != repository.messages[0].ID || len(evidence.called) != 1 {
+		t.Fatalf("outbox message was not delivered/marked exactly once: count=%d repository=%+v evidence=%+v", count, repository, evidence)
+	}
+	call := evidence.called[0]
+	if call.EvidenceID != repository.messages[0].SubmissionID || call.SubmissionID != call.EvidenceID || call.LearningActionID != "00000000-0000-4000-8000-000000000004" ||
+		call.TaskRevisionDigest != "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || len(call.Evidence) != 1 ||
+		len(call.Evidence[0].StepIDs) != 2 || call.Evidence[0].StepIDs[1] != "step-b" {
+		t.Fatalf("immutable evidence mapping lost identity/ordered step attribution: %+v", call)
+	}
+}
+
+func TestEvidenceOutboxDoesNotMarkWhenStudentReceiptDoesNotMatch(t *testing.T) {
+	repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{{StudentID: "00000000-0000-4000-8000-000000000001", ID: "00000000-0000-4000-8000-000000000010", SubmissionID: "00000000-0000-4000-8000-000000000010", Payload: validEvidencePayload()}}}
+	evidence := &evidencePortFake{receipt: ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: "00000000-0000-4000-8000-000000000099", Accepted: true, PolicyVersion: StudentReceiptPolicyV1}}
+	runtime := Runtime{Repository: repository, Evidence: evidence}
+	if _, err := runtime.DispatchEvidence(context.Background(), 10); err == nil || len(repository.delivered) != 0 {
+		t.Fatalf("mismatched Student receipt was accepted: err=%v delivered=%v", err, repository.delivered)
+	}
+}
+
+func validEvidencePayload() json.RawMessage {
+	return json.RawMessage(`{"schema":"practice-task-competency-evidence.v2","evidence_id":"00000000-0000-4000-8000-000000000010","student_id":"00000000-0000-4000-8000-000000000001","task_instance_id":"00000000-0000-4000-8000-000000000002","task_revision_id":"00000000-0000-4000-8000-000000000003","task_revision_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","learning_action_id":"00000000-0000-4000-8000-000000000004","submission_id":"00000000-0000-4000-8000-000000000010","workspace_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","outcome":"passed","assistance_policy_version":"practice-task-assistance-policy.v1","hints_used":0,"teacher_assistance_used":false,"evidence":[{"target":{"type":"concept","key":"go.errors","version":"v1"},"correctness":1,"independence":1,"confidence":1,"step_ids":["step-a","step-b"]}],"occurred_at":"2026-10-02T02:00:00Z","policy_version":"practice-competency-evidence-v2"}`)
+}
+
+func TestEvidenceOutboxPreservesAssignmentAcrossRepeatedDelivery(t *testing.T) {
+	var wire map[string]any
+	if err := json.Unmarshal(validEvidencePayload(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	wire["learning_path_item_id"] = "00000000-0000-4000-8000-000000000011"
+	wire["requirement_id"] = "00000000-0000-4000-8000-000000000012"
+	payload, _ := json.Marshal(wire)
+	repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{{StudentID: "00000000-0000-4000-8000-000000000001", ID: wire["evidence_id"].(string), SubmissionID: wire["submission_id"].(string), Payload: payload}}}
+	evidence := &evidencePortFake{receipt: ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: wire["evidence_id"].(string), LearningActionID: wire["learning_action_id"].(string), Accepted: true, PolicyVersion: StudentReceiptPolicyV1}}
+	runtime := Runtime{Repository: repository, Evidence: evidence}
+	for i := 0; i < 2; i++ {
+		if _, err := runtime.DispatchEvidence(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, call := range evidence.called {
+		if call.LearningPathItemID != wire["learning_path_item_id"] || call.RequirementID != wire["requirement_id"] {
+			t.Fatal("delivery lost assignment")
+		}
+	}
+	delete(wire, "requirement_id")
+	partial, _ := json.Marshal(wire)
+	if _, err := DecodePassedEvidence(partial); err == nil {
+		t.Fatal("partial assignment pair accepted")
+	}
+}
+
+func TestCompletedFactCopiesStoredAssignmentExactly(t *testing.T) {
+	wire, err := DecodePassedEvidence(validEvidencePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, requirement := "00000000-0000-4000-8000-000000000011", "00000000-0000-4000-8000-000000000012"
+	instance := domain.TaskInstance{ID: wire.TaskInstanceID, StudentID: wire.StudentID, TaskRevisionID: wire.TaskRevisionID, TaskRevisionDigest: wire.TaskRevisionDigest, LearningActionID: wire.LearningActionID, LearningPathItemID: item, RequirementID: requirement, AssistancePolicyVersion: wire.AssistancePolicyVersion, Steps: []domain.Step{{ID: "step-a", Status: "PASSED", Required: true, Targets: wire.Targets}}}
+	submission := domain.Submission{ID: wire.SubmissionID, WorkspaceDigest: wire.WorkspaceDigest}
+	payload, err := passedEvidencePayload(instance, submission, wire.OccurredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact, err := DecodePassedEvidence(payload)
+	if err != nil || fact.LearningPathItemID != item || fact.RequirementID != requirement {
+		t.Fatalf("lost frozen assignment: %+v %v", fact, err)
+	}
+	instance.LearningPathItemID, instance.RequirementID = "", ""
+	legacy, err := passedEvidencePayload(instance, submission, wire.OccurredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	_ = json.Unmarshal(legacy, &fields)
+	if _, ok := fields["learning_path_item_id"]; ok {
+		t.Fatal("legacy payload changed")
+	}
+}
+
+// T11 RED uses the existing ports: one poison must not hide unrelated facts.
+func TestT11PoisonDoesNotStopIndependentDelivery(t *testing.T) {
+	good := validEvidencePayload()
+	repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{
+		{StudentID: "00000000-0000-4000-8000-000000000098", ID: "00000000-0000-4000-8000-000000000099", SubmissionID: "00000000-0000-4000-8000-000000000099", Payload: json.RawMessage(`{"schema":"poison"}`)},
+		{StudentID: "00000000-0000-4000-8000-000000000001", ID: "00000000-0000-4000-8000-000000000010", SubmissionID: "00000000-0000-4000-8000-000000000010", Payload: good},
+	}}
+	evidence := &evidencePortFake{receipt: ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: "00000000-0000-4000-8000-000000000010", LearningActionID: "00000000-0000-4000-8000-000000000004", Accepted: true, PolicyVersion: StudentReceiptPolicyV1}}
+	runtime := Runtime{Repository: repository, Evidence: evidence}
+	count, err := runtime.DispatchEvidence(context.Background(), 10)
+	if count != 1 || len(repository.delivered) != 1 || err == nil {
+		t.Fatalf("poison must remain an error while independent fact delivers: count=%d marked=%d err=%v", count, len(repository.delivered), err)
+	}
+}
+
+type t11EvidenceFunc func(context.Context, ports.PassedEvidence) (ports.EvidenceReceipt, error)
+
+func (call t11EvidenceFunc) ApplyPassedEvidence(ctx context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+	return call(ctx, input)
+}
+func t11Message(id, student string) ports.OutboxMessage {
+	var payload map[string]any
+	_ = json.Unmarshal(validEvidencePayload(), &payload)
+	payload["evidence_id"], payload["submission_id"], payload["student_id"] = id, id, student
+	raw, _ := json.Marshal(payload)
+	return ports.OutboxMessage{ID: id, SubmissionID: id, StudentID: student, Payload: raw}
+}
+func t11Receipt(input ports.PassedEvidence) ports.EvidenceReceipt {
+	return ports.EvidenceReceipt{Schema: "student-practice-evidence-receipt.v2", EvidenceID: input.EvidenceID, LearningActionID: input.LearningActionID, Accepted: true, PolicyVersion: StudentReceiptPolicyV1}
+}
+func TestT11ClassifiedFailuresContinueOnlyIndependentStudents(t *testing.T) {
+	for _, scenario := range []struct{ name, code string }{
+		{"payload", ports.EvidenceFailurePayloadInvalid}, {"identity", ports.EvidenceFailureIdentityMismatch},
+		{"provider", ports.EvidenceFailureProviderUnavailable}, {"receipt", ports.EvidenceFailureReceiptMismatch}, {"marker", ports.EvidenceFailureDeliveryMarker},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			first := t11Message("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000001")
+			later := t11Message("00000000-0000-4000-8000-000000000011", first.StudentID)
+			other := t11Message("00000000-0000-4000-8000-000000000012", "00000000-0000-4000-8000-000000000002")
+			original := append([]byte(nil), first.Payload...)
+			if scenario.name == "payload" {
+				first.Payload = json.RawMessage(`{"schema":"poison"}`)
+				original = append([]byte(nil), first.Payload...)
+			}
+			if scenario.name == "identity" {
+				first.StudentID = "00000000-0000-4000-8000-000000000009"
+				later.StudentID = first.StudentID
+			}
+			repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{first, later, other}, markerErrors: map[string]error{}}
+			if scenario.name == "marker" {
+				repository.markerErrors[first.ID] = errors.New("private marker diagnostic")
+			}
+			calls := []string{}
+			provider := t11EvidenceFunc(func(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+				calls = append(calls, input.EvidenceID)
+				receipt := t11Receipt(input)
+				if input.EvidenceID == first.ID {
+					if scenario.name == "provider" {
+						return ports.EvidenceReceipt{}, errors.New("private provider diagnostic")
+					}
+					if scenario.name == "receipt" {
+						receipt.PolicyVersion = "wrong"
+					}
+				}
+				return receipt, nil
+			})
+			runtime := Runtime{Repository: repository, Evidence: provider}
+			count, err := runtime.DispatchEvidence(context.Background(), 10)
+			var summary *EvidenceDispatchError
+			if count != 1 || len(repository.delivered) != 1 || repository.delivered[0] != other.ID || !errors.As(err, &summary) ||
+				len(summary.Failures) != 1 || summary.Failures[0].Code != scenario.code || !errors.Is(err, domain.ErrDependency) ||
+				len(repository.failed) != 1 || repository.failed[0].Code != scenario.code || strings.Contains(err.Error(), "private") {
+				t.Fatalf("incorrect recovery: count=%d err=%v failures=%+v marked=%v", count, err, repository.failed, repository.delivered)
+			}
+			for _, id := range calls {
+				if id == later.ID {
+					t.Fatal("same-student successor overtook failed head")
+				}
+			}
+			if string(first.Payload) != string(original) {
+				t.Fatal("poison fact was altered")
+			}
+		})
+	}
+}
+func TestT11FailurePersistenceAndContextStopDispatch(t *testing.T) {
+	for _, scenario := range []string{"failure-persistence", "cancelled", "provider-cancelled"} {
+		t.Run(scenario, func(t *testing.T) {
+			first := t11Message("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000001")
+			other := t11Message("00000000-0000-4000-8000-000000000012", "00000000-0000-4000-8000-000000000002")
+			repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{first, other}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if scenario == "failure-persistence" {
+				repository.failureErr = domain.ErrConflict
+				first.Payload = json.RawMessage(`{}`)
+				repository.messages[0] = first
+			}
+			if scenario == "cancelled" {
+				cancel()
+			}
+			calls := 0
+			provider := t11EvidenceFunc(func(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+				calls++
+				if scenario == "provider-cancelled" {
+					cancel()
+					return ports.EvidenceReceipt{}, context.Canceled
+				}
+				return t11Receipt(input), nil
+			})
+			runtime := Runtime{Repository: repository, Evidence: provider}
+			count, err := runtime.DispatchEvidence(ctx, 10)
+			if count != 0 || err == nil || len(repository.delivered) != 0 {
+				t.Fatalf("dispatch did not stop: %d %v", count, err)
+			}
+			if scenario == "failure-persistence" && (calls != 0 || !errors.Is(err, domain.ErrConflict)) {
+				t.Fatal("unpersisted failure allowed progress")
+			}
+			if scenario != "failure-persistence" && !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation lost")
+			}
+		})
+	}
+}
+func TestT11ReceiptRequiresEveryExactAcceptedField(t *testing.T) {
+	for _, field := range []string{"schema", "accepted", "evidence", "action", "policy"} {
+		t.Run(field, func(t *testing.T) {
+			message := t11Message("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000001")
+			repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{message}}
+			provider := t11EvidenceFunc(func(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+				receipt := t11Receipt(input)
+				switch field {
+				case "schema":
+					receipt.Schema = "wrong"
+				case "accepted":
+					receipt.Accepted = false
+				case "evidence":
+					receipt.EvidenceID = "wrong"
+				case "action":
+					receipt.LearningActionID = "wrong"
+				case "policy":
+					receipt.PolicyVersion = "wrong"
+				}
+				return receipt, nil
+			})
+			runtime := Runtime{Repository: repository, Evidence: provider}
+			if count, err := runtime.DispatchEvidence(context.Background(), 1); count != 0 || err == nil || len(repository.failed) != 1 || len(repository.delivered) != 0 {
+				t.Fatal("invalid receipt acknowledged")
+			}
+		})
+	}
+}
+
+func TestT11LocalTimeoutDoesNotStopIndependentDelivery(t *testing.T) {
+	for _, scenario := range []string{"provider", "marker"} {
+		t.Run(scenario, func(t *testing.T) {
+			first := t11Message("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000001")
+			other := t11Message("00000000-0000-4000-8000-000000000012", "00000000-0000-4000-8000-000000000002")
+			repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{first, other}, markerErrors: map[string]error{}}
+			if scenario == "marker" {
+				repository.markerErrors[first.ID] = context.DeadlineExceeded
+			}
+			provider := t11EvidenceFunc(func(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+				if scenario == "provider" && input.EvidenceID == first.ID {
+					return ports.EvidenceReceipt{}, context.DeadlineExceeded
+				}
+				return t11Receipt(input), nil
+			})
+			runtime := Runtime{Repository: repository, Evidence: provider}
+			count, err := runtime.DispatchEvidence(context.Background(), 10)
+			if count != 1 || err == nil || len(repository.failed) != 1 || len(repository.delivered) != 1 || repository.delivered[0] != other.ID {
+				t.Fatalf("local timeout stopped independent fact: count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestT11CancelledContextCannotAcknowledgeProviderReceipt(t *testing.T) {
+	message := t11Message("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000001")
+	repository := &evidenceRepositoryFake{messages: []ports.OutboxMessage{message}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	provider := t11EvidenceFunc(func(_ context.Context, input ports.PassedEvidence) (ports.EvidenceReceipt, error) {
+		cancel()
+		return t11Receipt(input), nil
+	})
+	runtime := Runtime{Repository: repository, Evidence: provider}
+	count, err := runtime.DispatchEvidence(ctx, 1)
+	if count != 0 || !errors.Is(err, context.Canceled) || len(repository.failed) != 0 || len(repository.delivered) != 0 {
+		t.Fatal("cancelled dispatch attempted persistence")
+	}
+}

@@ -1,0 +1,525 @@
+package domain
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"math"
+	"reflect"
+)
+
+const (
+	PlanningInputCheckpointSchema       = "planner-planning-input.v1"
+	GeneratedCourseCheckpointSchema     = "planner-generated-course.v1"
+	CourseEnsureCheckpointSchema        = "planner-course-ensure.v1"
+	MaximumPlanningInputCheckpointBytes = 32 << 20
+	MaximumCourseEnsureCheckpointBytes  = 1 << 20
+)
+
+// PlanningInputCheckpoint is bounded historical job input, never Student source
+// of truth. OriginalPath and diagnostic fences are used unchanged on delivery.
+// CourseFingerprint keeps its existing student-neutral identity; InputHash is
+// a separate private job identity which binds the Student and request.
+type PlanningInputCheckpoint struct {
+	Schema                    string                     `json:"schema"`
+	RequestID                 string                     `json:"request_id"`
+	StudentID                 string                     `json:"student_id"`
+	RequestHash               string                     `json:"request_hash"`
+	GoalCode                  string                     `json:"goal_code"`
+	Intent                    PlanningIntent             `json:"intent"`
+	DiagnosticPlanID          string                     `json:"diagnostic_plan_id,omitempty"`
+	DiagnosticRoute           string                     `json:"diagnostic_route,omitempty"`
+	ExpectedOnboardingVersion int64                      `json:"expected_onboarding_version,omitempty"`
+	ExpectedDirectionCode     string                     `json:"expected_direction_code,omitempty"`
+	OriginalLearningPathID    string                     `json:"original_learning_path_id,omitempty"`
+	OriginalPath              *LearningPathPlanningState `json:"original_path"`
+	Profile                   StudentPlanningProfile     `json:"profile"`
+	Mastery                   []TargetMastery            `json:"mastery"`
+	Graph                     GoalGraph                  `json:"graph"`
+	Policy                    PolicyBundle               `json:"policy"`
+	Draft                     GeneratedCourse            `json:"draft"`
+	Fingerprint               string                     `json:"fingerprint"`
+	NormalizedContext         json.RawMessage            `json:"normalized_context"`
+	GapTargets                []TargetRef                `json:"gap_targets"`
+	InputHash                 string                     `json:"input_hash"`
+}
+
+type GeneratedCourseCheckpoint struct {
+	Schema       string          `json:"schema"`
+	RequestID    string          `json:"request_id"`
+	InputHash    string          `json:"input_hash"`
+	Course       GeneratedCourse `json:"course"`
+	ArtifactHash string          `json:"artifact_hash"`
+}
+
+type CourseEnsureCheckpoint struct {
+	Schema       string             `json:"schema"`
+	RequestID    string             `json:"request_id"`
+	InputHash    string             `json:"input_hash"`
+	ArtifactHash string             `json:"artifact_hash"`
+	Result       EnsureCourseResult `json:"result"`
+	ReceiptHash  string             `json:"receipt_hash"`
+}
+
+func NewPlanningInputCheckpoint(c PlanningInputCheckpoint) (PlanningInputCheckpoint, error) {
+	// Clone before normalizers mutate slices. Preserve RawMessage object order.
+	raw, err := json.Marshal(c)
+	if err != nil || len(raw) > MaximumPlanningInputCheckpointBytes {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	if json.Unmarshal(raw, &c) != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	c.Schema = PlanningInputCheckpointSchema
+	if c.Profile, err = NormalizeStudentPlanningProfile(c.Profile); err != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	if c.Graph, err = NormalizeGoalGraph(c.Graph); err != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	if c.Policy, err = NormalizePolicyBundle(c.Policy); err != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	if c.Intent, err = NormalizePlanningIntent(c.Intent); err != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	for i := range c.Mastery {
+		if c.Mastery[i], err = NormalizeTargetMastery(c.Mastery[i]); err != nil {
+			return PlanningInputCheckpoint{}, ErrValidation
+		}
+	}
+	if c.GapTargets, err = NormalizeTargetRefs(c.GapTargets); err != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	if c.OriginalPath != nil {
+		p, e := NormalizeLearningPathPlanningState(*c.OriginalPath)
+		if e != nil {
+			return PlanningInputCheckpoint{}, ErrValidation
+		}
+		c.OriginalPath = &p
+	}
+	c.InputHash = ""
+	c.InputHash, err = planningCheckpointDigest(c, MaximumPlanningInputCheckpointBytes)
+	if err != nil || c.validateBody() != nil {
+		return PlanningInputCheckpoint{}, ErrValidation
+	}
+	return c, nil
+}
+
+func (c PlanningInputCheckpoint) Validate(r CoursePlanRequest) error {
+	if c.validateBody() != nil || c.RequestID != r.ID || c.StudentID != r.StudentID || c.RequestHash != r.RequestHash || c.GoalCode != r.GoalCode || c.DiagnosticPlanID != r.DiagnosticPlanID {
+		return ErrValidation
+	}
+	normalized, err := NormalizePlanningIntent(r.Intent)
+	if err != nil || !reflect.DeepEqual(c.Intent, normalized) {
+		return ErrValidation
+	}
+	// INITIAL has an immutable original nil path even when Student allocation
+	// has since resolved r.LearningPathID. REPLAN remains exactly caller-bound.
+	if c.Intent.Reason == PlanningReasonInitial && c.OriginalPath != nil && c.OriginalPath.LearningPathID != r.LearningPathID {
+		return ErrValidation
+	}
+	if c.Intent.Reason == PlanningReasonReplan && c.OriginalLearningPathID != r.LearningPathID {
+		return ErrValidation
+	}
+	return nil
+}
+
+func (c PlanningInputCheckpoint) validateBody() error {
+	if c.Schema != PlanningInputCheckpointSchema || !validCoursePlanUUID(c.RequestID) || !validCoursePlanUUID(c.StudentID) || !planningDigest(c.RequestHash) || !planningDigest(c.InputHash) || !planningDigest(c.Fingerprint) || c.GoalCode == "" || len(c.GoalCode) > 64 || c.Graph.Goal.Code != c.GoalCode || c.Profile.GoalCode != c.GoalCode {
+		return ErrValidation
+	}
+	hash := c.InputHash
+	c.InputHash = ""
+	actual, err := planningCheckpointDigest(c, MaximumPlanningInputCheckpointBytes)
+	if err != nil || actual != hash {
+		return ErrValidation
+	}
+	c.InputHash = hash
+	// All projections must be valid and already normalized; never repair a read.
+	normalized, e := normalizedPlanningInputBody(c)
+	before, _ := json.Marshal(c)
+	after, _ := json.Marshal(normalized)
+	if e != nil || !bytes.Equal(before, after) {
+		return ErrValidation
+	}
+	// Preserve the existing domain envelope. The byte bound limits retained
+	// projections without adding new mastery/profile/graph/policy rules.
+	if len(c.Mastery) != len(c.Graph.Targets) || len(c.GapTargets) > 500 {
+		return ErrValidation
+	}
+	if math.IsNaN(c.Policy.MasterySkipConfidence) || math.IsInf(c.Policy.MasterySkipConfidence, 0) {
+		return ErrValidation
+	}
+	allowed := map[string]bool{}
+	for _, t := range c.Graph.Targets {
+		allowed[TargetIdentity(t.Ref)] = true
+	}
+	seen := map[string]bool{}
+	for _, m := range c.Mastery {
+		id := TargetIdentity(m.Target)
+		if !allowed[id] || seen[id] || math.IsNaN(m.Confidence) || math.IsNaN(m.MasteryScore) {
+			return ErrValidation
+		}
+		seen[id] = true
+	}
+	for _, t := range c.GapTargets {
+		if !allowed[TargetIdentity(t)] {
+			return ErrValidation
+		}
+	}
+	if c.Intent.Reason == PlanningReasonInitial {
+		if c.OriginalLearningPathID != "" || (c.OriginalPath != nil && (c.OriginalPath.StudentID != c.StudentID || c.OriginalPath.GoalCode != c.GoalCode)) {
+			return ErrValidation
+		}
+	} else {
+		if !validCoursePlanUUID(c.OriginalLearningPathID) || c.OriginalPath == nil || c.OriginalPath.LearningPathID != c.OriginalLearningPathID || c.OriginalPath.StudentID != c.StudentID || c.OriginalPath.GoalCode != c.GoalCode {
+			return ErrValidation
+		}
+	}
+	if c.DiagnosticPlanID == "" {
+		if c.DiagnosticRoute != "" || c.ExpectedOnboardingVersion != 0 || c.ExpectedDirectionCode != "" {
+			return ErrValidation
+		}
+	} else {
+		if !validCoursePlanUUID(c.DiagnosticPlanID) || c.Intent.Reason != PlanningReasonInitial || c.Intent.Source != PlanningSourceTeacher || c.ExpectedOnboardingVersion < 1 || c.ExpectedOnboardingVersion != c.Profile.OnboardingVersion || c.ExpectedDirectionCode != c.Profile.DirectionCode || (c.DiagnosticRoute != "START_FOUNDATION" && c.DiagnosticRoute != "START_CORE" && c.DiagnosticRoute != "START_ADVANCED") {
+			return ErrValidation
+		}
+	}
+	sum := sha256.Sum256(c.NormalizedContext)
+	var context pinnedFingerprintContext
+	if DecodePlanningCheckpoint(c.NormalizedContext, MaximumGeneratedCoursePayloadBytes, &context) != nil || hex.EncodeToString(sum[:]) != c.Fingerprint || context.FingerprintVersion != CourseFingerprintVersion || context.GoalCode != c.GoalCode || context.GoalVersion != c.Graph.Goal.Version || context.GraphVersion != c.Graph.Goal.GraphVersion || context.ProfileVersion != c.Profile.ProfileVersion || context.DirectionCode != c.Profile.DirectionCode || context.Experience != c.Profile.SelfAssessedExperience || context.Language != c.Profile.PreferredLanguage || context.PlannerVersion != c.Policy.PlannerVersion || context.PedagogyProfile != c.Policy.PedagogyProfile || context.PresentationStyle != c.Policy.PresentationStyle || context.GenerationPolicy != c.Policy.GenerationPolicy {
+		return ErrValidation
+	}
+	if !reflect.DeepEqual(normalizeCodes(context.KnownStacks), normalizeCodes(c.Profile.KnownStacks)) || !reflect.DeepEqual(normalizeCodes(context.DesiredStacks), normalizeCodes(c.Profile.DesiredStacks)) {
+		return ErrValidation
+	}
+	if !reflect.DeepEqual(SortTargetRefs(context.Gap), SortTargetRefs(c.GapTargets)) {
+		return ErrValidation
+	}
+	if len(context.Mastery) != len(c.Graph.Targets) {
+		return ErrValidation
+	}
+	decisions := map[string]bool{}
+	for _, m := range context.Mastery {
+		id := TargetIdentity(m.Target)
+		if !allowed[id] || decisions[id] || m.PolicyVersion != StudentMasteryPolicyVersion || (m.Decision != "INCLUDE" && m.Decision != "SKIP") {
+			return ErrValidation
+		}
+		decisions[id] = true
+	}
+	if c.DiagnosticRoute == "" {
+		if context.DiagnosticRoute != "" || context.DiagnosticRoutePolicy != "" {
+			return ErrValidation
+		}
+	} else if context.DiagnosticRoute != c.DiagnosticRoute || context.DiagnosticRoutePolicy != "diagnostic-placement-route-v1" {
+		return ErrValidation
+	}
+	if err := validatePinnedCourse(c.Draft, c, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizedPlanningInputBody validates existing domain projections without
+// recursively hashing or changing persisted byte order.
+func normalizedPlanningInputBody(c PlanningInputCheckpoint) (PlanningInputCheckpoint, error) {
+	raw, _ := json.Marshal(c)
+	var n PlanningInputCheckpoint
+	if json.Unmarshal(raw, &n) != nil {
+		return n, ErrValidation
+	}
+	var e error
+	if n.Profile, e = NormalizeStudentPlanningProfile(n.Profile); e != nil {
+		return n, e
+	}
+	if n.Graph, e = NormalizeGoalGraph(n.Graph); e != nil {
+		return n, e
+	}
+	if n.Policy, e = NormalizePolicyBundle(n.Policy); e != nil {
+		return n, e
+	}
+	if n.Intent, e = NormalizePlanningIntent(n.Intent); e != nil {
+		return n, e
+	}
+	for i := range n.Mastery {
+		if n.Mastery[i], e = NormalizeTargetMastery(n.Mastery[i]); e != nil {
+			return n, e
+		}
+	}
+	if n.GapTargets, e = NormalizeTargetRefs(n.GapTargets); e != nil {
+		return n, e
+	}
+	if n.OriginalPath != nil {
+		p, e := NormalizeLearningPathPlanningState(*n.OriginalPath)
+		if e != nil {
+			return n, e
+		}
+		n.OriginalPath = &p
+	}
+	return n, nil
+}
+
+func NewGeneratedCourseCheckpoint(input PlanningInputCheckpoint, course GeneratedCourse) (GeneratedCourseCheckpoint, error) {
+	raw, e := json.Marshal(course)
+	if e != nil || len(raw) > MaximumGeneratedCoursePayloadBytes || json.Unmarshal(raw, &course) != nil {
+		return GeneratedCourseCheckpoint{}, ErrValidation
+	}
+	c := GeneratedCourseCheckpoint{Schema: GeneratedCourseCheckpointSchema, RequestID: input.RequestID, InputHash: input.InputHash, Course: course}
+	c.ArtifactHash, e = planningCheckpointDigest(c, MaximumGeneratedCoursePayloadBytes+4096)
+	if e != nil || c.Validate(input) != nil {
+		return GeneratedCourseCheckpoint{}, ErrValidation
+	}
+	return c, nil
+}
+func (c GeneratedCourseCheckpoint) Validate(input PlanningInputCheckpoint) error {
+	if input.validateBody() != nil || c.Schema != GeneratedCourseCheckpointSchema || c.RequestID != input.RequestID || c.InputHash != input.InputHash || !planningDigest(c.ArtifactHash) || len(input.GapTargets) == 0 {
+		return ErrValidation
+	}
+	h := c.ArtifactHash
+	c.ArtifactHash = ""
+	actual, e := planningCheckpointDigest(c, MaximumGeneratedCoursePayloadBytes+4096)
+	if e != nil || actual != h {
+		return ErrValidation
+	}
+	if e := validatePinnedCourse(c.Course, input, true); e != nil {
+		return e
+	}
+	// Generated enrichment may change content and lifecycle status only.
+	raw, _ := json.Marshal(c.Course)
+	var structural GeneratedCourse
+	_ = json.Unmarshal(raw, &structural)
+	structural.Status = input.Draft.Status
+	for mi := range structural.Modules {
+		if mi >= len(input.Draft.Modules) {
+			return ErrValidation
+		}
+		for si := range structural.Modules[mi].Sections {
+			if si >= len(input.Draft.Modules[mi].Sections) {
+				return ErrValidation
+			}
+			for li := range structural.Modules[mi].Sections[si].Lessons {
+				if li >= len(input.Draft.Modules[mi].Sections[si].Lessons) {
+					return ErrValidation
+				}
+				l := &structural.Modules[mi].Sections[si].Lessons[li]
+				d := input.Draft.Modules[mi].Sections[si].Lessons[li]
+				l.Status = d.Status
+				l.DescriptionMarkdown = d.DescriptionMarkdown
+				l.Examples = d.Examples
+				l.Tasks = d.Tasks
+			}
+		}
+	}
+	a, _ := json.Marshal(structural)
+	b, _ := json.Marshal(input.Draft)
+	if !bytes.Equal(a, b) {
+		return ErrValidation
+	}
+	return nil
+}
+func NewCourseEnsureCheckpoint(input PlanningInputCheckpoint, generated GeneratedCourseCheckpoint, result EnsureCourseResult) (CourseEnsureCheckpoint, error) {
+	raw, e := json.Marshal(result)
+	if e != nil || len(raw) > MaximumCourseEnsureCheckpointBytes || json.Unmarshal(raw, &result) != nil {
+		return CourseEnsureCheckpoint{}, ErrValidation
+	}
+	c := CourseEnsureCheckpoint{Schema: CourseEnsureCheckpointSchema, RequestID: input.RequestID, InputHash: input.InputHash, ArtifactHash: generated.ArtifactHash, Result: result}
+	c.ReceiptHash, e = planningCheckpointDigest(c, MaximumCourseEnsureCheckpointBytes)
+	if e != nil || c.Validate(input, generated) != nil {
+		return CourseEnsureCheckpoint{}, ErrValidation
+	}
+	return c, nil
+}
+func (c CourseEnsureCheckpoint) Validate(input PlanningInputCheckpoint, generated GeneratedCourseCheckpoint) error {
+	if generated.Validate(input) != nil || c.Schema != CourseEnsureCheckpointSchema || c.RequestID != input.RequestID || c.InputHash != input.InputHash || c.ArtifactHash != generated.ArtifactHash || !planningDigest(c.ReceiptHash) || !validCoursePlanUUID(c.Result.CourseID) {
+		return ErrValidation
+	}
+	h := c.ReceiptHash
+	c.ReceiptHash = ""
+	actual, e := planningCheckpointDigest(c, MaximumCourseEnsureCheckpointBytes)
+	if e != nil || actual != h {
+		return ErrValidation
+	}
+	lessons := []PlannedLesson{}
+	for _, m := range generated.Course.Modules {
+		for _, s := range m.Sections {
+			lessons = append(lessons, s.Lessons...)
+		}
+	}
+	if len(c.Result.Lessons) != len(lessons) || len(c.Result.Lessons) == 0 || len(c.Result.Lessons) > 500 {
+		return ErrValidation
+	}
+	seen := map[string]bool{}
+	for i, l := range c.Result.Lessons {
+		refs, e := NormalizeTargetRefs(l.Targets)
+		if !validCoursePlanUUID(l.LessonID) || (l.LessonRevisionID != "" && !validCoursePlanUUID(l.LessonRevisionID)) || l.Order != i || seen[l.LessonID] || e != nil || !reflect.DeepEqual(SortTargetRefs(refs), SortTargetRefs(lessons[i].Targets)) {
+			return ErrValidation
+		}
+		seen[l.LessonID] = true
+	}
+	return nil
+}
+func validatePinnedCourse(course GeneratedCourse, input PlanningInputCheckpoint, generated bool) error {
+	raw, e := json.Marshal(course)
+	if e != nil || len(raw) > MaximumGeneratedCoursePayloadBytes || course.Fingerprint != input.Fingerprint || course.FingerprintVersion != CourseFingerprintVersion || course.GoalCode != input.GoalCode || course.GoalVersion != input.Graph.Goal.Version || course.Language != input.Profile.PreferredLanguage || course.PlannerVersion != input.Policy.PlannerVersion || course.PedagogyProfile != input.Policy.PedagogyProfile || course.PresentationStyle != input.Policy.PresentationStyle || course.GenerationPolicy != input.Policy.GenerationPolicy || course.Title == "" || course.CatalogVisible || (course.Status != CourseStatusActiveBuilding && course.Status != CourseStatusActive) || len(course.Modules) > 500 {
+		return ErrValidation
+	}
+	wanted := map[string]bool{}
+	for _, r := range input.GapTargets {
+		wanted[TargetIdentity(r)] = true
+	}
+	seen := map[string]bool{}
+	count := 0
+	for _, m := range course.Modules {
+		if m.Code == "" || m.Title == "" || len(m.Sections) > 500 {
+			return ErrValidation
+		}
+		for _, s := range m.Sections {
+			if s.Code == "" || s.Title == "" || len(s.Lessons) > 500 {
+				return ErrValidation
+			}
+			for _, l := range s.Lessons {
+				count++
+				refs, e := NormalizeTargetRefs(l.Targets)
+				if e != nil || len(refs) == 0 || l.Code == "" || l.Title == "" || len(l.Examples) > 100 || len(l.Tasks) > 100 {
+					return ErrValidation
+				}
+				for _, r := range refs {
+					id := TargetIdentity(r)
+					if !wanted[id] || seen[id] {
+						return ErrValidation
+					}
+					seen[id] = true
+				}
+			}
+		}
+	}
+	if count > 500 || len(seen) != len(wanted) || (generated && count == 0) {
+		return ErrValidation
+	}
+	return nil
+}
+func planningDigest(s string) bool {
+	b, e := hex.DecodeString(s)
+	return e == nil && len(b) == 32 && hex.EncodeToString(b) == s
+}
+func planningCheckpointDigest(v any, maximum int) (string, error) {
+	b, e := json.Marshal(v)
+	if e != nil || len(b) > maximum || planningJSONShape(b) != nil {
+		return "", ErrValidation
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
+}
+
+// DecodePlanningCheckpoint rejects unknown fields and trailing JSON. Persistence
+// additionally checks the SHA of original BYTEA before this typed decode.
+func DecodePlanningCheckpoint(raw []byte, maximum int, out any) error {
+	if len(raw) == 0 || len(raw) > maximum || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' || planningJSONShape(raw) != nil {
+		return ErrValidation
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if d.Decode(out) != nil {
+		return ErrValidation
+	}
+	var extra any
+	if d.Decode(&extra) != io.EOF {
+		return ErrValidation
+	}
+	return nil
+}
+
+// Reject duplicate object keys (including RawMessage context/config), excessive
+// nesting and trailing tokens before the strict typed decoder sees the payload.
+func planningJSONShape(raw []byte) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var value func(int) error
+	value = func(depth int) error {
+		if depth > 64 {
+			return ErrValidation
+		}
+		t, e := d.Token()
+		if e != nil {
+			return ErrValidation
+		}
+		delim, ok := t.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := map[string]bool{}
+			for d.More() {
+				k, e := d.Token()
+				if e != nil {
+					return ErrValidation
+				}
+				key, ok := k.(string)
+				if !ok || seen[key] {
+					return ErrValidation
+				}
+				seen[key] = true
+				if e = value(depth + 1); e != nil {
+					return e
+				}
+			}
+			end, e := d.Token()
+			if e != nil || end != json.Delim('}') {
+				return ErrValidation
+			}
+		case '[':
+			for d.More() {
+				if e = value(depth + 1); e != nil {
+					return e
+				}
+			}
+			end, e := d.Token()
+			if e != nil || end != json.Delim(']') {
+				return ErrValidation
+			}
+		default:
+			return ErrValidation
+		}
+		return nil
+	}
+	if value(0) != nil {
+		return ErrValidation
+	}
+	if _, e := d.Token(); e != io.EOF {
+		return ErrValidation
+	}
+	return nil
+}
+
+// This is the existing fingerprint-v1 projection, including its optional
+// diagnostic route extension. Decode-only: never reorder or rebuild its bytes.
+// Unknown identity/evidence fields are rejected before shared Course reuse.
+type pinnedFingerprintContext struct {
+	FingerprintVersion string   `json:"fingerprint_version"`
+	GoalCode           string   `json:"goal_code"`
+	GoalVersion        string   `json:"goal_version"`
+	GraphVersion       string   `json:"graph_version"`
+	ProfileVersion     string   `json:"profile_version"`
+	DirectionCode      string   `json:"direction_code"`
+	Experience         string   `json:"self_assessed_experience"`
+	KnownStacks        []string `json:"known_stacks"`
+	DesiredStacks      []string `json:"desired_stacks"`
+	Language           string   `json:"language"`
+	Mastery            []struct {
+		Target        TargetRef `json:"target"`
+		Decision      string    `json:"decision"`
+		PolicyVersion string    `json:"policy_version"`
+	} `json:"mastery"`
+	Gap                   []TargetRef           `json:"gap"`
+	Transitions           []TransitionKnowledge `json:"transitions"`
+	PlannerVersion        string                `json:"planner_version"`
+	PedagogyProfile       string                `json:"pedagogy_profile"`
+	PresentationStyle     string                `json:"presentation_style"`
+	GenerationPolicy      string                `json:"generation_policy"`
+	DiagnosticRoute       string                `json:"diagnostic_entry_route,omitempty"`
+	DiagnosticRoutePolicy string                `json:"diagnostic_entry_route_policy,omitempty"`
+}

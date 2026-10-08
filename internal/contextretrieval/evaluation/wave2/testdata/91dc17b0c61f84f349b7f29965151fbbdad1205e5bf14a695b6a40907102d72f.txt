@@ -1,0 +1,495 @@
+package usecase
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/postgres"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const t222EvidenceRoot = "/Users/marat/.codex/visualizations/2026/10/03/01a102d8-ab74-7d20-b2e5-79ecea218b46/remediation-20261004-01/EVIDENCE/T22"
+
+// Root dispatches seed and replay as different Go test processes. Production
+// Planner and JobRepository own all lifecycle writes. Collaborators are named
+// bounded fixtures; this proves neither real LLM/validator/Practice services nor
+// public publication. No job state is seeded by SQL; all rows remain retained.
+func TestT222ActualStagedReplay(t *testing.T) {
+	if os.Getenv("T222_TZ_PROOF") != "1" {
+		t.Skip("root-dispatched actual TZ PostgreSQL seed/replay proof")
+	}
+	phase := os.Getenv("T222_TZ_PHASE")
+	if phase != "seed" && phase != "replay" {
+		t.Fatal("SETUP: T222_TZ_PHASE must be seed or replay")
+	}
+	seedFile := t222EvidenceFile(t, os.Getenv("T222_TZ_SEED_FILE"))
+	dsn := os.Getenv("T222_TZ_DATABASE_URL")
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998 || cfg.ConnConfig.Database != "remediation_t222_tz_integration_proof" || cfg.ConnConfig.User != "postgres" || cfg.ConnConfig.Password != "" || cfg.ConnConfig.TLSConfig != nil {
+		t.Fatal("SETUP: exact isolated TZ T22.2 PostgreSQL database required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if phase == "seed" {
+		if _, e := os.Stat(seedFile); e == nil || !os.IsNotExist(e) {
+			t.Fatal("SETUP: seed metadata must use a fresh owned path")
+		}
+		// Existing production migration loader/ledger, root-authorized only in
+		// seed and only for this newly provisioned DB; replay performs no DDL.
+		conn, e := pgx.ConnectConfig(ctx, cfg.ConnConfig.Copy())
+		if e != nil {
+			t.Fatalf("SETUP: migration connection: %T", e)
+		}
+		migrations, e := postgres.LoadMigrations("../../db/migrations")
+		if e != nil || len(migrations) != 3 {
+			_ = conn.Close(ctx)
+			t.Fatal("SETUP: expected exactly existing forward migrations 001–003")
+		}
+		if e = postgres.ApplyMigrations(ctx, conn, migrations); e != nil {
+			_ = conn.Close(ctx)
+			t.Fatalf("SETUP: production migration ledger: %T", e)
+		}
+		applied, e := postgres.AppliedMigrations(ctx, conn)
+		if e != nil || len(applied) != 3 {
+			_ = conn.Close(ctx)
+			t.Fatal("SETUP: migration ledger count mismatch")
+		}
+		for i, item := range applied {
+			if item.Filename != migrations[i].Filename || item.SHA256 != migrations[i].SHA256 {
+				_ = conn.Close(ctx)
+				t.Fatal("SETUP: recorded migration checksum mismatch")
+			}
+		}
+		if e = conn.Close(ctx); e != nil {
+			t.Fatal("migration connection close failed")
+		}
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("SETUP: actual pool: %T", err)
+	}
+	defer pool.Close()
+	if err = pool.Ping(ctx); err != nil {
+		t.Fatalf("SETUP: actual DB unavailable: %T", err)
+	}
+	repository := postgres.JobRepository{Pool: pool}
+	var metadata t222SeedMetadata
+	if phase == "seed" {
+		metadata = t222Seed(t, ctx, pool, repository, seedFile)
+	} else {
+		metadata = t222LoadSeed(t, seedFile)
+		t222Replay(t, ctx, pool, repository, metadata)
+	}
+	if resultFile := os.Getenv("T222_TZ_RESULT_FILE"); resultFile != "" && !t.Failed() {
+		resultFile = t222EvidenceFile(t, resultFile)
+		result := map[string]any{"status": "PASS", "phase": phase, "process_id": os.Getpid(), "seed_process_id": metadata.SeedPID, "jobs": metadata.Jobs, "ledger_sha256": metadata.LedgerHash, "retained_rows": true, "proof": "production Planner/PostgreSQL lifecycle with named collaborator fixtures", "actual_model_validator_practice_services": false, "public_release": false}
+		raw, e := json.MarshalIndent(result, "", "  ")
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = os.WriteFile(resultFile, append(raw, '\n'), 0600); e != nil {
+			t.Fatal("safe phase result write failed")
+		}
+	}
+}
+
+type t222SeedJob struct {
+	Name          string `json:"name"`
+	ID            string `json:"job_id"`
+	Key           string `json:"idempotency_key"`
+	RequestSchema string `json:"request_schema"`
+	RequestHash   string `json:"request_hash"`
+	Attempts      int    `json:"attempts"`
+	RowHash       string `json:"row_sha256"`
+}
+type t222SeedMetadata struct {
+	Schema     string        `json:"schema"`
+	SeedPID    int           `json:"seed_process_id"`
+	LedgerHash string        `json:"ledger_sha256"`
+	Jobs       []t222SeedJob `json:"jobs"`
+}
+
+func t222Seed(t *testing.T, ctx context.Context, pool *pgxpool.Pool, repository postgres.JobRepository, seedFile string) t222SeedMetadata {
+	t.Helper()
+	task := validPreparedSourceTask()
+	source := domain.PlanningRequestV1{Schema: domain.PlanningRequestSchemaV3, Mode: "private", Locale: "en", Source: domain.PlanningSource{Type: "github_repository", URL: task.Source.RepositoryURL, Company: "Acme"}, Hints: domain.ClassificationHint{Stacks: []string{"javascript"}}, PreparedSourceTask: &task}
+	cases := []struct {
+		name     string
+		request  domain.PlanningRequestV1
+		attempts int
+	}{
+		{"v1_staged_normal", validRequest("T22.2 named bounded intent fixture"), 1},
+		{"v2_staged_attempt5", validV2Request("T22.2 named bounded project fixture", domain.SurfaceClassificationProject, "beginner"), 5},
+		{"v3_source_staged_normal", source, 1},
+	}
+	metadata := t222SeedMetadata{Schema: "t222-staged-seed.v1", SeedPID: os.Getpid(), LedgerHash: t222LedgerHash(t, ctx, pool)}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			key := newUUID()
+			if item.attempts == 5 {
+				normalized, hash, e := normalizePlanningRequest(item.request)
+				if e != nil {
+					t.Fatal("SETUP: valid bounded request rejected")
+				}
+				now := time.Now().UTC()
+				job, created, e := repository.Ensure(ctx, domain.PlanningJob{ID: newUUID(), IdempotencyKey: key, RequestHash: hash, Request: normalized, Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now})
+				if e != nil || !created {
+					t.Fatalf("SETUP: initial lifecycle Ensure: created=%v err=%T", created, e)
+				}
+				for i := 1; i <= 4; i++ {
+					token := newUUID()
+					claimed, e := repository.Claim(ctx, job.ID, token, time.Now().UTC(), time.Minute)
+					if e != nil || claimed.Attempts != i || claimed.Status != domain.JobStatusGenerating {
+						t.Fatalf("real failure attempt %d Claim failed: %T", i, e)
+					}
+					if e = repository.SaveFailed(ctx, job.ID, token, "t222_named_preterminal_failure", time.Now().UTC()); e != nil {
+						t.Fatalf("real failure attempt %d SaveFailed: %T", i, e)
+					}
+					failed, e := repository.Get(ctx, job.ID)
+					if e != nil || failed.Status != domain.JobStatusFailed || failed.Attempts != i || failed.LeaseToken != "" || failed.Artifact != nil {
+						t.Fatal("real failed lifecycle state did not persist")
+					}
+				}
+			}
+			fixtures := &t222NamedPorts{}
+			planner := t222Planner(repository, fixtures)
+			job, created, e := planner.Plan(ctx, key, item.request)
+			if e != nil || job.Status != domain.JobStatusReady || job.Artifact == nil || !job.Artifact.Verification.Passed || job.Attempts != item.attempts || (item.attempts == 1 && !created) || (item.attempts == 5 && created) {
+				t.Fatalf("actual production Plan did not persist READY: status=%s attempts=%d created=%v err=%T", job.Status, job.Attempts, created, e)
+			}
+			staged, e := planner.Stage(ctx, job.ID)
+			if e != nil || staged.Status != domain.JobStatusStaged || staged.Staging == nil || staged.Staging.AuthoringJobID != job.ID || staged.LeaseToken != "" || staged.LeaseExpiresAt != nil || staged.LegacyPublicationPresent {
+				t.Fatalf("actual production Stage did not persist private receipt: status=%s err=%T", staged.Status, e)
+			}
+			if fixtures.calls[t222Generate].Load() != 1 || fixtures.calls[t222Stage].Load() != 1 || fixtures.calls[t222Inspect].Load() != 1 || fixtures.calls[t222Verify].Load() != 1 || fixtures.calls[t222WorkspaceCreate].Load() == 0 || fixtures.calls[t222WorkspaceCreate].Load() != fixtures.calls[t222WorkspaceDelete].Load() {
+				t.Fatal("named collaborator pipeline counters did not establish real persisted authoring/staging flow")
+			}
+			rowHash := t222RowHash(t, ctx, pool, job.ID)
+			metadata.Jobs = append(metadata.Jobs, t222SeedJob{Name: item.name, ID: job.ID, Key: key, RequestSchema: staged.Request.Schema, RequestHash: staged.RequestHash, Attempts: staged.Attempts, RowHash: rowHash})
+			t.Logf("persisted named staged fixture: job=%s schema=%s attempts=%d row_sha256=%s", job.ID, staged.Request.Schema, staged.Attempts, rowHash)
+		})
+	}
+	t.Run("real_nonterminal_lease_failure_and_cap_control", func(t *testing.T) { t222NonterminalControl(t, ctx, pool, repository) })
+	if t.Failed() || len(metadata.Jobs) != 3 {
+		t.Fatal("seed fixtures incomplete; no replay metadata published")
+	}
+	raw, e := json.MarshalIndent(metadata, "", "  ")
+	if e != nil {
+		t.Fatal(e)
+	}
+	file, e := os.OpenFile(seedFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		t.Fatal("fresh seed metadata creation failed")
+	}
+	if _, e = file.Write(append(raw, '\n')); e != nil {
+		_ = file.Close()
+		t.Fatal("safe seed metadata write failed")
+	}
+	if e = file.Close(); e != nil {
+		t.Fatal("seed metadata close failed")
+	}
+	return metadata
+}
+
+func t222Replay(t *testing.T, ctx context.Context, pool *pgxpool.Pool, repository postgres.JobRepository, metadata t222SeedMetadata) {
+	t.Helper()
+	if metadata.SeedPID == os.Getpid() {
+		t.Fatal("SETUP: replay must run in a separate Go test process")
+	}
+	ledgerBefore := t222LedgerHash(t, ctx, pool)
+	if ledgerBefore != metadata.LedgerHash {
+		t.Fatal("SETUP: retained migration ledger changed between seed/replay")
+	}
+	for _, seed := range metadata.Jobs {
+		t.Run(seed.Name, func(t *testing.T) {
+			stored, e := repository.Get(ctx, seed.ID)
+			if e != nil || stored.ID != seed.ID || stored.IdempotencyKey != seed.Key || stored.RequestHash != seed.RequestHash || stored.Request.Schema != seed.RequestSchema || stored.Attempts != seed.Attempts || stored.Status != domain.JobStatusStaged || stored.Artifact == nil || stored.Staging == nil {
+				t.Fatalf("SETUP: retained staged job mismatch: status=%s err=%T", stored.Status, e)
+			}
+			before := t222RowHash(t, ctx, pool, stored.ID)
+			if before != seed.RowHash {
+				t.Fatal("SETUP: exact whole seeded row/xmin changed before replay")
+			}
+			ports := &t222NamedPorts{trap: true}
+			planner := t222Planner(repository, ports)
+			planned, created, e := planner.Plan(ctx, stored.IdempotencyKey, stored.Request)
+			t222AssertReplay(t, "Plan", planned, created, e, stored)
+			processed, e := planner.Process(ctx, stored.ID)
+			t222AssertReplay(t, "Process", processed, false, e, stored)
+			staged, e := planner.Stage(ctx, stored.ID)
+			t222AssertReplay(t, "Stage", staged, false, e, stored)
+			claimed, e := repository.Claim(ctx, stored.ID, newUUID(), time.Now().UTC(), time.Minute)
+			t222AssertReplay(t, "repository Claim terminal fallback", claimed, false, e, stored)
+			// Every collaborator trap is atomic and immutable; duplicate Plan,
+			// Process and existing Stage calls are safe to run concurrently.
+			type outcome struct {
+				kind    string
+				job     domain.PlanningJob
+				created bool
+				err     error
+			}
+			outcomes := make(chan outcome, 12)
+			start := make(chan struct{})
+			var wait sync.WaitGroup
+			for i := 0; i < 12; i++ {
+				wait.Add(1)
+				go func(kind int) {
+					defer wait.Done()
+					<-start
+					switch kind % 3 {
+					case 0:
+						j, c, e := planner.Plan(ctx, stored.IdempotencyKey, stored.Request)
+						outcomes <- outcome{"concurrent Plan", j, c, e}
+					case 1:
+						j, e := planner.Process(ctx, stored.ID)
+						outcomes <- outcome{"concurrent Process", j, false, e}
+					case 2:
+						j, e := planner.Stage(ctx, stored.ID)
+						outcomes <- outcome{"concurrent Stage", j, false, e}
+					}
+				}(i)
+			}
+			close(start)
+			wait.Wait()
+			close(outcomes)
+			for value := range outcomes {
+				t222AssertReplay(t, value.kind, value.job, value.created, value.err, stored)
+			}
+			changed := stored.Request
+			if changed.Locale == "en" {
+				changed.Locale = "ru"
+			} else {
+				changed.Locale = "en"
+			}
+			_, _, e = planner.Plan(ctx, stored.IdempotencyKey, changed)
+			if !errors.Is(e, domain.ErrConflict) {
+				t.Errorf("changed normalized request must conflict: error=%T", e)
+			}
+			for i := range ports.calls {
+				if ports.calls[i].Load() != 0 {
+					t.Errorf("terminal replay invoked named collaborator %d: count=%d", i, ports.calls[i].Load())
+				}
+			}
+			fresh, e := repository.Get(ctx, stored.ID)
+			if e != nil || !reflect.DeepEqual(fresh, stored) || before != t222RowHash(t, ctx, pool, stored.ID) {
+				t.Error("terminal replay changed artifact/receipt/attempts/time/lease or whole row/xmin")
+			}
+			var count int
+			if e = pool.QueryRow(ctx, `SELECT count(*) FROM tz_authoring_job WHERE idempotency_key=$1`, stored.IdempotencyKey).Scan(&count); e != nil || count != 1 {
+				t.Fatal("terminal replay duplicated exact idempotency job")
+			}
+			t.Logf("retained replay observation: job=%s attempts=%d row_sha256=%s collaborator_calls=%d", stored.ID, stored.Attempts, before, ports.total())
+		})
+	}
+	if ledgerBefore != t222LedgerHash(t, ctx, pool) {
+		t.Error("replay changed migration ledger")
+	}
+}
+
+func t222AssertReplay(t *testing.T, operation string, job domain.PlanningJob, created bool, err error, want domain.PlanningJob) {
+	t.Helper()
+	if err != nil || created || !reflect.DeepEqual(job, want) {
+		t.Errorf("%s terminal replay: job=%s status=%s attempts=%d created=%v error=%T want_unchanged_STAGED_attempts=%d", operation, job.ID, job.Status, job.Attempts, created, err, want.Attempts)
+	}
+}
+func t222NonterminalControl(t *testing.T, ctx context.Context, pool *pgxpool.Pool, repository postgres.JobRepository) {
+	t.Helper()
+	request, hash, e := normalizePlanningRequest(validRequest("T22.2 named lease/cap lifecycle control"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	now := time.Now().UTC()
+	job, created, e := repository.Ensure(ctx, domain.PlanningJob{ID: newUUID(), IdempotencyKey: newUUID(), Request: request, RequestHash: hash, Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now})
+	if e != nil || !created {
+		t.Fatal("nonterminal control Ensure failed")
+	}
+	for attempt := 1; attempt <= 5; attempt++ {
+		token := newUUID()
+		claimed, e := repository.Claim(ctx, job.ID, token, time.Now().UTC(), time.Minute)
+		if e != nil || claimed.Attempts != attempt || claimed.Status != domain.JobStatusGenerating {
+			t.Fatal("nonterminal control Claim failed")
+		}
+		before := t222RowHash(t, ctx, pool, job.ID)
+		_, e = repository.Claim(ctx, job.ID, newUUID(), time.Now().UTC(), time.Minute)
+		expected := domain.ErrLeaseHeld
+		if attempt == 5 {
+			expected = domain.ErrConflict
+		}
+		if !errors.Is(e, expected) || before != t222RowHash(t, ctx, pool, job.ID) {
+			t.Fatal("active nonterminal lease/cap rejection changed retained row")
+		}
+		if e = repository.SaveFailed(ctx, job.ID, newUUID(), "t222_wrong_fence", time.Now().UTC()); !errors.Is(e, domain.ErrConflict) || before != t222RowHash(t, ctx, pool, job.ID) {
+			t.Fatal("wrong nonterminal fence mutated retained row")
+		}
+		if e = repository.SaveFailed(ctx, job.ID, token, "t222_named_failure", time.Now().UTC()); e != nil {
+			t.Fatal("nonterminal failure retry persistence failed")
+		}
+	}
+	before := t222RowHash(t, ctx, pool, job.ID)
+	if _, e = repository.Claim(ctx, job.ID, newUUID(), time.Now().UTC(), time.Minute); !errors.Is(e, domain.ErrConflict) || before != t222RowHash(t, ctx, pool, job.ID) {
+		t.Fatal("failed nonterminal attempts5 cap changed")
+	}
+}
+
+const (
+	t222Generate = iota
+	t222Discover
+	t222Resolve
+	t222Profiles
+	t222Inspect
+	t222Verify
+	t222WorkspaceCreate
+	t222WorkspaceDelete
+	t222Stage
+	t222PortCount
+)
+
+// Named fixture ports use atomic counters in both phases. Replay returns a
+// sentinel before any private output is created; all counters must stay zero.
+type t222NamedPorts struct {
+	trap  bool
+	calls [t222PortCount]atomic.Int64
+}
+
+func (p *t222NamedPorts) called(kind int) error {
+	p.calls[kind].Add(1)
+	if p.trap {
+		return errors.New("named downstream collaborator unavailable during terminal replay")
+	}
+	return nil
+}
+func (p *t222NamedPorts) total() int64 {
+	var result int64
+	for i := range p.calls {
+		result += p.calls[i].Load()
+	}
+	return result
+}
+func (p *t222NamedPorts) Generate(context.Context, domain.GenerationInput) (domain.AuthoringCandidateV1, error) {
+	if e := p.called(t222Generate); e != nil {
+		return domain.AuthoringCandidateV1{}, e
+	}
+	return validCandidate(), nil
+}
+func (p *t222NamedPorts) DiscoverTargets(ctx context.Context, stacks []string) ([]domain.LearningTargetDescriptor, error) {
+	if e := p.called(t222Discover); e != nil {
+		return nil, e
+	}
+	return (&competencyStub{}).DiscoverTargets(ctx, stacks)
+}
+func (p *t222NamedPorts) ResolveExactTargets(context.Context, []domain.LearningTargetRef) error {
+	return p.called(t222Resolve)
+}
+func (p *t222NamedPorts) ListRuntimeProfiles(ctx context.Context) ([]domain.RuntimeProfileDescriptor, error) {
+	if e := p.called(t222Profiles); e != nil {
+		return nil, e
+	}
+	return (profileStub{}).ListRuntimeProfiles(ctx)
+}
+func (p *t222NamedPorts) InspectContract(ctx context.Context, raw json.RawMessage) (domain.ContractInspection, error) {
+	if e := p.called(t222Inspect); e != nil {
+		return domain.ContractInspection{}, e
+	}
+	return (validationStub{passed: true}).InspectContract(ctx, raw)
+}
+func (p *t222NamedPorts) VerifyContract(ctx context.Context, request domain.VerificationRequestV1) (domain.VerificationReceiptV1, error) {
+	if e := p.called(t222Verify); e != nil {
+		return domain.VerificationReceiptV1{}, e
+	}
+	return (validationStub{passed: true}).VerifyContract(ctx, request)
+}
+func (p *t222NamedPorts) CreateVerificationWorkspace(context.Context, domain.RuntimeProfileRef, domain.WorkspaceFixture, time.Duration) (domain.VerificationWorkspace, error) {
+	if e := p.called(t222WorkspaceCreate); e != nil {
+		return domain.VerificationWorkspace{}, e
+	}
+	id := fmt.Sprintf("t222-named-workspace-%d", p.calls[t222WorkspaceCreate].Load())
+	return domain.VerificationWorkspace{ID: id, RootPath: "/t222-named-fixture/" + id}, nil
+}
+func (p *t222NamedPorts) DeleteVerificationWorkspace(context.Context, string) error {
+	return p.called(t222WorkspaceDelete)
+}
+func (p *t222NamedPorts) Stage(_ context.Context, jobID string, artifact domain.AuthoringArtifact) (domain.StagingReceiptV1, error) {
+	if e := p.called(t222Stage); e != nil {
+		return domain.StagingReceiptV1{}, e
+	}
+	digest, e := jsonDigest(artifact.Candidate.Blueprint)
+	if e != nil {
+		return domain.StagingReceiptV1{}, e
+	}
+	return domain.StagingReceiptV1{Schema: "practice-task-staging-receipt.v1", StagedID: newUUID(), AuthoringJobID: jobID, State: "staged", Created: true, CreatedAt: time.Now().UTC(), FamilyKey: artifact.Candidate.Blueprint.Identity.FamilyKey, VariantKey: artifact.Candidate.Blueprint.Identity.VariantKey, CandidateDigest: artifact.CandidateDigest, BlueprintDigest: digest}, nil
+}
+func t222Planner(repository domain.JobRepository, ports *t222NamedPorts) Planner {
+	planner := newTestPlanner(repository, ports, ports, ports, ports)
+	planner.Profiles = ports
+	planner.Stager = ports
+	planner.Now = func() time.Time { return time.Now().UTC() }
+	return planner
+}
+func t222EvidenceFile(t *testing.T, value string) string {
+	t.Helper()
+	abs, e := filepath.Abs(value)
+	if value == "" || e != nil || !strings.HasPrefix(abs, t222EvidenceRoot+string(filepath.Separator)) {
+		t.Fatal("SETUP: seed/result metadata must be inside owned T22 evidence directory")
+	}
+	if e = os.MkdirAll(filepath.Dir(abs), 0700); e != nil {
+		t.Fatal("SETUP: owned metadata directory")
+	}
+	return abs
+}
+func t222LoadSeed(t *testing.T, path string) t222SeedMetadata {
+	t.Helper()
+	file, e := os.Open(path)
+	if e != nil {
+		t.Fatal("SETUP: seed metadata unavailable")
+	}
+	defer func() {
+		if e := file.Close(); e != nil {
+			t.Error("seed metadata close failed")
+		}
+	}()
+	decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
+	decoder.DisallowUnknownFields()
+	var result t222SeedMetadata
+	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || result.Schema != "t222-staged-seed.v1" || result.SeedPID <= 0 || len(result.Jobs) != 3 {
+		t.Fatal("SETUP: safe seed metadata invalid")
+	}
+	for _, job := range result.Jobs {
+		if !validUUID(job.ID) || !validUUID(job.Key) || job.RequestHash == "" || len(job.RowHash) != 64 {
+			t.Fatal("SETUP: safe seeded identity/hash invalid")
+		}
+	}
+	return result
+}
+func t222RowHash(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id string) string {
+	t.Helper()
+	var raw string
+	if e := pool.QueryRow(ctx, `SELECT jsonb_build_object('row',to_jsonb(j),'xmin',j.xmin::text)::text FROM tz_authoring_job j WHERE id=$1`, id).Scan(&raw); e != nil {
+		t.Fatalf("whole retained job fingerprint: %T", e)
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+func t222LedgerHash(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	var raw string
+	if e := pool.QueryRow(ctx, `SELECT jsonb_agg(jsonb_build_object('row',to_jsonb(m),'xmin',m.xmin::text) ORDER BY filename)::text FROM tz_schema_migration m`).Scan(&raw); e != nil {
+		t.Fatalf("migration ledger fingerprint: %T", e)
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}

@@ -1,0 +1,339 @@
+package hybridreplan
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+// These named in-memory doubles prove orchestration only, never actual owners.
+type evaluationPolicyPort struct {
+	calls  int
+	policy domain.PolicyBundle
+	err    error
+	onRead func(context.Context)
+}
+
+func (s *evaluationPolicyPort) GetActivePolicyBundle(ctx context.Context) (domain.PolicyBundle, error) {
+	s.calls++
+	if s.onRead != nil {
+		s.onRead(ctx)
+	}
+	return s.policy, s.err
+}
+
+type evaluationGraphPort struct {
+	calls  int
+	goal   string
+	graph  domain.GoalGraph
+	err    error
+	onRead func(context.Context)
+}
+
+func (s *evaluationGraphPort) GetPublishedGoalGraph(ctx context.Context, goal string) (domain.GoalGraph, error) {
+	s.calls++
+	s.goal = goal
+	if s.onRead != nil {
+		s.onRead(ctx)
+	}
+	return s.graph, s.err
+}
+
+type evaluationConsequencePort struct {
+	work                                      domain.HybridConsequenceEvaluation
+	done                                      bool
+	claims, pins, completes, releases         int
+	completeErr, pinErr, releaseErr, claimErr error
+	pinnedPolicy                              domain.PolicyBundle
+	pinnedGraph                               domain.HybridPrerequisiteGraph
+	retryAt                                   time.Time
+	receipt                                   domain.HybridConsequenceReceipt
+	onPin, onComplete                         func(context.Context)
+}
+
+func (s *evaluationConsequencePort) ClaimHybridConsequenceEvaluation(_ context.Context, now time.Time, ttl time.Duration) (domain.HybridConsequenceEvaluation, bool, error) {
+	s.claims++
+	if s.claimErr != nil {
+		return domain.HybridConsequenceEvaluation{}, false, s.claimErr
+	}
+	if s.done || now.Before(s.retryAt) {
+		return domain.HybridConsequenceEvaluation{}, false, nil
+	}
+	s.work.ClaimToken = snapshotID("consequence-claim")
+	s.work.LeaseUntil = now.Add(ttl)
+	return s.work, true, nil
+}
+func (s *evaluationConsequencePort) CheckpointHybridConsequenceInputs(ctx context.Context, w domain.HybridConsequenceEvaluation, p domain.PolicyBundle, g domain.HybridPrerequisiteGraph) (domain.HybridConsequenceEvaluation, error) {
+	s.pins++
+	if s.onPin != nil {
+		s.onPin(ctx)
+	}
+	if s.pinErr != nil {
+		return domain.HybridConsequenceEvaluation{}, s.pinErr
+	}
+	s.pinnedPolicy = p
+	s.pinnedGraph = g
+	inputs, err := domain.NormalizeHybridConsequenceInputs(p, g)
+	if err != nil {
+		return domain.HybridConsequenceEvaluation{}, err
+	}
+	s.work.Inputs = &inputs
+	w.Inputs = s.work.Inputs
+	return w, nil
+}
+func (s *evaluationConsequencePort) CompleteHybridConsequenceEvaluation(ctx context.Context, w domain.HybridConsequenceEvaluation, c domain.HybridConsequence) (domain.HybridConsequenceReceipt, error) {
+	s.completes++
+	if s.onComplete != nil {
+		s.onComplete(ctx)
+	}
+	if s.completeErr != nil {
+		return domain.HybridConsequenceReceipt{}, s.completeErr
+	}
+	s.done = true
+	s.receipt = domain.HybridConsequenceReceipt{JobID: w.Job.ID, Consequence: c}
+	return s.receipt, nil
+}
+func (s *evaluationConsequencePort) ReleaseHybridConsequenceEvaluation(_ context.Context, _ domain.HybridConsequenceEvaluation, retryAt time.Time) error {
+	s.releases++
+	s.retryAt = retryAt
+	return s.releaseErr
+}
+func (s *evaluationConsequencePort) GetHybridConsequence(context.Context, string) (domain.HybridConsequenceReceipt, error) {
+	if !s.done {
+		return domain.HybridConsequenceReceipt{}, domain.ErrNotFound
+	}
+	return s.receipt, nil
+}
+func evaluationFixture(t *testing.T) (EvaluationProcessor, *evaluationConsequencePort, *evaluationPolicyPort, *evaluationGraphPort, *snapshotTestClock) {
+	t.Helper()
+	r, _ := domain.NormalizeHybridSnapshotRequest(domain.HybridSnapshotRequest{Targets: []domain.HybridTargetRef{snapshotTarget("go.syntax")}, TriggerContext: domain.HybridSnapshotTrigger{Kind: "OBJECTIVE_EVIDENCE", Reason: "Committed Student planning state", CorrelationID: snapshotID("trigger")}})
+	snapshot := snapshotOwnerFixture(r, 3, r.Targets)
+	clock := &snapshotTestClock{now: time.Now().UTC()}
+	jobs := &evaluationConsequencePort{work: domain.HybridConsequenceEvaluation{Job: domain.HybridEvaluationJob{ID: snapshotID("evaluation-job"), StudentID: snapshot.StudentID, LearningPathID: snapshot.LearningPathID, SnapshotRef: snapshot.References.SnapshotRef, PolicyVersion: domain.HybridReplanPolicyVersion, Snapshot: snapshot, CreatedAt: clock.now}}}
+	policies := &evaluationPolicyPort{policy: domain.PolicyBundle{PlannerVersion: domain.PlannerVersion, PedagogyProfile: domain.DefaultPedagogyProfile, PresentationStyle: domain.DefaultPresentationStyle, GenerationPolicy: domain.DefaultGenerationPolicy, MasterySkipConfidence: .8, PedagogyStrategies: []domain.PedagogyStrategyVersion{{Code: "explicit_instruction", Version: 1, Priority: 10, Config: json.RawMessage(`{}`)}}}}
+	graphs := &evaluationGraphPort{err: domain.ErrNotFound}
+	return EvaluationProcessor{Consequences: jobs, Policies: policies, Graphs: graphs, Clock: clock, LeaseTTL: time.Minute, RetryDelay: time.Second}, jobs, policies, graphs, clock
+}
+func TestEvaluationWorkerPolicyStorageOutageRetriesWithoutConsequence(t *testing.T) {
+	p, jobs, policies, graphs, clock := evaluationFixture(t)
+	policies.err = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.releases != 1 || jobs.pins != 0 || jobs.completes != 0 || graphs.calls != 0 || !jobs.retryAt.Equal(clock.now.Add(p.RetryDelay)) {
+		t.Fatalf("processed=%v err=%v release=%d pins=%d complete=%d graphreads=%d retry=%s", processed, err, jobs.releases, jobs.pins, jobs.completes, graphs.calls, jobs.retryAt)
+	}
+}
+func TestEvaluationWorkerGraphStorageOutageIsNotGraphAbsence(t *testing.T) {
+	p, jobs, _, graphs, _ := evaluationFixture(t)
+	graphs.err = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.releases != 1 || jobs.pins != 0 || jobs.completes != 0 {
+		t.Fatalf("processed=%v err=%v pins=%d complete=%d release=%d", processed, err, jobs.pins, jobs.completes, jobs.releases)
+	}
+}
+
+func TestEvaluationWorkerPinsAbsentGraphBeforePersistingNoChange(t *testing.T) {
+	p, jobs, policies, graphs, _ := evaluationFixture(t)
+	before, _ := json.Marshal(jobs.work.Job.Snapshot)
+	var calls []string
+	bounded := func(label string) func(context.Context) {
+		return func(ctx context.Context) {
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) > p.LeaseTTL || ctx.Err() != nil {
+				t.Fatalf("%s uses no valid bounded lease context", label)
+			}
+			calls = append(calls, label)
+		}
+	}
+	policies.onRead = bounded("policy")
+	graphs.onRead = bounded("graph")
+	jobs.onPin = bounded("pin")
+	jobs.onComplete = bounded("complete")
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || !jobs.done || jobs.pins != 1 || jobs.completes != 1 || jobs.releases != 0 {
+		t.Fatalf("processed=%v err=%v pins=%d completes=%d releases=%d", processed, err, jobs.pins, jobs.completes, jobs.releases)
+	}
+	if graphs.goal != jobs.work.Job.Snapshot.Path.GoalCode || jobs.pinnedGraph.Available || jobs.pinnedGraph.GoalCode != graphs.goal || jobs.pinnedGraph.Targets == nil || len(jobs.pinnedGraph.Targets) != 0 {
+		t.Fatalf("absence projection=%+v goal=%s", jobs.pinnedGraph, graphs.goal)
+	}
+	if string(mustEvaluationJSON(t, calls)) != `["policy","graph","pin","complete"]` {
+		t.Fatalf("ordering=%v", calls)
+	}
+	c := jobs.receipt.Consequence
+	if c.Outcome != domain.HybridOutcomeNoChange || c.ApplicationMode != "" || len(c.Mutations) != 0 || c.SnapshotRef != jobs.work.Job.SnapshotRef || c.ExpectedPathRevision != 3 || c.PolicyInputHash != jobs.work.Inputs.InputHash {
+		t.Fatalf("consequence=%+v", c)
+	}
+	after, _ := json.Marshal(jobs.work.Job.Snapshot)
+	if string(before) != string(after) {
+		t.Fatal("evaluator mutated the checkpointed Student snapshot")
+	}
+	processed, err = p.ProcessNext(context.Background())
+	if err != nil || processed || jobs.completes != 1 || policies.calls != 1 || graphs.calls != 1 {
+		t.Fatalf("completed job replay processed=%v err=%v completes=%d policies=%d graphs=%d", processed, err, jobs.completes, policies.calls, graphs.calls)
+	}
+}
+
+func mustEvaluationJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestEvaluationWorkerRestartReusesPersistedPinsDespiteNewPolicyAndGraphOutage(t *testing.T) {
+	p, jobs, policies, graphs, clock := evaluationFixture(t)
+	jobs.completeErr = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.work.Inputs == nil || jobs.pins != 1 || jobs.completes != 1 || jobs.done {
+		t.Fatalf("first processed=%v err=%v pins=%d completes=%d", processed, err, jobs.pins, jobs.completes)
+	}
+	pinnedHash := jobs.work.Inputs.InputHash
+	policies.policy.MasterySkipConfidence = .99
+	policies.err = domain.ErrUpstreamUnavailable
+	graphs.err = domain.ErrUpstreamUnavailable
+	jobs.completeErr = nil
+	clock.now = clock.now.Add(p.RetryDelay)
+	// A fresh processor value represents restart; the named durable double retains pins.
+	restarted := EvaluationProcessor{Consequences: jobs, Policies: policies, Graphs: graphs, Clock: clock, LeaseTTL: p.LeaseTTL, RetryDelay: p.RetryDelay}
+	processed, err = restarted.ProcessNext(context.Background())
+	if err != nil || !processed || !jobs.done || jobs.pins != 1 || jobs.completes != 2 || policies.calls != 1 || graphs.calls != 1 || jobs.receipt.Consequence.PolicyInputHash != pinnedHash {
+		t.Fatalf("restart processed=%v err=%v pins=%d complete=%d policyreads=%d graphreads=%d", processed, err, jobs.pins, jobs.completes, policies.calls, graphs.calls)
+	}
+}
+
+func TestEvaluationWorkerPinStorageOutageNeverEvaluatesOrCompletes(t *testing.T) {
+	p, jobs, _, _, _ := evaluationFixture(t)
+	jobs.pinErr = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.pins != 1 || jobs.work.Inputs != nil || jobs.completes != 0 || jobs.releases != 1 {
+		t.Fatalf("processed=%v err=%v pins=%d completes=%d releases=%d", processed, err, jobs.pins, jobs.completes, jobs.releases)
+	}
+}
+
+func TestEvaluationWorkerLeaseExpiryBeforePinOrCompleteRetries(t *testing.T) {
+	for _, stage := range []string{"policy", "graph", "pin"} {
+		t.Run(stage, func(t *testing.T) {
+			p, jobs, policies, graphs, clock := evaluationFixture(t)
+			expire := func(context.Context) { clock.now = clock.now.Add(p.LeaseTTL) }
+			if stage == "policy" {
+				policies.onRead = expire
+			} else if stage == "graph" {
+				graphs.onRead = expire
+			} else {
+				jobs.onPin = expire
+			}
+			processed, err := p.ProcessNext(context.Background())
+			if !processed || !errors.Is(err, domain.ErrConflict) || jobs.completes != 0 || jobs.releases != 1 || (stage != "pin" && jobs.pins != 0) || (stage == "policy" && graphs.calls != 0) {
+				t.Fatalf("processed=%v err=%v pins=%d completes=%d releases=%d", processed, err, jobs.pins, jobs.completes, jobs.releases)
+			}
+		})
+	}
+}
+
+func TestEvaluationWorkerInvalidPersistedPinsDoNotReloadActivePolicy(t *testing.T) {
+	p, jobs, policies, graphs, _ := evaluationFixture(t)
+	jobs.work.Inputs = &domain.HybridConsequenceInputs{Policy: policies.policy, Graph: domain.HybridPrerequisiteGraph{GoalCode: jobs.work.Job.Snapshot.Path.GoalCode, Targets: []domain.HybridPrerequisiteTarget{}}, InputHash: "invalid"}
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || err == nil || policies.calls != 0 || graphs.calls != 0 || jobs.pins != 0 || jobs.completes != 0 || jobs.releases != 1 {
+		t.Fatalf("processed=%v err=%v policies=%d graphs=%d pins=%d complete=%d releases=%d", processed, err, policies.calls, graphs.calls, jobs.pins, jobs.completes, jobs.releases)
+	}
+}
+
+func TestEvaluationWorkerContextCancellationBeforePin(t *testing.T) {
+	p, jobs, _, graphs, _ := evaluationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	graphs.onRead = func(context.Context) { cancel() }
+	processed, err := p.ProcessNext(ctx)
+	if !processed || !errors.Is(err, context.Canceled) || jobs.pins != 0 || jobs.completes != 0 || jobs.releases != 1 {
+		t.Fatalf("processed=%v err=%v pins=%d completes=%d releases=%d", processed, err, jobs.pins, jobs.completes, jobs.releases)
+	}
+}
+
+func TestEvaluationWorkerRejectsMismatchedDurableSnapshotWithoutPolicyRead(t *testing.T) {
+	p, jobs, policies, graphs, _ := evaluationFixture(t)
+	jobs.work.Job.StudentID = snapshotID("other-student")
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrValidation) || policies.calls != 0 || graphs.calls != 0 || jobs.releases != 1 || jobs.pins != 0 || jobs.completes != 0 {
+		t.Fatalf("processed=%v err=%v policy=%d graph=%d releases=%d", processed, err, policies.calls, graphs.calls, jobs.releases)
+	}
+}
+
+func TestEvaluationWorkerClaimOutageAndIdleDoNotRelease(t *testing.T) {
+	p, jobs, policies, graphs, _ := evaluationFixture(t)
+	jobs.claimErr = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if processed || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.releases != 0 || policies.calls != 0 || graphs.calls != 0 {
+		t.Fatalf("claim outage processed=%v err=%v", processed, err)
+	}
+	jobs.claimErr = nil
+	jobs.done = true
+	processed, err = p.ProcessNext(context.Background())
+	if processed || err != nil || jobs.releases != 0 || policies.calls != 0 || graphs.calls != 0 {
+		t.Fatalf("idle processed=%v err=%v", processed, err)
+	}
+}
+
+func TestEvaluationWorkerJoinsFailureAndReleaseOutage(t *testing.T) {
+	p, jobs, policies, _, _ := evaluationFixture(t)
+	policies.err = domain.ErrNotFound
+	jobs.releaseErr = domain.ErrUpstreamUnavailable
+	processed, err := p.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrNotFound) || !errors.Is(err, domain.ErrUpstreamUnavailable) || jobs.pins != 0 || jobs.completes != 0 {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+}
+
+func TestEvaluationWorkerProjectsPublishedGraphToBoundedPins(t *testing.T) {
+	p, jobs, _, graphs, _ := evaluationFixture(t)
+	graphs.err = nil
+	graphs.graph = domain.GoalGraph{Goal: domain.LearningGoal{Code: "go.backend", Version: "v1", GraphVersion: "g1", Title: "Private authored title", Description: "Private authored description"}, Targets: []domain.LearningTarget{{Ref: domain.TargetRef{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}, Title: "Private authored target title", Description: "Private authored target description", Prerequisites: []domain.TargetRef{}, ModuleCode: "m", ModuleTitle: "private module", SectionCode: "s", SectionTitle: "private section", LessonCode: "l", LessonTitle: "private lesson", LessonExcerpt: "Private full lesson excerpt"}}, Transitions: []domain.TransitionKnowledge{}}
+	processed, err := p.ProcessNext(context.Background())
+	if err != nil || !processed || !jobs.done || !jobs.pinnedGraph.Available || jobs.pinnedGraph.GoalVersion != "v1" || jobs.pinnedGraph.GraphVersion != "g1" || len(jobs.pinnedGraph.Targets) != 1 {
+		t.Fatalf("processed=%v err=%v projection=%+v", processed, err, jobs.pinnedGraph)
+	}
+	raw := mustEvaluationJSON(t, jobs.pinnedGraph)
+	if bytes.Contains(raw, []byte("Private")) || bytes.Contains(raw, []byte("private")) {
+		t.Fatalf("bounded pin leaked authored contents: %s", raw)
+	}
+}
+
+func TestEvaluationWorkerRejectsInvalidOrWrongGoalPublishedGraph(t *testing.T) {
+	for _, goal := range []string{"go.backend", "other.goal"} {
+		t.Run(goal, func(t *testing.T) {
+			p, jobs, _, graphs, _ := evaluationFixture(t)
+			graphs.err = nil
+			graphs.graph = domain.GoalGraph{Goal: domain.LearningGoal{Code: goal, Version: "v1", GraphVersion: "g1", Title: "graph"}, Targets: []domain.LearningTarget{{Ref: domain.TargetRef{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}, Title: "target", ModuleCode: "m", ModuleTitle: "m", SectionCode: "s", SectionTitle: "s", LessonCode: "l", LessonTitle: "l", Prerequisites: []domain.TargetRef{}}}}
+			if goal == "go.backend" {
+				graphs.graph.Targets[0].Prerequisites = []domain.TargetRef{{Type: domain.TargetConcept, Key: "missing", Version: "v1"}}
+			}
+			processed, err := p.ProcessNext(context.Background())
+			if !processed || err == nil || jobs.pins != 0 || jobs.completes != 0 || jobs.releases != 1 {
+				t.Fatalf("processed=%v err=%v pins=%d completes=%d", processed, err, jobs.pins, jobs.completes)
+			}
+		})
+	}
+}
+
+func TestEvaluationWorkerRunPersistsThenStopsOnCancellation(t *testing.T) {
+	p, jobs, _, _, _ := evaluationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jobs.onComplete = func(context.Context) { cancel() }
+	done := make(chan struct{})
+	go func() { (EvaluationWorker{Processor: p, PollInterval: time.Millisecond}).Run(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after cancellation")
+	}
+	if !jobs.done || jobs.completes != 1 || jobs.pins != 1 {
+		t.Fatalf("worker completed=%v pins=%d completes=%d", jobs.done, jobs.pins, jobs.completes)
+	}
+}

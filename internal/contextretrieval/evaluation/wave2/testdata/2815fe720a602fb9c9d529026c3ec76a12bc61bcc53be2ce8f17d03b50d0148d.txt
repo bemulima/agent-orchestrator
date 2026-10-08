@@ -1,0 +1,230 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/config"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	aipromptclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/aiprompt"
+	courseclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/course"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	tzplannerclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/tzplanner"
+	natspublisher "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/messaging/nats"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	apihandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	diagnosticmessages "github.com/bemulima/ms-go-learning-planner/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/diagnosticplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/hybridreplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/onboardinghandoff"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/onboardingpathexecution"
+	outboxuc "github.com/bemulima/ms-go-learning-planner/internal/usecase/outbox"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/practiceroute"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/projectauthoring"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/readiness"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/targetcatalog"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type uuidGenerator struct{}
+
+func (uuidGenerator) NewID() string { return uuid.NewString() }
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now().UTC() }
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if err := run(logger); err != nil {
+		logger.Error("service stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	serviceConfig, err := config.Load()
+	if err != nil {
+		return err
+	}
+	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := pgxpool.New(rootContext, serviceConfig.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	pingContext, cancelPing := context.WithTimeout(rootContext, 5*time.Second)
+	defer cancelPing()
+	if err := pool.Ping(pingContext); err != nil {
+		return err
+	}
+	store := postgres.Store{Pool: pool}
+	client := &http.Client{Timeout: serviceConfig.DownstreamHTTPTimeout}
+	studentService := studentclient.Client{
+		BaseURL: serviceConfig.StudentServiceURL, ReadToken: serviceConfig.StudentServiceToken,
+		WriteToken: serviceConfig.StudentServiceWriteToken, HTTPClient: client,
+	}
+	courseService := courseclient.Client{
+		BaseURL: serviceConfig.CourseServiceURL, InternalToken: serviceConfig.CourseServiceToken,
+		DiagnosticCatalogToken: serviceConfig.CourseDiagnosticCatalogToken, HTTPClient: client,
+	}
+	contentGenerator := aipromptclient.Client{
+		BaseURL: serviceConfig.AIPromptServiceURL, InternalToken: serviceConfig.AIPromptServiceToken,
+		HTTPClient: client,
+	}
+	tzPlannerService := tzplannerclient.Client{
+		BaseURL: serviceConfig.TZPlannerServiceURL, InternalToken: serviceConfig.TZPlannerServiceToken,
+		HTTPClient: &http.Client{Timeout: serviceConfig.ProjectAuthoringHTTPTimeout},
+	}
+	ids := uuidGenerator{}
+	clock := systemClock{}
+	placementConsumer := diagnosticplan.PlacementConsumer{Plans: store, Placements: store, Students: studentService, Clock: clock}
+	diagnosticConsumer, err := diagnosticmessages.NewDiagnosticResultConsumer(rootContext, serviceConfig.NATSURL, placementConsumer)
+	if err != nil {
+		return err
+	}
+	defer diagnosticConsumer.Close()
+	planningStateConsumer, err := diagnosticmessages.NewPlanningStateConsumer(rootContext, serviceConfig.NATSURL, hybridreplan.TriggerProcessor{Jobs: store})
+	if err != nil {
+		return err
+	}
+	defer planningStateConsumer.Close()
+	go hybridreplan.SnapshotWorker{
+		Processor: hybridreplan.SnapshotProcessor{Jobs: store, Students: studentService, Clock: clock,
+			LeaseTTL: serviceConfig.WorkerLeaseTTL, RetryDelay: 2 * time.Second},
+		PollInterval: serviceConfig.WorkerPollInterval, Logger: logger,
+	}.Run(rootContext)
+	go hybridreplan.EvaluationWorker{
+		Processor: hybridreplan.EvaluationProcessor{Consequences: store, Policies: store, Graphs: store, Clock: clock,
+			LeaseTTL: serviceConfig.WorkerLeaseTTL, RetryDelay: 2 * time.Second},
+		PollInterval: serviceConfig.WorkerPollInterval, Logger: logger,
+	}.Run(rootContext)
+	go hybridreplan.ApplicationWorker{
+		Processor: hybridreplan.ApplicationProcessor{Applications: store, Students: studentService, Clock: clock,
+			LeaseTTL: serviceConfig.WorkerLeaseTTL, RetryDelay: 2 * time.Second},
+		PollInterval: serviceConfig.WorkerPollInterval, Logger: logger,
+	}.Run(rootContext)
+	eventPublisher := &natspublisher.Publisher{
+		URL: serviceConfig.NATSURL, Name: "ms-go-learning-planner-outbox",
+		ConnectTimeout: serviceConfig.OutboxPublishTimeout,
+	}
+	defer eventPublisher.Close()
+	relay := outboxuc.Relay{
+		Outbox: store, Publisher: eventPublisher, Clock: clock,
+		WorkerID: "learning-planner-" + uuid.NewString(), BatchSize: serviceConfig.OutboxBatchSize,
+		LockTTL: serviceConfig.OutboxLockTTL, PublishTimeout: serviceConfig.OutboxPublishTimeout,
+		RetryBase: serviceConfig.OutboxRetryBase, RetryMax: serviceConfig.OutboxRetryMax,
+	}
+	go runOutboxRelay(rootContext, logger, relay, serviceConfig.OutboxPollInterval)
+	createCoursePlan := courseplan.Create{Requests: store, DiagnosticRequests: store, IDs: ids, Clock: clock}
+	readinessResolver := readiness.Resolver{Enabled: serviceConfig.GraphReadinessEnabled, Students: studentService, Graphs: store}
+	acceptOnboardingHandoff := onboardinghandoff.Acceptor{
+		Enabled: serviceConfig.OnboardingHandoffEnabled, Receipts: store, Readiness: readinessResolver, IDs: ids, Clock: clock,
+	}
+	getCoursePlan := courseplan.Get{Requests: store}
+	processor := courseplan.Processor{
+		Requests: store, Graphs: store, Policies: store, Students: studentService, Courses: courseService,
+		Generator: contentGenerator,
+		IDs:       ids, Clock: clock, Strategies: pedagogy.NewDefaultRegistry(),
+		LeaseTTL: serviceConfig.WorkerLeaseTTL, MaxAttempts: serviceConfig.WorkerMaxAttempts,
+		DiagnosticPlans: store, DiagnosticPlacements: store,
+		InitialAllocations: store,
+	}
+	worker := courseplan.Worker{
+		Processor: processor, PollInterval: serviceConfig.WorkerPollInterval, Logger: logger,
+	}
+	go worker.Run(rootContext)
+	// S9 remains inert unless the separately validated execution gate is on.
+	// Construction is schema-safe: no S9 repository call happens while off.
+	if serviceConfig.OnboardingPathExecutionEnabled {
+		s9processor := onboardingpathexecution.Processor{
+			Enabled: true, Executions: store, Graphs: store, Policies: store,
+			Readiness: studentService, Students: studentService, Courses: courseService, Generator: contentGenerator,
+			IDs: ids, Clock: clock, Strategies: pedagogy.NewDefaultRegistry(), LeaseTTL: serviceConfig.WorkerLeaseTTL, MaxAttempts: serviceConfig.WorkerMaxAttempts,
+		}
+		go onboardingpathexecution.Worker{Processor: s9processor, PollInterval: serviceConfig.WorkerPollInterval, Logger: logger}.Run(rootContext)
+	}
+	projectCommands := projectauthoring.Commands{Flows: store, Students: studentService, IDs: ids, Clock: clock}
+	projectWorker := projectauthoring.Worker{Processor: projectauthoring.Processor{
+		Flows: store, Students: studentService, TZ: tzPlannerService, IDs: ids, Clock: clock,
+		LeaseTTL: serviceConfig.ProjectAuthoringLeaseTTL, MaxAttempts: serviceConfig.ProjectAuthoringMaxAttempts,
+	}, PollInterval: serviceConfig.WorkerPollInterval, Logger: logger}
+	go projectWorker.Run(rootContext)
+
+	handler := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		CoursePlans:        apihandlers.CoursePlanHandler{Create: createCoursePlan, Get: getCoursePlan},
+		TeacherCoursePlans: privatehandlers.CoursePlanHandler{Create: createCoursePlan, DiagnosticState: courseplan.GetDiagnosticPlanning{Plans: store, Requests: store}},
+		Health:             privatehandlers.HealthHandler{Checker: pool}, InternalToken: serviceConfig.InternalAPIToken,
+		TargetCatalog: privatehandlers.TargetCatalogHandler{Resolve: targetcatalog.Resolve{Catalog: store}, Discover: targetcatalog.Discover{Catalog: store}},
+		PracticeLearning: privatehandlers.PracticeLearningHandler{
+			Routes:    newPracticeLearningResolver(store, studentService, clock),
+			Materials: practiceroute.Materializer{Routes: store, Catalog: store, Generator: contentGenerator, Courses: courseService},
+		},
+		LearningReadiness:     privatehandlers.LearningReadinessHandler{Resolve: readinessResolver},
+		OnboardingPlanHandoff: privatehandlers.OnboardingPlanHandoffHandler{Accept: acceptOnboardingHandoff},
+		TeacherToken:          serviceConfig.TeacherServiceToken, TeacherOnboardingHandoffToken: serviceConfig.TeacherOnboardingHandoffToken,
+		PracticeToken:       serviceConfig.PracticeServiceToken,
+		DiagnosticBootstrap: apihandlers.DiagnosticAssessmentBootstrapHandler{Bootstrap: diagnosticplan.Bootstrap{Issuer: diagnosticplan.Issuer{Plans: store, Reservations: store, Placements: store, Courses: courseService, Students: studentService, Clock: clock}, Plans: store, Receipts: store, Students: studentService, Clock: clock}},
+		DiagnosticPlacement: privatehandlers.DiagnosticPlacementHandler{Placement: placementConsumer},
+		ProjectAuthoring:    privatehandlers.ProjectAuthoringHandler{Commands: projectCommands},
+	})
+	server := &http.Server{
+		Addr: serviceConfig.HTTPAddr, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
+		WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info("service started", "address", serviceConfig.HTTPAddr)
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-rootContext.Done():
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	}
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		return err
+	}
+	return nil
+}
+
+func newPracticeLearningResolver(store postgres.Store, students domainservice.PracticeStudentMasteryService, clock practiceroute.Clock) practiceroute.Resolver {
+	return practiceroute.Resolver{
+		Routes: store, Readiness: store, Catalog: store, Students: students, Policies: store,
+		Strategies: pedagogy.NewDefaultRegistry(), Clock: clock,
+	}
+}
+
+func runOutboxRelay(ctx context.Context, logger *slog.Logger, relay outboxuc.Relay, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if _, err := relay.ProcessBatch(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("outbox relay failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

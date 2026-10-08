@@ -1,0 +1,279 @@
+-- Practice Runtime V2 owns these records. No legacy Student practice rows are
+-- imported into these tables.
+CREATE TABLE practice_task_instances (
+    id UUID PRIMARY KEY,
+    student_id UUID NOT NULL,
+    task_revision_id UUID NOT NULL,
+    task_revision_digest TEXT NOT NULL CHECK (task_revision_digest ~ '^sha256:[0-9a-f]{64}$'),
+    status TEXT NOT NULL CHECK (status IN ('STARTING','IN_PROGRESS','VALIDATING','IN_REVIEW','FINALIZING','COMPLETED','CANCELLED')),
+    start_command_digest TEXT NOT NULL CHECK (start_command_digest ~ '^sha256:[0-9a-f]{64}$'),
+    current_submission_id UUID,
+    final_submission_id UUID,
+    version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0),
+    payload JSONB NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (student_id, id),
+    CHECK ((status = 'COMPLETED') = (completed_at IS NOT NULL)),
+    CHECK (status NOT IN ('VALIDATING','IN_REVIEW','FINALIZING','COMPLETED') OR current_submission_id IS NOT NULL),
+    CHECK (status <> 'COMPLETED' OR final_submission_id IS NOT NULL)
+);
+
+CREATE INDEX practice_task_instances_student_cursor_idx
+    ON practice_task_instances (student_id, id DESC);
+CREATE INDEX practice_task_instances_status_idx
+    ON practice_task_instances (status, updated_at);
+
+CREATE FUNCTION practice_runtime_instance_frozen_steps(payload JSONB) RETURNS JSONB LANGUAGE SQL IMMUTABLE AS $$
+    SELECT COALESCE(jsonb_agg(step_object - 'status' ORDER BY ordinal), '[]'::jsonb)
+    FROM jsonb_array_elements(COALESCE(payload->'steps','[]'::jsonb)) WITH ORDINALITY AS step(step_object,ordinal)
+$$;
+
+CREATE FUNCTION practice_runtime_guard_instance_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.student_id IS DISTINCT FROM OLD.student_id
+       OR NEW.task_revision_id IS DISTINCT FROM OLD.task_revision_id
+       OR NEW.task_revision_digest IS DISTINCT FROM OLD.task_revision_digest
+       OR NEW.start_command_digest IS DISTINCT FROM OLD.start_command_digest
+       OR NEW.started_at IS DISTINCT FROM OLD.started_at
+       OR NEW.payload->'revision_summary' IS DISTINCT FROM OLD.payload->'revision_summary'
+       OR NEW.payload->'revision_envelope' IS DISTINCT FROM OLD.payload->'revision_envelope'
+       OR NEW.payload->'solution_variant_id' IS DISTINCT FROM OLD.payload->'solution_variant_id'
+       OR NEW.payload->'start_command_digest' IS DISTINCT FROM OLD.payload->'start_command_digest'
+       OR NEW.payload->'instance'->'id' IS DISTINCT FROM OLD.payload->'instance'->'id'
+       OR NEW.payload->'instance'->'student_id' IS DISTINCT FROM OLD.payload->'instance'->'student_id'
+       OR NEW.payload->'instance'->'task_revision_id' IS DISTINCT FROM OLD.payload->'instance'->'task_revision_id'
+       OR NEW.payload->'instance'->'task_revision_digest' IS DISTINCT FROM OLD.payload->'instance'->'task_revision_digest'
+       OR NEW.payload->'instance'->'surface_classification' IS DISTINCT FROM OLD.payload->'instance'->'surface_classification'
+       OR NEW.payload->'instance'->'locale' IS DISTINCT FROM OLD.payload->'instance'->'locale'
+       OR NEW.payload->'instance'->'learning_path_id' IS DISTINCT FROM OLD.payload->'instance'->'learning_path_id'
+       OR NEW.payload->'instance'->'started_at' IS DISTINCT FROM OLD.payload->'instance'->'started_at'
+       OR practice_runtime_instance_frozen_steps(NEW.payload) IS DISTINCT FROM practice_runtime_instance_frozen_steps(OLD.payload) THEN
+        RAISE EXCEPTION 'immutable TaskInstance binding changed' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.payload->'instance'->'learning_action_id' IS NOT NULL
+       AND OLD.payload->'instance'->>'learning_action_id' <> ''
+       AND NEW.payload->'instance'->'learning_action_id' IS DISTINCT FROM OLD.payload->'instance'->'learning_action_id' THEN
+        RAISE EXCEPTION 'immutable LearningAction binding changed' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.payload->'instance'->'workspace_binding'->>'sandbox_id' IS NOT NULL
+       AND OLD.payload->'instance'->'workspace_binding'->>'sandbox_id' <> ''
+       AND NEW.payload->'instance'->'workspace_binding'->'sandbox_id' IS DISTINCT FROM OLD.payload->'instance'->'workspace_binding'->'sandbox_id' THEN
+        RAISE EXCEPTION 'immutable Sandbox binding changed' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.payload->'instance'->'learning_route'->>'id' IS NOT NULL
+       AND OLD.payload->'instance'->'learning_route'->>'id' <> ''
+       AND NEW.payload->'instance'->'learning_route' IS DISTINCT FROM OLD.payload->'instance'->'learning_route' THEN
+        RAISE EXCEPTION 'immutable Planner route binding changed' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER practice_task_instance_binding_immutable
+    BEFORE UPDATE ON practice_task_instances
+    FOR EACH ROW EXECUTE FUNCTION practice_runtime_guard_instance_binding();
+
+CREATE TABLE practice_submit_intents (
+    task_instance_id UUID NOT NULL REFERENCES practice_task_instances(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL,
+    idempotency_key UUID NOT NULL,
+    command_digest TEXT NOT NULL CHECK (command_digest ~ '^sha256:[0-9a-f]{64}$'),
+    submission_id UUID NOT NULL UNIQUE,
+    validation_run_id UUID NOT NULL UNIQUE,
+    scope TEXT NOT NULL CHECK (scope IN ('FINAL','MILESTONE')),
+    milestone_id UUID,
+    validation_contract_digest TEXT NOT NULL CHECK (validation_contract_digest ~ '^sha256:[0-9a-f]{64}$'),
+    validation_specification JSONB NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('INTENT','LOCKED','FROZEN','COMMITTED','ABORTED')),
+    snapshot JSONB,
+    write_lock_id TEXT,
+    fence_epoch BIGINT NOT NULL DEFAULT 0 CHECK (fence_epoch >= 0),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_instance_id, idempotency_key),
+    CHECK ((scope = 'FINAL' AND milestone_id IS NULL) OR (scope = 'MILESTONE' AND milestone_id IS NOT NULL))
+);
+
+-- Concurrent distinct Submit keys cannot both become durable active intents.
+CREATE UNIQUE INDEX practice_submit_intents_one_open_per_instance_idx
+    ON practice_submit_intents (task_instance_id)
+    WHERE status IN ('INTENT','LOCKED','FROZEN');
+
+CREATE TABLE practice_submissions (
+    id UUID PRIMARY KEY,
+    task_instance_id UUID NOT NULL,
+    student_id UUID NOT NULL,
+    idempotency_key UUID NOT NULL,
+    command_digest TEXT NOT NULL CHECK (command_digest ~ '^sha256:[0-9a-f]{64}$'),
+    scope TEXT NOT NULL CHECK (scope IN ('FINAL','MILESTONE')),
+    milestone_id UUID,
+    status TEXT NOT NULL CHECK (status IN ('VALIDATING','FAILED','REVIEW_REQUIRED','CHANGES_REQUESTED','PASSED')),
+    snapshot JSONB NOT NULL,
+    workspace_digest TEXT NOT NULL CHECK (workspace_digest ~ '^sha256:[0-9a-f]{64}$'),
+    revision_digest TEXT NOT NULL CHECK (revision_digest ~ '^sha256:[0-9a-f]{64}$'),
+    validation_contract_digest TEXT NOT NULL CHECK (validation_contract_digest ~ '^sha256:[0-9a-f]{64}$'),
+    validation_specification JSONB NOT NULL,
+    current_run_id UUID NOT NULL,
+    requires_human_review BOOLEAN NOT NULL DEFAULT FALSE,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    UNIQUE (task_instance_id, id),
+    UNIQUE (task_instance_id, idempotency_key),
+    FOREIGN KEY (student_id, task_instance_id) REFERENCES practice_task_instances(student_id, id),
+    CHECK ((scope = 'FINAL' AND milestone_id IS NULL) OR (scope = 'MILESTONE' AND milestone_id IS NOT NULL)),
+    CHECK ((status = 'VALIDATING') = (completed_at IS NULL))
+);
+
+-- A failed/checkpointed submission can be followed by another one; validation
+-- and required human review remain the only active submission states.
+CREATE UNIQUE INDEX practice_submissions_one_active_per_instance_idx
+    ON practice_submissions (task_instance_id)
+    WHERE status IN ('VALIDATING','REVIEW_REQUIRED');
+CREATE INDEX practice_submissions_history_idx
+    ON practice_submissions (task_instance_id, created_at DESC, id DESC);
+
+ALTER TABLE practice_task_instances
+    ADD CONSTRAINT practice_task_instances_current_submission_fk
+    FOREIGN KEY (id,current_submission_id) REFERENCES practice_submissions(task_instance_id,id)
+    DEFERRABLE INITIALLY DEFERRED,
+    ADD CONSTRAINT practice_task_instances_final_submission_fk
+    FOREIGN KEY (id,final_submission_id) REFERENCES practice_submissions(task_instance_id,id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE practice_validation_runs (
+    id UUID PRIMARY KEY,
+    task_instance_id UUID NOT NULL,
+    submission_id UUID NOT NULL,
+    ordinal BIGINT NOT NULL CHECK (ordinal > 0),
+    status TEXT NOT NULL CHECK (status IN ('PENDING','RUNNING','PASSED','FAILED','ERROR')),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('PASS','FAIL','ERROR')),
+    error_classification TEXT,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (submission_id, id),
+    UNIQUE (submission_id, ordinal),
+    CHECK ((status IN ('PENDING','RUNNING') AND outcome IS NULL AND error_classification IS NULL)
+        OR (status = 'PASSED' AND outcome = 'PASS' AND error_classification IS NULL)
+        OR (status = 'FAILED' AND outcome = 'FAIL' AND error_classification IS NULL)
+        OR (status = 'ERROR' AND outcome = 'ERROR' AND NULLIF(error_classification,'') IS NOT NULL)),
+    CHECK ((status = 'PENDING' AND started_at IS NULL AND finished_at IS NULL)
+        OR (status = 'RUNNING' AND started_at IS NOT NULL AND finished_at IS NULL)
+        OR (status IN ('PASSED','FAILED','ERROR') AND started_at IS NOT NULL AND finished_at IS NOT NULL)),
+    FOREIGN KEY (task_instance_id, submission_id) REFERENCES practice_submissions(task_instance_id, id) ON DELETE CASCADE
+);
+CREATE INDEX practice_validation_runs_recovery_idx
+    ON practice_validation_runs (status, started_at, created_at);
+
+CREATE FUNCTION practice_runtime_guard_submission_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.task_instance_id IS DISTINCT FROM OLD.task_instance_id
+       OR NEW.student_id IS DISTINCT FROM OLD.student_id
+       OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+       OR NEW.command_digest IS DISTINCT FROM OLD.command_digest
+       OR NEW.scope IS DISTINCT FROM OLD.scope
+       OR NEW.milestone_id IS DISTINCT FROM OLD.milestone_id
+       OR NEW.snapshot IS DISTINCT FROM OLD.snapshot
+       OR NEW.workspace_digest IS DISTINCT FROM OLD.workspace_digest
+       OR NEW.revision_digest IS DISTINCT FROM OLD.revision_digest
+       OR NEW.validation_contract_digest IS DISTINCT FROM OLD.validation_contract_digest
+       OR NEW.validation_specification IS DISTINCT FROM OLD.validation_specification
+       OR NEW.requires_human_review IS DISTINCT FROM OLD.requires_human_review THEN
+        RAISE EXCEPTION 'immutable submission binding changed' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER practice_submission_binding_immutable
+    BEFORE UPDATE ON practice_submissions
+    FOR EACH ROW EXECUTE FUNCTION practice_runtime_guard_submission_binding();
+
+CREATE FUNCTION practice_runtime_guard_validation_run() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.task_instance_id IS DISTINCT FROM OLD.task_instance_id
+       OR NEW.submission_id IS DISTINCT FROM OLD.submission_id THEN
+        RAISE EXCEPTION 'immutable validation-run identity changed' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.status IN ('PASSED','FAILED','ERROR') AND NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'terminal validation run is immutable' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.status = 'RUNNING' AND NEW.status NOT IN ('RUNNING','PENDING','PASSED','FAILED','ERROR') THEN
+        RAISE EXCEPTION 'invalid validation-run transition' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER practice_validation_run_immutable
+    BEFORE UPDATE ON practice_validation_runs
+    FOR EACH ROW EXECUTE FUNCTION practice_runtime_guard_validation_run();
+
+CREATE FUNCTION practice_runtime_guard_outbox_payload() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.task_instance_id IS DISTINCT FROM OLD.task_instance_id
+       OR NEW.submission_id IS DISTINCT FROM OLD.submission_id OR NEW.payload::text IS DISTINCT FROM OLD.payload::text
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'evidence outbox identity and payload are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+ALTER TABLE practice_submissions
+    ADD CONSTRAINT practice_submissions_current_run_fk
+    FOREIGN KEY (id, current_run_id) REFERENCES practice_validation_runs(submission_id, id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE practice_command_receipts (
+    task_instance_id UUID NOT NULL REFERENCES practice_task_instances(id) ON DELETE CASCADE,
+    command_type TEXT NOT NULL,
+    idempotency_key UUID NOT NULL,
+    command_digest TEXT NOT NULL CHECK (command_digest ~ '^sha256:[0-9a-f]{64}$'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_instance_id, command_type, idempotency_key)
+);
+
+CREATE TABLE practice_assistance_receipts (
+    usage_id UUID PRIMARY KEY,
+    task_instance_id UUID NOT NULL,
+    student_id UUID NOT NULL,
+    command_digest TEXT NOT NULL CHECK (command_digest ~ '^sha256:[0-9a-f]{64}$'),
+    receipt JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    FOREIGN KEY (student_id,task_instance_id) REFERENCES practice_task_instances(student_id,id) ON DELETE CASCADE
+);
+CREATE INDEX practice_assistance_receipts_instance_idx
+    ON practice_assistance_receipts (task_instance_id, created_at, usage_id);
+
+CREATE TABLE practice_review_events (
+    submission_id UUID PRIMARY KEY,
+    task_instance_id UUID NOT NULL,
+    reviewer_id UUID NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('APPROVE','CHANGES_REQUESTED')),
+    feedback TEXT NOT NULL,
+    reviewed_at TIMESTAMPTZ NOT NULL,
+    payload JSONB NOT NULL,
+    FOREIGN KEY (task_instance_id,submission_id) REFERENCES practice_submissions(task_instance_id,id) ON DELETE RESTRICT
+);
+
+CREATE TABLE practice_student_evidence_outbox (
+    id UUID PRIMARY KEY,
+    task_instance_id UUID NOT NULL,
+    submission_id UUID NOT NULL UNIQUE,
+    payload JSON NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at TIMESTAMPTZ,
+    FOREIGN KEY (task_instance_id, submission_id) REFERENCES practice_submissions(task_instance_id, id) ON DELETE RESTRICT
+);
+CREATE INDEX practice_student_evidence_outbox_pending_idx
+    ON practice_student_evidence_outbox (created_at, id) WHERE delivered_at IS NULL;
+CREATE TRIGGER practice_evidence_outbox_payload_immutable
+    BEFORE UPDATE ON practice_student_evidence_outbox
+    FOR EACH ROW EXECUTE FUNCTION practice_runtime_guard_outbox_payload();

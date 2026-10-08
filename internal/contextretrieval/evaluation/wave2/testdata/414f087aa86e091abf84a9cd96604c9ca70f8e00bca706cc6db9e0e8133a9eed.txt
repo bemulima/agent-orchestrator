@@ -1,0 +1,72 @@
+package outbox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+type Clock interface{ Now() time.Time }
+
+type Relay struct {
+	Outbox         repository.Outbox
+	Publisher      domain.EventPublisher
+	Clock          Clock
+	WorkerID       string
+	BatchSize      int
+	LockTTL        time.Duration
+	PublishTimeout time.Duration
+	RetryBase      time.Duration
+	RetryMax       time.Duration
+}
+
+func (relay Relay) ProcessBatch(ctx context.Context) (int, error) {
+	if relay.Outbox == nil || relay.Publisher == nil || relay.Clock == nil || strings.TrimSpace(relay.WorkerID) == "" ||
+		relay.BatchSize < 1 || relay.LockTTL <= 0 || relay.PublishTimeout <= 0 ||
+		relay.LockTTL <= time.Duration(relay.BatchSize)*relay.PublishTimeout ||
+		relay.RetryBase <= 0 || relay.RetryMax < relay.RetryBase {
+		return 0, domain.ErrValidation
+	}
+	now := relay.Clock.Now().UTC()
+	events, err := relay.Outbox.Claim(ctx, repository.OutboxClaim{
+		WorkerID: relay.WorkerID, Limit: relay.BatchSize, Now: now, LockedUntil: now.Add(relay.LockTTL),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var failures []error
+	for _, event := range events {
+		publishContext, cancel := context.WithTimeout(ctx, relay.PublishTimeout)
+		publishErr := relay.Publisher.Publish(publishContext, event)
+		cancel()
+		if publishErr != nil {
+			retryAt := relay.Clock.Now().UTC().Add(relay.retryDelay(event.Attempts))
+			if markErr := relay.Outbox.MarkFailed(ctx, event.EventID, relay.WorkerID, publishErr.Error(), retryAt); markErr != nil {
+				failures = append(failures, errors.Join(publishErr, markErr))
+			} else {
+				failures = append(failures, fmt.Errorf("publish %s: %w", event.EventID, publishErr))
+			}
+			continue
+		}
+		if err := relay.Outbox.MarkPublished(ctx, event.EventID, relay.WorkerID, relay.Clock.Now().UTC()); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return len(events), errors.Join(failures...)
+}
+
+func (relay Relay) retryDelay(attempt int) time.Duration {
+	delay := relay.RetryBase
+	for current := 1; current < attempt && delay < relay.RetryMax; current++ {
+		delay *= 2
+	}
+	if delay > relay.RetryMax {
+		return relay.RetryMax
+	}
+	return delay
+}

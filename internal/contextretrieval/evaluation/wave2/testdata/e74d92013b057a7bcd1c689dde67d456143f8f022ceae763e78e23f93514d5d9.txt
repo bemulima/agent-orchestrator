@@ -1,0 +1,150 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (repository *validationRepositoryFake) GetInstance(_ context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if repository.instance.ID != instanceID || repository.instance.StudentID != studentID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return repository.instance, nil
+}
+
+func teacherFeedbackFixture(outcome domain.ValidationOutcome, stages []domain.ValidationStage) (*Runtime, *validationRepositoryFake) {
+	instance, submission, pending := validationFixtures()
+	instance.CurrentStep = &instance.Steps[0]
+	submission.UpdatedAt = time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
+	result := validationResultFor(instance, submission, pending.RunID)
+	result.Outcome, result.Stages = outcome, stages
+	run := &submission.ValidationRuns[0]
+	run.Outcome = outcome
+	switch outcome {
+	case domain.OutcomePass:
+		run.Status = domain.ValidationRunPassed
+	case domain.OutcomeFail:
+		run.Status = domain.ValidationRunFailed
+	case domain.OutcomeError:
+		run.Status = domain.ValidationRunError
+		result.ErrorClassification = "SNAPSHOT_UNAVAILABLE"
+		run.ErrorClassification = result.ErrorClassification
+	}
+	run.SafeSummary = domain.NewSafeValidationSummary(run.ID, result)
+	repository := &validationRepositoryFake{instance: instance, submission: submission}
+	return &Runtime{Repository: repository}, repository
+}
+
+func TestTeacherSafeFeedbackUsesStrictEnvelopeUniqueBoundedRequiredIssues(t *testing.T) {
+	stages := []domain.ValidationStage{{StageID: "optional", Required: false, Outcome: "FAIL", Issues: []domain.ValidationIssue{{Code: "OPTIONAL_ISSUE", Message: "PRIVATE_CANARY"}}}}
+	stage := domain.ValidationStage{StageID: "html", Required: true, Outcome: "FAIL"}
+	for index := 0; index < 8; index++ {
+		issue := domain.ValidationIssue{Code: fmt.Sprintf("MISSING_%d", index), Message: "PRIVATE_CANARY <script>solution</script>"}
+		stage.Issues = append(stage.Issues, issue, issue)
+	}
+	stages = append(stages, stage)
+	runtime, repository := teacherFeedbackFixture(domain.OutcomeFail, stages)
+	result, err := runtime.TeacherValidation(context.Background(), repository.instance.ID, repository.instance.StudentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Schema != "practice-task-teacher-validation-context.v1" || !result.Available || result.Passed == nil || *result.Passed || result.SubmissionID == nil || *result.SubmissionID != repository.submission.ID || result.WorkspaceDigest == nil || *result.WorkspaceDigest != repository.submission.WorkspaceDigest || result.UpdatedAt == nil || !result.UpdatedAt.Equal(repository.submission.UpdatedAt) {
+		t.Fatalf("wrong Teacher correlation: %+v", result)
+	}
+	explanation := result.TeacherExplanation
+	if explanation == nil || explanation.Schema != "teacher-validation-explanation.v1" || len(explanation.BlockingIssues) != 5 || !explanation.Truncated || !strings.HasPrefix(explanation.SourceDigest, "sha256:") {
+		t.Fatalf("wrong bounded explanation: %+v", explanation)
+	}
+	for index, issue := range explanation.BlockingIssues {
+		if issue.Code != fmt.Sprintf("MISSING_%d", index) || issue.StageID != "html" || issue.Message != domain.SafeSemanticIssueMessage {
+			t.Fatalf("wrong required semantic issue: %+v", issue)
+		}
+	}
+	encoded, _ := json.Marshal(result)
+	for _, private := range []string{"PRIVATE_CANARY", "script", "safe_summary", "snapshot_id", "sandbox_id", "validation_specification"} {
+		if strings.Contains(string(encoded), private) {
+			t.Fatalf("unsafe Teacher field/content: %s", encoded)
+		}
+	}
+	repeated, err := runtime.TeacherValidation(context.Background(), repository.instance.ID, repository.instance.StudentID)
+	if err != nil || repeated.TeacherExplanation.SourceDigest != explanation.SourceDigest {
+		t.Fatal("source digest changed without safe content change")
+	}
+	repository.submission.ValidationRuns[0].SafeSummary.Stages[1].Issues[0].Code = "CHANGED"
+	changed, _ := runtime.TeacherValidation(context.Background(), repository.instance.ID, repository.instance.StudentID)
+	if changed.TeacherExplanation.SourceDigest == explanation.SourceDigest {
+		t.Fatal("source digest did not bind safe content")
+	}
+	contextResult, err := runtime.TeacherContext(context.Background(), repository.instance.ID, repository.instance.StudentID)
+	if err != nil || !contextResult.Validation.Available || contextResult.Validation.Passed || contextResult.Validation.StageCount != 2 || contextResult.Validation.ErrorCount != 17 {
+		t.Fatalf("Teacher counts not derived from safe current result: %+v %v", contextResult.Validation, err)
+	}
+}
+
+func TestTeacherPassHasNoBlockingOptionalFailuresAndErrorRemainsTechnical(t *testing.T) {
+	stages := []domain.ValidationStage{{StageID: "optional", Required: false, Outcome: "FAIL", Issues: []domain.ValidationIssue{{Code: "OPTIONAL", Message: "PRIVATE_CANARY"}}}}
+	for _, outcome := range []domain.ValidationOutcome{domain.OutcomePass, domain.OutcomeError} {
+		t.Run(string(outcome), func(t *testing.T) {
+			runtime, repository := teacherFeedbackFixture(outcome, stages)
+			result, err := runtime.TeacherValidation(context.Background(), repository.instance.ID, repository.instance.StudentID)
+			if err != nil || !result.Available || result.TeacherExplanation == nil {
+				t.Fatalf("safe result unavailable: %+v %v", result, err)
+			}
+			explanation := result.TeacherExplanation
+			if outcome == domain.OutcomePass {
+				if !*result.Passed || len(explanation.BlockingIssues) != 0 || explanation.Truncated {
+					t.Fatal("optional FAIL became a blocking PASS issue")
+				}
+			} else if *result.Passed || len(explanation.BlockingIssues) != 1 || explanation.BlockingIssues[0].Code != "SNAPSHOT_UNAVAILABLE" || explanation.BlockingIssues[0].Message != domain.SafeTechnicalIssueMessage || explanation.BlockingIssues[0].StageID != "" {
+				t.Fatalf("technical ERROR invented learner failure: %+v", explanation)
+			}
+		})
+	}
+}
+
+func TestTeacherLegacyPendingAndForeignCorrelationFailClosed(t *testing.T) {
+	for _, mode := range []string{"legacy", "pending", "different summary", "owner", "instance", "revision", "snapshot", "different submission"} {
+		t.Run(mode, func(t *testing.T) {
+			runtime, repository := teacherFeedbackFixture(domain.OutcomeFail, []domain.ValidationStage{{StageID: "html", Required: true, Outcome: "FAIL", Issues: []domain.ValidationIssue{{Code: "MISSING"}}}})
+			switch mode {
+			case "legacy":
+				repository.submission.ValidationRuns[0].SafeSummary = nil
+			case "pending":
+				repository.submission.ValidationRuns = append(repository.submission.ValidationRuns, domain.ValidationRun{ID: "00000000-0000-4000-8000-000000000022", Status: domain.ValidationRunPending})
+			case "different summary":
+				repository.submission.ValidationRuns[0].SafeSummary.ValidationRunID = "00000000-0000-4000-8000-000000000023"
+			case "owner":
+				repository.submission.StudentID = "00000000-0000-4000-8000-000000000024"
+			case "instance":
+				repository.submission.TaskInstanceID = "00000000-0000-4000-8000-000000000025"
+			case "revision":
+				repository.submission.RevisionDigest = "sha256:" + strings.Repeat("d", 64)
+			case "snapshot":
+				repository.submission.Snapshot.WorkspaceDigest = "sha256:" + strings.Repeat("e", 64)
+			case "different submission":
+				repository.submission.ID = "00000000-0000-4000-8000-000000000026"
+			}
+			result, err := runtime.TeacherValidation(context.Background(), repository.instance.ID, repository.instance.StudentID)
+			if mode == "legacy" || mode == "pending" || mode == "different summary" {
+				if err != nil || result.Available || result.Passed != nil || result.TeacherExplanation != nil {
+					t.Fatalf("fabricated unavailable explanation: %+v %v", result, err)
+				}
+				current, contextErr := runtime.TeacherContext(context.Background(), repository.instance.ID, repository.instance.StudentID)
+				if contextErr != nil || current.Validation.Available || current.Validation.StageCount != 0 || current.Validation.ErrorCount != 0 {
+					t.Fatalf("stale Teacher counts: %+v %v", current.Validation, contextErr)
+				}
+			} else if err == nil {
+				t.Fatal("foreign/mismatched submission accepted")
+			}
+			if _, err := runtime.TeacherValidation(context.Background(), repository.instance.ID, "00000000-0000-4000-8000-000000000099"); err == nil {
+				t.Fatal("foreign student accepted")
+			}
+		})
+	}
+}

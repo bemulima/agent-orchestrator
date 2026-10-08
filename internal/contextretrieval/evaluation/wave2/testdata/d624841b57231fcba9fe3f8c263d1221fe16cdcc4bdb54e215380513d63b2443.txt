@@ -1,0 +1,178 @@
+//go:build integration
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/hybridreplan"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Root prepares the genuine Student ingress/outbox/broker/snapshot job first.
+// This proof uses the production evaluator, actual Planner policy/graph/store
+// and real registered Student HTTP. It creates no synthetic mastery or job and
+// does not apply consequences; Student application is T20.4/T20.5 scope.
+func TestT203ActualHybridEvaluation(t *testing.T) {
+	if os.Getenv("T203_ACTUAL_HYBRID") != "true" {
+		t.Skip("root-owned actual T20.3 gate absent")
+	}
+	cfg, err := pgxpool.ParseConfig(os.Getenv("PLANNER_T20_DATABASE_URL"))
+	if err != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_planner_integration_proof" {
+		t.Fatal("SETUP: exact isolated actual Planner PostgreSQL required")
+	}
+	var owner struct {
+		URL         string                   `json:"url"`
+		Token       string                   `json:"token"`
+		StudentID   string                   `json:"student_id"`
+		PathID      string                   `json:"path_id"`
+		Targets     []domain.HybridTargetRef `json:"targets"`
+		SnapshotRef string                   `json:"snapshot_ref"`
+		EventID     string                   `json:"event_id"`
+	}
+	t203ReadJSON(t, os.Getenv("T203_OWNER_READY_FILE"), &owner)
+	address, err := url.Parse(owner.URL)
+	if err != nil || address.Scheme != "http" || address.Hostname() != "127.0.0.1" || address.Port() == "" || address.User != nil || address.Path != "" || address.RawQuery != "" || address.Fragment != "" || owner.Token == "" {
+		t.Fatal("SETUP: actual isolated Student HTTP provider required")
+	}
+	var snapshot domain.HybridPlanningSnapshot
+	t203ReadJSON(t, os.Getenv("T203_SNAPSHOT_FILE"), &snapshot)
+	request := domain.HybridSnapshotRequest{Targets: owner.Targets, TriggerContext: snapshot.TriggerContext}
+	if err := domain.ValidateHybridPlanningSnapshot(snapshot, owner.StudentID, owner.PathID, request); err != nil || snapshot.References.SnapshotRef != owner.SnapshotRef {
+		t.Fatal("SETUP: actual exported owner snapshot mismatch")
+	}
+	if len(snapshot.Mastery) != 1 || snapshot.Mastery[0].State != "MASTERED" || snapshot.Mastery[0].Confidence != .80 || snapshot.Mastery[0].EvidenceCount != 8 || len(snapshot.Evidence) != 8 || len(snapshot.Path.Items) != 2 || snapshot.Path.Items[0].Status != "READY" || snapshot.Path.Items[1].Status != "PLANNED" {
+		t.Fatal("SETUP: eight real official evidence commits and initial owner path required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := postgres.Store{Pool: pool}
+	var jobID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM hybrid_evaluation_job WHERE student_id=$1 AND learning_path_id=$2 AND snapshot_ref=$3 AND policy_version=$4`, owner.StudentID, owner.PathID, owner.SnapshotRef, domain.HybridReplanPolicyVersion).Scan(&jobID); err != nil {
+		t.Fatalf("SETUP: genuine owner/broker coherent snapshot job missing: %v", err)
+	}
+	policy, err := store.GetActivePolicyBundle(ctx)
+	if err != nil || policy.MasterySkipConfidence != .80 {
+		t.Fatalf("actual accepted Planner policy must retain0.80: %v", err)
+	}
+	student := studentclient.Client{BaseURL: owner.URL, WriteToken: owner.Token, HTTPClient: &http.Client{Timeout: 5 * time.Second}}
+	before, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, request)
+	if err != nil || before.References.SnapshotRef != snapshot.References.SnapshotRef {
+		t.Fatalf("actual registered owner snapshot before evaluation: %v", err)
+	}
+	processor := hybridreplan.EvaluationProcessor{Consequences: store, Policies: store, Graphs: store, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	var receipt domain.HybridConsequenceReceipt
+	for attempts := 0; attempts < 128; attempts++ {
+		receipt, err = store.GetHybridConsequence(ctx, jobID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, domain.ErrNotFound) {
+			t.Fatal(err)
+		}
+		processed, err := processor.ProcessNext(ctx)
+		if err != nil || !processed {
+			t.Fatalf("real deterministic evaluation worker processed=%v err=%v", processed, err)
+		}
+	}
+	if receipt.JobID != jobID {
+		t.Fatal("bounded real evaluator did not commit requested owner receipt")
+	}
+	consequence := receipt.Consequence
+	if consequence.Outcome != domain.HybridOutcomeReplanNeeded || consequence.ApplicationMode != domain.HybridApplicationAuto || consequence.PolicyVersion != domain.HybridReplanPolicyVersion || consequence.ExpectedPathRevision != snapshot.Path.Version || consequence.SnapshotRef != snapshot.References.SnapshotRef || consequence.StudentID != owner.StudentID || consequence.LearningPathID != owner.PathID || consequence.PolicyInputHash == "" || len(consequence.Mutations) != 1 || consequence.Mutations[0].Kind != "SKIP_REDUNDANT_PENDING_ITEM" || consequence.Mutations[0].ItemID != snapshot.Path.Items[1].ID {
+		t.Fatalf("real positive Hybrid consequence incomplete or wrong: %+v", consequence)
+	}
+	if !t203ContainsReason(consequence.ReasonCodes, "TARGET_MASTERED_STABLE") {
+		t.Fatal("positive receipt lacks accepted machine reason")
+	}
+	var pinned []byte
+	if err := pool.QueryRow(ctx, `SELECT inputs_json FROM hybrid_consequence_input WHERE job_id=$1`, jobID).Scan(&pinned); err != nil {
+		t.Fatal(err)
+	}
+	var inputs domain.HybridConsequenceInputs
+	if json.Unmarshal(pinned, &inputs) != nil || inputs.Policy.MasterySkipConfidence != .80 || inputs.InputHash != consequence.PolicyInputHash {
+		t.Fatal("actual accepted policy input was not durably pinned")
+	}
+	// Reconstruct processor and repository after commit. Every duplicate read
+	// returns the same immutable receipt and another work pass cannot create a
+	// second consequence for this committed snapshot/policy.
+	restartedStore := postgres.Store{Pool: pool}
+	restarted := hybridreplan.EvaluationProcessor{Consequences: restartedStore, Policies: restartedStore, Graphs: restartedStore, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	for i := 0; i < 3; i++ {
+		replayed, err := restartedStore.GetHybridConsequence(ctx, jobID)
+		if err != nil || !reflect.DeepEqual(replayed, receipt) {
+			t.Fatalf("committed receipt changed after repository reconstruction: %v", err)
+		}
+	}
+	for i := 0; i < 128; i++ {
+		processed, err := restarted.ProcessNext(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			break
+		}
+		if i == 127 {
+			t.Fatal("bounded evaluator drain exceeded retained root fixtures")
+		}
+	}
+	var count, actualNoChange int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM hybrid_consequence_receipt WHERE job_id=$1),(SELECT count(*) FROM hybrid_consequence_receipt r JOIN hybrid_evaluation_job j ON j.id=r.job_id WHERE j.student_id<>$2 AND r.consequence_json->>'outcome'='NO_CHANGE')`, jobID, owner.StudentID).Scan(&count, &actualNoChange); err != nil || count != 1 || actualNoChange < 1 {
+		t.Fatalf("actual positive/retained NO_CHANGE receipts count=%d nochange=%d err=%v", count, actualNoChange, err)
+	}
+	after, err := student.GetHybridPlanningSnapshot(ctx, owner.StudentID, owner.PathID, request)
+	if err != nil || !reflect.DeepEqual(before.Path, after.Path) || before.References != after.References {
+		t.Fatalf("evaluation-only consequence mutated Student owner state: %v", err)
+	}
+	result := os.Getenv("T203_RESULT_FILE")
+	if result == "" {
+		t.Fatal("SETUP: fresh root result path required")
+	}
+	raw, err := json.MarshalIndent(map[string]any{"student_id": owner.StudentID, "learning_path_id": owner.PathID, "job_id": jobID, "receipt": receipt, "actual_no_change_receipts": actualNoChange, "actual_evaluator": true, "actual_planner_pg_policy_graph": true, "real_registered_student_snapshot": true, "path_mutations": 0, "current_ready_preserved": true, "accepted_confidence": .80, "exact_receipt_replay": true, "upstream_double": "eight named official legacy Practice bundles; Runtime validation not executed"}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(result, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.Write(append(raw, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal("actual evaluation result export failed")
+	}
+	t.Log("PASS actual owner-derived snapshot job → real Hybrid evaluator/accepted PG policy → durable AUTO future skip and actual NO_CHANGE receipts; exact replay; Student path unchanged")
+}
+
+func t203ReadJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, value) != nil {
+		t.Fatalf("SETUP: root actual fixture metadata unavailable: %s", path)
+	}
+}
+
+func t203ContainsReason(reasons []string, reason string) bool {
+	for _, candidate := range reasons {
+		if candidate == reason {
+			return true
+		}
+	}
+	return false
+}

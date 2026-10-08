@@ -1,0 +1,207 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.PinnedCoursePlanRepository = Store{}
+
+// BYTEA is deliberate: JSONB changes object key order, including the exact
+// existing course-fingerprint-v1 normalized context bytes.
+func (s Store) GetPlanningInput(ctx context.Context, r domain.CoursePlanRequest) (domain.PlanningInputCheckpoint, error) {
+	actual, e := s.checkPlanningRequestBinding(ctx, r)
+	if e != nil {
+		return domain.PlanningInputCheckpoint{}, e
+	}
+	var c domain.PlanningInputCheckpoint
+	e = s.readPlanningCheckpoint(ctx, "course_planning_input_checkpoint", r.ID, domain.MaximumPlanningInputCheckpointBytes, &c)
+	if e == nil {
+		e = c.Validate(actual)
+	}
+	if e == nil {
+		e = c.Validate(r)
+	}
+	return c, e
+}
+func (s Store) GetGeneratedCourse(ctx context.Context, r domain.CoursePlanRequest) (domain.GeneratedCourseCheckpoint, error) {
+	input, e := s.GetPlanningInput(ctx, r)
+	if e != nil {
+		return domain.GeneratedCourseCheckpoint{}, e
+	}
+	var c domain.GeneratedCourseCheckpoint
+	e = s.readPlanningCheckpoint(ctx, "course_planning_generated_checkpoint", r.ID, domain.MaximumGeneratedCoursePayloadBytes+4096, &c)
+	if e == nil {
+		e = c.Validate(input)
+	}
+	return c, e
+}
+func (s Store) GetCourseEnsure(ctx context.Context, r domain.CoursePlanRequest) (domain.CourseEnsureCheckpoint, error) {
+	input, e := s.GetPlanningInput(ctx, r)
+	if e != nil {
+		return domain.CourseEnsureCheckpoint{}, e
+	}
+	generated, e := s.GetGeneratedCourse(ctx, r)
+	if e != nil {
+		return domain.CourseEnsureCheckpoint{}, e
+	}
+	var c domain.CourseEnsureCheckpoint
+	e = s.readPlanningCheckpoint(ctx, "course_planning_ensure_checkpoint", r.ID, domain.MaximumCourseEnsureCheckpointBytes, &c)
+	if e == nil {
+		e = c.Validate(input, generated)
+	}
+	return c, e
+}
+func (s Store) CheckpointPlanningInput(ctx context.Context, r domain.CoursePlanRequest, c domain.PlanningInputCheckpoint, now time.Time) error {
+	if c.Validate(r) != nil {
+		return domain.ErrValidation
+	}
+	return s.writePlanningCheckpoint(ctx, r, "course_planning_input_checkpoint", c.InputHash, "", c, now)
+}
+func (s Store) CheckpointGeneratedCourse(ctx context.Context, r domain.CoursePlanRequest, c domain.GeneratedCourseCheckpoint, now time.Time) error {
+	input, e := s.GetPlanningInput(ctx, r)
+	if e != nil {
+		return e
+	}
+	if c.Validate(input) != nil {
+		return domain.ErrValidation
+	}
+	return s.writePlanningCheckpoint(ctx, r, "course_planning_generated_checkpoint", c.ArtifactHash, c.InputHash, c, now)
+}
+func (s Store) CheckpointCourseEnsure(ctx context.Context, r domain.CoursePlanRequest, c domain.CourseEnsureCheckpoint, now time.Time) error {
+	input, e := s.GetPlanningInput(ctx, r)
+	if e != nil {
+		return e
+	}
+	generated, e := s.GetGeneratedCourse(ctx, r)
+	if e != nil {
+		return e
+	}
+	if c.Validate(input, generated) != nil {
+		return domain.ErrValidation
+	}
+	return s.writePlanningCheckpoint(ctx, r, "course_planning_ensure_checkpoint", c.ReceiptHash, c.ArtifactHash, c, now)
+}
+func (s Store) checkPlanningRequestBinding(ctx context.Context, r domain.CoursePlanRequest) (domain.CoursePlanRequest, error) {
+	actual, e := s.GetForStudent(ctx, r.StudentID, r.ID)
+	if e != nil {
+		return actual, e
+	}
+	a, _ := json.Marshal(actual.Intent)
+	b, _ := json.Marshal(r.Intent)
+	if actual.RequestHash != r.RequestHash || actual.GoalCode != r.GoalCode || actual.DiagnosticPlanID != r.DiagnosticPlanID || !bytes.Equal(a, b) || (r.Intent.Reason == domain.PlanningReasonReplan && actual.LearningPathID != r.LearningPathID) {
+		return actual, domain.ErrValidation
+	}
+	return actual, nil
+}
+func (s Store) readPlanningCheckpoint(ctx context.Context, table, id string, maximum int, out any) error {
+	var raw []byte
+	var digest, hash, parent string
+	parentExpr := "''::text"
+	if table != "course_planning_input_checkpoint" {
+		parentExpr = "parent_hash"
+	}
+	e := s.Pool.QueryRow(ctx, "SELECT payload_bytes,payload_sha256,checkpoint_hash,"+parentExpr+" FROM "+table+" WHERE request_id=$1", id).Scan(&raw, &digest, &hash, &parent)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if e != nil {
+		return e
+	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != digest {
+		return domain.ErrValidation
+	}
+	if e := domain.DecodePlanningCheckpoint(raw, maximum, out); e != nil {
+		return e
+	}
+	switch c := out.(type) {
+	case *domain.PlanningInputCheckpoint:
+		if c.InputHash != hash {
+			return domain.ErrValidation
+		}
+	case *domain.GeneratedCourseCheckpoint:
+		if c.ArtifactHash != hash || c.InputHash != parent {
+			return domain.ErrValidation
+		}
+	case *domain.CourseEnsureCheckpoint:
+		if c.ReceiptHash != hash || c.ArtifactHash != parent {
+			return domain.ErrValidation
+		}
+	default:
+		return domain.ErrValidation
+	}
+	return nil
+}
+func (s Store) writePlanningCheckpoint(ctx context.Context, r domain.CoursePlanRequest, table, hash, parent string, value any, now time.Time) error {
+	if now.IsZero() || r.ClaimToken == "" {
+		return domain.ErrValidation
+	}
+	raw, e := json.Marshal(value)
+	if e != nil {
+		return domain.ErrValidation
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	tx, e := s.Pool.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	actual, e := scanCoursePlan(tx.QueryRow(ctx, "SELECT "+coursePlanColumns+" FROM course_plan_request WHERE id=$1 FOR UPDATE", r.ID))
+	if errors.Is(e, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if e != nil {
+		return e
+	}
+	a, _ := json.Marshal(actual.Intent)
+	b, _ := json.Marshal(r.Intent)
+	if actual.StudentID != r.StudentID || actual.RequestHash != r.RequestHash || actual.GoalCode != r.GoalCode || actual.DiagnosticPlanID != r.DiagnosticPlanID || !bytes.Equal(a, b) || (r.Intent.Reason == domain.PlanningReasonReplan && actual.LearningPathID != r.LearningPathID) {
+		return domain.ErrValidation
+	}
+	var active bool
+	if e = tx.QueryRow(ctx, `SELECT COALESCE(status='PLANNING' AND claim_token=$2 AND lease_until>$3 AND lease_until>clock_timestamp(),false) FROM course_plan_request WHERE id=$1`, r.ID, r.ClaimToken, now).Scan(&active); e != nil {
+		return e
+	}
+	if !active {
+		return domain.ErrConflict
+	}
+	if c, ok := value.(domain.PlanningInputCheckpoint); ok && c.Validate(actual) != nil {
+		return domain.ErrValidation
+	}
+	if actual.Status != domain.CoursePlanPlanning || actual.ClaimToken != r.ClaimToken || actual.LeaseUntil == nil || !actual.LeaseUntil.After(now) {
+		return domain.ErrConflict
+	}
+	// An identical byte-for-byte retry succeeds only while this claim is active.
+	var stored []byte
+	var storedHash string
+	e = tx.QueryRow(ctx, "SELECT payload_bytes,checkpoint_hash FROM "+table+" WHERE request_id=$1", r.ID).Scan(&stored, &storedHash)
+	if e == nil {
+		if !bytes.Equal(stored, raw) || storedHash != hash {
+			return domain.ErrConflict
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(e, pgx.ErrNoRows) {
+		return e
+	}
+	if table == "course_planning_input_checkpoint" {
+		_, e = tx.Exec(ctx, `INSERT INTO course_planning_input_checkpoint(request_id,student_id,request_hash,goal_code,checkpoint_hash,payload_bytes,payload_sha256,write_claim,checkpointed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, r.ID, r.StudentID, r.RequestHash, r.GoalCode, hash, raw, digest, r.ClaimToken, now)
+	} else {
+		_, e = tx.Exec(ctx, "INSERT INTO "+table+"(request_id,checkpoint_hash,parent_hash,payload_bytes,payload_sha256,write_claim,checkpointed_at) VALUES($1,$2,$3,$4,$5,$6,$7)", r.ID, hash, parent, raw, digest, r.ClaimToken, now)
+	}
+	if e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}

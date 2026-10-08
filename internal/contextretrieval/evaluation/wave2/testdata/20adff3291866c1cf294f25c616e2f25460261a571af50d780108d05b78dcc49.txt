@@ -1,0 +1,797 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	planningmessages "github.com/bemulima/ms-go-learning-planner/internal/transport/message/nats"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/hybridreplan"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// Named upstream Runtime evidence/projection and authored Course metadata are
+// provided by the bounded root Student fixture. Every successful state change
+// enters real owner APIs. No synthetic successful evaluator/job/receipt exists.
+type t205Fixture struct {
+	StudentID          string                     `json:"student_id"`
+	PathID             string                     `json:"path_id"`
+	Targets            []domain.HybridTargetRef   `json:"targets"`
+	Scope              domain.HybridScopeIdentity `json:"scope"`
+	ActiveItemID       string                     `json:"active_item_id"`
+	PendingItemID      string                     `json:"pending_item_id"`
+	TemplateItemID     string                     `json:"template_item_id"`
+	CompletedItemID    string                     `json:"completed_item_id"`
+	TaskInstanceID     string                     `json:"task_instance_id"`
+	TaskRevisionID     string                     `json:"task_revision_id"`
+	TaskRevisionDigest string                     `json:"task_revision_digest"`
+	LearningActionID   string                     `json:"learning_action_id"`
+	RequirementID      string                     `json:"requirement_id"`
+	PathRevision       int64                      `json:"path_revision"`
+}
+type t205Ready struct {
+	URL           string                 `json:"url"`
+	PlannerToken  string                 `json:"planner_token"`
+	PracticeToken string                 `json:"practice_token"`
+	TeacherToken  string                 `json:"teacher_token"`
+	ControlToken  string                 `json:"control_token"`
+	Fixtures      map[string]t205Fixture `json:"fixtures"`
+}
+type t205State struct {
+	Path            json.RawMessage   `json:"path"`
+	Revisions       int               `json:"revisions"`
+	Applications    int               `json:"applications"`
+	Receipts        int               `json:"receipts"`
+	Intents         int               `json:"intents"`
+	IntentEvents    int               `json:"intent_events"`
+	PrivateDigests  map[string]string `json:"private_digests"`
+	PracticeBinding json.RawMessage   `json:"practice_binding"`
+	Context         json.RawMessage   `json:"context"`
+	SnapshotRefs    json.RawMessage   `json:"snapshot_refs"`
+	ConsumedIntents int               `json:"consumed_intents"`
+}
+type t205Harness struct {
+	t         *testing.T
+	ctx       context.Context
+	owner     t205Ready
+	pool      *pgxpool.Pool
+	store     postgres.Store
+	http      *http.Client
+	student   studentclient.Client
+	js        natsgo.JetStreamContext
+	trigger   hybridreplan.TriggerProcessor
+	snapshots hybridreplan.SnapshotProcessor
+	evaluator hybridreplan.EvaluationProcessor
+	delivery  hybridreplan.ApplicationProcessor
+	consumer  *planningmessages.PlanningStateConsumer
+	results   map[string]any
+}
+
+func TestT205ActualHybridComposed(t *testing.T) {
+	if os.Getenv("T205_ACTUAL_HYBRID") != "true" {
+		t.Skip("root-owned actual T20.5 gate absent")
+	}
+	cfg, e := pgxpool.ParseConfig(os.Getenv("PLANNER_T20_DATABASE_URL"))
+	if e != nil || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58999 || cfg.ConnConfig.Database != "remediation_t20_planner_integration_proof" {
+		t.Fatal("SETUP: exact isolated Planner database required")
+	}
+	var ready t205Ready
+	t203ReadJSON(t, os.Getenv("T205_OWNER_READY_FILE"), &ready)
+	address, e := url.Parse(ready.URL)
+	if e != nil || address.Scheme != "http" || address.Hostname() != "127.0.0.1" || address.Port() == "" || address.Path != "" || address.User != nil || ready.PlannerToken == "" || ready.PracticeToken == "" || ready.TeacherToken == "" || ready.ControlToken == "" {
+		t.Fatal("SETUP: actual finite scoped Student owner required")
+	}
+	ids := map[string]bool{}
+	for _, key := range []string{"no_change", "positive", "stale", "active_practice", "intent", "outage"} {
+		f, ok := ready.Fixtures[key]
+		if !ok || f.StudentID == "" || f.PathID == "" || len(f.Targets) == 0 || ids[f.StudentID] {
+			t.Fatal("SETUP: six separate real owner fixtures required")
+		}
+		ids[f.StudentID] = true
+	}
+	brokerURL := os.Getenv("T205_NATS_URL")
+	if brokerURL != "nats://127.0.0.1:59000" {
+		t.Fatal("SETUP: exact root broker required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pool.Close()
+	conn, e := natsgo.Connect(brokerURL, natsgo.Name("t205-actual-composed"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	js, e := conn.JetStream()
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := t205Harness{t: t, ctx: ctx, owner: ready, pool: pool, store: postgres.Store{Pool: pool}, http: &http.Client{Timeout: 5 * time.Second}, js: js, results: map[string]any{}}
+	h.student = studentclient.Client{BaseURL: ready.URL, WriteToken: ready.PlannerToken, HTTPClient: h.http}
+	h.trigger = hybridreplan.TriggerProcessor{Jobs: h.store}
+	h.snapshots = hybridreplan.SnapshotProcessor{Jobs: h.store, Students: h.student, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	h.evaluator = hybridreplan.EvaluationProcessor{Consequences: h.store, Policies: h.store, Graphs: h.store, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	h.delivery = hybridreplan.ApplicationProcessor{Applications: h.store, Students: h.student, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	defer func() {
+		if h.consumer != nil {
+			h.consumer.Close()
+		}
+	}()
+	policy, e := h.store.GetActivePolicyBundle(ctx)
+	if e != nil || policy.MasterySkipConfidence != .8 {
+		t.Fatal("SETUP: accepted existing Planner policy must retain confidence .80")
+	}
+
+	// A: bounded failed official Course execution; hook owns production closure
+	// and Teacher assistance ingestion, with an explicit upstream result fixture.
+	a := ready.Fixtures["no_change"]
+	aBefore, aBeforeNBA := h.state(a), h.nba(a)
+	raw, status := h.request("POST", "/__t205/failed-course-fact", ready.ControlToken, "", map[string]any{"student_id": a.StudentID}, "")
+	if status != 200 {
+		t.Fatalf("actual official failed Course ingress status=%d body=%s", status, raw)
+	}
+	aAfterEvidence, aNBA := h.state(a), h.nba(a)
+	if !bytes.Equal(aBefore.Path, aAfterEvidence.Path) || aBefore.Revisions != aAfterEvidence.Revisions || !bytes.Equal(aBefore.Context, aAfterEvidence.Context) || !reflect.DeepEqual(aBefore.PrivateDigests, aAfterEvidence.PrivateDigests) {
+		t.Fatal("A actual failed ingress itself altered current/history/path revision")
+	}
+	h.requireNBAVersion(aBefore, aBeforeNBA)
+	h.requireNBAVersion(aAfterEvidence, aNBA)
+	h.startConsumer(brokerURL)
+	h.relay(a)
+	aC := h.evaluate(a)
+	if aC.Consequence.Outcome != domain.HybridOutcomeNoChange {
+		t.Fatalf("one failed execution must not create significant adaptation: %+v", aC.Consequence)
+	}
+	aReceipt := h.apply(a, aC)
+	aAfter := h.state(a)
+	if !bytes.Equal(aBefore.Path, aAfter.Path) || aBefore.Revisions != aAfter.Revisions || aReceipt.Status != "NO_CHANGE" || !reflect.DeepEqual(aNBA, h.nba(a)) {
+		t.Fatal("A NO_CHANGE modified path/history/NBA")
+	}
+	h.results["A"] = map[string]any{"receipt": aReceipt, "path_revision_before_failed_ingress": h.pathVersion(aBefore), "path_revision_after_failed_ingress": h.pathVersion(aAfterEvidence), "path_revision_after_hybrid": h.pathVersion(aAfter), "path_revision_delta": 0, "nba_before_failed_ingress": aBeforeNBA, "nba_after_failed_ingress": aNBA, "nba_after_no_change": h.nba(a), "classification": "ordinary failed attempt may change resume/retry suggestion; Hybrid NO_CHANGE preserves post-evidence NBA exactly", "failed_course_owner_observation": json.RawMessage(raw)}
+
+	// B: eight distinct official independent execution applications qualify .80.
+	b := ready.Fixtures["positive"]
+	bBefore := h.state(b)
+	bBeforeNBA := h.nba(b)
+	h.evidence(b, 8)
+	bSnapshot := h.snapshot(b)
+	h.requireMastered(b, bSnapshot)
+	h.relay(b)
+	bC := h.evaluate(b)
+	h.requireSkip(b, bC.Consequence)
+	bReceipt := h.apply(b, bC)
+	bAfter := h.state(b)
+	h.requireFutureOnly(b, bBefore, bAfter, bReceipt)
+	bNBA := h.nba(b)
+	h.requireNBAVersion(bAfter, bNBA)
+	if reflect.DeepEqual(bBeforeNBA["source_versions"], bNBA["source_versions"]) {
+		t.Fatal("B actual NBA source versions/state digest did not follow Hybrid owner revision")
+	}
+	h.results["B"] = map[string]any{"receipt": bReceipt, "mastery": bSnapshot.Mastery, "nba": bNBA, "protected_private_digests": bAfter.PrivateDigests}
+
+	// C: same real envelope/redelivery and same stored consequence. No fake
+	// trigger identity: canonical durable loses ACK after immutable inbox commit.
+	events := h.events(b)
+	event := events[len(events)-1]
+	bGeneration := t202Generation(t, ctx, pool, b.StudentID, b.PathID)
+	beforeJobs := t202JobCount(t, ctx, pool, b.StudentID, b.PathID)
+	h.consumer.Close()
+	h.consumer = nil
+	t202Await(t, ctx, 5*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumWaiting == 0 && info.NumAckPending == 0
+	})
+	t202Publish(t, js, event, false)
+	lost, e := natsgo.Connect(brokerURL, natsgo.Name("t205-exact-owner-envelope-lost-ack"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	lostJS, e := lost.JetStream()
+	if e != nil {
+		lost.Close()
+		t.Fatal(e)
+	}
+	sub, e := lostJS.PullSubscribe(domain.SubjectPlanningStateChanged, planningmessages.HybridReplanDurable, natsgo.Bind(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable), natsgo.ManualAck())
+	if e != nil {
+		lost.Close()
+		t.Fatal(e)
+	}
+	messages, e := sub.Fetch(1, natsgo.MaxWait(5*time.Second))
+	if e != nil || len(messages) != 1 {
+		lost.Close()
+		t.Fatalf("C actual broker delivery: %v", e)
+	}
+	decoded, e := planningmessages.DecodePlanningStateMessage(messages[0])
+	if e != nil || decoded.EventID != event.EventID {
+		lost.Close()
+		t.Fatal("C lost ACK envelope differs from actual committed fact")
+	}
+	created, e := h.trigger.ReceivePlanningStateEvent(ctx, decoded)
+	if e != nil || created {
+		lost.Close()
+		t.Fatalf("C exact inbox replay created=%v error=%v", created, e)
+	}
+	info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+	if e != nil {
+		lost.Close()
+		t.Fatal(e)
+	}
+	delivered := info.Delivered.Consumer
+	lost.Close()
+	h.startConsumer(brokerURL)
+	t202Await(t, ctx, 45*time.Second, func() bool {
+		info, e := js.ConsumerInfo(planningmessages.PlanningStateStream, planningmessages.HybridReplanDurable)
+		return e == nil && info.NumPending == 0 && info.NumAckPending == 0 && info.Delivered.Consumer > delivered
+	})
+	replay, e := h.student.ApplyHybridConsequence(ctx, bC.Consequence)
+	if e != nil || !reflect.DeepEqual(replay, bReceipt) || t202InboxCount(t, ctx, pool, event.EventID) != 1 || t202Generation(t, ctx, pool, b.StudentID, b.PathID) != bGeneration || t202JobCount(t, ctx, pool, b.StudentID, b.PathID) != beforeJobs || !reflect.DeepEqual(bAfter, h.state(b)) {
+		t.Fatal("C redelivery/replay duplicated outcome/revision or owner receipt")
+	}
+	h.results["C"] = map[string]any{"exact_owner_event_id": event.EventID, "actual_lost_ack_recovered": true, "replayed_receipt": replay, "inbox_receipts": 1, "revision_delta": 0}
+
+	// D: genuine queued NO_CHANGE becomes stale after another owner evidence
+	// commit; local generation refetches a changed actual snapshot and outcome.
+	d := ready.Fixtures["stale"]
+	h.evidence(d, 1)
+	h.relay(d)
+	dOld := h.evaluate(d)
+	dBefore := h.state(d)
+	oldGeneration := t202Generation(t, ctx, pool, d.StudentID, d.PathID)
+	h.evidence(d, 1)
+	dApplicationBaseline := h.state(d)
+	if bytes.Equal(dApplicationBaseline.SnapshotRefs, dBefore.SnapshotRefs) || !bytes.Equal(dApplicationBaseline.Path, dBefore.Path) {
+		t.Fatal("D actual second evidence must change coherent reference without path mutation")
+	}
+	h.schedule("application", d, dOld.Consequence.ConsequenceID)
+	processed, e := h.delivery.ProcessNext(ctx)
+	if e != nil || !processed {
+		t.Fatalf("D stale delivery processed=%v error=%v", processed, e)
+	}
+	var staleStatus string
+	var ownerReceipt []byte
+	if e = pool.QueryRow(ctx, `SELECT status,owner_receipt_json FROM hybrid_application_result WHERE consequence_id=$1`, dOld.Consequence.ConsequenceID).Scan(&staleStatus, &ownerReceipt); e != nil || staleStatus != "STALE" || len(ownerReceipt) != 0 || !reflect.DeepEqual(dApplicationBaseline, h.state(d)) {
+		t.Fatalf("D stale application partial mutation status=%s error=%v", staleStatus, e)
+	}
+	if t202Generation(t, ctx, pool, d.StudentID, d.PathID) != oldGeneration+1 {
+		t.Fatal("D typed stale failed local refetch generation")
+	}
+	dNew := h.evaluate(d)
+	if dNew.Consequence.SnapshotRef == dOld.Consequence.SnapshotRef || dNew.Consequence.Outcome != domain.HybridOutcomeNoChange {
+		t.Fatal("D actual refetch did not observe changed evidence/NO_CHANGE")
+	}
+	dReceipt := h.apply(d, dNew)
+	if dReceipt.Status != "NO_CHANGE" || !bytes.Equal(dBefore.Path, h.state(d).Path) {
+		t.Fatal("D refetched NO_CHANGE rewrote owner path")
+	}
+	h.results["D"] = map[string]any{"stale_consequence_id": dOld.Consequence.ConsequenceID, "refetched_consequence": dNew, "receipt": dReceipt, "partial_writes": 0}
+
+	// E: active Practice binding survives future AUTO; exact explicit active
+	// replacement waits. Ordinary v2 completion changes owner revision/history.
+	f := ready.Fixtures["active_practice"]
+	eBefore := h.state(f)
+	h.evidence(f, 8)
+	h.relay(f)
+	eC := h.evaluate(f)
+	h.requireSkip(f, eC.Consequence)
+	eReceipt := h.apply(f, eC)
+	eAfter := h.state(f)
+	h.requireFutureOnly(f, eBefore, eAfter, eReceipt)
+	if !bytes.Equal(eBefore.PracticeBinding, eAfter.PracticeBinding) {
+		t.Fatal("E future adaptation rewrote active TaskInstance/binding")
+	}
+	eNBA := h.nba(f)
+	h.requireNBAVersion(eAfter, eNBA)
+	if versions, ok := eNBA["source_versions"].(map[string]any); !ok || versions["runtime_version"] != "named-t205-runtime-projection-v1" {
+		t.Fatal("E actual NBA must reference bounded exact active Runtime projection")
+	}
+	intentID := h.createIntent(f, "REPLACE_ACTIVE_ACTIVITY", []domain.HybridFutureMutation{{Kind: "REPLACE_ACTIVE_ACTIVITY", ItemID: f.ActiveItemID, TemplateItemID: f.TemplateItemID}})
+	h.relay(f)
+	eMajor := h.evaluate(f)
+	if eMajor.Consequence.ApplicationMode != domain.HybridApplicationRequiresIntent || eMajor.Consequence.IntentID != intentID {
+		t.Fatal("E real evaluator lost exact active intent")
+	}
+	eWaitBefore := h.state(f)
+	h.schedule("application", f, eMajor.Consequence.ConsequenceID)
+	processed, e = h.delivery.ProcessNext(ctx)
+	if e != nil || !processed {
+		t.Fatalf("E real waiting worker: %v", e)
+	}
+	eWaitAfter := h.state(f)
+	if eWaitAfter.Revisions != eWaitBefore.Revisions || eWaitAfter.Receipts != eWaitBefore.Receipts || !bytes.Equal(eWaitAfter.Path, eWaitBefore.Path) || !bytes.Equal(eWaitAfter.PracticeBinding, eWaitBefore.PracticeBinding) {
+		t.Fatal("E WAITING mutated current execution/history")
+	}
+	h.requireIntentStatus(f, intentID, "PENDING", nil)
+	h.completePractice(f)
+	eCompleted := h.state(f)
+	if bytes.Equal(eCompleted.PracticeBinding, eWaitAfter.PracticeBinding) {
+		t.Fatal("E official v2 completion did not close real owner binding")
+	}
+	h.schedule("application", f, eMajor.Consequence.ConsequenceID)
+	processed, e = h.delivery.ProcessNext(ctx)
+	if e != nil || !processed {
+		t.Fatalf("E stale after official completion: %v", e)
+	}
+	if e = pool.QueryRow(ctx, `SELECT status FROM hybrid_application_result WHERE consequence_id=$1`, eMajor.Consequence.ConsequenceID).Scan(&staleStatus); e != nil || staleStatus != "STALE" {
+		t.Fatal("E old active intent did not become stale at ordinary completion")
+	}
+	if !reflect.DeepEqual(eCompleted, h.state(f)) {
+		t.Fatal("E stale intent orphaned or rewrote officially completed work")
+	}
+	h.requireIntentStatus(f, intentID, "PENDING", nil)
+	h.results["E"] = map[string]any{"future_receipt": eReceipt, "waiting_consequence": eMajor, "ordinary_completion_state": eCompleted, "old_intent_consumed": false, "nba_before_completion": eNBA}
+
+	// F: unconsented negative proposal is labelled and never pretends to be a
+	// successful evaluation. Real registered intent drives the real evaluator.
+	g := ready.Fixtures["intent"]
+	fBefore := h.state(g)
+	baseline := h.snapshot(g)
+	negative := domain.HybridConsequence{Schema: domain.HybridConsequenceSchema, StudentID: g.StudentID, LearningPathID: g.PathID, ExpectedPathRevision: baseline.Path.Version, SnapshotRef: baseline.References.SnapshotRef, SnapshotTargets: baseline.RequestedTargets, PolicyVersion: domain.HybridReplanPolicyVersion, PolicyInputHash: "sha256:" + strings.Repeat("a", 64), Outcome: domain.HybridOutcomeReplanNeeded, ApplicationMode: domain.HybridApplicationRequiresIntent, ReasonCodes: []string{"EXPLICIT_LEARNER_INTENT", "REQUIRES_LEARNER_INTENT"}, BaselineScope: g.Scope, DesiredScope: g.Scope, Mutations: []domain.HybridFutureMutation{{Kind: "REPLACE_ACTIVE_ACTIVITY", ItemID: g.ActiveItemID, TemplateItemID: g.TemplateItemID}}, IntentID: uuid.NewString(), RequiredIntentKind: "REPLACE_ACTIVE_ACTIVITY"}
+	negative.ConsequenceID = domain.HybridConsequenceID(g.StudentID, g.PathID, negative.SnapshotRef, negative.PolicyVersion)
+	_, e = h.student.ApplyHybridConsequence(ctx, negative)
+	if !errors.Is(e, domain.ErrHybridApplicationIntentRequired) || !reflect.DeepEqual(fBefore, h.state(g)) {
+		t.Fatalf("F named unconsented negative proposal changed state: %v", e)
+	}
+	fIntent := h.createIntent(g, "REPLACE_ACTIVE_ACTIVITY", negative.Mutations)
+	h.relay(g)
+	fReal := h.evaluate(g)
+	if fReal.Consequence.IntentID != fIntent || fReal.Consequence.ApplicationMode != domain.HybridApplicationRequiresIntent {
+		t.Fatal("F real evaluator did not bind exact learner intent")
+	}
+	fReceipt := h.apply(g, fReal)
+	fAfter := h.state(g)
+	if fReceipt.Status != "APPLIED" || fAfter.Revisions != fBefore.Revisions+1 || h.pathVersion(fAfter) != h.pathVersion(fBefore)+1 || fAfter.ConsumedIntents != fBefore.ConsumedIntents+1 {
+		t.Fatal("F exact-intent READY transition failed")
+	}
+	h.requireREADYReplacement(g, fBefore, fAfter)
+	fOwnerIntent := h.requireIntentStatus(g, fIntent, "CONSUMED", &fReal.Consequence)
+	h.results["F"] = map[string]any{"negative_fixture": "unconsented REQUIRES_INTENT wire proposal; zero effects", "real_consequence": fReal, "receipt": fReceipt, "intent_consumed": true, "owner_intent_receipt": json.RawMessage(fOwnerIntent), "nba": h.nba(g)}
+
+	// G: broker retention while Planner absent, owner outage and EOF only after
+	// registered application commit. Rebuilt worker retries immutable delivery.
+	o := ready.Fixtures["outage"]
+	oBefore := h.state(o)
+	h.consumer.Close()
+	h.consumer = nil
+	h.evidence(o, 8)
+	h.relayOnly(o)
+	oEvents := h.events(o)
+	for _, event := range oEvents {
+		if t202InboxCount(t, ctx, pool, event.EventID) != 0 {
+			t.Fatal("G absent Planner unexpectedly ingested fixture")
+		}
+	}
+	stream, e := js.StreamInfo(planningmessages.PlanningStateStream)
+	if e != nil || stream.State.Msgs == 0 {
+		t.Fatal("G actual broker did not retain official owner facts")
+	}
+	h.startConsumer(brokerURL)
+	h.awaitInbox(oEvents)
+	oC := h.evaluate(o)
+	h.requireSkip(o, oC.Consequence)
+	oApplicationBaseline := h.state(o)
+	h.fault(o, "APPLY_UNAVAILABLE", true)
+	h.schedule("application", o, oC.Consequence.ConsequenceID)
+	processed, e = h.delivery.ProcessNext(ctx)
+	if !processed || !errors.Is(e, domain.ErrUpstreamUnavailable) || !reflect.DeepEqual(oApplicationBaseline, h.state(o)) {
+		t.Fatalf("G actual owner outage lost work or mutated path: %v", e)
+	}
+	h.fault(o, "APPLY_UNAVAILABLE", false)
+	h.fault(o, "LOSE_NEXT_APPLY_RESPONSE", true)
+	h.schedule("application", o, oC.Consequence.ConsequenceID)
+	processed, e = h.delivery.ProcessNext(ctx)
+	if !processed || !errors.Is(e, domain.ErrUpstreamUnavailable) {
+		t.Fatalf("G postcommit response EOF missing: %v", e)
+	}
+	committed := h.state(o)
+	if committed.Revisions != oBefore.Revisions+1 || committed.Receipts != oBefore.Receipts+1 {
+		t.Fatal("G response loss occurred before actual owner commit")
+	}
+	var resultCount int
+	if e = pool.QueryRow(ctx, `SELECT count(*) FROM hybrid_application_result WHERE consequence_id=$1`, oC.Consequence.ConsequenceID).Scan(&resultCount); e != nil || resultCount != 0 {
+		t.Fatal("G response EOF fabricated delivery completion")
+	}
+	h.delivery = hybridreplan.ApplicationProcessor{Applications: postgres.Store{Pool: pool}, Students: studentclient.Client{BaseURL: ready.URL, WriteToken: ready.PlannerToken, HTTPClient: h.http}, Clock: systemClock{}, LeaseTTL: 20 * time.Second, RetryDelay: 20 * time.Millisecond}
+	oReceipt := h.apply(o, oC)
+	if !reflect.DeepEqual(committed, h.state(o)) {
+		t.Fatal("G recovery produced duplicate owner revision")
+	}
+	h.results["G"] = map[string]any{"receipt": oReceipt, "broker_retention": true, "owner_outage_retry": true, "response_loss_after_owner_commit": true, "revision_delta": 1, "nba": h.nba(o)}
+	h.results["classification"] = map[string]any{"actual_student_pg_registered_routes": true, "actual_planner_pg_broker_workers": true, "fake_evaluator": false, "direct_final_state_or_immutable_job_inserts": false, "metadata_scheduling": "next_attempt_at and lazy work-row registration only in dedicated proof DB; immutable truth untouched", "upstream_doubles": []string{"bounded authored Course metadata", "bounded official legacy Practice and v2 evidence envelopes", "bounded Teacher assistance outcome for failed Course execution", "bounded Runtime active execution projection", "gateway actor headers", "named HTTP/NATS transport faults"}, "full_runtime_service_executed": false}
+	result := os.Getenv("T205_RESULT_FILE")
+	if result == "" {
+		t.Fatal("SETUP: fresh result file required")
+	}
+	output, e := json.MarshalIndent(h.results, "", "  ")
+	if e != nil {
+		t.Fatal(e)
+	}
+	file, e := os.OpenFile(result, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = file.Write(append(output, '\n'))
+	closeErr := file.Close()
+	if e != nil || closeErr != nil {
+		t.Fatal("actual composed export failed")
+	}
+	t.Log("PASS A–G actual owner/broker/Planner evaluation/application/NBA chain; all doubles explicitly classified")
+}
+
+func (h *t205Harness) request(method, path, token, actor string, input any, key string) ([]byte, int) {
+	h.t.Helper()
+	var body []byte
+	var e error
+	if input != nil {
+		body, e = json.Marshal(input)
+		if e != nil {
+			h.t.Fatal(e)
+		}
+	}
+	req, e := http.NewRequestWithContext(h.ctx, method, h.owner.URL+path, bytes.NewReader(body))
+	if e != nil {
+		h.t.Fatal(e)
+	}
+	if input != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("X-Internal-Token", token)
+	}
+	if actor != "" {
+		req.Header.Set("X-User-ID", actor)
+		req.Header.Set("X-User-Role", "STUDENT")
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	res, e := h.http.Do(req)
+	if e != nil {
+		h.t.Fatal(e)
+	}
+	defer res.Body.Close()
+	raw, e := io.ReadAll(io.LimitReader(res.Body, 16<<20))
+	if e != nil {
+		h.t.Fatal(e)
+	}
+	return raw, res.StatusCode
+}
+func (h *t205Harness) state(f t205Fixture) t205State {
+	raw, status := h.request("GET", "/__t205/state?student_id="+f.StudentID+"&path_id="+f.PathID, h.owner.ControlToken, "", nil, "")
+	var state t205State
+	if status != 200 || json.Unmarshal(raw, &state) != nil {
+		h.t.Fatalf("actual owner observation status=%d body=%s", status, raw)
+	}
+	return state
+}
+func (h *t205Harness) snapshot(f t205Fixture) domain.HybridPlanningSnapshot {
+	s, e := h.student.GetHybridPlanningSnapshot(h.ctx, f.StudentID, f.PathID, domain.HybridSnapshotRequest{Targets: f.Targets, TriggerContext: domain.HybridSnapshotTrigger{Kind: "actual_t205", Reason: "coherent composed owner proof"}})
+	if e != nil {
+		h.t.Fatalf("actual coherent snapshot: %v", e)
+	}
+	return s
+}
+func (h *t205Harness) nba(f t205Fixture) map[string]any {
+	raw, status := h.request("GET", "/api/v1/student/next-action", "", f.StudentID, nil, "")
+	var result map[string]any
+	if status != 200 || json.Unmarshal(raw, &result) != nil {
+		h.t.Fatalf("actual registered NBA status=%d body=%s", status, raw)
+	}
+	return result
+}
+func (h *t205Harness) pathVersion(s t205State) int64 {
+	var p struct {
+		Version int64 `json:"version"`
+	}
+	if json.Unmarshal(s.Path, &p) != nil || p.Version < 1 {
+		h.t.Fatal("actual path revision missing")
+	}
+	return p.Version
+}
+func (h *t205Harness) requireNBAVersion(s t205State, n map[string]any) {
+	v, ok := n["source_versions"].(map[string]any)
+	var context struct {
+		Version int64 `json:"version"`
+	}
+	if json.Unmarshal(s.Context, &context) != nil || !ok || v["path_version"] != float64(h.pathVersion(s)) || v["context_version"] != float64(context.Version) || v["state_digest"] == "" {
+		h.t.Fatalf("actual NBA does not reference revised owner path: %+v", n)
+	}
+}
+func (h *t205Harness) events(f t205Fixture) []domain.PlanningStateChangedEvent {
+	raw, status := h.request("GET", "/__t205/events?student_id="+f.StudentID, h.owner.ControlToken, "", nil, "")
+	var events []domain.PlanningStateChangedEvent
+	if json.Unmarshal(raw, &events) != nil {
+		var wrapper struct {
+			Events []domain.PlanningStateChangedEvent `json:"events"`
+		}
+		if json.Unmarshal(raw, &wrapper) != nil {
+			h.t.Fatal("owner event export malformed")
+		}
+		events = wrapper.Events
+	}
+	if status != 200 || len(events) == 0 {
+		h.t.Fatalf("actual committed owner facts absent status%d body%s", status, raw)
+	}
+	for _, e := range events {
+		if domain.ValidatePlanningStateChangedEvent(e) != nil || e.StudentID != f.StudentID || e.Data.LearningPathID != f.PathID {
+			h.t.Fatal("owner exported invalid or foreign envelope")
+		}
+	}
+	return events
+}
+func (h *t205Harness) relayOnly(f t205Fixture) {
+	raw, status := h.request("POST", "/__t205/relay", h.owner.ControlToken, "", map[string]any{"student_id": f.StudentID}, "")
+	if status != 200 {
+		h.t.Fatalf("actual production relay status%d body%s", status, raw)
+	}
+}
+func (h *t205Harness) awaitInbox(events []domain.PlanningStateChangedEvent) {
+	t202Await(h.t, h.ctx, 10*time.Second, func() bool {
+		for _, e := range events {
+			if t202InboxCount(h.t, h.ctx, h.pool, e.EventID) != 1 {
+				return false
+			}
+		}
+		return true
+	})
+}
+func (h *t205Harness) relay(f t205Fixture) { h.relayOnly(f); h.awaitInbox(h.events(f)) }
+func (h *t205Harness) startConsumer(address string) {
+	var e error
+	h.consumer, e = planningmessages.NewPlanningStateConsumer(h.ctx, address, h.trigger)
+	if e != nil {
+		h.t.Fatal(e)
+	}
+}
+func (h *t205Harness) fault(f t205Fixture, name string, enabled bool) {
+	raw, status := h.request("POST", "/__t205/control", h.owner.ControlToken, "", map[string]any{"student_id": f.StudentID, "fault": name, "enabled": enabled}, "")
+	if status != 200 {
+		h.t.Fatalf("bounded transport control status%d body%s", status, raw)
+	}
+}
+func (h *t205Harness) evidence(f t205Fixture, count int) {
+	for i := 0; i < count; i++ {
+		id := uuid.NewString()
+		input := map[string]any{"schema": "practice-task-competency-evidence.v1", "policy_version": "practice-competency-evidence-v1", "evidence_id": id, "submission_id": id, "student_id": f.StudentID, "task_instance_id": uuid.NewString(), "task_revision_id": uuid.NewString(), "outcome": "passed", "assistance_policy_version": "teacher-assistance-v1", "evidence": []any{map[string]any{"target": f.Targets[0], "correctness": 1, "independence": 1, "confidence": 1, "step_ids": []string{"named-t205-official-upstream-execution-step"}}}, "occurred_at": time.Now().UTC().Truncate(time.Microsecond)}
+		raw, status := h.request("POST", "/internal/students/"+f.StudentID+"/practice-evidence", h.owner.PracticeToken, "", input, id)
+		if status != 200 {
+			h.t.Fatalf("official legacy execution ingress status%d body%s", status, raw)
+		}
+	}
+}
+func (h *t205Harness) requireMastered(f t205Fixture, s domain.HybridPlanningSnapshot) {
+	for _, m := range s.Mastery {
+		if m.Target == f.Targets[0] {
+			signal := domain.DeriveHybridSnapshotTargetSignal(s, m)
+			if string(m.State) != "MASTERED" || m.Confidence != .8 || m.EvidenceCount != 8 || string(signal.Quality) != "EXECUTION" || string(signal.Stability) != "STABLE" {
+				h.t.Fatalf("actual reducer did not qualify accepted .80 execution signal: %+v %+v", m, signal)
+			}
+			return
+		}
+	}
+	h.t.Fatal("actual mastery target absent")
+}
+
+// Only delivery scheduling/lazy work-row metadata in the named isolated proof
+// DB is modified to select the scenario. Truth tables and outcomes are untouched.
+func (h *t205Harness) schedule(kind string, f t205Fixture, id string) {
+	var e error
+	switch kind {
+	case "snapshot":
+		_, e = h.pool.Exec(h.ctx, `UPDATE hybrid_evaluation_work SET next_attempt_at=CASE WHEN student_id=$1 AND learning_path_id=$2 THEN clock_timestamp()-interval '1 second' ELSE clock_timestamp()+interval '48 hours' END WHERE generation>processed_generation AND claim_token IS NULL`, f.StudentID, f.PathID)
+	case "evaluation":
+		_, e = h.pool.Exec(h.ctx, `INSERT INTO hybrid_consequence_work(job_id) SELECT id FROM hybrid_evaluation_job ON CONFLICT DO NOTHING`)
+		if e == nil {
+			_, e = h.pool.Exec(h.ctx, `UPDATE hybrid_consequence_work SET next_attempt_at=CASE WHEN job_id=$1 THEN clock_timestamp()-interval '1 second' ELSE clock_timestamp()+interval '48 hours' END WHERE NOT completed AND claim_token IS NULL`, id)
+		}
+	case "application":
+		_, e = h.pool.Exec(h.ctx, `INSERT INTO hybrid_application_work(consequence_id) SELECT consequence_id FROM hybrid_consequence_receipt ON CONFLICT DO NOTHING`)
+		if e == nil {
+			_, e = h.pool.Exec(h.ctx, `UPDATE hybrid_application_work SET next_attempt_at=CASE WHEN consequence_id=$1 THEN clock_timestamp()-interval '1 second' ELSE clock_timestamp()+interval '48 hours' END WHERE NOT completed AND claim_token IS NULL`, id)
+		}
+	default:
+		h.t.Fatal("invalid proof scheduling kind")
+	}
+	if e != nil {
+		h.t.Fatal(e)
+	}
+}
+func (h *t205Harness) evaluate(f t205Fixture) domain.HybridConsequenceReceipt {
+	h.schedule("snapshot", f, "")
+	t202ProcessUntilDone(h.t, h.ctx, h.snapshots, h.pool, f.StudentID, f.PathID)
+	var job string
+	var raw []byte
+	if e := h.pool.QueryRow(h.ctx, `SELECT id::text,snapshot_json FROM hybrid_evaluation_job WHERE student_id=$1 AND learning_path_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1`, f.StudentID, f.PathID).Scan(&job, &raw); e != nil {
+		h.t.Fatal(e)
+	}
+	h.schedule("evaluation", f, job)
+	for i := 0; i < 8; i++ {
+		r, e := h.store.GetHybridConsequence(h.ctx, job)
+		if e == nil {
+			var inputs []byte
+			var pins domain.HybridConsequenceInputs
+			if e = h.pool.QueryRow(h.ctx, `SELECT inputs_json FROM hybrid_consequence_input WHERE job_id=$1`, job).Scan(&inputs); e != nil || json.Unmarshal(inputs, &pins) != nil || pins.Policy.MasterySkipConfidence != .8 || pins.InputHash != r.Consequence.PolicyInputHash {
+				h.t.Fatal("actual evaluator policy pin/provenance missing")
+			}
+			return r
+		}
+		if !errors.Is(e, domain.ErrNotFound) {
+			h.t.Fatal(e)
+		}
+		processed, e := h.evaluator.ProcessNext(h.ctx)
+		if e != nil || !processed {
+			h.t.Fatalf("real evaluator processed=%v error=%v", processed, e)
+		}
+	}
+	h.t.Fatal("bounded real evaluator did not commit")
+	return domain.HybridConsequenceReceipt{}
+}
+func (h *t205Harness) apply(f t205Fixture, c domain.HybridConsequenceReceipt) domain.HybridApplicationReceipt {
+	h.schedule("application", f, c.Consequence.ConsequenceID)
+	for i := 0; i < 8; i++ {
+		var status string
+		var raw []byte
+		e := h.pool.QueryRow(h.ctx, `SELECT status,owner_receipt_json FROM hybrid_application_result WHERE consequence_id=$1`, c.Consequence.ConsequenceID).Scan(&status, &raw)
+		if e == nil {
+			var r domain.HybridApplicationReceipt
+			if json.Unmarshal(raw, &r) != nil || r.Status != status || domain.ValidateHybridApplicationReceipt(r, c.Consequence) != nil {
+				h.t.Fatalf("actual terminal owner receipt invalid status%s", status)
+			}
+			return r
+		}
+		if !errors.Is(e, pgx.ErrNoRows) {
+			h.t.Fatal(e)
+		}
+		processed, e := h.delivery.ProcessNext(h.ctx)
+		if e != nil || !processed {
+			h.t.Fatalf("actual applicationworker processed=%v error=%v", processed, e)
+		}
+	}
+	h.t.Fatal("bounded real application did not commit")
+	return domain.HybridApplicationReceipt{}
+}
+func (h *t205Harness) requireSkip(f t205Fixture, c domain.HybridConsequence) {
+	if c.Outcome != domain.HybridOutcomeReplanNeeded || c.ApplicationMode != domain.HybridApplicationAuto || len(c.Mutations) != 1 || c.Mutations[0].Kind != "SKIP_REDUNDANT_PENDING_ITEM" || c.Mutations[0].ItemID != f.PendingItemID {
+		h.t.Fatalf("actual significant evaluator skipped wrong owner occurrence: %+v", c)
+	}
+}
+func (h *t205Harness) requireFutureOnly(f t205Fixture, before, after t205State, r domain.HybridApplicationReceipt) {
+	if r.Status != "APPLIED" || h.pathVersion(after) != h.pathVersion(before)+1 || after.Revisions != before.Revisions+1 || after.Receipts != before.Receipts+1 {
+		h.t.Fatal("Hybrid application did not commit one revision/receipt")
+	}
+	var a, b struct {
+		Items []map[string]any `json:"items"`
+	}
+	if json.Unmarshal(before.Path, &a) != nil || json.Unmarshal(after.Path, &b) != nil || len(a.Items) != len(b.Items) {
+		h.t.Fatal("future skip changed path occurrence count")
+	}
+	for i, item := range a.Items {
+		id, _ := item["learning_path_item_id"].(string)
+		if id == f.PendingItemID {
+			item["status"] = "SKIPPED_MASTERED"
+		}
+		if !reflect.DeepEqual(item, b.Items[i]) {
+			h.t.Fatalf("future skip rewrote protected item%s", id)
+		}
+		if before.PrivateDigests[id] != after.PrivateDigests[id] {
+			h.t.Fatal("private frozen assignment changed")
+		}
+	}
+}
+func (h *t205Harness) createIntent(f t205Fixture, kind string, ops []domain.HybridFutureMutation) string {
+	id := uuid.NewString()
+	before := h.state(f)
+	input := map[string]any{"intent_id": id, "expected_path_revision": h.pathVersion(before), "kind": kind, "requested_change": domain.HybridRequestedChange{Scope: f.Scope, Mutations: ops}}
+	raw, status := h.request("POST", "/api/v1/student/learning-paths/"+f.PathID+"/learning-intents", "", f.StudentID, input, "")
+	if status != 200 {
+		h.t.Fatalf("actual learner intent status%d body%s", status, raw)
+	}
+	after := h.state(f)
+	if !bytes.Equal(before.Path, after.Path) || !bytes.Equal(before.Context, after.Context) || !bytes.Equal(before.PracticeBinding, after.PracticeBinding) || !reflect.DeepEqual(before.PrivateDigests, after.PrivateDigests) || after.Revisions != before.Revisions || after.Applications != before.Applications || after.Receipts != before.Receipts || after.Intents != before.Intents+1 || after.IntentEvents != before.IntentEvents+1 || after.ConsumedIntents != before.ConsumedIntents || bytes.Equal(before.SnapshotRefs, after.SnapshotRefs) {
+		h.t.Fatal("registered exact intent must commit one semantic projection/outbox with no execution/path mutation")
+	}
+	return id
+}
+
+func (h *t205Harness) requireREADYReplacement(f t205Fixture, before, after t205State) {
+	var a, b struct {
+		Items []map[string]any `json:"items"`
+	}
+	if json.Unmarshal(before.Path, &a) != nil || json.Unmarshal(after.Path, &b) != nil || len(a.Items) != len(b.Items) {
+		h.t.Fatal("F READY replacement changed occurrence count")
+	}
+	var template map[string]any
+	for _, item := range a.Items {
+		if item["learning_path_item_id"] == f.TemplateItemID {
+			template = item
+		}
+	}
+	if template == nil {
+		h.t.Fatal("F actual authored replacement template absent")
+	}
+	for i, item := range a.Items {
+		if item["learning_path_item_id"] != f.ActiveItemID {
+			if !reflect.DeepEqual(item, b.Items[i]) || before.PrivateDigests[item["learning_path_item_id"].(string)] != after.PrivateDigests[item["learning_path_item_id"].(string)] {
+				h.t.Fatal("F intent application rewrote unrelated current/history/future occurrence")
+			}
+			continue
+		}
+		expected := map[string]any{}
+		for k, v := range template {
+			expected[k] = v
+		}
+		expected["learning_path_item_id"] = item["learning_path_item_id"]
+		expected["position"] = item["position"]
+		expected["status"] = "READY"
+		expected["reason_code"] = item["reason_code"]
+		if !reflect.DeepEqual(expected, b.Items[i]) || after.PrivateDigests[f.ActiveItemID] != before.PrivateDigests[f.TemplateItemID] {
+			h.t.Fatal("F exact consent did not reuse known frozen material while preserving READY occurrence identity")
+		}
+	}
+}
+func (h *t205Harness) requireIntentStatus(f t205Fixture, id, status string, expected *domain.HybridConsequence) json.RawMessage {
+	raw, code := h.request("GET", "/api/v1/student/learning-paths/"+f.PathID+"/learning-intents/"+id, "", f.StudentID, nil, "")
+	var r struct {
+		Intent      domain.HybridLearningIntentProjection `json:"intent"`
+		PayloadHash string                                `json:"payload_hash"`
+		Status      string                                `json:"status"`
+		ConsumedBy  string                                `json:"consumed_by_consequence_id"`
+		CommittedAt time.Time                             `json:"committed_at"`
+		ConsumedAt  *time.Time                            `json:"consumed_at"`
+	}
+	if code != 200 || json.Unmarshal(raw, &r) != nil || r.Status != status || r.Intent.IntentID != id || r.Intent.StudentID != f.StudentID || r.Intent.LearningPathID != f.PathID || r.CommittedAt.IsZero() || r.Intent.CreatedAt.IsZero() || !r.Intent.CreatedAt.Equal(r.CommittedAt) || (status == "CONSUMED" && (expected == nil || r.ConsumedBy != expected.ConsequenceID || r.ConsumedAt == nil || r.ConsumedAt.Before(r.CommittedAt))) || (status == "PENDING" && (r.ConsumedBy != "" || r.ConsumedAt != nil)) {
+		h.t.Fatalf("actual intent receipt status%d body%s", code, raw)
+	}
+	projection := r.Intent
+	projection.CreatedAt = time.Time{}
+	projection.RequestedChange.Mutations = append([]domain.HybridFutureMutation{}, projection.RequestedChange.Mutations...)
+	sort.Slice(projection.RequestedChange.Mutations, func(i, j int) bool {
+		return projection.RequestedChange.Mutations[i].ItemID < projection.RequestedChange.Mutations[j].ItemID
+	})
+	semantic, e := json.Marshal(projection)
+	if e != nil {
+		h.t.Fatal(e)
+	}
+	hash := sha256.Sum256(semantic)
+	if r.PayloadHash != fmt.Sprintf("sha256:%x", hash) {
+		h.t.Fatal("actual owner intent payload hash differs from immutable semantic request")
+	}
+	if expected != nil && (r.Intent.ExpectedPathRevision != expected.ExpectedPathRevision || r.Intent.Kind != expected.RequiredIntentKind || !reflect.DeepEqual(r.Intent.RequestedChange.Scope, expected.DesiredScope) || !reflect.DeepEqual(projection.RequestedChange.Mutations, expected.Mutations)) {
+		h.t.Fatal("consumed owner intent does not match exact real evaluated consequence revision/kind/scope/mutations")
+	}
+	return raw
+}
+func (h *t205Harness) completePractice(f t205Fixture) {
+	id := uuid.NewString()
+	input := map[string]any{"schema": "practice-task-competency-evidence.v2", "policy_version": "practice-competency-evidence-v2", "evidence_id": id, "submission_id": id, "learning_action_id": f.LearningActionID, "student_id": f.StudentID, "task_instance_id": f.TaskInstanceID, "task_revision_id": f.TaskRevisionID, "task_revision_digest": f.TaskRevisionDigest, "workspace_digest": "sha256:" + strings.Repeat("d", 64), "outcome": "passed", "assistance_policy_version": "teacher-assistance-v1", "hints_used": 0, "teacher_assistance_used": false, "evidence": []any{map[string]any{"target": f.Targets[0], "correctness": 1, "independence": 1, "confidence": 1, "step_ids": []string{"named-official-v2-completion"}}}, "occurred_at": time.Now().UTC().Truncate(time.Microsecond)}
+	if f.RequirementID != "" {
+		input["learning_path_item_id"] = f.ActiveItemID
+		input["requirement_id"] = f.RequirementID
+	}
+	raw, status := h.request("POST", "/internal/v2/students/"+f.StudentID+"/practice-learning-actions/"+f.TaskInstanceID+"/evidence", h.owner.PracticeToken, "", input, id)
+	if status != 200 {
+		h.t.Fatalf("actual registered v2 ordinary completion status%d body%s", status, raw)
+	}
+}

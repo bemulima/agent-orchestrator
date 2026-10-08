@@ -1,0 +1,227 @@
+package course
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+func TestClientUsesAtomicGeneratedCourseEnsureContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/internal/generated-courses" {
+			http.NotFound(writer, request)
+			return
+		}
+		if request.Header.Get("X-Internal-Token") != "course-token" ||
+			request.Header.Get("Idempotency-Key") != "11111111-1111-4111-8111-111111111111" {
+			t.Errorf("unexpected auth/idempotency headers")
+		}
+		var payload domain.GeneratedCourse
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.Fingerprint != "fingerprint" || payload.Status != "ACTIVE" || payload.CatalogVisible {
+			t.Errorf("unexpected generated Course payload: %#v", payload)
+		}
+		writer.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(writer).Encode(domain.EnsureCourseResult{
+			CourseID: "22222222-2222-4222-8222-222222222222", Reused: false,
+			Lessons: []domain.CourseLessonBinding{{
+				LessonID: "33333333-3333-4333-8333-333333333333", LessonRevisionID: "44444444-4444-4444-8444-444444444444", Order: 0,
+				Targets: []domain.TargetRef{{Type: domain.TargetConcept, Key: "go.syntax", Version: "v1"}},
+			}},
+		})
+	}))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "course-token", HTTPClient: server.Client()}
+	result, err := client.EnsureCourse(context.Background(), domain.GeneratedCourse{
+		Fingerprint: "fingerprint", Status: "ACTIVE",
+	}, "11111111-1111-4111-8111-111111111111")
+	if err != nil {
+		t.Fatalf("ensure course: %v", err)
+	}
+	if result.CourseID != "22222222-2222-4222-8222-222222222222" || result.Reused ||
+		result.Lessons[0].LessonRevisionID != "44444444-4444-4444-8444-444444444444" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestClientMapsGeneratedCourseContractErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantDomainErr error
+		wantStatusErr string
+	}{
+		{
+			name:          "malformed request",
+			status:        http.StatusBadRequest,
+			body:          `{"error":{"code":"invalid_request"}}`,
+			wantDomainErr: domain.ErrValidation,
+		},
+		{
+			name:          "unsupported course reference",
+			status:        http.StatusUnprocessableEntity,
+			body:          `{"error":{"code":"unsupported_course_reference"}}`,
+			wantDomainErr: domain.ErrValidation,
+		},
+		{
+			name:          "idempotency conflict",
+			status:        http.StatusConflict,
+			body:          `{"error":{"code":"idempotency_conflict"}}`,
+			wantDomainErr: domain.ErrConflict,
+		},
+		{
+			name:          "upstream internal error",
+			status:        http.StatusInternalServerError,
+			body:          `{"error":{"code":"internal_error"}}`,
+			wantStatusErr: "course returned status 500",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodPost || request.URL.Path != "/internal/generated-courses" {
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+				}
+				if request.Header.Get("X-Internal-Token") != "course-token" ||
+					request.Header.Get("Idempotency-Key") != "11111111-1111-4111-8111-111111111111" {
+					t.Errorf("missing Course authorization or idempotency header")
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(testCase.status)
+				_, _ = writer.Write([]byte(testCase.body))
+			}))
+			defer server.Close()
+
+			client := Client{BaseURL: server.URL, InternalToken: "course-token", HTTPClient: server.Client()}
+			_, err := client.EnsureCourse(context.Background(), domain.GeneratedCourse{
+				Fingerprint: "fingerprint", Status: "ACTIVE",
+			}, "11111111-1111-4111-8111-111111111111")
+			if err == nil {
+				t.Fatal("expected Course contract error")
+			}
+			if testCase.wantDomainErr != nil {
+				if !errors.Is(err, testCase.wantDomainErr) {
+					t.Fatalf("error = %v, want %v", err, testCase.wantDomainErr)
+				}
+				return
+			}
+			if err.Error() != testCase.wantStatusErr {
+				t.Fatalf("error = %v, want %q", err, testCase.wantStatusErr)
+			}
+		})
+	}
+}
+
+func TestClientRejectsGeneratedCourseAboveContractLimitBeforeHTTP(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, InternalToken: "course-token", HTTPClient: server.Client()}
+	_, err := client.EnsureCourse(context.Background(), domain.GeneratedCourse{
+		Description: strings.Repeat("x", domain.MaximumGeneratedCoursePayloadBytes),
+	}, "11111111-1111-4111-8111-111111111111")
+	if !errors.Is(err, domain.ErrValidation) || calls != 0 {
+		t.Fatalf("oversized Course: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestDiagnosticCatalogExactCoursePayloadAndRedirectDoesNotLeakToken(t *testing.T) {
+	redirectCalls := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectCalls++
+		if r.Header.Get("X-Internal-Token") != "" {
+			t.Error("redirect leaked token")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, http.StatusFound) }))
+	defer source.Close()
+	client := Client{BaseURL: source.URL, InternalToken: "write", DiagnosticCatalogToken: "secret", HTTPClient: source.Client()}
+	_, err := client.GetDiagnosticAssessmentCatalog(context.Background(), "22222222-2222-4222-8222-222222222222")
+	if !errors.Is(err, domain.ErrUpstreamInvalid) || redirectCalls != 0 {
+		t.Fatalf("redirect err=%v calls=%d", err, redirectCalls)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Token") != "secret" {
+			t.Errorf("diagnostic token mismatch: %q", r.Header.Get("X-Internal-Token"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"schema":"course-diagnostic-assessment-catalog.v1","course_id":"22222222-2222-4222-8222-222222222222","curric\u0075lum_revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lessons":[{"id":"33333333-3333-4333-8333-333333333333","course_id":"22222222-2222-4222-8222-222222222222","section_id":"44444444-4444-4444-8444-444444444444","title":"L","description":"D","order":1,"status":1,"updated_at":"2026-01-01T00:00:00Z","tasks":[{"id":"55555555-5555-4555-8555-555555555555","lesson_id":"33333333-3333-4333-8333-333333333333","title":"T","description":"D","type":11,"assessment_purpose":"diagnostic","evaluation_mode":"AUTO","order":2,"status":1,"learning_targets":[{"type":"concept","key":"go.syntax","version":"v1"}],"updated_at":"2026-01-01T00:00:00Z","version":1}]}]}`))
+	}))
+	defer server.Close()
+	client = Client{BaseURL: server.URL, InternalToken: "write", DiagnosticCatalogToken: "secret", HTTPClient: server.Client()}
+	catalog, err := client.GetDiagnosticAssessmentCatalog(context.Background(), "22222222-2222-4222-8222-222222222222")
+	if err != nil || len(catalog.Assessments) != 1 || catalog.Assessments[0].LessonOrder != 1 || catalog.Revision[:7] != "sha256:" {
+		t.Fatalf("catalog=%#v err=%v", catalog, err)
+	}
+}
+
+func TestDiagnosticCatalogRejectsAdversarialCourseWire(t *testing.T) {
+	base := fmt.Sprintf(`{"schema":"course-diagnostic-assessment-catalog.v1","course_id":"22222222-2222-4222-8222-222222222222","%s":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lessons":[{"id":"33333333-3333-4333-8333-333333333333","course_id":"22222222-2222-4222-8222-222222222222","section_id":"44444444-4444-4444-8444-444444444444","title":"L","description":"D","order":1,"status":1,"updated_at":"2026-01-01T00:00:00Z","tasks":[{"id":"55555555-5555-4555-8555-555555555555","lesson_id":"33333333-3333-4333-8333-333333333333","title":"T","description":"D","type":11,"assessment_purpose":"diagnostic","evaluation_mode":"AUTO","order":2,"status":1,"learning_targets":[{"type":"concept","key":"go.syntax","version":"v1"}],"updated_at":"2026-01-01T00:00:00Z","version":1}]}]}`, "curric"+"ulum_revision")
+	cases := []struct {
+		name, body, content string
+		status              int
+		want                error
+	}{
+		{"purpose", strings.Replace(base, "\"diagnostic\"", "\"knowledge_check\"", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"inactive", strings.Replace(base, "\"status\":1", "\"status\":0", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"type", strings.Replace(base, "\"type\":11", "\"type\":9", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"evaluation mode", strings.Replace(base, "\"evaluation_mode\":\"AUTO\"", "\"evaluation_mode\":\"MANUAL\"", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"evaluation mode wrong type", strings.Replace(base, "\"evaluation_mode\":\"AUTO\"", "\"evaluation_mode\":1", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"lesson", strings.Replace(base, "33333333-3333-4333-8333-333333333333\",\"title\":\"T", "99999999-9999-4999-8999-999999999999\",\"title\":\"T", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"duplicate", strings.Replace(base, "]}]}", `,{"id":"55555555-5555-4555-8555-555555555555","lesson_id":"33333333-3333-4333-8333-333333333333","title":"T2","description":"D","type":11,"assessment_purpose":"diagnostic","evaluation_mode":"AUTO","order":3,"status":1,"learning_targets":[],"updated_at":"2026-01-01T00:00:00Z","version":1}]}`, 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"revision", strings.Replace(base, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bad", 1), "application/json", 200, domain.ErrUpstreamInvalid},
+		{"content", base, "text/plain", 200, domain.ErrUpstreamInvalid},
+		{"trailing", base + "{}", "application/json", 200, domain.ErrUpstreamInvalid},
+		{"status", base, "application/json", 502, domain.ErrUpstreamUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.content)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer s.Close()
+			_, err := Client{BaseURL: s.URL, InternalToken: "write", DiagnosticCatalogToken: "x", HTTPClient: s.Client()}.GetDiagnosticAssessmentCatalog(context.Background(), "22222222-2222-4222-8222-222222222222")
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err=%v want=%v", err, tc.want)
+			}
+		})
+	}
+	// A response above the hard limit is never decoded.
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(strings.Repeat("x", maximumResponseBytes+1)))
+	}))
+	defer s.Close()
+	_, err := Client{BaseURL: s.URL, InternalToken: "write", DiagnosticCatalogToken: "x", HTTPClient: s.Client()}.GetDiagnosticAssessmentCatalog(context.Background(), "22222222-2222-4222-8222-222222222222")
+	if !errors.Is(err, domain.ErrUpstreamInvalid) {
+		t.Fatalf("cap err=%v", err)
+	}
+}
+
+func TestDiagnosticCatalogRejectsNonCanonicalCourseIDBeforeHTTP(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer server.Close()
+	client := Client{BaseURL: server.URL, DiagnosticCatalogToken: "diagnostic", HTTPClient: server.Client()}
+	for _, alias := range []string{"22222222-2222-4222-8222-22222222222A", " 22222222-2222-4222-8222-222222222222"} {
+		if _, err := client.GetDiagnosticAssessmentCatalog(context.Background(), alias); !errors.Is(err, domain.ErrValidation) || calls != 0 {
+			t.Fatalf("alias=%q err=%v calls=%d", alias, err, calls)
+		}
+	}
+}

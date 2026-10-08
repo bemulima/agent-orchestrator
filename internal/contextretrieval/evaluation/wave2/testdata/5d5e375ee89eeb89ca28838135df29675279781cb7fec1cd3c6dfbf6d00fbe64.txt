@@ -1,0 +1,110 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/config"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/persistence/postgres"
+	httptransport "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("practice runtime stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	settings, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	database, err := sql.Open("pgx", settings.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(20)
+	database.SetMaxIdleConns(5)
+	database.SetConnMaxLifetime(30 * time.Minute)
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	err = database.PingContext(startupContext)
+	cancelStartup()
+	if err != nil {
+		return errors.New("PostgreSQL is unavailable")
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	runtime := &usecase.Runtime{
+		Repository: postgres.NewRepository(database),
+		Revisions:  adapters.NewRevisionHTTPClient(settings.CatalogBaseURL, settings.CatalogInternalToken, client),
+		Student:    adapters.NewStudentHTTPClient(settings.StudentBaseURL, settings.StudentInternalToken, client),
+		Planner:    adapters.NewLearningPlannerHTTPClient(settings.PlannerBaseURL, settings.PlannerInternalToken, client),
+		Workspace:  adapters.NewSandboxHTTPClient(settings.SandboxBaseURL, settings.SandboxInternalToken, client),
+		Validator:  adapters.NewValidationHTTPClient(settings.ValidationBaseURL, settings.ValidationInternalToken, client),
+		Evidence:   adapters.NewStudentHTTPClient(settings.StudentBaseURL, settings.StudentInternalToken, client),
+	}
+
+	processContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go runWorker(processContext, time.Second, func(ctx context.Context) error {
+		_, err := runtime.ProcessPendingValidations(ctx, 100)
+		return err
+	})
+	go runWorker(processContext, 2*time.Second, func(ctx context.Context) error {
+		_, err := runtime.DispatchEvidence(ctx, 100)
+		return err
+	})
+
+	handler := (&httptransport.Server{Runtime: runtime, InternalToken: settings.InternalToken, TeacherToken: settings.TeacherToken}).Handler()
+	server := &http.Server{
+		Addr: settings.ListenAddress, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
+		WriteTimeout: 90 * time.Second, IdleTimeout: 60 * time.Second,
+	}
+	serverError := make(chan error, 1)
+	go func() { serverError <- server.ListenAndServe() }()
+
+	select {
+	case err := <-serverError:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-processContext.Done():
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownContext); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func runWorker(ctx context.Context, interval time.Duration, work func(context.Context) error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := work(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("practice runtime background worker cycle failed")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

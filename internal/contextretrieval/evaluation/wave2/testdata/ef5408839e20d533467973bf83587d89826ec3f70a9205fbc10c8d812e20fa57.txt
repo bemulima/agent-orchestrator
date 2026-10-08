@@ -1,0 +1,663 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (repository *Repository) SetRunRunning(ctx context.Context, runID string, at time.Time) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if !domain.IsCanonicalUUID(runID) || at.IsZero() {
+		return domain.ErrInvalid
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `SELECT run.payload FROM practice_validation_runs AS run
+JOIN practice_submissions AS submission ON submission.id=run.submission_id AND submission.current_run_id=run.id
+JOIN practice_task_instances AS instance ON instance.id=run.task_instance_id AND instance.current_submission_id=submission.id
+WHERE run.id=$1 AND run.status='PENDING' AND submission.status='VALIDATING' AND instance.status='VALIDATING'
+FOR UPDATE OF run`, runID).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			var exists bool
+			if checkErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM practice_validation_runs WHERE id=$1)`, runID).Scan(&exists); checkErr != nil {
+				return checkErr
+			}
+			if !exists {
+				return domain.ErrNotFound
+			}
+			return domain.ErrConflict
+		}
+		return err
+	}
+	var run domain.ValidationRun
+	if err := json.Unmarshal(raw, &run); err != nil {
+		return fmt.Errorf("decode persisted ValidationRun: %w", err)
+	}
+	started := at.UTC()
+	run.Status = domain.ValidationRunRunning
+	run.StartedAt = &started
+	encoded, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_validation_runs AS run SET status='RUNNING',started_at=$2,payload=$3::jsonb,updated_at=$2
+FROM practice_submissions AS submission,practice_task_instances AS instance
+WHERE run.id=$1 AND run.status='PENDING' AND submission.id=run.submission_id AND submission.current_run_id=run.id AND submission.status='VALIDATING'
+AND instance.id=run.task_instance_id AND instance.current_submission_id=submission.id AND instance.status='VALIDATING'`, runID, started, encoded)
+	if err != nil {
+		return translateError(err)
+	}
+	return translateError(tx.Commit())
+}
+
+func (repository *Repository) GetValidationContextByRunID(ctx context.Context, runID string) (domain.TaskInstance, domain.Submission, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, domain.Submission{}, err
+	}
+	if !domain.IsCanonicalUUID(runID) {
+		return domain.TaskInstance{}, domain.Submission{}, domain.ErrInvalid
+	}
+	var taskInstanceID, submissionID string
+	err := repository.db.QueryRowContext(ctx, `SELECT task_instance_id,submission_id FROM practice_validation_runs WHERE id=$1`, runID).Scan(&taskInstanceID, &submissionID)
+	if err != nil {
+		return domain.TaskInstance{}, domain.Submission{}, translateError(err)
+	}
+	instance, err := repository.GetInstanceByID(ctx, taskInstanceID)
+	if err != nil {
+		return domain.TaskInstance{}, domain.Submission{}, err
+	}
+	submission, err := repository.GetSubmission(ctx, taskInstanceID, submissionID)
+	if err != nil {
+		return domain.TaskInstance{}, domain.Submission{}, err
+	}
+	return instance, submission, nil
+}
+
+func (repository *Repository) CompleteValidation(ctx context.Context, submission domain.Submission, run domain.ValidationRun, instance domain.TaskInstance) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if err := validateTerminalRun(run); err != nil {
+		return err
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	currentInstance, err := instanceForUpdate(ctx, tx, instance.ID)
+	if err != nil {
+		return err
+	}
+	currentSubmission, currentRunID, err := submissionForUpdate(ctx, tx, submission.TaskInstanceID, submission.ID)
+	if err != nil {
+		return err
+	}
+	if currentRunID == run.ID && len(currentSubmission.ValidationRuns) > 0 {
+		storedCurrent := currentSubmission.ValidationRuns[len(currentSubmission.ValidationRuns)-1]
+		if storedCurrent.Status == run.Status {
+			candidateInstance := instance
+			candidateInstance.Version = currentInstance.Version
+			candidateSubmission := submission
+			candidateSubmission.ValidationRuns = currentSubmission.ValidationRuns
+			if currentInstance.CurrentSubmissionID == submission.ID && currentInstance.Status == instance.Status &&
+				currentSubmission.Status == submission.Status && equalJSON(mustJSON(storedCurrent), mustJSON(run)) &&
+				sameInstance(currentInstance, candidateInstance) && sameSubmission(currentSubmission, candidateSubmission) {
+				return tx.Commit()
+			}
+			return domain.ErrConflict
+		}
+	}
+	if currentRunID != run.ID || currentInstance.CurrentSubmissionID != submission.ID || currentInstance.Status != domain.TaskInstanceValidating ||
+		!sameSubmissionBinding(currentSubmission, submission) || !validTerminalTransition(submission, run, instance) ||
+		!sameCompletionBinding(currentInstance, instance) || !validProgressProjection(instance) ||
+		submission.Scope == "FINAL" && run.Outcome == domain.OutcomePass && instance.FinalSubmissionID != submission.ID {
+		return domain.ErrConflict
+	}
+	var storedRun domain.ValidationRun
+	var currentRunRaw []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM practice_validation_runs WHERE submission_id=$1 AND id=$2 AND status IN ('PENDING','RUNNING') FOR UPDATE`, submission.ID, run.ID).Scan(&currentRunRaw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrConflict
+		}
+		return err
+	}
+	if err := json.Unmarshal(currentRunRaw, &storedRun); err != nil {
+		return fmt.Errorf("decode persisted ValidationRun: %w", err)
+	}
+	if storedRun.ID != run.ID || storedRun.StartedAt != nil && (run.StartedAt == nil || !storedRun.StartedAt.Equal(*run.StartedAt)) {
+		return domain.ErrConflict
+	}
+	encodedRun, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_validation_runs SET status=$2,outcome=$3,error_classification=$4,started_at=$5,finished_at=$6,payload=$7::jsonb,updated_at=$8
+WHERE id=$1 AND submission_id=$9 AND status IN ('PENDING','RUNNING')`, run.ID, run.Status, nullableString(string(run.Outcome)),
+		nullableString(run.ErrorClassification), nullableTime(run.StartedAt), nullableTime(run.FinishedAt), encodedRun, time.Now().UTC(), submission.ID)
+	if err != nil {
+		return translateError(err)
+	}
+	currentSubmission.Status = submission.Status
+	currentSubmission.ValidationRuns = append(currentSubmission.ValidationRuns, run)
+	currentSubmission.CompletedAt = submission.CompletedAt
+	currentSubmission.UpdatedAt = submission.UpdatedAt
+	currentSubmission.HumanReview = submission.HumanReview
+	currentSubmissionRaw, err := marshalSubmission(currentSubmission)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_submissions SET status=$2,payload=$3::jsonb,updated_at=$4,completed_at=$5
+WHERE task_instance_id=$1 AND id=$6 AND current_run_id=$7`, currentSubmission.TaskInstanceID, currentSubmission.Status,
+		currentSubmissionRaw, currentSubmission.UpdatedAt.UTC(), nullableTime(currentSubmission.CompletedAt), currentSubmission.ID, run.ID)
+	if err != nil {
+		return translateError(err)
+	}
+	instance.Version = currentInstance.Version + 1
+	instanceRaw, err := marshalInstance(instance)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_task_instances SET status=$2,current_submission_id=$3,final_submission_id=$4,
+version=$5,payload=$6::jsonb,updated_at=$7,completed_at=$8 WHERE id=$1 AND version=$9`, instance.ID,
+		instance.Status, nullableUUID(instance.CurrentSubmissionID), nullableUUID(instance.FinalSubmissionID), instance.Version,
+		instanceRaw, instance.UpdatedAt.UTC(), nullableTime(instance.CompletedAt), currentInstance.Version)
+	if err != nil {
+		return translateError(err)
+	}
+	return translateError(tx.Commit())
+}
+
+func validateTerminalRun(run domain.ValidationRun) error {
+	if !domain.IsCanonicalUUID(run.ID) || run.StartedAt == nil || run.StartedAt.IsZero() || run.FinishedAt == nil || run.FinishedAt.IsZero() {
+		return domain.ErrInvalid
+	}
+	switch run.Status {
+	case domain.ValidationRunPassed:
+		if run.Outcome != domain.OutcomePass {
+			return domain.ErrInvalid
+		}
+	case domain.ValidationRunFailed:
+		if run.Outcome != domain.OutcomeFail {
+			return domain.ErrInvalid
+		}
+	case domain.ValidationRunError:
+		if run.Outcome != domain.OutcomeError || run.ErrorClassification == "" {
+			return domain.ErrInvalid
+		}
+	default:
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
+func validTerminalTransition(submission domain.Submission, run domain.ValidationRun, instance domain.TaskInstance) bool {
+	switch run.Outcome {
+	case domain.OutcomeError:
+		return submission.Status == domain.SubmissionValidating && instance.Status == domain.TaskInstanceValidating
+	case domain.OutcomeFail:
+		return submission.Status == domain.SubmissionFailed && instance.Status == domain.TaskInstanceInProgress
+	case domain.OutcomePass:
+		if submission.Status == domain.SubmissionReviewRequired {
+			return submission.Scope == "FINAL" && submission.RequiresHumanReview && instance.Status == domain.TaskInstanceInReview
+		}
+		if submission.Status == domain.SubmissionPassed && submission.Scope == "MILESTONE" {
+			return instance.Status == domain.TaskInstanceInProgress
+		}
+		if submission.Status == domain.SubmissionPassed && submission.Scope == "FINAL" && !submission.RequiresHumanReview {
+			return instance.Status == domain.TaskInstanceFinalizing || instance.Status == domain.TaskInstanceCompleted
+		}
+	}
+	return false
+}
+
+func sameSubmissionBinding(left, right domain.Submission) bool {
+	return left.ID == right.ID && left.TaskInstanceID == right.TaskInstanceID && left.StudentID == right.StudentID &&
+		left.Scope == right.Scope && left.MilestoneID == right.MilestoneID && left.Snapshot == right.Snapshot &&
+		left.WorkspaceDigest == right.WorkspaceDigest && left.RevisionDigest == right.RevisionDigest &&
+		left.ValidationContractDigest == right.ValidationContractDigest &&
+		equalJSON(left.ValidationSpecification, right.ValidationSpecification) &&
+		left.RequiresHumanReview == right.RequiresHumanReview && left.IdempotencyKey == right.IdempotencyKey && left.CommandDigest == right.CommandDigest
+}
+
+func sameSubmission(left, right domain.Submission) bool {
+	leftBytes, leftErr := marshalSubmission(left)
+	rightBytes, rightErr := marshalSubmission(right)
+	return canonicalEqual(leftBytes, rightBytes, leftErr, rightErr)
+}
+
+func submissionForUpdate(ctx context.Context, tx *sql.Tx, taskInstanceID, submissionID string) (domain.Submission, string, error) {
+	var raw []byte
+	var currentRunID string
+	err := tx.QueryRowContext(ctx, `SELECT payload,current_run_id FROM practice_submissions WHERE task_instance_id=$1 AND id=$2 FOR UPDATE`, taskInstanceID, submissionID).Scan(&raw, &currentRunID)
+	if err != nil {
+		return domain.Submission{}, "", translateError(err)
+	}
+	submission, err := unmarshalSubmission(raw)
+	if err != nil {
+		return domain.Submission{}, "", fmt.Errorf("decode persisted Submission: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT payload FROM practice_validation_runs WHERE submission_id=$1 ORDER BY ordinal`, submissionID)
+	if err != nil {
+		return domain.Submission{}, "", err
+	}
+	defer rows.Close()
+	submission.ValidationRuns = make([]domain.ValidationRun, 0)
+	for rows.Next() {
+		var runRaw []byte
+		var run domain.ValidationRun
+		if err := rows.Scan(&runRaw); err != nil {
+			return domain.Submission{}, "", err
+		}
+		if err := json.Unmarshal(runRaw, &run); err != nil {
+			return domain.Submission{}, "", fmt.Errorf("decode persisted ValidationRun: %w", err)
+		}
+		submission.ValidationRuns = append(submission.ValidationRuns, run)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.Submission{}, "", err
+	}
+	return submission, currentRunID, nil
+}
+
+func (repository *Repository) CreateValidationRetry(ctx context.Context, submission domain.Submission, run domain.ValidationRun) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if run.Status != domain.ValidationRunPending || !domain.IsCanonicalUUID(run.ID) || len(submission.ValidationRuns) < 2 || submission.ValidationRuns[len(submission.ValidationRuns)-1].ID != run.ID {
+		return domain.ErrInvalid
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	instance, err := instanceForUpdate(ctx, tx, submission.TaskInstanceID)
+	if err != nil {
+		return err
+	}
+	current, currentRunID, err := submissionForUpdate(ctx, tx, submission.TaskInstanceID, submission.ID)
+	if err != nil {
+		return err
+	}
+	if current.Status != domain.SubmissionValidating || instance.Status != domain.TaskInstanceValidating || instance.CurrentSubmissionID != submission.ID ||
+		currentRunID == run.ID || len(current.ValidationRuns) == 0 || currentRunID != current.ValidationRuns[len(current.ValidationRuns)-1].ID ||
+		current.ValidationRuns[len(current.ValidationRuns)-1].Status != domain.ValidationRunError ||
+		!sameSubmissionBinding(current, submission) {
+		return domain.ErrConflict
+	}
+	var oldRun domain.ValidationRun
+	if err := json.Unmarshal(mustJSON(current.ValidationRuns[len(current.ValidationRuns)-1]), &oldRun); err != nil {
+		return err
+	}
+	if oldRun.Outcome != domain.OutcomeError || !validSnapshotRef(submission.Snapshot) {
+		return domain.ErrConflict
+	}
+	encodedRun, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	var ordinal int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(ordinal),0)+1 FROM practice_validation_runs WHERE submission_id=$1`, submission.ID).Scan(&ordinal); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_validation_runs(id,task_instance_id,submission_id,ordinal,status,payload,created_at,updated_at)
+VALUES ($1,$2,$3,$4,'PENDING',$5::jsonb,$6,$6)`, run.ID, submission.TaskInstanceID, submission.ID, ordinal, encodedRun, time.Now().UTC())
+	if err != nil {
+		return translateError(err)
+	}
+	currentRunID = run.ID
+	current.ValidationRuns = append(current.ValidationRuns, run)
+	current.UpdatedAt = submission.UpdatedAt
+	encodedSubmission, err := marshalSubmission(current)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_submissions SET current_run_id=$3,payload=$4::jsonb,updated_at=$5
+WHERE task_instance_id=$1 AND id=$2`, submission.TaskInstanceID, submission.ID, currentRunID, encodedSubmission, current.UpdatedAt.UTC())
+	if err != nil {
+		return translateError(err)
+	}
+	return translateError(tx.Commit())
+}
+
+func (repository *Repository) SaveReview(ctx context.Context, submission domain.Submission, instance domain.TaskInstance, reviewerID, decision string) error {
+	if err := repository.ready(); err != nil {
+		return err
+	}
+	if submission.HumanReview == nil || submission.HumanReview.ReviewerID != reviewerID || submission.HumanReview.Decision != decision ||
+		!domain.IsCanonicalUUID(reviewerID) || submission.HumanReview.Decision != "CHANGES_REQUESTED" {
+		return domain.ErrInvalid
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	currentInstance, err := instanceForUpdate(ctx, tx, instance.ID)
+	if err != nil {
+		return err
+	}
+	current, currentRunID, err := submissionForUpdate(ctx, tx, submission.TaskInstanceID, submission.ID)
+	if err != nil {
+		return err
+	}
+	if currentRunID != lastRunID(current) || !sameSubmissionBinding(current, submission) || current.Status != domain.SubmissionReviewRequired ||
+		currentInstance.CurrentSubmissionID != current.ID || currentInstance.Status != domain.TaskInstanceInReview ||
+		submission.Scope != "FINAL" || submission.Status != domain.SubmissionChangesRequested || instance.Status != domain.TaskInstanceInProgress {
+		return domain.ErrConflict
+	}
+	if submission.HumanReview.Decision == "CHANGES_REQUESTED" && !sameCompletionBinding(currentInstance, instance) {
+		return domain.ErrConflict
+	}
+	receipt := *submission.HumanReview
+	if receipt.ReviewedAt.IsZero() {
+		return domain.ErrInvalid
+	}
+	encodedReceipt, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	var oldRaw []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM practice_review_events WHERE submission_id=$1`, submission.ID).Scan(&oldRaw)
+	if err == nil {
+		if equalJSON(oldRaw, encodedReceipt) {
+			return tx.Commit()
+		}
+		return domain.ErrConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_review_events(submission_id,task_instance_id,reviewer_id,decision,feedback,reviewed_at,payload)
+VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`, submission.ID, submission.TaskInstanceID, reviewerID, receipt.Decision, receipt.Feedback, receipt.ReviewedAt.UTC(), encodedReceipt)
+	if err != nil {
+		return translateError(err)
+	}
+	current.HumanReview = &receipt
+	if receipt.Decision == "CHANGES_REQUESTED" {
+		current.Status = domain.SubmissionChangesRequested
+		current.UpdatedAt = submission.UpdatedAt
+		instance.Version = currentInstance.Version + 1
+		instanceRaw, err := marshalInstance(instance)
+		if err != nil {
+			return err
+		}
+		currentRaw, err := marshalSubmission(current)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE practice_submissions SET status=$2,payload=$3::jsonb,updated_at=$4
+WHERE id=$1`, submission.ID, current.Status, currentRaw, current.UpdatedAt.UTC())
+		if err != nil {
+			return translateError(err)
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE practice_task_instances SET status=$2,version=$3,payload=$4::jsonb,updated_at=$5
+WHERE id=$1 AND version=$6`, instance.ID, instance.Status, instance.Version, instanceRaw, instance.UpdatedAt.UTC(), currentInstance.Version)
+		if err != nil {
+			return translateError(err)
+		}
+	} else {
+		current.UpdatedAt = submission.UpdatedAt
+		currentRaw, err := marshalSubmission(current)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE practice_submissions SET payload=$2::jsonb,updated_at=$3 WHERE id=$1`, submission.ID, currentRaw, current.UpdatedAt.UTC())
+		if err != nil {
+			return translateError(err)
+		}
+	}
+	return translateError(tx.Commit())
+}
+
+func lastRunID(submission domain.Submission) string {
+	if len(submission.ValidationRuns) == 0 {
+		return ""
+	}
+	return submission.ValidationRuns[len(submission.ValidationRuns)-1].ID
+}
+
+// GetAssistance scopes durable replay to the persisted instance owner. It never
+// derives authorization from a receipt supplied by the caller.
+func (repository *Repository) GetAssistance(ctx context.Context, studentID, instanceID, usageID string) (ports.AssistanceReceipt, string, error) {
+	if err := repository.ready(); err != nil {
+		return ports.AssistanceReceipt{}, "", err
+	}
+	var raw []byte
+	var digest, storedInstanceID, storedStudentID string
+	err := repository.db.QueryRowContext(ctx, `SELECT assistance.receipt,assistance.command_digest,assistance.task_instance_id,assistance.student_id
+FROM practice_assistance_receipts assistance
+JOIN practice_task_instances instance ON instance.id=$2 AND instance.student_id=$3
+WHERE assistance.usage_id=$1`, usageID, instanceID, studentID).Scan(&raw, &digest, &storedInstanceID, &storedStudentID)
+	if err != nil {
+		return ports.AssistanceReceipt{}, "", translateError(err)
+	}
+	if storedInstanceID != instanceID || storedStudentID != studentID {
+		return ports.AssistanceReceipt{}, "", domain.ErrIdempotency
+	}
+	var receipt ports.AssistanceReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		return ports.AssistanceReceipt{}, "", err
+	}
+	return receipt, digest, nil
+}
+
+func (repository *Repository) RecordAssistance(ctx context.Context, instance domain.TaskInstance, receipt ports.AssistanceReceipt, commandDigest string) (domain.TaskInstance, ports.AssistanceReceipt, bool, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	if receipt.Schema != "practice-task-assistance-usage.v1" || !domain.IsCanonicalUUID(receipt.UsageID) || receipt.TaskInstanceID != instance.ID || receipt.StudentID != instance.StudentID ||
+		!validDigest(commandDigest) || receipt.OccurredAt.IsZero() || receipt.PolicyVersion != instance.AssistancePolicyVersion ||
+		receipt.Kind != "HINT" && receipt.Kind != "TEACHER_QUESTION" && receipt.Kind != "TEACHER_EXPLANATION" ||
+		receipt.Kind == "HINT" && (receipt.HintLevel < 1 || receipt.HintLevel > 7) ||
+		receipt.Kind != "HINT" && receipt.HintLevel != 0 {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrInvalid
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := instanceForUpdate(ctx, tx, instance.ID)
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	// This authorization also covers callers racing between lookup and commit.
+	if current.StudentID != receipt.StudentID || current.StudentID != instance.StudentID {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrNotFound
+	}
+	var oldDigest string
+	var oldRaw []byte
+	err = tx.QueryRowContext(ctx, `SELECT command_digest,receipt FROM practice_assistance_receipts WHERE usage_id=$1`, receipt.UsageID).Scan(&oldDigest, &oldRaw)
+	if err == nil {
+		var existing ports.AssistanceReceipt
+		if json.Unmarshal(oldRaw, &existing) != nil || oldDigest != commandDigest || !existing.SameCommand(receipt) || existing.PolicyVersion == "" || existing.OccurredAt.IsZero() {
+			return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrIdempotency
+		}
+		return current, existing, false, tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	if current.Status != domain.TaskInstanceInProgress || current.LearningActionID == "" || receipt.Kind == "HINT" && current.HintsUsed >= 1000 {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrConflict
+	}
+	stepExists := false
+	for _, step := range current.Steps {
+		if step.ID == receipt.StepID {
+			stepExists = true
+			break
+		}
+	}
+	if !stepExists {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrConflict
+	}
+	encodedReceipt, err := json.Marshal(receipt)
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO practice_assistance_receipts(usage_id,task_instance_id,student_id,command_digest,receipt,created_at)
+VALUES ($1,$2,$3,$4,$5::jsonb,$6)`, receipt.UsageID, instance.ID, instance.StudentID, commandDigest, encodedReceipt, receipt.OccurredAt.UTC())
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, translateError(err)
+	}
+	if receipt.Kind == "HINT" {
+		current.HintsUsed++
+		if current.MaxHintLevel == nil || receipt.HintLevel > *current.MaxHintLevel {
+			value := receipt.HintLevel
+			current.MaxHintLevel = &value
+		}
+	}
+	current.TeacherAssistanceUsed = true
+	current.AssistancePolicyVersion = receipt.PolicyVersion
+	if receipt.OccurredAt.After(current.UpdatedAt) {
+		current.UpdatedAt = receipt.OccurredAt.UTC()
+	}
+	current.Version++
+	encodedInstance, err := marshalInstance(current)
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE practice_task_instances SET version=$2,payload=$3::jsonb,updated_at=$4 WHERE id=$1 AND version=$5`,
+		current.ID, current.Version, encodedInstance, current.UpdatedAt, current.Version-1)
+	if err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, translateError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, err
+	}
+	return current, receipt, true, nil
+}
+
+func (repository *Repository) CreateOrLoadCommandReceipt(ctx context.Context, idempotencyKey, taskInstanceID, commandType, commandDigest string) (bool, error) {
+	if err := repository.ready(); err != nil {
+		return false, err
+	}
+	if !domain.IsCanonicalUUID(taskInstanceID) || !domain.IsCanonicalUUID(idempotencyKey) || commandType == "" || !validDigest(commandDigest) {
+		return false, domain.ErrInvalid
+	}
+	result, err := repository.db.ExecContext(ctx, `INSERT INTO practice_command_receipts(task_instance_id,command_type,idempotency_key,command_digest)
+VALUES ($1,$2,$3,$4) ON CONFLICT (task_instance_id,command_type,idempotency_key) DO NOTHING`, taskInstanceID, commandType, idempotencyKey, commandDigest)
+	if err != nil {
+		return false, translateError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 1 {
+		return true, nil
+	}
+	var stored string
+	err = repository.db.QueryRowContext(ctx, `SELECT command_digest FROM practice_command_receipts
+WHERE task_instance_id=$1 AND command_type=$2 AND idempotency_key=$3`, taskInstanceID, commandType, idempotencyKey).Scan(&stored)
+	if err != nil {
+		return false, translateError(err)
+	}
+	if stored != commandDigest {
+		return false, domain.ErrIdempotency
+	}
+	return false, nil
+}
+
+func (repository *Repository) PendingValidationRuns(ctx context.Context, limit int) ([]ports.PendingValidation, error) {
+	if err := repository.ready(); err != nil {
+		return nil, err
+	}
+	if limit < 1 || limit > 100 {
+		return nil, domain.ErrInvalid
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	cutoff := time.Now().UTC().Add(-validationLease)
+	rows, err := tx.QueryContext(ctx, `SELECT run.id,run.payload FROM practice_validation_runs AS run
+JOIN practice_submissions AS submission ON submission.id=run.submission_id AND submission.current_run_id=run.id
+JOIN practice_task_instances AS instance ON instance.id=run.task_instance_id AND instance.current_submission_id=submission.id
+WHERE run.status='RUNNING' AND run.started_at <= $1 AND submission.status='VALIDATING' AND instance.status='VALIDATING'
+FOR UPDATE OF run SKIP LOCKED`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	type staleRun struct {
+		id  string
+		raw []byte
+	}
+	stale := make([]staleRun, 0)
+	for rows.Next() {
+		var item staleRun
+		if err := rows.Scan(&item.id, &item.raw); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		stale = append(stale, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, item := range stale {
+		var run domain.ValidationRun
+		if err := json.Unmarshal(item.raw, &run); err != nil {
+			return nil, fmt.Errorf("decode stale ValidationRun: %w", err)
+		}
+		run.Status, run.StartedAt, run.FinishedAt, run.Outcome, run.ErrorClassification = domain.ValidationRunPending, nil, nil, "", ""
+		encoded, err := json.Marshal(run)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE practice_validation_runs SET status='PENDING',outcome=NULL,error_classification=NULL,started_at=NULL,finished_at=NULL,payload=$2::jsonb,updated_at=$3 WHERE id=$1`, item.id, encoded, time.Now().UTC()); err != nil {
+			return nil, translateError(err)
+		}
+	}
+	selectRows, err := tx.QueryContext(ctx, `SELECT run.task_instance_id,run.submission_id,run.id,instance.student_id
+FROM practice_validation_runs AS run
+JOIN practice_submissions AS submission ON submission.id=run.submission_id AND submission.current_run_id=run.id
+JOIN practice_task_instances AS instance ON instance.id=run.task_instance_id
+WHERE run.status='PENDING' AND submission.status='VALIDATING' AND instance.current_submission_id=submission.id AND instance.status='VALIDATING'
+ORDER BY run.created_at,run.id LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ports.PendingValidation, 0, limit)
+	for selectRows.Next() {
+		var item ports.PendingValidation
+		if err := selectRows.Scan(&item.TaskInstanceID, &item.SubmissionID, &item.RunID, &item.StudentID); err != nil {
+			_ = selectRows.Close()
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := selectRows.Err(); err != nil {
+		_ = selectRows.Close()
+		return nil, err
+	}
+	if err := selectRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}

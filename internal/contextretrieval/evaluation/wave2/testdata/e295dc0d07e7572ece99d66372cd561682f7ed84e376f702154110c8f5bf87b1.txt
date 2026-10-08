@@ -1,0 +1,353 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const validationLease = 5 * time.Minute
+
+type Repository struct{ db *sql.DB }
+
+func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
+
+var _ ports.Repository = (*Repository)(nil)
+
+func (repository *Repository) ready() error {
+	if repository == nil || repository.db == nil {
+		return domain.ErrDependency
+	}
+	return nil
+}
+
+func translateError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) {
+		switch postgresError.Code {
+		case "23505", "23503", "23514":
+			return fmt.Errorf("%w: persistence constraint %s", domain.ErrConflict, postgresError.ConstraintName)
+		}
+	}
+	return err
+}
+
+func (repository *Repository) CreateOrLoadStart(ctx context.Context, instance domain.TaskInstance) (domain.TaskInstance, bool, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, false, err
+	}
+	if instance.ID == "" || instance.StudentID == "" || instance.TaskRevisionID == "" || instance.StartCommandDigest == "" || instance.Status != domain.TaskInstanceStarting {
+		return domain.TaskInstance{}, false, domain.ErrInvalid
+	}
+	instance.Version = 1
+	payload, err := marshalInstance(instance)
+	if err != nil {
+		return domain.TaskInstance{}, false, err
+	}
+	result, err := repository.db.ExecContext(ctx, `
+INSERT INTO practice_task_instances
+    (id,student_id,task_revision_id,task_revision_digest,status,start_command_digest,
+     current_submission_id,final_submission_id,version,payload,started_at,updated_at,completed_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9::jsonb,$10,$11,$12)
+ON CONFLICT (id) DO NOTHING`, instance.ID, instance.StudentID, instance.TaskRevisionID,
+		instance.TaskRevisionDigest, instance.Status, instance.StartCommandDigest,
+		nullableUUID(instance.CurrentSubmissionID), nullableUUID(instance.FinalSubmissionID), payload,
+		instance.StartedAt.UTC(), instance.UpdatedAt.UTC(), nullableTime(instance.CompletedAt))
+	if err != nil {
+		return domain.TaskInstance{}, false, translateError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.TaskInstance{}, false, err
+	}
+	if affected == 1 {
+		return instance, true, nil
+	}
+	stored, err := repository.getInstanceByID(ctx, instance.ID, false)
+	return stored, false, err
+}
+
+func (repository *Repository) GetInstance(ctx context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, err
+	}
+	var payload []byte
+	err := repository.db.QueryRowContext(ctx, `SELECT payload FROM practice_task_instances WHERE student_id=$1 AND id=$2`, studentID, instanceID).Scan(&payload)
+	if err != nil {
+		return domain.TaskInstance{}, translateError(err)
+	}
+	instance, err := unmarshalInstance(payload)
+	if err != nil {
+		return domain.TaskInstance{}, fmt.Errorf("decode persisted TaskInstance: %w", err)
+	}
+	return instance, nil
+}
+
+func (repository *Repository) GetInstanceByID(ctx context.Context, instanceID string) (domain.TaskInstance, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, err
+	}
+	return repository.getInstanceByID(ctx, instanceID, false)
+}
+
+func (repository *Repository) getInstanceByID(ctx context.Context, instanceID string, forUpdate bool) (domain.TaskInstance, error) {
+	query := `SELECT payload,version FROM practice_task_instances WHERE id=$1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	var payload []byte
+	var version int64
+	if err := repository.db.QueryRowContext(ctx, query, instanceID).Scan(&payload, &version); err != nil {
+		return domain.TaskInstance{}, translateError(err)
+	}
+	instance, err := unmarshalInstance(payload)
+	if err != nil {
+		return domain.TaskInstance{}, fmt.Errorf("decode persisted TaskInstance: %w", err)
+	}
+	instance.Version = version
+	return instance, nil
+}
+
+func (repository *Repository) ListInstances(ctx context.Context, studentID, cursor string, limit int, status domain.TaskInstanceStatus) ([]domain.TaskInstance, string, error) {
+	if err := repository.ready(); err != nil {
+		return nil, "", err
+	}
+	if limit < 1 || limit > 100 {
+		return nil, "", domain.ErrInvalid
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = repository.db.QueryContext(ctx, `SELECT payload,id FROM practice_task_instances
+WHERE student_id=$1 AND ($2='' OR status=$2) ORDER BY id DESC LIMIT $3`, studentID, status, limit+1)
+	} else {
+		decoded, decodeErr := decodeHexCursor(cursor)
+		if decodeErr != nil {
+			return nil, "", domain.ErrInvalid
+		}
+		rows, err = repository.db.QueryContext(ctx, `SELECT payload,id FROM practice_task_instances
+WHERE student_id=$1 AND id < $2 AND ($3='' OR status=$3) ORDER BY id DESC LIMIT $4`, studentID, decoded, status, limit+1)
+	}
+	if err != nil {
+		return nil, "", translateError(err)
+	}
+	defer rows.Close()
+	items := make([]domain.TaskInstance, 0, limit+1)
+	ids := make([]string, 0, limit+1)
+	for rows.Next() {
+		var raw []byte
+		var id string
+		if err := rows.Scan(&raw, &id); err != nil {
+			return nil, "", err
+		}
+		instance, err := unmarshalInstance(raw)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode persisted TaskInstance: %w", err)
+		}
+		items, ids = append(items, instance), append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	var next string
+	if len(items) > limit {
+		items = items[:limit]
+		next = hex.EncodeToString([]byte(ids[limit-1]))
+	}
+	return items, next, nil
+}
+
+func (repository *Repository) SaveInstance(ctx context.Context, instance domain.TaskInstance) (domain.TaskInstance, error) {
+	if err := repository.ready(); err != nil {
+		return domain.TaskInstance{}, err
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return domain.TaskInstance{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var raw []byte
+	var version int64
+	err = tx.QueryRowContext(ctx, `SELECT payload,version FROM practice_task_instances WHERE id=$1 FOR UPDATE`, instance.ID).Scan(&raw, &version)
+	if err != nil {
+		return domain.TaskInstance{}, translateError(err)
+	}
+	current, err := unmarshalInstance(raw)
+	if err != nil {
+		return domain.TaskInstance{}, fmt.Errorf("decode persisted TaskInstance: %w", err)
+	}
+	current.Version = version
+	if instance.Version != version {
+		candidate := instance
+		candidate.Version = version
+		if version == instance.Version+1 && sameInstance(current, candidate) {
+			if err := tx.Commit(); err != nil {
+				return domain.TaskInstance{}, err
+			}
+			return current, nil
+		}
+		return domain.TaskInstance{}, domain.ErrConflict
+	}
+	if err := validateInstanceUpdate(current, instance); err != nil {
+		return domain.TaskInstance{}, err
+	}
+	instance.Version = version + 1
+	payload, err := marshalInstance(instance)
+	if err != nil {
+		return domain.TaskInstance{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE practice_task_instances
+SET task_revision_id=$2,task_revision_digest=$3,status=$4,current_submission_id=$5,final_submission_id=$6,
+    version=$7,payload=$8::jsonb,updated_at=$9,completed_at=$10
+WHERE id=$1 AND version=$11`, instance.ID, instance.TaskRevisionID, instance.TaskRevisionDigest, instance.Status,
+		nullableUUID(instance.CurrentSubmissionID), nullableUUID(instance.FinalSubmissionID), instance.Version,
+		payload, instance.UpdatedAt.UTC(), nullableTime(instance.CompletedAt), version)
+	if err != nil {
+		return domain.TaskInstance{}, translateError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.TaskInstance{}, err
+	}
+	if affected != 1 {
+		return domain.TaskInstance{}, domain.ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.TaskInstance{}, err
+	}
+	return instance, nil
+}
+
+func validateInstanceUpdate(current, next domain.TaskInstance) error {
+	if current.ID != next.ID || current.StudentID != next.StudentID || current.TaskRevisionID != next.TaskRevisionID ||
+		current.TaskRevisionDigest != next.TaskRevisionDigest || current.StartCommandDigest != next.StartCommandDigest ||
+		current.SurfaceClassification != next.SurfaceClassification || current.Locale != next.Locale || current.StartedAt != next.StartedAt ||
+		current.LearningPathID != next.LearningPathID || current.SolutionVariantID != next.SolutionVariantID || current.LearningPathItemID != next.LearningPathItemID || current.RequirementID != next.RequirementID ||
+		!sameRevisionBinding(current, next) || !sameFrozenSteps(current.Steps, next.Steps) ||
+		(current.LearningActionID != "" && current.LearningActionID != next.LearningActionID) ||
+		(current.WorkspaceBinding.SandboxID != "" && current.WorkspaceBinding.SandboxID != next.WorkspaceBinding.SandboxID) ||
+		(current.LearningRoute.ID != "" && !sameRoute(current.LearningRoute, next.LearningRoute)) {
+		return domain.ErrConflict
+	}
+	if current.Status != next.Status && !domain.CanTransitionInstance(current.Status, next.Status) {
+		return domain.ErrConflict
+	}
+	if !validProgressProjection(next) {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func sameRevisionBinding(left, right domain.TaskInstance) bool {
+	leftBytes, leftErr := json.Marshal(struct {
+		Summary  storedRevisionSummary
+		Envelope domain.RevisionEnvelope
+	}{storeRevisionSummary(left.RevisionSummary), left.RevisionEnvelope})
+	rightBytes, rightErr := json.Marshal(struct {
+		Summary  storedRevisionSummary
+		Envelope domain.RevisionEnvelope
+	}{storeRevisionSummary(right.RevisionSummary), right.RevisionEnvelope})
+	return canonicalEqual(leftBytes, rightBytes, leftErr, rightErr)
+}
+
+func sameFrozenSteps(left, right []domain.Step) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		leftCopy, rightCopy := left[index], right[index]
+		leftCopy.Status, rightCopy.Status = "", ""
+		leftCopy.ReadinessReceipt, rightCopy.ReadinessReceipt = nil, nil
+		leftCopy.ReadinessIdempotencyKey, rightCopy.ReadinessIdempotencyKey = "", ""
+		leftCopyBytes, leftErr := json.Marshal(storeStep(leftCopy))
+		rightCopyBytes, rightErr := json.Marshal(storeStep(rightCopy))
+		if !canonicalEqual(leftCopyBytes, rightCopyBytes, leftErr, rightErr) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameRoute(left, right domain.LearningRouteReceipt) bool {
+	leftBytes, leftErr := json.Marshal(left)
+	rightBytes, rightErr := json.Marshal(right)
+	return canonicalEqual(leftBytes, rightBytes, leftErr, rightErr)
+}
+
+func validProgressProjection(instance domain.TaskInstance) bool {
+	passed, total := 0, 0
+	for _, step := range instance.Steps {
+		if !step.Required {
+			continue
+		}
+		total++
+		if step.Status == "PASSED" || step.Status == "CHECKPOINTED" {
+			passed++
+		}
+	}
+	percentage := float64(0)
+	if total > 0 {
+		percentage = float64(passed) * 100 / float64(total)
+	}
+	return instance.Progress.PassedSteps == passed && instance.Progress.TotalSteps == total && instance.Progress.Percentage == percentage
+}
+
+func sameInstance(left, right domain.TaskInstance) bool {
+	leftBytes, leftErr := marshalInstance(left)
+	rightBytes, rightErr := marshalInstance(right)
+	return canonicalEqual(leftBytes, rightBytes, leftErr, rightErr)
+}
+
+func canonicalEqual(left, right []byte, leftErr, rightErr error) bool {
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func decodeHexCursor(cursor string) (string, error) {
+	decoded, err := hex.DecodeString(cursor)
+	if err != nil || strings.TrimSpace(string(decoded)) == "" {
+		return "", domain.ErrInvalid
+	}
+	return string(decoded), nil
+}
+
+func encodeCursor(value string) string { return hex.EncodeToString([]byte(value)) }
+
+func parseSubmissionCursor(cursor string) (time.Time, string, error) {
+	decoded, err := hex.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", domain.ErrInvalid
+	}
+	parts := strings.SplitN(string(decoded), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", domain.ErrInvalid
+	}
+	at, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil || parts[1] == "" {
+		return time.Time{}, "", domain.ErrInvalid
+	}
+	return at.UTC(), parts[1], nil
+}
+
+func formatSubmissionCursor(at time.Time, id string) string {
+	return encodeCursor(at.UTC().Format(time.RFC3339Nano) + "|" + id)
+}

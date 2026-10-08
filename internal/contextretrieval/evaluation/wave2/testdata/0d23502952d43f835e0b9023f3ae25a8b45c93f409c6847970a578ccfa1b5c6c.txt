@@ -1,0 +1,175 @@
+package memory
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+)
+
+type JobRepository struct {
+	mu    sync.Mutex
+	jobs  map[string]domain.PlanningJob
+	byKey map[string]string
+}
+
+func NewJobRepository() *JobRepository {
+	return &JobRepository{jobs: map[string]domain.PlanningJob{}, byKey: map[string]string{}}
+}
+
+func (repository *JobRepository) Ensure(ctx context.Context, job domain.PlanningJob) (domain.PlanningJob, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.PlanningJob{}, false, err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	if id, ok := repository.byKey[job.IdempotencyKey]; ok {
+		stored := repository.jobs[id]
+		if stored.RequestHash != job.RequestHash {
+			return domain.PlanningJob{}, false, domain.ErrConflict
+		}
+		return stored, false, nil
+	}
+	repository.jobs[job.ID] = job
+	repository.byKey[job.IdempotencyKey] = job.ID
+	return job, true, nil
+}
+
+func (repository *JobRepository) Get(ctx context.Context, id string) (domain.PlanningJob, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.PlanningJob{}, err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	job, ok := repository.jobs[id]
+	if !ok {
+		return domain.PlanningJob{}, domain.ErrNotFound
+	}
+	return job, nil
+}
+
+func (repository *JobRepository) Claim(ctx context.Context, id, token string, now time.Time, lease time.Duration) (domain.PlanningJob, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.PlanningJob{}, err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	job, ok := repository.jobs[id]
+	if !ok {
+		return domain.PlanningJob{}, domain.ErrNotFound
+	}
+	if job.Status == domain.JobStatusReady || job.Status == domain.JobStatusStaged {
+		return job, nil
+	}
+	if (job.Status == domain.JobStatusGenerating || job.Status == domain.JobStatusVerifying) && job.LeaseExpiresAt != nil && job.LeaseExpiresAt.After(now) {
+		return domain.PlanningJob{}, domain.ErrLeaseHeld
+	}
+	if job.Attempts >= 5 {
+		return domain.PlanningJob{}, fmt.Errorf("%w: maximum authoring attempts reached", domain.ErrConflict)
+	}
+	expires := now.Add(lease)
+	job.Status = domain.JobStatusGenerating
+	job.Attempts++
+	job.LeaseToken = token
+	job.LeaseExpiresAt = &expires
+	job.FailureCode = ""
+	job.UpdatedAt = now
+	repository.jobs[id] = job
+	return job, nil
+}
+
+func (repository *JobRepository) RenewLease(ctx context.Context, id, token string, now time.Time, lease time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	job, ok := repository.jobs[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if job.LeaseToken == "" || job.LeaseToken != token || job.Status != domain.JobStatusGenerating && job.Status != domain.JobStatusVerifying {
+		return domain.ErrConflict
+	}
+	expires := now.Add(lease)
+	job.LeaseExpiresAt = &expires
+	job.UpdatedAt = now
+	repository.jobs[id] = job
+	return nil
+}
+
+func (repository *JobRepository) MarkVerifying(ctx context.Context, id, token string, now time.Time) error {
+	return repository.updateClaimed(ctx, id, token, func(job *domain.PlanningJob) { job.Status = domain.JobStatusVerifying; job.UpdatedAt = now })
+}
+
+func (repository *JobRepository) SaveReady(ctx context.Context, id, token string, artifact domain.AuthoringArtifact, now time.Time) error {
+	return repository.updateClaimed(ctx, id, token, func(job *domain.PlanningJob) {
+		job.Status = domain.JobStatusReady
+		job.Artifact = &artifact
+		job.FailureCode = ""
+		job.LeaseToken = ""
+		job.LeaseExpiresAt = nil
+		job.UpdatedAt = now
+	})
+}
+
+func (repository *JobRepository) SaveStaging(ctx context.Context, id string, staging domain.StagingReceiptV1, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	job, ok := repository.jobs[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if (job.Status != domain.JobStatusReady && job.Status != domain.JobStatusStaged) || job.Artifact == nil {
+		return domain.ErrConflict
+	}
+	if job.Staging != nil {
+		prior := *job.Staging
+		prior.Created = staging.Created
+		if prior == staging {
+			return nil
+		}
+		return domain.ErrConflict
+	}
+	job.Status = domain.JobStatusStaged
+	job.Staging = &staging
+	job.UpdatedAt = now
+	repository.jobs[id] = job
+	return nil
+}
+
+func (repository *JobRepository) SaveFailed(ctx context.Context, id, token, code string, now time.Time) error {
+	return repository.updateClaimed(ctx, id, token, func(job *domain.PlanningJob) {
+		job.Status = domain.JobStatusFailed
+		job.Artifact = nil
+		job.FailureCode = code
+		job.LeaseToken = ""
+		job.LeaseExpiresAt = nil
+		job.UpdatedAt = now
+	})
+}
+
+func (repository *JobRepository) updateClaimed(ctx context.Context, id, token string, apply func(*domain.PlanningJob)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	job, ok := repository.jobs[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if job.LeaseToken == "" || job.LeaseToken != token {
+		return domain.ErrConflict
+	}
+	apply(&job)
+	repository.jobs[id] = job
+	return nil
+}
+
+var _ domain.JobRepository = (*JobRepository)(nil)

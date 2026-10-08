@@ -1,0 +1,171 @@
+package domain_test
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"strings"
+	"testing"
+)
+
+func checkpointFixture(t *testing.T) (domain.CoursePlanRequest, domain.PlanningInputCheckpoint) {
+	t.Helper()
+	ref := domain.TargetRef{Type: domain.TargetConcept, Key: "go.variables", Version: "v1"}
+	graph := domain.GoalGraph{Goal: domain.LearningGoal{Code: "go.backend", Version: "v1", GraphVersion: "g-v1", Title: "Go"}, Targets: []domain.LearningTarget{{Ref: ref, Title: "Variables", ModuleCode: "m", ModuleTitle: "Module", SectionCode: "s", SectionTitle: "Section", LessonCode: "l", LessonTitle: "Lesson"}}}
+	profile := domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "beginner", GoalCode: "go.backend", PreferredLanguage: "en", PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, DesiredStacks: []string{"go"}, WeeklyMinutes: 60}
+	policy := domain.PolicyBundle{PlannerVersion: domain.PlannerVersion, PedagogyProfile: domain.DefaultPedagogyProfile, PresentationStyle: domain.DefaultPresentationStyle, GenerationPolicy: domain.DefaultGenerationPolicy, MasterySkipConfidence: .8, PedagogyStrategies: []domain.PedagogyStrategyVersion{{Code: "explicit_instruction", Version: 1, Config: json.RawMessage(`{"z":1,"a":2}`)}}}
+	mastery := []domain.TargetMastery{{Target: ref, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion}}
+	r := domain.CoursePlanRequest{ID: "11111111-1111-4111-8111-111111111111", StudentID: "22222222-2222-4222-8222-222222222222", RequestHash: strings.Repeat("a", 64), GoalCode: "go.backend", Intent: domain.PlanningIntent{Source: domain.PlanningSourceStudent, Reason: domain.PlanningReasonInitial, DesiredOutcome: "Learn"}}
+	result, e := courseplan.BuildDeterministicCourseForIntent(graph, profile, mastery, policy, r.Intent, pedagogy.NewDefaultRegistry())
+	if e != nil {
+		t.Fatal(e)
+	}
+	c, e := domain.NewPlanningInputCheckpoint(domain.PlanningInputCheckpoint{RequestID: r.ID, StudentID: r.StudentID, RequestHash: r.RequestHash, GoalCode: r.GoalCode, Intent: r.Intent, Graph: graph, Profile: profile, Mastery: mastery, Policy: policy, Draft: result.Course, Fingerprint: result.Fingerprint, NormalizedContext: result.NormalizedContext, GapTargets: result.GapTargets})
+	if e != nil {
+		t.Fatalf("create input: %v result=%+v", e, result)
+	}
+	return r, c
+}
+func TestPlanningInputImmutableBindingAndContext(t *testing.T) {
+	r, c := checkpointFixture(t)
+	if c.Validate(r) != nil {
+		t.Fatal("valid input rejected")
+	}
+	r.LearningPathID = "33333333-3333-4333-8333-333333333333"
+	if c.Validate(r) != nil {
+		t.Fatal("INITIAL resolution changed original binding")
+	}
+	r.RequestHash = strings.Repeat("b", 64)
+	if c.Validate(r) == nil {
+		t.Fatal("changed request hash accepted")
+	}
+}
+func TestPlanningCheckpointChainRejectsTamper(t *testing.T) {
+	r, c := checkpointFixture(t)
+	g, e := domain.NewGeneratedCourseCheckpoint(c, c.Draft)
+	if e != nil {
+		t.Fatal(e)
+	}
+	receipt, e := domain.NewCourseEnsureCheckpoint(c, g, domain.EnsureCourseResult{CourseID: "33333333-3333-4333-8333-333333333333", Lessons: []domain.CourseLessonBinding{{LessonID: "44444444-4444-4444-8444-444444444444", Order: 0, Targets: c.GapTargets}}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	receipt.Result.Reused = true
+	if receipt.Validate(c, g) == nil {
+		t.Fatal("tampered receipt accepted")
+	}
+	g.Course.Fingerprint = strings.Repeat("0", 64)
+	if g.Validate(c) == nil {
+		t.Fatal("tampered artifact accepted")
+	}
+	c.Profile.WeeklyMinutes++
+	if c.Validate(r) == nil {
+		t.Fatal("tampered projection accepted")
+	}
+}
+func TestPlanningCheckpointStrictDecode(t *testing.T) {
+	var c domain.PlanningInputCheckpoint
+	for _, raw := range []string{`{"unknown":true}`, `{} {}`, `null`, `{"schema":"x","schema":"y"}`} {
+		e := domain.DecodePlanningCheckpoint([]byte(raw), 128, &c)
+		if e == nil {
+			t.Fatalf("accepted %s", raw)
+		}
+	}
+}
+
+func TestPrivateInputHashSeparatesStudentFromCourseIdentity(t *testing.T) {
+	r, c := checkpointFixture(t)
+	changed := c
+	changed.StudentID = "55555555-5555-4555-8555-555555555555"
+	other, e := domain.NewPlanningInputCheckpoint(changed)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if other.InputHash == c.InputHash || other.Fingerprint != c.Fingerprint {
+		t.Fatal("private job identity contaminated shared Course identity")
+	}
+	if c.Validate(r) != nil {
+		t.Fatal("constructor mutated original")
+	}
+}
+func TestGeneratedPinCannotChangeDraftStructure(t *testing.T) {
+	_, c := checkpointFixture(t)
+	raw, _ := json.Marshal(c.Draft)
+	var changed domain.GeneratedCourse
+	_ = json.Unmarshal(raw, &changed)
+	changed.Modules[0].Code = "forged-module"
+	if _, e := domain.NewGeneratedCourseCheckpoint(c, changed); e == nil {
+		t.Fatal("artifact changed trusted structure")
+	}
+}
+func TestInputPayloadAccommodatesExistingDraftBoundAndRejectsOversized(t *testing.T) {
+	_, c := checkpointFixture(t)
+	c.Draft.Description = strings.Repeat("x", 5<<20)
+	c.Graph.Goal.Description = c.Draft.Description
+	valid, e := domain.NewPlanningInputCheckpoint(c)
+	if e != nil {
+		t.Fatalf("legitimate draft beyond old4MiB cap rejected: %v", e)
+	}
+	if len(valid.Draft.Description) != 5<<20 {
+		t.Fatal("draft truncated")
+	}
+	c.Draft.Description = strings.Repeat("x", domain.MaximumGeneratedCoursePayloadBytes)
+	if _, e = domain.NewPlanningInputCheckpoint(c); e == nil {
+		t.Fatal("oversized existing course draft accepted")
+	}
+}
+
+func TestInputPinPreservesExistingLargeGraphEnvelope(t *testing.T) {
+	r, c := checkpointFixture(t)
+	c.Graph.Targets = nil
+	c.Graph.Transitions = nil
+	c.Mastery = nil
+	for i := 0; i < 500; i++ {
+		ref := domain.TargetRef{Type: domain.TargetConcept, Key: fmt.Sprintf("go.target-%d", i), Version: "v1"}
+		c.Graph.Targets = append(c.Graph.Targets, domain.LearningTarget{Ref: ref, Title: "Target", ModuleCode: "m", ModuleTitle: "Module", SectionCode: "s", SectionTitle: "Section", LessonCode: fmt.Sprintf("l-%d", i), LessonTitle: "Lesson", LessonOrder: i})
+		c.Mastery = append(c.Mastery, domain.TargetMastery{Target: ref, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion})
+		for _, stack := range []string{"go", "php", "sql"} {
+			c.Graph.Transitions = append(c.Graph.Transitions, domain.TransitionKnowledge{SourceStack: stack, Target: ref, Similarity: "Similarity", Difference: "Difference", AnalogyBoundary: "Boundary"})
+		}
+	}
+	for i := 0; i < 80; i++ {
+		c.Profile.KnownStacks = append(c.Profile.KnownStacks, fmt.Sprintf("unused-%d", i))
+		c.Policy.PedagogyStrategies = append(c.Policy.PedagogyStrategies, domain.PedagogyStrategyVersion{Code: "explicit_instruction", Version: i + 2, Config: json.RawMessage(`{}`)})
+	}
+	result, e := courseplan.BuildDeterministicCourseForIntent(c.Graph, c.Profile, c.Mastery, c.Policy, r.Intent, pedagogy.NewDefaultRegistry())
+	if e != nil {
+		t.Fatalf("existing deterministic envelope rejects fixture: %v", e)
+	}
+	c.Draft = result.Course
+	c.Fingerprint = result.Fingerprint
+	c.NormalizedContext = result.NormalizedContext
+	c.GapTargets = result.GapTargets
+	pinned, e := domain.NewPlanningInputCheckpoint(c)
+	if e != nil {
+		t.Fatalf("valid existing500target/1500transition/80stack/81strategy projection was rejected: %v", e)
+	}
+	if len(pinned.Graph.Transitions) != 1500 || len(pinned.Profile.KnownStacks) != 80 || len(pinned.Policy.PedagogyStrategies) != 81 {
+		t.Fatal("existing projection envelope truncated")
+	}
+}
+
+func TestPinnedFingerprintContextRejectsStudentIdentity(t *testing.T) {
+	_, c := checkpointFixture(t)
+	var projection map[string]any
+	if json.Unmarshal(c.NormalizedContext, &projection) != nil {
+		t.Fatal("fixture context")
+	}
+	projection["student_id"] = c.StudentID
+	raw, _ := json.Marshal(projection)
+	c.NormalizedContext = raw
+	sum := sha256.Sum256(raw)
+	c.Fingerprint = hex.EncodeToString(sum[:])
+	c.Draft.Fingerprint = c.Fingerprint
+	if _, e := domain.NewPlanningInputCheckpoint(c); e == nil {
+		t.Fatal("student identity entered shared Course fingerprint context")
+	}
+}

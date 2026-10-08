@@ -1,0 +1,102 @@
+package outbox
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+type relayClock struct{ now time.Time }
+
+func (clock *relayClock) Now() time.Time { return clock.now }
+
+type outboxStub struct {
+	events    []domain.IntegrationEvent
+	claim     repository.OutboxClaim
+	published []string
+	failed    []string
+	retryAt   time.Time
+}
+
+func (stub *outboxStub) Claim(_ context.Context, claim repository.OutboxClaim) ([]domain.IntegrationEvent, error) {
+	stub.claim = claim
+	return stub.events, nil
+}
+func (stub *outboxStub) MarkPublished(_ context.Context, eventID, _ string, _ time.Time) error {
+	stub.published = append(stub.published, eventID)
+	return nil
+}
+func (stub *outboxStub) MarkFailed(_ context.Context, eventID, _, _ string, retryAt time.Time) error {
+	stub.failed = append(stub.failed, eventID)
+	stub.retryAt = retryAt
+	return nil
+}
+
+type publisherStub struct {
+	events []domain.IntegrationEvent
+	err    error
+}
+
+func (stub *publisherStub) Publish(_ context.Context, event domain.IntegrationEvent) error {
+	stub.events = append(stub.events, event)
+	return stub.err
+}
+
+func relayFixture(events []domain.IntegrationEvent) (Relay, *outboxStub, *publisherStub, *relayClock) {
+	clock := &relayClock{now: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)}
+	outbox := &outboxStub{events: events}
+	publisher := &publisherStub{}
+	return Relay{
+		Outbox: outbox, Publisher: publisher, Clock: clock, WorkerID: "planner-1",
+		BatchSize: 10, LockTTL: time.Minute, PublishTimeout: 5 * time.Second,
+		RetryBase: time.Second, RetryMax: time.Minute,
+	}, outbox, publisher, clock
+}
+
+func TestRelayMarksAcknowledgedOutcomePublished(t *testing.T) {
+	relay, outbox, publisher, _ := relayFixture([]domain.IntegrationEvent{{EventID: "event-1", Attempts: 1}})
+	processed, err := relay.ProcessBatch(context.Background())
+	if err != nil || processed != 1 {
+		t.Fatalf("process batch: processed=%d err=%v", processed, err)
+	}
+	if len(publisher.events) != 1 || len(outbox.published) != 1 || len(outbox.failed) != 0 {
+		t.Fatalf("unexpected relay state: publisher=%v published=%v failed=%v", publisher.events, outbox.published, outbox.failed)
+	}
+}
+
+func TestRelayPublishesS9OnboardingOutcome(t *testing.T) {
+	event := domain.IntegrationEvent{
+		EventID: "11111111-1111-4111-8111-111111111111", Subject: domain.SubjectOnboardingPathOutcome,
+		Attempts: 1, Payload: []byte(`{"schema":"planner-onboarding-path-outcome.v1"}`),
+	}
+	relay, outbox, publisher, _ := relayFixture([]domain.IntegrationEvent{event})
+	processed, err := relay.ProcessBatch(context.Background())
+	if err != nil || processed != 1 {
+		t.Fatalf("process S9 outcome: processed=%d err=%v", processed, err)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].Subject != domain.SubjectOnboardingPathOutcome ||
+		len(outbox.published) != 1 || outbox.published[0] != event.EventID || len(outbox.failed) != 0 {
+		t.Fatalf("unexpected S9 relay result: events=%#v published=%v failed=%v", publisher.events, outbox.published, outbox.failed)
+	}
+}
+
+func TestRelayRetriesFailedOutcome(t *testing.T) {
+	relay, outbox, publisher, clock := relayFixture([]domain.IntegrationEvent{{EventID: "event-1", Attempts: 3}})
+	publisher.err = errors.New("broker unavailable")
+	processed, err := relay.ProcessBatch(context.Background())
+	if err == nil || processed != 1 || len(outbox.failed) != 1 || !outbox.retryAt.Equal(clock.now.Add(4*time.Second)) {
+		t.Fatalf("unexpected retry: processed=%d err=%v failed=%v retry=%v", processed, err, outbox.failed, outbox.retryAt)
+	}
+}
+
+func TestRelayRejectsLeaseShorterThanSequentialPublishBudget(t *testing.T) {
+	relay, _, _, _ := relayFixture(nil)
+	relay.LockTTL = 50 * time.Second
+	if _, err := relay.ProcessBatch(context.Background()); err == nil {
+		t.Fatal("expected invalid relay configuration")
+	}
+}

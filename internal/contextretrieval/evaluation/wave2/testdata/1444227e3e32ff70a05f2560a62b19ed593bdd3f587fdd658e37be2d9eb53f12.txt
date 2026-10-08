@@ -1,0 +1,171 @@
+package usecase
+
+import (
+	"context"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+// ExecutionProjection exposes bounded execution facts. Student owns the learner's
+// primary progression decision; this read never invokes an execution command.
+type ExecutionProjection struct {
+	Schema             string   `json:"schema"`
+	StudentID          string   `json:"student_id"`
+	TaskInstanceID     string   `json:"task_instance_id"`
+	LearningActionID   string   `json:"learning_action_id"`
+	TaskRevisionID     string   `json:"task_revision_id"`
+	TaskRevisionDigest string   `json:"task_revision_digest"`
+	LearningPathID     string   `json:"learning_path_id,omitempty"`
+	LearningPathItemID string   `json:"learning_path_item_id,omitempty"`
+	RequirementID      string   `json:"requirement_id,omitempty"`
+	Status             string   `json:"status"`
+	SuggestedAction    string   `json:"suggested_action"`
+	ReasonCode         string   `json:"reason_code"`
+	Version            string   `json:"version"`
+	StepID             string   `json:"step_id,omitempty"`
+	MilestoneID        string   `json:"milestone_id,omitempty"`
+	SubmissionID       string   `json:"submission_id,omitempty"`
+	SubmissionScope    string   `json:"submission_scope,omitempty"`
+	AvailableActions   []string `json:"available_actions"`
+}
+
+func (runtime *Runtime) ExecutionProjection(ctx context.Context, studentID, instanceID string) (ExecutionProjection, error) {
+	if !domain.IsCanonicalUUID(studentID) || !domain.IsCanonicalUUID(instanceID) {
+		return ExecutionProjection{}, domain.ErrInvalid
+	}
+	// Validation run updates need not increment the instance version. Comparing
+	// two complete bounded snapshots covers those changes as well as lifecycle
+	// transactions, without persisting a second execution source of truth.
+	for attempt := 0; attempt < 3; attempt++ {
+		first, err := runtime.readExecutionProjection(ctx, studentID, instanceID)
+		if err != nil {
+			return ExecutionProjection{}, err
+		}
+		second, err := runtime.readExecutionProjection(ctx, studentID, instanceID)
+		if err != nil {
+			return ExecutionProjection{}, err
+		}
+		if first.Version == second.Version {
+			return second, nil
+		}
+	}
+	return ExecutionProjection{}, domain.ErrConflict
+}
+
+func (runtime *Runtime) readExecutionProjection(ctx context.Context, studentID, instanceID string) (ExecutionProjection, error) {
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return ExecutionProjection{}, err
+	}
+	if instance.ID != instanceID || instance.StudentID != studentID {
+		return ExecutionProjection{}, domain.ErrDependency
+	}
+	var submission domain.Submission
+	if instance.CurrentSubmissionID != "" {
+		submission, err = runtime.Repository.GetSubmission(ctx, instance.ID, instance.CurrentSubmissionID)
+		if err != nil {
+			return ExecutionProjection{}, err
+		}
+		if submission.ID != instance.CurrentSubmissionID || submission.StudentID != studentID || submission.TaskInstanceID != instanceID {
+			return ExecutionProjection{}, domain.ErrDependency
+		}
+	}
+	projection, err := projectExecution(instance, submission)
+	if err != nil {
+		return ExecutionProjection{}, err
+	}
+	var latestID string
+	var latestStatus domain.ValidationRunStatus
+	if len(submission.ValidationRuns) > 0 {
+		latest := submission.ValidationRuns[len(submission.ValidationRuns)-1]
+		latestID, latestStatus = latest.ID, latest.Status
+	}
+	projection.Version, err = domain.CommandDigest(struct {
+		Projection          ExecutionProjection        `json:"projection"`
+		InstanceVersion     int64                      `json:"instance_version"`
+		SubmissionStatus    domain.SubmissionStatus    `json:"submission_status"`
+		SubmissionUpdatedAt time.Time                  `json:"submission_updated_at"`
+		LatestRunID         string                     `json:"latest_run_id"`
+		LatestRunStatus     domain.ValidationRunStatus `json:"latest_run_status"`
+	}{projection, instance.Version, submission.Status, submission.UpdatedAt, latestID, latestStatus})
+	return projection, err
+}
+
+func projectExecution(instance domain.TaskInstance, submission domain.Submission) (ExecutionProjection, error) {
+	result := ExecutionProjection{Schema: "practice-execution-projection.v1", StudentID: instance.StudentID, TaskInstanceID: instance.ID, LearningActionID: instance.LearningActionID,
+		TaskRevisionID: instance.TaskRevisionID, TaskRevisionDigest: instance.TaskRevisionDigest, LearningPathID: instance.LearningPathID, LearningPathItemID: instance.LearningPathItemID, RequirementID: instance.RequirementID,
+		Status: "BLOCKED", AvailableActions: []string{}, SubmissionID: submission.ID}
+	switch instance.Status {
+	case domain.TaskInstanceStarting:
+		result.ReasonCode = "practice_provisioning"
+	case domain.TaskInstanceValidating:
+		if submission.Status != domain.SubmissionValidating || len(submission.ValidationRuns) == 0 {
+			return ExecutionProjection{}, domain.ErrDependency
+		}
+		result.ReasonCode = "validation_running"
+		if submission.ValidationRuns[len(submission.ValidationRuns)-1].Status == domain.ValidationRunError {
+			result.ReasonCode = "validation_error"
+		}
+	case domain.TaskInstanceInReview:
+		result.ReasonCode = "human_review_pending"
+	case domain.TaskInstanceFinalizing:
+		result.ReasonCode = "practice_finalizing"
+	case domain.TaskInstanceCompleted:
+		result.Status, result.ReasonCode = "COMPLETED", "practice_completed"
+	case domain.TaskInstanceCancelled:
+		result.Status, result.ReasonCode = "CANCELLED", "practice_cancelled"
+	case domain.TaskInstanceInProgress:
+		if !instance.WorkspaceBinding.Available {
+			result.ReasonCode = "workspace_unavailable"
+			break
+		}
+		var next *domain.Step
+		required := 0
+		for index := range instance.Steps {
+			step := &instance.Steps[index]
+			if !step.Required {
+				continue
+			}
+			required++
+			if next == nil && step.Status != "PASSED" && step.Status != "CHECKPOINTED" {
+				next = step
+			}
+		}
+		if required == 0 {
+			return ExecutionProjection{}, domain.ErrDependency
+		}
+		if next != nil {
+			result.StepID, result.MilestoneID = next.ID, next.ID
+			if next.Status == "LEARNING_REQUIRED" {
+				result.ReasonCode = "prerequisite_learning_required"
+				result.Status = "READY"
+				result.SuggestedAction = "START_PRACTICE_LEARNING"
+				result.AvailableActions = []string{"START_PRACTICE_LEARNING"}
+				break
+			}
+			if next.Status != "AVAILABLE" {
+				result.ReasonCode = "milestone_unavailable"
+				break
+			}
+			result.SubmissionScope = "MILESTONE"
+			result.SuggestedAction, result.ReasonCode = "RESUME_PRACTICE", "practice_active"
+			result.AvailableActions = []string{"RESUME_PRACTICE", "SUBMIT_PRACTICE"}
+		} else {
+			result.SubmissionScope = "FINAL"
+			result.SuggestedAction, result.ReasonCode = "SUBMIT_PRACTICE", "final_submission_required"
+			result.AvailableActions = []string{"SUBMIT_PRACTICE"}
+		}
+		result.Status = "READY"
+		if submission.Status == domain.SubmissionFailed || submission.Status == domain.SubmissionChangesRequested {
+			result.SuggestedAction, result.ReasonCode = "REVIEW_VALIDATION_RESULT", "validation_result_failed"
+			if submission.Status == domain.SubmissionChangesRequested {
+				result.ReasonCode = "human_changes_requested"
+			}
+			result.AvailableActions = append([]string{"REVIEW_VALIDATION_RESULT", "RETRY_PRACTICE"}, result.AvailableActions...)
+		}
+	default:
+		return ExecutionProjection{}, domain.ErrDependency
+	}
+	return result, nil
+}

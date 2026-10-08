@@ -1,0 +1,112 @@
+package domain
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+const feedbackRunID = "00000000-0000-4000-8000-000000000011"
+
+func TestSafeValidationSummaryBoundsAndExcludesProviderText(t *testing.T) {
+	result := ValidationResult{Outcome: OutcomeFail}
+	for index := 0; index < 102; index++ {
+		stage := ValidationStage{StageID: "https://private.example/secret", Required: true, Outcome: "FAIL"}
+		for issue := 0; issue < 102; issue++ {
+			stage.Issues = append(stage.Issues, ValidationIssue{Code: "PRIVATE CANARY\nsecret", Message: "PRIVATE_EVALUATION_CANARY <script>solution</script> /private/reference.go"})
+		}
+		result.Stages = append(result.Stages, stage)
+	}
+	summary := NewSafeValidationSummary(feedbackRunID, result)
+	if len(summary.Stages) != 100 || len(summary.Stages[0].Issues) != 100 {
+		t.Fatalf("summary is not bounded: %d stages, %d issues", len(summary.Stages), len(summary.Stages[0].Issues))
+	}
+	if summary.Stages[0].StageID != "validation-stage" || summary.Stages[0].Issues[0].Code != "VALIDATION_ISSUE" || summary.Stages[0].Issues[0].Message != SafeSemanticIssueMessage {
+		t.Fatalf("unsafe identifiers/messages survived: %+v", summary.Stages[0])
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{"CANARY", "script", "/private", "private.example", "reference.go"} {
+		if strings.Contains(string(encoded), private) {
+			t.Fatalf("private provider content leaked: %s", private)
+		}
+	}
+	result.Stages[0].Issues[0].Code = "MUTATED"
+	if summary.Stages[0].Issues[0].Code == "MUTATED" {
+		t.Fatal("summary aliases provider stages")
+	}
+}
+
+func TestPublicProjectionDerivesOnlyLatestMatchingSafeSummaryAndStripsPrivateField(t *testing.T) {
+	result := ValidationResult{Outcome: OutcomeFail, Stages: []ValidationStage{{StageID: "html.structure", Required: true, Outcome: "FAIL", Issues: []ValidationIssue{{Code: "MISSING_ELEMENT", Message: "PRIVATE_CANARY"}}}}}
+	run := ValidationRun{ID: feedbackRunID, Status: ValidationRunFailed, Outcome: OutcomeFail, SafeSummary: NewSafeValidationSummary(feedbackRunID, result)}
+	submission := Submission{ValidationRuns: []ValidationRun{run}, ValidationSpecification: json.RawMessage(`{"private":"CANARY"}`)}
+	projected := submission.PublicProjection()
+	if projected.CurrentValidationSummary == nil {
+		t.Fatal("safe current summary unavailable")
+	}
+	if projected.ValidationRuns[0].SafeSummary != nil || submission.ValidationRuns[0].SafeSummary == nil {
+		t.Fatal("public projection leaked private run field or mutated original history")
+	}
+	encoded, _ := json.Marshal(projected)
+	if strings.Contains(string(encoded), "safe_summary") || strings.Contains(string(encoded), "CANARY") {
+		t.Fatalf("private payload leaked: %s", encoded)
+	}
+	projected.CurrentValidationSummary.Stages[0].Issues[0].Code = "MUTATED"
+	if submission.ValidationRuns[0].SafeSummary.Stages[0].Issues[0].Code == "MUTATED" {
+		t.Fatal("public summary aliases stored summary")
+	}
+	// Even an injected/stale projection field must be replaced from run history.
+	submission.CurrentValidationSummary = NewSafeValidationSummary(feedbackRunID, result)
+	submission.ValidationRuns = append(submission.ValidationRuns, ValidationRun{ID: "00000000-0000-4000-8000-000000000012", Status: ValidationRunPending})
+	if submission.PublicProjection().CurrentValidationSummary != nil {
+		t.Fatal("pending retry reused an older summary")
+	}
+}
+
+func TestCurrentSafeValidationSummaryRejectsLegacyAndCorrelationMismatch(t *testing.T) {
+	classification := "VALIDATOR_TIMEOUT"
+	valid := ValidationRun{ID: feedbackRunID, Status: ValidationRunError, Outcome: OutcomeError, ErrorClassification: classification,
+		SafeSummary: NewSafeValidationSummary(feedbackRunID, ValidationResult{Outcome: OutcomeError, ErrorClassification: classification})}
+	cases := map[string]func(*ValidationRun){
+		"legacy":                   func(run *ValidationRun) { run.SafeSummary = nil },
+		"different run":            func(run *ValidationRun) { run.SafeSummary.ValidationRunID = "00000000-0000-4000-8000-000000000099" },
+		"different outcome":        func(run *ValidationRun) { run.SafeSummary.Outcome = OutcomeFail },
+		"different classification": func(run *ValidationRun) { value := "SNAPSHOT_CORRUPT"; run.SafeSummary.ErrorClassification = &value },
+		"unknown classification": func(run *ValidationRun) {
+			run.ErrorClassification = "PRIVATE_CANARY"
+			run.SafeSummary.ErrorClassification = &run.ErrorClassification
+		},
+		"nonterminal":           func(run *ValidationRun) { run.Status = ValidationRunRunning },
+		"wrong status outcome":  func(run *ValidationRun) { run.Status = ValidationRunFailed },
+		"absent classification": func(run *ValidationRun) { run.SafeSummary.ErrorClassification = nil },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			run := valid
+			copied := *valid.SafeSummary
+			run.SafeSummary = &copied
+			mutate(&run)
+			if (Submission{ValidationRuns: []ValidationRun{run}}).CurrentSafeValidationSummary() != nil {
+				t.Fatal("mismatched current summary accepted")
+			}
+		})
+	}
+	if (Submission{ValidationRuns: []ValidationRun{valid}}).CurrentSafeValidationSummary() == nil {
+		t.Fatal("valid technical ERROR detail unavailable")
+	}
+}
+
+func TestSafeSummaryEmptyIssuesRemainCompatibleAndClassificationsAreBounded(t *testing.T) {
+	result := ValidationResult{Outcome: OutcomePass, Stages: []ValidationStage{{StageID: "html", Outcome: "PASS"}}}
+	encoded, _ := json.Marshal(NewSafeValidationSummary(feedbackRunID, result))
+	if !strings.Contains(string(encoded), `"issues":[]`) || !strings.Contains(string(encoded), `"error_classification":null`) {
+		t.Fatalf("safe DTO omitted required nullable/array fields: %s", encoded)
+	}
+	summary := NewSafeValidationSummary(feedbackRunID, ValidationResult{Outcome: OutcomeError, ErrorClassification: "PRIVATE_CANARY"})
+	if *summary.ErrorClassification != "VALIDATOR_PROTOCOL" {
+		t.Fatal("unknown technical classification was exposed")
+	}
+}

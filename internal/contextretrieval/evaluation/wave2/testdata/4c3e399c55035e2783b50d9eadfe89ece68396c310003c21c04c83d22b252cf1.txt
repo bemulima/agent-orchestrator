@@ -1,0 +1,186 @@
+package http_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/readiness"
+)
+
+const readinessRouteStudentID = "11111111-1111-4111-8111-111111111111"
+
+func TestLearningReadinessRouteRequiresExactTeacherTokenAndReturnsNoStore(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	graphs := &routeReadinessGraphs{}
+	router := readinessRouter(true, student, graphs)
+	path := "/internal/students/" + readinessRouteStudentID + "/learning-readiness"
+	body := `{"schema":"learning-readiness-request.v1"}`
+	for _, testCase := range []struct {
+		name, token string
+		want        int
+	}{
+		{name: "general token rejected", token: "general-token", want: http.StatusForbidden},
+		{name: "practice token rejected", token: "practice-token", want: http.StatusForbidden},
+		{name: "teacher token accepted", token: "teacher-token", want: http.StatusOK},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+			request.Header.Set("X-Internal-Token", testCase.token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.want {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, testCase.want, response.Body.String())
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("cache-control=%q", response.Header().Get("Cache-Control"))
+			}
+			if testCase.want == http.StatusOK {
+				if strings.Contains(response.Body.String(), "course_id") || strings.Contains(response.Body.String(), "learning_path_id") || strings.Contains(response.Body.String(), "lesson_id") {
+					t.Fatalf("READY leaked prospective identity: %s", response.Body.String())
+				}
+				var result domain.LearningReadiness
+				if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.Schema != domain.LearningReadinessSchema || result.Goal == nil || result.Goal.Code != "programming.foundation" {
+					t.Fatalf("result=%#v err=%v", result, err)
+				}
+			}
+		})
+	}
+	if student.calls != 1 || graphs.calls != 1 {
+		t.Fatalf("student_calls=%d graph_calls=%d", student.calls, graphs.calls)
+	}
+}
+
+func TestLearningReadinessRouteStrictBodyAndCanonicalStudentID(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "unknown field", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v1","goal_code":"go.backend"}`},
+		{name: "trailing json", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v1"}{}`},
+		{name: "wrong schema", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v2"}`},
+		{name: "null expected ref", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v1","expected_state_ref":null}`},
+		{name: "invalid expected ref", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v1","expected_state_ref":{"kind":"none","version":1}}`},
+		{name: "noncanonical student", path: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", body: `{"schema":"learning-readiness-request.v1"}`},
+		{name: "oversize", path: readinessRouteStudentID, body: `{"schema":"learning-readiness-request.v1","padding":"` + strings.Repeat("x", 17<<10) + `"}`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+			graphs := &routeReadinessGraphs{}
+			router := readinessRouter(true, student, graphs)
+			request := httptest.NewRequest(http.MethodPost, "/internal/students/"+testCase.path+"/learning-readiness", bytes.NewBufferString(testCase.body))
+			request.Header.Set("X-Internal-Token", "teacher-token")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusUnprocessableEntity && response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if student.calls != 0 || graphs.calls != 0 {
+				t.Fatalf("student_calls=%d graph_calls=%d", student.calls, graphs.calls)
+			}
+		})
+	}
+}
+
+func TestLearningReadinessRouteFlagOffAndStaleExpectedVersion(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	graphs := &routeReadinessGraphs{}
+	request := httptest.NewRequest(http.MethodPost, "/internal/students/"+readinessRouteStudentID+"/learning-readiness", bytes.NewBufferString(`{"schema":"learning-readiness-request.v1"}`))
+	request.Header.Set("X-Internal-Token", "teacher-token")
+	response := httptest.NewRecorder()
+	readinessRouter(false, student, graphs).ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || student.calls != 0 || graphs.calls != 0 || !strings.Contains(response.Body.String(), "learning_readiness_disabled") {
+		t.Fatalf("status=%d body=%s student_calls=%d graph_calls=%d", response.Code, response.Body.String(), student.calls, graphs.calls)
+	}
+
+	student = &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	graphs = &routeReadinessGraphs{}
+	request = httptest.NewRequest(http.MethodPost, "/internal/students/"+readinessRouteStudentID+"/learning-readiness", bytes.NewBufferString(`{"schema":"learning-readiness-request.v1","expected_state_ref":{"kind":"accepted_draft","version":3}}`))
+	request.Header.Set("X-Internal-Token", "teacher-token")
+	response = httptest.NewRecorder()
+	readinessRouter(true, student, graphs).ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || student.calls != 1 || graphs.calls != 0 || !strings.Contains(response.Body.String(), "student_state_changed") {
+		t.Fatalf("status=%d body=%s student_calls=%d graph_calls=%d", response.Code, response.Body.String(), student.calls, graphs.calls)
+	}
+}
+
+func TestLearningReadinessRouteMapsRepositoryGraphValidationToInvalidGraph(t *testing.T) {
+	student := &routeReadinessStudent{snapshot: routeReadinessSnapshot()}
+	graphs := &routeReadinessGraphs{err: domain.ErrValidation}
+	request := httptest.NewRequest(http.MethodPost, "/internal/students/"+readinessRouteStudentID+"/learning-readiness", bytes.NewBufferString(`{"schema":"learning-readiness-request.v1"}`))
+	request.Header.Set("X-Internal-Token", "teacher-token")
+	response := httptest.NewRecorder()
+	readinessRouter(true, student, graphs).ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || response.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(response.Body.String(), "published_graph_invalid") || student.calls != 1 || graphs.calls != 1 {
+		t.Fatalf("status=%d cache=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Body.String())
+	}
+}
+
+func readinessRouter(enabled bool, student *routeReadinessStudent, graphs *routeReadinessGraphs) http.Handler {
+	return transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "general-token", TeacherToken: "teacher-token", PracticeToken: "practice-token",
+		LearningReadiness: privatehandlers.LearningReadinessHandler{Resolve: readiness.Resolver{
+			Enabled: enabled, Students: student, Graphs: graphs,
+		}},
+	})
+}
+
+func routeReadinessSnapshot() domain.StudentPlanningReadinessSnapshot {
+	return domain.StudentPlanningReadinessSnapshot{
+		Schema: domain.StudentReadinessSnapshotSchema, StudentID: readinessRouteStudentID,
+		StateRef:       domain.StudentReadinessStateRef{Kind: domain.StudentReadinessStateDraft, Version: 4},
+		LearningIntent: &domain.StudentReadinessLearningIntent{Code: "learn_programming", Source: "onboarding_goal_code.v1", Provenance: "accepted_student_draft"},
+		Profile: domain.StudentReadinessProfile{
+			DirectionCode: "undecided", SelfAssessedExperience: "beginner",
+			KnownStacks:       domain.StudentReadinessStackValues{State: domain.StudentReadinessArrayUnanswered},
+			DesiredStacks:     domain.StudentReadinessStackValues{State: domain.StudentReadinessArrayUnanswered},
+			PreferredLanguage: &domain.StudentReadinessLanguage{Code: "ru", Provenance: "explicit_ui"},
+			ContentLanguage:   &domain.StudentReadinessLanguage{Code: "ru", Provenance: "explicit_ui", Source: "preferred_language"},
+		},
+	}
+}
+
+type routeReadinessStudent struct {
+	snapshot domain.StudentPlanningReadinessSnapshot
+	calls    int
+}
+
+func (stub *routeReadinessStudent) GetPlanningReadiness(context.Context, string) (domain.StudentPlanningReadinessSnapshot, error) {
+	stub.calls++
+	return stub.snapshot, nil
+}
+
+type routeReadinessGraphs struct {
+	calls int
+	err   error
+}
+
+func (stub *routeReadinessGraphs) GetPublishedGoalGraphExact(
+	_ context.Context,
+	goalCode string,
+	goalVersion string,
+	graphVersion string,
+) (domain.GoalGraph, error) {
+	stub.calls++
+	if stub.err != nil {
+		return domain.GoalGraph{}, stub.err
+	}
+	return domain.GoalGraph{
+		Goal: domain.LearningGoal{Code: goalCode, Version: goalVersion, GraphVersion: graphVersion, Title: "Основы программирования"},
+		Targets: []domain.LearningTarget{{
+			Ref: domain.TargetRef{Type: domain.TargetConcept, Key: "programming.execution-state", Version: "v1"}, Title: "Execution",
+			ModuleCode: "module", ModuleTitle: "Module", SectionCode: "section", SectionTitle: "Section",
+			LessonCode: "lesson", LessonTitle: "Lesson",
+		}},
+	}, nil
+}

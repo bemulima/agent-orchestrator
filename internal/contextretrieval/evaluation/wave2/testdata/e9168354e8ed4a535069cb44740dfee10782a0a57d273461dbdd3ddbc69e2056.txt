@@ -1,0 +1,367 @@
+package postgres_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	plannerpostgres "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// This bounded persistence proof runs only against the explicitly named NEW T19
+// database. It never reaches owner services, applies the regular migration task,
+// resets existing state, or claims live end-to-end coverage.
+func TestT19PlanningCheckpointPostgresLifecycle(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("PLANNER_T19_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("PLANNER_T19_DATABASE_URL not configured")
+	}
+	cfg, e := pgxpool.ParseConfig(dsn)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if cfg.ConnConfig.Database != "remediation_t19_planner_test" || cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Port != 58998 {
+		t.Fatal("T19 requires the exact new isolated database at127.0.0.1:58998")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pool.Close()
+	if e = pool.Ping(ctx); e != nil {
+		t.Fatal(e)
+	}
+	var foreign int
+	if e = pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='project_authoring_flow' AND column_name='staging_receipt_json'`).Scan(&foreign); e != nil {
+		t.Fatal(e)
+	}
+	if foreign != 0 {
+		t.Fatal("T19 database includes foreign018")
+	}
+	store := plannerpostgres.Store{Pool: pool}
+	// This exact marker/hash is minted only by t19NewCheckpointJob in this named
+	// isolated database. Retain and terminalize earlier header-guard fixtures;
+	// composer jobs have their own distinct request identity and intent.
+	cleaned, e := pool.Exec(ctx, `UPDATE course_plan_request SET status='FAILED',failure_code='T19_TEST_FIXTURE_TERMINAL',claim_token=NULL,lease_until=NULL,completed_at=clock_timestamp() WHERE status='PLANNING' AND goal_code='go.backend' AND request_hash=repeat('a',64) AND intent_json->>'desired_outcome'='Learn Go'`)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Logf("terminalized retained owned header fixtures: %d", cleaned.RowsAffected())
+
+	t.Run("empty_down_up_down_up_atomic", func(t *testing.T) {
+		var n int
+		if e = pool.QueryRow(ctx, `SELECT count(*) FROM course_planning_input_checkpoint`).Scan(&n); e != nil {
+			t.Fatal(e)
+		}
+		if n != 0 {
+			t.Skip("retained pins already exist; destructive empty-schema lifecycle not repeated")
+		}
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer tx.Rollback(ctx)
+		for i := 0; i < 2; i++ {
+			for _, direction := range []string{"down", "up"} {
+				body := t19MigrationBody(t, direction)
+				if _, e = tx.Exec(ctx, body); e != nil {
+					t.Fatalf("cycle%d %s: %v", i, direction, e)
+				}
+			}
+		}
+		// Roll back the isolated lifecycle proof; the root-prepared schema survives.
+		if e = tx.Rollback(ctx); e != nil {
+			t.Fatal(e)
+		}
+	})
+	r, input := t19NewCheckpointJob(t, ctx, store)
+	defer t19TerminalFixture(t, pool, r.ID, r.StudentID)
+	if e = store.CheckpointPlanningInput(ctx, r, input, time.Now().UTC()); e != nil {
+		t.Fatalf("pin input: %v", e)
+	}
+	if e = store.CheckpointPlanningInput(ctx, r, input, time.Now().UTC()); e != nil {
+		t.Fatalf("identical replay: %v", e)
+	}
+	reloaded, e := store.GetPlanningInput(ctx, r)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !bytes.Equal(reloaded.NormalizedContext, input.NormalizedContext) || reloaded.InputHash != input.InputHash {
+		t.Fatal("BYTEA changed exact context/hash")
+	}
+	changed := input
+	changed.Profile.WeeklyMinutes++
+	if e = store.CheckpointPlanningInput(ctx, r, changed, time.Now().UTC()); !errors.Is(e, domain.ErrValidation) {
+		t.Fatalf("tampered self hash: %v", e)
+	}
+	changed, e = domain.NewPlanningInputCheckpoint(changed)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = store.CheckpointPlanningInput(ctx, r, changed, time.Now().UTC()); !errors.Is(e, domain.ErrConflict) {
+		t.Fatalf("different immutable replay: %v", e)
+	}
+	generated, e := domain.NewGeneratedCourseCheckpoint(input, input.Draft)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Run("stale_claim_waiter", func(t *testing.T) {
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer tx.Rollback(ctx)
+		if _, e = tx.Exec(ctx, `SELECT id FROM course_plan_request WHERE id=$1 FOR UPDATE`, r.ID); e != nil {
+			t.Fatal(e)
+		}
+		done := make(chan error, 1)
+		go func() { done <- store.CheckpointGeneratedCourse(ctx, r, generated, time.Now().UTC()) }()
+		deadline := time.Now().Add(3 * time.Second)
+		var waiting bool
+		for time.Now().Before(deadline) {
+			if e = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%course_plan_request%FOR UPDATE%')`).Scan(&waiting); e != nil {
+				t.Fatal(e)
+			}
+			if waiting {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !waiting {
+			t.Fatal("stale writer did not reach row lock")
+		}
+		token := uuid.NewString()
+		if _, e = tx.Exec(ctx, `UPDATE course_plan_request SET claim_token=$2 WHERE id=$1`, r.ID, token); e != nil {
+			t.Fatal(e)
+		}
+		if e = tx.Commit(ctx); e != nil {
+			t.Fatal(e)
+		}
+		if e = <-done; !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("stale waiting writer: %v", e)
+		}
+		r.ClaimToken = token
+	})
+	if e = store.CheckpointGeneratedCourse(ctx, r, generated, time.Now().UTC()); e != nil {
+		t.Fatal(e)
+	}
+	actual, e := store.GetGeneratedCourse(ctx, r)
+	if e != nil || actual.ArtifactHash != generated.ArtifactHash {
+		t.Fatalf("reconstruct artifact: %v", e)
+	}
+	lessons := []domain.CourseLessonBinding{}
+	for _, m := range generated.Course.Modules {
+		for _, s := range m.Sections {
+			for _, l := range s.Lessons {
+				lessons = append(lessons, domain.CourseLessonBinding{LessonID: uuid.NewString(), LessonRevisionID: uuid.NewString(), Order: len(lessons), Targets: l.Targets})
+			}
+		}
+	}
+	receipt, e := domain.NewCourseEnsureCheckpoint(input, generated, domain.EnsureCourseResult{CourseID: uuid.NewString(), Reused: true, Lessons: lessons})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = store.CheckpointCourseEnsure(ctx, r, receipt, time.Now().UTC()); e != nil {
+		t.Fatal(e)
+	}
+	receiptRead, e := store.GetCourseEnsure(ctx, r)
+	if e != nil || receiptRead.ReceiptHash != receipt.ReceiptHash {
+		t.Fatalf("reconstruct receipt: %v", e)
+	}
+	t.Run("request_binding_and_internal_resolution", func(t *testing.T) {
+		wrong := r
+		wrong.RequestHash = strings.Repeat("b", 64)
+		if _, e = store.GetPlanningInput(ctx, wrong); !errors.Is(e, domain.ErrValidation) {
+			t.Fatalf("wrong supplied binding: %v", e)
+		}
+		if _, e = pool.Exec(ctx, `UPDATE course_plan_request SET request_hash=$2 WHERE id=$1`, r.ID, strings.Repeat("c", 64)); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = store.GetPlanningInput(ctx, r); !errors.Is(e, domain.ErrValidation) {
+			t.Fatalf("mutated stored binding accepted: %v", e)
+		}
+		if _, e = pool.Exec(ctx, `UPDATE course_plan_request SET request_hash=$2 WHERE id=$1`, r.ID, r.RequestHash); e != nil {
+			t.Fatal(e)
+		}
+		r.LearningPathID = uuid.NewString()
+		if e = store.ResolveLearningPath(ctx, r.ID, r.ClaimToken, r.LearningPathID, time.Now().UTC()); e != nil {
+			t.Fatal(e)
+		}
+		if c, e := store.GetPlanningInput(ctx, r); e != nil || c.OriginalPath != nil || c.OriginalLearningPathID != "" {
+			t.Fatalf("INITIAL path resolution reinterpreted pin: %v", e)
+		}
+	})
+	t.Run("immutable_rows_and_retained_down_refusal", func(t *testing.T) {
+		for _, table := range []string{"course_planning_input_checkpoint", "course_planning_generated_checkpoint", "course_planning_ensure_checkpoint"} {
+			for _, sql := range []string{"UPDATE " + table + " SET checkpointed_at=checkpointed_at WHERE request_id=$1", "DELETE FROM " + table + " WHERE request_id=$1"} {
+				if _, e = pool.Exec(ctx, sql, r.ID); e == nil {
+					t.Fatalf("accepted mutation%s", sql)
+				}
+			}
+			if _, e = pool.Exec(ctx, "TRUNCATE "+table+" CASCADE"); e == nil {
+				t.Fatalf("accepted truncate%s", table)
+			}
+		}
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer tx.Rollback(ctx)
+		if _, e = tx.Exec(ctx, t19MigrationBody(t, "down")); e == nil || !strings.Contains(e.Error(), "cannot discard retained planning checkpoints") {
+			t.Fatalf("DOWN did not refuse retained pins: %v", e)
+		}
+		_ = tx.Rollback(ctx)
+		if _, e = store.GetCourseEnsure(ctx, r); e != nil {
+			t.Fatalf("DOWN destroyed pins: %v", e)
+		}
+	})
+	t.Run("privileged_tamper_detected_and_restored", func(t *testing.T) {
+		var raw []byte
+		if e = pool.QueryRow(ctx, `SELECT payload_bytes FROM course_planning_input_checkpoint WHERE request_id=$1`, r.ID).Scan(&raw); e != nil {
+			t.Fatal(e)
+		}
+		altered := input
+		altered.Profile.WeeklyMinutes++
+		tampered, e := json.Marshal(altered)
+		if e != nil {
+			t.Fatal(e)
+		}
+		t19ReplaceTestPayload(t, ctx, pool, r.ID, tampered)
+		if _, e = store.GetPlanningInput(ctx, r); !errors.Is(e, domain.ErrValidation) {
+			t.Fatalf("read accepted valid byte SHA but invalid semantic hash: %v", e)
+		}
+		t19ReplaceTestPayload(t, ctx, pool, r.ID, raw)
+		if _, e = store.GetPlanningInput(ctx, r); e != nil {
+			t.Fatalf("restored pin: %v", e)
+		}
+	})
+	t.Run("expired_claim_and_terminal_retention", func(t *testing.T) {
+		if _, e = pool.Exec(ctx, `UPDATE course_plan_request SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1`, r.ID); e != nil {
+			t.Fatal(e)
+		}
+		if e = store.CheckpointCourseEnsure(ctx, r, receipt, time.Now().UTC()); !errors.Is(e, domain.ErrConflict) {
+			t.Fatalf("expired claim accepted: %v", e)
+		}
+		if _, e = pool.Exec(ctx, `UPDATE course_plan_request SET status='FAILED',claim_token=NULL,lease_until=NULL WHERE id=$1`, r.ID); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = store.GetCourseEnsure(ctx, r); e != nil {
+			t.Fatalf("terminal did not retain receipt: %v", e)
+		}
+	})
+	t.Run("header_sha_checks_and_read_errors", func(t *testing.T) {
+		other, otherInput := t19NewCheckpointJob(t, ctx, store)
+		defer t19TerminalFixture(t, pool, other.ID, other.StudentID)
+		raw, _ := json.Marshal(otherInput)
+		sum := sha256.Sum256(raw)
+		_, e = pool.Exec(ctx, `INSERT INTO course_planning_input_checkpoint(request_id,student_id,request_hash,goal_code,checkpoint_hash,payload_bytes,payload_sha256,write_claim,checkpointed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp())`, other.ID, other.StudentID, other.RequestHash, other.GoalCode, otherInput.InputHash, raw, strings.Repeat("0", 64), other.ClaimToken)
+		if e == nil {
+			t.Fatal("DB accepted wrong byte SHA")
+		}
+		_, e = pool.Exec(ctx, `INSERT INTO course_planning_input_checkpoint(request_id,student_id,request_hash,goal_code,checkpoint_hash,payload_bytes,payload_sha256,write_claim,checkpointed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp())`, other.ID, uuid.NewString(), other.RequestHash, other.GoalCode, otherInput.InputHash, raw, hex.EncodeToString(sum[:]), other.ClaimToken)
+		if e == nil {
+			t.Fatal("DB accepted mismatched Student header")
+		}
+		canceled, stop := context.WithCancel(ctx)
+		stop()
+		if _, e = store.GetPlanningInput(canceled, r); e == nil || errors.Is(e, domain.ErrValidation) || errors.Is(e, domain.ErrNotFound) {
+			t.Fatalf("read error was translated to validation/notfound: %v", e)
+		}
+	})
+}
+func t19MigrationBody(t *testing.T, direction string) string {
+	t.Helper()
+	b, e := os.ReadFile("../../../../db/migrations/019_course_planning_input_checkpoint." + direction + ".sql")
+	if e != nil {
+		t.Fatal(e)
+	}
+	s := strings.TrimSpace(string(b))
+	s = strings.TrimSpace(strings.TrimPrefix(s, "BEGIN;"))
+	s = strings.TrimSpace(strings.TrimSuffix(s, "COMMIT;"))
+	return s
+}
+func t19NewCheckpointJob(t *testing.T, ctx context.Context, store plannerpostgres.Store) (domain.CoursePlanRequest, domain.PlanningInputCheckpoint) {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	r := domain.CoursePlanRequest{ID: uuid.NewString(), StudentID: uuid.NewString(), IdempotencyKey: uuid.NewString(), RequestHash: strings.Repeat("a", 64), GoalCode: "go.backend", Intent: domain.PlanningIntent{Source: domain.PlanningSourceStudent, Reason: domain.PlanningReasonInitial, DesiredOutcome: "Learn Go"}, Status: domain.CoursePlanPlanning, CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
+	var e error
+	r.Intent, e = domain.NormalizePlanningIntent(r.Intent)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if r, _, e = store.CreateOrGet(ctx, r); e != nil {
+		t.Fatal(e)
+	}
+	r.ClaimToken = uuid.NewString()
+	lease := now.Add(15 * time.Minute)
+	r.LeaseUntil = &lease
+	if _, e = store.Pool.Exec(ctx, `UPDATE course_plan_request SET claim_token=$2,lease_until=$3 WHERE id=$1`, r.ID, r.ClaimToken, lease); e != nil {
+		t.Fatal(e)
+	}
+	graph, e := store.GetPublishedGoalGraph(ctx, r.GoalCode)
+	if e != nil {
+		t.Fatal(e)
+	}
+	policy, e := store.GetActivePolicyBundle(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	profile := domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "beginner", DesiredStacks: []string{"go"}, GoalCode: r.GoalCode, PreferredLanguage: "en", WeeklyMinutes: 60, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion}
+	mastery := []domain.TargetMastery{}
+	for _, target := range graph.Targets {
+		mastery = append(mastery, domain.TargetMastery{Target: target.Ref, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion})
+	}
+	result, e := courseplan.BuildDeterministicCourseForIntent(graph, profile, mastery, policy, r.Intent, pedagogy.NewDefaultRegistry())
+	if e != nil {
+		t.Fatal(e)
+	}
+	input, e := domain.NewPlanningInputCheckpoint(domain.PlanningInputCheckpoint{RequestID: r.ID, StudentID: r.StudentID, RequestHash: r.RequestHash, GoalCode: r.GoalCode, Intent: r.Intent, Profile: profile, Mastery: mastery, Graph: graph, Policy: policy, Draft: result.Course, Fingerprint: result.Fingerprint, NormalizedContext: result.NormalizedContext, GapTargets: result.GapTargets})
+	if e != nil {
+		t.Fatal(e)
+	}
+	return r, input
+}
+func t19ReplaceTestPayload(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id string, raw []byte) {
+	t.Helper()
+	tx, e := pool.Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer tx.Rollback(ctx)
+	if _, e = tx.Exec(ctx, `ALTER TABLE course_planning_input_checkpoint DISABLE TRIGGER USER`); e != nil {
+		t.Fatal(e)
+	}
+	sum := sha256.Sum256(raw)
+	if _, e = tx.Exec(ctx, `UPDATE course_planning_input_checkpoint SET payload_bytes=$2,payload_sha256=$3 WHERE request_id=$1`, id, raw, hex.EncodeToString(sum[:])); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = tx.Exec(ctx, `ALTER TABLE course_planning_input_checkpoint ENABLE TRIGGER USER`); e != nil {
+		t.Fatal(e)
+	}
+	if e = tx.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func t19TerminalFixture(t *testing.T, pool *pgxpool.Pool, id, studentID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, e := pool.Exec(ctx, `UPDATE course_plan_request SET status='FAILED',failure_code='T19_TEST_FIXTURE_TERMINAL',claim_token=NULL,lease_until=NULL,completed_at=clock_timestamp() WHERE id=$1 AND student_id=$2`, id, studentID); e != nil {
+		t.Errorf("retain terminal owned fixture: %v", e)
+	}
+}

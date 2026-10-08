@@ -1,0 +1,487 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+const coursePlanColumns = `id, student_id, idempotency_key, request_hash, goal_code, learning_path_id, intent_json, status,
+result_code, course_id, reused, course_fingerprint, fingerprint_version,
+normalized_context_json, generated_course_json, failure_code, attempts, claim_token, lease_until,
+next_attempt_at, created_at, updated_at, completed_at,
+path_command_kind, path_command_expected_version, path_command_hash, path_command_payload, path_command_checkpointed_at,
+path_command_result_code, path_command_course_id, path_command_reused, diagnostic_plan_id`
+
+func (store Store) CreateOrGet(
+	ctx context.Context,
+	request domain.CoursePlanRequest,
+) (domain.CoursePlanRequest, bool, error) {
+	row := store.Pool.QueryRow(ctx, `
+INSERT INTO course_plan_request(
+    id, student_id, idempotency_key, request_hash, goal_code, learning_path_id, diagnostic_plan_id, intent_json, status,
+    attempts, next_attempt_at, created_at, updated_at
+) VALUES ($1,$2,$3,$4,$5,NULLIF($6::text,'')::uuid,NULLIF($7::text,'')::uuid,$8,$9,$10,$11,$12,$13)
+ON CONFLICT (student_id, idempotency_key)
+DO UPDATE SET idempotency_key = course_plan_request.idempotency_key
+RETURNING `+coursePlanColumns,
+		request.ID, request.StudentID, request.IdempotencyKey, request.RequestHash, request.GoalCode, request.LearningPathID, request.DiagnosticPlanID,
+		mustJSON(request.Intent), request.Status, request.Attempts, request.NextAttemptAt, request.CreatedAt, request.UpdatedAt,
+	)
+	stored, err := scanCoursePlan(row)
+	if err != nil {
+		return domain.CoursePlanRequest{}, false, err
+	}
+	if stored.RequestHash != request.RequestHash {
+		return domain.CoursePlanRequest{}, false, domain.ErrConflict
+	}
+	return stored, stored.ID == request.ID, nil
+}
+
+func (store Store) GetForStudent(
+	ctx context.Context,
+	studentID string,
+	requestID string,
+) (domain.CoursePlanRequest, error) {
+	request, err := scanCoursePlan(store.Pool.QueryRow(ctx,
+		`SELECT `+coursePlanColumns+` FROM course_plan_request WHERE id=$1 AND student_id=$2`,
+		requestID, studentID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.CoursePlanRequest{}, domain.ErrNotFound
+	}
+	return request, err
+}
+
+func (store Store) GetDiagnosticPlanningRequest(ctx context.Context, studentID, planID string) (domain.CoursePlanRequest, error) {
+	rows, err := store.Pool.Query(ctx, `SELECT `+coursePlanColumns+` FROM course_plan_request WHERE student_id=$1 AND diagnostic_plan_id=$2 ORDER BY created_at,id LIMIT 2`, studentID, planID)
+	if err != nil {
+		return domain.CoursePlanRequest{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if rows.Err() != nil {
+			return domain.CoursePlanRequest{}, rows.Err()
+		}
+		return domain.CoursePlanRequest{}, domain.ErrNotFound
+	}
+	request, err := scanCoursePlan(rows)
+	if err != nil {
+		return domain.CoursePlanRequest{}, err
+	}
+	if rows.Next() {
+		return domain.CoursePlanRequest{}, domain.ErrConflict
+	}
+	if rows.Err() != nil {
+		return domain.CoursePlanRequest{}, rows.Err()
+	}
+	if request.Intent.Source != domain.PlanningSourceTeacher || request.Intent.Reason != domain.PlanningReasonInitial {
+		return domain.CoursePlanRequest{}, domain.ErrConflict
+	}
+	return request, nil
+}
+
+func (store Store) ClaimNext(
+	ctx context.Context,
+	claimToken string,
+	now time.Time,
+	leaseUntil time.Time,
+) (domain.CoursePlanRequest, error) {
+	request, err := scanCoursePlan(store.Pool.QueryRow(ctx, `
+WITH candidate AS (
+    SELECT id
+    FROM course_plan_request
+    WHERE status='PLANNING'
+      AND next_attempt_at <= $2
+      AND (lease_until IS NULL OR lease_until <= $2)
+    ORDER BY next_attempt_at, created_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE course_plan_request AS request
+SET claim_token=$1, lease_until=$3, attempts=request.attempts+1, updated_at=$2
+FROM candidate
+WHERE request.id=candidate.id
+RETURNING `+prefixedCoursePlanColumns("request"), claimToken, now, leaseUntil))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.CoursePlanRequest{}, domain.ErrNotFound
+	}
+	return request, err
+}
+
+func (store Store) RenewClaim(
+	ctx context.Context,
+	requestID string,
+	claimToken string,
+	now time.Time,
+	leaseUntil time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE course_plan_request
+SET lease_until=$4, updated_at=$3
+WHERE id=$1 AND status='PLANNING' AND claim_token=$2`, requestID, claimToken, now, leaseUntil)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) ResolveLearningPath(
+	ctx context.Context,
+	requestID string,
+	claimToken string,
+	learningPathID string,
+	now time.Time,
+) error {
+	command, err := store.Pool.Exec(ctx, `
+UPDATE course_plan_request
+SET learning_path_id=$3, updated_at=$4
+WHERE id=$1 AND status='PLANNING' AND claim_token=$2
+  AND (learning_path_id IS NULL OR learning_path_id=$3)`, requestID, claimToken, learningPathID, now)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) CheckpointLearningPathCommand(
+	ctx context.Context,
+	request domain.CoursePlanRequest,
+	claimToken string,
+	now time.Time,
+) error {
+	if request.LearningPathCommand == nil {
+		return domain.ErrValidation
+	}
+	checkpoint, err := domain.NormalizeLearningPathCommandCheckpoint(
+		*request.LearningPathCommand, request.StudentID, request.ID, request.LearningPathID,
+	)
+	if err != nil {
+		return err
+	}
+	command, err := store.Pool.Exec(ctx, `
+UPDATE course_plan_request
+SET path_command_kind=COALESCE(path_command_kind,$3),
+    path_command_expected_version=COALESCE(path_command_expected_version,$4),
+    path_command_hash=COALESCE(path_command_hash,$5),
+    path_command_payload=COALESCE(path_command_payload,$6::jsonb),
+    path_command_checkpointed_at=COALESCE(path_command_checkpointed_at,$7),
+    path_command_result_code=COALESCE(path_command_result_code,$8),
+    path_command_course_id=COALESCE(path_command_course_id,NULLIF($9::text,'')::uuid),
+    path_command_reused=COALESCE(path_command_reused,$10),
+    course_fingerprint=CASE WHEN path_command_kind IS NULL THEN NULLIF($11::text,'') ELSE course_fingerprint END,
+    fingerprint_version=CASE WHEN path_command_kind IS NULL THEN NULLIF($12::text,'') ELSE fingerprint_version END,
+    normalized_context_json=CASE WHEN path_command_kind IS NULL THEN $13 ELSE normalized_context_json END,
+    generated_course_json=CASE WHEN path_command_kind IS NULL THEN $14 ELSE generated_course_json END,
+    updated_at=$15
+WHERE id=$1 AND status='PLANNING' AND claim_token=$2 AND learning_path_id IS NOT NULL
+  AND (
+    (path_command_kind IS NULL AND path_command_expected_version IS NULL AND path_command_hash IS NULL
+      AND path_command_payload IS NULL AND path_command_checkpointed_at IS NULL
+      AND path_command_result_code IS NULL AND path_command_course_id IS NULL AND path_command_reused IS NULL)
+    OR
+    (path_command_kind=$3 AND path_command_expected_version=$4 AND path_command_hash=$5
+      AND path_command_payload=$6::jsonb AND path_command_result_code=$8
+      AND path_command_course_id IS NOT DISTINCT FROM NULLIF($9::text,'')::uuid AND path_command_reused=$10)
+  )`, request.ID, claimToken, checkpoint.Command, checkpoint.ExpectedVersion,
+		checkpoint.PayloadHash, string(checkpoint.Payload), checkpoint.CheckpointedAt,
+		checkpoint.PlannedResultCode, checkpoint.PlannedCourseID, checkpoint.PlannedReused,
+		request.CourseFingerprint, request.FingerprintVersion,
+		nullableJSON(request.NormalizedContextJSON), nullableJSON(request.GeneratedCourseJSON), now)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (store Store) Complete(
+	ctx context.Context,
+	request domain.CoursePlanRequest,
+	claimToken string,
+	now time.Time,
+) error {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx, `
+UPDATE course_plan_request
+SET status='COMPLETED', result_code=$1, course_id=NULLIF($2::text,'')::uuid, reused=$3,
+    course_fingerprint=NULLIF($4::text,''), fingerprint_version=NULLIF($5::text,''),
+    normalized_context_json=$6, generated_course_json=$7, learning_path_id=NULLIF($8::text,'')::uuid,
+    failure_code='', claim_token=NULL, lease_until=NULL, updated_at=$9, completed_at=$9
+WHERE id=$10 AND status='PLANNING' AND claim_token=$11`,
+		request.ResultCode, request.CourseID, request.Reused, request.CourseFingerprint,
+		request.FingerprintVersion, nullableJSON(request.NormalizedContextJSON), nullableJSON(request.GeneratedCourseJSON),
+		request.LearningPathID, now, request.ID, claimToken,
+	)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	if err := insertCoursePlanEvent(ctx, tx, request, domain.SubjectCoursePlanCompleted, now); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (store Store) Retry(
+	ctx context.Context,
+	request domain.CoursePlanRequest,
+	claimToken string,
+	nextAttemptAt time.Time,
+	now time.Time,
+) error {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx, `
+UPDATE course_plan_request
+SET course_fingerprint=NULLIF($1::text,''), fingerprint_version=NULLIF($2::text,''),
+    normalized_context_json=$3, generated_course_json=$4, learning_path_id=NULLIF($5::text,'')::uuid,
+    claim_token=NULL, lease_until=NULL, next_attempt_at=$6, updated_at=$7
+WHERE id=$8 AND status='PLANNING' AND claim_token=$9`,
+		request.CourseFingerprint, request.FingerprintVersion, nullableJSON(request.NormalizedContextJSON),
+		nullableJSON(request.GeneratedCourseJSON), request.LearningPathID, nextAttemptAt, now, request.ID, claimToken,
+	)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return tx.Commit(ctx)
+}
+
+func insertCoursePlanEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	request domain.CoursePlanRequest,
+	subject string,
+	now time.Time,
+) error {
+	event, err := newCoursePlanEvent(request, subject, now)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO planner_outbox(
+event_id,subject,schema_version,student_id,correlation_id,causation_id,occurred_at,payload,next_attempt_at,created_at
+) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$7,$7) ON CONFLICT (event_id) DO NOTHING`, event.EventID, event.Subject, event.SchemaVersion,
+		event.StudentID, event.CorrelationID, event.CausationID, event.OccurredAt, string(event.Payload))
+	return err
+}
+
+func newCoursePlanEvent(
+	request domain.CoursePlanRequest,
+	subject string,
+	now time.Time,
+) (domain.IntegrationEvent, error) {
+	eventID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(request.ID+"\x00"+subject)).String()
+	status := domain.CoursePlanCompleted
+	if subject == domain.SubjectCoursePlanFailed {
+		status = domain.CoursePlanFailed
+	}
+	dataFields := map[string]any{
+		"request_id": request.ID, "goal_code": request.GoalCode, "status": status,
+		"result_code": request.ResultCode, "course_id": request.CourseID, "reused": request.Reused,
+		"failure_code": request.FailureCode, "source": request.Intent.Source, "reason": request.Intent.Reason,
+		"audit_refs": request.Intent.AuditRefs,
+	}
+	if request.LearningPathID != "" {
+		dataFields["learning_path_id"] = request.LearningPathID
+	}
+	data, err := json.Marshal(dataFields)
+	if err != nil {
+		return domain.IntegrationEvent{}, err
+	}
+	envelope, err := json.Marshal(domain.EventEnvelope{
+		EventID: eventID, EventType: subject, CorrelationID: request.ID,
+		CausationID: request.IdempotencyKey, StudentID: request.StudentID,
+		OccurredAt: now.UTC(), SchemaVersion: domain.CoursePlanEventSchemaV2, Data: data,
+	})
+	if err != nil {
+		return domain.IntegrationEvent{}, err
+	}
+	return domain.IntegrationEvent{
+		EventID: eventID, Subject: subject, SchemaVersion: domain.CoursePlanEventSchemaV2,
+		StudentID: request.StudentID, CorrelationID: request.ID, CausationID: request.IdempotencyKey,
+		OccurredAt: now.UTC(), Payload: envelope,
+	}, nil
+}
+
+func (store Store) Fail(
+	ctx context.Context,
+	request domain.CoursePlanRequest,
+	claimToken string,
+	failureCode string,
+	now time.Time,
+) error {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx, `
+UPDATE course_plan_request
+SET status='FAILED', failure_code=$1, course_fingerprint=NULLIF($2::text,''),
+    fingerprint_version=NULLIF($3::text,''), normalized_context_json=$4, generated_course_json=$5,
+    learning_path_id=NULLIF($6::text,'')::uuid, claim_token=NULL, lease_until=NULL, updated_at=$7, completed_at=$7
+WHERE id=$8 AND status='PLANNING' AND claim_token=$9`,
+		failureCode, request.CourseFingerprint, request.FingerprintVersion,
+		nullableJSON(request.NormalizedContextJSON), nullableJSON(request.GeneratedCourseJSON), request.LearningPathID,
+		now, request.ID, claimToken,
+	)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	request.FailureCode = failureCode
+	if err := insertCoursePlanEvent(ctx, tx, request, domain.SubjectCoursePlanFailed, now); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanCoursePlan(row rowScanner) (domain.CoursePlanRequest, error) {
+	var request domain.CoursePlanRequest
+	var learningPathID, diagnosticPlanID, courseID, fingerprint, fingerprintVersion, claimToken sql.NullString
+	var pathCommandKind, pathCommandHash, pathCommandResultCode, pathCommandCourseID sql.NullString
+	var pathCommandExpectedVersion sql.NullInt64
+	var pathCommandReused sql.NullBool
+	var leaseUntil, completedAt, pathCommandCheckpointedAt sql.NullTime
+	var intentJSON, normalizedContext, generatedCourse, pathCommandPayload []byte
+	err := row.Scan(
+		&request.ID, &request.StudentID, &request.IdempotencyKey, &request.RequestHash,
+		&request.GoalCode, &learningPathID, &intentJSON, &request.Status, &request.ResultCode, &courseID, &request.Reused,
+		&fingerprint, &fingerprintVersion, &normalizedContext, &generatedCourse, &request.FailureCode,
+		&request.Attempts, &claimToken, &leaseUntil, &request.NextAttemptAt,
+		&request.CreatedAt, &request.UpdatedAt, &completedAt,
+		&pathCommandKind, &pathCommandExpectedVersion, &pathCommandHash, &pathCommandPayload, &pathCommandCheckpointedAt,
+		&pathCommandResultCode, &pathCommandCourseID, &pathCommandReused, &diagnosticPlanID,
+	)
+	if err != nil {
+		return domain.CoursePlanRequest{}, err
+	}
+	if err := json.Unmarshal(intentJSON, &request.Intent); err != nil {
+		return domain.CoursePlanRequest{}, err
+	}
+	if learningPathID.Valid {
+		request.LearningPathID = learningPathID.String
+	}
+	if diagnosticPlanID.Valid {
+		request.DiagnosticPlanID = diagnosticPlanID.String
+	}
+	if courseID.Valid {
+		request.CourseID = courseID.String
+	}
+	if fingerprint.Valid {
+		request.CourseFingerprint = fingerprint.String
+	}
+	if fingerprintVersion.Valid {
+		request.FingerprintVersion = fingerprintVersion.String
+	}
+	if len(normalizedContext) > 0 {
+		request.NormalizedContextJSON = append(json.RawMessage(nil), normalizedContext...)
+	}
+	if len(generatedCourse) > 0 {
+		request.GeneratedCourseJSON = append(json.RawMessage(nil), generatedCourse...)
+	}
+	if claimToken.Valid {
+		request.ClaimToken = claimToken.String
+	}
+	if leaseUntil.Valid {
+		value := leaseUntil.Time.UTC()
+		request.LeaseUntil = &value
+	}
+	if completedAt.Valid {
+		value := completedAt.Time.UTC()
+		request.CompletedAt = &value
+	}
+	checkpointFields := 0
+	for _, present := range []bool{
+		pathCommandKind.Valid, pathCommandExpectedVersion.Valid, pathCommandHash.Valid,
+		len(pathCommandPayload) > 0, pathCommandCheckpointedAt.Valid, pathCommandResultCode.Valid,
+		pathCommandReused.Valid,
+	} {
+		if present {
+			checkpointFields++
+		}
+	}
+	if (checkpointFields == 0 && pathCommandCourseID.Valid) || (checkpointFields != 0 && checkpointFields != 7) {
+		return domain.CoursePlanRequest{}, domain.ErrValidation
+	}
+	if checkpointFields == 7 {
+		checkpoint, err := domain.NormalizeLearningPathCommandCheckpoint(domain.LearningPathCommandCheckpoint{
+			Command: pathCommandKind.String, LearningPathID: request.LearningPathID,
+			PlanningRequestID: request.ID, IdempotencyKey: request.ID, ExpectedVersion: pathCommandExpectedVersion.Int64,
+			PlannedResultCode: pathCommandResultCode.String, PlannedCourseID: pathCommandCourseID.String,
+			PlannedReused: pathCommandReused.Bool,
+			PayloadHash:   pathCommandHash.String, Payload: append(json.RawMessage(nil), pathCommandPayload...),
+			CheckpointedAt: pathCommandCheckpointedAt.Time,
+		}, request.StudentID, request.ID, request.LearningPathID)
+		if err != nil {
+			return domain.CoursePlanRequest{}, err
+		}
+		request.LearningPathCommand = &checkpoint
+	}
+	return request, nil
+}
+
+func nullableJSON(input json.RawMessage) any {
+	if len(input) == 0 {
+		return nil
+	}
+	return string(input)
+}
+
+func mustJSON(input any) string {
+	payload, err := json.Marshal(input)
+	if err != nil {
+		panic(err)
+	}
+	return string(payload)
+}
+
+func prefixedCoursePlanColumns(prefix string) string {
+	return prefix + `.id, ` + prefix + `.student_id, ` + prefix + `.idempotency_key, ` +
+		prefix + `.request_hash, ` + prefix + `.goal_code, ` + prefix + `.learning_path_id, ` + prefix + `.intent_json, ` +
+		prefix + `.status, ` +
+		prefix + `.result_code, ` + prefix + `.course_id, ` + prefix + `.reused, ` +
+		prefix + `.course_fingerprint, ` + prefix + `.fingerprint_version, ` +
+		prefix + `.normalized_context_json, ` + prefix + `.generated_course_json, ` +
+		prefix + `.failure_code, ` + prefix + `.attempts, ` +
+		prefix + `.claim_token, ` + prefix + `.lease_until, ` + prefix + `.next_attempt_at, ` +
+		prefix + `.created_at, ` + prefix + `.updated_at, ` + prefix + `.completed_at, ` +
+		prefix + `.path_command_kind, ` + prefix + `.path_command_expected_version, ` +
+		prefix + `.path_command_hash, ` + prefix + `.path_command_payload, ` + prefix + `.path_command_checkpointed_at, ` +
+		prefix + `.path_command_result_code, ` + prefix + `.path_command_course_id, ` + prefix + `.path_command_reused, ` + prefix + `.diagnostic_plan_id`
+}
+
+var _ repository.CoursePlanRepository = Store{}

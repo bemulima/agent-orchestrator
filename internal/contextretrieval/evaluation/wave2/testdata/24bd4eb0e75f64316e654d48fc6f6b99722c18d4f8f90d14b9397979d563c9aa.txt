@@ -1,0 +1,134 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+func planningMessage() *natsgo.Msg {
+	planID := "11111111-1111-4111-8111-111111111111"
+	event := domain.PlanningStateChangedEvent{EventType: domain.SubjectPlanningStateChanged, CorrelationID: planID, CausationID: "22222222-2222-4222-8222-222222222222", StudentID: "33333333-3333-4333-8333-333333333333", OccurredAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), SchemaVersion: 1, Data: domain.PlanningStateChangedData{LearningPathID: planID, PathVersion: 1, TriggerKind: "OBJECTIVE_EVIDENCE", TriggerIdentity: "22222222-2222-4222-8222-222222222222", Targets: []domain.HybridTargetRef{{Type: domain.TargetConcept, Key: "go.values"}}}}
+	event.EventID = domain.PlanningStateChangedEventID(event.StudentID, planID, event.Data.TriggerKind, event.Data.TriggerIdentity)
+	message := natsgo.NewMsg(domain.SubjectPlanningStateChanged)
+	message.Sub = &natsgo.Subscription{}
+	message.Reply = "$JS.ACK." + PlanningStateStream + "." + HybridReplanDurable + ".1.1.1.1700000000000000000.0"
+	message.Data, _ = json.Marshal(event)
+	for key, value := range map[string]string{"X-Event-ID": event.EventID, "X-Correlation-ID": event.CorrelationID, "X-Causation-ID": event.CausationID, "X-Schema-Version": "1", natsgo.MsgIdHdr: event.EventID} {
+		message.Header.Set(key, value)
+	}
+	return message
+}
+
+type recordingPlanningProcessor struct {
+	calls     int
+	committed bool
+	err       error
+}
+
+func (p *recordingPlanningProcessor) ReceivePlanningStateEvent(context.Context, domain.PlanningStateChangedEvent) (bool, error) {
+	p.calls++
+	if p.err != nil {
+		return false, p.err
+	}
+	p.committed = true
+	return true, nil
+}
+
+func TestPlanningStateMessageAckOnlyAfterSuccessfulProcessor(t *testing.T) {
+	processor := &recordingPlanningProcessor{}
+	delivery := &recordingDelivery{commit: &processor.committed}
+	if err := handlePlanningStateDelivery(context.Background(), planningMessage(), processor, delivery); err != nil || !delivery.ackedAfterCommit || delivery.ack != 1 || delivery.term != 0 || delivery.nak != 0 {
+		t.Fatalf("delivery=%#v err=%v", delivery, err)
+	}
+}
+
+func TestPlanningStateMessageInvalidTermAndTransientRetry(t *testing.T) {
+	for _, err := range []error{domain.ErrValidation, domain.ErrConflict, domain.ErrForbidden, domain.ErrUpstreamUnavailable, domain.ErrNotFound, errors.New("database unavailable")} {
+		t.Run(err.Error(), func(t *testing.T) {
+			processor := &recordingPlanningProcessor{err: err}
+			delivery := &recordingDelivery{}
+			if got := handlePlanningStateDelivery(context.Background(), planningMessage(), processor, delivery); !errors.Is(got, err) || delivery.ack != 0 {
+				t.Fatalf("delivery=%#v err=%v", delivery, got)
+			}
+			invalid := errors.Is(err, domain.ErrValidation) || errors.Is(err, domain.ErrConflict) || errors.Is(err, domain.ErrForbidden)
+			if invalid && (delivery.term != 1 || delivery.nak != 0) || !invalid && (delivery.nak != 1 || delivery.term != 0 || delivery.delay != 2*time.Second) {
+				t.Fatalf("delivery=%#v", delivery)
+			}
+		})
+	}
+}
+
+func TestPlanningStateMessageStrictHeadersNoDispatchForMalformed(t *testing.T) {
+	for _, name := range []string{"subject", "missing", "duplicate", "case_duplicate", "mismatch", "schema", "causation", "message_id", "unknown_body", "oversized_header", "too_many_header_values", "wrong_stream", "wrong_durable", "missing_metadata"} {
+		t.Run(name, func(t *testing.T) {
+			message := planningMessage()
+			switch name {
+			case "wrong_stream":
+				message.Reply = strings.Replace(message.Reply, PlanningStateStream, "WRONG_STREAM", 1)
+			case "wrong_durable":
+				message.Reply = strings.Replace(message.Reply, HybridReplanDurable, "wrong-durable", 1)
+			case "missing_metadata":
+				message.Reply = ""
+			case "subject":
+				message.Subject = "student.planning-state.changed.v2"
+			case "missing":
+				message.Header.Del("X-Event-ID")
+			case "duplicate":
+				message.Header.Add("X-Event-ID", message.Header.Get("X-Event-ID"))
+			case "case_duplicate":
+				message.Header["x-event-id"] = []string{message.Header.Get("X-Event-ID")}
+			case "mismatch":
+				message.Header.Set("X-Correlation-ID", "wrong")
+			case "schema":
+				message.Header.Set("X-Schema-Version", "01")
+			case "causation":
+				message.Header.Del("X-Causation-ID")
+			case "message_id":
+				message.Header.Set(natsgo.MsgIdHdr, "wrong")
+			case "oversized_header":
+				message.Header.Set("X-Extra", strings.Repeat("a", 8193))
+			case "too_many_header_values":
+				message.Header["X-Extra"] = make([]string, 65)
+			case "unknown_body":
+				message.Data = []byte(strings.Replace(string(message.Data), `"path_version":1`, `"path_version":1,"score":100`, 1))
+			}
+			processor := &recordingPlanningProcessor{}
+			delivery := &recordingDelivery{}
+			if err := handlePlanningStateDelivery(context.Background(), message, processor, delivery); !errors.Is(err, domain.ErrValidation) || processor.calls != 0 || delivery.term != 1 || delivery.ack != 0 || delivery.nak != 0 {
+				t.Fatalf("calls=%d delivery=%#v err=%v", processor.calls, delivery, err)
+			}
+		})
+	}
+}
+
+func TestPlanningStateStreamAndDurableAdmission(t *testing.T) {
+	stream := natsgo.StreamConfig{Name: PlanningStateStream, Subjects: []string{domain.SubjectPlanningStateChanged}, Retention: natsgo.WorkQueuePolicy, Storage: natsgo.FileStorage, MaxAge: 0, MaxMsgs: -1, MaxBytes: 1 << 30, Discard: natsgo.DiscardNew, Replicas: 1, Duplicates: 10 * time.Minute}
+	if err := validatePlanningStateStream(stream); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*natsgo.StreamConfig){func(c *natsgo.StreamConfig) { c.MaxAge = time.Hour }, func(c *natsgo.StreamConfig) { c.Subjects = append(c.Subjects, "student.>") }, func(c *natsgo.StreamConfig) { c.Discard = natsgo.DiscardOld }, func(c *natsgo.StreamConfig) { c.Retention = natsgo.LimitsPolicy }} {
+		changed := stream
+		mutate(&changed)
+		if validatePlanningStateStream(changed) == nil {
+			t.Fatal("unsafe stream accepted")
+		}
+	}
+	durable := natsgo.ConsumerConfig{Durable: HybridReplanDurable, FilterSubject: domain.SubjectPlanningStateChanged, DeliverPolicy: natsgo.DeliverAllPolicy, AckPolicy: natsgo.AckExplicitPolicy, MaxDeliver: -1, AckWait: 30 * time.Second, MaxAckPending: 1}
+	if err := validatePlanningStateConsumer(durable); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*natsgo.ConsumerConfig){func(c *natsgo.ConsumerConfig) { c.MaxDeliver = 5 }, func(c *natsgo.ConsumerConfig) { c.AckPolicy = natsgo.AckNonePolicy }, func(c *natsgo.ConsumerConfig) { c.DeliverPolicy = natsgo.DeliverNewPolicy }, func(c *natsgo.ConsumerConfig) { c.FilterSubject = "student.>" }} {
+		changed := durable
+		mutate(&changed)
+		if validatePlanningStateConsumer(changed) == nil {
+			t.Fatal("unsafe durable accepted")
+		}
+	}
+}

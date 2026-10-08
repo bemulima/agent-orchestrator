@@ -1,0 +1,252 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"io"
+	"time"
+)
+
+func (s Store) GetByStudentKey(c context.Context, student, key string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return scanDiagnostic(s.Pool.QueryRow(c, `SELECT idempotency_key::text,request_hash,id::text,student_id::text,course_id::text,plan_revision::text,policy_version,course_content_revision,plan_digest,bootstrap_binding_revision,bootstrap_binding_digest,bootstrap_binding_created_at,bootstrap_binding_goal_code,bootstrap_binding_direction_code,created_at,plan_json FROM diagnostic_assessment_plan WHERE student_id=$1 AND idempotency_key=$2`, student, key))
+}
+func (s Store) GetDiagnosticByID(c context.Context, id string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return scanDiagnostic(s.Pool.QueryRow(c, `SELECT idempotency_key::text,request_hash,id::text,student_id::text,course_id::text,plan_revision::text,policy_version,course_content_revision,plan_digest,bootstrap_binding_revision,bootstrap_binding_digest,bootstrap_binding_created_at,bootstrap_binding_goal_code,bootstrap_binding_direction_code,created_at,plan_json FROM diagnostic_assessment_plan WHERE id=$1`, id))
+}
+func (s Store) GetLatest(c context.Context, student, course, contextDigest string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	return scanDiagnostic(s.Pool.QueryRow(c, `SELECT idempotency_key::text,request_hash,id::text,student_id::text,course_id::text,plan_revision::text,policy_version,course_content_revision,plan_digest,bootstrap_binding_revision,bootstrap_binding_digest,bootstrap_binding_created_at,bootstrap_binding_goal_code,bootstrap_binding_direction_code,created_at,plan_json FROM diagnostic_assessment_plan WHERE student_id=$1 AND course_id=$2 AND bootstrap_context_digest=$3 ORDER BY plan_revision DESC LIMIT 1`, student, course, contextDigest))
+}
+func (s Store) Insert(c context.Context, r domain.DiagnosticAssessmentPlanRecord) (domain.DiagnosticAssessmentPlanRecord, error) {
+	b, e := json.Marshal(r.Plan)
+	if e != nil {
+		return domain.DiagnosticAssessmentPlanRecord{}, e
+	}
+	_, e = s.Pool.Exec(c, `INSERT INTO diagnostic_assessment_plan(id,student_id,course_id,plan_revision,idempotency_key,request_hash,course_content_revision,policy_version,plan_digest,onboarding_version,bootstrap_policy_version,bootstrap_context_digest,bootstrap_binding_revision,bootstrap_binding_digest,bootstrap_binding_created_at,bootstrap_binding_goal_code,bootstrap_binding_direction_code,plan_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, r.Plan.ID, r.Plan.StudentID, r.Plan.CourseID, r.Plan.PlanRevision, r.IdempotencyKey, r.RequestHash, r.Plan.CourseRevision, r.Plan.PolicyVersion, r.Plan.PlanDigest, r.Plan.OnboardingVersion, r.Plan.BootstrapPolicyVersion, r.Plan.BootstrapContextDigest, r.BindingRevision, r.BindingDigest, r.BindingCreatedAt, r.BindingGoalCode, r.BindingDirectionCode, b, r.Plan.CreatedAt)
+	if e != nil {
+		var pg *pgconn.PgError
+		if errors.As(e, &pg) && pg.Code == "23505" {
+			return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrConflict
+		}
+		return domain.DiagnosticAssessmentPlanRecord{}, e
+	}
+	return r, nil
+}
+
+type diagnosticRow interface{ Scan(...any) error }
+
+func scanDiagnostic(row diagnosticRow) (domain.DiagnosticAssessmentPlanRecord, error) {
+	var r domain.DiagnosticAssessmentPlanRecord
+	var b []byte
+	var createdAt time.Time
+	var id, student, course, revision, policy, contentRevision, planDigest string
+	if e := row.Scan(&r.IdempotencyKey, &r.RequestHash, &id, &student, &course, &revision, &policy, &contentRevision, &planDigest, &r.BindingRevision, &r.BindingDigest, &r.BindingCreatedAt, &r.BindingGoalCode, &r.BindingDirectionCode, &createdAt, &b); e != nil {
+		if errors.Is(e, pgx.ErrNoRows) {
+			return r, domain.ErrNotFound
+		}
+		return r, e
+	}
+	r.BindingCreatedAt = utcStorageTimestamp(r.BindingCreatedAt)
+	createdAt = utcStorageTimestamp(createdAt)
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if e := dec.Decode(&r.Plan); e != nil {
+		return r, e
+	}
+	if dec.Decode(&struct{}{}) != io.EOF || domain.ValidateStoredDiagnosticPlan(r.Plan, id, student, course, revision, policy, contentRevision, planDigest, createdAt) != nil || domain.ValidateDiagnosticPlanRecord(r) != nil {
+		return r, domain.ErrValidation
+	}
+	return r, nil
+}
+
+func (s Store) GetDiagnosticReservation(c context.Context, planID string) (domain.DiagnosticAssessmentReservationRecord, error) {
+	return scanDiagnosticReservation(s.Pool.QueryRow(c, `SELECT student_id::text,course_id::text,attempt_id::text,plan_revision::text,plan_digest,reservation_digest,received_at,reservation_json FROM diagnostic_assessment_reservation_receipt WHERE plan_id=$1`, planID))
+}
+
+func (s Store) InsertDiagnosticReservation(c context.Context, record domain.DiagnosticAssessmentReservationRecord) (domain.DiagnosticAssessmentReservationRecord, error) {
+	plan, validateErr := s.GetDiagnosticByID(c, record.Reservation.PlanID)
+	if validateErr != nil || domain.ValidateDiagnosticPlan(plan.Plan) != nil || domain.ValidateStoredDiagnosticReservation(record, plan.Plan) != nil {
+		return domain.DiagnosticAssessmentReservationRecord{}, domain.ErrValidation
+	}
+	b, err := json.Marshal(record.Reservation)
+	if err != nil {
+		return domain.DiagnosticAssessmentReservationRecord{}, err
+	}
+	_, err = s.Pool.Exec(c, `INSERT INTO diagnostic_assessment_reservation_receipt(plan_id,student_id,course_id,attempt_id,plan_revision,plan_digest,reservation_digest,reservation_json,received_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, record.Reservation.PlanID, record.StudentID, record.CourseID, record.AttemptID, record.Reservation.PlanRevision, record.Reservation.PlanDigest, record.ReservationDigest, b, record.ReceivedAt)
+	if err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && pg.Code == "23505" {
+			return domain.DiagnosticAssessmentReservationRecord{}, domain.ErrConflict
+		}
+		return domain.DiagnosticAssessmentReservationRecord{}, err
+	}
+	return record, nil
+}
+
+func scanDiagnosticReservation(row diagnosticRow) (domain.DiagnosticAssessmentReservationRecord, error) {
+	var record domain.DiagnosticAssessmentReservationRecord
+	var revision string
+	var receivedAt time.Time
+	var b []byte
+	if err := row.Scan(&record.StudentID, &record.CourseID, &record.AttemptID, &revision, &record.Reservation.PlanDigest, &record.ReservationDigest, &receivedAt, &b); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return record, domain.ErrNotFound
+		}
+		return record, err
+	}
+	receivedAt = utcStorageTimestamp(receivedAt)
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&record.Reservation); err != nil {
+		return record, err
+	}
+	record.ReceivedAt = receivedAt
+	plan := domain.DiagnosticAssessmentPlan{ID: record.Reservation.PlanID, StudentID: record.StudentID, CourseID: record.CourseID, PlanRevision: record.Reservation.PlanRevision, PlanDigest: record.Reservation.PlanDigest}
+	if dec.Decode(&struct{}{}) != io.EOF || !canonicalReceiptTime(receivedAt) || record.AttemptID != record.Reservation.PlanID {
+		return record, domain.ErrValidation
+	}
+	digest, err := domain.DiagnosticReservationDigest(record.Reservation)
+	if err != nil || digest != record.ReservationDigest || record.Reservation.PlanRevision != atoiPositive(revision) || domain.ValidateStoredDiagnosticReservation(record, plan) != nil {
+		return record, domain.ErrValidation
+	}
+	return record, nil
+}
+
+func (s Store) GetDiagnosticPlacement(c context.Context, planID string) (domain.DiagnosticPlacementRecord, error) {
+	return scanDiagnosticPlacement(s.Pool.QueryRow(c, `SELECT request_id::text,request_hash,decision_digest,decision_json FROM diagnostic_assessment_placement_decision WHERE plan_id=$1`, planID))
+}
+
+func (s Store) InsertDiagnosticPlacement(c context.Context, record domain.DiagnosticPlacementRecord) (domain.DiagnosticPlacementRecord, error) {
+	plan, validateErr := s.GetDiagnosticByID(c, record.Decision.PlanID)
+	if validateErr != nil {
+		if errors.Is(validateErr, domain.ErrNotFound) {
+			return domain.DiagnosticPlacementRecord{}, domain.ErrValidation
+		}
+		// Database/connection/context failures are retryable delivery failures;
+		// they must never become terminal event validation errors.
+		return domain.DiagnosticPlacementRecord{}, validateErr
+	}
+	if domain.ValidateDiagnosticPlan(plan.Plan) != nil || domain.ValidateStoredDiagnosticPlacement(record.Decision, plan.Plan, record.RequestID, record.RequestHash, record.Decision.DecisionDigest) != nil {
+		return domain.DiagnosticPlacementRecord{}, domain.ErrValidation
+	}
+	b, err := json.Marshal(record.Decision)
+	if err != nil {
+		return domain.DiagnosticPlacementRecord{}, err
+	}
+	_, err = s.Pool.Exec(c, `INSERT INTO diagnostic_assessment_placement_decision(plan_id,student_id,course_id,attempt_id,plan_revision,policy_version,course_content_revision,plan_digest,result_digest,correct,total,percent,band,band_policy_version,route_code,route_policy_version,result_completed_at,decided_at,request_id,request_hash,decision_digest,decision_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, record.Decision.PlanID, record.Decision.StudentID, record.Decision.CourseID, record.Decision.AttemptID, record.Decision.PlanRevision, record.Decision.PolicyVersion, record.Decision.CourseContentRevision, record.Decision.PlanDigest, record.Decision.ResultDigest, record.Decision.Correct, record.Decision.Total, record.Decision.Percent, record.Decision.Band, record.Decision.BandPolicyVersion, record.Decision.RouteCode, record.Decision.RoutePolicyVersion, record.Decision.ResultCompletedAt, record.Decision.DecidedAt, record.RequestID, record.RequestHash, record.Decision.DecisionDigest, b)
+	if err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && pg.Code == "23505" {
+			return domain.DiagnosticPlacementRecord{}, domain.ErrConflict
+		}
+		return domain.DiagnosticPlacementRecord{}, err
+	}
+	return record, nil
+}
+
+func scanDiagnosticPlacement(row diagnosticRow) (domain.DiagnosticPlacementRecord, error) {
+	var record domain.DiagnosticPlacementRecord
+	var digest string
+	var b []byte
+	if err := row.Scan(&record.RequestID, &record.RequestHash, &digest, &b); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return record, domain.ErrNotFound
+		}
+		return record, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&record.Decision); err != nil {
+		return record, err
+	}
+	plan := domain.DiagnosticAssessmentPlan{ID: record.Decision.PlanID, StudentID: record.Decision.StudentID, CourseID: record.Decision.CourseID, PlanRevision: record.Decision.PlanRevision, PolicyVersion: record.Decision.PolicyVersion, CourseRevision: record.Decision.CourseContentRevision, PlanDigest: record.Decision.PlanDigest}
+	if dec.Decode(&struct{}{}) != io.EOF || record.Decision.DecisionDigest != digest || domain.ValidateStoredDiagnosticPlacement(record.Decision, plan, record.RequestID, record.RequestHash, digest) != nil {
+		return record, domain.ErrValidation
+	}
+	return record, nil
+}
+
+func canonicalReceiptTime(v time.Time) bool {
+	return !v.IsZero() && v.Location() == time.UTC && v.Nanosecond()%1000 == 0
+}
+func atoiPositive(raw string) int {
+	var value int
+	if _, err := fmt.Sscan(raw, &value); err != nil || value < 1 {
+		return 0
+	}
+	return value
+}
+
+var _ repository.DiagnosticAssessmentPlanRepository = Store{}
+var _ repository.DiagnosticAssessmentReservationRepository = Store{}
+var _ repository.DiagnosticPlacementRepository = Store{}
+
+func (s Store) GetLatestDiagnosticBootstrapBinding(c context.Context, goal, direction string) (domain.DiagnosticBootstrapBinding, error) {
+	var binding domain.DiagnosticBootstrapBinding
+	err := s.Pool.QueryRow(c, `SELECT goal_code,direction_code,course_id::text,binding_revision,policy_version,binding_digest,active,created_at FROM diagnostic_bootstrap_binding WHERE goal_code=$1 AND direction_code=$2 ORDER BY binding_revision DESC LIMIT 1`, goal, direction).Scan(&binding.GoalCode, &binding.DirectionCode, &binding.CourseID, &binding.BindingRevision, &binding.PolicyVersion, &binding.BindingDigest, &binding.Active, &binding.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return binding, domain.ErrNotFound
+	}
+	if err != nil {
+		return binding, err
+	}
+	return normalizeDiagnosticBootstrapBinding(binding)
+}
+
+// pgx may decode a PostgreSQL timestamptz with time.Local even when its offset
+// is UTC. The domain contract deliberately requires the canonical time.UTC
+// location because the instant is part of the binding digest.
+func normalizeDiagnosticBootstrapBinding(binding domain.DiagnosticBootstrapBinding) (domain.DiagnosticBootstrapBinding, error) {
+	binding.CreatedAt = utcStorageTimestamp(binding.CreatedAt)
+	return domain.NormalizeDiagnosticBootstrapBinding(binding)
+}
+
+func utcStorageTimestamp(value time.Time) time.Time { return value.UTC() }
+
+func (s Store) GetDiagnosticBootstrapReceipt(c context.Context, student, key string) (domain.DiagnosticBootstrapReceipt, error) {
+	var r domain.DiagnosticBootstrapReceipt
+	var raw []byte
+	err := s.Pool.QueryRow(c, `SELECT student_id::text,idempotency_key::text,request_hash,onboarding_version,goal_code,direction_code,course_id::text,binding_revision,binding_digest,binding_created_at,bootstrap_context_digest,plan_id::text,plan_revision,plan_digest,created_at,receipt_json FROM diagnostic_bootstrap_receipt WHERE student_id=$1 AND idempotency_key=$2`, student, key).Scan(&r.StudentID, &r.IdempotencyKey, &r.RequestHash, &r.OnboardingVersion, &r.GoalCode, &r.DirectionCode, &r.CourseID, &r.BindingRevision, &r.BindingDigest, &r.BindingCreatedAt, &r.BootstrapContextDigest, &r.PlanID, &r.PlanRevision, &r.PlanDigest, &r.CreatedAt, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, domain.ErrNotFound
+	}
+	if err != nil {
+		return r, err
+	}
+	r.BindingCreatedAt = utcStorageTimestamp(r.BindingCreatedAt)
+	r.CreatedAt = utcStorageTimestamp(r.CreatedAt)
+	var decoded domain.DiagnosticBootstrapReceipt
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil || decoder.Decode(&struct{}{}) != io.EOF || decoded != r {
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrValidation
+	}
+	return r, nil
+}
+func (s Store) InsertDiagnosticBootstrapReceipt(c context.Context, r domain.DiagnosticBootstrapReceipt) (domain.DiagnosticBootstrapReceipt, error) {
+	plan, planErr := s.GetDiagnosticByID(c, r.PlanID)
+	if planErr != nil || domain.ValidateDiagnosticBootstrapReceipt(r, plan) != nil {
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrValidation
+	}
+	b, marshalErr := json.Marshal(r)
+	if marshalErr != nil {
+		return domain.DiagnosticBootstrapReceipt{}, marshalErr
+	}
+	_, err := s.Pool.Exec(c, `INSERT INTO diagnostic_bootstrap_receipt(student_id,idempotency_key,request_hash,onboarding_version,goal_code,direction_code,course_id,binding_revision,binding_digest,binding_created_at,bootstrap_context_digest,plan_id,plan_revision,plan_digest,receipt_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, r.StudentID, r.IdempotencyKey, r.RequestHash, r.OnboardingVersion, r.GoalCode, r.DirectionCode, r.CourseID, r.BindingRevision, r.BindingDigest, r.BindingCreatedAt, r.BootstrapContextDigest, r.PlanID, r.PlanRevision, r.PlanDigest, b, r.CreatedAt)
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) && pg.Code == "23505" {
+		return domain.DiagnosticBootstrapReceipt{}, domain.ErrConflict
+	}
+	if err != nil {
+		return domain.DiagnosticBootstrapReceipt{}, err
+	}
+	return r, nil
+}
+
+var _ repository.DiagnosticBootstrapRepository = Store{}

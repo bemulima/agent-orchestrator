@@ -1,0 +1,286 @@
+package practiceroute
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+)
+
+var (
+	targetDOM = domain.TargetRef{Type: domain.TargetCapability, Key: "javascript.dom-events", Version: "v1"}
+	targetCSS = domain.TargetRef{Type: domain.TargetConcept, Key: "css.grid", Version: "v1"}
+)
+
+func TestResolveFreezesCompetencyFirstDecisionsAndMaterialIdentities(t *testing.T) {
+	routes := newRouteRepositoryStub()
+	catalog := &practiceCatalogStub{definitions: []domain.LearningTargetDefinition{
+		{Ref: targetDOM, Title: "DOM events", Description: "Handle browser events"},
+		{Ref: targetCSS, Title: "CSS Grid", Description: "Build grid layouts"},
+	}}
+	students := &practiceStudentStub{mastery: []domain.TargetMastery{
+		{Target: targetDOM, State: domain.MasteryMastered, MasteryScore: .91, Confidence: .88, PolicyVersion: domain.StudentMasteryPolicyVersion},
+		{Target: targetCSS, State: domain.MasteryUnknown, MasteryScore: 0, Confidence: 0, PolicyVersion: domain.StudentMasteryPolicyVersion},
+	}}
+	resolver := testResolver(routes, catalog, students)
+	request := validRouteRequest()
+	route, created, err := resolver.Resolve(context.Background(), request.TaskInstanceID, request)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !created || route.Schema != domain.PracticeLearningRouteSchemaV1 || route.RouteDigest == "" || len(route.Steps) != 1 {
+		t.Fatalf("route=%+v created=%v", route, created)
+	}
+	requirements := route.Steps[0].Requirements
+	if requirements[0].Decision != domain.RequirementSatisfied || requirements[0].Blocking || requirements[0].Material != nil {
+		t.Fatalf("mastered required target was not satisfied: %+v", requirements[0])
+	}
+	if requirements[1].Decision != domain.RequirementChallengeOrLearn || !requirements[1].Blocking ||
+		!requirements[1].ChallengeOutAllowed || requirements[1].Material == nil || requirements[1].Material.GenerationKey == "" {
+		t.Fatalf("adaptive target did not produce challenge-or-learn route: %+v", requirements[1])
+	}
+	if requirements[2].Decision != domain.RequirementRecommend || requirements[2].Blocking || requirements[2].Material == nil {
+		t.Fatalf("recommended target has wrong semantics: %+v", requirements[2])
+	}
+
+	replayed, created, err := resolver.Resolve(context.Background(), request.TaskInstanceID, request)
+	if err != nil || created || replayed.RouteDigest != route.RouteDigest || students.calls != 1 {
+		t.Fatalf("replay changed frozen route: route=%+v created=%v mastery_calls=%d err=%v", replayed, created, students.calls, err)
+	}
+}
+
+func TestResolveFailsClosedWhenCatalogDoesNotOwnEveryTarget(t *testing.T) {
+	resolver := testResolver(newRouteRepositoryStub(), &practiceCatalogStub{definitions: []domain.LearningTargetDefinition{{Ref: targetDOM, Title: "DOM", Description: "Events"}}}, &practiceStudentStub{})
+	_, _, err := resolver.Resolve(context.Background(), validRouteRequest().TaskInstanceID, validRouteRequest())
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected missing target, got %v", err)
+	}
+}
+
+func TestReconcileReadinessUsesCurrentStudentMasteryAndReturnsIdempotentReceipt(t *testing.T) {
+	routes := newRouteRepositoryStub()
+	catalog := &practiceCatalogStub{definitions: []domain.LearningTargetDefinition{{Ref: targetDOM, Title: "DOM events", Description: "Handle browser events"}}}
+	students := &practiceStudentStub{mastery: []domain.TargetMastery{{Target: targetDOM, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion}}}
+	readiness := newReadinessRepositoryStub()
+	resolver := testResolver(routes, catalog, students)
+	resolver.Readiness = readiness
+	input := readinessRouteRequest()
+
+	route, _, err := resolver.Resolve(context.Background(), input.TaskInstanceID, domain.PracticeLearningRouteRequestV1{
+		Schema: domain.PracticeLearningRouteRequestSchemaV1, StudentID: input.StudentID, TaskInstanceID: input.TaskInstanceID,
+		TaskRevisionID: input.TaskRevisionID, TaskRevisionDigest: input.TaskRevisionDigest, Locale: "ru",
+		Steps: []domain.PracticeLearningStepInput{{StepID: input.StepID, Requirements: []domain.PracticeLearningRequirement{{
+			ID: "required-dom", Target: targetDOM, Policy: domain.RequirementPolicyRequired, MasteryThreshold: .7,
+		}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RouteID, input.RouteDigest = route.ID, route.RouteDigest
+
+	first, created, err := resolver.ReconcileReadiness(context.Background(), "44444444-4444-4444-8444-444444444444", input)
+	if err != nil || !created || first.Decision != domain.PracticeReadinessNotReady {
+		t.Fatalf("initial reconciliation = (%+v, created=%v, err=%v), want persisted NOT_READY", first, created, err)
+	}
+	students.mastery = []domain.TargetMastery{{Target: targetDOM, State: domain.MasteryMastered, MasteryScore: .91, Confidence: .92, PolicyVersion: domain.StudentMasteryPolicyVersion}}
+	replay, created, err := resolver.ReconcileReadiness(context.Background(), "44444444-4444-4444-8444-444444444444", input)
+	if err != nil || created || replay.ID != first.ID || replay.Decision != domain.PracticeReadinessNotReady || students.calls != 2 {
+		t.Fatalf("same-key replay = (%+v, created=%v, calls=%d, err=%v), want original receipt", replay, created, students.calls, err)
+	}
+	changed := input
+	changed.RouteDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if _, _, err := resolver.ReconcileReadiness(context.Background(), "44444444-4444-4444-8444-444444444444", changed); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("same key with changed payload = %v, want conflict", err)
+	}
+
+	ready, created, err := resolver.ReconcileReadiness(context.Background(), "55555555-5555-4555-8555-555555555555", input)
+	if err != nil || !created || ready.Decision != domain.PracticeReadinessReady || ready.LearnerStateDigest == first.LearnerStateDigest {
+		t.Fatalf("new reconciliation = (%+v, created=%v, err=%v), want READY for current mastery", ready, created, err)
+	}
+}
+
+func TestReconcileReadinessRejectsWrongInstanceOrRevision(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*domain.PracticeLearningReadinessRequestV1)
+	}{
+		{name: "instance", mutate: func(input *domain.PracticeLearningReadinessRequestV1) {
+			input.TaskInstanceID = "99999999-9999-4999-8999-999999999999"
+		}},
+		{name: "revision", mutate: func(input *domain.PracticeLearningReadinessRequestV1) {
+			input.TaskRevisionID = "99999999-9999-4999-8999-999999999999"
+		}},
+		{name: "digest", mutate: func(input *domain.PracticeLearningReadinessRequestV1) {
+			input.TaskRevisionDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			routes := newRouteRepositoryStub()
+			students := &practiceStudentStub{}
+			resolver := testResolver(routes, &practiceCatalogStub{definitions: []domain.LearningTargetDefinition{
+				{Ref: targetDOM, Title: "DOM", Description: "Events"}, {Ref: targetCSS, Title: "Grid", Description: "Layouts"},
+			}}, students)
+			resolver.Readiness = newReadinessRepositoryStub()
+			base := validRouteRequest()
+			route, _, err := resolver.Resolve(context.Background(), base.TaskInstanceID, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := readinessRouteRequest()
+			input.RouteID, input.RouteDigest = route.ID, route.RouteDigest
+			test.mutate(&input)
+			_, _, err = resolver.ReconcileReadiness(context.Background(), "66666666-6666-4666-8666-666666666666", input)
+			if !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("got %v, want route identity conflict", err)
+			}
+		})
+	}
+}
+
+func validRouteRequest() domain.PracticeLearningRouteRequestV1 {
+	return domain.PracticeLearningRouteRequestV1{
+		Schema:    domain.PracticeLearningRouteRequestSchemaV1,
+		StudentID: "11111111-1111-4111-8111-111111111111", TaskInstanceID: "22222222-2222-4222-8222-222222222222",
+		TaskRevisionID:     "33333333-3333-4333-8333-333333333333",
+		TaskRevisionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Locale: "ru",
+		Steps: []domain.PracticeLearningStepInput{{StepID: "board", Requirements: []domain.PracticeLearningRequirement{
+			{ID: "dom", Target: targetDOM, Policy: domain.RequirementPolicyRequired, MasteryThreshold: .7},
+			{ID: "grid-adaptive", Target: targetCSS, Policy: domain.RequirementPolicyAdaptive, MasteryThreshold: .5},
+			{ID: "grid-recommended", Target: targetCSS, Policy: domain.RequirementPolicyRecommended, MasteryThreshold: .5},
+		}}},
+	}
+}
+
+type routeRepositoryStub struct {
+	byTask map[string]domain.PracticeLearningRouteRecord
+	byID   map[string]domain.PracticeLearningRouteRecord
+}
+
+type readinessRepositoryStub struct {
+	records map[string]domain.PracticeLearningReadinessRecord
+}
+
+func newReadinessRepositoryStub() *readinessRepositoryStub {
+	return &readinessRepositoryStub{records: map[string]domain.PracticeLearningReadinessRecord{}}
+}
+
+func readinessRecordKey(taskInstanceID, stepID, key string) string {
+	return taskInstanceID + "\x00" + stepID + "\x00" + key
+}
+
+func (repository *readinessRepositoryStub) GetByIdempotencyKey(_ context.Context, taskInstanceID, stepID, key string) (domain.PracticeLearningReadinessRecord, error) {
+	result, ok := repository.records[readinessRecordKey(taskInstanceID, stepID, key)]
+	if !ok {
+		return domain.PracticeLearningReadinessRecord{}, domain.ErrNotFound
+	}
+	return result, nil
+}
+
+func (repository *readinessRepositoryStub) EnsureReadiness(_ context.Context, record domain.PracticeLearningReadinessRecord) (domain.PracticeLearningReadinessRecord, bool, error) {
+	key := readinessRecordKey(record.Receipt.TaskInstanceID, record.Receipt.StepID, record.IdempotencyKey)
+	if existing, ok := repository.records[key]; ok {
+		if existing.RequestHash != record.RequestHash {
+			return domain.PracticeLearningReadinessRecord{}, false, domain.ErrConflict
+		}
+		return existing, false, nil
+	}
+	repository.records[key] = record
+	return record, true, nil
+}
+
+func newRouteRepositoryStub() *routeRepositoryStub {
+	return &routeRepositoryStub{byTask: map[string]domain.PracticeLearningRouteRecord{}, byID: map[string]domain.PracticeLearningRouteRecord{}}
+}
+func (repository *routeRepositoryStub) GetByTaskInstance(_ context.Context, id string) (domain.PracticeLearningRouteRecord, error) {
+	result, ok := repository.byTask[id]
+	if !ok {
+		return domain.PracticeLearningRouteRecord{}, domain.ErrNotFound
+	}
+	return result, nil
+}
+func (repository *routeRepositoryStub) GetByID(_ context.Context, id string) (domain.PracticeLearningRouteRecord, error) {
+	result, ok := repository.byID[id]
+	if !ok {
+		return domain.PracticeLearningRouteRecord{}, domain.ErrNotFound
+	}
+	return result, nil
+}
+func (repository *routeRepositoryStub) Ensure(_ context.Context, record domain.PracticeLearningRouteRecord) (domain.PracticeLearningRouteRecord, bool, error) {
+	if existing, ok := repository.byTask[record.Route.TaskInstanceID]; ok {
+		if existing.RequestHash != record.RequestHash {
+			return domain.PracticeLearningRouteRecord{}, false, domain.ErrConflict
+		}
+		return existing, false, nil
+	}
+	repository.byTask[record.Route.TaskInstanceID] = record
+	repository.byID[record.Route.ID] = record
+	return record, true, nil
+}
+
+type practiceCatalogStub struct {
+	definitions []domain.LearningTargetDefinition
+}
+
+func (stub *practiceCatalogStub) ResolveDefinitions(_ context.Context, requested []domain.TargetRef) ([]domain.LearningTargetDefinition, error) {
+	wanted := make(map[string]struct{}, len(requested))
+	for _, target := range requested {
+		wanted[domain.TargetIdentity(target)] = struct{}{}
+	}
+	result := make([]domain.LearningTargetDefinition, 0, len(requested))
+	for _, definition := range stub.definitions {
+		if _, exists := wanted[domain.TargetIdentity(definition.Ref)]; exists {
+			result = append(result, definition)
+		}
+	}
+	return result, nil
+}
+
+type practiceStudentStub struct {
+	mastery []domain.TargetMastery
+	calls   int
+}
+
+func (stub *practiceStudentStub) QueryMastery(_ context.Context, _ string, targets []domain.TargetRef) ([]domain.TargetMastery, error) {
+	stub.calls++
+	if len(stub.mastery) != 0 {
+		return stub.mastery, nil
+	}
+	result := make([]domain.TargetMastery, len(targets))
+	for index, target := range targets {
+		result[index] = domain.TargetMastery{Target: target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion}
+	}
+	return result, nil
+}
+
+type practicePolicyStub struct{}
+
+func (practicePolicyStub) GetActivePolicyBundle(context.Context) (domain.PolicyBundle, error) {
+	return domain.PolicyBundle{
+		PlannerVersion: domain.PlannerVersion, PedagogyProfile: domain.DefaultPedagogyProfile,
+		PresentationStyle: domain.DefaultPresentationStyle, GenerationPolicy: domain.DefaultGenerationPolicy,
+		MasterySkipConfidence: domain.DefaultMasteryConfidence,
+		PedagogyStrategies: []domain.PedagogyStrategyVersion{
+			{Code: "explicit_instruction", Version: 1, Priority: 10, Config: json.RawMessage(`{}`)},
+			{Code: "retrieval_practice", Version: 1, Priority: 9, Config: json.RawMessage(`{}`)},
+		},
+	}, nil
+}
+
+type practiceClock struct{}
+
+func (practiceClock) Now() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) }
+
+func testResolver(routes *routeRepositoryStub, catalog *practiceCatalogStub, students *practiceStudentStub) Resolver {
+	return Resolver{Routes: routes, Catalog: catalog, Students: students, Policies: practicePolicyStub{}, Strategies: pedagogy.NewDefaultRegistry(), Clock: practiceClock{}}
+}
+
+func readinessRouteRequest() domain.PracticeLearningReadinessRequestV1 {
+	return domain.PracticeLearningReadinessRequestV1{Schema: domain.PracticeLearningReadinessRequestSchemaV1,
+		TaskInstanceID: "22222222-2222-4222-8222-222222222222", StudentID: "11111111-1111-4111-8111-111111111111",
+		TaskRevisionID: "33333333-3333-4333-8333-333333333333", TaskRevisionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		RouteID: "77777777-7777-4777-8777-777777777777", RouteDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", StepID: "board"}
+}

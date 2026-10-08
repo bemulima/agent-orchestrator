@@ -1,0 +1,130 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	service "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+// Bootstrap owns the only browser-visible diagnostic issue flow. It derives a
+// Course exclusively from Student onboarding and a durably provisioned exact
+// binding; no public field can select a Course or placement outcome.
+type Bootstrap struct {
+	Issuer   Issuer
+	Plans    repository.DiagnosticAssessmentPlanRepository
+	Receipts repository.DiagnosticBootstrapRepository
+	Students service.StudentService
+	Clock    Clock
+}
+
+func (b Bootstrap) Start(ctx context.Context, studentID, key string, input domain.DiagnosticAssessmentBootstrapRequestV1) (domain.DiagnosticAssessmentBootstrapResultV1, bool, error) {
+	if b.Plans == nil || b.Receipts == nil || b.Students == nil || b.Clock == nil || !canonicalUUID(studentID) || !canonicalUUID(key) {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrValidation
+	}
+	input, err := domain.NormalizeDiagnosticBootstrapRequest(input)
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	hash, err := domain.DiagnosticBootstrapRequestHash(studentID, input)
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	if receipt, err := b.Receipts.GetDiagnosticBootstrapReceipt(ctx, studentID, key); err == nil {
+		if receipt.RequestHash != hash || receipt.OnboardingVersion != input.ExpectedOnboardingVersion {
+			return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrConflict
+		}
+		planRecord, planErr := b.Plans.GetDiagnosticByID(ctx, receipt.PlanID)
+		if planErr != nil || domain.ValidateDiagnosticPlan(planRecord.Plan) != nil || domain.ValidateDiagnosticBootstrapReceipt(receipt, planRecord) != nil {
+			return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrValidation
+		}
+		return bootstrapResult(planRecord.Plan), false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+
+	// Crash recovery intentionally happens before either downstream read. The
+	// plan request hash is the public command hash for bootstrap-issued plans.
+	if prior, err := b.Plans.GetByStudentKey(ctx, studentID, key); err == nil {
+		if prior.RequestHash != hash || !validBootstrapPlanRecord(prior) || prior.Plan.OnboardingVersion != input.ExpectedOnboardingVersion {
+			return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrConflict
+		}
+		if err := b.Issuer.EnsureReservation(ctx, prior.Plan); err != nil {
+			return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+		}
+		if err := b.persistReceipt(ctx, receiptFromRecord(studentID, key, hash, prior)); err != nil {
+			return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+		}
+		return bootstrapResult(prior.Plan), false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+
+	profile, err := b.Students.GetPlanningProfile(ctx, studentID)
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	if profile.OnboardingVersion != input.ExpectedOnboardingVersion {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrConflict
+	}
+	binding, err := b.Receipts.GetLatestDiagnosticBootstrapBinding(ctx, profile.GoalCode, profile.DirectionCode)
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	binding, err = domain.NormalizeDiagnosticBootstrapBinding(binding)
+	if err != nil || !binding.Active {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrNotFound
+	}
+	contextDigest, err := domain.DiagnosticBootstrapContextDigest(studentID, profile.OnboardingVersion, binding)
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	plan, created, err := b.Issuer.Issue(ctx, key, domain.DiagnosticAssessmentPlanRequestV1{
+		Schema: domain.DiagnosticAssessmentPlanRequestSchemaV1, StudentID: studentID, CourseID: binding.CourseID, ExpectedPreviousRevision: input.ExpectedPreviousRevision,
+		OnboardingVersion: profile.OnboardingVersion, BootstrapPolicyVersion: domain.DiagnosticBootstrapPolicyV1, BootstrapContextDigest: contextDigest,
+		BindingRevision: binding.BindingRevision, BindingDigest: binding.BindingDigest, BindingGoalCode: binding.GoalCode, BindingDirectionCode: binding.DirectionCode, BindingCreatedAt: binding.CreatedAt, RequestHash: hash,
+	})
+	if err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	issued, err := b.Plans.GetDiagnosticByID(ctx, plan.ID)
+	if err != nil || issued.Plan.ID != plan.ID || issued.Plan.PlanDigest != plan.PlanDigest || !validBootstrapPlanRecord(issued) {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, domain.ErrValidation
+	}
+	if err := b.persistReceipt(ctx, receiptFromRecord(studentID, key, hash, issued)); err != nil {
+		return domain.DiagnosticAssessmentBootstrapResultV1{}, false, err
+	}
+	return bootstrapResult(plan), created, nil
+}
+
+func (b Bootstrap) persistReceipt(ctx context.Context, wanted domain.DiagnosticBootstrapReceipt) error {
+	stored, err := b.Receipts.InsertDiagnosticBootstrapReceipt(ctx, wanted)
+	if errors.Is(err, domain.ErrConflict) {
+		stored, err = b.Receipts.GetDiagnosticBootstrapReceipt(ctx, wanted.StudentID, wanted.IdempotencyKey)
+	}
+	if err != nil {
+		return err
+	}
+	plan, err := b.Plans.GetDiagnosticByID(ctx, wanted.PlanID)
+	if err != nil || domain.ValidateDiagnosticBootstrapReceipt(stored, plan) != nil || stored != wanted {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+func receiptFromRecord(student, key, hash string, record domain.DiagnosticAssessmentPlanRecord) domain.DiagnosticBootstrapReceipt {
+	return domain.DiagnosticBootstrapReceipt{StudentID: student, IdempotencyKey: key, RequestHash: hash, OnboardingVersion: record.Plan.OnboardingVersion, GoalCode: record.BindingGoalCode, DirectionCode: record.BindingDirectionCode, CourseID: record.Plan.CourseID, BindingRevision: record.BindingRevision, BindingDigest: record.BindingDigest, BindingCreatedAt: record.BindingCreatedAt, BootstrapContextDigest: record.Plan.BootstrapContextDigest, PlanID: record.Plan.ID, PlanRevision: record.Plan.PlanRevision, PlanDigest: record.Plan.PlanDigest, CreatedAt: record.Plan.CreatedAt}
+}
+func bootstrapResult(plan domain.DiagnosticAssessmentPlan) domain.DiagnosticAssessmentBootstrapResultV1 {
+	return domain.DiagnosticAssessmentBootstrapResultV1{Schema: domain.DiagnosticAssessmentBootstrapResultSchemaV1, PlanID: plan.ID, AttemptID: plan.ID, PlanRevision: plan.PlanRevision, PlanDigest: plan.PlanDigest, OnboardingVersion: plan.OnboardingVersion, CreatedAt: plan.CreatedAt}
+}
+
+func validBootstrapPlanRecord(record domain.DiagnosticAssessmentPlanRecord) bool {
+	if domain.ValidateDiagnosticPlan(record.Plan) != nil {
+		return false
+	}
+	binding, err := domain.NormalizeDiagnosticBootstrapBinding(domain.DiagnosticBootstrapBinding{GoalCode: record.BindingGoalCode, DirectionCode: record.BindingDirectionCode, CourseID: record.Plan.CourseID, BindingRevision: record.BindingRevision, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, BindingDigest: record.BindingDigest, Active: true, CreatedAt: record.BindingCreatedAt})
+	return err == nil && binding.GoalCode == record.BindingGoalCode && binding.DirectionCode == record.BindingDirectionCode
+}

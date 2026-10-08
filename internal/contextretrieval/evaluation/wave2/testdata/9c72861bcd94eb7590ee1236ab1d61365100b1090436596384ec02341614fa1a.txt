@@ -1,0 +1,592 @@
+package projectauthoring
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+type projectFlowRepositoryFake struct {
+	flow            domain.ProjectAuthoringFlow
+	missing         bool
+	readyCalls      int
+	publishedCalls  int
+	retryCalls      int
+	failCalls       int
+	failureCode     string
+	checkpointCalls int
+}
+
+func (fake *projectFlowRepositoryFake) CreateOrGetProjectAuthoringFlow(_ context.Context, flow domain.ProjectAuthoringFlow) (domain.ProjectAuthoringFlow, bool, error) {
+	if fake.flow.ID != "" {
+		return fake.flow, false, nil
+	}
+	fake.flow = flow
+	return flow, true, nil
+}
+func (fake *projectFlowRepositoryFake) GetProjectAuthoringFlow(_ context.Context, studentID, flowID string) (domain.ProjectAuthoringFlow, error) {
+	if fake.missing || fake.flow.StudentID != studentID || fake.flow.ID != flowID {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) GetProjectAuthoringFlowByKey(_ context.Context, studentID, key string) (domain.ProjectAuthoringFlow, error) {
+	if fake.missing || fake.flow.StudentID != studentID || fake.flow.IdempotencyKey != key {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) GetCurrentProjectAuthoringFlow(
+	_ context.Context, studentID, pathID string, pathVersion int64, pathDigest string, profileVersion int64, profileDigest string,
+) (domain.ProjectAuthoringFlow, error) {
+	flow := fake.flow
+	if fake.missing || flow.Status == domain.ProjectAuthoringFailed || flow.StudentID != studentID ||
+		flow.LearningPathID != pathID || flow.LearningPathVersion != pathVersion ||
+		flow.PathSnapshotDigest != pathDigest || flow.AuthoringProfileVersion != profileVersion ||
+		flow.AuthoringProfileDigest != profileDigest {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	return flow, nil
+}
+func (fake *projectFlowRepositoryFake) ConfirmProjectAuthoringFlow(_ context.Context, studentID, flowID, key, digest string, now time.Time) (domain.ProjectAuthoringFlow, error) {
+	if fake.flow.StudentID != studentID || fake.flow.ID != flowID || fake.flow.Status != domain.ProjectAuthoringProposed {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	fake.flow.Status = domain.ProjectAuthoringConfirmed
+	fake.flow.ConfirmationIdempotencyKey, fake.flow.ConfirmationDigest = key, digest
+	fake.flow.ConfirmedAt = &now
+	fake.flow.Version++
+	fake.flow.UpdatedAt = now
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) RequestProjectPublication(_ context.Context, studentID, flowID, key, digest string, now time.Time) (domain.ProjectAuthoringFlow, error) {
+	if fake.flow.StudentID != studentID || fake.flow.ID != flowID || fake.flow.Status != domain.ProjectAuthoringReady {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	fake.flow.PublicationIdempotencyKey, fake.flow.PublicationRequestDigest = key, digest
+	fake.flow.PublicationRequestedAt = &now
+	fake.flow.Version++
+	fake.flow.UpdatedAt = now
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) ClaimNextProjectAuthoringFlow(_ context.Context, token string, now, lease time.Time) (domain.ProjectAuthoringFlow, error) {
+	if fake.missing || (fake.flow.Status != domain.ProjectAuthoringConfirmed && fake.flow.Status != domain.ProjectAuthoringAuthoring &&
+		(fake.flow.Status != domain.ProjectAuthoringReady || fake.flow.PublicationRequestedAt == nil)) {
+		return domain.ProjectAuthoringFlow{}, domain.ErrNotFound
+	}
+	if fake.flow.Status == domain.ProjectAuthoringConfirmed {
+		fake.flow.Status = domain.ProjectAuthoringAuthoring
+	}
+	fake.flow.ClaimToken, fake.flow.LeaseUntil = token, &lease
+	fake.flow.Attempts++
+	fake.flow.Version++
+	fake.flow.UpdatedAt = now
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) RenewProjectAuthoringClaim(_ context.Context, id, token string, version int64, _, lease time.Time) error {
+	if fake.flow.ID != id || fake.flow.ClaimToken != token || fake.flow.Version != version {
+		return domain.ErrConflict
+	}
+	fake.flow.LeaseUntil = &lease
+	return nil
+}
+func (fake *projectFlowRepositoryFake) CheckpointTZAuthoringJob(_ context.Context, flow domain.ProjectAuthoringFlow, token, jobID string, status domain.TZAuthoringJobStatus, now time.Time) (domain.ProjectAuthoringFlow, error) {
+	if fake.flow.Version != flow.Version || fake.flow.ClaimToken != token {
+		return domain.ProjectAuthoringFlow{}, domain.ErrConflict
+	}
+	fake.checkpointCalls++
+	fake.flow.TZAuthoringJobID, fake.flow.TZJobStatus = jobID, status
+	fake.flow.Version++
+	fake.flow.UpdatedAt = now
+	return fake.flow, nil
+}
+func (fake *projectFlowRepositoryFake) MarkProjectAuthoringStaged(_ context.Context, flow domain.ProjectAuthoringFlow, token string, job domain.TZAuthoringJob, now time.Time) error {
+	if fake.flow.Version != flow.Version || fake.flow.ClaimToken != token {
+		return domain.ErrConflict
+	}
+	fake.readyCalls++
+	fake.flow.Status, fake.flow.TZJobStatus = domain.ProjectAuthoringStaged, domain.TZAuthoringStaged
+	fake.flow.Staging = job.Staging
+	fake.flow.ReadyBlueprintDigest, fake.flow.ReadyCandidateDigest = job.BlueprintDigest, job.CandidateDigest
+	fake.flow.ReadyContractDigest, fake.flow.ReadyCapabilitiesDigest = job.ContractDigest, job.CapabilitiesDigest
+	fake.flow.ReadyVerificationDigest, fake.flow.ReadyAt = job.VerificationDigest, &now
+	fake.flow.ClaimToken, fake.flow.LeaseUntil = "", nil
+	fake.flow.Version++
+	return nil
+}
+func (fake *projectFlowRepositoryFake) MarkProjectAuthoringPublished(_ context.Context, flow domain.ProjectAuthoringFlow, token string, receipt domain.ProjectPublicationReceiptV1, digest string, now time.Time) error {
+	if fake.flow.Version != flow.Version || fake.flow.ClaimToken != token {
+		return domain.ErrConflict
+	}
+	fake.publishedCalls++
+	fake.flow.Status, fake.flow.Publication = domain.ProjectAuthoringPublished, &receipt
+	fake.flow.PublicationReceiptDigest, fake.flow.PublishedAt = digest, &now
+	fake.flow.ClaimToken, fake.flow.LeaseUntil = "", nil
+	fake.flow.Version++
+	return nil
+}
+func (fake *projectFlowRepositoryFake) RetryProjectAuthoring(_ context.Context, flow domain.ProjectAuthoringFlow, token string, next, now time.Time) error {
+	if fake.flow.Version != flow.Version || fake.flow.ClaimToken != token {
+		return domain.ErrConflict
+	}
+	fake.retryCalls++
+	fake.flow.ClaimToken, fake.flow.LeaseUntil = "", nil
+	fake.flow.NextAttemptAt, fake.flow.UpdatedAt = next, now
+	fake.flow.Version++
+	return nil
+}
+func (fake *projectFlowRepositoryFake) FailProjectAuthoring(_ context.Context, flow domain.ProjectAuthoringFlow, token, code string, now time.Time) error {
+	if fake.flow.Version != flow.Version || fake.flow.ClaimToken != token {
+		return domain.ErrConflict
+	}
+	fake.failCalls++
+	fake.failureCode = code
+	fake.flow.Status, fake.flow.FailureCode = domain.ProjectAuthoringFailed, code
+	fake.flow.ClaimToken, fake.flow.LeaseUntil = "", nil
+	fake.flow.UpdatedAt = now
+	fake.flow.Version++
+	return nil
+}
+
+type projectStudentFake struct {
+	profile      domain.StudentPlanningProfile
+	path         domain.LearningPathPlanningState
+	profileError error
+	pathError    error
+	profiles     []domain.StudentPlanningProfile
+	profileCalls int
+	pathCalls    int
+}
+
+func (fake *projectStudentFake) GetPlanningProfile(context.Context, string) (domain.StudentPlanningProfile, error) {
+	profile := fake.profile
+	if len(fake.profiles) > 0 {
+		profile = fake.profiles[min(fake.profileCalls, len(fake.profiles)-1)]
+	}
+	fake.profileCalls++
+	return profile, fake.profileError
+}
+func (fake *projectStudentFake) GetLearningPathPlanningState(context.Context, string, string) (domain.LearningPathPlanningState, error) {
+	fake.pathCalls++
+	return fake.path, fake.pathError
+}
+
+type projectTZFake struct {
+	ensureJob    domain.TZAuthoringJob
+	getJob       domain.TZAuthoringJob
+	resumeJob    domain.TZAuthoringJob
+	publishJob   domain.TZAuthoringJob
+	ensureError  error
+	getError     error
+	resumeError  error
+	publishError error
+	ensureCalls  int
+	getCalls     int
+	resumeCalls  int
+	publishCalls int
+	stageCalls   int
+	stageError   error
+	stageJob     domain.TZAuthoringJob
+}
+
+func (fake *projectTZFake) EnsureAuthoringJob(_ context.Context, _ string, _ domain.TZAuthoringRequestV2) (domain.TZAuthoringJob, error) {
+	fake.ensureCalls++
+	return fake.ensureJob, fake.ensureError
+}
+func (fake *projectTZFake) GetAuthoringJob(context.Context, string) (domain.TZAuthoringJob, error) {
+	fake.getCalls++
+	return fake.getJob, fake.getError
+}
+func (fake *projectTZFake) ResumeAuthoringJob(context.Context, string) (domain.TZAuthoringJob, error) {
+	fake.resumeCalls++
+	return fake.resumeJob, fake.resumeError
+}
+func (fake *projectTZFake) PublishAuthoringJob(context.Context, string) (domain.TZAuthoringJob, error) {
+	fake.publishCalls++
+	return fake.publishJob, fake.publishError
+}
+
+func (fake *projectTZFake) StageAuthoringJob(_ context.Context, id string) (domain.TZAuthoringJob, error) {
+	fake.stageCalls++
+	if fake.stageError != nil {
+		return domain.TZAuthoringJob{}, fake.stageError
+	}
+	job := fake.stageJob
+	if job.ID == "" {
+		job = fake.ensureJob
+		if job.ID == "" {
+			job = fake.getJob
+		}
+		if job.ID == "" {
+			job = fake.resumeJob
+		}
+	}
+	job.Status = domain.TZAuthoringStaged
+	job.Staging = &domain.ProjectStagingReceiptV1{Schema: "practice-task-staging-receipt.v1", StagedID: "33333333-3333-4333-8333-333333333333", AuthoringJobID: id, State: "staged", Created: true, FamilyKey: "go-project", VariantKey: "default", CandidateDigest: job.CandidateDigest, BlueprintDigest: job.BlueprintDigest, CreatedAt: time.Now().UTC()}
+	return job, nil
+}
+
+type projectClock struct{ now time.Time }
+
+func (clock projectClock) Now() time.Time { return clock.now }
+
+type projectIDs struct{ id string }
+
+func (ids projectIDs) NewID() string { return ids.id }
+
+func TestAuthoringReachesPrivateStageWithoutPublishingOrStartingRuntime(t *testing.T) {
+	flow, student := confirmedProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	tz := &projectTZFake{ensureJob: readyTZJob(flow)}
+	processor := projectProcessor(repository, student, tz)
+	processed, err := processor.ProcessNext(context.Background())
+	if err != nil || !processed || repository.readyCalls != 1 || repository.publishedCalls != 0 ||
+		tz.ensureCalls != 1 || tz.publishCalls != 0 || tz.stageCalls != 1 {
+		t.Fatalf("processed=%t err=%v ready=%d published=%d TZ=%+v", processed, err, repository.readyCalls, repository.publishedCalls, tz)
+	}
+	if repository.flow.Status != domain.ProjectAuthoringStaged || repository.flow.Staging == nil || repository.flow.PublicationRequestedAt != nil {
+		t.Fatalf("READY crossed explicit publication boundary: %#v", repository.flow)
+	}
+}
+
+func TestAuthoringLostResponseRecoveryReplaysCreateAndKeepsExactTZJob(t *testing.T) {
+	flow, student := confirmedProjectFlow(t)
+	flow.Status = domain.ProjectAuthoringAuthoring
+	flow.TZAuthoringJobID = "77777777-7777-4777-8777-777777777777"
+	flow.TZJobStatus = domain.TZAuthoringGenerating
+	repository := &projectFlowRepositoryFake{flow: flow}
+	job := readyTZJob(flow)
+	job.ID = flow.TZAuthoringJobID
+	tz := &projectTZFake{getError: domain.ErrNotFound, ensureJob: job}
+	processed, err := projectProcessor(repository, student, tz).ProcessNext(context.Background())
+	if err != nil || !processed || tz.getCalls != 1 || tz.ensureCalls != 1 || repository.checkpointCalls != 0 || repository.readyCalls != 1 {
+		t.Fatalf("lost response recovery failed processed=%t err=%v repository=%+v tz=%+v", processed, err, repository, tz)
+	}
+}
+
+func TestAuthoringStaleOwnerAndMalformedTZAreTerminalWhileNetworkRetries(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		mutate      func(*projectStudentFake, *projectTZFake)
+		failureCode string
+		retry       bool
+	}{
+		{name: "stale owner", mutate: func(student *projectStudentFake, _ *projectTZFake) { student.path.PathVersion++ }, failureCode: domain.ProjectAuthoringFailureOwnerStale},
+		{name: "stale authoring locale", mutate: func(student *projectStudentFake, _ *projectTZFake) { student.profile.PreferredLanguage = "en" }, failureCode: domain.ProjectAuthoringFailureOwnerStale},
+		{name: "stale desired stacks", mutate: func(student *projectStudentFake, _ *projectTZFake) {
+			student.profile.DesiredStacks = []string{"go", "postgresql"}
+		}, failureCode: domain.ProjectAuthoringFailureOwnerStale},
+		{name: "stale profile revision", mutate: func(student *projectStudentFake, _ *projectTZFake) { student.profile.OnboardingVersion++ }, failureCode: domain.ProjectAuthoringFailureOwnerStale},
+		{name: "malformed TZ", mutate: func(_ *projectStudentFake, tz *projectTZFake) { tz.ensureJob.ID = "not-a-uuid" }, failureCode: domain.ProjectAuthoringFailureTZInvalid},
+		{name: "network retry", mutate: func(_ *projectStudentFake, tz *projectTZFake) { tz.ensureError = domain.ErrUpstreamUnavailable }, retry: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			flow, student := confirmedProjectFlow(t)
+			repository := &projectFlowRepositoryFake{flow: flow}
+			tz := &projectTZFake{ensureJob: readyTZJob(flow)}
+			testCase.mutate(student, tz)
+			processed, err := projectProcessor(repository, student, tz).ProcessNext(context.Background())
+			if err != nil || !processed {
+				t.Fatalf("processed=%t err=%v", processed, err)
+			}
+			if testCase.retry {
+				if repository.retryCalls != 1 || repository.failCalls != 0 {
+					t.Fatalf("wanted retry: %+v", repository)
+				}
+			} else if repository.failCalls != 1 || repository.failureCode != testCase.failureCode || repository.retryCalls != 0 {
+				t.Fatalf("wanted terminal %s: %+v", testCase.failureCode, repository)
+			}
+			if testCase.failureCode == domain.ProjectAuthoringFailureOwnerStale && tz.ensureCalls != 0 {
+				t.Fatal("TZ called before stale owner was rejected")
+			}
+		})
+	}
+}
+
+func TestReadyCheckpointRevalidatesFrozenAuthoringProfileAfterTZCall(t *testing.T) {
+	flow, student := confirmedProjectFlow(t)
+	changed := student.profile
+	changed.PreferredLanguage = "en"
+	student.profiles = []domain.StudentPlanningProfile{student.profile, changed}
+	repository := &projectFlowRepositoryFake{flow: flow}
+	tz := &projectTZFake{ensureJob: readyTZJob(flow)}
+	processed, err := projectProcessor(repository, student, tz).ProcessNext(context.Background())
+	if err != nil || !processed || tz.ensureCalls != 1 || repository.readyCalls != 0 ||
+		repository.failCalls != 1 || repository.failureCode != domain.ProjectAuthoringFailureOwnerStale {
+		t.Fatalf("READY accepted changed profile: processed=%t err=%v repository=%+v tz=%+v", processed, err, repository, tz)
+	}
+}
+
+func TestLegacyPublicationFailsClosedEvenWithChangedOwner(t *testing.T) {
+	flow, student := readyProjectFlow(t)
+	student.profile.DesiredStacks = []string{"go", "postgresql"}
+	repository := &projectFlowRepositoryFake{flow: flow}
+	tz := &projectTZFake{}
+	processed, err := projectProcessor(repository, student, tz).ProcessNext(context.Background())
+	if err != nil || !processed || tz.publishCalls != 0 || repository.publishedCalls != 0 ||
+		repository.failCalls != 1 || repository.failureCode != domain.ProjectAuthoringFailureTZInvalid {
+		t.Fatalf("publish accepted changed profile: processed=%t err=%v repository=%+v tz=%+v", processed, err, repository, tz)
+	}
+}
+
+func TestLegacyPublicationFailsClosedWithoutAcceptance(t *testing.T) {
+	flow, student := readyProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	tz := &projectTZFake{}
+	processed, err := projectProcessor(repository, student, tz).ProcessNext(context.Background())
+	if err != nil || !processed || repository.failCalls != 1 || repository.publishedCalls != 0 || tz.publishCalls != 0 || tz.stageCalls != 0 {
+		t.Fatalf("publication crossed acceptance gate: %+v %+v %v", repository, tz, err)
+	}
+}
+
+func TestConfirmationExactReplayIsLocalAndCompetingKeyConflicts(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	commands := Commands{Flows: repository, Students: student, Clock: projectClock{flow.CreatedAt.Add(time.Minute)}}
+	key := "66666666-6666-4666-8666-666666666666"
+	confirmed, err := commands.Confirm(context.Background(), flow.StudentID, flow.ID, key, domain.ProjectAuthoringConfirmRequestV1{Schema: domain.ProjectAuthoringConfirmSchemaV1})
+	if err != nil || confirmed.Status != domain.ProjectAuthoringConfirmed || student.pathCalls != 1 {
+		t.Fatalf("confirm=%+v err=%v calls=%d", confirmed, err, student.pathCalls)
+	}
+	student.pathError = errors.New("must not read on replay")
+	if _, err := commands.Confirm(context.Background(), flow.StudentID, flow.ID, key, domain.ProjectAuthoringConfirmRequestV1{Schema: domain.ProjectAuthoringConfirmSchemaV1}); err != nil || student.pathCalls != 1 {
+		t.Fatalf("exact replay was not local err=%v calls=%d", err, student.pathCalls)
+	}
+	if _, err := commands.Confirm(context.Background(), flow.StudentID, flow.ID, "99999999-9999-4999-8999-999999999999", domain.ProjectAuthoringConfirmRequestV1{Schema: domain.ProjectAuthoringConfirmSchemaV1}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("competing confirmation err=%v", err)
+	}
+}
+
+func TestCreateExactReplayReturnsFrozenAuthoringProfileProvenance(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	student.profileError = errors.New("replay must not reread changed profile")
+	student.pathError = errors.New("replay must not reread changed path")
+	repository := &projectFlowRepositoryFake{flow: flow}
+	commands := Commands{
+		Flows: repository, Students: student,
+		IDs: projectIDs{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, Clock: projectClock{flow.CreatedAt},
+	}
+	replayed, created, err := commands.Create(
+		context.Background(), flow.StudentID, flow.LearningPathID, flow.IdempotencyKey,
+		domain.ProjectAuthoringCreateRequestV1{Schema: domain.ProjectAuthoringCreateSchemaV1},
+	)
+	if err != nil || created || replayed.AuthoringProfileVersion != flow.AuthoringProfileVersion ||
+		replayed.AuthoringProfileDigest != flow.AuthoringProfileDigest || student.profileCalls != 0 || student.pathCalls != 0 {
+		t.Fatalf("create replay=%+v created=%t err=%v student=%+v", replayed, created, err, student)
+	}
+}
+
+func TestGetCurrentRecoversOnlyExactLiveOwnerSnapshot(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	commands := Commands{Flows: &projectFlowRepositoryFake{flow: flow}, Students: student}
+	current, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID)
+	if err != nil || current.ID != flow.ID || student.profileCalls != 1 || student.pathCalls != 1 {
+		t.Fatalf("current=%+v err=%v student=%+v", current, err, student)
+	}
+
+	student.profile.PreferredLanguage = "en"
+	if _, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("stale profile current err=%v", err)
+	}
+	student.profile = projectProfile(t)
+	student.path.PathVersion++
+	student.profile.LearningPathVersion++
+	if _, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("stale path current err=%v", err)
+	}
+	student.path.PathVersion--
+	student.profile.LearningPathVersion--
+	student.path.IsSelected = false
+	if _, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("unselected current err=%v", err)
+	}
+}
+
+func TestGetCurrentExcludesFailedAndReturnsPublished(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	commands := Commands{Flows: repository, Students: student}
+	repository.flow.Status = domain.ProjectAuthoringFailed
+	if _, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("failed current err=%v", err)
+	}
+	repository.flow = flow
+	repository.flow.Status = domain.ProjectAuthoringPublished
+	current, err := commands.GetCurrent(context.Background(), flow.StudentID, flow.LearningPathID)
+	if err != nil || current.Status != domain.ProjectAuthoringPublished {
+		t.Fatalf("published current=%+v err=%v", current, err)
+	}
+}
+
+func TestCreateDifferentKeyConvergesOnExistingSnapshotWithoutChangingIdentity(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	commands := Commands{Flows: repository, Students: student,
+		IDs: projectIDs{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, Clock: projectClock{flow.CreatedAt}}
+	stored, created, err := commands.Create(context.Background(), flow.StudentID, flow.LearningPathID,
+		"99999999-9999-4999-8999-999999999999", domain.ProjectAuthoringCreateRequestV1{Schema: domain.ProjectAuthoringCreateSchemaV1})
+	if err != nil || created || stored.ID != flow.ID || stored.IdempotencyKey != flow.IdempotencyKey {
+		t.Fatalf("stored=%+v created=%t err=%v", stored, created, err)
+	}
+}
+
+func TestCreateAllowsDifferentSnapshotButRejectsSameKeyForAnotherPath(t *testing.T) {
+	flow, student := proposedProjectFlow(t)
+	repository := &snapshotCreateRepository{projectFlowRepositoryFake: &projectFlowRepositoryFake{flow: flow}}
+	commands := Commands{Flows: repository, Students: student,
+		IDs: projectIDs{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, Clock: projectClock{flow.CreatedAt}}
+	student.path.PathVersion++
+	student.profile.LearningPathVersion++
+	stored, created, err := commands.Create(context.Background(), flow.StudentID, flow.LearningPathID,
+		"99999999-9999-4999-8999-999999999999", domain.ProjectAuthoringCreateRequestV1{Schema: domain.ProjectAuthoringCreateSchemaV1})
+	if err != nil || !created || stored.PathSnapshotDigest == flow.PathSnapshotDigest {
+		t.Fatalf("different snapshot stored=%+v created=%t err=%v", stored, created, err)
+	}
+	if _, _, err := commands.Create(context.Background(), flow.StudentID,
+		"99999999-9999-4999-8999-999999999999", flow.IdempotencyKey,
+		domain.ProjectAuthoringCreateRequestV1{Schema: domain.ProjectAuthoringCreateSchemaV1}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("same key foreign path err=%v", err)
+	}
+}
+
+type snapshotCreateRepository struct{ *projectFlowRepositoryFake }
+
+func (repository *snapshotCreateRepository) CreateOrGetProjectAuthoringFlow(
+	_ context.Context, flow domain.ProjectAuthoringFlow,
+) (domain.ProjectAuthoringFlow, bool, error) {
+	existing := repository.flow
+	if existing.IdempotencyKey == flow.IdempotencyKey ||
+		(existing.Status != domain.ProjectAuthoringFailed && existing.LearningPathVersion == flow.LearningPathVersion &&
+			existing.PathSnapshotDigest == flow.PathSnapshotDigest &&
+			existing.AuthoringProfileVersion == flow.AuthoringProfileVersion &&
+			existing.AuthoringProfileDigest == flow.AuthoringProfileDigest) {
+		return existing, false, nil
+	}
+	return flow, true, nil
+}
+
+func projectProfile(t *testing.T) domain.StudentPlanningProfile {
+	t.Helper()
+	profile, _ := projectOwnerFixture()
+	return profile
+}
+
+func projectProcessor(repository *projectFlowRepositoryFake, student *projectStudentFake, tz *projectTZFake) Processor {
+	return Processor{Flows: repository, Students: student, TZ: tz,
+		IDs:      projectIDs{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		Clock:    projectClock{time.Date(2026, 9, 5, 13, 0, 0, 0, time.UTC)},
+		LeaseTTL: time.Minute, MaxAttempts: 5}
+}
+
+func proposedProjectFlow(t *testing.T) (domain.ProjectAuthoringFlow, *projectStudentFake) {
+	t.Helper()
+	profile, path := projectOwnerFixture()
+	flow, err := domain.NewProjectAuthoringFlow(
+		"11111111-1111-4111-8111-111111111111", path.StudentID, path.LearningPathID,
+		"55555555-5555-4555-8555-555555555555", profile, path,
+		time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return flow, &projectStudentFake{profile: profile, path: path}
+}
+
+func confirmedProjectFlow(t *testing.T) (domain.ProjectAuthoringFlow, *projectStudentFake) {
+	flow, student := proposedProjectFlow(t)
+	now := flow.CreatedAt.Add(time.Minute)
+	flow.ConfirmationIdempotencyKey = "66666666-6666-4666-8666-666666666666"
+	flow.ConfirmationDigest, _ = domain.ProjectConfirmationDigest(flow)
+	flow.ConfirmedAt, flow.Status, flow.UpdatedAt = &now, domain.ProjectAuthoringConfirmed, now
+	flow.Version++
+	return flow, student
+}
+
+func readyProjectFlow(t *testing.T) (domain.ProjectAuthoringFlow, *projectStudentFake) {
+	flow, student := confirmedProjectFlow(t)
+	job := readyTZJob(flow)
+	now := flow.CreatedAt.Add(2 * time.Minute)
+	flow.Status, flow.TZAuthoringJobID, flow.TZJobStatus = domain.ProjectAuthoringReady, job.ID, domain.TZAuthoringReady
+	flow.ReadyBlueprintDigest, flow.ReadyCandidateDigest = job.BlueprintDigest, job.CandidateDigest
+	flow.ReadyContractDigest, flow.ReadyCapabilitiesDigest = job.ContractDigest, job.CapabilitiesDigest
+	flow.ReadyVerificationDigest, flow.ReadyAt = job.VerificationDigest, &now
+	flow.PublicationIdempotencyKey = "88888888-8888-4888-8888-888888888888"
+	flow.PublicationRequestDigest, _ = domain.ProjectPublicationRequestDigest(flow)
+	flow.PublicationRequestedAt, flow.UpdatedAt = &now, now
+	flow.Version += 2
+	return flow, student
+}
+
+func readyTZJob(flow domain.ProjectAuthoringFlow) domain.TZAuthoringJob {
+	jobID := flow.TZAuthoringJobID
+	if jobID == "" {
+		jobID = "77777777-7777-4777-8777-777777777777"
+	}
+	return domain.TZAuthoringJob{ID: jobID, Status: domain.TZAuthoringReady, Attempts: 1,
+		Intent:          flow.AuthoringRequest.Orchestration,
+		BlueprintDigest: projectDigest("a"), CandidateDigest: projectDigest("b"), ContractDigest: projectDigest("c"),
+		CapabilitiesDigest: projectDigest("d"), VerificationDigest: projectDigest("e")}
+}
+
+func publicationReceipt(flow domain.ProjectAuthoringFlow) domain.ProjectPublicationReceiptV1 {
+	return domain.ProjectPublicationReceiptV1{Schema: domain.TZPublicationResultSchemaV1,
+		RevisionID: "99999999-9999-4999-8999-999999999999", FamilyKey: "go-project", VariantKey: "default", RevisionNumber: 1,
+		BlueprintDigest: flow.ReadyBlueprintDigest, CandidateDigest: flow.ReadyCandidateDigest,
+		ContractDigest: flow.ReadyContractDigest, CapabilitiesDigest: flow.ReadyCapabilitiesDigest,
+		AuthoringJobID: flow.TZAuthoringJobID}
+}
+
+func projectOwnerFixture() (domain.StudentPlanningProfile, domain.LearningPathPlanningState) {
+	studentID, pathID, courseID := "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+	profile := domain.StudentPlanningProfile{DirectionCode: "backend", SelfAssessedExperience: "junior", KnownStacks: []string{"sql"}, DesiredStacks: []string{"go"}, GoalCode: "go.backend", PreferredLanguage: "ru", WeeklyMinutes: 240, PreferredPace: "standard", ProfileVersion: domain.StudentPlanningProfileVersion, OnboardingVersion: 2, LearningPathVersion: 7, LearningPathCourseID: courseID, LearningPathGoalCode: "go.backend", LearningPathRevision: "course-fingerprint-v1"}
+	path := domain.LearningPathPlanningState{Schema: domain.LearningPathPlanningStateSchema, StudentID: studentID, LearningPathID: pathID, CourseID: courseID, GoalCode: "go.backend", CourseFingerprint: "course-fingerprint-v1", Status: "ACTIVE", IsPrimary: true, IsSelected: true, PathVersion: 7, JourneyVersion: 9, PlannerPolicyVersion: "course-planner-v1", ReasonCode: "initial_plan", ReasonSummary: "initial", Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Position: 0, Status: domain.LearningPathItemReady, Targets: []domain.TargetRef{{Type: domain.TargetCapability, Key: "go.http", Version: "v1"}}, ReasonCode: "first_current_gap"}}, UpdatedAt: time.Date(2026, 9, 5, 11, 0, 0, 0, time.UTC)}
+	return profile, path
+}
+
+func projectDigest(character string) string { return "sha256:" + strings.Repeat(character, 64) }
+
+func TestStagingAmbiguityRetriesSameVerifiedJobWithoutPublication(t *testing.T) {
+	flow, student := confirmedProjectFlow(t)
+	repository := &projectFlowRepositoryFake{flow: flow}
+	tz := &projectTZFake{ensureJob: readyTZJob(flow), stageError: domain.ErrUpstreamUnavailable}
+	processor := projectProcessor(repository, student, tz)
+	if _, err := processor.ProcessNext(context.Background()); err != nil || repository.retryCalls != 1 || repository.readyCalls != 0 || tz.stageCalls != 1 {
+		t.Fatalf("retry=%+v tz=%+v err=%v", repository, tz, err)
+	}
+	tz.getJob, tz.stageError = tz.ensureJob, nil
+	if _, err := processor.ProcessNext(context.Background()); err != nil || repository.flow.Status != domain.ProjectAuthoringStaged || repository.flow.Staging == nil || tz.ensureCalls != 1 || tz.stageCalls != 2 || tz.publishCalls != 0 || repository.flow.Publication != nil {
+		t.Fatalf("stage=%+v tz=%+v err=%v", repository, tz, err)
+	}
+}
+
+func TestPublicationCommandRejectsReadyAndStagedCandidates(t *testing.T) {
+	for _, status := range []domain.ProjectAuthoringStatus{domain.ProjectAuthoringReady, domain.ProjectAuthoringStaged} {
+		flow, student := readyProjectFlow(t)
+		flow.Status = status
+		repository := &projectFlowRepositoryFake{flow: flow}
+		commands := Commands{Flows: repository, Students: student, Clock: projectClock{now: flow.UpdatedAt}}
+		_, err := commands.RequestPublication(context.Background(), flow.StudentID, flow.ID, flow.PublicationIdempotencyKey, domain.ProjectAuthoringPublishRequestV1{Schema: domain.ProjectAuthoringPublishSchemaV1})
+		if !errors.Is(err, domain.ErrConflict) || repository.publishedCalls != 0 {
+			t.Fatalf("%s accepted publication: %v", status, err)
+		}
+	}
+}
+
+func TestRecoveredStageReceiptFinishesWithoutResubmitting(t *testing.T) {
+	flow, student := confirmedProjectFlow(t)
+	job := readyTZJob(flow)
+	fake := &projectTZFake{ensureJob: job}
+	staged, err := fake.StageAuthoringJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tz := &projectTZFake{ensureJob: staged}
+	repository := &projectFlowRepositoryFake{flow: flow}
+	if _, err := projectProcessor(repository, student, tz).ProcessNext(context.Background()); err != nil || repository.flow.Status != domain.ProjectAuthoringStaged || repository.flow.Staging.StagedID != staged.Staging.StagedID || tz.stageCalls != 0 || tz.publishCalls != 0 {
+		t.Fatalf("recovery=%+v tz=%+v err=%v", repository, tz, err)
+	}
+}

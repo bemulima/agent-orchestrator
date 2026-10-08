@@ -1,0 +1,163 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+	runtimehttp "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+)
+
+type t08WorkspaceFixture struct {
+	Schema             string              `json:"schema"`
+	StudentID          string              `json:"student_id"`
+	TaskInstanceID     string              `json:"task_instance_id"`
+	TaskRevisionID     string              `json:"task_revision_id"`
+	TaskRevisionDigest string              `json:"task_revision_digest"`
+	StepID             string              `json:"step_id"`
+	Locale             string              `json:"locale"`
+	Target             domain.Target       `json:"target"`
+	Title              string              `json:"title"`
+	Objective          string              `json:"objective"`
+	Deliverables       []string            `json:"deliverables"`
+	Acceptance         []domain.Acceptance `json:"acceptance"`
+}
+
+// This fixture persists a synthetic frozen instance; it does not invoke Start,
+// Sandbox, Student reservation, Teacher, validators or official outcomes. The
+// Planner route and subsequent commands use actual HTTP adapters and owners.
+func TestT08WorkspaceHTTPProvider(t *testing.T) {
+	plannerURL, token := os.Getenv("T08_PLANNER_URL"), os.Getenv("T08_PLANNER_TOKEN")
+	fixtureFile := os.Getenv("T08_RUNTIME_PROVIDER_FIXTURE_FILE")
+	readyFile, stopFile := os.Getenv("T08_RUNTIME_READY_FILE"), os.Getenv("T08_RUNTIME_STOP_FILE")
+	if plannerURL == "" || token == "" || fixtureFile == "" || readyFile == "" || stopFile == "" {
+		t.Skip("owned T08 Runtime provider fixture is not configured")
+	}
+	var fixture t08WorkspaceFixture
+	payload, err := os.ReadFile(fixtureFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(payload, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.Schema != "t08-workspace-provider-fixture.v1" || !domain.IsCanonicalUUID(fixture.StudentID) ||
+		!domain.IsCanonicalUUID(fixture.TaskInstanceID) || !domain.IsCanonicalUUID(fixture.TaskRevisionID) || !domain.IsCanonicalUUID(fixture.StepID) ||
+		!validDigest(fixture.TaskRevisionDigest) || fixture.Locale == "" || fixture.Title == "" || fixture.Objective == "" {
+		t.Fatal("invalid owned T08 frozen-instance fixture")
+	}
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	instance.ID, instance.StudentID, instance.TaskRevisionID = fixture.TaskInstanceID, fixture.StudentID, fixture.TaskRevisionID
+	instance.TaskRevisionDigest, instance.Locale = fixture.TaskRevisionDigest, fixture.Locale
+	instance.LearningActionID = testUUID(0x8008) // Synthetic actor context; no Student reservation is claimed.
+	instance.Steps[0].ID, instance.Steps[0].Title, instance.Steps[0].Objective = fixture.StepID, fixture.Title, fixture.Objective
+	instance.Steps[0].Deliverables, instance.Steps[0].Acceptance = fixture.Deliverables, fixture.Acceptance
+	instance.Steps[0].Targets, instance.Steps[0].Status = []domain.Target{fixture.Target}, "LEARNING_REQUIRED"
+	instance.CurrentStep = &instance.Steps[0]
+	instance.RevisionSummary.RevisionID, instance.RevisionSummary.Digest = instance.TaskRevisionID, instance.TaskRevisionDigest
+	instance.RevisionSummary.Title, instance.RevisionSummary.Type = "T08 synthetic frozen practice", "BUILD"
+	instance.RevisionSummary.Surface, instance.RevisionSummary.FamilyKey = "practice", "t08-practice"
+	instance.RevisionSummary.VariantKey = "t08-variant"
+	instance.RevisionSummary.RevisionNumber, instance.RevisionSummary.PublishedAt = 1, time.Now().UTC()
+	instance.RevisionEnvelope.Revision.ID, instance.RevisionEnvelope.RevisionDigest = instance.TaskRevisionID, instance.TaskRevisionDigest
+	// A syntactically valid unprovisioned reference is required by the public DTO;
+	// Available=false truthfully declares that no Sandbox workspace exists here.
+	instance.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: testUUID(0x8009), Available: false}
+	planner := adapters.NewLearningPlannerHTTPClient(plannerURL, token, &http.Client{Timeout: 10 * time.Second})
+	request, err := domain.BuildLearningRouteRequest(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.LearningRoute, err = planner.ResolveRoute(ctx, ports.ResolveLearningRoute{Request: encoded})
+	if err != nil {
+		t.Fatalf("SETUP: actual Planner route resolution: %v", err)
+	}
+	// Preserve the exact ARRAY returned by the production adapter. Wrapping it
+	// in {steps: ...} would mask an incompatible materialization consumer.
+	if len(instance.LearningRoute.Steps) == 0 || instance.LearningRoute.Steps[0] != '[' {
+		t.Fatal("actual Planner route must expose the frozen steps array")
+	}
+	instance, _, err = repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance, err = repository.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := NewRepository(db).GetInstance(ctx, fixture.StudentID, fixture.TaskInstanceID)
+	if err != nil || loaded.LearningRoute.ID != instance.LearningRoute.ID || loaded.LearningRoute.RouteDigest != instance.LearningRoute.RouteDigest ||
+		!jsonEqual(loaded.LearningRoute.Steps, instance.LearningRoute.Steps) {
+		t.Fatalf("SETUP: frozen real Planner route persistence: %v", err)
+	}
+	runtime := &usecase.Runtime{Repository: NewRepository(db), Planner: planner}
+	server := httptest.NewServer((&runtimehttp.Server{Runtime: runtime}).Handler())
+	t.Cleanup(server.Close)
+	var databaseSchema string
+	if err := db.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&databaseSchema); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := json.Marshal(map[string]string{
+		"base_url": server.URL, "database_schema": databaseSchema, "student_id": instance.StudentID, "instance_id": instance.ID,
+		"revision_id": instance.TaskRevisionID, "step_id": fixture.StepID, "route_id": instance.LearningRoute.ID,
+		"classification": "actual Runtime HTTP+PG and actual Planner HTTP route; synthetic frozen instance/actor; no Start/Sandbox/Teacher/validator outcomes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readyFile, ready, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("T08 owned actual Runtime provider ready; actual frozen Planner steps array retained")
+	t08WaitRuntimeStop(t, stopFile)
+	final, err := NewRepository(db).GetInstance(ctx, fixture.StudentID, fixture.TaskInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var commandReceipts int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM practice_command_receipts WHERE task_instance_id=$1`, instance.ID).Scan(&commandReceipts); err != nil {
+		t.Fatal(err)
+	}
+	decision := "NONE"
+	if final.Steps[0].ReadinessReceipt != nil {
+		decision = final.Steps[0].ReadinessReceipt.Decision
+	}
+	t.Logf("owned actual Runtime SQL readback: status=%s stepStatus=%s readinessDecision=%s version=%d commandReceipts=%d", final.Status, final.Steps[0].Status, decision, final.Version, commandReceipts)
+}
+
+func t08WaitRuntimeStop(t *testing.T, stopFile string) {
+	t.Helper()
+	timer := time.NewTimer(15 * time.Minute)
+	defer timer.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(stopFile); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("T08 Runtime provider timed out awaiting root stop file")
+		case <-ticker.C:
+		}
+	}
+}

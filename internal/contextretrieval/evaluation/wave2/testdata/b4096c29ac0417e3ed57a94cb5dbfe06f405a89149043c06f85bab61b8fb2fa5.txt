@@ -1,0 +1,77 @@
+BEGIN;
+-- Independent of 018 (project authoring). No legacy checkpoint is backfilled.
+-- BYTEA retains exact fingerprint-v1 context and generated artifact bytes.
+CREATE TABLE course_planning_input_checkpoint (
+ request_id uuid PRIMARY KEY REFERENCES course_plan_request(id) ON DELETE RESTRICT,
+ student_id uuid NOT NULL,
+ request_hash text NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+ goal_code varchar(64) NOT NULL CHECK (length(goal_code)>0),
+ checkpoint_hash text NOT NULL CHECK (checkpoint_hash ~ '^[0-9a-f]{64}$'),
+ payload_bytes bytea NOT NULL CHECK (octet_length(payload_bytes) BETWEEN 1 AND 33554432),
+ payload_sha256 text NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$' AND payload_sha256=encode(sha256(payload_bytes),'hex')),
+ write_claim uuid NOT NULL,
+ checkpointed_at timestamptz NOT NULL,
+ UNIQUE (request_id,checkpoint_hash),
+ CHECK ((convert_from(payload_bytes,'UTF8')::jsonb->>'schema'='planner-planning-input.v1'
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'request_id'=request_id::text
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'student_id'=student_id::text
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'request_hash'=request_hash
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'goal_code'=goal_code
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'input_hash'=checkpoint_hash) IS TRUE)
+);
+CREATE TABLE course_planning_generated_checkpoint (
+ request_id uuid PRIMARY KEY,
+ checkpoint_hash text NOT NULL CHECK (checkpoint_hash ~ '^[0-9a-f]{64}$'),
+ parent_hash text NOT NULL CHECK (parent_hash ~ '^[0-9a-f]{64}$'),
+ payload_bytes bytea NOT NULL CHECK (octet_length(payload_bytes) BETWEEN 1 AND 16781312),
+ payload_sha256 text NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$' AND payload_sha256=encode(sha256(payload_bytes),'hex')),
+ write_claim uuid NOT NULL,
+ checkpointed_at timestamptz NOT NULL,
+ FOREIGN KEY(request_id,parent_hash) REFERENCES course_planning_input_checkpoint(request_id,checkpoint_hash) ON DELETE RESTRICT,
+ UNIQUE(request_id,checkpoint_hash),
+ CHECK ((convert_from(payload_bytes,'UTF8')::jsonb->>'schema'='planner-generated-course.v1'
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'request_id'=request_id::text
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'artifact_hash'=checkpoint_hash
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'input_hash'=parent_hash) IS TRUE)
+);
+CREATE TABLE course_planning_ensure_checkpoint (
+ request_id uuid PRIMARY KEY,
+ checkpoint_hash text NOT NULL CHECK (checkpoint_hash ~ '^[0-9a-f]{64}$'),
+ parent_hash text NOT NULL CHECK (parent_hash ~ '^[0-9a-f]{64}$'),
+ payload_bytes bytea NOT NULL CHECK (octet_length(payload_bytes) BETWEEN 1 AND 1048576),
+ payload_sha256 text NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$' AND payload_sha256=encode(sha256(payload_bytes),'hex')),
+ write_claim uuid NOT NULL,
+ checkpointed_at timestamptz NOT NULL,
+ FOREIGN KEY(request_id,parent_hash) REFERENCES course_planning_generated_checkpoint(request_id,checkpoint_hash) ON DELETE RESTRICT,
+ CHECK ((convert_from(payload_bytes,'UTF8')::jsonb->>'schema'='planner-course-ensure.v1'
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'request_id'=request_id::text
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'receipt_hash'=checkpoint_hash
+ AND convert_from(payload_bytes,'UTF8')::jsonb->>'artifact_hash'=parent_hash) IS TRUE)
+);
+CREATE FUNCTION guard_course_planning_checkpoint_insert() RETURNS trigger AS $$
+DECLARE r course_plan_request; p jsonb;
+BEGIN
+ SELECT * INTO r FROM course_plan_request WHERE id=NEW.request_id FOR UPDATE;
+ IF NOT FOUND OR r.status<>'PLANNING' OR r.claim_token IS DISTINCT FROM NEW.write_claim OR r.lease_until IS NULL OR r.lease_until<=NEW.checkpointed_at OR r.lease_until<=clock_timestamp() THEN
+  RAISE EXCEPTION 'planning checkpoint requires active claim' USING ERRCODE='23514';
+ END IF;
+ IF TG_TABLE_NAME='course_planning_input_checkpoint' THEN
+  p:=convert_from(NEW.payload_bytes,'UTF8')::jsonb;
+  IF NEW.student_id<>r.student_id OR NEW.request_hash<>r.request_hash OR NEW.goal_code<>r.goal_code OR p->'intent' IS DISTINCT FROM r.intent_json OR COALESCE(p->>'diagnostic_plan_id','')<>COALESCE(r.diagnostic_plan_id::text,'') OR
+   (r.intent_json->>'reason'='REPLAN' AND COALESCE(p->>'original_learning_path_id','')<>COALESCE(r.learning_path_id::text,'')) OR
+   (r.intent_json->>'reason'='INITIAL' AND (COALESCE(p->>'original_learning_path_id','')<>'' OR (p->'original_path' IS DISTINCT FROM 'null'::jsonb AND COALESCE(p->'original_path'->>'learning_path_id','')<>COALESCE(r.learning_path_id::text,'')))) THEN
+   RAISE EXCEPTION 'planning checkpoint request binding mismatch' USING ERRCODE='23514';
+  END IF;
+ END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE FUNCTION protect_course_planning_checkpoint() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'planning checkpoint is immutable'; END; $$ LANGUAGE plpgsql;
+DO $$ DECLARE t text; BEGIN
+ FOREACH t IN ARRAY ARRAY['course_planning_input_checkpoint','course_planning_generated_checkpoint','course_planning_ensure_checkpoint'] LOOP
+  EXECUTE format('CREATE TRIGGER %I BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION guard_course_planning_checkpoint_insert()',t||'_claim',t);
+  EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION protect_course_planning_checkpoint()',t||'_immutable',t);
+  EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION protect_course_planning_checkpoint()',t||'_truncate',t);
+ END LOOP;
+END $$;
+COMMIT;

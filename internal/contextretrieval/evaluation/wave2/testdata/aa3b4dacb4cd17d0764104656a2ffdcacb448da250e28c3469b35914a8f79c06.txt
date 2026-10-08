@@ -1,0 +1,146 @@
+package hybridreplan
+
+import (
+	"context"
+	"errors"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"log/slog"
+	"strings"
+	"time"
+)
+
+type Clock interface{ Now() time.Time }
+
+// SnapshotProcessor only obtains/checkpoints coherent observations. T20.2
+// provides no evaluation or consequence-application dependency.
+type SnapshotProcessor struct {
+	Jobs       repository.HybridReplanning
+	Students   domainservice.HybridStudentSnapshotService
+	Clock      Clock
+	LeaseTTL   time.Duration
+	RetryDelay time.Duration
+}
+
+func (p SnapshotProcessor) ProcessNext(ctx context.Context) (bool, error) {
+	if p.Jobs == nil || p.Students == nil || p.Clock == nil || p.LeaseTTL <= 0 || p.RetryDelay <= 0 {
+		return false, domain.ErrValidation
+	}
+	work, claimed, err := p.Jobs.ClaimHybridEvaluationWork(ctx, p.Clock.Now().UTC(), p.LeaseTTL)
+	if err != nil || !claimed {
+		return false, err
+	}
+	// One bounded lifetime belongs to this durable lease. A restarted worker can
+	// only reclaim after expiry; its claim token fences this worker's checkpoint.
+	workContext, cancel := context.WithTimeout(ctx, p.LeaseTTL)
+	defer cancel()
+	fail := func(cause error) (bool, error) {
+		releaseErr := p.Jobs.ReleaseHybridEvaluationWork(ctx, work, p.Clock.Now().UTC().Add(p.RetryDelay))
+		return true, errors.Join(cause, releaseErr)
+	}
+	event := work.LatestEvent
+	if domain.ValidatePlanningStateChangedEvent(event) != nil || work.StudentID != event.StudentID || work.LearningPathID != event.Data.LearningPathID || work.Generation < 1 || strings.TrimSpace(work.ClaimToken) == "" || !work.LeaseUntil.After(p.Clock.Now().UTC()) {
+		return fail(domain.ErrValidation)
+	}
+	reason := "Committed Student planning state"
+	if work.LocalReason != "" {
+		if work.LocalReason != "OWNER_APPLICATION_STALE" {
+			return fail(domain.ErrValidation)
+		}
+		reason = "Planner recovery after stale owner application"
+	}
+	request, err := domain.NormalizeHybridSnapshotRequest(domain.HybridSnapshotRequest{Targets: event.Data.Targets, TriggerContext: domain.HybridSnapshotTrigger{Kind: event.Data.TriggerKind, Reason: reason, CorrelationID: event.EventID}})
+	if err != nil {
+		return fail(err)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		snapshot, readErr := p.Students.GetHybridPlanningSnapshot(workContext, work.StudentID, work.LearningPathID, request)
+		if readErr != nil {
+			return fail(readErr)
+		}
+		if err := domain.ValidateHybridPlanningSnapshot(snapshot, work.StudentID, work.LearningPathID, request); err != nil {
+			return fail(err)
+		}
+		// This snapshot alone discovers the path's target set. If a concurrent path
+		// revision introduces another target, refetch the entire expanded set; never
+		// join old mastery/profile/path fragments into an invented observation.
+		nextRequest, complete, unionErr := snapshotTargetUnion(request, snapshot)
+		if unionErr != nil {
+			return fail(unionErr)
+		}
+		if !complete {
+			request = nextRequest
+			continue
+		}
+		if !work.LeaseUntil.After(p.Clock.Now().UTC()) {
+			return fail(domain.ErrConflict)
+		}
+		if _, err := p.Jobs.CheckpointHybridSnapshot(workContext, work, snapshot, domain.HybridReplanPolicyVersion); err != nil {
+			return fail(err)
+		}
+		return true, nil
+	}
+	return fail(domain.ErrStateChanged)
+}
+
+func snapshotTargetUnion(request domain.HybridSnapshotRequest, snapshot domain.HybridPlanningSnapshot) (domain.HybridSnapshotRequest, bool, error) {
+	targets := map[string]domain.HybridTargetRef{}
+	identity := func(t domain.HybridTargetRef) string { return string(t.Type) + "\x00" + t.Key + "\x00" + t.Version }
+	for _, target := range request.Targets {
+		targets[identity(target)] = target
+	}
+	complete := true
+	for _, target := range domain.HybridSnapshotTargets(snapshot) {
+		key := identity(target)
+		if _, present := targets[key]; !present {
+			complete = false
+			targets[key] = target
+		}
+	}
+	if complete {
+		return request, true, nil
+	}
+	request.Targets = make([]domain.HybridTargetRef, 0, len(targets))
+	for _, target := range targets {
+		request.Targets = append(request.Targets, target)
+	}
+	normalized, err := domain.NormalizeHybridSnapshotRequest(request)
+	if err != nil {
+		return domain.HybridSnapshotRequest{}, false, domain.ErrUpstreamInvalid
+	}
+	return normalized, false, nil
+}
+
+type SnapshotWorker struct {
+	Processor    SnapshotProcessor
+	PollInterval time.Duration
+	Logger       *slog.Logger
+}
+
+func (w SnapshotWorker) Run(ctx context.Context) {
+	interval := w.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	logger := w.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		processed, err := w.Processor.ProcessNext(ctx)
+		if err != nil {
+			logger.ErrorContext(ctx, "hybrid planning snapshot checkpoint failed", "error", err)
+		}
+		if processed && err == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

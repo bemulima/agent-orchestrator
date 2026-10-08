@@ -1,0 +1,176 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type executionRepositoryFake struct {
+	ports.Repository
+	instance   domain.TaskInstance
+	submission domain.Submission
+	reads      int
+	changing   bool
+}
+
+func (r *executionRepositoryFake) GetInstance(_ context.Context, studentID, instanceID string) (domain.TaskInstance, error) {
+	if studentID != r.instance.StudentID || instanceID != r.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	r.reads++
+	value := r.instance
+	if r.changing {
+		value.Version = int64(r.reads)
+	}
+	return value, nil
+}
+func (r *executionRepositoryFake) GetSubmission(_ context.Context, instanceID, submissionID string) (domain.Submission, error) {
+	if instanceID != r.submission.TaskInstanceID || submissionID != r.submission.ID {
+		return domain.Submission{}, domain.ErrNotFound
+	}
+	return r.submission, nil
+}
+
+func (r *executionRepositoryFake) GetIntent(context.Context, string, string) (domain.SubmitIntent, error) {
+	return domain.SubmitIntent{}, domain.ErrNotFound
+}
+
+func executionFixture() domain.TaskInstance {
+	return domain.TaskInstance{ID: "00000000-0000-4000-8000-000000000001", StudentID: "00000000-0000-4000-8000-000000000002", LearningActionID: "00000000-0000-4000-8000-000000000003", TaskRevisionID: "00000000-0000-4000-8000-000000000004", TaskRevisionDigest: "sha256:" + strings.Repeat("a", 64), Status: domain.TaskInstanceInProgress, Version: 1, WorkspaceBinding: domain.WorkspaceBinding{Available: true}, Steps: []domain.Step{{ID: "optional", Required: false, Status: "AVAILABLE"}, {ID: "required", Required: true, Status: "AVAILABLE"}}}
+}
+
+func TestExecutionProjectionBoundsRuntimeStatesAndActions(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		status                     domain.TaskInstanceStatus
+		submission                 domain.SubmissionStatus
+		run                        domain.ValidationRunStatus
+		stepStatus                 string
+		wantStatus, action, reason string
+	}{
+		{"active", domain.TaskInstanceInProgress, "", "", "AVAILABLE", "READY", "RESUME_PRACTICE", "practice_active"},
+		{"prerequisite", domain.TaskInstanceInProgress, "", "", "LEARNING_REQUIRED", "READY", "START_PRACTICE_LEARNING", "prerequisite_learning_required"},
+		{"final submission", domain.TaskInstanceInProgress, "", "", "CHECKPOINTED", "READY", "SUBMIT_PRACTICE", "final_submission_required"},
+		{"failed", domain.TaskInstanceInProgress, domain.SubmissionFailed, domain.ValidationRunFailed, "AVAILABLE", "READY", "REVIEW_VALIDATION_RESULT", "validation_result_failed"},
+		{"changes requested", domain.TaskInstanceInProgress, domain.SubmissionChangesRequested, domain.ValidationRunPassed, "PASSED", "READY", "REVIEW_VALIDATION_RESULT", "human_changes_requested"},
+		{"validation running", domain.TaskInstanceValidating, domain.SubmissionValidating, domain.ValidationRunRunning, "AVAILABLE", "BLOCKED", "", "validation_running"},
+		{"technical failure", domain.TaskInstanceValidating, domain.SubmissionValidating, domain.ValidationRunError, "AVAILABLE", "BLOCKED", "", "validation_error"},
+		{"provisioning", domain.TaskInstanceStarting, "", "", "AVAILABLE", "BLOCKED", "", "practice_provisioning"},
+		{"human review", domain.TaskInstanceInReview, domain.SubmissionReviewRequired, domain.ValidationRunPassed, "PASSED", "BLOCKED", "", "human_review_pending"},
+		{"finalizing", domain.TaskInstanceFinalizing, "", "", "PASSED", "BLOCKED", "", "practice_finalizing"},
+		{"completed", domain.TaskInstanceCompleted, "", "", "PASSED", "COMPLETED", "", "practice_completed"},
+		{"cancelled", domain.TaskInstanceCancelled, "", "", "AVAILABLE", "CANCELLED", "", "practice_cancelled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			instance := executionFixture()
+			instance.Status = tc.status
+			instance.Steps[1].Status = tc.stepStatus
+			repo := &executionRepositoryFake{instance: instance}
+			if tc.submission != "" {
+				repo.instance.CurrentSubmissionID = "00000000-0000-4000-8000-000000000005"
+				repo.submission = domain.Submission{ID: repo.instance.CurrentSubmissionID, TaskInstanceID: instance.ID, StudentID: instance.StudentID, Status: tc.submission, ValidationRuns: []domain.ValidationRun{{ID: "run", Status: tc.run}}}
+			}
+			projection, err := (&Runtime{Repository: repo}).ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if projection.Status != tc.wantStatus || projection.SuggestedAction != tc.action || projection.ReasonCode != tc.reason {
+				t.Fatalf("projection %+v", projection)
+			}
+			if tc.action == "RESUME_PRACTICE" && projection.StepID != "required" {
+				t.Fatalf("optional step blocked required progression: %+v", projection)
+			}
+			if tc.action == "START_PRACTICE_LEARNING" && (projection.StepID != "required" || projection.MilestoneID != "required" || len(projection.AvailableActions) != 1 || projection.AvailableActions[0] != tc.action || projection.SubmissionScope != "") {
+				t.Fatalf("prerequisite lacks exact executable learning target: %+v", projection)
+			}
+			if tc.action == "REVIEW_VALIDATION_RESULT" && !strings.Contains(strings.Join(projection.AvailableActions, ","), "RETRY_PRACTICE") {
+				t.Fatal("learner retry missing")
+			}
+			if tc.wantStatus == "BLOCKED" && len(projection.AvailableActions) != 0 {
+				t.Fatalf("blocked projection offers commands: %+v", projection)
+			}
+			if !strings.HasPrefix(projection.Version, "sha256:") {
+				t.Fatal("missing provenance")
+			}
+			encoded, _ := json.Marshal(projection)
+			for _, forbidden := range []string{"validation_runs", "workspace_binding", "evaluation_context", "runtime_profile", "STARTING", "IN_PROGRESS"} {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("internal state leaked: %s", encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutionProjectionIsOwnerScopedAndReadOnlyWithStableVersion(t *testing.T) {
+	instance := executionFixture()
+	repo := &executionRepositoryFake{instance: instance}
+	runtime := &Runtime{Repository: repo}
+	first, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil || first.Version != replay.Version {
+		t.Fatal("unstable computed version")
+	}
+	repo.instance.Version++
+	next, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil || next.Version == first.Version {
+		t.Fatal("changed state did not alter version")
+	}
+	if _, err := runtime.ExecutionProjection(context.Background(), "00000000-0000-4000-8000-000000000099", instance.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("cross-owner read accepted")
+	}
+	repo.changing = true
+	if _, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("torn snapshot accepted: %v", err)
+	}
+}
+
+func TestStaleExecutionProjectionCannotSubmitAfterStateTransition(t *testing.T) {
+	instance := executionFixture()
+	instance.Steps[1].ID = "00000000-0000-4000-8000-000000000007"
+	repo := &executionRepositoryFake{instance: instance}
+	runtime := &Runtime{Repository: repo}
+	projection, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.SubmissionScope != "MILESTONE" {
+		t.Fatal("submit target missing")
+	}
+	repo.instance.Status = domain.TaskInstanceValidating
+	_, status, err := runtime.Submit(context.Background(), domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID, IdempotencyKey: "00000000-0000-4000-8000-000000000006", Scope: projection.SubmissionScope, MilestoneID: projection.MilestoneID})
+	if !errors.Is(err, domain.ErrConflict) || status != 409 {
+		t.Fatalf("stale projection forced transition: status %d error %v", status, err)
+	}
+}
+
+func TestExecutionProjectionVersionTracksRunChangesWithoutInstanceVersion(t *testing.T) {
+	instance := executionFixture()
+	instance.Status = domain.TaskInstanceValidating
+	instance.CurrentSubmissionID = "00000000-0000-4000-8000-000000000005"
+	repo := &executionRepositoryFake{instance: instance, submission: domain.Submission{ID: instance.CurrentSubmissionID, StudentID: instance.StudentID, TaskInstanceID: instance.ID, Status: domain.SubmissionValidating, ValidationRuns: []domain.ValidationRun{{ID: "first-run", Status: domain.ValidationRunPending}}}}
+	runtime := &Runtime{Repository: repo}
+	first, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.submission.ValidationRuns[0].Status = domain.ValidationRunRunning
+	running, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil || running.Version == first.Version {
+		t.Fatal("RUNNING change omitted from provenance")
+	}
+	repo.submission.ValidationRuns[0].Status = domain.ValidationRunError
+	failed, err := runtime.ExecutionProjection(context.Background(), instance.StudentID, instance.ID)
+	if err != nil || failed.Version == running.Version || failed.ReasonCode != "validation_error" {
+		t.Fatal("ERROR change omitted from provenance")
+	}
+}

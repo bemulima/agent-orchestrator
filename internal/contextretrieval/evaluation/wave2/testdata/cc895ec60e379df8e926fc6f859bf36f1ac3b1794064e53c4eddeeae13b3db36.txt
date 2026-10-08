@@ -1,0 +1,359 @@
+//go:build integration
+
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+	runtimehttp "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+)
+
+// This opt-in cross-service proof uses real Runtime PostgreSQL persistence,
+// public HTTP commands, authoritative validation/completion transitions, durable
+// outbox, and the real Student HTTP adapter. The Catalog revision provider and unrelated Planner/Sandbox/Validator
+// providers are explicit doubles.
+// It does not prove live Catalog/Sandbox/Validator integration.
+func TestPracticeCompletionReachesAssignedStudentRequirement(t *testing.T) {
+	fixturePath := os.Getenv("PRACTICE_COMPLETION_FIXTURE")
+	if fixturePath == "" {
+		t.Skip("PRACTICE_COMPLETION_FIXTURE not set")
+	}
+	var assigned struct {
+		StudentID     string `json:"student_id"`
+		PathID        string `json:"learning_path_id"`
+		ItemID        string `json:"learning_path_item_id"`
+		RequirementID string `json:"requirement_id"`
+	}
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(raw, &assigned); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{assigned.StudentID, assigned.PathID, assigned.ItemID, assigned.RequirementID} {
+		if !domain.IsCanonicalUUID(id) {
+			t.Fatalf("fixture missing canonical identity: %s", raw)
+		}
+	}
+	repo, db := openTestRepository(t)
+	ctx := context.Background()
+	initial := fixtureInstance()
+	initial.ID = testUUID(int(time.Now().UnixNano() & 0x7fffffff))
+	initial.StudentID, initial.LearningPathID, initial.LearningPathItemID, initial.RequirementID = assigned.StudentID, assigned.PathID, assigned.ItemID, assigned.RequirementID
+	initial.LearningActionID = testUUID(int(time.Now().UnixNano() & 0x7fffffff))
+	initial.Steps[0].ID = testUUID(5)
+	studentURL := os.Getenv("PRACTICE_COMPLETION_STUDENT_URL")
+	if studentURL == "" {
+		t.Fatal("PRACTICE_COMPLETION_STUDENT_URL missing")
+	}
+	token := os.Getenv("PRACTICE_COMPLETION_STUDENT_TOKEN")
+	if token == "" {
+		t.Fatal("PRACTICE_COMPLETION_STUDENT_TOKEN missing")
+	}
+	student := adapters.NewStudentHTTPClient(studentURL, token, &http.Client{Timeout: 10 * time.Second})
+	runtime := &usecase.Runtime{Repository: repo, Revisions: proofCatalog{}, Student: student, Evidence: student, Planner: proofPlanner{}, Workspace: proofSandbox{}, Validator: proofValidator{}}
+	server := httptest.NewUnstartedServer((&runtimehttp.Server{Runtime: runtime, InternalToken: "proof-runtime"}).Handler())
+	if addr := os.Getenv("PRACTICE_COMPLETION_RUNTIME_LISTEN"); addr != "" {
+		listener, listenErr := net.Listen("tcp", addr)
+		if listenErr != nil {
+			t.Fatal(listenErr)
+		}
+		_ = server.Listener.Close()
+		server.Listener = listener
+	}
+	server.Start()
+	defer server.Close()
+	nbaEnabled := os.Getenv("PRACTICE_COMPLETION_NBA_ENABLED") == "true"
+	var nbaSnapshots []json.RawMessage
+	nba := func(status, kind string) {
+		t.Helper()
+		if !nbaEnabled {
+			return
+		}
+		request, _ := http.NewRequest(http.MethodGet, studentURL+"/api/v1/student/next-action", nil)
+		request.Header.Set("X-User-ID", initial.StudentID)
+		request.Header.Set("X-User-Role", "STUDENT")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var action struct {
+			Schema  string `json:"schema"`
+			Status  string `json:"status"`
+			Primary *struct {
+				Kind string `json:"kind"`
+			} `json:"primary"`
+			Secondary []struct {
+				Kind string `json:"kind"`
+			} `json:"secondary_actions"`
+			Reason string `json:"reason_code"`
+		}
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &action); err != nil {
+			t.Fatal(err)
+		}
+		observed := ""
+		if action.Primary != nil {
+			observed = action.Primary.Kind
+		}
+		if response.StatusCode != http.StatusOK || action.Schema != "student-next-action.v1" || action.Status != status || observed != kind || action.Reason == "" {
+			t.Fatalf("NBA status=%d body=%+v want=%s/%s", response.StatusCode, action, status, kind)
+		}
+		if kind == "REVIEW_VALIDATION_RESULT" {
+			retry := false
+			for _, permitted := range action.Secondary {
+				retry = retry || permitted.Kind == "RETRY_PRACTICE"
+			}
+			if !retry {
+				t.Fatal("failed result has no permitted retry")
+			}
+		}
+		nbaSnapshots = append(nbaSnapshots, json.RawMessage(raw))
+		t.Logf("AUTHORITATIVE_NBA status=%s primary=%s reason=%s", action.Status, observed, action.Reason)
+	}
+	post := func(path, key string, body any, status int, target any) {
+		t.Helper()
+		payload, _ := json.Marshal(body)
+		request, _ := http.NewRequest(http.MethodPost, server.URL+path, bytes.NewReader(payload))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-User-ID", initial.StudentID)
+		request.Header.Set("X-User-Role", "STUDENT")
+		request.Header.Set("Idempotency-Key", key)
+		response, callErr := server.Client().Do(request)
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+		defer response.Body.Close()
+		reply, _ := io.ReadAll(response.Body)
+		if response.StatusCode != status {
+			t.Fatalf("%s status %d want %d: %s", path, response.StatusCode, status, reply)
+		}
+		if target != nil {
+			if err := json.Unmarshal(reply, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	body := map[string]string{"schema": domain.StartSchema, "task_revision_id": initial.TaskRevisionID, "locale": "en", "learning_path_id": assigned.PathID, "learning_path_item_id": assigned.ItemID, "requirement_id": assigned.RequirementID}
+	nba("READY", "START_PRACTICE")
+	var started domain.StartResult
+	post("/api/v2/practice-instances", initial.ID, body, 200, &started)
+	if started.Instance.Status != domain.TaskInstanceInProgress {
+		t.Fatalf("start was not fully provisioned: %+v", started.Instance)
+	}
+	nba("READY", "RESUME_PRACTICE")
+	post("/api/v2/practice-instances", initial.ID, body, 200, nil)
+	body["requirement_id"] = testUUID(99)
+	post("/api/v2/practice-instances", initial.ID, body, 409, nil)
+	var checkpoint domain.Submission
+	submitPath := "/api/v2/task-instances/" + initial.ID + "/submissions"
+	post(submitPath, testUUID(100), map[string]string{"schema": domain.SubmitSchema, "scope": "MILESTONE", "milestone_id": initial.Steps[0].ID}, 202, &checkpoint)
+	nba("WAITING", "")
+	if nbaEnabled {
+		// The old resume/submit recommendation cannot authorize a second active
+		// submission. The command owner rechecks its current execution invariants.
+		post(submitPath, testUUID(103), map[string]string{"schema": domain.SubmitSchema, "scope": "MILESTONE", "milestone_id": initial.Steps[0].ID}, 409, nil)
+		runtime.Validator = proofValidator{outcome: domain.OutcomeFail}
+	}
+	if err := runtime.ProcessValidation(ctx, ports.PendingValidation{TaskInstanceID: initial.ID, StudentID: initial.StudentID, SubmissionID: checkpoint.ID, RunID: checkpoint.ValidationRuns[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if nbaEnabled {
+		nba("READY", "REVIEW_VALIDATION_RESULT")
+		post(submitPath, testUUID(104), map[string]string{"schema": domain.SubmitSchema, "scope": "MILESTONE", "milestone_id": initial.Steps[0].ID}, 202, &checkpoint)
+		nba("WAITING", "")
+		runtime.Validator = proofValidator{}
+		if err := runtime.ProcessValidation(ctx, ports.PendingValidation{TaskInstanceID: initial.ID, StudentID: initial.StudentID, SubmissionID: checkpoint.ID, RunID: checkpoint.ValidationRuns[0].ID}); err != nil {
+			t.Fatal(err)
+		}
+		nba("READY", "SUBMIT_PRACTICE")
+	}
+	var final domain.Submission
+	post(submitPath, testUUID(101), map[string]string{"schema": domain.SubmitSchema, "scope": "FINAL"}, 202, &final)
+	nba("WAITING", "")
+	if err := runtime.ProcessValidation(ctx, ports.PendingValidation{TaskInstanceID: initial.ID, StudentID: initial.StudentID, SubmissionID: final.ID, RunID: final.ValidationRuns[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := NewRepository(db).GetInstance(ctx, initial.StudentID, initial.ID)
+	if err != nil || restored.Status != domain.TaskInstanceCompleted || restored.FinalSubmissionID != final.ID || restored.LearningPathItemID != assigned.ItemID {
+		t.Fatalf("durable completion lost: %+v %v", restored, err)
+	}
+	pending, err := repo.PendingEvidence(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outbox = %+v %v", pending, err)
+	}
+	fact, err := usecase.DecodePassedEvidence(pending[0].Payload)
+	if err != nil || fact.LearningPathItemID != assigned.ItemID || fact.RequirementID != assigned.RequirementID || fact.EvidenceID != final.ID {
+		t.Fatalf("outbox correlation: %+v %v", fact, err)
+	}
+	if count, err := runtime.DispatchEvidence(ctx, 10); err != nil || count != 1 {
+		t.Fatalf("delivery count %d: %v", count, err)
+	}
+	nba("READY", "START_LESSON")
+	if count, err := runtime.DispatchEvidence(ctx, 10); err != nil || count != 0 {
+		t.Fatalf("duplicate dispatch count %d: %v", count, err)
+	}
+	if _, err := student.ApplyPassedEvidence(ctx, fact); err != nil {
+		t.Fatalf("Student replay rejected: %v", err)
+	}
+	if output := os.Getenv("PRACTICE_COMPLETION_NBA_PROOF_OUTPUT"); nbaEnabled && output != "" {
+		proof, err := json.MarshalIndent(map[string]any{
+			"schema": "next-action-live-proof.v1", "result": "PASS", "student_id": initial.StudentID,
+			"learning_path_id": assigned.PathID, "task_instance_id": initial.ID,
+			"real_owners":               []string{"Student", "Course", "PracticeRuntime", "PostgreSQL"},
+			"doubles":                   []string{"Catalog", "Planner", "Sandbox", "Validator"},
+			"stale_submission_rejected": true, "evidence_delivery_count": 1,
+			"snapshots": nbaSnapshots,
+		}, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(output, proof, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("REAL_RUNTIME_COMPLETION student=%s path=%s item=%s requirement=%s instance=%s evidence=%s delivered=1 replay_accepted=true doubles=Catalog,Planner,Sandbox,Validator", assigned.StudentID, assigned.PathID, assigned.ItemID, assigned.RequirementID, initial.ID, final.ID)
+}
+
+type proofPlanner struct{ ports.LearningRouteProvider }
+
+func (proofPlanner) ResolveRoute(_ context.Context, input ports.ResolveLearningRoute) (domain.LearningRouteReceipt, error) {
+	var request struct {
+		StudentID      string `json:"student_id"`
+		TaskInstanceID string `json:"task_instance_id"`
+		TaskRevisionID string `json:"task_revision_id"`
+		Digest         string `json:"task_revision_digest"`
+		Locale         string `json:"locale"`
+		Steps          []struct {
+			ID string `json:"step_id"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(input.Request, &request); err != nil {
+		return domain.LearningRouteReceipt{}, err
+	}
+	steps, _ := json.Marshal([]map[string]any{{"step_id": request.Steps[0].ID, "ready": true, "requirements": []any{}}})
+	return domain.LearningRouteReceipt{Schema: "student-task-learning-snapshot.v1", ID: testUUID(200), StudentID: request.StudentID, TaskInstanceID: request.TaskInstanceID, TaskRevisionID: request.TaskRevisionID, TaskRevisionDigest: request.Digest, Locale: request.Locale, RouteDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Steps: steps, CreatedAt: time.Now()}, nil
+}
+
+type proofSandbox struct{ ports.WorkspacePort }
+
+func (proofSandbox) CreateOrResumeWorkspace(context.Context, ports.CreateWorkspace) (domain.WorkspaceBinding, error) {
+	return domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: testUUID(201), Available: true}, nil
+}
+func (proofSandbox) LockWrites(_ context.Context, input ports.LockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	return ports.WorkspaceWriteLock{LockID: input.RequestID, FenceEpoch: 1, Permanent: input.Mode == "PERMANENT"}, nil
+}
+func (proofSandbox) FreezeSnapshot(_ context.Context, input ports.FreezeSnapshot) (domain.SnapshotRef, error) {
+	return domain.SnapshotRef{SandboxID: input.SandboxID, SnapshotID: input.SubmissionID, GenerationID: testUUID(202), WorkspaceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
+}
+func (proofSandbox) ReadPinnedSnapshot(_ context.Context, ref domain.SnapshotRef) (ports.WorkspaceSnapshot, error) {
+	return ports.WorkspaceSnapshot{Ref: ref}, nil
+}
+func (proofSandbox) UnlockWrites(_ context.Context, input ports.UnlockWorkspaceWrites) (ports.WorkspaceWriteLock, error) {
+	return ports.WorkspaceWriteLock{LockID: input.LockID, FenceEpoch: 2}, nil
+}
+
+type proofValidator struct{ outcome domain.ValidationOutcome }
+
+func (validator proofValidator) ValidateOfficialSubmission(_ context.Context, input ports.OfficialValidationRequest) (domain.ValidationResult, error) {
+	if len(input.ValidationSpecification) == 0 {
+		return domain.ValidationResult{}, errors.New("missing frozen specification")
+	}
+	outcome := validator.outcome
+	if outcome == "" {
+		outcome = domain.OutcomePass
+	}
+	return domain.ValidationResult{TaskInstanceID: input.TaskInstanceID, SubmissionID: input.SubmissionID, ValidationRunID: input.ValidationRunID, RevisionDigest: input.RevisionDigest, ValidationContractDigest: input.ValidationContractDigest, Snapshot: input.Snapshot, Outcome: outcome}, nil
+}
+
+type proofCatalog struct{}
+
+func (proofCatalog) GetPublishedRevisionEnvelope(_ context.Context, id string) (domain.RevisionEnvelope, error) {
+	envelope := proofRevisionEnvelope()
+	if id != envelope.Revision.ID {
+		return domain.RevisionEnvelope{}, domain.ErrNotFound
+	}
+	return envelope, nil
+}
+func proofRevisionEnvelope() domain.RevisionEnvelope {
+	runtime := json.RawMessage(`{"execution_projection_schema":"practice-task-runtime-projection.v2","task_type_schema":"practice-task-type.v1","task_type":"BUILD","practice_task":{"id":"00000000-0000-4000-8000-000000000004","slug":"practice-one","title":"Practice one"},"practice_task_milestones":[{"id":"00000000-0000-4000-8000-000000000005","title":"Build it","description":"Build a tiny service","sort_order":1,"part_sort_order":1,"is_required":true,"is_active":true,"acceptance_criteria_json":{"checklist":["The service builds"]},"execution_spec":{"schema":"practice-step-execution-spec.v1","deliverables":["main.go"]},"validation_contract_json":{"schema":"validation-contract.v1","checks":[{"id":"compile","required":true}]},"runtime_profile_json":{"code_structure_type_code":"HTML_BASIC_DOCUMENT","compose_config":{"services":{"web":{"image":"nginx"}}}},"learning_targets":[{"type":"concept","key":"loops","version":"v1"}]}],"solution_variants":[{"id":"00000000-0000-4000-8000-000000000006","code":"default","title":"Default","topology":"frontend_only","sort_order":1,"is_active":true,"review_policy_json":{"version":1,"mentor_review":{"mode":"disabled"},"ai_review":{"mode":"disabled"}},"milestone_bindings":[{"practice_task_part_milestone_id":"00000000-0000-4000-8000-000000000005","sort_order":1,"is_required":true}]}]}`)
+	evaluation := json.RawMessage(`{"milestones":[{"practice_task_runtime_milestone_id":"00000000-0000-4000-8000-000000000005","test_suite_ref":"suite://safe-ref"}]}`)
+	envelope := domain.RevisionEnvelope{
+		Schema:               "practice-task-execution-envelope.v1",
+		Revision:             domain.RevisionMetadata{ID: "00000000-0000-4000-8000-000000000003", PracticeTaskID: "00000000-0000-4000-8000-000000000004", RevisionNumber: 1, PublishedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)},
+		RevisionDigestSchema: domain.RevisionDigestV1,
+		RuntimeContext:       runtime,
+		EvaluationContext:    evaluation,
+	}
+	envelope.RevisionDigest = envelope.ComputedDigest()
+	return envelope
+}
+
+func TestPostgresCheckpointFinalAndFailedSubmissionRetry(t *testing.T) {
+	for _, outcome := range []domain.ValidationOutcome{domain.OutcomePass, domain.OutcomeFail} {
+		t.Run(string(outcome), func(t *testing.T) {
+			repo, _ := openTestRepository(t)
+			ctx := context.Background()
+			instance := fixtureInstance()
+			created, _, err := repo.CreateOrLoadStart(ctx, instance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created.Status = domain.TaskInstanceInProgress
+			created.LearningActionID = testUUID(20)
+			created.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: testUUID(201), Available: true}
+			created.AssistancePolicyVersion = usecase.AssistancePolicyVersion
+			if _, err = repo.SaveInstance(ctx, created); err != nil {
+				t.Fatal(err)
+			}
+			runtime := usecase.Runtime{Repository: repo, Workspace: proofSandbox{}, Validator: proofValidator{outcome: outcome}}
+			first := domain.SubmitCommand{StudentID: created.StudentID, TaskInstanceID: created.ID, IdempotencyKey: testUUID(50), Scope: "MILESTONE", MilestoneID: created.Steps[0].ID}
+			submitted, _, err := runtime.Submit(ctx, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second := first
+			second.IdempotencyKey = testUUID(51)
+			if _, _, err := runtime.Submit(ctx, second); !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("active submission accepted replacement: %v", err)
+			}
+			if err := runtime.ProcessValidation(ctx, ports.PendingValidation{TaskInstanceID: created.ID, StudentID: created.StudentID, SubmissionID: submitted.ID, RunID: submitted.ValidationRuns[0].ID}); err != nil {
+				t.Fatal(err)
+			}
+			if outcome == domain.OutcomePass {
+				second.Scope = "FINAL"
+				second.MilestoneID = ""
+			}
+			next, _, err := runtime.Submit(ctx, second)
+			if err != nil {
+				t.Fatalf("next submit after %s rejected: %v", outcome, err)
+			}
+			if next.ID == submitted.ID {
+				t.Fatal("distinct retry reused first submission")
+			}
+			replay, _, err := runtime.Submit(ctx, second)
+			if err != nil || replay.ID != next.ID {
+				t.Fatalf("next submit replay changed identity: %+v %v", replay, err)
+			}
+		})
+	}
+}

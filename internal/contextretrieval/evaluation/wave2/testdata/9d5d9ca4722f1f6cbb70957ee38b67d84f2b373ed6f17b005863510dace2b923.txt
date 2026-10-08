@@ -1,0 +1,297 @@
+package tzplanner
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/google/uuid"
+)
+
+const maximumAuthoringResponseBytes int64 = 2 << 20
+
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+func (client Client) EnsureAuthoringJob(ctx context.Context, idempotencyKey string, request domain.TZAuthoringRequestV2) (domain.TZAuthoringJob, error) {
+	if !canonicalUUID(idempotencyKey) || request.Orchestration.CorrelationID != idempotencyKey ||
+		domain.ValidateProjectTZAuthoringRequest(request) != nil {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	return client.do(ctx, http.MethodPost, "/internal/v1/authoring-jobs", idempotencyKey, request)
+}
+
+func (client Client) GetAuthoringJob(ctx context.Context, jobID string) (domain.TZAuthoringJob, error) {
+	if !canonicalUUID(jobID) {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	return client.do(ctx, http.MethodGet, "/internal/v1/authoring-jobs/"+url.PathEscape(jobID), "", nil)
+}
+
+func (client Client) ResumeAuthoringJob(ctx context.Context, jobID string) (domain.TZAuthoringJob, error) {
+	if !canonicalUUID(jobID) {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	return client.do(ctx, http.MethodPost, "/internal/v1/authoring-jobs/"+url.PathEscape(jobID)+"/resume", "", nil)
+}
+
+func (client Client) StageAuthoringJob(ctx context.Context, jobID string) (domain.TZAuthoringJob, error) {
+	if !canonicalUUID(jobID) {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	return client.do(ctx, http.MethodPost, "/internal/v1/authoring-jobs/"+url.PathEscape(jobID)+"/stage", "", nil)
+}
+
+func (client Client) do(ctx context.Context, method, path, idempotencyKey string, payload any) (domain.TZAuthoringJob, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" || client.HTTPClient == nil {
+		return domain.TZAuthoringJob{}, errors.New("tz planner client is not configured")
+	}
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return domain.TZAuthoringJob{}, err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(client.BaseURL, "/")+path, body)
+	if err != nil {
+		return domain.TZAuthoringJob{}, err
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Accept", "application/json")
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	noRedirect := *client.HTTPClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := noRedirect.Do(request)
+	if err != nil {
+		return domain.TZAuthoringJob{}, fmt.Errorf("%w: %v", domain.ErrUpstreamUnavailable, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.ContentLength > maximumAuthoringResponseBytes {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumAuthoringResponseBytes+1))
+	if err != nil {
+		return domain.TZAuthoringJob{}, fmt.Errorf("%w: %v", domain.ErrUpstreamUnavailable, err)
+	}
+	if int64(len(contents)) > maximumAuthoringResponseBytes {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			return domain.TZAuthoringJob{}, domain.ErrNotFound
+		case http.StatusConflict:
+			return domain.TZAuthoringJob{}, domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domain.TZAuthoringJob{}, domain.ErrValidation
+		default:
+			return domain.TZAuthoringJob{}, domain.ErrUpstreamUnavailable
+		}
+	}
+	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	var projection jobProjection
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&projection); err != nil {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	job, err := projection.normalize()
+	if err != nil {
+		return domain.TZAuthoringJob{}, domain.ErrUpstreamInvalid
+	}
+	return job, nil
+}
+
+type jobProjection struct {
+	ID                 string                          `json:"id"`
+	Status             domain.TZAuthoringJobStatus     `json:"status"`
+	Attempts           int                             `json:"attempts"`
+	Orchestration      *domain.TZAuthoringIntentV1     `json:"orchestration,omitempty"`
+	FailureCode        string                          `json:"failure_code,omitempty"`
+	Blueprint          json.RawMessage                 `json:"blueprint,omitempty"`
+	CandidateDigest    string                          `json:"candidate_digest,omitempty"`
+	ContractDigest     string                          `json:"contract_digest,omitempty"`
+	CapabilitiesDigest string                          `json:"capabilities_digest,omitempty"`
+	Verification       *verificationReceiptProjection  `json:"verification,omitempty"`
+	Staging            *domain.ProjectStagingReceiptV1 `json:"staging,omitempty"`
+}
+
+type verificationReceiptProjection struct {
+	Schema               string                       `json:"schema"`
+	BlueprintDigest      string                       `json:"blueprint_digest"`
+	RuntimeProfileDigest string                       `json:"runtime_profile_digest"`
+	ContractDigest       string                       `json:"contract_digest"`
+	CapabilitiesDigest   string                       `json:"capabilities_digest"`
+	Passed               bool                         `json:"passed"`
+	Cases                []verificationCaseProjection `json:"cases"`
+	VerifiedAt           time.Time                    `json:"verified_at"`
+	ReceiptDigest        string                       `json:"receipt_digest"`
+}
+
+type verificationCaseProjection struct {
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	ExpectedPassed bool   `json:"expected_passed"`
+	ActualPassed   bool   `json:"actual_passed"`
+	ResultDigest   string `json:"result_digest"`
+}
+
+func (projection jobProjection) normalize() (domain.TZAuthoringJob, error) {
+	projection.ID = strings.TrimSpace(projection.ID)
+	projection.FailureCode = strings.TrimSpace(projection.FailureCode)
+	if !canonicalUUID(projection.ID) || projection.Attempts < 0 || projection.Orchestration == nil ||
+		!validIntent(*projection.Orchestration) || !validTZStatus(projection.Status) {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	job := domain.TZAuthoringJob{
+		ID: projection.ID, Status: projection.Status, Attempts: projection.Attempts,
+		FailureCode: projection.FailureCode, Intent: *projection.Orchestration,
+	}
+	if projection.Status != domain.TZAuthoringReady && projection.Status != domain.TZAuthoringStaged {
+		if len(projection.Blueprint) != 0 || projection.Verification != nil || projection.Staging != nil ||
+			projection.CandidateDigest != "" || projection.ContractDigest != "" || projection.CapabilitiesDigest != "" {
+			return domain.TZAuthoringJob{}, domain.ErrValidation
+		}
+		if projection.Status == domain.TZAuthoringFailed && projection.FailureCode == "" {
+			return domain.TZAuthoringJob{}, domain.ErrValidation
+		}
+		return job, nil
+	}
+	if !jsonObject(projection.Blueprint) || projection.Verification == nil ||
+		!digestPattern.MatchString(projection.CandidateDigest) || !digestPattern.MatchString(projection.ContractDigest) ||
+		!digestPattern.MatchString(projection.CapabilitiesDigest) || !validVerification(*projection.Verification) ||
+		projection.Verification.ContractDigest != projection.ContractDigest ||
+		projection.Verification.CapabilitiesDigest != projection.CapabilitiesDigest {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	blueprintHash := sha256.Sum256(projection.Blueprint)
+	if "sha256:"+hex.EncodeToString(blueprintHash[:]) != projection.Verification.BlueprintDigest {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	job.BlueprintDigest = projection.Verification.BlueprintDigest
+	job.CandidateDigest = projection.CandidateDigest
+	job.ContractDigest = projection.ContractDigest
+	job.CapabilitiesDigest = projection.CapabilitiesDigest
+	job.VerificationDigest = projection.Verification.ReceiptDigest
+	if projection.Staging != nil {
+		receipt := *projection.Staging
+		job.Staging = &receipt
+	}
+	if domain.ValidateTZAuthoringJob(job) != nil {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	var identity struct {
+		Identity struct {
+			FamilyKey  string `json:"family_key"`
+			VariantKey string `json:"variant_key"`
+		} `json:"identity"`
+	}
+	if job.Staging != nil && (json.Unmarshal(projection.Blueprint, &identity) != nil || identity.Identity.FamilyKey != job.Staging.FamilyKey || identity.Identity.VariantKey != job.Staging.VariantKey) {
+		return domain.TZAuthoringJob{}, domain.ErrValidation
+	}
+	return job, nil
+}
+
+func validIntent(intent domain.TZAuthoringIntentV1) bool {
+	return intent.Schema == domain.TZAuthoringIntentSchemaV1 && intent.Trigger == "planner_recommendation" &&
+		canonicalUUID(intent.CorrelationID) && intent.SurfaceClassification == "project"
+}
+
+func validVerification(receipt verificationReceiptProjection) bool {
+	if receipt.Schema != domain.TZVerificationReceiptSchemaV1 || !receipt.Passed || receipt.VerifiedAt.IsZero() ||
+		!digestPattern.MatchString(receipt.BlueprintDigest) || !digestPattern.MatchString(receipt.RuntimeProfileDigest) ||
+		!digestPattern.MatchString(receipt.ContractDigest) || !digestPattern.MatchString(receipt.CapabilitiesDigest) ||
+		!digestPattern.MatchString(receipt.ReceiptDigest) || len(receipt.Cases) < 3 || len(receipt.Cases) > 22 {
+		return false
+	}
+	seen := map[string]struct{}{}
+	starter, reference, negatives := 0, 0, 0
+	for _, item := range receipt.Cases {
+		if strings.TrimSpace(item.ID) == "" || len(item.ID) > 128 || !digestPattern.MatchString(item.ResultDigest) ||
+			item.ExpectedPassed != item.ActualPassed {
+			return false
+		}
+		if _, duplicate := seen[item.ID]; duplicate {
+			return false
+		}
+		seen[item.ID] = struct{}{}
+		switch item.Kind {
+		case "starter":
+			starter++
+			if item.ExpectedPassed {
+				return false
+			}
+		case "reference":
+			reference++
+			if !item.ExpectedPassed {
+				return false
+			}
+		case "negative":
+			negatives++
+			if item.ExpectedPassed {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	if starter != 1 || reference != 1 || negatives < 1 {
+		return false
+	}
+	wanted := receipt.ReceiptDigest
+	receipt.ReceiptDigest = ""
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(encoded)
+	return wanted == "sha256:"+hex.EncodeToString(digest[:])
+}
+
+func validTZStatus(status domain.TZAuthoringJobStatus) bool {
+	return status == domain.TZAuthoringPlanned || status == domain.TZAuthoringGenerating ||
+		status == domain.TZAuthoringVerifying || status == domain.TZAuthoringReady || status == domain.TZAuthoringStaged || status == domain.TZAuthoringFailed
+}
+
+func jsonObject(raw json.RawMessage) bool {
+	var object map[string]json.RawMessage
+	return len(raw) > 0 && json.Unmarshal(raw, &object) == nil && object != nil
+}
+
+func canonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+var _ domainservice.ProjectAuthoringTZService = Client{}

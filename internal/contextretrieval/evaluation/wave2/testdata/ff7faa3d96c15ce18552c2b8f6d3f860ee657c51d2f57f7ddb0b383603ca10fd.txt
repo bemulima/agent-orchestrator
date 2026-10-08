@@ -1,0 +1,570 @@
+package httptransport
+
+import (
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+const (
+	maximumCommandBytes = 64 << 10
+	maximumReviewBytes  = 16 << 10
+)
+
+type Server struct {
+	Runtime       *usecase.Runtime
+	InternalToken string
+	TeacherToken  string
+}
+
+type revisionSummaryV2 struct {
+	Schema                string    `json:"schema"`
+	RevisionID            string    `json:"revision_id"`
+	RevisionDigest        string    `json:"revision_digest"`
+	FamilyKey             string    `json:"family_key"`
+	VariantKey            string    `json:"variant_key"`
+	RevisionNumber        int       `json:"revision_number"`
+	SurfaceClassification string    `json:"surface_classification"`
+	ScenarioTitle         string    `json:"scenario_title"`
+	TaskType              string    `json:"task_type"`
+	PublishedAt           time.Time `json:"published_at"`
+}
+
+func revisionSummaryDTO(summary domain.RevisionSummary) revisionSummaryV2 {
+	return revisionSummaryV2{Schema: summary.Schema, RevisionID: summary.RevisionID, RevisionDigest: summary.Digest,
+		FamilyKey: summary.FamilyKey, VariantKey: summary.VariantKey, RevisionNumber: summary.RevisionNumber,
+		SurfaceClassification: summary.Surface, ScenarioTitle: summary.Title, TaskType: summary.Type,
+		PublishedAt: summary.PublishedAt.UTC()}
+}
+
+func writeStartResult(writer http.ResponseWriter, status int, result domain.StartResult) {
+	writeJSON(writer, status, struct {
+		Schema   string              `json:"schema"`
+		Instance domain.TaskInstance `json:"instance"`
+		Revision revisionSummaryV2   `json:"revision"`
+	}{result.Schema, result.Instance, revisionSummaryDTO(result.Revision)})
+}
+
+func (server *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /api/v2/project-instances", server.start("project"))
+	mux.HandleFunc("POST /api/v2/practice-instances", server.start("practice"))
+	mux.HandleFunc("GET /api/v2/task-instances", server.listInstances)
+	mux.HandleFunc("GET /api/v2/task-instances/{instanceID}", server.getInstance)
+	mux.HandleFunc("GET /api/v2/task-instances/{instanceID}/workspace", server.getWorkspace)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/steps/{stepID}/materialize", server.materialize)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/steps/{stepID}/readiness-reconciliations", server.reconcileStepReadiness)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/steps/{stepID}/checkpoints", server.checkpoint)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/submissions", server.submit)
+	mux.HandleFunc("GET /api/v2/task-instances/{instanceID}/submissions", server.listSubmissions)
+	mux.HandleFunc("GET /api/v2/task-instances/{instanceID}/submissions/{submissionID}", server.getSubmission)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/submissions/{submissionID}/review", server.review)
+	mux.HandleFunc("POST /api/v2/task-instances/{instanceID}/cancel", server.cancel)
+	mux.HandleFunc("POST /internal/v2/task-instances/{instanceID}/provisioning/retry", server.requireInternal(server.retryProvisioning))
+	mux.HandleFunc("POST /internal/v2/validation-runs/{runID}/retry", server.requireInternal(server.retryValidation))
+	mux.HandleFunc("GET /internal/v2/task-instances/{instanceID}/execution-projection", server.requireInternal(server.executionProjection))
+	mux.HandleFunc("GET /internal/task-instances/{instanceID}/teacher-context", server.requireTeacher(server.teacherContext))
+	mux.HandleFunc("GET /internal/task-instances/{instanceID}/teacher-validation-explanation", server.requireTeacher(server.teacherValidation))
+	mux.HandleFunc("POST /internal/task-instances/{instanceID}/teacher-assistance", server.requireTeacher(server.teacherAssistance))
+	return noStore(mux)
+}
+
+type startRequest struct {
+	Schema             string `json:"schema"`
+	TaskRevisionID     string `json:"task_revision_id"`
+	Locale             string `json:"locale"`
+	SolutionVariantID  string `json:"solution_variant_id,omitempty"`
+	LearningPathID     string `json:"learning_path_id,omitempty"`
+	LearningPathItemID string `json:"learning_path_item_id,omitempty"`
+	RequirementID      string `json:"requirement_id,omitempty"`
+}
+
+func (server *Server) start(surface string) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		studentID, ok := requireStudent(writer, request)
+		if !ok {
+			return
+		}
+		var payload startRequest
+		if err := decodeStrict(writer, request, &payload, maximumCommandBytes); err != nil || payload.Schema != domain.StartSchema {
+			writeError(writer, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		idempotencyKey := request.Header.Get("Idempotency-Key")
+		result, status, err := server.Runtime.Start(request.Context(), domain.StartCommand{StudentID: studentID,
+			IdempotencyKey: idempotencyKey, TaskRevisionID: payload.TaskRevisionID, Locale: payload.Locale,
+			SurfaceClassification: surface, SolutionVariantID: payload.SolutionVariantID, LearningPathID: payload.LearningPathID, LearningPathItemID: payload.LearningPathItemID, RequirementID: payload.RequirementID})
+		if err != nil {
+			writeUsecaseError(writer, status, err)
+			return
+		}
+		writeStartResult(writer, status, result)
+	}
+}
+
+func (server *Server) listInstances(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	limit, err := parseLimit(request.URL.Query().Get("limit"), 50)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	status := domain.TaskInstanceStatus(request.URL.Query().Get("status"))
+	if status != "" && !validTaskStatus(status) {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	items, next, err := server.Runtime.List(request.Context(), studentID, request.URL.Query().Get("cursor"), limit, status)
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		Schema     string                `json:"schema"`
+		Items      []domain.TaskInstance `json:"items"`
+		NextCursor string                `json:"next_cursor,omitempty"`
+	}{"practice-task-instance-list.v2", items, next})
+}
+
+func (server *Server) getInstance(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	result, err := server.Runtime.GetDetail(request.Context(), studentID, request.PathValue("instanceID"))
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeStartResult(writer, http.StatusOK, result)
+}
+
+func (server *Server) getWorkspace(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	result, err := server.Runtime.GetDetail(request.Context(), studentID, request.PathValue("instanceID"))
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		Schema      string              `json:"schema"`
+		Instance    domain.TaskInstance `json:"instance"`
+		Revision    revisionSummaryV2   `json:"revision"`
+		CurrentStep *domain.Step        `json:"current_step,omitempty"`
+		Progress    domain.Progress     `json:"progress"`
+	}{"practice-task-workspace.v2", result.Instance, revisionSummaryDTO(result.Revision), result.Instance.CurrentStep, result.Instance.Progress})
+}
+
+func (server *Server) materialize(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	if err := decodeEmpty(writer, request); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := server.Runtime.Materialize(request.Context(), studentID, request.PathValue("instanceID"), request.PathValue("stepID"))
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, result.Value)
+}
+
+func (server *Server) reconcileStepReadiness(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	var payload struct {
+		Schema string `json:"schema"`
+	}
+	if err := decodeStrict(writer, request, &payload, maximumCommandBytes); err != nil || payload.Schema != "practice-step-readiness-reconcile.v1" {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.ReconcileStepReadiness(request.Context(), studentID, request.PathValue("instanceID"), request.PathValue("stepID"), request.Header.Get("Idempotency-Key"))
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeJSON(writer, status, result)
+}
+
+func (server *Server) checkpoint(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	stepID := request.PathValue("stepID")
+	payload, err := decodeCheckpointRequest(writer, request, stepID)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.Submit(request.Context(), domain.SubmitCommand{TaskInstanceID: request.PathValue("instanceID"),
+		StudentID: studentID, IdempotencyKey: request.Header.Get("Idempotency-Key"), Scope: payload.Scope, MilestoneID: payload.MilestoneID})
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeJSON(writer, status, result)
+}
+
+func decodeCheckpointRequest(writer http.ResponseWriter, request *http.Request, stepID string) (submitRequest, error) {
+	var payload submitRequest
+	if err := decodeStrict(writer, request, &payload, maximumCommandBytes); err != nil {
+		return submitRequest{}, err
+	}
+	if payload.Schema != domain.SubmitSchema || payload.Scope != "MILESTONE" || payload.MilestoneID != stepID {
+		return submitRequest{}, domain.ErrInvalid
+	}
+	return payload, nil
+}
+
+type submitRequest struct {
+	Schema      string `json:"schema"`
+	Scope       string `json:"scope"`
+	MilestoneID string `json:"milestone_id,omitempty"`
+}
+
+func (server *Server) submit(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	var payload submitRequest
+	if err := decodeStrict(writer, request, &payload, maximumCommandBytes); err != nil || payload.Schema != domain.SubmitSchema {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.Submit(request.Context(), domain.SubmitCommand{TaskInstanceID: request.PathValue("instanceID"),
+		StudentID: studentID, IdempotencyKey: request.Header.Get("Idempotency-Key"), Scope: payload.Scope, MilestoneID: payload.MilestoneID})
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeJSON(writer, status, result)
+}
+
+func (server *Server) listSubmissions(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	limit, err := parseLimit(request.URL.Query().Get("limit"), 50)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	items, next, err := server.Runtime.ListSubmissions(request.Context(), studentID, request.PathValue("instanceID"), request.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		Schema     string              `json:"schema"`
+		Items      []domain.Submission `json:"items"`
+		NextCursor string              `json:"next_cursor,omitempty"`
+	}{"practice-task-submission-list.v2", items, next})
+}
+
+func (server *Server) getSubmission(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	result, err := server.Runtime.GetSubmission(request.Context(), studentID, request.PathValue("instanceID"), request.PathValue("submissionID"))
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+type reviewRequest struct {
+	Schema   string `json:"schema"`
+	Decision string `json:"decision"`
+	Feedback string `json:"feedback"`
+}
+
+func (server *Server) review(writer http.ResponseWriter, request *http.Request) {
+	reviewerID := request.Header.Get("X-User-ID")
+	role := request.Header.Get("X-User-Role")
+	if !domain.IsCanonicalUUID(reviewerID) || (role != "MENTOR" && role != "ADMIN") {
+		writeError(writer, http.StatusForbidden, "forbidden")
+		return
+	}
+	var payload reviewRequest
+	if err := decodeStrict(writer, request, &payload, maximumReviewBytes); err != nil || payload.Schema != "practice-human-review-decision.v1" {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.Review(request.Context(), request.PathValue("instanceID"), request.PathValue("submissionID"), reviewerID, payload.Decision, payload.Feedback)
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeJSON(writer, status, result)
+}
+
+type cancelRequest struct {
+	Schema string `json:"schema"`
+	Reason string `json:"reason"`
+}
+
+func (server *Server) cancel(writer http.ResponseWriter, request *http.Request) {
+	studentID, ok := requireStudent(writer, request)
+	if !ok {
+		return
+	}
+	var payload cancelRequest
+	if err := decodeStrict(writer, request, &payload, maximumCommandBytes); err != nil || payload.Schema != "practice-task-instance-cancel.v1" {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.Cancel(request.Context(), studentID, request.PathValue("instanceID"), request.Header.Get("Idempotency-Key"), payload.Reason)
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeJSON(writer, status, result)
+}
+
+func (server *Server) retryProvisioning(writer http.ResponseWriter, request *http.Request) {
+	if err := decodeEmpty(writer, request); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, status, err := server.Runtime.RetryProvisioning(request.Context(), request.PathValue("instanceID"))
+	if err != nil {
+		writeUsecaseError(writer, status, err)
+		return
+	}
+	writeStartResult(writer, status, result)
+}
+
+func (server *Server) retryValidation(writer http.ResponseWriter, request *http.Request) {
+	if err := decodeEmpty(writer, request); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := server.Runtime.RetryValidation(request.Context(), request.PathValue("runID"))
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, result)
+}
+
+func (server *Server) teacherContext(writer http.ResponseWriter, request *http.Request) {
+	studentID := request.URL.Query().Get("student_id")
+	result, err := server.Runtime.TeacherContext(request.Context(), request.PathValue("instanceID"), studentID)
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (server *Server) teacherValidation(writer http.ResponseWriter, request *http.Request) {
+	studentID := request.URL.Query().Get("student_id")
+	result, err := server.Runtime.TeacherValidation(request.Context(), request.PathValue("instanceID"), studentID)
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+type teacherAssistanceRequest struct {
+	UsageID    string `json:"usage_id"`
+	StudentID  string `json:"student_id"`
+	Assistance struct {
+		Schema    string `json:"schema"`
+		StepID    string `json:"step_id"`
+		Kind      string `json:"kind"`
+		HintLevel int    `json:"hint_level,omitempty"`
+	} `json:"assistance"`
+}
+
+// Teacher consumes this bounded HTTP receipt; the stored assistance receipt
+// retains its versioned schema, usage_id, and occurred_at fields.
+type teacherAssistanceResponse struct {
+	ID             string    `json:"id"`
+	TaskInstanceID string    `json:"task_instance_id"`
+	StudentID      string    `json:"student_id"`
+	StepID         string    `json:"step_id"`
+	Kind           string    `json:"kind"`
+	HintLevel      int       `json:"hint_level,omitempty"`
+	PolicyVersion  string    `json:"policy_version"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func (server *Server) teacherAssistance(writer http.ResponseWriter, request *http.Request) {
+	var payload teacherAssistanceRequest
+	if err := decodeStrict(writer, request, &payload, maximumReviewBytes); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := server.Runtime.RecordAssistance(request.Context(), request.PathValue("instanceID"), ports.AssistanceReceipt{
+		Schema: payload.Assistance.Schema, UsageID: payload.UsageID, StudentID: payload.StudentID,
+		TaskInstanceID: request.PathValue("instanceID"), StepID: payload.Assistance.StepID,
+		Kind: payload.Assistance.Kind, HintLevel: payload.Assistance.HintLevel})
+	if err != nil {
+		writeUsecaseError(writer, 0, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, teacherAssistanceResponse{
+		ID: result.UsageID, TaskInstanceID: result.TaskInstanceID, StudentID: result.StudentID,
+		StepID: result.StepID, Kind: result.Kind, HintLevel: result.HintLevel,
+		PolicyVersion: result.PolicyVersion, CreatedAt: result.OccurredAt,
+	})
+}
+
+func (server *Server) requireInternal(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if !validToken(request.Header.Get("X-Internal-Token"), server.InternalToken) {
+			writeError(writer, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(writer, request)
+	}
+}
+
+func (server *Server) requireTeacher(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if !validToken(request.Header.Get("X-Internal-Token"), server.TeacherToken) {
+			writeError(writer, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(writer, request)
+	}
+}
+
+func requireStudent(writer http.ResponseWriter, request *http.Request) (string, bool) {
+	studentID, role := request.Header.Get("X-User-ID"), request.Header.Get("X-User-Role")
+	if !domain.IsCanonicalUUID(studentID) || (role != "STUDENT" && role != "STUDENT_PRO") {
+		writeError(writer, http.StatusForbidden, "forbidden")
+		return "", false
+	}
+	return studentID, true
+}
+
+func validToken(given, expected string) bool {
+	return given != "" && expected != "" && len(given) == len(expected) && subtle.ConstantTimeCompare([]byte(given), []byte(expected)) == 1
+}
+
+func decodeStrict(writer http.ResponseWriter, request *http.Request, result any, maximum int64) error {
+	if request.Body == nil {
+		return errors.New("missing request body")
+	}
+	mediaType := strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0])
+	if mediaType != "application/json" {
+		return errors.New("application/json is required")
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, maximum))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(result); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain exactly one JSON value")
+	}
+	return nil
+}
+
+func decodeEmpty(writer http.ResponseWriter, request *http.Request) error {
+	var empty struct{}
+	if err := decodeStrict(writer, request, &empty, 8<<10); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseLimit(value string, defaultValue int) (int, error) {
+	if value == "" {
+		return defaultValue, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 || limit > 100 {
+		return 0, fmt.Errorf("limit must be between 1 and 100")
+	}
+	return limit, nil
+}
+
+func validTaskStatus(status domain.TaskInstanceStatus) bool {
+	switch status {
+	case domain.TaskInstanceStarting, domain.TaskInstanceInProgress, domain.TaskInstanceValidating, domain.TaskInstanceInReview,
+		domain.TaskInstanceFinalizing, domain.TaskInstanceCompleted, domain.TaskInstanceCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func writeUsecaseError(writer http.ResponseWriter, status int, err error) {
+	code := "unavailable"
+	if errors.Is(err, domain.ErrInvalid) {
+		code, status = "invalid_request", http.StatusBadRequest
+	} else if errors.Is(err, domain.ErrAuthoringDefect) {
+		code, status = "invalid_revision", http.StatusUnprocessableEntity
+	} else if errors.Is(err, domain.ErrVariantRequired) {
+		code, status = "variant_required", http.StatusUnprocessableEntity
+	} else if errors.Is(err, domain.ErrNotFound) {
+		code, status = "not_found", http.StatusNotFound
+	} else if errors.Is(err, domain.ErrIdempotency) {
+		code, status = "idempotency_conflict", http.StatusConflict
+	} else if errors.Is(err, domain.ErrConflict) {
+		code, status = "conflict", http.StatusConflict
+	} else if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	if status == 0 {
+		status = http.StatusInternalServerError
+	}
+	writeError(writer, status, code)
+}
+
+func writeError(writer http.ResponseWriter, status int, code string) {
+	writeJSON(writer, status, map[string]any{"error": map[string]string{"code": code}})
+}
+
+func writeJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(writer, request)
+	})
+}

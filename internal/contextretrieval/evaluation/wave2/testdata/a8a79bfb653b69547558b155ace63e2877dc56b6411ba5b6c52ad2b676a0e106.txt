@@ -1,0 +1,290 @@
+package domain
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	LearningPathCommandReplan = "REPLAN"
+	LearningPathCommandNoGap  = "NO_GAP"
+
+	MaximumLearningPathCommandPayloadBytes = 16 << 20
+)
+
+// LearningPathCommandCheckpoint is the immutable Student command boundary.
+// Payload contains the exact request body; StudentID, LearningPathID and the
+// planning/idempotency identity are bound by PayloadHash.
+type LearningPathCommandCheckpoint struct {
+	Command           string          `json:"command"`
+	LearningPathID    string          `json:"learning_path_id"`
+	PlanningRequestID string          `json:"planning_request_id"`
+	IdempotencyKey    string          `json:"idempotency_key"`
+	ExpectedVersion   int64           `json:"expected_version"`
+	PlannedResultCode string          `json:"planned_result_code"`
+	PlannedCourseID   string          `json:"planned_course_id,omitempty"`
+	PlannedReused     bool            `json:"planned_reused"`
+	PayloadHash       string          `json:"payload_hash"`
+	Payload           json.RawMessage `json:"payload"`
+	CheckpointedAt    time.Time       `json:"checkpointed_at"`
+}
+
+func NewLearningPathReplanCheckpoint(
+	request CoursePlanRequest,
+	command LearningPathReplan,
+	checkpointedAt time.Time,
+) (LearningPathCommandCheckpoint, error) {
+	normalized, err := NormalizeLearningPathReplan(command)
+	if err != nil || normalized.LearningPathID != strings.TrimSpace(request.LearningPathID) ||
+		normalized.PlanningRequestID != strings.TrimSpace(request.ID) {
+		return LearningPathCommandCheckpoint{}, ErrValidation
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return LearningPathCommandCheckpoint{}, err
+	}
+	return newLearningPathCommandCheckpoint(request, LearningPathCommandReplan, normalized.ExpectedVersion, payload, checkpointedAt)
+}
+
+func NewLearningPathNoGapCheckpoint(
+	request CoursePlanRequest,
+	command LearningPathCompletion,
+	checkpointedAt time.Time,
+) (LearningPathCommandCheckpoint, error) {
+	normalized, err := NormalizeLearningPathCompletion(command)
+	if err != nil || normalized.LearningPathID != strings.TrimSpace(request.LearningPathID) ||
+		normalized.PlanningRequestID != strings.TrimSpace(request.ID) {
+		return LearningPathCommandCheckpoint{}, ErrValidation
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return LearningPathCommandCheckpoint{}, err
+	}
+	return newLearningPathCommandCheckpoint(request, LearningPathCommandNoGap, normalized.ExpectedVersion, payload, checkpointedAt)
+}
+
+func NormalizeLearningPathCommandCheckpoint(
+	input LearningPathCommandCheckpoint,
+	studentID string,
+	planningRequestID string,
+	learningPathID string,
+) (LearningPathCommandCheckpoint, error) {
+	input.Command = strings.ToUpper(strings.TrimSpace(input.Command))
+	input.LearningPathID = strings.TrimSpace(input.LearningPathID)
+	input.PlanningRequestID = strings.TrimSpace(input.PlanningRequestID)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.PlannedResultCode = strings.TrimSpace(input.PlannedResultCode)
+	input.PlannedCourseID = strings.TrimSpace(input.PlannedCourseID)
+	input.PayloadHash = strings.TrimSpace(input.PayloadHash)
+	input.CheckpointedAt = input.CheckpointedAt.UTC()
+	studentID = strings.TrimSpace(studentID)
+	planningRequestID = strings.TrimSpace(planningRequestID)
+	learningPathID = strings.TrimSpace(learningPathID)
+	digest, digestErr := hex.DecodeString(input.PayloadHash)
+	if (input.Command != LearningPathCommandReplan && input.Command != LearningPathCommandNoGap) ||
+		input.ExpectedVersion < 1 || digestErr != nil || len(digest) != sha256.Size || len(input.Payload) == 0 ||
+		len(input.Payload) > MaximumLearningPathCommandPayloadBytes || input.CheckpointedAt.IsZero() ||
+		!validCoursePlanUUID(studentID) || !validCoursePlanUUID(planningRequestID) || !validCoursePlanUUID(learningPathID) ||
+		input.LearningPathID != learningPathID || input.PlanningRequestID != planningRequestID ||
+		input.IdempotencyKey != planningRequestID {
+		return LearningPathCommandCheckpoint{}, ErrValidation
+	}
+	if input.Command == LearningPathCommandReplan {
+		if !validCoursePlanUUID(input.PlannedCourseID) ||
+			(input.PlannedResultCode != CoursePlanResultCreated && input.PlannedResultCode != CoursePlanResultReused) ||
+			input.PlannedReused != (input.PlannedResultCode == CoursePlanResultReused) {
+			return LearningPathCommandCheckpoint{}, ErrValidation
+		}
+	} else if input.PlannedResultCode != CoursePlanResultNoGap || input.PlannedCourseID != "" || input.PlannedReused {
+		return LearningPathCommandCheckpoint{}, ErrValidation
+	}
+
+	var payload []byte
+	var err error
+	switch input.Command {
+	case LearningPathCommandReplan:
+		var command LearningPathReplan
+		if err = decodeStrictLearningPathCommand(input.Payload, &command); err == nil {
+			command.LearningPathID = learningPathID
+			command, err = NormalizeLearningPathReplan(command)
+			if err == nil && command.PlanningRequestID == planningRequestID && command.ExpectedVersion == input.ExpectedVersion &&
+				command.CourseID == input.PlannedCourseID {
+				payload, err = json.Marshal(command)
+			} else if err == nil {
+				err = ErrValidation
+			}
+		}
+	case LearningPathCommandNoGap:
+		var command LearningPathCompletion
+		if err = decodeStrictLearningPathCommand(input.Payload, &command); err == nil {
+			command.LearningPathID = learningPathID
+			command, err = NormalizeLearningPathCompletion(command)
+			if err == nil && command.PlanningRequestID == planningRequestID && command.ExpectedVersion == input.ExpectedVersion {
+				payload, err = json.Marshal(command)
+			} else if err == nil {
+				err = ErrValidation
+			}
+		}
+	}
+	if err != nil || learningPathCommandHash(
+		studentID, planningRequestID, learningPathID, input.Command, input.ExpectedVersion,
+		input.PlannedResultCode, input.PlannedCourseID, input.PlannedReused, payload,
+	) != input.PayloadHash {
+		return LearningPathCommandCheckpoint{}, ErrValidation
+	}
+	input.Payload = payload
+	return input, nil
+}
+
+func DecodeLearningPathReplanCheckpoint(
+	checkpoint LearningPathCommandCheckpoint,
+	studentID string,
+	planningRequestID string,
+	learningPathID string,
+) (LearningPathReplan, error) {
+	checkpoint, err := NormalizeLearningPathCommandCheckpoint(checkpoint, studentID, planningRequestID, learningPathID)
+	if err != nil || checkpoint.Command != LearningPathCommandReplan {
+		return LearningPathReplan{}, ErrValidation
+	}
+	var command LearningPathReplan
+	if err := json.Unmarshal(checkpoint.Payload, &command); err != nil {
+		return LearningPathReplan{}, ErrValidation
+	}
+	command.LearningPathID = strings.TrimSpace(learningPathID)
+	return NormalizeLearningPathReplan(command)
+}
+
+func DecodeLearningPathNoGapCheckpoint(
+	checkpoint LearningPathCommandCheckpoint,
+	studentID string,
+	planningRequestID string,
+	learningPathID string,
+) (LearningPathCompletion, error) {
+	checkpoint, err := NormalizeLearningPathCommandCheckpoint(checkpoint, studentID, planningRequestID, learningPathID)
+	if err != nil || checkpoint.Command != LearningPathCommandNoGap {
+		return LearningPathCompletion{}, ErrValidation
+	}
+	var command LearningPathCompletion
+	if err := json.Unmarshal(checkpoint.Payload, &command); err != nil {
+		return LearningPathCompletion{}, ErrValidation
+	}
+	command.LearningPathID = strings.TrimSpace(learningPathID)
+	return NormalizeLearningPathCompletion(command)
+}
+
+func NormalizeLearningPathReplan(input LearningPathReplan) (LearningPathReplan, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.LearningPathID = strings.TrimSpace(input.LearningPathID)
+	input.PlanningRequestID = strings.TrimSpace(input.PlanningRequestID)
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.GoalCode = normalizeCode(input.GoalCode)
+	input.CourseFingerprint = strings.TrimSpace(input.CourseFingerprint)
+	input.PlannerPolicyVersion = strings.TrimSpace(input.PlannerPolicyVersion)
+	input.ReasonCode = normalizeCode(input.ReasonCode)
+	input.ReasonSummary = strings.TrimSpace(input.ReasonSummary)
+	items, err := normalizeLearningPathItems(input.Items, false)
+	if err != nil || input.Schema != LearningPathReplanRequestSchema || !validCoursePlanUUID(input.LearningPathID) ||
+		!validCoursePlanUUID(input.PlanningRequestID) || !validCoursePlanUUID(input.CourseID) || input.GoalCode == "" ||
+		len(input.GoalCode) > 64 || input.CourseFingerprint == "" || len(input.CourseFingerprint) > 128 ||
+		input.PlannerPolicyVersion == "" || len(input.PlannerPolicyVersion) > 64 || input.ReasonCode == "" ||
+		len(input.ReasonCode) > 64 || input.ReasonSummary == "" || utf8.RuneCountInString(input.ReasonSummary) > 500 ||
+		input.ExpectedVersion < 1 || len(items) < 1 || len(items) > 500 {
+		return LearningPathReplan{}, ErrValidation
+	}
+	input.Items = items
+	return input, nil
+}
+
+func NormalizeLearningPathCompletion(input LearningPathCompletion) (LearningPathCompletion, error) {
+	input.Schema = strings.TrimSpace(input.Schema)
+	input.LearningPathID = strings.TrimSpace(input.LearningPathID)
+	input.PlanningRequestID = strings.TrimSpace(input.PlanningRequestID)
+	input.GoalCode = normalizeCode(input.GoalCode)
+	input.CourseID = strings.TrimSpace(input.CourseID)
+	input.CourseFingerprint = strings.TrimSpace(input.CourseFingerprint)
+	input.PlannerPolicyVersion = strings.TrimSpace(input.PlannerPolicyVersion)
+	input.ReasonCode = normalizeCode(input.ReasonCode)
+	input.ReasonSummary = strings.TrimSpace(input.ReasonSummary)
+	if input.Schema != LearningPathNoGapRequestSchema || !validCoursePlanUUID(input.LearningPathID) ||
+		!validCoursePlanUUID(input.PlanningRequestID) || !validCoursePlanUUID(input.CourseID) || input.GoalCode == "" ||
+		len(input.GoalCode) > 64 || input.CourseFingerprint == "" || len(input.CourseFingerprint) > 128 ||
+		input.PlannerPolicyVersion == "" || len(input.PlannerPolicyVersion) > 64 || input.ReasonCode != "mastery_no_gap" ||
+		input.ReasonSummary == "" || utf8.RuneCountInString(input.ReasonSummary) > 500 || input.ExpectedVersion < 1 {
+		return LearningPathCompletion{}, ErrValidation
+	}
+	return input, nil
+}
+
+func newLearningPathCommandCheckpoint(
+	request CoursePlanRequest,
+	command string,
+	expectedVersion int64,
+	payload []byte,
+	checkpointedAt time.Time,
+) (LearningPathCommandCheckpoint, error) {
+	checkpoint := LearningPathCommandCheckpoint{
+		Command: command, LearningPathID: strings.TrimSpace(request.LearningPathID),
+		PlanningRequestID: strings.TrimSpace(request.ID), IdempotencyKey: strings.TrimSpace(request.ID),
+		ExpectedVersion: expectedVersion, PlannedResultCode: strings.TrimSpace(request.ResultCode),
+		PlannedCourseID: strings.TrimSpace(request.CourseID), PlannedReused: request.Reused,
+		Payload:        append(json.RawMessage(nil), payload...),
+		CheckpointedAt: checkpointedAt.UTC(),
+	}
+	checkpoint.PayloadHash = learningPathCommandHash(
+		request.StudentID, request.ID, request.LearningPathID, checkpoint.Command, checkpoint.ExpectedVersion,
+		checkpoint.PlannedResultCode, checkpoint.PlannedCourseID, checkpoint.PlannedReused, checkpoint.Payload,
+	)
+	return NormalizeLearningPathCommandCheckpoint(checkpoint, request.StudentID, request.ID, request.LearningPathID)
+}
+
+func learningPathCommandHash(
+	studentID string,
+	planningRequestID string,
+	learningPathID string,
+	command string,
+	expectedVersion int64,
+	plannedResultCode string,
+	plannedCourseID string,
+	plannedReused bool,
+	payload []byte,
+) string {
+	canonical, _ := json.Marshal(struct {
+		Schema            string          `json:"schema"`
+		StudentID         string          `json:"student_id"`
+		PlanningRequestID string          `json:"planning_request_id"`
+		IdempotencyKey    string          `json:"idempotency_key"`
+		LearningPathID    string          `json:"learning_path_id"`
+		Command           string          `json:"command"`
+		ExpectedVersion   int64           `json:"expected_version"`
+		PlannedResultCode string          `json:"planned_result_code"`
+		PlannedCourseID   string          `json:"planned_course_id,omitempty"`
+		PlannedReused     bool            `json:"planned_reused"`
+		Payload           json.RawMessage `json:"payload"`
+	}{
+		Schema: "planner-student-path-command-checkpoint.v1", StudentID: strings.TrimSpace(studentID),
+		PlanningRequestID: strings.TrimSpace(planningRequestID), IdempotencyKey: strings.TrimSpace(planningRequestID),
+		LearningPathID: strings.TrimSpace(learningPathID), Command: strings.ToUpper(strings.TrimSpace(command)),
+		ExpectedVersion: expectedVersion, PlannedResultCode: strings.TrimSpace(plannedResultCode),
+		PlannedCourseID: strings.TrimSpace(plannedCourseID), PlannedReused: plannedReused, Payload: payload,
+	})
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:])
+}
+
+func decodeStrictLearningPathCommand(payload []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return ErrValidation
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return ErrValidation
+	}
+	return nil
+}

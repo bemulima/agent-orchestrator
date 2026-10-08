@@ -1,0 +1,180 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/practiceroute"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func TestPracticeReadinessProductionPostgresLifecycle(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("T07_READINESS_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("T07_READINESS_TEST_DATABASE_URL is not configured; requires the owned migrated T07 test database")
+	}
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal("invalid T07 database configuration")
+	}
+	if !strings.HasPrefix(config.ConnConfig.Database, "remediation_t07_") || !strings.HasSuffix(config.ConnConfig.Database, "_test") {
+		t.Fatal("T07 database must have remediation_t07_ prefix and _test suffix")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := postgres.Store{Pool: pool}
+	student := &t07StudentMasteryFixture{mastery: []domain.TargetMastery{{
+		Target: t07Target, State: domain.MasteryUnknown, PolicyVersion: domain.StudentMasteryPolicyVersion,
+	}}}
+	resolver := newPracticeLearningResolver(store, student, systemClock{})
+	routeInput := domain.PracticeLearningRouteRequestV1{
+		Schema:    domain.PracticeLearningRouteRequestSchemaV1,
+		StudentID: uuid.NewString(), TaskInstanceID: uuid.NewString(), TaskRevisionID: uuid.NewString(),
+		TaskRevisionDigest: "sha256:" + strings.Repeat("a", 64), Locale: "ru",
+		Steps: []domain.PracticeLearningStepInput{{StepID: "board", Requirements: []domain.PracticeLearningRequirement{{
+			ID: "required-dom", Target: t07Target, Policy: domain.RequirementPolicyRequired, MasteryThreshold: .7,
+		}}}},
+	}
+	route, created, err := resolver.Resolve(ctx, routeInput.TaskInstanceID, routeInput)
+	if err != nil || !created || route.Steps[0].Ready {
+		t.Fatalf("SETUP: actual PostgreSQL frozen route must exist and require learning: created=%v err=%v route=%+v", created, err, route)
+	}
+	before, err := store.GetByID(ctx, route.ID)
+	if err != nil {
+		t.Fatalf("SETUP: frozen route readback: %v", err)
+	}
+	input := domain.PracticeLearningReadinessRequestV1{
+		Schema: domain.PracticeLearningReadinessRequestSchemaV1, TaskInstanceID: route.TaskInstanceID,
+		StudentID: route.StudentID, TaskRevisionID: route.TaskRevisionID, TaskRevisionDigest: route.TaskRevisionDigest,
+		RouteID: route.ID, RouteDigest: route.RouteDigest, StepID: "board",
+	}
+	router := t07PracticeRouter(resolver)
+	callsBeforeDenial := student.calls
+	unconfigured := resolver
+	unconfigured.Readiness = nil
+	t07ReconcileHTTP(t, ctx, t07PracticeRouter(unconfigured), uuid.NewString(), input, http.StatusUnprocessableEntity)
+	for _, token := range []string{"", "t07-unrelated-token"} {
+		t07ReconcileHTTPWithToken(t, ctx, router, uuid.NewString(), input, http.StatusForbidden, token)
+	}
+	if student.calls != callsBeforeDenial {
+		t.Fatal("missing repository or denied credential must not query Student mastery")
+	}
+	var deniedReceiptCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM practice_learning_readiness_receipt WHERE task_instance_id=$1`, route.TaskInstanceID).Scan(&deniedReceiptCount); err != nil || deniedReceiptCount != 0 {
+		t.Fatalf("missing repository and denied credentials must persist no readiness receipt: count=%d err=%v", deniedReceiptCount, err)
+	}
+	firstKey := uuid.NewString()
+	first := t07ReconcileHTTP(t, ctx, router, firstKey, input, http.StatusCreated)
+	if first.Decision != domain.PracticeReadinessNotReady || !domain.ValidPracticeLearningReadinessReceipt(first) {
+		t.Fatalf("current unknown mastery must persist NOT_READY, got %+v", first)
+	}
+	firstStored, err := store.GetByIdempotencyKey(ctx, route.TaskInstanceID, input.StepID, firstKey)
+	if err != nil || !reflect.DeepEqual(firstStored.Receipt, first) {
+		t.Fatalf("NOT_READY must be durably stored in actual adapter: err=%v stored=%+v", err, firstStored)
+	}
+	student.mastery = []domain.TargetMastery{{Target: t07Target, State: domain.MasteryMastered,
+		MasteryScore: .91, Confidence: .92, PolicyVersion: domain.StudentMasteryPolicyVersion}}
+	callsBeforeReplay := student.calls
+	replayed := t07ReconcileHTTP(t, ctx, router, firstKey, input, http.StatusOK)
+	if !reflect.DeepEqual(first, replayed) || student.calls != callsBeforeReplay {
+		t.Fatal("same reconciliation key must replay NOT_READY without reading changed mastery")
+	}
+	changed := input
+	changed.RouteDigest = "sha256:" + strings.Repeat("d", 64)
+	t07ReconcileHTTP(t, ctx, router, firstKey, changed, http.StatusConflict)
+	if student.calls != callsBeforeReplay {
+		t.Fatal("conflicting retry must not read mastery")
+	}
+	readyKey := uuid.NewString()
+	ready := t07ReconcileHTTP(t, ctx, router, readyKey, input, http.StatusCreated)
+	if ready.Decision != domain.PracticeReadinessReady || ready.ID == first.ID || ready.LearnerStateDigest == first.LearnerStateDigest || student.calls != callsBeforeReplay+1 {
+		t.Fatalf("new reconciliation must use current objective mastery and persist READY: %+v", ready)
+	}
+	// Reconstruct the production resolver with a separate PostgreSQL pool. The
+	// Student fixture is unavailable: replay must depend only on the durable receipt.
+	restartedPool, err := pgxpool.NewWithConfig(ctx, config.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restartedPool.Close)
+	restartedStore := postgres.Store{Pool: restartedPool}
+	unavailableStudent := &t07StudentMasteryFixture{err: errors.New("Student fixture unavailable")}
+	restarted := newPracticeLearningResolver(restartedStore, unavailableStudent, systemClock{})
+	restored := t07ReconcileHTTP(t, ctx, t07PracticeRouter(restarted), readyKey, input, http.StatusOK)
+	if !reflect.DeepEqual(restored, ready) || unavailableStudent.calls != 0 {
+		t.Fatal("reconstructed resolver must replay exact READY from actual durable adapter")
+	}
+	readyStored, err := restartedStore.GetByIdempotencyKey(ctx, route.TaskInstanceID, input.StepID, readyKey)
+	if err != nil || !reflect.DeepEqual(readyStored.Receipt, ready) {
+		t.Fatalf("READY receipt readback mismatch: %v", err)
+	}
+	after, err := restartedStore.GetByID(ctx, route.ID)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("reconciliation must leave the frozen route unchanged: %v", err)
+	}
+	var receiptCount int
+	if err := restartedPool.QueryRow(ctx, `SELECT count(*) FROM practice_learning_readiness_receipt WHERE task_instance_id=$1`, route.TaskInstanceID).Scan(&receiptCount); err != nil || receiptCount != 2 {
+		t.Fatalf("exact replay/conflict must create no duplicate receipts: count=%d err=%v", receiptCount, err)
+	}
+	t.Logf("actual PostgreSQL + registered handler: NOT_READY → READY, exact replay, conflict, separate-pool reconstruction, unchanged route; Student query fixture only; route=%s", route.ID)
+}
+
+func t07PracticeRouter(resolver practiceroute.Resolver) http.Handler {
+	return transporthttp.NewRouter(transporthttp.RouterDependencies{
+		PracticeLearning: privatehandlers.PracticeLearningHandler{Routes: resolver}, PracticeToken: "t07-practice-token",
+	})
+}
+
+func t07ReconcileHTTP(t *testing.T, ctx context.Context, router http.Handler, key string, input domain.PracticeLearningReadinessRequestV1, status int) domain.PracticeLearningReadinessReceiptV1 {
+	t.Helper()
+	return t07ReconcileHTTPWithToken(t, ctx, router, key, input, status, "t07-practice-token")
+}
+
+func t07ReconcileHTTPWithToken(t *testing.T, ctx context.Context, router http.Handler, key string, input domain.PracticeLearningReadinessRequestV1, status int, token string) domain.PracticeLearningReadinessReceiptV1 {
+	t.Helper()
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/internal/practice-learning-routes/"+input.RouteID+"/steps/"+input.StepID+"/readiness-reconciliations", bytes.NewReader(body)).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Internal-Token", token)
+	request.Header.Set("Idempotency-Key", key)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != status {
+		t.Fatalf("BUSINESS: production registered readiness handler status=%d want=%d body=%s", response.Code, status, response.Body.String())
+	}
+	if status != http.StatusForbidden && response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("registered readiness handler must preserve no-store")
+	}
+	var receipt domain.PracticeLearningReadinessReceiptV1
+	if status == http.StatusCreated || status == http.StatusOK {
+		if err := json.Unmarshal(response.Body.Bytes(), &receipt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return receipt
+}

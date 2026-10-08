@@ -1,0 +1,132 @@
+package postgres
+
+import (
+	"context"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+func (store Store) ResolveExact(ctx context.Context, targets []domain.TargetRef) ([]domain.TargetRef, error) {
+	types := make([]string, len(targets))
+	keys := make([]string, len(targets))
+	versions := make([]string, len(targets))
+	for index, target := range targets {
+		types[index] = string(target.Type)
+		keys[index] = target.Key
+		versions[index] = target.Version
+	}
+	rows, err := store.Pool.Query(ctx, `
+SELECT target.target_type, target.target_key, target.target_version
+FROM learning_target target
+JOIN unnest($1::text[], $2::text[], $3::text[]) AS requested(target_type, target_key, target_version)
+  ON target.target_type=requested.target_type
+ AND target.target_key=requested.target_key
+ AND target.target_version=requested.target_version`, types, keys, versions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.TargetRef, 0, len(targets))
+	for rows.Next() {
+		var target domain.TargetRef
+		if err := rows.Scan(&target.Type, &target.Key, &target.Version); err != nil {
+			return nil, err
+		}
+		result = append(result, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (store Store) DiscoverByStacks(ctx context.Context, stacks []string, limit int) ([]domain.LearningTargetDefinition, error) {
+	rows, err := store.Pool.Query(ctx, `
+SELECT DISTINCT target.target_type, target.target_key, target.target_version
+FROM learning_target target
+LEFT JOIN learning_target_stack stack
+  ON stack.target_type=target.target_type
+ AND stack.target_key=target.target_key
+ AND stack.target_version=target.target_version
+WHERE cardinality($1::text[])=0 OR stack.stack_code=ANY($1::text[])
+ORDER BY target.target_type, target.target_key, target.target_version
+LIMIT $2`, stacks, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	refs := make([]domain.TargetRef, 0, limit)
+	for rows.Next() {
+		var ref domain.TargetRef
+		if err := rows.Scan(&ref.Type, &ref.Key, &ref.Version); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil || len(refs) == 0 {
+		return nil, err
+	}
+	return store.ResolveDefinitions(ctx, refs)
+}
+
+func (store Store) ResolveDefinitions(ctx context.Context, targets []domain.TargetRef) ([]domain.LearningTargetDefinition, error) {
+	types := make([]string, len(targets))
+	keys := make([]string, len(targets))
+	versions := make([]string, len(targets))
+	for index, target := range targets {
+		types[index], keys[index], versions[index] = string(target.Type), target.Key, target.Version
+	}
+	rows, err := store.Pool.Query(ctx, `
+SELECT requested.ordinality, target.target_type, target.target_key, target.target_version,
+       target.title, target.description,
+       prerequisite.prerequisite_type, prerequisite.prerequisite_key, prerequisite.prerequisite_version
+FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY
+     AS requested(target_type, target_key, target_version, ordinality)
+JOIN learning_target target
+  ON target.target_type=requested.target_type
+ AND target.target_key=requested.target_key
+ AND target.target_version=requested.target_version
+LEFT JOIN target_prerequisite prerequisite
+  ON prerequisite.target_type=target.target_type
+ AND prerequisite.target_key=target.target_key
+ AND prerequisite.target_version=target.target_version
+ORDER BY requested.ordinality, prerequisite.prerequisite_type,
+         prerequisite.prerequisite_key, prerequisite.prerequisite_version`, types, keys, versions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.LearningTargetDefinition, 0, len(targets))
+	byIdentity := make(map[string]int, len(targets))
+	for rows.Next() {
+		var ordinal int64
+		var definition domain.LearningTargetDefinition
+		var prerequisiteType, prerequisiteKey, prerequisiteVersion *string
+		if err := rows.Scan(
+			&ordinal, &definition.Ref.Type, &definition.Ref.Key, &definition.Ref.Version,
+			&definition.Title, &definition.Description,
+			&prerequisiteType, &prerequisiteKey, &prerequisiteVersion,
+		); err != nil {
+			return nil, err
+		}
+		identity := domain.TargetIdentity(definition.Ref)
+		index, exists := byIdentity[identity]
+		if !exists {
+			index = len(result)
+			byIdentity[identity] = index
+			result = append(result, definition)
+		}
+		if prerequisiteType != nil && prerequisiteKey != nil && prerequisiteVersion != nil {
+			result[index].Prerequisites = append(result[index].Prerequisites, domain.TargetRef{
+				Type: domain.TargetType(*prerequisiteType), Key: *prerequisiteKey, Version: *prerequisiteVersion,
+			})
+		}
+		_ = ordinal
+	}
+	return result, rows.Err()
+}
+
+var _ repository.TargetCatalog = Store{}
+var _ repository.TargetDiscoveryCatalog = Store{}
+var _ repository.PracticeLearningCatalog = Store{}

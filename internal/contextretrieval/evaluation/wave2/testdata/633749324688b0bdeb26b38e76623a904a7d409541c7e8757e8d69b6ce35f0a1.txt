@@ -1,0 +1,199 @@
+// Package onboardingpathexecution owns the isolated S9 execution workflow.
+// It deliberately does not depend on courseplan: S9 cannot construct a legacy
+// StudentPlanningProfile, PlanningIntent, mastery projection, or defaults.
+package onboardingpathexecution
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"sort"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+)
+
+// FrozenSnapshot is write-once evidence for the exact Student observation and
+// deterministic hierarchy that was admitted for S9 authoring.
+type FrozenSnapshot struct {
+	Schema    string                                  `json:"schema"`
+	Readiness domain.StudentPlanningReadinessSnapshot `json:"readiness"`
+	Authoring domain.OnboardingPathAuthoringInput     `json:"authoring"`
+	Course    domain.GeneratedCourse                  `json:"course"`
+}
+
+const frozenSnapshotSchema = "planner-onboarding-path-frozen-snapshot.v1"
+
+// BuildFrozenSnapshot uses only the S9-authorized inputs. Every graph target
+// remains included: S9 performs no mastery analysis and cannot create a gap or
+// no-gap interpretation from Student preferences.
+func BuildFrozenSnapshot(graph domain.GoalGraph, policy domain.PolicyBundle, snapshot domain.StudentPlanningReadinessSnapshot, strategies pedagogy.Registry) (FrozenSnapshot, string, error) {
+	graph, err := domain.NormalizeGoalGraph(graph)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	policy, err = domain.NormalizePolicyBundle(policy)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	snapshot, err = domain.NormalizeStudentPlanningReadinessSnapshot(snapshot)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	authoring, err := domain.NewOnboardingPathAuthoringInput(graph, policy, snapshot)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	fingerprint, err := authoring.Hash()
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	ordered, err := domain.OrderGoalTargets(graph.Targets)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	transitions := s9Transitions(graph.Transitions, authoring.KnownStacks)
+	course, err := s9Course(graph, policy, authoring, fingerprint, ordered, transitions, strategies)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	result := FrozenSnapshot{Schema: frozenSnapshotSchema, Readiness: snapshot, Authoring: authoring, Course: course}
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return FrozenSnapshot{}, "", err
+	}
+	digest := sha256.Sum256(payload)
+	return result, hex.EncodeToString(digest[:]), nil
+}
+
+func DecodeFrozenSnapshot(raw []byte) (FrozenSnapshot, error) {
+	var result FrozenSnapshot
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || result.Schema != frozenSnapshotSchema {
+		return FrozenSnapshot{}, domain.ErrValidation
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return FrozenSnapshot{}, domain.ErrValidation
+	}
+	if _, err := domain.NormalizeStudentPlanningReadinessSnapshot(result.Readiness); err != nil {
+		return FrozenSnapshot{}, domain.ErrValidation
+	}
+	if _, err := result.Authoring.Hash(); err != nil || result.Course.Fingerprint == "" || result.Course.Fingerprint != mustAuthoringHash(result.Authoring) {
+		return FrozenSnapshot{}, domain.ErrValidation
+	}
+	return result, nil
+}
+
+func mustAuthoringHash(input domain.OnboardingPathAuthoringInput) string {
+	hash, _ := input.Hash()
+	return hash
+}
+
+func s9Transitions(inputs []domain.TransitionKnowledge, stacks []string) []domain.TransitionKnowledge {
+	set := make(map[string]struct{}, len(stacks))
+	for _, stack := range stacks {
+		set[stack] = struct{}{}
+	}
+	result := make([]domain.TransitionKnowledge, 0, len(inputs))
+	for _, transition := range inputs {
+		if _, ok := set[transition.SourceStack]; ok {
+			result = append(result, transition)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SourceStack+"\x00"+domain.TargetIdentity(result[i].Target) < result[j].SourceStack+"\x00"+domain.TargetIdentity(result[j].Target)
+	})
+	return result
+}
+
+func s9Course(graph domain.GoalGraph, policy domain.PolicyBundle, authoring domain.OnboardingPathAuthoringInput, fingerprint string, targets []domain.LearningTarget, transitions []domain.TransitionKnowledge, strategies pedagogy.Registry) (domain.GeneratedCourse, error) {
+	type sectionKey struct{ module, section string }
+	type lessonKey struct{ module, section, lesson string }
+	modules := make([]domain.PlannedModule, 0)
+	moduleIndex := map[string]int{}
+	sectionIndex := map[sectionKey]int{}
+	lessonIndex := map[lessonKey]int{}
+	for _, target := range targets {
+		mi, exists := moduleIndex[target.ModuleCode]
+		if !exists {
+			mi = len(modules)
+			moduleIndex[target.ModuleCode] = mi
+			modules = append(modules, domain.PlannedModule{Code: target.ModuleCode, Title: target.ModuleTitle, Order: target.ModuleOrder})
+		}
+		sk := sectionKey{target.ModuleCode, target.SectionCode}
+		si, exists := sectionIndex[sk]
+		if !exists {
+			si = len(modules[mi].Sections)
+			sectionIndex[sk] = si
+			modules[mi].Sections = append(modules[mi].Sections, domain.PlannedSection{Code: target.SectionCode, Title: target.SectionTitle, Order: target.SectionOrder})
+		}
+		var lessonTransitions []domain.TransitionKnowledge
+		for _, transition := range transitions {
+			if domain.TargetIdentity(transition.Target) == domain.TargetIdentity(target.Ref) {
+				lessonTransitions = append(lessonTransitions, transition)
+			}
+		}
+		section := &modules[mi].Sections[si]
+		lk := lessonKey{target.ModuleCode, target.SectionCode, target.LessonCode}
+		li, exists := lessonIndex[lk]
+		if !exists {
+			li = len(section.Lessons)
+			lessonIndex[lk] = li
+			section.Lessons = append(section.Lessons, domain.PlannedLesson{Code: target.LessonCode, Title: target.LessonTitle, Excerpt: target.LessonExcerpt, Order: target.LessonOrder, Status: domain.LessonStatusPlanned, Targets: []domain.TargetRef{target.Ref}, Prerequisites: append([]domain.TargetRef(nil), target.Prerequisites...), TransitionKnowledge: lessonTransitions})
+			continue
+		}
+		lesson := &section.Lessons[li]
+		lesson.Targets = appendS9Target(lesson.Targets, target.Ref)
+		for _, prerequisite := range target.Prerequisites {
+			lesson.Prerequisites = appendS9Target(lesson.Prerequisites, prerequisite)
+		}
+		lesson.TransitionKnowledge = append(lesson.TransitionKnowledge, lessonTransitions...)
+	}
+	for mi := range modules {
+		module := &modules[mi]
+		sort.Slice(module.Sections, func(i, j int) bool {
+			if module.Sections[i].Order != module.Sections[j].Order {
+				return module.Sections[i].Order < module.Sections[j].Order
+			}
+			return module.Sections[i].Code < module.Sections[j].Code
+		})
+		for si := range module.Sections {
+			section := &module.Sections[si]
+			sort.Slice(section.Lessons, func(i, j int) bool {
+				if section.Lessons[i].Order != section.Lessons[j].Order {
+					return section.Lessons[i].Order < section.Lessons[j].Order
+				}
+				return section.Lessons[i].Code < section.Lessons[j].Code
+			})
+			for li := range section.Lessons {
+				lesson := &section.Lessons[li]
+				lesson.Targets, lesson.Prerequisites = domain.SortTargetRefs(lesson.Targets), domain.SortTargetRefs(lesson.Prerequisites)
+				selected, err := strategies.Select(policy.PedagogyStrategies, pedagogy.LessonContext{Targets: lesson.Targets, TransitionKnowledge: lesson.TransitionKnowledge, SelfAssessedExperience: authoring.SelfAssessedExperience})
+				if err != nil {
+					return domain.GeneratedCourse{}, err
+				}
+				lesson.PedagogyStrategies = selected
+			}
+		}
+	}
+	sort.Slice(modules, func(i, j int) bool {
+		if modules[i].Order != modules[j].Order {
+			return modules[i].Order < modules[j].Order
+		}
+		return modules[i].Code < modules[j].Code
+	})
+	return domain.GeneratedCourse{Fingerprint: fingerprint, FingerprintVersion: domain.CourseFingerprintVersion, GoalCode: graph.Goal.Code, GoalVersion: graph.Goal.Version, Title: graph.Goal.Title, Description: graph.Goal.Description, Language: authoring.ContentLanguage, Status: domain.CourseStatusActiveBuilding, CatalogVisible: false, PlannerVersion: policy.PlannerVersion, PedagogyProfile: policy.PedagogyProfile, PresentationStyle: policy.PresentationStyle, GenerationPolicy: policy.GenerationPolicy, Modules: modules}, nil
+}
+
+func appendS9Target(inputs []domain.TargetRef, candidate domain.TargetRef) []domain.TargetRef {
+	for _, input := range inputs {
+		if domain.TargetIdentity(input) == domain.TargetIdentity(candidate) {
+			return inputs
+		}
+	}
+	return append(inputs, candidate)
+}

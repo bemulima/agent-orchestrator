@@ -1,0 +1,195 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+type assistanceReplayRepository struct {
+	ports.Repository
+	instance    domain.TaskInstance
+	stored      ports.AssistanceReceipt
+	digest      string
+	writes      int
+	reads       int
+	lookupError error
+}
+
+func (r *assistanceReplayRepository) GetInstance(_ context.Context, student, instance string) (domain.TaskInstance, error) {
+	if student != r.instance.StudentID || instance != r.instance.ID {
+		return domain.TaskInstance{}, domain.ErrNotFound
+	}
+	return r.instance, nil
+}
+func (r *assistanceReplayRepository) GetAssistance(_ context.Context, student, instance, usage string) (ports.AssistanceReceipt, string, error) {
+	r.reads++
+	if r.lookupError != nil {
+		return ports.AssistanceReceipt{}, "", r.lookupError
+	}
+	if student != r.instance.StudentID || instance != r.instance.ID || usage != r.stored.UsageID {
+		return ports.AssistanceReceipt{}, "", domain.ErrNotFound
+	}
+	return r.stored, r.digest, nil
+}
+func (r *assistanceReplayRepository) RecordAssistance(_ context.Context, instance domain.TaskInstance, receipt ports.AssistanceReceipt, digest string) (domain.TaskInstance, ports.AssistanceReceipt, bool, error) {
+	r.writes++
+	// Mirrors the original PostgreSQL comparison, so time drift is a real RED.
+	if r.stored.UsageID != "" {
+		if r.digest != digest || r.stored != receipt {
+			return domain.TaskInstance{}, ports.AssistanceReceipt{}, false, domain.ErrIdempotency
+		}
+		return r.instance, r.stored, false, nil
+	}
+	instance.Version++
+	r.instance, r.stored, r.digest = instance, receipt, digest
+	return instance, receipt, true, nil
+}
+func assistanceReplayFixture() (*assistanceReplayRepository, ports.AssistanceReceipt) {
+	r := &assistanceReplayRepository{instance: domain.TaskInstance{
+		ID: "22222222-2222-4222-8222-222222222222", StudentID: "11111111-1111-4111-8111-111111111111",
+		LearningActionID: "44444444-4444-4444-8444-444444444444", Status: domain.TaskInstanceInProgress,
+		Steps: []domain.Step{{ID: "step-1"}}, Version: 1,
+	}}
+	receipt := ports.AssistanceReceipt{Schema: "practice-task-assistance-usage.v1", UsageID: "55555555-5555-4555-8555-555555555555",
+		StudentID: r.instance.StudentID, TaskInstanceID: r.instance.ID, StepID: "step-1", Kind: "HINT", HintLevel: 2}
+	return r, receipt
+}
+func TestT13AssistanceReplayPrecedesCurrentGuards(t *testing.T) {
+	for _, status := range []domain.TaskInstanceStatus{domain.TaskInstanceInProgress, domain.TaskInstanceInReview, domain.TaskInstanceCompleted, domain.TaskInstanceCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			repo, input := assistanceReplayFixture()
+			firstTime := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
+			runtime := &Runtime{Repository: repo, Now: func() time.Time { return firstTime }}
+			first, err := runtime.RecordAssistance(context.Background(), input.TaskInstanceID, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			repo.instance.Status = status
+			repo.instance.HintsUsed = 1000
+			repo.instance.LearningActionID = ""
+			repo.instance.Steps = nil
+			before := repo.instance
+			restarted := &Runtime{Repository: repo, Now: func() time.Time { return firstTime.Add(time.Hour) }}
+			replay, err := restarted.RecordAssistance(context.Background(), input.TaskInstanceID, input)
+			if err != nil {
+				t.Fatalf("exact committed replay after %s: %v", status, err)
+			}
+			if replay != first || repo.writes != 1 || repo.instance.Version != before.Version || repo.instance.HintsUsed != before.HintsUsed || repo.instance.Status != before.Status {
+				t.Fatal("replay changed receipt or aggregate")
+			}
+			changed := input
+			changed.HintLevel++
+			if _, err := restarted.RecordAssistance(context.Background(), input.TaskInstanceID, changed); !errors.Is(err, domain.ErrIdempotency) {
+				t.Fatalf("changed payload: %v", err)
+			}
+			foreign := input
+			foreign.StudentID = "33333333-3333-4333-8333-333333333333"
+			reads := repo.reads
+			if _, err := restarted.RecordAssistance(context.Background(), input.TaskInstanceID, foreign); !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("foreign owner: %v", err)
+			}
+			if repo.reads != reads || repo.writes != 1 {
+				t.Fatal("foreign owner reached receipt lookup or mutated")
+			}
+		})
+	}
+}
+func TestT13AssistanceNewFactsKeepCurrentGuards(t *testing.T) {
+	for _, guard := range []string{"lifecycle", "action", "step", "hint_cap"} {
+		t.Run(guard, func(t *testing.T) {
+			repo, input := assistanceReplayFixture()
+			switch guard {
+			case "lifecycle":
+				repo.instance.Status = domain.TaskInstanceInReview
+			case "action":
+				repo.instance.LearningActionID = ""
+			case "step":
+				repo.instance.Steps = nil
+			case "hint_cap":
+				repo.instance.HintsUsed = 1000
+			}
+			_, err := (&Runtime{Repository: repo}).RecordAssistance(context.Background(), input.TaskInstanceID, input)
+			if err == nil || repo.writes != 0 {
+				t.Fatal("new assistance bypassed guard")
+			}
+		})
+	}
+}
+func TestT13AssistanceReplayUsesOriginalServerFacts(t *testing.T) {
+	repo, input := assistanceReplayFixture()
+	firstTime := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
+	first, err := (&Runtime{Repository: repo, Now: func() time.Time { return firstTime }}).RecordAssistance(context.Background(), input.TaskInstanceID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.PolicyVersion = "caller-policy"
+	input.OccurredAt = firstTime.Add(24 * time.Hour)
+	replay, err := (&Runtime{Repository: repo, Now: func() time.Time { return firstTime.Add(time.Hour) }}).RecordAssistance(context.Background(), input.TaskInstanceID, input)
+	if err != nil {
+		t.Fatalf("server time drift blocked replay: %v", err)
+	}
+	if replay != first || repo.writes != 1 {
+		t.Fatal("caller/server time or policy overwrote original receipt")
+	}
+}
+
+func TestT13AssistanceReceiptLookupFailsClosed(t *testing.T) {
+	repo, input := assistanceReplayFixture()
+	repo.lookupError = domain.ErrDependency
+	if _, err := (&Runtime{Repository: repo}).RecordAssistance(context.Background(), input.TaskInstanceID, input); !errors.Is(err, domain.ErrDependency) {
+		t.Fatalf("lookup failure: %v", err)
+	}
+	if repo.writes != 0 {
+		t.Fatal("lookup failure fell through to a fresh write")
+	}
+}
+func TestT13AssistanceReplayConfirmsEveryStableField(t *testing.T) {
+	for _, field := range []string{"schema", "usage", "student", "instance", "step", "kind", "hint", "policy", "time"} {
+		t.Run(field, func(t *testing.T) {
+			repo, input := assistanceReplayFixture()
+			if _, err := (&Runtime{Repository: repo}).RecordAssistance(context.Background(), input.TaskInstanceID, input); err != nil {
+				t.Fatal(err)
+			}
+			switch field {
+			case "schema":
+				repo.stored.Schema = "different"
+			case "usage":
+				repo.stored.UsageID = "66666666-6666-4666-8666-666666666666"
+			case "student":
+				repo.stored.StudentID = "different"
+			case "instance":
+				repo.stored.TaskInstanceID = "different"
+			case "step":
+				repo.stored.StepID = "different"
+			case "kind":
+				repo.stored.Kind = "TEACHER_QUESTION"
+			case "hint":
+				repo.stored.HintLevel = 3
+			case "policy":
+				repo.stored.PolicyVersion = ""
+			case "time":
+				repo.stored.OccurredAt = time.Time{}
+			}
+			// The lookup represents a corrupt persisted/provider receipt, including
+			// a wrong returned usage ID; do not let the fake hide it as absent.
+			repoOverride := &assistanceCorruptReceiptRepository{assistanceReplayRepository: repo}
+			if _, err := (&Runtime{Repository: repoOverride}).RecordAssistance(context.Background(), input.TaskInstanceID, input); err == nil {
+				t.Fatal("corrupt stored receipt accepted")
+			}
+			if repo.writes != 1 {
+				t.Fatal("corrupt replay mutated aggregate")
+			}
+		})
+	}
+}
+
+type assistanceCorruptReceiptRepository struct{ *assistanceReplayRepository }
+
+func (r *assistanceCorruptReceiptRepository) GetAssistance(context.Context, string, string, string) (ports.AssistanceReceipt, string, error) {
+	return r.stored, r.digest, nil
+}

@@ -1,0 +1,184 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.HybridApplications = Store{}
+
+func (s Store) ClaimHybridApplication(ctx context.Context, now time.Time, ttl time.Duration) (domain.HybridApplicationWork, bool, error) {
+	var work domain.HybridApplicationWork
+	if s.Pool == nil || now.IsZero() || ttl <= 0 {
+		return work, false, domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return work, false, err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_application_work(consequence_id,next_attempt_at) SELECT consequence_id,$1::timestamptz FROM hybrid_consequence_receipt ON CONFLICT(consequence_id) DO NOTHING`, now.UTC())
+	if err != nil {
+		return work, false, err
+	}
+	var raw []byte
+	err = tx.QueryRow(ctx, `WITH candidate AS(SELECT consequence_id FROM hybrid_application_work WHERE NOT completed AND next_attempt_at<=$1 AND (lease_until IS NULL OR lease_until<=$1) ORDER BY next_attempt_at,consequence_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS(UPDATE hybrid_application_work w SET claim_token=$2,lease_until=$3 FROM candidate c WHERE w.consequence_id=c.consequence_id RETURNING w.*) SELECT r.job_id::text,r.payload_hash,r.consequence_json,r.committed_at,c.claim_token::text,c.lease_until FROM claimed c JOIN hybrid_consequence_receipt r ON r.consequence_id=c.consequence_id`, now.UTC(), uuid.NewString(), now.Add(ttl).UTC()).Scan(&work.Consequence.JobID, &work.Consequence.PayloadHash, &raw, &work.Consequence.CommittedAt, &work.ClaimToken, &work.LeaseUntil)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return work, false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return work, false, err
+	}
+	if decodeHybridStoredJSON(raw, &work.Consequence.Consequence) != nil || domain.ValidateHybridApplicationWork(work) != nil {
+		return work, false, domain.ErrValidation
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return work, false, err
+	}
+	return work, true, nil
+}
+
+func lockHybridApplicationClaim(ctx context.Context, tx pgx.Tx, work domain.HybridApplicationWork) (domain.HybridConsequenceReceipt, error) {
+	var durable domain.HybridConsequenceReceipt
+	var raw []byte
+	if domain.ValidateHybridApplicationWork(work) != nil {
+		return durable, domain.ErrValidation
+	}
+	err := tx.QueryRow(ctx, `SELECT r.job_id::text,r.payload_hash,r.consequence_json,r.committed_at FROM hybrid_application_work w JOIN hybrid_consequence_receipt r ON r.consequence_id=w.consequence_id WHERE w.consequence_id=$1 AND NOT w.completed AND w.claim_token=$2 AND w.lease_until>clock_timestamp() FOR UPDATE OF w`, work.Consequence.Consequence.ConsequenceID, work.ClaimToken).Scan(&durable.JobID, &durable.PayloadHash, &raw, &durable.CommittedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return durable, domain.ErrConflict
+	}
+	if err != nil {
+		return durable, err
+	}
+	if decodeHybridStoredJSON(raw, &durable.Consequence) != nil || durable.JobID != work.Consequence.JobID || durable.PayloadHash != work.Consequence.PayloadHash {
+		return durable, domain.ErrConflict
+	}
+	return durable, nil
+}
+
+func (s Store) CompleteHybridApplication(ctx context.Context, work domain.HybridApplicationWork, receipt domain.HybridApplicationReceipt) error {
+	if s.Pool == nil || domain.ValidateHybridApplicationWork(work) != nil || domain.ValidateHybridApplicationReceipt(receipt, work.Consequence.Consequence) != nil || receipt.Status == "WAITING_SAFE_BOUNDARY" {
+		return domain.ErrValidation
+	}
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		return domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if replay, err := replayHybridApplicationResult(ctx, tx, work, receipt.Status, raw); err != nil {
+		return err
+	} else if replay {
+		return tx.Commit(ctx)
+	}
+	durable, err := lockHybridApplicationClaim(ctx, tx, work)
+	if err != nil {
+		if replay, replayErr := replayHybridApplicationResult(ctx, tx, work, receipt.Status, raw); replayErr == nil && replay {
+			return tx.Commit(ctx)
+		}
+		return err
+	}
+	if domain.ValidateHybridApplicationReceipt(receipt, durable.Consequence) != nil {
+		return domain.ErrConflict
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_application_result(consequence_id,payload_hash,status,owner_receipt_json) VALUES($1,$2,$3,$4)`, durable.Consequence.ConsequenceID, durable.PayloadHash, receipt.Status, raw)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE hybrid_application_work SET completed=true,claim_token=NULL,lease_until=NULL WHERE consequence_id=$1 AND claim_token=$2`, durable.Consequence.ConsequenceID, work.ClaimToken)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func replayHybridApplicationResult(ctx context.Context, tx pgx.Tx, work domain.HybridApplicationWork, status string, raw []byte) (bool, error) {
+	var storedHash, storedStatus string
+	var stored []byte
+	err := tx.QueryRow(ctx, `SELECT payload_hash,status,owner_receipt_json FROM hybrid_application_result WHERE consequence_id=$1`, work.Consequence.Consequence.ConsequenceID).Scan(&storedHash, &storedStatus, &stored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if storedHash != work.Consequence.PayloadHash || storedStatus != status {
+		return false, domain.ErrConflict
+	}
+	if status != "STALE" {
+		var a, b domain.HybridApplicationReceipt
+		if decodeHybridStoredJSON(stored, &a) != nil || decodeHybridStoredJSON(raw, &b) != nil || !reflect.DeepEqual(a, b) {
+			return false, domain.ErrConflict
+		}
+	}
+	return true, nil
+}
+
+func (s Store) ReleaseHybridApplication(ctx context.Context, work domain.HybridApplicationWork, retryAt time.Time) error {
+	if s.Pool == nil || domain.ValidateHybridApplicationWork(work) != nil || retryAt.IsZero() {
+		return domain.ErrValidation
+	}
+	result, err := s.Pool.Exec(ctx, `UPDATE hybrid_application_work SET claim_token=NULL,lease_until=NULL,next_attempt_at=$3 WHERE consequence_id=$1 AND claim_token=$2 AND NOT completed`, work.Consequence.Consequence.ConsequenceID, work.ClaimToken, retryAt.UTC())
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+// One atomic local stale result schedules one new snapshot generation using the
+// retained actual Student fact. It never fabricates an inbox event or alters a pin.
+func (s Store) RecordHybridApplicationStale(ctx context.Context, work domain.HybridApplicationWork, reason string, now time.Time) error {
+	if s.Pool == nil || domain.ValidateHybridApplicationWork(work) != nil || reason != "OWNER_APPLICATION_STALE" || now.IsZero() {
+		return domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if replay, err := replayHybridApplicationResult(ctx, tx, work, "STALE", nil); err != nil {
+		return err
+	} else if replay {
+		return tx.Commit(ctx)
+	}
+	durable, err := lockHybridApplicationClaim(ctx, tx, work)
+	if err != nil {
+		if replay, replayErr := replayHybridApplicationResult(ctx, tx, work, "STALE", nil); replayErr == nil && replay {
+			return tx.Commit(ctx)
+		}
+		return err
+	}
+	c := durable.Consequence
+	// UPDATE-only requires a retained true owner trigger from the original chain.
+	updated, err := tx.Exec(ctx, `UPDATE hybrid_evaluation_work SET generation=generation+1,next_attempt_at=$3,local_reason=$4 WHERE student_id=$1 AND learning_path_id=$2`, c.StudentID, c.LearningPathID, now.UTC(), reason)
+	if err != nil {
+		return err
+	}
+	if updated.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_application_result(consequence_id,payload_hash,status,reason_code) VALUES($1,$2,'STALE',$3)`, c.ConsequenceID, durable.PayloadHash, reason)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE hybrid_application_work SET completed=true,claim_token=NULL,lease_until=NULL WHERE consequence_id=$1 AND claim_token=$2`, c.ConsequenceID, work.ClaimToken)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}

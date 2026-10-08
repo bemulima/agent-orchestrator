@@ -1,0 +1,239 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+const onboardingExecutionHandoffColumns = `h.handoff_id, h.student_id, h.idempotency_key, h.request_hash,
+h.state_ref_kind, h.state_ref_version, h.dialog_id, h.teacher_job_id, h.goal_code, h.goal_version, h.graph_version,
+h.readiness_observed_at, h.created_at`
+
+const onboardingExecutionColumns = `e.execution_id, ` + onboardingExecutionHandoffColumns + `, e.status, e.request_hash,
+e.snapshot_json, COALESCE(e.snapshot_hash,''), e.generated_course_json, COALESCE(e.generated_course_hash,''), COALESCE(e.course_id::text,''), COALESCE(e.course_reused,FALSE), COALESCE(e.course_lesson_bindings_json,'[]'::jsonb),
+COALESCE(e.admission_id::text,''), COALESCE(e.admission_fence,0), e.admission_expires_at, e.reserve_key::text,
+e.student_command_id, COALESCE(e.student_command_hash,''), COALESCE(e.learning_path_id::text,''), COALESCE(e.first_lesson_id::text,''),
+e.attempts, COALESCE(e.claim_token::text,''), e.lease_until, e.next_attempt_at, e.failure_code, e.created_at, e.updated_at, e.completed_at`
+
+func (store Store) NextAcceptedHandoff(ctx context.Context) (domain.OnboardingPlanHandoffRecord, error) {
+	return scanOnboardingPlanHandoff(store.Pool.QueryRow(ctx, `SELECT `+onboardingPlanHandoffColumns+` FROM teacher_onboarding_plan_handoff h
+WHERE NOT EXISTS (SELECT 1 FROM onboarding_path_execution e WHERE e.handoff_id=h.handoff_id) ORDER BY h.created_at,h.handoff_id LIMIT 1`))
+}
+func (store Store) NextOnboardingPathExecution(ctx context.Context, now time.Time) (domain.OnboardingPathExecution, error) {
+	return scanOnboardingExecution(store.Pool.QueryRow(ctx, `SELECT `+onboardingExecutionColumns+` FROM onboarding_path_execution e JOIN teacher_onboarding_plan_handoff h ON h.handoff_id=e.handoff_id WHERE e.status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN') AND e.next_attempt_at <= $1 AND (e.lease_until IS NULL OR e.lease_until <= $1) ORDER BY e.next_attempt_at,e.created_at,e.execution_id LIMIT 1`, now))
+}
+
+func (store Store) CreateOrGetOnboardingPathExecution(ctx context.Context, input domain.OnboardingPathExecution) (domain.OnboardingPathExecution, bool, error) {
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.OnboardingPathExecution{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var insertedExecutionID string
+	err = tx.QueryRow(ctx, `INSERT INTO onboarding_path_execution(execution_id,handoff_id,request_hash,status,student_command_id,reserve_key,next_attempt_at,created_at,updated_at)
+VALUES ($1,$2,$3,'PENDING',$4,$5,$6,$7,$8)
+ON CONFLICT (handoff_id) DO NOTHING
+RETURNING execution_id::text`, input.ExecutionID, input.Handoff.HandoffID, input.RequestHash, input.StudentCommandID, input.ReserveKey, input.NextAttemptAt, input.CreatedAt, input.UpdatedAt).Scan(&insertedExecutionID)
+	created := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return domain.OnboardingPathExecution{}, false, err
+	}
+
+	stored, err := scanOnboardingExecution(tx.QueryRow(ctx, `SELECT `+onboardingExecutionColumns+`
+FROM onboarding_path_execution e
+JOIN teacher_onboarding_plan_handoff h ON h.handoff_id=e.handoff_id
+WHERE e.handoff_id=$1
+FOR UPDATE OF e`, input.Handoff.HandoffID))
+	if err != nil {
+		return domain.OnboardingPathExecution{}, false, err
+	}
+	if stored.RequestHash != input.RequestHash || stored.ExecutionID != input.ExecutionID || stored.StudentCommandID != input.StudentCommandID || stored.ReserveKey != input.ReserveKey {
+		return domain.OnboardingPathExecution{}, false, domain.ErrConflict
+	}
+	if created && insertedExecutionID != stored.ExecutionID {
+		return domain.OnboardingPathExecution{}, false, domain.ErrConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.OnboardingPathExecution{}, false, err
+	}
+	return stored, created, nil
+}
+
+func (store Store) ClaimOnboardingPathExecution(ctx context.Context, executionID, token string, now, until time.Time) (domain.OnboardingPathExecution, error) {
+	row := store.Pool.QueryRow(ctx, `UPDATE onboarding_path_execution e SET claim_token=$2,lease_until=$4,attempts=e.attempts+1,updated_at=$3
+FROM teacher_onboarding_plan_handoff h WHERE e.handoff_id=h.handoff_id AND e.execution_id=$1 AND e.status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN')
+AND e.next_attempt_at <= $3 AND (e.lease_until IS NULL OR e.lease_until <= $3) RETURNING `+onboardingExecutionColumns, executionID, token, now, until)
+	return scanOnboardingExecution(row)
+}
+func (store Store) RenewOnboardingPathExecution(ctx context.Context, id, token string, fence int64, expiry, now, until time.Time) error {
+	c, e := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET admission_fence=GREATEST(admission_fence,$3),admission_expires_at=GREATEST(admission_expires_at,$4),lease_until=$6,updated_at=$5 WHERE execution_id=$1 AND claim_token=$2 AND admission_id IS NOT NULL AND status IN ('SNAPSHOT_FROZEN','COURSE_FROZEN')`, id, token, fence, expiry, now, until)
+	if e != nil {
+		return e
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) CheckpointOnboardingSnapshot(ctx context.Context, e domain.OnboardingPathExecution, token string, snapshot []byte, hash, admissionID string, fence int64, expiry, now time.Time) error {
+	c, err := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET snapshot_json=COALESCE(snapshot_json,$3::jsonb),snapshot_hash=COALESCE(snapshot_hash,$4),admission_id=COALESCE(admission_id,$5::uuid),admission_fence=GREATEST(COALESCE(admission_fence,0),$6),admission_expires_at=GREATEST(COALESCE(admission_expires_at,$7),$7),status='SNAPSHOT_FROZEN',updated_at=$8 WHERE execution_id=$1 AND claim_token=$2 AND status IN ('PENDING','SNAPSHOT_FROZEN') AND (snapshot_hash IS NULL OR snapshot_hash=$4) AND (admission_id IS NULL OR admission_id=$5::uuid)`, e.ExecutionID, token, string(snapshot), hash, admissionID, fence, expiry, now)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) CheckpointOnboardingCourse(ctx context.Context, e domain.OnboardingPathExecution, token string, course []byte, hash string, now time.Time) error {
+	c, err := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET generated_course_json=COALESCE(generated_course_json,$3::jsonb),generated_course_hash=COALESCE(generated_course_hash,$4),updated_at=$5 WHERE execution_id=$1 AND claim_token=$2 AND status IN ('SNAPSHOT_FROZEN','COURSE_FROZEN') AND (generated_course_hash IS NULL OR generated_course_hash=$4)`, e.ExecutionID, token, string(course), hash, now)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) CheckpointOnboardingCourseReceipt(ctx context.Context, e domain.OnboardingPathExecution, token, courseID string, reused bool, lessons []domain.CourseLessonBinding, now time.Time) error {
+	bindings, marshalErr := json.Marshal(lessons)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	c, err := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET course_id=COALESCE(course_id,$3::uuid),course_reused=COALESCE(course_reused,$4),course_lesson_bindings_json=COALESCE(course_lesson_bindings_json,$5::jsonb),status='COURSE_FROZEN',updated_at=$6 WHERE execution_id=$1 AND claim_token=$2 AND status IN ('SNAPSHOT_FROZEN','COURSE_FROZEN') AND generated_course_hash IS NOT NULL AND (course_id IS NULL OR course_id=$3::uuid) AND (course_lesson_bindings_json IS NULL OR course_lesson_bindings_json=$5::jsonb)`, e.ExecutionID, token, courseID, reused, string(bindings), now)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) CheckpointOnboardingMaterialization(ctx context.Context, e domain.OnboardingPathExecution, token, commandHash string, now time.Time) error {
+	c, err := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET student_command_hash=COALESCE(student_command_hash,$3),updated_at=$4 WHERE execution_id=$1 AND claim_token=$2 AND status='COURSE_FROZEN' AND course_lesson_bindings_json IS NOT NULL AND (student_command_hash IS NULL OR student_command_hash=$3)`, e.ExecutionID, token, commandHash, now)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) ListOnboardingPathLessonContent(ctx context.Context, executionID string) ([]domain.OnboardingPathLessonContent, error) {
+	rows, err := store.Pool.Query(ctx, `SELECT execution_id::text,lesson_index,module_code,section_code,lesson_code,ai_idempotency_key::text,content_json,content_hash,created_at FROM onboarding_path_execution_lesson_content WHERE execution_id=$1 ORDER BY lesson_index`, executionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]domain.OnboardingPathLessonContent, 0)
+	for rows.Next() {
+		var item domain.OnboardingPathLessonContent
+		if err := rows.Scan(&item.ExecutionID, &item.LessonIndex, &item.ModuleCode, &item.SectionCode, &item.LessonCode, &item.AIIdempotencyKey, &item.Content, &item.ContentHash, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+func (store Store) CheckpointOnboardingPathLessonContent(ctx context.Context, e domain.OnboardingPathExecution, token string, item domain.OnboardingPathLessonContent) error {
+	c, err := store.Pool.Exec(ctx, `INSERT INTO onboarding_path_execution_lesson_content(execution_id,lesson_index,module_code,section_code,lesson_code,ai_idempotency_key,content_json,content_hash,created_at)
+SELECT $1,$3,$4,$5,$6,$7,$8::jsonb,$9,$10 FROM onboarding_path_execution WHERE execution_id=$1 AND claim_token=$2 AND status='SNAPSHOT_FROZEN'
+ON CONFLICT (execution_id,lesson_index) DO UPDATE SET execution_id=onboarding_path_execution_lesson_content.execution_id
+WHERE onboarding_path_execution_lesson_content.module_code=EXCLUDED.module_code AND onboarding_path_execution_lesson_content.section_code=EXCLUDED.section_code AND onboarding_path_execution_lesson_content.lesson_code=EXCLUDED.lesson_code AND onboarding_path_execution_lesson_content.ai_idempotency_key=EXCLUDED.ai_idempotency_key AND onboarding_path_execution_lesson_content.content_json=EXCLUDED.content_json AND onboarding_path_execution_lesson_content.content_hash=EXCLUDED.content_hash`, e.ExecutionID, token, item.LessonIndex, item.ModuleCode, item.SectionCode, item.LessonCode, item.AIIdempotencyKey, string(item.Content), item.ContentHash, item.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+func (store Store) CompleteOnboardingPathExecution(ctx context.Context, e domain.OnboardingPathExecution, token string, now time.Time) error {
+	var event domain.IntegrationEvent
+	if e.Status != domain.OnboardingExecutionFailed {
+		var eventErr error
+		event, eventErr = newOnboardingPathOutcomeEvent(e, now)
+		if eventErr != nil {
+			return eventErr
+		}
+	}
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	c, err := tx.Exec(ctx, `UPDATE onboarding_path_execution SET status=$3,failure_code=$4,learning_path_id=NULLIF($5::text,'')::uuid,first_lesson_id=NULLIF($6::text,'')::uuid,claim_token=NULL,lease_until=NULL,updated_at=$7,completed_at=$7 WHERE execution_id=$1 AND claim_token=$2 AND status IN ('PENDING','COURSE_FROZEN','SNAPSHOT_FROZEN')`, e.ExecutionID, token, e.Status, e.FailureCode, e.LearningPathID, e.FirstLessonID, now)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	if e.Status != domain.OnboardingExecutionFailed {
+		_, err = tx.Exec(ctx, `INSERT INTO planner_outbox(event_id,subject,schema_version,student_id,correlation_id,causation_id,occurred_at,payload,next_attempt_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$7,$7) ON CONFLICT (event_id) DO NOTHING`, event.EventID, event.Subject, event.SchemaVersion, event.StudentID, event.CorrelationID, event.CausationID, event.OccurredAt, string(event.Payload))
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+func (store Store) RetryOnboardingPathExecution(ctx context.Context, e domain.OnboardingPathExecution, token, code string, now, next time.Time) error {
+	c, err := store.Pool.Exec(ctx, `UPDATE onboarding_path_execution SET claim_token=NULL,lease_until=NULL,failure_code=$3,next_attempt_at=$5,updated_at=$4 WHERE execution_id=$1 AND claim_token=$2 AND status IN ('PENDING','SNAPSHOT_FROZEN','COURSE_FROZEN')`, e.ExecutionID, token, code, now, next)
+	if err != nil {
+		return err
+	}
+	if c.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+type onboardingExecutionRow interface{ Scan(...any) error }
+
+func scanOnboardingExecution(row onboardingExecutionRow) (domain.OnboardingPathExecution, error) {
+	var e domain.OnboardingPathExecution
+	var snapshot, course, bindings []byte
+	err := row.Scan(&e.ExecutionID, &e.Handoff.HandoffID, &e.Handoff.StudentID, &e.Handoff.IdempotencyKey, &e.Handoff.RequestHash, &e.Handoff.StateRef.Kind, &e.Handoff.StateRef.Version, &e.Handoff.DialogID, &e.Handoff.TeacherJobID, &e.Handoff.Goal.Code, &e.Handoff.Goal.Version, &e.Handoff.Goal.GraphVersion, &e.Handoff.ReadinessObservedAt, &e.Handoff.CreatedAt, &e.Status, &e.RequestHash, &snapshot, &e.SnapshotHash, &course, &e.GeneratedCourseHash, &e.CourseID, &e.CourseReused, &bindings, &e.AdmissionID, &e.AdmissionFence, &e.AdmissionExpiresAt, &e.ReserveKey, &e.StudentCommandID, &e.StudentCommandHash, &e.LearningPathID, &e.FirstLessonID, &e.Attempts, &e.ClaimToken, &e.LeaseUntil, &e.NextAttemptAt, &e.FailureCode, &e.CreatedAt, &e.UpdatedAt, &e.CompletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OnboardingPathExecution{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.OnboardingPathExecution{}, err
+	}
+	e.Snapshot = append([]byte(nil), snapshot...)
+	e.GeneratedCourse = append([]byte(nil), course...)
+	if err := json.Unmarshal(bindings, &e.CourseLessons); err != nil {
+		return domain.OnboardingPathExecution{}, domain.ErrValidation
+	}
+	return e, nil
+}
+
+func newOnboardingPathOutcomeEvent(e domain.OnboardingPathExecution, now time.Time) (domain.IntegrationEvent, error) {
+	out, err := domain.NewOnboardingPathOutcome(e)
+	if err != nil {
+		return domain.IntegrationEvent{}, err
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return domain.IntegrationEvent{}, err
+	}
+	eventID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(e.ExecutionID+"\x00"+domain.SubjectOnboardingPathOutcome)).String()
+	payload, err := json.Marshal(domain.EventEnvelope{EventID: eventID, EventType: domain.SubjectOnboardingPathOutcome, CorrelationID: e.ExecutionID, CausationID: e.Handoff.HandoffID, StudentID: e.Handoff.StudentID, OccurredAt: now.UTC(), SchemaVersion: 1, Data: data})
+	if err != nil {
+		return domain.IntegrationEvent{}, err
+	}
+	return domain.IntegrationEvent{EventID: eventID, Subject: domain.SubjectOnboardingPathOutcome, CorrelationID: e.ExecutionID, CausationID: e.Handoff.HandoffID, StudentID: e.Handoff.StudentID, OccurredAt: now.UTC(), SchemaVersion: 1, Payload: payload}, nil
+}
+
+var _ repository.OnboardingPathExecutionRepository = Store{}

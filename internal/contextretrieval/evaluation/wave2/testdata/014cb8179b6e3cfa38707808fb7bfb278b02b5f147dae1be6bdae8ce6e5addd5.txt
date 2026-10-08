@@ -1,0 +1,252 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+var _ repository.HybridConsequences = Store{}
+
+func (s Store) ClaimHybridConsequenceEvaluation(ctx context.Context, now time.Time, ttl time.Duration) (domain.HybridConsequenceEvaluation, bool, error) {
+	var work domain.HybridConsequenceEvaluation
+	if s.Pool == nil || now.IsZero() || ttl <= 0 {
+		return work, false, domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return work, false, err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_consequence_work(job_id,next_attempt_at) SELECT id,$1::timestamptz FROM hybrid_evaluation_job ON CONFLICT(job_id) DO NOTHING`, now.UTC())
+	if err != nil {
+		return work, false, err
+	}
+	var snapshotRaw, inputsRaw []byte
+	token := uuid.NewString()
+	err = tx.QueryRow(ctx, `WITH candidate AS (SELECT job_id FROM hybrid_consequence_work WHERE NOT completed AND next_attempt_at<=$1 AND (lease_until IS NULL OR lease_until<=$1) ORDER BY next_attempt_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE hybrid_consequence_work w SET claim_token=$2,lease_until=$3 FROM candidate c WHERE w.job_id=c.job_id RETURNING w.*) SELECT j.id::text,j.student_id::text,j.learning_path_id::text,j.snapshot_ref,j.policy_version,j.snapshot_json,j.created_at,c.claim_token::text,c.lease_until,p.inputs_json FROM claimed c JOIN hybrid_evaluation_job j ON j.id=c.job_id LEFT JOIN hybrid_consequence_input p ON p.job_id=j.id`, now.UTC(), token, now.Add(ttl).UTC()).Scan(&work.Job.ID, &work.Job.StudentID, &work.Job.LearningPathID, &work.Job.SnapshotRef, &work.Job.PolicyVersion, &snapshotRaw, &work.Job.CreatedAt, &work.ClaimToken, &work.LeaseUntil, &inputsRaw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return work, false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return work, false, err
+	}
+	if err = decodeHybridStoredJSON(snapshotRaw, &work.Job.Snapshot); err != nil {
+		return work, false, err
+	}
+	request := domain.HybridSnapshotRequest{Targets: work.Job.Snapshot.RequestedTargets, TriggerContext: work.Job.Snapshot.TriggerContext}
+	expectedID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("hybrid-evaluation:"+work.Job.StudentID+":"+work.Job.LearningPathID+":"+work.Job.SnapshotRef+":"+work.Job.PolicyVersion)).String()
+	if work.Job.ID != expectedID || work.Job.PolicyVersion != domain.HybridReplanPolicyVersion || work.Job.Snapshot.References.SnapshotRef != work.Job.SnapshotRef || domain.ValidateHybridPlanningSnapshot(work.Job.Snapshot, work.Job.StudentID, work.Job.LearningPathID, request) != nil {
+		return work, false, domain.ErrValidation
+	}
+	if len(inputsRaw) > 0 {
+		inputs, err := decodeHybridInputs(inputsRaw)
+		if err != nil {
+			return work, false, err
+		}
+		work.Inputs = &inputs
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return work, false, err
+	}
+	return work, true, nil
+}
+
+func (s Store) CheckpointHybridConsequenceInputs(ctx context.Context, work domain.HybridConsequenceEvaluation, policy domain.PolicyBundle, graph domain.HybridPrerequisiteGraph) (domain.HybridConsequenceEvaluation, error) {
+	if s.Pool == nil {
+		return work, domain.ErrValidation
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return work, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lockHybridConsequenceClaim(ctx, tx, work); err != nil {
+		return work, err
+	}
+	// Existing pin is replay authority even if a caller observed a newer policy activation.
+	var stored []byte
+	err = tx.QueryRow(ctx, `SELECT inputs_json FROM hybrid_consequence_input WHERE job_id=$1`, work.Job.ID).Scan(&stored)
+	if err == nil {
+		inputs, err := decodeHybridInputs(stored)
+		if err != nil {
+			return work, err
+		}
+		work.Inputs = &inputs
+		return work, tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return work, err
+	}
+	inputs, err := domain.NormalizeHybridConsequenceInputs(policy, graph)
+	if err != nil {
+		return work, err
+	}
+	raw, err := json.Marshal(inputs)
+	if err != nil {
+		return work, err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO hybrid_consequence_input(job_id,input_hash,inputs_json) VALUES($1,$2,$3)`, work.Job.ID, inputs.InputHash, raw)
+	if err != nil {
+		return work, err
+	}
+	work.Inputs = &inputs
+	return work, tx.Commit(ctx)
+}
+
+func (s Store) CompleteHybridConsequenceEvaluation(ctx context.Context, work domain.HybridConsequenceEvaluation, consequence domain.HybridConsequence) (domain.HybridConsequenceReceipt, error) {
+	var receipt domain.HybridConsequenceReceipt
+	if s.Pool == nil || domain.ValidateHybridConsequence(consequence) != nil {
+		return receipt, domain.ErrValidation
+	}
+	hash, err := domain.HybridConsequencePayloadHash(consequence)
+	if err != nil {
+		return receipt, err
+	}
+	if stored, err := s.GetHybridConsequence(ctx, work.Job.ID); err == nil {
+		if stored.PayloadHash != hash {
+			return receipt, domain.ErrConflict
+		}
+		return stored, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return receipt, err
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return receipt, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lockHybridConsequenceClaim(ctx, tx, work); err != nil {
+		_ = tx.Rollback(ctx)
+		// A concurrent exact completion is valid replay after waiting for its commit.
+		if stored, replayErr := s.GetHybridConsequence(ctx, work.Job.ID); replayErr == nil {
+			if stored.PayloadHash != hash {
+				return receipt, domain.ErrConflict
+			}
+			return stored, nil
+		}
+		return receipt, err
+	}
+	var rawInputs []byte
+	var student, path, ref, policy string
+	var snapshotRaw []byte
+	err = tx.QueryRow(ctx, `SELECT p.inputs_json,j.student_id::text,j.learning_path_id::text,j.snapshot_ref,j.policy_version,j.snapshot_json FROM hybrid_consequence_input p JOIN hybrid_evaluation_job j ON j.id=p.job_id WHERE p.job_id=$1`, work.Job.ID).Scan(&rawInputs, &student, &path, &ref, &policy, &snapshotRaw)
+	if err != nil {
+		return receipt, err
+	}
+	inputs, err := decodeHybridInputs(rawInputs)
+	if err != nil {
+		return receipt, err
+	}
+	var snapshot domain.HybridPlanningSnapshot
+	if err = decodeHybridStoredJSON(snapshotRaw, &snapshot); err != nil {
+		return receipt, err
+	}
+	if consequence.StudentID != student || consequence.LearningPathID != path || consequence.SnapshotRef != ref || consequence.PolicyVersion != policy || consequence.ExpectedPathRevision != snapshot.Path.Version || consequence.PolicyInputHash != inputs.InputHash {
+		return receipt, domain.ErrConflict
+	}
+	expected, err := domain.EvaluateHybridSnapshot(snapshot, inputs)
+	if err != nil {
+		return receipt, err
+	}
+	expectedHash, err := domain.HybridConsequencePayloadHash(expected)
+	if err != nil || expectedHash != hash {
+		return receipt, domain.ErrConflict
+	}
+	raw, err := json.Marshal(consequence)
+	if err != nil {
+		return receipt, err
+	}
+	receipt = domain.HybridConsequenceReceipt{JobID: work.Job.ID, PayloadHash: hash, Consequence: consequence}
+	err = tx.QueryRow(ctx, `INSERT INTO hybrid_consequence_receipt(job_id,consequence_id,payload_hash,consequence_json) VALUES($1,$2,$3,$4) RETURNING committed_at`, work.Job.ID, consequence.ConsequenceID, hash, raw).Scan(&receipt.CommittedAt)
+	if err != nil {
+		return receipt, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE hybrid_consequence_work SET completed=true,claim_token=NULL,lease_until=NULL WHERE job_id=$1 AND claim_token=$2`, work.Job.ID, work.ClaimToken)
+	if err != nil {
+		return receipt, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return receipt, err
+	}
+	return receipt, nil
+}
+
+func (s Store) ReleaseHybridConsequenceEvaluation(ctx context.Context, work domain.HybridConsequenceEvaluation, retryAt time.Time) error {
+	if s.Pool == nil || retryAt.IsZero() || work.ClaimToken == "" {
+		return domain.ErrValidation
+	}
+	result, err := s.Pool.Exec(ctx, `UPDATE hybrid_consequence_work SET claim_token=NULL,lease_until=NULL,next_attempt_at=$3 WHERE job_id=$1 AND claim_token=$2 AND NOT completed`, work.Job.ID, work.ClaimToken, retryAt.UTC())
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (s Store) GetHybridConsequence(ctx context.Context, jobID string) (domain.HybridConsequenceReceipt, error) {
+	var receipt domain.HybridConsequenceReceipt
+	var raw []byte
+	if s.Pool == nil {
+		return receipt, domain.ErrValidation
+	}
+	err := s.Pool.QueryRow(ctx, `SELECT job_id::text,payload_hash,consequence_json,committed_at FROM hybrid_consequence_receipt WHERE job_id=$1`, jobID).Scan(&receipt.JobID, &receipt.PayloadHash, &raw, &receipt.CommittedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return receipt, domain.ErrNotFound
+	}
+	if err != nil {
+		return receipt, err
+	}
+	if err = decodeHybridStoredJSON(raw, &receipt.Consequence); err != nil {
+		return receipt, err
+	}
+	if domain.ValidateHybridConsequence(receipt.Consequence) != nil {
+		return receipt, domain.ErrValidation
+	}
+	hash, err := domain.HybridConsequencePayloadHash(receipt.Consequence)
+	if err != nil || hash != receipt.PayloadHash {
+		return receipt, domain.ErrValidation
+	}
+	return receipt, nil
+}
+
+func lockHybridConsequenceClaim(ctx context.Context, tx pgx.Tx, work domain.HybridConsequenceEvaluation) error {
+	if work.Job.ID == "" || work.ClaimToken == "" {
+		return domain.ErrValidation
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT job_id::text FROM hybrid_consequence_work WHERE job_id=$1 AND claim_token=$2 AND NOT completed AND lease_until>clock_timestamp() FOR UPDATE`, work.Job.ID, work.ClaimToken).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrConflict
+	}
+	return err
+}
+func decodeHybridInputs(raw []byte) (domain.HybridConsequenceInputs, error) {
+	var inputs domain.HybridConsequenceInputs
+	if err := decodeHybridStoredJSON(raw, &inputs); err != nil {
+		return inputs, err
+	}
+	normalized, err := domain.NormalizeHybridConsequenceInputs(inputs.Policy, inputs.Graph)
+	if err != nil || normalized.InputHash != inputs.InputHash {
+		return inputs, domain.ErrValidation
+	}
+	return inputs, nil
+}
+func decodeHybridStoredJSON(raw []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(value) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return domain.ErrValidation
+	}
+	return nil
+}

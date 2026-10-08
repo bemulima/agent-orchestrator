@@ -1,0 +1,164 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/transport/http/api/v1/middleware"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+type CoursePlanHandler struct {
+	Create courseplan.Create
+	Get    courseplan.Get
+}
+
+type coursePlanResponse struct {
+	RequestID      string                  `json:"request_id"`
+	GoalCode       string                  `json:"goal_code"`
+	Status         domain.CoursePlanStatus `json:"status"`
+	ResultCode     string                  `json:"result_code,omitempty"`
+	CourseID       string                  `json:"course_id,omitempty"`
+	LearningPathID string                  `json:"learning_path_id,omitempty"`
+	Reused         bool                    `json:"reused"`
+	Attempts       int                     `json:"attempts"`
+	CreatedAt      string                  `json:"created_at"`
+	UpdatedAt      string                  `json:"updated_at"`
+	CompletedAt    string                  `json:"completed_at,omitempty"`
+	Source         domain.PlanningSource   `json:"source"`
+	Reason         domain.PlanningReason   `json:"reason"`
+}
+
+type createCoursePlanPayload struct {
+	GoalCode         string                     `json:"goal_code"`
+	LearningPathID   string                     `json:"learning_path_id"`
+	DesiredOutcome   string                     `json:"desired_outcome"`
+	RequestedTargets []domain.TargetRef         `json:"requested_targets"`
+	Constraints      domain.PlanningConstraints `json:"constraints"`
+	AuditRefs        domain.PlanningAuditRefs   `json:"audit_refs"`
+	Reason           domain.PlanningReason      `json:"reason"`
+}
+
+func (handler CoursePlanHandler) CreateCoursePlan(writer http.ResponseWriter, request *http.Request) {
+	actor, ok := middleware.ActorFromContext(request.Context())
+	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+	if !ok {
+		writeError(writer, http.StatusForbidden, "forbidden")
+		return
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_idempotency_key")
+		return
+	}
+	payload, ok := decodeCreatePayload(writer, request)
+	if !ok {
+		return
+	}
+	if payload.DesiredOutcome == "" {
+		payload.DesiredOutcome = payload.GoalCode
+	}
+	if payload.Reason == "" {
+		payload.Reason = domain.PlanningReasonInitial
+	}
+	result, created, err := handler.Create.Handle(request.Context(), courseplan.CreateInput{
+		StudentID: actor.UserID, IdempotencyKey: idempotencyKey, GoalCode: payload.GoalCode,
+		LearningPathID: payload.LearningPathID,
+		Intent: domain.PlanningIntent{
+			Source: domain.PlanningSourceStudent, Reason: payload.Reason,
+			DesiredOutcome: payload.DesiredOutcome, RequestedTargets: payload.RequestedTargets,
+			Constraints: payload.Constraints,
+		},
+	})
+	writeCreateResult(writer, result, created, err)
+}
+
+func decodeCreatePayload(writer http.ResponseWriter, request *http.Request) (createCoursePlanPayload, bool) {
+	var payload createCoursePlanPayload
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return createCoursePlanPayload{}, false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return createCoursePlanPayload{}, false
+	}
+	return payload, true
+}
+
+func writeCreateResult(writer http.ResponseWriter, result domain.CoursePlanRequest, created bool, err error) {
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	status := http.StatusAccepted
+	if !created && result.Status != domain.CoursePlanPlanning {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, publicCoursePlan(result))
+}
+
+func (handler CoursePlanHandler) GetCoursePlan(writer http.ResponseWriter, request *http.Request) {
+	actor, ok := middleware.ActorFromContext(request.Context())
+	requestID := chi.URLParam(request, "requestID")
+	if !ok {
+		writeError(writer, http.StatusForbidden, "forbidden")
+		return
+	}
+	if _, err := uuid.Parse(requestID); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request_id")
+		return
+	}
+	result, err := handler.Get.Handle(request.Context(), actor.UserID, requestID)
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, publicCoursePlan(result))
+}
+
+func publicCoursePlan(input domain.CoursePlanRequest) coursePlanResponse {
+	response := coursePlanResponse{
+		RequestID: input.ID, GoalCode: input.GoalCode, Status: input.Status,
+		ResultCode: input.ResultCode, CourseID: input.CourseID, LearningPathID: input.LearningPathID, Reused: input.Reused,
+		Attempts: input.Attempts, CreatedAt: input.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		UpdatedAt: input.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		Source:    input.Intent.Source, Reason: input.Intent.Reason,
+	}
+	if input.CompletedAt != nil {
+		response.CompletedAt = input.CompletedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
+	}
+	return response
+}
+
+func writeDomainError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrValidation):
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_request")
+	case errors.Is(err, domain.ErrConflict):
+		writeError(writer, http.StatusConflict, "idempotency_conflict")
+	case errors.Is(err, domain.ErrNotFound):
+		writeError(writer, http.StatusNotFound, "not_found")
+	case errors.Is(err, domain.ErrForbidden):
+		writeError(writer, http.StatusForbidden, "forbidden")
+	default:
+		writeError(writer, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+func writeError(writer http.ResponseWriter, status int, code string) {
+	writeJSON(writer, status, map[string]any{"error": map[string]string{"code": code}})
+}
+
+func writeJSON(writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(payload)
+}

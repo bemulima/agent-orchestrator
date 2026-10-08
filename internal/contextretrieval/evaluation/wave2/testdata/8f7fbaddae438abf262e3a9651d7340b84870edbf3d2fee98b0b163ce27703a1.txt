@@ -1,0 +1,209 @@
+package courseplan
+
+import (
+	"context"
+	"errors"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"testing"
+	"time"
+)
+
+func TestDiagnosticInitialRejectsRandomRetryKeyBeforePersistence(t *testing.T) {
+	repo := &createRequestRepository{}
+	_, _, err := (Create{Requests: repo, IDs: fixedIDs{value: "44444444-4444-4444-8444-444444444444"}, Clock: fixedClock{value: time.Now()}}).Handle(context.Background(), CreateInput{StudentID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: "22222222-2222-4222-8222-222222222222", DiagnosticPlanID: "33333333-3333-4333-8333-333333333333", GoalCode: "go.backend", Intent: domain.PlanningIntent{Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial, DesiredOutcome: "go"}})
+	if !errors.Is(err, domain.ErrValidation) || repo.calls != 0 {
+		t.Fatalf("err=%v calls=%d", err, repo.calls)
+	}
+}
+
+type diagnosticCreateMemory struct {
+	repository.CoursePlanRepository
+	request          domain.CoursePlanRequest
+	creates, resumes int
+}
+
+func (m *diagnosticCreateMemory) CreateOrGet(_ context.Context, r domain.CoursePlanRequest) (domain.CoursePlanRequest, bool, error) {
+	if m.request.ID != "" {
+		if m.request.RequestHash != r.RequestHash {
+			return domain.CoursePlanRequest{}, false, domain.ErrConflict
+		}
+		return m.request, false, nil
+	}
+	m.creates++
+	m.request = r
+	return r, true, nil
+}
+func (m *diagnosticCreateMemory) GetDiagnosticPlanningRequest(context.Context, string, string) (domain.CoursePlanRequest, error) {
+	if m.request.ID == "" {
+		return domain.CoursePlanRequest{}, domain.ErrNotFound
+	}
+	return m.request, nil
+}
+func (m *diagnosticCreateMemory) GetInitialAllocation(context.Context, domain.CoursePlanRequest) (domain.InitialAllocationCheckpoint, error) {
+	return domain.InitialAllocationCheckpoint{}, domain.ErrNotFound
+}
+func (m *diagnosticCreateMemory) CheckpointInitialAllocation(context.Context, domain.CoursePlanRequest, domain.InitialAllocationCheckpoint, time.Time) error {
+	return nil
+}
+func (m *diagnosticCreateMemory) ResumeDiagnosticPlanning(context.Context, string, string, time.Time) (domain.CoursePlanRequest, error) {
+	m.resumes++
+	m.request.Status = domain.CoursePlanPlanning
+	m.request.FailureCode = ""
+	m.request.Attempts = 0
+	return m.request, nil
+}
+
+func TestDiagnosticExplicitRetryRetainsRequestAndResolvedPath(t *testing.T) {
+	now := time.Now()
+	planID := "33333333-3333-4333-8333-333333333333"
+	input := CreateInput{StudentID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: planID, DiagnosticPlanID: planID, GoalCode: "go.backend", Intent: domain.PlanningIntent{Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial, DesiredOutcome: "Go backend"}}
+	for _, terminal := range []string{domain.CoursePlanFailureAttempts, "DIAGNOSTIC_PLAN_INVALID", "COMPLETED", "NO_GAP"} {
+		t.Run(terminal, func(t *testing.T) {
+			m := &diagnosticCreateMemory{}
+			create := Create{Requests: m, DiagnosticRequests: m, IDs: fixedIDs{value: "44444444-4444-4444-8444-444444444444"}, Clock: fixedClock{value: now}}
+			first, created, err := create.Handle(context.Background(), input)
+			if err != nil || !created {
+				t.Fatalf("create %v", err)
+			}
+			m.request.Status = domain.CoursePlanFailed
+			m.request.FailureCode = terminal
+			m.request.LearningPathID = "55555555-5555-4555-8555-555555555555"
+			if terminal == "COMPLETED" || terminal == "NO_GAP" {
+				m.request.Status = domain.CoursePlanCompleted
+				m.request.FailureCode = ""
+				m.request.ResultCode = terminal
+			}
+			result, created, err := create.Handle(context.Background(), input)
+			if err != nil || created || result.ID != first.ID || result.LearningPathID != m.request.LearningPathID || m.creates != 1 {
+				t.Fatalf("retry %#v %v creates=%d", result, err, m.creates)
+			}
+			expectedResumes := 0
+			if terminal == domain.CoursePlanFailureAttempts {
+				expectedResumes = 1
+			}
+			if m.resumes != expectedResumes {
+				t.Fatalf("resumes=%d", m.resumes)
+			}
+		})
+	}
+}
+
+type diagnosticStateRequests struct {
+	request domain.CoursePlanRequest
+	err     error
+	calls   int
+}
+
+func (r *diagnosticStateRequests) GetDiagnosticPlanningRequest(context.Context, string, string) (domain.CoursePlanRequest, error) {
+	r.calls++
+	return r.request, r.err
+}
+
+func TestDiagnosticPlanningStateOwnerEmptyAndConflict(t *testing.T) {
+	studentID, planID := "11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"
+	plans := &diagnosticProcessorRepository{plan: diagnosticRecordForCoursePlan(t, studentID, planID)}
+	requests := &diagnosticStateRequests{err: domain.ErrNotFound}
+	get := GetDiagnosticPlanning{Plans: plans, Requests: requests}
+	state, err := get.Handle(context.Background(), studentID, planID)
+	if err != nil || state.Request != nil || state.Schema != "diagnostic-planning-state.v1" || state.GoalCode != "go.backend" {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+	_, err = get.Handle(context.Background(), "22222222-2222-4222-8222-222222222222", planID)
+	if !errors.Is(err, domain.ErrNotFound) || requests.calls != 1 {
+		t.Fatalf("foreign owner err=%v calls=%d", err, requests.calls)
+	}
+	requests.err = domain.ErrConflict
+	_, err = get.Handle(context.Background(), studentID, planID)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("ambiguous=%v", err)
+	}
+	requests.err = nil
+	requests.request = domain.CoursePlanRequest{ID: planID, StudentID: studentID, DiagnosticPlanID: planID, GoalCode: "go.backend", Status: domain.CoursePlanFailed, FailureCode: domain.CoursePlanFailureAttempts, Intent: domain.PlanningIntent{Source: domain.PlanningSourceTeacher, Reason: domain.PlanningReasonInitial}}
+	state, err = get.Handle(context.Background(), studentID, planID)
+	if err != nil || state.Request == nil || state.Request.FailureCode != domain.CoursePlanFailureAttempts {
+		t.Fatalf("failed projection %#v %v", state, err)
+	}
+	requests.request.GoalCode = "other"
+	_, err = get.Handle(context.Background(), studentID, planID)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("foreign context=%v", err)
+	}
+}
+
+type initialAllocationMemory struct {
+	checkpoint domain.InitialAllocationCheckpoint
+	err        error
+}
+
+func (r *initialAllocationMemory) GetInitialAllocation(context.Context, domain.CoursePlanRequest) (domain.InitialAllocationCheckpoint, error) {
+	return r.checkpoint, r.err
+}
+func (r *initialAllocationMemory) CheckpointInitialAllocation(context.Context, domain.CoursePlanRequest, domain.InitialAllocationCheckpoint, time.Time) error {
+	return errors.New("unexpected rebuild")
+}
+func (r *initialAllocationMemory) ResumeDiagnosticPlanning(context.Context, string, string, time.Time) (domain.CoursePlanRequest, error) {
+	return domain.CoursePlanRequest{}, errors.New("unused")
+}
+
+func TestDiagnosticAllocatedInitialReplayNeverReplansOrReadsMutableInputs(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	request := planningRequest(now)
+	request.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+	request.Intent.Source = domain.PlanningSourceTeacher
+	request.LearningPathID = "77777777-7777-4777-8777-777777777777"
+	checkpoint := domain.InitialAllocationCheckpoint{StudentID: request.StudentID, RequestID: request.ID, DiagnosticPlanID: request.DiagnosticPlanID, Replacement: domain.LearningPathReplacement{PlanningRequestID: request.ID, CourseID: "44444444-4444-4444-8444-444444444444", GoalCode: request.GoalCode, CourseFingerprint: "frozen-fingerprint", PlannerPolicyVersion: domain.PlannerVersion, ReasonCode: "initial_plan", Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: "55555555-5555-4555-8555-555555555555", Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap"}}}}
+	checkpoint.Replacement.ExpectedOnboardingVersion = 1
+	checkpoint.Replacement.ExpectedDirectionCode = "backend"
+	checkpoint.Replacement.ReasonSummary = "Go backend"
+	requests := &processorRequestRepository{claimed: request, completeErr: errors.New("lost terminal acknowledgement")}
+	student := &processorStudentService{}
+	processor := testProcessor(now, requests, student, &processorCourseService{})
+	processor.InitialAllocations = &initialAllocationMemory{checkpoint: checkpoint}
+	_, err := processor.ProcessNext(context.Background())
+	if err == nil {
+		t.Fatal("expected lost terminal acknowledgement")
+	}
+	requests.completeErr = nil
+	_, err = processor.ProcessNext(context.Background())
+	if err != nil || student.createCalls != 2 || student.replanCalls != 0 || student.planningStateCalls != 0 || requests.completed == nil || student.created.CourseFingerprint != "frozen-fingerprint" {
+		t.Fatalf("replay err=%v student=%#v result=%#v", err, student, requests.completed)
+	}
+}
+
+func TestDiagnosticInitialCheckpointTransientReadRetries(t *testing.T) {
+	now := time.Now()
+	request := planningRequest(now)
+	request.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+	requests := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{}
+	processor := testProcessor(now, requests, student, &processorCourseService{})
+	processor.InitialAllocations = &initialAllocationMemory{err: errors.New("connection reset")}
+	_, err := processor.ProcessNext(context.Background())
+	if err == nil || requests.retried == nil || requests.failed != nil || student.createCalls != 0 {
+		t.Fatalf("err=%v repo=%#v", err, requests)
+	}
+}
+
+type staleAllocationStudent struct{ *processorStudentService }
+
+func (s staleAllocationStudent) CreateLearningPath(context.Context, string, string, domain.LearningPathReplacement) (domain.LearningPathAllocation, error) {
+	return domain.LearningPathAllocation{}, domain.ErrDiagnosticContextStale
+}
+
+func TestDiagnosticInitialAtomicStaleFenceIsPermanent(t *testing.T) {
+	now := time.Now()
+	request := planningRequest(now)
+	request.Intent.Source = domain.PlanningSourceTeacher
+	request.DiagnosticPlanID = "33333333-3333-4333-8333-333333333333"
+	checkpoint := domain.InitialAllocationCheckpoint{StudentID: request.StudentID, RequestID: request.ID, DiagnosticPlanID: request.DiagnosticPlanID, Replacement: domain.LearningPathReplacement{PlanningRequestID: request.ID, CourseID: "44444444-4444-4444-8444-444444444444", GoalCode: request.GoalCode, CourseFingerprint: "frozen-fingerprint", PlannerPolicyVersion: domain.PlannerVersion, ReasonCode: "initial_plan", ReasonSummary: "Go backend", ExpectedOnboardingVersion: 1, ExpectedDirectionCode: "backend", Items: []domain.LearningPathItem{{ReferenceType: "lesson", ReferenceID: "55555555-5555-4555-8555-555555555555", Status: domain.LearningPathItemReady, ReasonCode: "first_current_gap"}}}}
+	requests := &processorRequestRepository{claimed: request}
+	student := &processorStudentService{}
+	processor := testProcessor(now, requests, student, &processorCourseService{})
+	processor.Students = staleAllocationStudent{student}
+	processor.InitialAllocations = &initialAllocationMemory{checkpoint: checkpoint}
+	processed, err := processor.ProcessNext(context.Background())
+	if !processed || !errors.Is(err, domain.ErrValidation) || requests.failed == nil || requests.failureCode != "DIAGNOSTIC_PLAN_INVALID" || requests.retried != nil || requests.completed != nil || requests.resolvedLearningPathID != "" {
+		t.Fatalf("processed=%v err=%v requests=%#v", processed, err, requests)
+	}
+}

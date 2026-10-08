@@ -1,0 +1,274 @@
+package httptransport
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/memory"
+	"github.com/bemulima/ms-go-tz-planner/internal/usecase"
+)
+
+type technicalTaskPlannerStub struct {
+	usecase.Planner
+	task domain.TechnicalTaskV1
+}
+
+type createPlannerStub struct {
+	usecase.Planner
+	request domain.PlanningRequestV1
+}
+
+func (stub *createPlannerStub) Plan(_ context.Context, _ string, request domain.PlanningRequestV1) (domain.PlanningJob, bool, error) {
+	stub.request = request
+	return domain.PlanningJob{
+		ID: "11111111-1111-4111-8111-111111111111", Status: domain.JobStatusPlanned, Request: request,
+	}, true, nil
+}
+
+func (stub technicalTaskPlannerStub) GetTechnicalTask(context.Context, string) (domain.TechnicalTaskV1, error) {
+	return stub.task, nil
+}
+
+func (stub technicalTaskPlannerStub) GetStudentTechnicalTask(context.Context, string) (domain.StudentTechnicalTaskViewV1, error) {
+	return stub.task.StudentView(), nil
+}
+
+func TestInternalRoutesRequireExactToken(t *testing.T) {
+	handler := Handler{InternalToken: "secret", Health: healthStub{}}.Router()
+	request := httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+	request.Header.Set("X-Internal-Token", "secret")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d", response.Code)
+	}
+}
+
+func TestHealthReportsDatabaseReadiness(t *testing.T) {
+	handler := Handler{InternalToken: "secret", Health: healthStub{err: context.DeadlineExceeded}}.Router()
+	request := httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+	request.Header.Set("X-Internal-Token", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+type healthStub struct{ err error }
+
+func (stub healthStub) Ping(context.Context) error { return stub.err }
+
+func TestReadyJobProjectionNeverReturnsPrivateEvaluation(t *testing.T) {
+	repository := memory.NewJobRepository()
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	job := domain.PlanningJob{ID: "11111111-1111-4111-8111-111111111111", IdempotencyKey: "22222222-2222-4222-8222-222222222222", RequestHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.JobStatusPlanned, CreatedAt: now, UpdatedAt: now}
+	_, _, err := repository.Ensure(context.Background(), job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repository.Claim(context.Background(), job.ID, "33333333-3333-4333-8333-333333333333", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := domain.AuthoringArtifact{Candidate: domain.AuthoringCandidateV1{Blueprint: domain.TaskBlueprintV1{Schema: domain.TaskBlueprintSchemaV1, Scenario: domain.Scenario{Title: "public"}}, PrivateEvaluation: domain.PrivateEvaluationBundle{Reference: domain.WorkspaceFixture{Files: []domain.WorkspaceFile{{Path: "solution.txt", Content: "PRIVATE_REFERENCE"}}}}}, CandidateDigest: "sha256:candidate", Verification: domain.VerificationReceiptV1{Passed: true}}
+	if err := repository.SaveReady(context.Background(), job.ID, "33333333-3333-4333-8333-333333333333", artifact, now); err != nil {
+		t.Fatal(err)
+	}
+	handler := Handler{Planner: usecase.Planner{Jobs: repository}, InternalToken: "secret"}.Router()
+	request := httptest.NewRequest(http.MethodGet, "/internal/v1/authoring-jobs/"+job.ID, nil)
+	request.Header.Set("X-Internal-Token", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "public") || strings.Contains(body, "PRIVATE_REFERENCE") || strings.Contains(body, "private_evaluation") {
+		t.Fatalf("unsafe projection status=%d body=%s", response.Code, body)
+	}
+}
+
+func TestCreateRejectsUnknownRequestFields(t *testing.T) {
+	handler := Handler{InternalToken: "secret"}.Router()
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/authoring-jobs", strings.NewReader(`{"schema":"tz-planning-request.v1","unexpected":true}`))
+	request.Header.Set("X-Internal-Token", "secret")
+	request.Header.Set("Idempotency-Key", "11111111-1111-4111-8111-111111111111")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateRejectsPIIOrUnknownFieldsInsideV2Orchestration(t *testing.T) {
+	handler := Handler{InternalToken: "secret"}.Router()
+	for _, field := range []string{`"student_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"`, `"conversation":{"body":"private"}`, `"unexpected":true`} {
+		body := `{
+			"schema":"tz-planning-request.v2","mode":"private","manifest":"task","locale":"ru",
+			"source":{"type":"user_intent"},"classification_hints":{},
+			"orchestration":{"schema":"learning-workspace-authoring-intent.v1","trigger":"student_project",
+			"correlation_id":"99999999-9999-4999-8999-999999999999","surface_classification":"project",` + field + `}
+		}`
+		request := httptest.NewRequest(http.MethodPost, "/internal/v1/authoring-jobs", strings.NewReader(body))
+		request.Header.Set("X-Internal-Token", "secret")
+		request.Header.Set("Idempotency-Key", "11111111-1111-4111-8111-111111111111")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("field=%s status=%d body=%s", field, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestCreateAcceptsV2OnExistingEndpointAndReturnsSafeIntentProjection(t *testing.T) {
+	planner := &createPlannerStub{}
+	handler := Handler{Planner: planner, InternalToken: "secret"}.Router()
+	body := `{
+		"schema":"tz-planning-request.v2","mode":"private","manifest":"PRIVATE PROJECT BRIEF","locale":"ru",
+		"source":{"type":"user_intent","anonymized":false},"classification_hints":{},
+		"orchestration":{"schema":"learning-workspace-authoring-intent.v1","trigger":"student_project",
+		"correlation_id":"99999999-9999-4999-8999-999999999999","surface_classification":"project",
+		"desired_difficulty_level":"junior"}
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/authoring-jobs", strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", "secret")
+	request.Header.Set("Idempotency-Key", "11111111-1111-4111-8111-111111111111")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || planner.request.Orchestration == nil ||
+		planner.request.Orchestration.SurfaceClassification != domain.SurfaceClassificationProject {
+		t.Fatalf("status=%d request=%+v body=%s", response.Code, planner.request, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "PRIVATE PROJECT BRIEF") || !strings.Contains(response.Body.String(), `"orchestration"`) {
+		t.Fatalf("unsafe or incomplete job projection: %s", response.Body.String())
+	}
+}
+
+func TestSourceAuthoringRouteAcceptsTypedTaskAndKeepsLegacyManifestRouteSeparate(t *testing.T) {
+	planner := &createPlannerStub{}
+	handler := Handler{Planner: planner, InternalToken: "secret"}.Router()
+	body := `{"schema":"tz-source-authoring-request.v1","prepared_source_task":{"schema_version":"prepared-source-task.v1","source":{"provider":"github","repository_url":"https://github.com/acme/tasks","commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":"tasks/one/README.md","locator":"heading:1"},"title":"Cache","content":"Implement a cache","metadata":{"company":"Acme"},"content_hash":"sha256:7cfee48174fe3f169ed2033b425cca485dfc7e422da794617f25be10eb45514d"}}`
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/source-authoring-jobs", strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", "secret")
+	request.Header.Set("Idempotency-Key", "11111111-1111-4111-8111-111111111111")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || planner.request.Schema != domain.PlanningRequestSchemaV3 || planner.request.Manifest != "" || planner.request.PreparedSourceTask == nil {
+		t.Fatalf("status=%d request=%+v body=%s", response.Code, planner.request, response.Body.String())
+	}
+	if planner.request.PreparedSourceTask.Source.CommitSHA != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || planner.request.Source.Type != "github_repository" {
+		t.Fatalf("typed provenance was lost: %+v", planner.request)
+	}
+}
+
+func TestSourceAuthoringRouteRejectsUnknownNestedFields(t *testing.T) {
+	handler := Handler{InternalToken: "secret"}.Router()
+	body := `{"schema":"tz-source-authoring-request.v1","prepared_source_task":{"unexpected":true}}`
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/source-authoring-jobs", strings.NewReader(body))
+	request.Header.Set("X-Internal-Token", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestV2JobProjectionContainsOnlyPIIFreeOrchestrationMetadata(t *testing.T) {
+	job := domain.PlanningJob{
+		ID: "11111111-1111-4111-8111-111111111111", Status: domain.JobStatusPlanned, Attempts: 1,
+		Request: domain.PlanningRequestV1{
+			Schema: domain.PlanningRequestSchemaV2, Manifest: "PRIVATE_MANIFEST_SECRET",
+			Orchestration: &domain.AuthoringOrchestrationIntentV1{
+				Schema: domain.AuthoringOrchestrationIntentSchemaV1, Trigger: domain.AuthoringTriggerStudentProject,
+				CorrelationID:         "99999999-9999-4999-8999-999999999999",
+				SurfaceClassification: domain.SurfaceClassificationProject, DesiredDifficultyLevel: "junior",
+			},
+		},
+	}
+	payload, err := json.Marshal(projectJob(job))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(payload)
+	for _, expected := range []string{"learning-workspace-authoring-intent.v1", "student_project", "99999999-9999-4999-8999-999999999999", `"surface_classification":"project"`, `"desired_difficulty_level":"junior"`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("projection is missing %q: %s", expected, body)
+		}
+	}
+	for _, forbidden := range []string{"PRIVATE_MANIFEST_SECRET", "student_id", "profile", "mastery", "conversation", "private_evaluation"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("projection leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestJobRoutesRejectMalformedUUIDBeforeRepositoryAccess(t *testing.T) {
+	handler := Handler{Planner: usecase.Planner{Jobs: memory.NewJobRepository()}, InternalToken: "secret"}.Router()
+	for _, testCase := range []struct {
+		method, path string
+	}{
+		{method: http.MethodGet, path: "/internal/v1/authoring-jobs/not-a-uuid"},
+		{method: http.MethodGet, path: "/internal/v1/authoring-jobs/not-a-uuid/technical-task"},
+		{method: http.MethodGet, path: "/internal/v1/authoring-jobs/not-a-uuid/student-view"},
+		{method: http.MethodPost, path: "/internal/v1/authoring-jobs/not-a-uuid/resume"},
+	} {
+		request := httptest.NewRequest(testCase.method, testCase.path, nil)
+		request.Header.Set("X-Internal-Token", "secret")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("%s %s status=%d body=%s", testCase.method, testCase.path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestTechnicalTaskAndStudentViewsHaveSeparateContracts(t *testing.T) {
+	target := domain.LearningTargetRef{Type: "capability", Key: "go.http", Version: "v1"}
+	task := domain.TechnicalTaskV1{
+		Schema: domain.TechnicalTaskSchemaV1, SchemaVersion: 1, Goal: "Internal goal",
+		StudentInstruction: domain.StudentInstructionV1{Title: "Public title", Description: "Public description", Requirements: []domain.StudentRequirementV1{{ID: "req-one", Text: "Public requirement"}}},
+		ExpectedResult:     domain.ExpectedResultV1{Type: domain.ExpectedResultAcceptanceContract, Outcomes: []domain.ExpectedOutcomeV1{{ID: "acc-one", Description: "Internal outcome", EvidenceKind: "deterministic"}}},
+		Concepts:           []domain.TaskConceptV1{{Target: target, Role: domain.ConceptRoleRequired}},
+		Steps:              []domain.TechnicalTaskStepV1{{ID: "step-one", Order: 1, Goal: "Internal step", Deliverables: []string{"artifact"}, ConceptRefs: []domain.LearningTargetRef{target}, ExpectedResultIDs: []string{"acc-one"}, VerificationIDs: []string{"check-one"}, EstimatedEffortMinutes: 15, Actions: []domain.TaskActionV1{{Type: domain.TaskActionRunCommand, Command: "go test ./..."}}}},
+		Verification:       []domain.TaskVerificationV1{{ID: "check-one", Type: "test", Visibility: "private", ExpectedResultIDs: []string{"acc-one"}, ExecutionContractRef: "private_evaluation.code_structure"}},
+	}
+	handler := Handler{Planner: technicalTaskPlannerStub{task: task}, InternalToken: "secret"}.Router()
+
+	full := performAuthenticatedRequest(handler, "/internal/v1/authoring-jobs/11111111-1111-4111-8111-111111111111/technical-task")
+	if full.Code != http.StatusOK {
+		t.Fatalf("full status=%d body=%s", full.Code, full.Body.String())
+	}
+	for _, required := range []string{`"goal"`, `"student_instruction"`, `"expected_result"`, `"concepts"`, `"steps"`, `"verification"`, `"actions"`} {
+		if !strings.Contains(full.Body.String(), required) {
+			t.Fatalf("technical task is missing %s: %s", required, full.Body.String())
+		}
+	}
+
+	student := performAuthenticatedRequest(handler, "/internal/v1/authoring-jobs/11111111-1111-4111-8111-111111111111/student-view")
+	if student.Code != http.StatusOK || !strings.Contains(student.Body.String(), "Public title") {
+		t.Fatalf("student status=%d body=%s", student.Code, student.Body.String())
+	}
+	for _, forbidden := range []string{"Internal goal", "Internal step", "Internal outcome", "go test ./...", `"steps"`, `"verification"`, `"concepts"`, `"actions"`, `"hints"`} {
+		if strings.Contains(student.Body.String(), forbidden) {
+			t.Fatalf("student view leaked %q: %s", forbidden, student.Body.String())
+		}
+	}
+}
+
+func performAuthenticatedRequest(handler http.Handler, path string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	request.Header.Set("X-Internal-Token", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}

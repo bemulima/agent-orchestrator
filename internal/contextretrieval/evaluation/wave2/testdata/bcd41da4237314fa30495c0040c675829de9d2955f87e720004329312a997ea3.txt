@@ -1,0 +1,151 @@
+package postgres_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	plannerpostgres "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func TestOnboardingPathExecutionCreateOrGetIsAtomicAndLoadsJoinedIdentity(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("PLANNER_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("PLANNER_TEST_DATABASE_URL is not configured")
+	}
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(config.ConnConfig.Database, "_test") {
+		t.Fatalf("PLANNER_TEST_DATABASE_URL must target a database ending in _test, got %q", config.ConnConfig.Database)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	handoff := domain.OnboardingPlanHandoffRecord{
+		HandoffID:      uuid.NewString(),
+		StudentID:      uuid.NewString(),
+		IdempotencyKey: uuid.NewString(),
+		RequestHash:    strings.Repeat("a", 64),
+		StateRef: domain.StudentReadinessStateRef{
+			Kind:    domain.StudentReadinessStateDraft,
+			Version: 1,
+		},
+		DialogID:     uuid.NewString(),
+		TeacherJobID: uuid.NewString(),
+		Goal: domain.LearningReadinessGoal{
+			Code:         "programming.foundation",
+			Version:      "v1",
+			GraphVersion: "programming-foundation-graph-v1",
+		},
+		ReadinessObservedAt: now,
+		CreatedAt:           now,
+	}
+	_, err = pool.Exec(ctx, `INSERT INTO teacher_onboarding_plan_handoff(
+		handoff_id,student_id,idempotency_key,request_hash,state_ref_kind,state_ref_version,
+		dialog_id,teacher_job_id,goal_code,goal_version,graph_version,readiness_observed_at,created_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		handoff.HandoffID, handoff.StudentID, handoff.IdempotencyKey, handoff.RequestHash,
+		handoff.StateRef.Kind, handoff.StateRef.Version, handoff.DialogID, handoff.TeacherJobID,
+		handoff.Goal.Code, handoff.Goal.Version, handoff.Goal.GraphVersion,
+		handoff.ReadinessObservedAt, handoff.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	execution, err := domain.NewOnboardingPathExecution(handoff, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := plannerpostgres.Store{Pool: pool}
+	type createResult struct {
+		execution domain.OnboardingPathExecution
+		created   bool
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan createResult, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			stored, created, createErr := store.CreateOrGetOnboardingPathExecution(ctx, execution)
+			results <- createResult{execution: stored, created: created, err: createErr}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	createdCount := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.created {
+			createdCount++
+		}
+		if result.execution.ExecutionID != execution.ExecutionID ||
+			result.execution.Handoff.HandoffID != handoff.HandoffID ||
+			result.execution.Handoff.StudentID != handoff.StudentID ||
+			result.execution.Handoff.IdempotencyKey != handoff.IdempotencyKey ||
+			result.execution.Handoff.RequestHash != handoff.RequestHash ||
+			result.execution.Handoff.StateRef != handoff.StateRef ||
+			result.execution.Handoff.DialogID != handoff.DialogID ||
+			result.execution.Handoff.TeacherJobID != handoff.TeacherJobID ||
+			result.execution.Handoff.Goal != handoff.Goal ||
+			!result.execution.Handoff.ReadinessObservedAt.Equal(handoff.ReadinessObservedAt) ||
+			!result.execution.Handoff.CreatedAt.Equal(handoff.CreatedAt) ||
+			result.execution.RequestHash != execution.RequestHash ||
+			result.execution.StudentCommandID != execution.StudentCommandID ||
+			result.execution.ReserveKey != execution.ReserveKey {
+			t.Fatalf("unexpected stored execution: %#v", result.execution)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count=%d, want 1", createdCount)
+	}
+
+	replayed, created, err := store.CreateOrGetOnboardingPathExecution(ctx, execution)
+	if err != nil || created || replayed.ExecutionID != execution.ExecutionID {
+		t.Fatalf("exact replay execution=%#v created=%v err=%v", replayed, created, err)
+	}
+	conflicting := execution
+	conflicting.RequestHash = strings.Repeat("b", 64)
+	if _, _, err := store.CreateOrGetOnboardingPathExecution(ctx, conflicting); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("conflicting replay error=%v, want ErrConflict", err)
+	}
+
+	next, err := store.NextOnboardingPathExecution(ctx, now)
+	if err != nil || next.ExecutionID == "" || next.Handoff.HandoffID == "" {
+		t.Fatalf("next execution=%#v err=%v", next, err)
+	}
+	claimToken := uuid.NewString()
+	claimed, err := store.ClaimOnboardingPathExecution(ctx, execution.ExecutionID, claimToken, now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ExecutionID != execution.ExecutionID || claimed.ClaimToken != claimToken || claimed.Attempts != 1 || claimed.Handoff.HandoffID != handoff.HandoffID {
+		t.Fatalf("unexpected claimed execution: %#v", claimed)
+	}
+}

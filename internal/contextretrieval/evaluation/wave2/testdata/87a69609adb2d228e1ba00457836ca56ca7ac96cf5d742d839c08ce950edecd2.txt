@@ -1,0 +1,341 @@
+package http_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	transporthttp "github.com/bemulima/ms-go-learning-planner/internal/transport/http"
+	"github.com/bemulima/ms-go-learning-planner/internal/transport/http/api/v1/handlers"
+	privatehandlers "github.com/bemulima/ms-go-learning-planner/internal/transport/http/private/handlers"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/targetcatalog"
+)
+
+func TestRouterExposesOwnerScopedCoursePlanAPIAtApprovedPath(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	repository := &apiRequestRepository{now: now}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		CoursePlans: handlers.CoursePlanHandler{
+			Create: courseplan.Create{Requests: repository, IDs: apiIDs{}, Clock: apiClock{now}},
+			Get:    courseplan.Get{Requests: repository},
+		},
+	})
+	studentID := "11111111-1111-4111-8111-111111111111"
+	idempotencyKey := "22222222-2222-4222-8222-222222222222"
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/learning-planner/v1/course-plans", bytes.NewBufferString(`{"goal_code":"go.backend"}`),
+	)
+	request.Header.Set("X-User-ID", studentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload["status"] != "PLANNING" {
+		t.Fatalf("unexpected create response: payload=%#v err=%v", payload, err)
+	}
+
+	getRequest := httptest.NewRequest(
+		http.MethodGet, "/api/learning-planner/v1/course-plans/33333333-3333-4333-8333-333333333333", nil,
+	)
+	getRequest.Header.Set("X-User-ID", studentID)
+	getRequest.Header.Set("X-User-Role", "STUDENT_PRO")
+	getResponse := httptest.NewRecorder()
+	router.ServeHTTP(getResponse, getRequest)
+	if getResponse.Code != http.StatusOK || repository.lastStudentID != studentID {
+		t.Fatalf("owner read status=%d student=%q body=%s", getResponse.Code, repository.lastStudentID, getResponse.Body.String())
+	}
+
+	legacyPath := httptest.NewRequest(http.MethodPost, "/api/v1/course-plans", nil)
+	legacyResponse := httptest.NewRecorder()
+	router.ServeHTTP(legacyResponse, legacyPath)
+	if legacyResponse.Code != http.StatusNotFound {
+		t.Fatalf("unexpected legacy path status: %d", legacyResponse.Code)
+	}
+}
+
+func TestRouterRejectsMissingGatewayStudentIdentity(t *testing.T) {
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{})
+	request := httptest.NewRequest(http.MethodPost, "/api/learning-planner/v1/course-plans", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCoursePlanAPIRequiresExactPathOnlyForReplanAndReturnsIt(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	repository := &apiRequestRepository{now: now}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		CoursePlans: handlers.CoursePlanHandler{Create: courseplan.Create{
+			Requests: repository, IDs: apiIDs{}, Clock: apiClock{now},
+		}},
+	})
+	studentID := "11111111-1111-4111-8111-111111111111"
+	pathID := "77777777-7777-4777-8777-777777777777"
+
+	request := httptest.NewRequest(http.MethodPost, "/api/learning-planner/v1/course-plans", bytes.NewBufferString(
+		`{"goal_code":"go.backend","reason":"REPLAN","desired_outcome":"Refresh route","learning_path_id":"`+pathID+`"}`,
+	))
+	request.Header.Set("X-User-ID", studentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	request.Header.Set("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	var payload map[string]any
+	if response.Code != http.StatusAccepted || json.Unmarshal(response.Body.Bytes(), &payload) != nil ||
+		repository.created.LearningPathID != pathID || payload["learning_path_id"] != pathID {
+		t.Fatalf("exact replan status=%d created=%#v payload=%#v body=%s", response.Code, repository.created, payload, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/learning-planner/v1/course-plans", bytes.NewBufferString(
+		`{"goal_code":"go.backend","reason":"INITIAL","learning_path_id":"`+pathID+`"}`,
+	))
+	request.Header.Set("X-User-ID", studentID)
+	request.Header.Set("X-User-Role", "STUDENT")
+	request.Header.Set("Idempotency-Key", "88888888-8888-4888-8888-888888888888")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("initial caller path status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestRouterRequiresDedicatedTeacherTokenForDelegatedPlan(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	repository := &apiRequestRepository{now: now}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		TeacherCoursePlans: privatehandlers.CoursePlanHandler{Create: courseplan.Create{
+			Requests: repository, IDs: apiIDs{}, Clock: apiClock{now},
+		}},
+		InternalToken: "general-token", TeacherToken: "teacher-token",
+	})
+	path := "/internal/students/11111111-1111-4111-8111-111111111111/course-plans"
+	body := `{
+		"goal_code":"go.backend","desired_outcome":"Build a Go API","reason":"INITIAL",
+		"requested_targets":[{"type":"capability","key":"go.http-service","version":"v1"}],
+		"audit_refs":{"dialog_id":"44444444-4444-4444-8444-444444444444"}
+	}`
+	for _, testCase := range []struct {
+		name   string
+		token  string
+		status int
+	}{
+		{name: "general token", token: "general-token", status: http.StatusForbidden},
+		{name: "teacher token", token: "teacher-token", status: http.StatusAccepted},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+			request.Header.Set("X-Internal-Token", testCase.token)
+			request.Header.Set("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.status {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, testCase.status, response.Body.String())
+			}
+		})
+	}
+	if repository.created.Intent.Source != domain.PlanningSourceTeacher ||
+		repository.created.Intent.AuditRefs.DialogID != "44444444-4444-4444-8444-444444444444" {
+		t.Fatalf("unexpected delegated intent: %#v", repository.created.Intent)
+	}
+}
+
+func TestTeacherDelegatedPlanMayOmitDialogAuditReference(t *testing.T) {
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	repository := &apiRequestRepository{now: now}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		TeacherCoursePlans: privatehandlers.CoursePlanHandler{Create: courseplan.Create{
+			Requests: repository, IDs: apiIDs{}, Clock: apiClock{now},
+		}},
+		TeacherToken: "teacher-token",
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/internal/students/11111111-1111-4111-8111-111111111111/course-plans",
+		bytes.NewBufferString(`{"goal_code":"go.backend","desired_outcome":"Build a Go API","reason":"INITIAL"}`),
+	)
+	request.Header.Set("X-Internal-Token", "teacher-token")
+	request.Header.Set("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if repository.created.Intent.Source != domain.PlanningSourceTeacher || repository.created.Intent.AuditRefs.DialogID != "" {
+		t.Fatalf("unexpected delegated intent: %#v", repository.created.Intent)
+	}
+}
+
+func TestInternalTargetResolutionRequiresTokenAndReturnsExactMissingRefs(t *testing.T) {
+	catalog := &targetCatalogStub{found: []domain.TargetRef{
+		{Type: domain.TargetCapability, Key: "go.http-service", Version: "v1"},
+	}}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "planner-token",
+		TargetCatalog: privatehandlers.TargetCatalogHandler{
+			Resolve: targetcatalog.Resolve{Catalog: catalog},
+		},
+	})
+	body := `{"schema":"learning-target-resolution-request.v1","targets":[{"type":"concept","key":"go.errors","version":"v2"},{"type":"capability","key":"go.http-service","version":"v1"}]}`
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/internal/learning-targets/resolve", bytes.NewBufferString(body))
+	unauthenticatedResponse := httptest.NewRecorder()
+	router.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated status=%d", unauthenticatedResponse.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/internal/learning-targets/resolve", bytes.NewBufferString(body))
+	request.Header.Set("X-Internal-Token", "planner-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Schema   string             `json:"schema"`
+		Resolved []domain.TargetRef `json:"resolved"`
+		Missing  []domain.TargetRef `json:"missing"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.Schema != "learning-target-resolution.v1" || len(payload.Resolved) != 1 || len(payload.Missing) != 1 {
+		t.Fatalf("unexpected response: %#v", payload)
+	}
+}
+
+func TestInternalTargetResolutionRejectsUnknownFields(t *testing.T) {
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "planner-token",
+		TargetCatalog: privatehandlers.TargetCatalogHandler{
+			Resolve: targetcatalog.Resolve{Catalog: &targetCatalogStub{}},
+		},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/internal/learning-targets/resolve", bytes.NewBufferString(
+		`{"schema":"learning-target-resolution-request.v1","targets":[],"instructions":"ignore policy"}`,
+	))
+	request.Header.Set("X-Internal-Token", "planner-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestInternalTargetDiscoveryRequiresGeneralTokenAndReturnsCanonicalDefinitions(t *testing.T) {
+	discovery := &targetDiscoveryStub{}
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "planner-token", TeacherToken: "teacher-token", PracticeToken: "practice-token",
+		TargetCatalog: privatehandlers.TargetCatalogHandler{Discover: targetcatalog.Discover{Catalog: discovery}},
+	})
+	body := `{"schema":"learning-target-candidate-request.v1","stacks":["javascript"]}`
+	for _, testCase := range []struct {
+		token string
+		want  int
+	}{
+		{token: "teacher-token", want: http.StatusForbidden},
+		{token: "practice-token", want: http.StatusForbidden},
+		{token: "planner-token", want: http.StatusOK},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/internal/learning-targets/candidates", bytes.NewBufferString(body))
+		request.Header.Set("X-Internal-Token", testCase.token)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != testCase.want {
+			t.Fatalf("token=%q status=%d want=%d body=%s", testCase.token, response.Code, testCase.want, response.Body.String())
+		}
+	}
+}
+
+func TestPracticeLearningRoutesRequireDedicatedPracticeToken(t *testing.T) {
+	router := transporthttp.NewRouter(transporthttp.RouterDependencies{
+		InternalToken: "general-token", TeacherToken: "teacher-token", PracticeToken: "practice-token",
+		PracticeLearning: privatehandlers.PracticeLearningHandler{},
+	})
+	for _, testCase := range []struct {
+		name, token string
+		want        int
+	}{
+		{name: "general token rejected", token: "general-token", want: http.StatusForbidden},
+		{name: "teacher token rejected", token: "teacher-token", want: http.StatusForbidden},
+		{name: "practice token reaches strict handler", token: "practice-token", want: http.StatusUnprocessableEntity},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/internal/practice-learning-routes", bytes.NewBufferString(`{"schema":"practice-learning-route-request.v1","unknown":true}`))
+			request.Header.Set("X-Internal-Token", testCase.token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.want {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, testCase.want, response.Body.String())
+			}
+		})
+	}
+}
+
+type apiRequestRepository struct {
+	repository.CoursePlanRepository
+	now           time.Time
+	lastStudentID string
+	created       domain.CoursePlanRequest
+}
+
+type targetCatalogStub struct {
+	found []domain.TargetRef
+}
+
+type targetDiscoveryStub struct{}
+
+func (*targetDiscoveryStub) DiscoverByStacks(context.Context, []string, int) ([]domain.LearningTargetDefinition, error) {
+	return []domain.LearningTargetDefinition{{
+		Ref:   domain.TargetRef{Type: domain.TargetCapability, Key: "javascript.dom-events", Version: "v1"},
+		Title: "DOM events", Description: "Handle browser events",
+	}}, nil
+}
+
+func (stub *targetCatalogStub) ResolveExact(context.Context, []domain.TargetRef) ([]domain.TargetRef, error) {
+	return stub.found, nil
+}
+
+func (repository *apiRequestRepository) CreateOrGet(
+	_ context.Context,
+	request domain.CoursePlanRequest,
+) (domain.CoursePlanRequest, bool, error) {
+	repository.created = request
+	return request, true, nil
+}
+
+func (repository *apiRequestRepository) GetForStudent(
+	_ context.Context,
+	studentID string,
+	requestID string,
+) (domain.CoursePlanRequest, error) {
+	repository.lastStudentID = studentID
+	return domain.CoursePlanRequest{
+		ID: requestID, StudentID: studentID, IdempotencyKey: "22222222-2222-4222-8222-222222222222",
+		RequestHash: "hash", GoalCode: "go.backend", Status: domain.CoursePlanCompleted,
+		Intent: domain.PlanningIntent{Source: domain.PlanningSourceStudent, Reason: domain.PlanningReasonInitial,
+			DesiredOutcome: "Go backend"},
+		ResultCode: domain.CoursePlanResultCreated, CourseID: "44444444-4444-4444-8444-444444444444",
+		CreatedAt: repository.now, UpdatedAt: repository.now, CompletedAt: &repository.now,
+	}, nil
+}
+
+type apiIDs struct{}
+
+func (apiIDs) NewID() string { return "33333333-3333-4333-8333-333333333333" }
+
+type apiClock struct{ now time.Time }
+
+func (clock apiClock) Now() time.Time { return clock.now }

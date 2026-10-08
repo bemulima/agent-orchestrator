@@ -1,0 +1,112 @@
+package courseplan
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+)
+
+type CreateInput struct {
+	StudentID        string
+	IdempotencyKey   string
+	GoalCode         string
+	LearningPathID   string
+	DiagnosticPlanID string
+	Intent           domain.PlanningIntent
+}
+
+type Create struct {
+	Requests           repository.CoursePlanRepository
+	DiagnosticRequests repository.DiagnosticInitialAllocationRepository
+	IDs                IDGenerator
+	Clock              Clock
+}
+
+func (useCase Create) Handle(ctx context.Context, input CreateInput) (domain.CoursePlanRequest, bool, error) {
+	input.StudentID = strings.TrimSpace(input.StudentID)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.GoalCode = strings.ToLower(strings.TrimSpace(input.GoalCode))
+	input.LearningPathID = strings.TrimSpace(input.LearningPathID)
+	input.DiagnosticPlanID = strings.TrimSpace(input.DiagnosticPlanID)
+	intent, intentErr := domain.NormalizePlanningIntent(input.Intent)
+	if useCase.Requests == nil || useCase.IDs == nil || useCase.Clock == nil || input.StudentID == "" ||
+		input.IdempotencyKey == "" || input.GoalCode == "" || len(input.GoalCode) > 64 || intentErr != nil ||
+		(intent.Reason == domain.PlanningReasonReplan && input.LearningPathID == "") ||
+		(intent.Reason == domain.PlanningReasonInitial && input.LearningPathID != "") {
+		return domain.CoursePlanRequest{}, false, domain.ErrValidation
+	}
+	if input.DiagnosticPlanID != "" && (intent.Source != domain.PlanningSourceTeacher || intent.Reason != domain.PlanningReasonInitial || input.IdempotencyKey != input.DiagnosticPlanID) {
+		return domain.CoursePlanRequest{}, false, domain.ErrValidation
+	}
+	if input.DiagnosticPlanID != "" {
+		if lookup, ok := useCase.Requests.(repository.DiagnosticPlanningRepository); ok {
+			prior, lookupErr := lookup.GetDiagnosticPlanningRequest(ctx, input.StudentID, input.DiagnosticPlanID)
+			if lookupErr != nil && !errors.Is(lookupErr, domain.ErrNotFound) {
+				return domain.CoursePlanRequest{}, false, lookupErr
+			}
+			if lookupErr == nil && prior.IdempotencyKey != input.IdempotencyKey {
+				return domain.CoursePlanRequest{}, false, domain.ErrConflict
+			}
+		}
+	}
+	requestHash, err := hashCreateInputWithDiagnostic(input.GoalCode, input.LearningPathID, input.DiagnosticPlanID, intent)
+	if err != nil {
+		return domain.CoursePlanRequest{}, false, domain.ErrValidation
+	}
+	now := useCase.Clock.Now().UTC()
+	request, err := domain.NormalizeCoursePlanRequest(domain.CoursePlanRequest{
+		ID: useCase.IDs.NewID(), StudentID: input.StudentID, IdempotencyKey: input.IdempotencyKey,
+		RequestHash: requestHash, GoalCode: input.GoalCode, LearningPathID: input.LearningPathID, DiagnosticPlanID: input.DiagnosticPlanID,
+		Intent: intent, Status: domain.CoursePlanPlanning,
+		NextAttemptAt: now, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		return domain.CoursePlanRequest{}, false, domain.ErrValidation
+	}
+	stored, created, err := useCase.Requests.CreateOrGet(ctx, request)
+	if err == nil && !created && input.DiagnosticPlanID != "" && stored.Status == domain.CoursePlanFailed && stored.FailureCode == domain.CoursePlanFailureAttempts {
+		if useCase.DiagnosticRequests == nil {
+			return domain.CoursePlanRequest{}, false, domain.ErrValidation
+		}
+		stored, err = useCase.DiagnosticRequests.ResumeDiagnosticPlanning(ctx, stored.StudentID, stored.ID, now)
+	}
+	return stored, created, err
+}
+
+func hashCreateInputWithDiagnostic(goalCode string, learningPathID string, diagnosticPlanID string, intent domain.PlanningIntent) (string, error) {
+	if diagnosticPlanID == "" { // preserve v1 omitted hash bytes exactly.
+		return hashCreateInputLegacy(goalCode, learningPathID, intent)
+	}
+	payload, err := json.Marshal(struct {
+		GoalCode         string                `json:"goal_code"`
+		LearningPathID   string                `json:"learning_path_id,omitempty"`
+		Intent           domain.PlanningIntent `json:"intent"`
+		DiagnosticPlanID string                `json:"diagnostic_plan_id"`
+	}{GoalCode: goalCode, LearningPathID: learningPathID, Intent: intent, DiagnosticPlanID: diagnosticPlanID})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
+}
+func hashCreateInput(goalCode string, learningPathID string, intent domain.PlanningIntent) (string, error) {
+	return hashCreateInputLegacy(goalCode, learningPathID, intent)
+}
+func hashCreateInputLegacy(goalCode string, learningPathID string, intent domain.PlanningIntent) (string, error) {
+	payload, err := json.Marshal(struct {
+		GoalCode       string                `json:"goal_code"`
+		LearningPathID string                `json:"learning_path_id,omitempty"`
+		Intent         domain.PlanningIntent `json:"intent"`
+	}{goalCode, learningPathID, intent})
+	if err != nil {
+		return "", err
+	}
+	d := sha256.Sum256(payload)
+	return hex.EncodeToString(d[:]), nil
+}

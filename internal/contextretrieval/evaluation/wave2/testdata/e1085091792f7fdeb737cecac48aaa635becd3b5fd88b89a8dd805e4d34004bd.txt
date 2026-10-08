@@ -1,0 +1,146 @@
+package handlers
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/onboardinghandoff"
+	"github.com/go-chi/chi/v5"
+)
+
+const maximumOnboardingPlanHandoffRequestBytes int64 = 16 << 10
+
+type OnboardingPlanHandoffHandler struct{ Accept onboardinghandoff.Acceptor }
+
+type onboardingPlanHandoffPayload struct {
+	Schema           string          `json:"schema"`
+	ExpectedStateRef json.RawMessage `json:"expected_state_ref"`
+	DialogID         string          `json:"dialog_id"`
+	TeacherJobID     string          `json:"teacher_job_id"`
+}
+
+func (handler OnboardingPlanHandoffHandler) AcceptStudent(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	if !domain.ValidLearningReadinessStudentID(studentID) {
+		writeOnboardingPlanHandoffError(writer, http.StatusBadRequest, "invalid_student_id")
+		return
+	}
+	idempotencyValues := request.Header.Values("Idempotency-Key")
+	if len(idempotencyValues) != 1 || !domain.ValidLearningReadinessStudentID(idempotencyValues[0]) {
+		writeOnboardingPlanHandoffError(writer, http.StatusUnprocessableEntity, "invalid_idempotency_key")
+		return
+	}
+	idempotencyKey := idempotencyValues[0]
+	contentType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		writeOnboardingPlanHandoffError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return
+	}
+	payload, err := decodeOnboardingPlanHandoffPayload(writer, request)
+	if err != nil {
+		writeOnboardingPlanHandoffError(writer, http.StatusUnprocessableEntity, "invalid_request")
+		return
+	}
+	response, created, err := handler.Accept.Handle(request.Context(), onboardinghandoff.AcceptInput{
+		StudentID: studentID, IdempotencyKey: idempotencyKey,
+		Request: domain.TeacherOnboardingPlanHandoffRequest{
+			Schema: payload.Schema, ExpectedStateRef: payload.ExpectedStateRef,
+			DialogID: payload.DialogID, TeacherJobID: payload.TeacherJobID,
+		},
+	})
+	if err != nil {
+		writeOnboardingPlanHandoffDomainError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeOnboardingPlanHandoffJSON(writer, status, response)
+}
+
+func decodeOnboardingPlanHandoffPayload(writer http.ResponseWriter, request *http.Request) (struct {
+	Schema           string
+	ExpectedStateRef domain.StudentReadinessStateRef
+	DialogID         string
+	TeacherJobID     string
+}, error) {
+	var payload onboardingPlanHandoffPayload
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, maximumOnboardingPlanHandoffRequestBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return struct {
+			Schema           string
+			ExpectedStateRef domain.StudentReadinessStateRef
+			DialogID         string
+			TeacherJobID     string
+		}{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || payload.ExpectedStateRef == nil || bytes.Equal(bytes.TrimSpace(payload.ExpectedStateRef), []byte("null")) {
+		return struct {
+			Schema           string
+			ExpectedStateRef domain.StudentReadinessStateRef
+			DialogID         string
+			TeacherJobID     string
+		}{}, domain.ErrValidation
+	}
+	var expected domain.StudentReadinessStateRef
+	expectedDecoder := json.NewDecoder(bytes.NewReader(payload.ExpectedStateRef))
+	expectedDecoder.DisallowUnknownFields()
+	if err := expectedDecoder.Decode(&expected); err != nil || expectedDecoder.Decode(&struct{}{}) != io.EOF {
+		return struct {
+			Schema           string
+			ExpectedStateRef domain.StudentReadinessStateRef
+			DialogID         string
+			TeacherJobID     string
+		}{}, domain.ErrValidation
+	}
+	return struct {
+		Schema           string
+		ExpectedStateRef domain.StudentReadinessStateRef
+		DialogID         string
+		TeacherJobID     string
+	}{Schema: payload.Schema, ExpectedStateRef: expected, DialogID: payload.DialogID, TeacherJobID: payload.TeacherJobID}, nil
+}
+
+func writeOnboardingPlanHandoffDomainError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrFeatureDisabled):
+		writeOnboardingPlanHandoffError(writer, http.StatusServiceUnavailable, "capability_disabled")
+	case errors.Is(err, domain.ErrValidation):
+		writeOnboardingPlanHandoffError(writer, http.StatusUnprocessableEntity, "invalid_request")
+	case errors.Is(err, domain.ErrConflict):
+		writeOnboardingPlanHandoffError(writer, http.StatusConflict, "idempotency_conflict")
+	case errors.Is(err, domain.ErrStateChanged):
+		writeOnboardingPlanHandoffError(writer, http.StatusConflict, "state_changed")
+	case errors.Is(err, domain.ErrActivePathExists):
+		writeOnboardingPlanHandoffError(writer, http.StatusConflict, "active_path_exists")
+	case errors.Is(err, domain.ErrNotReady):
+		writeOnboardingPlanHandoffError(writer, http.StatusUnprocessableEntity, "not_ready")
+	case errors.Is(err, domain.ErrStudentStateUnavailable):
+		writeOnboardingPlanHandoffError(writer, http.StatusBadGateway, "student_state_unavailable")
+	case errors.Is(err, domain.ErrGoalGraphUnavailable):
+		writeOnboardingPlanHandoffError(writer, http.StatusServiceUnavailable, "published_graph_unavailable")
+	case errors.Is(err, domain.ErrGoalGraphInvalid):
+		writeOnboardingPlanHandoffError(writer, http.StatusInternalServerError, "published_graph_invalid")
+	default:
+		writeOnboardingPlanHandoffError(writer, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+func writeOnboardingPlanHandoffError(writer http.ResponseWriter, status int, code string) {
+	writeOnboardingPlanHandoffJSON(writer, status, map[string]any{"error": map[string]string{"code": code}})
+}
+
+func writeOnboardingPlanHandoffJSON(writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(payload)
+}

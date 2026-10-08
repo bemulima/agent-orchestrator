@@ -1,0 +1,306 @@
+package usecase
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// This opt-in acceptance test uses a deterministic, repository-owned candidate fixture, while
+// both TZ Planner and Practice are the real running services selected by D8_PROOF_*_URL.
+func TestNativeRealPracticeStagingLifecycle(t *testing.T) {
+	mode := os.Getenv("D8_NATIVE_STAGING_PROOF_MODE")
+	if mode == "" {
+		t.Skip("set D8_NATIVE_STAGING_PROOF_MODE for the real-service staging acceptance proof")
+	}
+	if mode != "seed" && mode != "unavailable" && mode != "stage" && mode != "replay" && mode != "cleanup" {
+		t.Fatalf("unknown D8_NATIVE_STAGING_PROOF_MODE %q", mode)
+	}
+	proofKey := os.Getenv("D8_NATIVE_STAGING_PROOF_IDEMPOTENCY_KEY")
+	if !validUUID(proofKey) {
+		t.Fatal("D8_NATIVE_STAGING_PROOF_IDEMPOTENCY_KEY must be a UUID")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	tzPool := proofPool(t, ctx, os.Getenv("DATABASE_URL"), "DATABASE_URL")
+	defer tzPool.Close()
+	repository := postgres.JobRepository{Pool: tzPool}
+
+	if mode == "seed" {
+		candidate := validCandidate()
+		marker := proofMarker(proofKey)
+		candidate.PrivateEvaluation.Reference.Files[0].Content += "\n" + marker
+		planner := newTestPlanner(repository, &generatorStub{candidate: candidate}, &competencyStub{}, validationStub{passed: true}, &workspaceStub{})
+		job, created, err := planner.Plan(ctx, proofKey, validRequest("D8.5 private staging proof "+proofKey))
+		if err != nil || job.Status != domain.JobStatusReady || job.Artifact == nil || !job.Artifact.Verification.Passed {
+			t.Fatalf("safe fixture did not persist as READY: status=%s created=%v err=%v", job.Status, created, err)
+		}
+		t.Logf("seeded exact synthetic verified fixture: job=%s status=%s marker=%s", job.ID, job.Status, marker)
+		return
+	}
+
+	var jobID string
+	if err := tzPool.QueryRow(ctx, "SELECT id::text FROM tz_authoring_job WHERE idempotency_key=$1", proofKey).Scan(&jobID); err != nil {
+		t.Fatalf("resolve exact authoring fixture key: %v", err)
+	}
+	job, err := repository.Get(ctx, jobID)
+	if err != nil {
+		t.Fatalf("load exact authoring fixture: %v", err)
+	}
+	if mode == "cleanup" {
+		cleanupProofFixture(t, ctx, tzPool, jobID)
+		return
+	}
+	if job.Artifact == nil || !strings.Contains(job.Artifact.Candidate.PrivateEvaluation.Reference.Files[0].Content, proofMarker(proofKey)) {
+		t.Fatal("authoring fixture does not contain its unique private evaluation marker")
+	}
+
+	tzURL := proofURL("D8_PROOF_TZ_URL", "http://127.0.0.1:"+envOr("HTTP_PORT", "18088"))
+	practiceURL := proofURL("D8_PROOF_PRACTICE_URL", os.Getenv("PRACTICE_TASK_SERVICE_URL"))
+	token := os.Getenv("INTERNAL_API_TOKEN")
+	if token == "" || practiceURL == "" {
+		t.Fatal("real TZ auth token and Practice URL must be configured by native_config.py")
+	}
+
+	if mode == "unavailable" {
+		if job.Status != domain.JobStatusReady {
+			t.Fatalf("unavailable-path fixture began in %s, want READY", job.Status)
+		}
+		status, body := postProofJSON(t, ctx, tzURL+"/internal/v1/authoring-jobs/"+jobID+"/stage", token, "", nil)
+		if status != http.StatusBadGateway {
+			t.Fatalf("Practice-unavailable response status=%d body=%s, want 502", status, body)
+		}
+		stored, getErr := repository.Get(ctx, jobID)
+		if getErr != nil || stored.Status != domain.JobStatusReady || stored.Staging != nil {
+			t.Fatalf("failed handoff advanced TZ state: status=%s staging=%v err=%v", stored.Status, stored.Staging, getErr)
+		}
+		t.Logf("Practice-unavailable failure preserved READY: job=%s", jobID)
+		return
+	}
+
+	status, body := postProofJSON(t, ctx, tzURL+"/internal/v1/authoring-jobs/"+jobID+"/stage", token, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("real TZ staging route status=%d body=%s", status, body)
+	}
+	var projection struct {
+		ID      string                   `json:"id"`
+		Status  domain.JobStatus         `json:"status"`
+		Staging *domain.StagingReceiptV1 `json:"staging"`
+	}
+	if err := json.Unmarshal(body, &projection); err != nil || projection.ID != jobID || projection.Status != domain.JobStatusStaged || projection.Staging == nil {
+		t.Fatalf("real TZ staging projection invalid: projection=%+v err=%v", projection, err)
+	}
+	if projection.Staging.State != "staged" || projection.Staging.AuthoringJobID != jobID || projection.Staging.StagedID == "" {
+		t.Fatalf("invalid Practice receipt in TZ projection: %+v", *projection.Staging)
+	}
+
+	practicePool := proofPool(t, ctx, os.Getenv("D8_PRACTICE_STAGING_TEST_DATABASE_URL"), "D8_PRACTICE_STAGING_TEST_DATABASE_URL")
+	defer practicePool.Close()
+	marker := proofMarker(proofKey)
+	var state, blueprintJSON, evaluationJSON, verificationJSON, provenanceJSON string
+	if err := practicePool.QueryRow(ctx, `SELECT state, blueprint_json::text, private_evaluation_json::text, verification_json::text, provenance_json::text FROM practice_tz_authoring_staging WHERE authoring_job_id=$1`, jobID).Scan(&state, &blueprintJSON, &evaluationJSON, &verificationJSON, &provenanceJSON); err != nil {
+		t.Fatalf("read exact durable Practice staging row: %v", err)
+	}
+	var blueprintEvidence map[string]any
+	var verificationEvidence map[string]any
+	var provenanceEvidence map[string]any
+	if json.Unmarshal([]byte(blueprintJSON), &blueprintEvidence) != nil || json.Unmarshal([]byte(verificationJSON), &verificationEvidence) != nil || json.Unmarshal([]byte(provenanceJSON), &provenanceEvidence) != nil {
+		t.Fatal("persisted staging evidence is not valid JSON")
+	}
+	identityEvidence, _ := blueprintEvidence["identity"].(map[string]any)
+	generationEvidence, generationOK := provenanceEvidence["generation"].(map[string]any)
+	passed, passedOK := verificationEvidence["passed"].(bool)
+	if state != "staged" || !strings.Contains(evaluationJSON, marker) || !passedOK || !passed || !generationOK || len(generationEvidence) == 0 || identityEvidence["family_key"] == nil {
+		t.Fatalf("staging row lost required private candidate evidence: state=%s", state)
+	}
+
+	command := proofStageCommand(jobID, *job.Artifact)
+	commandBody, err := json.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	practiceToken := os.Getenv("LW_PRACTICE_TZ_TOKEN")
+	if practiceToken == "" {
+		t.Fatal("dedicated Practice TZ token is not configured")
+	}
+	practiceStatus, practiceBody := postProofJSON(t, ctx, practiceURL+"/internal/authoring/v1/task-revisions/stage", practiceToken, jobID, commandBody)
+	var practiceReceipt domain.StagingReceiptV1
+	if practiceStatus != http.StatusOK || json.Unmarshal(practiceBody, &practiceReceipt) != nil || practiceReceipt.Created || practiceReceipt.StagedID != projection.Staging.StagedID {
+		t.Fatalf("identical direct Practice retry did not return the stable receipt: status=%d body=%s", practiceStatus, practiceBody)
+	}
+	provePracticeAuthAndConflict(t, ctx, practiceURL, practiceToken, jobID, commandBody, command, job.Artifact.Candidate)
+	provePublicIsolation(t, ctx, practiceURL, projection.Staging.StagedID, marker)
+
+	status, retryBody := postProofJSON(t, ctx, tzURL+"/internal/v1/authoring-jobs/"+jobID+"/stage", token, "", nil)
+	var retry struct {
+		Status  domain.JobStatus         `json:"status"`
+		Staging *domain.StagingReceiptV1 `json:"staging"`
+	}
+	if status != http.StatusOK || json.Unmarshal(retryBody, &retry) != nil || retry.Status != domain.JobStatusStaged || retry.Staging == nil || retry.Staging.StagedID != projection.Staging.StagedID {
+		t.Fatalf("TZ durable retry changed staged identity: status=%d body=%s", status, retryBody)
+	}
+	t.Logf("real-service staging proof passed: job=%s staged_id=%s status=%s mode=%s", jobID, projection.Staging.StagedID, retry.Status, mode)
+}
+
+func proofStageCommand(jobID string, artifact domain.AuthoringArtifact) map[string]any {
+	return map[string]any{
+		"schema": "practice-task-staging-command.v1", "authoring_job_id": jobID,
+		"candidate_digest": artifact.CandidateDigest, "contract_digest": artifact.ContractDigest,
+		"capabilities_digest": artifact.CapabilitiesDigest, "candidate": artifact.Candidate,
+		"verification": artifact.Verification,
+	}
+}
+
+func provePracticeAuthAndConflict(t *testing.T, ctx context.Context, baseURL, tzToken, jobID string, validBody []byte, command map[string]any, candidate domain.AuthoringCandidateV1) {
+	t.Helper()
+	path := baseURL + "/internal/authoring/v1/task-revisions/stage"
+	for name, token := range map[string]string{"missing": "", "wrong": "not-the-TZ-token", "generic": os.Getenv("D8_TEST_GENERIC_TOKEN")} {
+		if name == "generic" && token == "" {
+			t.Fatal("generic-token rejection proof is missing D8_TEST_GENERIC_TOKEN")
+		}
+		status, _ := postProofJSON(t, ctx, path, token, jobID, validBody)
+		if status != http.StatusForbidden {
+			t.Fatalf("Practice %s credential status=%d, want 403", name, status)
+		}
+	}
+
+	invalid := make(map[string]any, len(command))
+	for key, value := range command {
+		invalid[key] = value
+	}
+	invalid["candidate_digest"] = "sha256:" + strings.Repeat("f", 64)
+	invalidBody, err := json.Marshal(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _ := postProofJSON(t, ctx, path, tzToken, jobID, invalidBody)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid candidate status=%d, want 422", status)
+	}
+
+	candidate.PrivateEvaluation.Reference.Files[0].Content += "\nconflicting-payload"
+	digest, err := candidate.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict := make(map[string]any, len(command))
+	for key, value := range command {
+		conflict[key] = value
+	}
+	conflict["candidate"] = candidate
+	conflict["candidate_digest"] = digest
+	conflictBody, err := json.Marshal(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body := postProofJSON(t, ctx, path, tzToken, jobID, conflictBody)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("idempotency_conflict")) {
+		t.Fatalf("conflicting retry status=%d body=%s, want explicit 409", status, body)
+	}
+}
+
+func provePublicIsolation(t *testing.T, ctx context.Context, baseURL, stagedID, marker string) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/practice-tasks", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-User-ID", "00000000-0000-4000-8000-000000000099")
+	request.Header.Set("X-User-Role", "STUDENT")
+	response, err := proofHTTPClient.Do(request)
+	if err != nil {
+		t.Fatalf("public student catalog request failed: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("public student catalog status=%d err=%v", response.StatusCode, err)
+	}
+	for _, forbidden := range []string{stagedID, marker, "private_evaluation"} {
+		if bytes.Contains(body, []byte(forbidden)) {
+			t.Fatalf("private staged candidate leaked through public catalog response (%s)", forbidden)
+		}
+	}
+}
+
+func postProofJSON(t *testing.T, ctx context.Context, url, token, idempotencyKey string, body []byte) (int, []byte) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		request.Header.Set("X-Internal-Token", token)
+	}
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	response, err := proofHTTPClient.Do(request)
+	if err != nil {
+		t.Fatalf("HTTP proof request failed: %v", err)
+	}
+	defer response.Body.Close()
+	result, err := io.ReadAll(io.LimitReader(response.Body, 10<<20))
+	if err != nil {
+		t.Fatalf("read HTTP proof response: %v", err)
+	}
+	return response.StatusCode, result
+}
+
+func cleanupProofFixture(t *testing.T, ctx context.Context, tzPool *pgxpool.Pool, jobID string) {
+	t.Helper()
+	practicePool := proofPool(t, ctx, os.Getenv("D8_PRACTICE_STAGING_TEST_DATABASE_URL"), "D8_PRACTICE_STAGING_TEST_DATABASE_URL")
+	defer practicePool.Close()
+	practiceResult, err := practicePool.Exec(ctx, "DELETE FROM practice_tz_authoring_staging WHERE authoring_job_id=$1", jobID)
+	if err != nil {
+		t.Fatalf("delete exact synthetic Practice staging fixture: %v", err)
+	}
+	tzResult, err := tzPool.Exec(ctx, "DELETE FROM tz_authoring_job WHERE id=$1", jobID)
+	if err != nil {
+		t.Fatalf("delete exact synthetic TZ authoring fixture: %v", err)
+	}
+	t.Logf("cleaned only synthetic proof rows: practice=%d tz=%d job=%s", practiceResult.RowsAffected(), tzResult.RowsAffected(), jobID)
+}
+
+func proofPool(t *testing.T, ctx context.Context, databaseURL, variable string) *pgxpool.Pool {
+	t.Helper()
+	if databaseURL == "" {
+		t.Fatalf("%s is not configured", variable)
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect through %s: %v", variable, err)
+	}
+	return pool
+}
+
+func proofURL(variable, fallback string) string {
+	if value := os.Getenv(variable); value != "" {
+		return strings.TrimRight(value, "/")
+	}
+	return strings.TrimRight(fallback, "/")
+}
+
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func proofMarker(jobID string) string {
+	return "D8_PRIVATE_EVALUATION_" + strings.ReplaceAll(jobID, "-", "")
+}
+
+var proofHTTPClient = &http.Client{Timeout: 20 * time.Second}

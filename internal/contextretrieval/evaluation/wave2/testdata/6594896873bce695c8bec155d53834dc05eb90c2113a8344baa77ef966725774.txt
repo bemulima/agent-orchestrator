@@ -1,0 +1,80 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/transport/http/api/v1/middleware"
+	"github.com/google/uuid"
+)
+
+type DiagnosticBootstrapStarter interface {
+	Start(context.Context, string, string, domain.DiagnosticAssessmentBootstrapRequestV1) (domain.DiagnosticAssessmentBootstrapResultV1, bool, error)
+}
+
+type DiagnosticAssessmentBootstrapHandler struct{ Bootstrap DiagnosticBootstrapStarter }
+
+func (h DiagnosticAssessmentBootstrapHandler) Start(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.ActorFromContext(r.Context())
+	rawActorID := r.Header.Get("X-User-ID")
+	media, _, mediaErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	key := r.Header.Get("Idempotency-Key")
+	parsed, keyErr := uuid.Parse(key)
+	if !ok || rawActorID != actor.UserID || !isCanonicalBootstrapUUID(rawActorID) {
+		writeBootstrapError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if mediaErr != nil || media != "application/json" || keyErr != nil || parsed.String() != key {
+		writeBootstrapError(w, http.StatusBadRequest, "malformed_request")
+		return
+	}
+	var input domain.DiagnosticAssessmentBootstrapRequestV1
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		writeBootstrapError(w, http.StatusBadRequest, "malformed_request")
+		return
+	}
+	result, created, err := h.Bootstrap.Start(r.Context(), actor.UserID, key, input)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrValidation):
+			writeBootstrapError(w, http.StatusUnprocessableEntity, "invalid_request")
+		case errors.Is(err, domain.ErrConflict):
+			writeBootstrapError(w, http.StatusConflict, "idempotency_conflict")
+		case errors.Is(err, domain.ErrNotFound):
+			writeBootstrapError(w, http.StatusNotFound, "not_found")
+		case errors.Is(err, domain.ErrUpstreamUnavailable):
+			writeBootstrapError(w, http.StatusServiceUnavailable, "upstream_unavailable")
+		case errors.Is(err, domain.ErrUpstreamInvalid):
+			writeBootstrapError(w, http.StatusBadGateway, "upstream_invalid")
+		default:
+			writeBootstrapError(w, http.StatusInternalServerError, "internal_error")
+		}
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func isCanonicalBootstrapUUID(raw string) bool {
+	parsed, err := uuid.Parse(raw)
+	return err == nil && parsed.String() == raw
+}
+func writeBootstrapError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code}})
+}

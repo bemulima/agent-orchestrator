@@ -1,0 +1,413 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"strings"
+	"testing"
+	"time"
+)
+
+type testClock struct{}
+
+func (testClock) Now() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+func bootstrapInput(student, course string, previous *int) domain.DiagnosticAssessmentPlanRequestV1 {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	binding := domain.DiagnosticBootstrapBinding{GoalCode: "goal", DirectionCode: "direction", CourseID: course, BindingRevision: 1, PolicyVersion: domain.DiagnosticBootstrapPolicyV1, Active: true, CreatedAt: created}
+	binding.BindingDigest, _ = domain.DiagnosticBootstrapBindingDigest(binding)
+	return domain.DiagnosticAssessmentPlanRequestV1{Schema: domain.DiagnosticAssessmentPlanRequestSchemaV1, StudentID: student, CourseID: course, ExpectedPreviousRevision: previous, OnboardingVersion: 1, BootstrapPolicyVersion: domain.DiagnosticBootstrapPolicyV1, BootstrapContextDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", BindingRevision: 1, BindingDigest: binding.BindingDigest, BindingGoalCode: "goal", BindingDirectionCode: "direction", BindingCreatedAt: created}
+}
+
+type testRepo struct {
+	byKey        map[string]domain.DiagnosticAssessmentPlanRecord
+	latest       map[string]domain.DiagnosticAssessmentPlanRecord
+	reservations map[string]domain.DiagnosticAssessmentReservationRecord
+	placements   map[string]domain.DiagnosticPlacementRecord
+}
+
+func (r *testRepo) GetDiagnosticByID(_ context.Context, id string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	for _, record := range r.byKey {
+		if record.Plan.ID == id {
+			return record, nil
+		}
+	}
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+}
+
+type nanoClock struct{}
+
+func (nanoClock) Now() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 123456789, time.UTC) }
+
+func (r *testRepo) GetByStudentKey(_ context.Context, s, k string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	v, ok := r.byKey[s+k]
+	if !ok {
+		return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+	}
+	return v, nil
+}
+func (r *testRepo) GetLatest(_ context.Context, s, c, contextDigest string) (domain.DiagnosticAssessmentPlanRecord, error) {
+	v, ok := r.latest[s+c+contextDigest]
+	if !ok {
+		v, ok = r.latest[s+c]
+	}
+	if !ok {
+		return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrNotFound
+	}
+	return v, nil
+}
+func (r *testRepo) Insert(_ context.Context, v domain.DiagnosticAssessmentPlanRecord) (domain.DiagnosticAssessmentPlanRecord, error) {
+	if _, ok := r.byKey[v.Plan.StudentID+v.IdempotencyKey]; ok {
+		return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrConflict
+	}
+	r.byKey[v.Plan.StudentID+v.IdempotencyKey] = v
+	r.latest[v.Plan.StudentID+v.Plan.CourseID+v.Plan.BootstrapContextDigest] = v
+	return v, nil
+}
+func (r *testRepo) GetDiagnosticReservation(_ context.Context, id string) (domain.DiagnosticAssessmentReservationRecord, error) {
+	v, ok := r.reservations[id]
+	if !ok {
+		return domain.DiagnosticAssessmentReservationRecord{}, domain.ErrNotFound
+	}
+	return v, nil
+}
+func (r *testRepo) InsertDiagnosticReservation(_ context.Context, v domain.DiagnosticAssessmentReservationRecord) (domain.DiagnosticAssessmentReservationRecord, error) {
+	if r.reservations == nil {
+		r.reservations = map[string]domain.DiagnosticAssessmentReservationRecord{}
+	}
+	if _, ok := r.reservations[v.Reservation.PlanID]; ok {
+		return domain.DiagnosticAssessmentReservationRecord{}, domain.ErrConflict
+	}
+	r.reservations[v.Reservation.PlanID] = v
+	return v, nil
+}
+func (r *testRepo) GetDiagnosticPlacement(_ context.Context, id string) (domain.DiagnosticPlacementRecord, error) {
+	v, ok := r.placements[id]
+	if !ok {
+		return domain.DiagnosticPlacementRecord{}, domain.ErrNotFound
+	}
+	return v, nil
+}
+func (r *testRepo) InsertDiagnosticPlacement(_ context.Context, v domain.DiagnosticPlacementRecord) (domain.DiagnosticPlacementRecord, error) {
+	if r.placements == nil {
+		r.placements = map[string]domain.DiagnosticPlacementRecord{}
+	}
+	if _, ok := r.placements[v.Decision.PlanID]; ok {
+		return domain.DiagnosticPlacementRecord{}, domain.ErrConflict
+	}
+	r.placements[v.Decision.PlanID] = v
+	return v, nil
+}
+
+type testCourse struct {
+	c domain.DiagnosticAssessmentCatalog
+}
+type testStudent struct{}
+
+func (testStudent) ReserveDiagnosticAssessment(_ context.Context, _ string, plan domain.DiagnosticAssessmentPlan) (domain.DiagnosticAssessmentReservation, error) {
+	return domain.DiagnosticAssessmentReservation{Schema: domain.DiagnosticAssessmentReservationSchemaV1, ID: plan.ID, PlanID: plan.ID, PlanRevision: plan.PlanRevision, PlanDigest: plan.PlanDigest}, nil
+}
+func (testStudent) GetDiagnosticAssessmentResult(context.Context, string, string) (domain.DiagnosticAssessmentResult, error) {
+	return domain.DiagnosticAssessmentResult{}, domain.ErrNotFound
+}
+
+func issueForTest(r *testRepo, c domain.DiagnosticAssessmentCatalog, clock Clock) Issuer {
+	return Issuer{Plans: r, Reservations: r, Placements: r, Courses: testCourse{c}, Students: testStudent{}, Clock: clock}
+}
+
+type resultStudent struct {
+	result domain.DiagnosticAssessmentResult
+	calls  int
+}
+
+type countedCourse struct {
+	catalog domain.DiagnosticAssessmentCatalog
+	calls   int
+}
+
+func (c *countedCourse) GetDiagnosticAssessmentCatalog(context.Context, string) (domain.DiagnosticAssessmentCatalog, error) {
+	c.calls++
+	return c.catalog, nil
+}
+
+type countedStudent struct {
+	calls int
+	err   error
+}
+
+func (s *countedStudent) ReserveDiagnosticAssessment(_ context.Context, _ string, p domain.DiagnosticAssessmentPlan) (domain.DiagnosticAssessmentReservation, error) {
+	s.calls++
+	if s.err != nil {
+		return domain.DiagnosticAssessmentReservation{}, s.err
+	}
+	return testStudent{}.ReserveDiagnosticAssessment(context.Background(), p.StudentID, p)
+}
+func (*countedStudent) GetDiagnosticAssessmentResult(context.Context, string, string) (domain.DiagnosticAssessmentResult, error) {
+	return domain.DiagnosticAssessmentResult{}, domain.ErrNotFound
+}
+
+type failOnceReservationRepo struct {
+	*testRepo
+	fail bool
+}
+
+func (r *failOnceReservationRepo) InsertDiagnosticReservation(c context.Context, v domain.DiagnosticAssessmentReservationRecord) (domain.DiagnosticAssessmentReservationRecord, error) {
+	if r.fail {
+		r.fail = false
+		return domain.DiagnosticAssessmentReservationRecord{}, errors.New("receipt write lost")
+	}
+	return r.testRepo.InsertDiagnosticReservation(c, v)
+}
+
+type raceReservationRepo struct {
+	*testRepo
+	race bool
+}
+
+func (r *raceReservationRepo) InsertDiagnosticReservation(c context.Context, v domain.DiagnosticAssessmentReservationRecord) (domain.DiagnosticAssessmentReservationRecord, error) {
+	if r.race {
+		r.race = false
+		_, _ = r.testRepo.InsertDiagnosticReservation(c, v)
+		return domain.DiagnosticAssessmentReservationRecord{}, domain.ErrConflict
+	}
+	return r.testRepo.InsertDiagnosticReservation(c, v)
+}
+
+type placementErrorRepo struct {
+	*testRepo
+	err error
+}
+
+func (r placementErrorRepo) GetDiagnosticPlacement(context.Context, string) (domain.DiagnosticPlacementRecord, error) {
+	return domain.DiagnosticPlacementRecord{}, r.err
+}
+
+func (s *resultStudent) ReserveDiagnosticAssessment(_ context.Context, _ string, plan domain.DiagnosticAssessmentPlan) (domain.DiagnosticAssessmentReservation, error) {
+	return testStudent{}.ReserveDiagnosticAssessment(context.Background(), plan.StudentID, plan)
+}
+func (s *resultStudent) GetDiagnosticAssessmentResult(context.Context, string, string) (domain.DiagnosticAssessmentResult, error) {
+	s.calls++
+	return s.result, nil
+}
+
+type conflictRepo struct {
+	testRepo
+}
+
+func (r *conflictRepo) Insert(_ context.Context, winner domain.DiagnosticAssessmentPlanRecord) (domain.DiagnosticAssessmentPlanRecord, error) {
+	r.byKey[winner.Plan.StudentID+winner.IdempotencyKey] = winner
+	return domain.DiagnosticAssessmentPlanRecord{}, domain.ErrConflict
+}
+
+func (c testCourse) GetDiagnosticAssessmentCatalog(context.Context, string) (domain.DiagnosticAssessmentCatalog, error) {
+	return c.c, nil
+}
+
+func TestIssueRecoversConcurrentSameKeyWinner(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	input := bootstrapInput(student, course, nil)
+	r := &conflictRepo{testRepo: testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}}
+	catalog := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for n := 0; n < 3; n++ {
+		catalog.Assessments = append(catalog.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: time.Now().UTC().Truncate(time.Microsecond), LessonOrder: n})
+	}
+	issuer := Issuer{Plans: r, Reservations: &r.testRepo, Placements: &r.testRepo, Courses: testCourse{catalog}, Students: testStudent{}, Clock: testClock{}}
+	got, created, err := issuer.Issue(context.Background(), key, input)
+	if err != nil || created || got.ID == "" {
+		t.Fatalf("%#v %v %v", got, created, err)
+	}
+}
+func TestIssueFixedPlanReplayAndSecondKeyConflicts(t *testing.T) {
+	student := "11111111-1111-1111-1111-111111111111"
+	course := "22222222-2222-2222-2222-222222222222"
+	key := "33333333-3333-3333-3333-333333333333"
+	catalog := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for n := 0; n < 6; n++ {
+		catalog.Assessments = append(catalog.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: time.Now().UTC().Truncate(time.Microsecond), LessonOrder: n, TaskOrder: 0})
+	}
+	r := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	issuer := issueForTest(r, catalog, testClock{})
+	input := bootstrapInput(student, course, nil)
+	p, created, e := issuer.Issue(context.Background(), key, input)
+	if e != nil || !created || len(p.Assessments) != 5 {
+		t.Fatalf("first: %v %v %d", e, created, len(p.Assessments))
+	}
+	again, created, e := issuer.Issue(context.Background(), key, input)
+	if e != nil || created || again.PlanDigest != p.PlanDigest {
+		t.Fatalf("replay: %v %v", e, created)
+	}
+	_, _, e = issuer.Issue(context.Background(), "66666666-6666-6666-6666-666666666666", input)
+	if !errors.Is(e, domain.ErrConflict) {
+		t.Fatalf("second initial=%v", e)
+	}
+}
+
+func TestIssueCanonicalizesCreatedAtToPostgresMicroseconds(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	catalog := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for n := 0; n < 3; n++ {
+		catalog.Assessments = append(catalog.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: time.Now().UTC().Truncate(time.Microsecond), LessonOrder: n})
+	}
+	r := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	p, _, e := issueForTest(r, catalog, nanoClock{}).Issue(context.Background(), key, bootstrapInput(student, course, nil))
+	if e != nil || p.CreatedAt.Nanosecond()%1000 != 0 || p.CreatedAt.Nanosecond() != 123456000 {
+		t.Fatalf("time=%s err=%v", p.CreatedAt, e)
+	}
+}
+
+func TestPlacementReplayGatesDeterministicRetake(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	catalog := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for n := 0; n < 5; n++ {
+		catalog.Assessments = append(catalog.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: time.Date(2026, 1, 2+n, 0, 0, 0, 0, time.UTC), LessonOrder: n})
+	}
+	repo := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	issuer := issueForTest(repo, catalog, testClock{})
+	input := bootstrapInput(student, course, nil)
+	plan, _, err := issuer.Issue(context.Background(), key, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := 1
+	if _, _, err := issuer.Issue(context.Background(), "66666666-6666-6666-6666-666666666666", bootstrapInput(student, course, &expected)); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("undecided retake=%v", err)
+	}
+	result := domain.DiagnosticAssessmentResult{Schema: domain.DiagnosticAssessmentResultSchemaV1, StudentID: student, CourseID: course, CourseContentRevision: plan.CourseRevision, PolicyVersion: plan.PolicyVersion, AttemptID: plan.ID, PlanID: plan.ID, PlanRevision: plan.PlanRevision, Correct: 3, Total: 5, Percent: 60, Band: "CORE", BandPolicyVersion: domain.DiagnosticAssessmentBandPolicyV1, PlanDigest: plan.PlanDigest, CompletedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)}
+	result.ResultDigest, err = domain.DiagnosticResultDigest(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	studentPort := &resultStudent{result: result}
+	consumer := PlacementConsumer{Plans: repo, Placements: repo, Students: studentPort, Clock: testClock{}}
+	decision, created, err := consumer.Consume(context.Background(), student, plan.ID, plan.ID, domain.DiagnosticPlacementConsumeRequest{Schema: domain.DiagnosticPlacementConsumeSchemaV1})
+	if err != nil || !created || decision.RouteCode != "START_CORE" || studentPort.calls != 1 {
+		t.Fatalf("placement=%#v created=%v calls=%d err=%v", decision, created, studentPort.calls, err)
+	}
+	_, created, err = consumer.Consume(context.Background(), student, plan.ID, plan.ID, domain.DiagnosticPlacementConsumeRequest{Schema: domain.DiagnosticPlacementConsumeSchemaV1})
+	if err != nil || created || studentPort.calls != 1 {
+		t.Fatalf("local replay created=%v calls=%d err=%v", created, studentPort.calls, err)
+	}
+	second, created, err := issuer.Issue(context.Background(), "66666666-6666-6666-6666-666666666666", bootstrapInput(student, course, &expected))
+	if err != nil || !created || second.PlanRevision != 2 || second.ID == plan.ID {
+		t.Fatalf("retake=%#v created=%v err=%v", second, created, err)
+	}
+}
+
+func TestPlacementRejectsTamperedSelfConsistentResult(t *testing.T) {
+	plan := domain.DiagnosticAssessmentPlan{Schema: domain.DiagnosticAssessmentPlanSchemaV1, ID: "11111111-1111-4111-8111-111111111111", StudentID: "22222222-2222-4222-8222-222222222222", CourseID: "33333333-3333-4333-8333-333333333333", PlanRevision: 1, PolicyVersion: domain.DiagnosticFixedPolicyV1, CourseRevision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	for n := 0; n < 3; n++ {
+		plan.Assessments = append(plan.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", n), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", n), TaskVersion: 1, UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), LessonOrder: n})
+	}
+	plan.PlanDigest, _ = domain.DiagnosticPlanDigest(plan)
+	result := domain.DiagnosticAssessmentResult{Schema: domain.DiagnosticAssessmentResultSchemaV1, StudentID: plan.StudentID, CourseID: plan.CourseID, CourseContentRevision: plan.CourseRevision, PolicyVersion: plan.PolicyVersion, AttemptID: plan.ID, PlanID: plan.ID, PlanRevision: 1, Correct: 3, Total: 3, Percent: 100, Band: "ADVANCED", BandPolicyVersion: domain.DiagnosticAssessmentBandPolicyV1, PlanDigest: plan.PlanDigest, CompletedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}
+	result.ResultDigest, _ = domain.DiagnosticResultDigest(result)
+	result.CourseID = "66666666-6666-4666-8666-666666666666"
+	result.ResultDigest, _ = domain.DiagnosticResultDigest(result)
+	if domain.ValidateDiagnosticResult(result, plan) == nil {
+		t.Fatal("self-consistent foreign result accepted")
+	}
+}
+func TestIssueReservationRecoveryAndReplayInvariants(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	catalog := issueCatalog(course, 5)
+	repo := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	courses := &countedCourse{catalog: catalog}
+	learners := &countedStudent{}
+	issuer := Issuer{Plans: repo, Reservations: repo, Placements: repo, Courses: courses, Students: learners, Clock: testClock{}}
+	input := bootstrapInput(student, course, nil)
+	plan, _, err := issuer.Issue(context.Background(), key, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	courses.calls = 0
+	learners.calls = 0
+	if _, created, err := issuer.Issue(context.Background(), key, input); err != nil || created || courses.calls != 0 || learners.calls != 0 {
+		t.Fatalf("local replay created=%v course=%d student=%d err=%v", created, courses.calls, learners.calls, err)
+	}
+	bad := repo.reservations[plan.ID]
+	bad.Reservation.PlanDigest = "sha256:" + strings.Repeat("b", 64)
+	bad.ReservationDigest, _ = domain.DiagnosticReservationDigest(bad.Reservation)
+	repo.reservations[plan.ID] = bad
+	if _, _, err := issuer.Issue(context.Background(), key, input); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("mismatched durable receipt=%v", err)
+	}
+	learners.err = errors.New("student unavailable")
+	fresh := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	if _, _, err := (Issuer{Plans: fresh, Reservations: fresh, Placements: fresh, Courses: &countedCourse{catalog: catalog}, Students: learners, Clock: testClock{}}).Issue(context.Background(), "66666666-6666-6666-6666-666666666666", input); err == nil {
+		t.Fatal("failed reservation succeeded")
+	}
+}
+
+func TestIssueRecoversLostReceiptAndConcurrentReceiptWinner(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	input := bootstrapInput(student, course, nil)
+	catalog := issueCatalog(course, 3)
+	base := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	lost := &failOnceReservationRepo{testRepo: base, fail: true}
+	learner := &countedStudent{}
+	issuer := Issuer{Plans: base, Reservations: lost, Placements: base, Courses: &countedCourse{catalog: catalog}, Students: learner, Clock: testClock{}}
+	if _, _, err := issuer.Issue(context.Background(), key, input); err == nil || learner.calls != 1 {
+		t.Fatalf("lost write err=%v calls=%d", err, learner.calls)
+	}
+	if _, created, err := issuer.Issue(context.Background(), key, input); err != nil || created || learner.calls != 2 {
+		t.Fatalf("recovery created=%v err=%v calls=%d", created, err, learner.calls)
+	}
+	raceBase := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	race := &raceReservationRepo{testRepo: raceBase, race: true}
+	if _, created, err := (Issuer{Plans: raceBase, Reservations: race, Placements: raceBase, Courses: &countedCourse{catalog: catalog}, Students: &countedStudent{}, Clock: testClock{}}).Issue(context.Background(), "66666666-6666-6666-6666-666666666666", input); err != nil || !created {
+		t.Fatalf("receipt race created=%v err=%v", created, err)
+	}
+}
+
+func TestRetakePropagatesPlacementStorageCorruption(t *testing.T) {
+	student, course, key := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	base := &testRepo{byKey: map[string]domain.DiagnosticAssessmentPlanRecord{}, latest: map[string]domain.DiagnosticAssessmentPlanRecord{}}
+	catalog := issueCatalog(course, 3)
+	issuer := issueForTest(base, catalog, testClock{})
+	input := bootstrapInput(student, course, nil)
+	plan, _, err := issuer.Issue(context.Background(), key, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := 1
+	storage := errors.New("storage failed")
+	errRepo := placementErrorRepo{testRepo: base, err: storage}
+	if _, _, err := (Issuer{Plans: base, Reservations: base, Placements: errRepo, Courses: testCourse{catalog}, Students: testStudent{}, Clock: testClock{}}).Issue(context.Background(), "66666666-6666-6666-6666-666666666666", bootstrapInput(student, course, &expected)); !errors.Is(err, storage) {
+		t.Fatalf("storage error collapsed=%v", err)
+	}
+	base.placements = map[string]domain.DiagnosticPlacementRecord{plan.ID: {RequestID: plan.ID, RequestHash: "sha256:" + strings.Repeat("a", 64)}}
+	if _, _, err := issuer.Issue(context.Background(), "66666666-6666-6666-6666-666666666666", bootstrapInput(student, course, &expected)); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("corrupt receipt=%v", err)
+	}
+}
+
+func issueCatalog(course string, n int) domain.DiagnosticAssessmentCatalog {
+	c := domain.DiagnosticAssessmentCatalog{Schema: domain.DiagnosticAssessmentCatalogSchemaV1, CourseID: course, Revision: "sha256:" + strings.Repeat("a", 64)}
+	for i := 0; i < n; i++ {
+		c.Assessments = append(c.Assessments, domain.DiagnosticAssessment{LessonID: fmt.Sprintf("44444444-4444-4444-8444-%012d", i), TaskID: fmt.Sprintf("55555555-5555-4555-8555-%012d", i), TaskVersion: 1, UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), LessonOrder: i})
+	}
+	return c
+}
+func TestSelectFixedRejectsUnderfilledAndIsStable(t *testing.T) {
+	if _, e := selectFixed(make([]domain.DiagnosticAssessment, 2)); !errors.Is(e, domain.ErrValidation) {
+		t.Fatal(e)
+	}
+	a := make([]domain.DiagnosticAssessment, 5)
+	for n := range a {
+		a[n] = domain.DiagnosticAssessment{TaskID: string(rune('a' + n)), LessonOrder: 4 - n}
+	}
+	x, e := selectFixed(a)
+	if e != nil || len(x) != 5 || x[0].LessonOrder != 0 {
+		t.Fatalf("%v %#v", e, x)
+	}
+	tied := make([]domain.DiagnosticAssessment, 5)
+	for n := range tied {
+		tied[n] = domain.DiagnosticAssessment{TaskID: string(rune('e' - n)), LessonOrder: 0, TaskOrder: 0}
+	}
+	x, e = selectFixed(tied)
+	if e != nil || x[0].TaskID != "a" || x[4].TaskID != "e" {
+		t.Fatalf("tie ordering=%#v err=%v", x, e)
+	}
+}

@@ -1494,3 +1494,41 @@ pre-read admission, path race and inventory-bound gaps; runtime admission remain
 DENIED pending exact certification. These workstreams must not be inferred from
 this isolated constraint repair. Published Wave 1 retrieval, Course fixtures,
 CI evidence paths and historical owner evidence remain intact.
+
+## Go context retrieval Wave 2 — 2026-10-08
+
+Status: PARTIAL, feature source only; Profile v2 is not production-ready.
+The verified baseline is 8e7eeb50a94eec29ccf1337c5ba232db83d61b66 after cleanup
+publication. Three independent service audits froze 27 unchanged tasks and
+source/test obligations before observation. Services remain read-only.
+
+Generic CDO fixes cover whole ASCII keyword matching, declared alternate
+application/usecase shape, metadata/AST-gated outgoing adapters, and explicit
+analysis routing with dependent/current-state/negative/conditional guards.
+ContextPack/RetrievalPlan/RoutingResult and boundary ownership are unchanged;
+the additive Go profile asset is version 1.3.2. No business runtime, migrations,
+local RAG, vector storage or model/provider calls were introduced.
+
+Actual final R1/Prepare/Expand replay finds62/62 Prepare anchors,111/111 combined
+Expand anchors and56/56 test anchors with precision1.00 at a uniform bounded
+128K context/64K per-facet profile. Lower32K/64K diagnostic runs are retained.
+All-pack classifications are9 VALID_PARTIAL and18 VALID_BLOCKED. Independent
+routing obligations remain12/82 selected (70 unmet); plan-wide required facets
+remain121/123 Prepare and196/198 Expand. Two T08 generic proposed contract
+obligations remain explicitly diagnosed contract-adapter misses. Its actual
+business DTO/application contracts exist and are retrieved; no files were
+invented, obligations waived or expected labels rewritten.
+
+Wave1 retains39 scenarios33PASS/3VALID_PARTIAL/3VALID_UNSUPPORTED and108 Gold.
+Twenty-seven additive source-hashed Gold scenarios pass, including explicit
+T08 gap preservation and dirty snapshot provenance. Full make verify without
+.env passes; physical CLI71 core Gold and39 Wave1/27 Wave2 Prepare/Expand/repeat
+API-digest comparisons pass. Independent source review P0=0/P1=0 applies to
+safe feature preservation and retrieval regressions; main readiness is denied.
+All3 target snapshots repeat exactly. Source preservation excludes secrets and
+includes the independently pinned497-document fixture corpus.
+
+Next: independently specify a source-bound read-only R1 analysis/typed-boundary
+compatibility contract without granting business/write ownership; retain all
+27 tasks,82 layer obligations and198 plan-wide requirements for acceptance.
+Wave3 has not started. See go-context-retrieval-wave2.md for the bounded scope.

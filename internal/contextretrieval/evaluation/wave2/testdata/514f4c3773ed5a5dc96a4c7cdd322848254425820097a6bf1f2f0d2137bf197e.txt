@@ -1,0 +1,738 @@
+//go:build integration
+
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+// These tests intentionally require an explicitly configured disposable test
+// database. They create and drop a random schema, and never start Postgres or
+// apply migrations to a shared/default database.
+func openTestRepository(t *testing.T) (*Repository, *sql.DB) {
+	t.Helper()
+	connectionURL := os.Getenv("PRACTICE_RUNTIME_TEST_DATABASE_URL")
+	if connectionURL == "" {
+		t.Skip("PRACTICE_RUNTIME_TEST_DATABASE_URL is not set")
+	}
+	parsed, err := url.Parse(connectionURL)
+	if err != nil || parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		t.Fatalf("PRACTICE_RUNTIME_TEST_DATABASE_URL must be a postgres URL")
+	}
+	adminConfig, err := pgx.ParseConfig(connectionURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminDB := stdlib.OpenDB(*adminConfig)
+	t.Cleanup(func() { _ = adminDB.Close() })
+	if err := adminDB.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping configured Postgres test database: %v", err)
+	}
+	schema := fmt.Sprintf("practice_runtime_test_%d", time.Now().UnixNano())
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA "`+schema+`"`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`) })
+
+	config, err := pgx.ParseConfig(connectionURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RuntimeParams["search_path"] = schema
+	db := stdlib.OpenDB(*config)
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	migrationDir := filepath.Join("..", "..", "..", "..", "db", "migrations")
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		t.Fatalf("read runtime migrations: %v", err)
+	}
+	var migrations []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".up.sql") {
+			migrations = append(migrations, entry.Name())
+		}
+	}
+	sort.Strings(migrations)
+	for _, name := range migrations {
+		migrationPath := filepath.Join(migrationDir, name)
+		migration, err := os.ReadFile(migrationPath)
+		if err != nil {
+			t.Fatalf("read runtime migration %s: %v", migrationPath, err)
+		}
+		if _, err := db.ExecContext(context.Background(), string(migration)); err != nil {
+			t.Fatalf("apply migration %s in isolated schema: %v", name, err)
+		}
+	}
+	return NewRepository(db), db
+}
+
+func TestPostgresStartReceiptIsIdempotentAndVersioned(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	start := fixtureInstance()
+	created, inserted, err := repository.CreateOrLoadStart(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted || created.ID != start.ID || created.Version == 0 {
+		t.Fatalf("first start = (%+v, created=%v), want persisted new receipt", created, inserted)
+	}
+	replayed, inserted, err := repository.CreateOrLoadStart(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted || replayed.ID != start.ID || replayed.StartCommandDigest != start.StartCommandDigest {
+		t.Fatalf("replay = (%+v, created=%v), want original receipt", replayed, inserted)
+	}
+
+	stale := created
+	created.Provisioning.StudentReserved = true
+	created.LearningActionID = testUUID(20)
+	updated, err := repository.SaveInstance(ctx, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != created.Version+1 {
+		t.Fatalf("updated version = %d, want %d", updated.Version, created.Version+1)
+	}
+	stale.Status = domain.TaskInstanceInProgress
+	if _, err := repository.SaveInstance(ctx, stale); err == nil {
+		t.Fatal("stale SaveInstance unexpectedly overwrote a newer receipt")
+	}
+
+	loaded, err := repository.GetInstance(ctx, start.StudentID, start.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.RevisionEnvelope.EvaluationContext == nil || !canonicalEqual(loaded.Steps[0].ValidationContract, []byte(`{"suite":"private"}`), nil, nil) ||
+		loaded.SolutionVariantID != testUUID(5) || loaded.RevisionSummary.VariantID != testUUID(5) {
+		t.Fatalf("internal frozen revision fields were not preserved: %+v", loaded)
+	}
+	restarted, err := NewRepository(db).GetInstance(ctx, start.StudentID, start.ID)
+	if err != nil || restarted.Version != updated.Version || restarted.LearningActionID != testUUID(20) {
+		t.Fatalf("repository restart reload = (%+v, %v)", restarted, err)
+	}
+	if _, err := repository.CreateOrLoadCommandReceipt(ctx, testUUID(41), start.ID, "cancel", "sha256:"+strings.Repeat("1", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateOrLoadCommandReceipt(ctx, testUUID(41), start.ID, "cancel", "sha256:"+strings.Repeat("1", 64)); err != nil {
+		t.Fatalf("matching command receipt replay failed: %v", err)
+	}
+	if _, err := repository.CreateOrLoadCommandReceipt(ctx, testUUID(41), start.ID, "cancel", "sha256:"+strings.Repeat("2", 64)); err == nil {
+		t.Fatal("changed command payload under the same receipt key was accepted")
+	}
+}
+
+func TestPostgresReadinessReceiptPersistsAndReloadsWithoutPublicExposure(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	instance.Steps[0].Status = "LEARNING_REQUIRED"
+	created, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Status = domain.TaskInstanceInProgress
+	created.Steps[0].Status = "AVAILABLE"
+	created.Steps[0].ReadinessIdempotencyKey = testUUID(42)
+	created.Steps[0].ReadinessReceipt = &domain.LearningReadinessReceipt{Schema: "practice-learning-readiness-receipt.v1", ID: testUUID(43),
+		TaskInstanceID: instance.ID, StudentID: instance.StudentID, TaskRevisionID: instance.TaskRevisionID,
+		TaskRevisionDigest: instance.TaskRevisionDigest, RouteID: testUUID(44), RouteDigest: "sha256:" + strings.Repeat("c", 64),
+		StepID: instance.Steps[0].ID, Decision: "READY", LearnerStateDigest: "sha256:" + strings.Repeat("d", 64),
+		MasteryPolicyVersion: domain.LearningReadinessMasteryPolicyV1, ObservedAt: time.Now().UTC()}
+	created.UpdatedAt = time.Now().UTC()
+	if _, err := repository.SaveInstance(ctx, created); err != nil {
+		t.Fatalf("save readiness receipt: %v", err)
+	}
+
+	restarted := NewRepository(db)
+	loaded, err := restarted.GetInstance(ctx, instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Steps[0].ReadinessReceipt == nil || loaded.Steps[0].ReadinessReceipt.ID != testUUID(43) ||
+		loaded.Steps[0].ReadinessIdempotencyKey != testUUID(42) || loaded.Steps[0].Status != "AVAILABLE" {
+		t.Fatalf("readiness state did not survive repository restart: %+v", loaded.Steps[0])
+	}
+	publicJSON, err := json.Marshal(loaded.PublicProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(publicJSON), "readiness_receipt") || strings.Contains(string(publicJSON), "learner_state_digest") || strings.Contains(string(publicJSON), testUUID(43)) {
+		t.Fatalf("internal readiness evidence leaked to public instance: %s", publicJSON)
+	}
+}
+
+func TestPostgresSubmitCommitRetryAndEvidenceOutboxAreAtomic(t *testing.T) {
+	repository, _ := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	createdInstance, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance.Provisioning = domain.ProvisioningReceipts{StudentReserved: true, RouteResolved: true, WorkspaceCreated: true, StudentOpened: true}
+	instance.LearningActionID = testUUID(20)
+	instance.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: "sandbox-1", Available: true}
+	instance.Version = createdInstance.Version
+	instance, err = repository.SaveInstance(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	intent := fixtureIntent(instance)
+	stored, created, err := repository.CreateOrLoadIntent(ctx, intent)
+	if err != nil || !created {
+		t.Fatalf("CreateOrLoadIntent = (%+v, %v, %v)", stored, created, err)
+	}
+	duplicateIntent := intent
+	duplicateIntent.SubmissionID = testUUID(13)
+	duplicateIntent.ValidationRunID = testUUID(14)
+	stored, created, err = repository.CreateOrLoadIntent(ctx, duplicateIntent)
+	if err != nil || created || stored.SubmissionID != intent.SubmissionID || stored.ValidationRunID != intent.ValidationRunID {
+		t.Fatalf("intent replay = (%+v, %v, %v)", stored, created, err)
+	}
+	changedIntent := intent
+	changedIntent.CommandDigest = "sha256:" + strings.Repeat("9", 64)
+	if _, _, err := repository.CreateOrLoadIntent(ctx, changedIntent); !errors.Is(err, domain.ErrIdempotency) {
+		t.Fatalf("same Submit key with changed payload = %v, want idempotency conflict", err)
+	}
+	stored.WriteLockID = "lock-1"
+	stored.FenceEpoch = 4
+	stored.Status = "LOCKED"
+	if err := repository.SaveIntent(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Snapshot = domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: "snapshot-1", GenerationID: "generation-1", WorkspaceDigest: "sha256:" + strings.Repeat("e", 64)}
+	stored.Status = "FROZEN"
+	if err := repository.SaveIntent(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	run := domain.ValidationRun{ID: intent.ValidationRunID, Status: domain.ValidationRunPending}
+	submission := fixtureSubmission(instance, stored, run)
+	stored.Status = "COMMITTED"
+	if err := repository.CommitIntent(ctx, stored, submission, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CommitIntent(ctx, stored, submission, run); err != nil {
+		t.Fatalf("identical commit replay should be idempotent: %v", err)
+	}
+	loadedInstance, err := repository.GetInstance(ctx, instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedInstance.Status != domain.TaskInstanceValidating || loadedInstance.CurrentSubmissionID != submission.ID {
+		t.Fatalf("instance did not transition atomically with Submit: %+v", loadedInstance)
+	}
+	validationInstance, validationSubmission, err := repository.GetValidationContextByRunID(ctx, run.ID)
+	if err != nil || validationInstance.ID != instance.ID || validationSubmission.ID != submission.ID {
+		t.Fatalf("run lookup = (%+v, %+v, %v)", validationInstance, validationSubmission, err)
+	}
+
+	firstStartedAt := time.Now().UTC()
+	if err := repository.SetRunRunning(ctx, run.ID, firstStartedAt); err != nil {
+		t.Fatal(err)
+	}
+	terminalRun := domain.ValidationRun{ID: run.ID, Status: domain.ValidationRunError,
+		Outcome: domain.OutcomeError, ErrorClassification: "VALIDATOR_UNAVAILABLE", StartedAt: timePtr(firstStartedAt), FinishedAt: timePtr(time.Now().UTC())}
+	submission.Status = domain.SubmissionValidating
+	submission.ValidationRuns = []domain.ValidationRun{terminalRun}
+	loadedInstance.Status = domain.TaskInstanceValidating
+	if err := repository.CompleteValidation(ctx, submission, terminalRun, loadedInstance); err != nil {
+		t.Fatal(err)
+	}
+	loadedAfterError, err := repository.GetInstance(ctx, instance.StudentID, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submissionAfterError, err := repository.GetSubmission(ctx, instance.ID, submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedAfterError.Status != domain.TaskInstanceValidating || submissionAfterError.Status != domain.SubmissionValidating ||
+		len(submissionAfterError.ValidationRuns) != 1 || submissionAfterError.ValidationRuns[0].Status != domain.ValidationRunError {
+		t.Fatalf("ERROR must preserve validating state for retry: instance=%+v submission=%+v", loadedAfterError, submissionAfterError)
+	}
+	newRun := domain.ValidationRun{ID: testUUID(31), Status: domain.ValidationRunPending}
+	submission.ValidationRuns = append(submission.ValidationRuns, newRun)
+	if err := repository.CreateValidationRetry(ctx, submission, newRun); err != nil {
+		t.Fatal(err)
+	}
+	loadedSubmission, err := repository.GetSubmission(ctx, instance.ID, submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loadedSubmission.ValidationRuns) != 2 || loadedSubmission.ValidationRuns[1].ID != newRun.ID {
+		t.Fatalf("retry history = %+v", loadedSubmission.ValidationRuns)
+	}
+	validationInstance, validationSubmission, err = repository.GetValidationContextByRunID(ctx, run.ID)
+	if err != nil || validationInstance.ID != instance.ID || len(validationSubmission.ValidationRuns) != 2 || validationSubmission.ValidationRuns[1].ID != newRun.ID {
+		t.Fatalf("historical run context = (%+v, %+v, %v)", validationInstance, validationSubmission, err)
+	}
+
+	secondStartedAt := time.Now().UTC()
+	passed := domain.ValidationRun{ID: newRun.ID, Status: domain.ValidationRunPassed,
+		Outcome: domain.OutcomePass, StartedAt: timePtr(secondStartedAt), FinishedAt: timePtr(time.Now().UTC())}
+	if err := repository.SetRunRunning(ctx, newRun.ID, secondStartedAt); err != nil {
+		t.Fatal(err)
+	}
+	submission.ValidationRuns = []domain.ValidationRun{terminalRun, passed}
+	submission.Status = domain.SubmissionPassed
+	submission.CompletedAt = timePtr(time.Now().UTC())
+	loadedInstance.Status = domain.TaskInstanceFinalizing
+	loadedInstance.Steps[0].Status = "PASSED"
+	loadedInstance.Progress = domain.Progress{PassedSteps: 1, TotalSteps: 1, Percentage: 100}
+	loadedInstance.FinalSubmissionID = submission.ID
+	if err := repository.CompleteValidation(ctx, submission, passed, loadedInstance); err != nil {
+		t.Fatal(err)
+	}
+
+	loadedInstance.Status = domain.TaskInstanceCompleted
+	loadedInstance.CompletedAt = timePtr(time.Now().UTC())
+	evidence := json.RawMessage(`{"evidence_id":"` + submission.ID + `","submission_id":"` + submission.ID + `"}`)
+	if err := repository.CompleteInstanceAndEnqueueEvidence(ctx, loadedInstance, submission, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteInstanceAndEnqueueEvidence(ctx, loadedInstance, submission, evidence); err != nil {
+		t.Fatalf("idempotent completion replay failed: %v", err)
+	}
+	pending, err := repository.PendingEvidence(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].SubmissionID != submission.ID || !jsonEqual(pending[0].Payload, evidence) {
+		t.Fatalf("pending evidence = %+v, want exactly one immutable outbox item", pending)
+	}
+	if err := repository.MarkEvidenceDelivered(ctx, pending[0].ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.MarkEvidenceDelivered(ctx, pending[0].ID, time.Now().UTC()); err != nil {
+		t.Fatalf("delivery acknowledgement replay failed: %v", err)
+	}
+	remaining, err := repository.PendingEvidence(ctx, 10)
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("pending evidence after delivery = (%+v, %v)", remaining, err)
+	}
+}
+
+func TestPostgresConcurrentDistinctSubmitsCommitExactlyOneActiveSubmission(t *testing.T) {
+	repository, db := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	created, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Status = domain.TaskInstanceInProgress
+	created.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: "sandbox-1", Available: true}
+	if _, err := repository.SaveInstance(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+
+	intents := []domain.SubmitIntent{fixtureIntent(instance), fixtureIntent(instance)}
+	intents[0].IdempotencyKey, intents[0].SubmissionID, intents[0].ValidationRunID = testUUID(60), testUUID(62), testUUID(63)
+	intents[1].IdempotencyKey, intents[1].SubmissionID, intents[1].ValidationRunID = testUUID(61), testUUID(64), testUUID(65)
+	for index := range intents {
+		intents[index].CommandDigest = "sha256:" + strings.Repeat(fmt.Sprint(index+1), 64)
+	}
+	type result struct {
+		intent domain.SubmitIntent
+		err    error
+	}
+	results := make(chan result, len(intents))
+	var group sync.WaitGroup
+	for _, intent := range intents {
+		group.Add(1)
+		go func(intent domain.SubmitIntent) {
+			defer group.Done()
+			stored, _, err := repository.CreateOrLoadIntent(ctx, intent)
+			results <- result{intent: stored, err: err}
+		}(intent)
+	}
+	group.Wait()
+	close(results)
+	var winner *domain.SubmitIntent
+	conflicts := 0
+	for item := range results {
+		if item.err == nil {
+			copy := item.intent
+			winner = &copy
+		} else if errors.Is(item.err, domain.ErrConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected concurrent Submit error: %v", item.err)
+		}
+	}
+	if winner == nil || conflicts != 1 {
+		t.Fatalf("concurrent Submit winners=%+v conflicts=%d, want one durable intent", winner, conflicts)
+	}
+	winner.WriteLockID, winner.FenceEpoch, winner.Status = "lock-1", 2, "LOCKED"
+	if err := repository.SaveIntent(ctx, *winner); err != nil {
+		t.Fatal(err)
+	}
+	winner.Snapshot = domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: winner.SubmissionID, GenerationID: "generation-1", WorkspaceDigest: "sha256:" + strings.Repeat("e", 64)}
+	winner.Status = "FROZEN"
+	if err := repository.SaveIntent(ctx, *winner); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.ValidationRun{ID: winner.ValidationRunID, Status: domain.ValidationRunPending}
+	submission := fixtureSubmission(instance, *winner, run)
+	winner.Status = "COMMITTED"
+	if err := repository.CommitIntent(ctx, *winner, submission, run); err != nil {
+		t.Fatalf("commit winning Submission: %v", err)
+	}
+	items, _, err := repository.ListSubmissions(ctx, instance.ID, "", 10)
+	if err != nil || len(items) != 1 || items[0].ID != winner.SubmissionID {
+		t.Fatalf("durable submissions = (%+v, %v), want only winner", items, err)
+	}
+	var active int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM practice_submissions WHERE task_instance_id=$1 AND status IN ('VALIDATING','REVIEW_REQUIRED')`, instance.ID).Scan(&active); err != nil || active != 1 {
+		t.Fatalf("active durable submissions = (%d, %v), want exactly one", active, err)
+	}
+}
+
+func TestPostgresAssistanceReceiptIsIdempotentAndAppliedOnce(t *testing.T) {
+	repository, _ := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	created, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Status = domain.TaskInstanceInProgress
+	created.LearningActionID = testUUID(20)
+	created.AssistancePolicyVersion = "practice-task-assistance-policy.v1"
+	created, err = repository.SaveInstance(ctx, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := ports.AssistanceReceipt{Schema: "practice-task-assistance-usage.v1", UsageID: testUUID(50), StudentID: instance.StudentID,
+		TaskInstanceID: instance.ID, StepID: instance.Steps[0].ID, Kind: "HINT", HintLevel: 2,
+		PolicyVersion: created.AssistancePolicyVersion, OccurredAt: time.Now().UTC()}
+	digest := "sha256:" + strings.Repeat("4", 64)
+	updated, stored, createdReceipt, err := repository.RecordAssistance(ctx, created, receipt, digest)
+	if err != nil || !createdReceipt || stored != receipt || updated.HintsUsed != 1 || updated.MaxHintLevel == nil || *updated.MaxHintLevel != 2 {
+		t.Fatalf("first assistance write = (%+v, %+v, created=%v, err=%v)", updated, stored, createdReceipt, err)
+	}
+	replayed, stored, createdReceipt, err := repository.RecordAssistance(ctx, created, receipt, digest)
+	if err != nil || createdReceipt || stored != receipt || replayed.HintsUsed != 1 {
+		t.Fatalf("assistance replay = (%+v, %+v, created=%v, err=%v)", replayed, stored, createdReceipt, err)
+	}
+}
+
+func TestPostgresImmutableIntentSnapshotAndCurrentRunBinding(t *testing.T) {
+	repository, _ := openTestRepository(t)
+	ctx := context.Background()
+	instance := fixtureInstance()
+	created, _, err := repository.CreateOrLoadStart(ctx, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance.Version = created.Version
+	if _, err := repository.SaveInstance(ctx, instance); err != nil {
+		t.Fatal(err)
+	}
+	intent := fixtureIntent(instance)
+	if _, _, err := repository.CreateOrLoadIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intent.WriteLockID = "lock-immutable"
+	intent.FenceEpoch = 2
+	intent.Status = "LOCKED"
+	if err := repository.SaveIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intent.Snapshot = domain.SnapshotRef{SandboxID: "sandbox-1", SnapshotID: "snapshot-1", GenerationID: "generation-1", WorkspaceDigest: "sha256:" + strings.Repeat("e", 64)}
+	intent.Status = "FROZEN"
+	if err := repository.SaveIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intent.Snapshot.WorkspaceDigest = "sha256:" + strings.Repeat("f", 64)
+	if err := repository.SaveIntent(ctx, intent); err == nil {
+		t.Fatal("changed frozen snapshot was accepted")
+	}
+}
+
+func fixtureInstance() domain.TaskInstance {
+	return domain.TaskInstance{
+		Schema: domain.InstanceSchema, ID: testUUID(1), StudentID: testUUID(2), TaskRevisionID: testUUID(3),
+		TaskRevisionDigest: "sha256:" + strings.Repeat("a", 64), Status: domain.TaskInstanceStarting,
+		SurfaceClassification: "practice", Locale: "en", SolutionVariantID: testUUID(5), Steps: []domain.Step{{ID: testUUID(4), Title: "Step", Required: true,
+			Status: "AVAILABLE", Targets: []domain.Target{{Type: "concept", Key: "loops", Version: "v1"}},
+			ValidationContract: json.RawMessage(`{"suite":"private"}`), EvaluationAssets: domain.EvaluationAssets{TestSuiteRef: "asset://suite"},
+			RuntimeProfile: json.RawMessage(`{"code_structure_type_code":"react","compose_config":{}}`),
+			StarterFiles:   []domain.WorkspaceFile{{Path: "src/main.ts", Content: "private starter"}}}},
+		StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(), StartCommandDigest: "sha256:" + strings.Repeat("b", 64),
+		Progress:        domain.Progress{TotalSteps: 1},
+		RevisionSummary: domain.RevisionSummary{Schema: "practice-task-revision-summary.v2", RevisionID: testUUID(3), Digest: "sha256:" + strings.Repeat("a", 64), VariantID: testUUID(5)},
+		RevisionEnvelope: domain.RevisionEnvelope{Schema: "practice-task-execution-envelope.v1", Revision: domain.RevisionMetadata{ID: testUUID(3), RevisionNumber: 1},
+			RevisionDigestSchema: domain.RevisionDigestV1, RevisionDigest: "sha256:" + strings.Repeat("a", 64),
+			RuntimeContext: json.RawMessage(`{"runtime":"frozen"}`), EvaluationContext: json.RawMessage(`{"private":"criteria"}`)},
+	}
+}
+
+func fixtureIntent(instance domain.TaskInstance) domain.SubmitIntent {
+	return domain.SubmitIntent{TaskInstanceID: instance.ID, StudentID: instance.StudentID, IdempotencyKey: testUUID(10),
+		CommandDigest: "sha256:" + strings.Repeat("c", 64), SubmissionID: testUUID(11), ValidationRunID: testUUID(12),
+		Scope: "FINAL", ValidationContractDigest: "sha256:" + strings.Repeat("d", 64),
+		ValidationSpecification: json.RawMessage(`{"schema":"practice-validation-specification.v1"}`), Status: "INTENT", CreatedAt: time.Now().UTC(),
+	}
+}
+
+func fixtureSubmission(instance domain.TaskInstance, intent domain.SubmitIntent, run domain.ValidationRun) domain.Submission {
+	return domain.Submission{Schema: domain.SubmissionSchema, ID: intent.SubmissionID, TaskInstanceID: instance.ID, StudentID: instance.StudentID,
+		Scope: intent.Scope, Snapshot: intent.Snapshot, WorkspaceDigest: intent.Snapshot.WorkspaceDigest, Status: domain.SubmissionValidating,
+		ValidationRuns: []domain.ValidationRun{run}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		ValidationSpecification: intent.ValidationSpecification, ValidationContractDigest: intent.ValidationContractDigest,
+		RevisionDigest: instance.TaskRevisionDigest, IdempotencyKey: intent.IdempotencyKey, CommandDigest: intent.CommandDigest}
+}
+
+func testUUID(n int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012x", n) }
+
+func timePtr(value time.Time) *time.Time { return &value }
+
+func jsonEqual(left, right json.RawMessage) bool {
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+var _ ports.Repository = (*Repository)(nil)
+
+// TestPostgresSubmitWithRealSandboxHTTP is launched only by the serialized T05
+// harness after it has seeded four owned Sandbox workspaces. The Workspace port
+// is the production HTTP client; fault injection only stops local SaveIntent
+// after a successful provider response, leaving PostgreSQL as restart state.
+func TestPostgresSubmitWithRealSandboxHTTP(t *testing.T) {
+	baseURL, token := os.Getenv("T05_SANDBOX_URL"), os.Getenv("T05_INTERNAL_TOKEN")
+	fixturePath := os.Getenv("T05_RUNTIME_PROVIDER_FIXTURE_FILE")
+	if baseURL == "" || token == "" || fixturePath == "" {
+		t.Skip("T05 serialized real Sandbox HTTP fixture is not configured")
+	}
+	var providerFixture struct {
+		Fixtures []struct {
+			SandboxID       string `json:"sandbox_id"`
+			TaskInstanceID  string `json:"task_instance_id"`
+			StudentID       string `json:"student_id"`
+			GenerationID    string `json:"generation_id"`
+			WorkspaceDigest string `json:"workspace_digest"`
+		} `json:"fixtures"`
+	}
+	fixtureJSON, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(fixtureJSON, &providerFixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(providerFixture.Fixtures) < 4 {
+		t.Fatal("T05 fixture requires four owned Sandbox bindings")
+	}
+	for fixtureIndex, scenario := range []struct {
+		name         string
+		base         int
+		cut          string
+		legacyLocked bool
+	}{
+		{name: "ordinary", base: 0x100},
+		{name: "after-lock", base: 0x110, cut: "LOCKED"},
+		{name: "after-freeze", base: 0x120, cut: "FROZEN"},
+		{name: "legacy-locked", base: 0x130, legacyLocked: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			repository, db := openTestRepository(t)
+			ctx := context.Background()
+			fixture := providerFixture.Fixtures[fixtureIndex]
+			instance := fixtureInstance()
+			instance.ID, instance.StudentID = fixture.TaskInstanceID, fixture.StudentID
+			instance.TaskRevisionID = testUUID(scenario.base + 3)
+			instance.SolutionVariantID = testUUID(scenario.base + 5)
+			instance.RevisionSummary.RevisionID, instance.RevisionSummary.VariantID = instance.TaskRevisionID, instance.SolutionVariantID
+			instance.RevisionEnvelope.Revision.ID = instance.TaskRevisionID
+			instance.Steps[0].ID, instance.Steps[0].Status = testUUID(scenario.base+4), "CHECKPOINTED"
+			instance.Progress = domain.Progress{PassedSteps: 1, TotalSteps: 1, Percentage: 100}
+			created, _, err := repository.CreateOrLoadStart(ctx, instance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created.Status = domain.TaskInstanceInProgress
+			created.Provisioning = domain.ProvisioningReceipts{StudentReserved: true, RouteResolved: true, WorkspaceCreated: true, StudentOpened: true}
+			created.LearningActionID = testUUID(scenario.base + 20)
+			created.WorkspaceBinding = domain.WorkspaceBinding{Schema: "practice-workspace-binding.v2", SandboxID: fixture.SandboxID, Available: true}
+			instance, err = repository.SaveInstance(ctx, created)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := domain.SubmitCommand{StudentID: instance.StudentID, TaskInstanceID: instance.ID, IdempotencyKey: testUUID(scenario.base + 10), Scope: "FINAL"}
+			submissionID, runID := testUUID(scenario.base+11), testUUID(scenario.base+12)
+			observedHTTP := &http.Client{Timeout: 10 * time.Second, Transport: submitLockObservationTransport{t: t, next: http.DefaultTransport}}
+			workspace := adapters.NewSandboxHTTPClient(baseURL, token, observedHTTP)
+			if scenario.legacyLocked {
+				spec, contractDigest, err := domain.BuildValidationSpecification(instance, command.Scope, command.MilestoneID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				digest, err := domain.CommandDigest(command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				intent := domain.SubmitIntent{TaskInstanceID: instance.ID, StudentID: instance.StudentID, IdempotencyKey: command.IdempotencyKey, CommandDigest: digest,
+					SubmissionID: submissionID, ValidationRunID: runID, Scope: "FINAL", ValidationContractDigest: contractDigest, ValidationSpecification: encoded, Status: "INTENT", CreatedAt: time.Now().UTC()}
+				intent, _, err = repository.CreateOrLoadIntent(ctx, intent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lock, err := workspace.LockWrites(ctx, ports.LockWorkspaceWrites{SandboxID: instance.WorkspaceBinding.SandboxID, RequestID: submissionID, SubmissionID: submissionID, Mode: "TEMPORARY"})
+				if err != nil {
+					t.Fatalf("legacy LOCK receipt: %v", err)
+				}
+				intent.Status, intent.WriteLockID, intent.FenceEpoch = "LOCKED", lock.LockID, lock.FenceEpoch
+				if err := repository.SaveIntent(ctx, intent); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				ids := []string{submissionID, runID}
+				fault := &submitSaveCutRepository{Repository: repository, status: scenario.cut}
+				runtime := usecase.Runtime{Repository: fault, Workspace: workspace, NewID: func() string { id := ids[0]; ids = ids[1:]; return id }}
+				_, status, err := runtime.Submit(ctx, command)
+				if scenario.cut == "" {
+					if err != nil || status != 202 {
+						t.Fatalf("official submit: status=%d err=%v", status, err)
+					}
+				} else {
+					if err == nil || status != 503 || !fault.triggered {
+						t.Fatalf("cut after %s: status=%d err=%v triggered=%v", scenario.cut, status, err, fault.triggered)
+					}
+					intent, err := NewRepository(db).GetIntent(ctx, instance.ID, command.IdempotencyKey)
+					want := "INTENT"
+					if scenario.cut == "FROZEN" {
+						want = "LOCKED"
+					}
+					if err != nil || intent.Status != want {
+						t.Fatalf("durable cut state: %+v err=%v", intent, err)
+					}
+				}
+			}
+			// Both process-local Runtime state and repository wrappers are dropped.
+			restarted := usecase.Runtime{Repository: NewRepository(db), Workspace: adapters.NewSandboxHTTPClient(baseURL, token, observedHTTP),
+				NewID: func() string { t.Fatal("recovery generated another identity"); return "" }}
+			submission, status, err := restarted.Submit(ctx, command)
+			if err != nil || status != 202 || submission.ID != submissionID || len(submission.ValidationRuns) != 1 || submission.ValidationRuns[0].ID != runID {
+				t.Fatalf("restart same-key recovery: status=%d err=%v submission=%+v", status, err, submission)
+			}
+			intent, err := NewRepository(db).GetIntent(ctx, instance.ID, command.IdempotencyKey)
+			if err != nil || intent.Status != "COMMITTED" || intent.WriteLockID != submissionID || intent.Snapshot != submission.Snapshot {
+				t.Fatalf("exact committed intent: %+v err=%v", intent, err)
+			}
+			persistedInstance, err := NewRepository(db).GetInstance(ctx, instance.StudentID, instance.ID)
+			if err != nil || persistedInstance.Status != domain.TaskInstanceValidating || persistedInstance.CurrentSubmissionID != submissionID {
+				t.Fatalf("atomic instance/submission/run commit: status=%s submission=%s err=%v", persistedInstance.Status, persistedInstance.CurrentSubmissionID, err)
+			}
+			pinned, err := workspace.ReadPinnedSnapshot(ctx, submission.Snapshot)
+			if err != nil || pinned.Ref != submission.Snapshot || len(pinned.Files) != 1 || pinned.Files[0].Path != "answer.txt" || pinned.Files[0].Content != "synthetic immutable protocol proof\n" || submission.Snapshot.GenerationID != fixture.GenerationID || submission.Snapshot.WorkspaceDigest != fixture.WorkspaceDigest {
+				t.Fatalf("retained exact source pin: %+v err=%v", pinned, err)
+			}
+			replayed, status, err := restarted.Submit(ctx, command)
+			if err != nil || status != 202 || replayed.ID != submission.ID || replayed.Snapshot != submission.Snapshot {
+				t.Fatalf("committed replay: status=%d err=%v", status, err)
+			}
+			changed := command
+			changed.Scope, changed.MilestoneID = "MILESTONE", instance.Steps[0].ID
+			if _, status, err := restarted.Submit(ctx, changed); status != 409 || !errors.Is(err, domain.ErrIdempotency) {
+				t.Fatalf("changed-payload replay: status=%d err=%v", status, err)
+			}
+			var submissions, runs, intents int
+			if err := db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM practice_submissions WHERE task_instance_id=$1), (SELECT count(*) FROM practice_validation_runs WHERE task_instance_id=$1), (SELECT count(*) FROM practice_submit_intents WHERE task_instance_id=$1)`, instance.ID).Scan(&submissions, &runs, &intents); err != nil {
+				t.Fatal(err)
+			}
+			if submissions != 1 || runs != 1 || intents != 1 {
+				t.Fatalf("durable row counts: submissions=%d runs=%d intents=%d", submissions, runs, intents)
+			}
+		})
+	}
+}
+
+type submitSaveCutRepository struct {
+	ports.Repository
+	status    string
+	triggered bool
+}
+
+func (repository *submitSaveCutRepository) SaveIntent(ctx context.Context, intent domain.SubmitIntent) error {
+	if repository.status != "" && intent.Status == repository.status {
+		repository.status, repository.triggered = "", true
+		return errors.New("injected process stop before saving provider receipt")
+	}
+	return repository.Repository.SaveIntent(ctx, intent)
+}
+
+// This transport forwards to the real provider unchanged. Its diagnostics are
+// restricted to the frozen LOCK response identity fields; request headers,
+// tokens, source content, and other provider responses are never logged.
+type submitLockObservationTransport struct {
+	t    *testing.T
+	next http.RoundTripper
+}
+
+func (transport submitLockObservationTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.next.RoundTrip(request)
+	if err != nil || request.Method != http.MethodPost || !strings.HasSuffix(request.URL.Path, "/write-lock") {
+		return response, err
+	}
+	payload, readErr := io.ReadAll(io.LimitReader(response.Body, (128<<10)+1))
+	_ = response.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	response.Body = io.NopCloser(bytes.NewReader(payload))
+	if len(payload) > 128<<10 {
+		transport.t.Logf("actual LOCK HTTP status=%d response exceeds diagnostic limit", response.StatusCode)
+		return response, nil
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil {
+		transport.t.Logf("actual LOCK HTTP status=%d non-JSON response", response.StatusCode)
+		return response, nil
+	}
+	filtered := map[string]json.RawMessage{}
+	for _, key := range []string{"schema", "sandbox_id", "task_instance_id", "request_id", "lock_id", "mode", "submission_id", "fence_epoch", "permanent", "locked"} {
+		if value, exists := fields[key]; exists {
+			filtered[key] = value
+		}
+	}
+	encoded, _ := json.Marshal(filtered)
+	transport.t.Logf("actual LOCK HTTP status=%d identity fields=%s", response.StatusCode, encoded)
+	return response, nil
+}

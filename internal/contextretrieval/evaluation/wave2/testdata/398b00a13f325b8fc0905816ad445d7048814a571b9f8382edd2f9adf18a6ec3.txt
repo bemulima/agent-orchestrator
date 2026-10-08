@@ -1,0 +1,161 @@
+package usecase
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+)
+
+func (runtime *Runtime) Cancel(ctx context.Context, studentID, instanceID, idempotencyKey, reason string) (domain.TaskInstance, int, error) {
+	studentID, instanceID, idempotencyKey, reason = strings.TrimSpace(studentID), strings.TrimSpace(instanceID), strings.TrimSpace(idempotencyKey), strings.TrimSpace(reason)
+	if !domain.IsCanonicalUUID(studentID) || !domain.IsCanonicalUUID(instanceID) || !domain.IsCanonicalUUID(idempotencyKey) || reason != "student_cancelled" {
+		return domain.TaskInstance{}, 0, domain.ErrInvalid
+	}
+	commandDigest, err := domain.CommandDigest(struct {
+		StudentID, TaskInstanceID, Reason string
+	}{studentID, instanceID, reason})
+	if err != nil {
+		return domain.TaskInstance{}, 0, err
+	}
+	unlock := runtime.lockInstance(instanceID)
+	defer unlock()
+	instance, err := runtime.Repository.GetInstance(ctx, studentID, instanceID)
+	if err != nil {
+		return domain.TaskInstance{}, statusFor(err), err
+	}
+	if instance.Status == domain.TaskInstanceCancelled {
+		return instance.PublicProjection(), 200, nil
+	}
+	if instance.Status != domain.TaskInstanceStarting && instance.Status != domain.TaskInstanceInProgress {
+		return domain.TaskInstance{}, 409, domain.ErrConflict
+	}
+	if instance.WorkspaceBinding.SandboxID != "" {
+		lock, lockErr := runtime.Workspace.LockWrites(ctx, ports.LockWorkspaceWrites{SandboxID: instance.WorkspaceBinding.SandboxID,
+			RequestID: idempotencyKey, Mode: "PERMANENT"})
+		if lockErr != nil || lock.LockID == "" || !lock.Permanent {
+			return domain.TaskInstance{}, 503, domain.ErrDependency
+		}
+	}
+	if instance.Provisioning.StudentReserved && instance.LearningActionID != "" {
+		binding, cancelErr := runtime.Student.CancelProvisioning(ctx, ports.CancelLearningAction{StudentID: instance.StudentID,
+			TaskInstanceID: instance.ID, LearningActionID: instance.LearningActionID, Reason: reason})
+		if cancelErr != nil || !validCancelledLearningAction(binding, instance) {
+			return domain.TaskInstance{}, 503, domain.ErrDependency
+		}
+	}
+	instance.Status = domain.TaskInstanceCancelled
+	instance.UpdatedAt = runtime.now()
+	instance, err = runtime.Repository.SaveInstance(ctx, instance)
+	if err != nil {
+		return domain.TaskInstance{}, statusFor(err), err
+	}
+	if _, err := runtime.Repository.CreateOrLoadCommandReceipt(ctx, idempotencyKey, instance.ID, "cancel", commandDigest); err != nil {
+		return domain.TaskInstance{}, statusFor(err), err
+	}
+	return instance.PublicProjection(), 200, nil
+}
+
+func validCancelledLearningAction(binding ports.LearningActionBinding, instance domain.TaskInstance) bool {
+	return domain.IsCanonicalUUID(binding.LearningActionID) && binding.LearningActionID == instance.LearningActionID &&
+		binding.StudentID == instance.StudentID && binding.TaskInstanceID == instance.ID && binding.TaskRevisionID == instance.TaskRevisionID &&
+		binding.TaskRevisionDigest == instance.TaskRevisionDigest && binding.SurfaceClassification == instance.SurfaceClassification &&
+		binding.LifecycleStatus == "CANCELLED" && sameTargets(binding.LearningTargets, uniqueTargets(instance.Steps))
+}
+
+func (runtime *Runtime) Review(ctx context.Context, instanceID, submissionID, reviewerID, decision, feedback string) (domain.Submission, int, error) {
+	if !domain.IsCanonicalUUID(instanceID) || !domain.IsCanonicalUUID(submissionID) || !domain.IsCanonicalUUID(reviewerID) ||
+		(decision != "APPROVE" && decision != "CHANGES_REQUESTED") || !validReviewFeedback(feedback) {
+		return domain.Submission{}, 0, domain.ErrInvalid
+	}
+	feedback = strings.TrimSpace(feedback)
+	unlock := runtime.lockInstance(instanceID)
+	defer unlock()
+	instance, err := runtime.Repository.GetInstanceByID(ctx, instanceID)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	submission, err := runtime.Repository.GetSubmission(ctx, instanceID, submissionID)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	if submission.HumanReview != nil {
+		if submission.HumanReview.ReviewerID == reviewerID && submission.HumanReview.Decision == decision && submission.HumanReview.Feedback == feedback {
+			if decision == "APPROVE" && instance.Status == domain.TaskInstanceInReview {
+				return runtime.completeApprovedReview(ctx, instance, submission)
+			}
+			return submission.PublicProjection(), 200, nil
+		}
+		return domain.Submission{}, 409, domain.ErrConflict
+	}
+	if instance.Status != domain.TaskInstanceInReview || instance.FinalSubmissionID != submission.ID || submission.Scope != "FINAL" || submission.Status != domain.SubmissionReviewRequired {
+		return domain.Submission{}, 409, domain.ErrConflict
+	}
+	now := runtime.now()
+	receipt := &domain.HumanReviewReceipt{ReviewerID: reviewerID, Decision: decision, Feedback: feedback, ReviewedAt: now}
+	submission.HumanReview = receipt
+	submission.UpdatedAt = now
+	instance.UpdatedAt = now
+	if decision == "CHANGES_REQUESTED" {
+		if err := runtime.unlockSubmission(ctx, submission, deterministicUUID(submission.ID, "review-changes-requested")); err != nil {
+			return domain.Submission{}, 503, err
+		}
+		submission.Status = domain.SubmissionChangesRequested
+		instance.Status = domain.TaskInstanceInProgress
+		if err := runtime.Repository.SaveReview(ctx, submission, instance, reviewerID, decision); err != nil {
+			return domain.Submission{}, statusFor(err), err
+		}
+		return submission.PublicProjection(), 200, nil
+	}
+	return runtime.completeApprovedReview(ctx, instance, submission)
+}
+
+func (runtime *Runtime) completeApprovedReview(ctx context.Context, instance domain.TaskInstance, submission domain.Submission) (domain.Submission, int, error) {
+	if instance.Status != domain.TaskInstanceInReview || submission.Status != domain.SubmissionReviewRequired || submission.HumanReview == nil || submission.HumanReview.Decision != "APPROVE" {
+		return domain.Submission{}, 409, domain.ErrConflict
+	}
+	now := runtime.now()
+	permanentLock, err := runtime.Workspace.LockWrites(ctx, ports.LockWorkspaceWrites{SandboxID: instance.WorkspaceBinding.SandboxID,
+		RequestID: deterministicUUID(submission.ID, "review-approved"), Mode: "PERMANENT", SubmissionID: submission.ID})
+	if err != nil || permanentLock.LockID == "" || !permanentLock.Permanent {
+		return domain.Submission{}, 503, domain.ErrDependency
+	}
+	submission.Status = domain.SubmissionPassed
+	instance.Status = domain.TaskInstanceCompleted
+	instance.FinalSubmissionID = submission.ID
+	instance.CompletedAt = &now
+	instance.UpdatedAt = now
+	payload, err := passedEvidencePayload(instance, submission, now)
+	if err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	if err := runtime.Repository.CompleteInstanceAndEnqueueEvidence(ctx, instance, submission, payload); err != nil {
+		return domain.Submission{}, statusFor(err), err
+	}
+	return submission.PublicProjection(), 200, nil
+}
+
+func validReviewFeedback(value string) bool {
+	if len(value) > 4000 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 && character != '\n' && character != '\r' && character != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func deterministicUUID(namespace, name string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + name))
+	value := append([]byte(nil), sum[:16]...)
+	value[6] = value[6]&0x0f | 0x50
+	value[8] = value[8]&0x3f | 0x80
+	hexValue := hex.EncodeToString(value)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hexValue[:8], hexValue[8:12], hexValue[12:16], hexValue[16:20], hexValue[20:])
+}

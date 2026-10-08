@@ -1,0 +1,103 @@
+# Operations and recovery
+
+## Safe checks and approval gates
+
+Run commands declared in `.ai/commands.yaml`. `policy`, `format_check`, `unit_test`, `vet`, and `build` are intended to be offline and must not connect to PostgreSQL or external services. The unit suite is limited to domain, application, and HTTP adapter packages. `postgres_integration`, `run`, `migrate_up`, and `migrate_down` are approval-required. Migration task names are placeholders until the serialized integration work adds and documents the runner.
+
+## Retry behavior
+
+- Start retries resume provisioning from durable receipts and keep the original revision projection and TaskInstance ID.
+- A Submit timeout is ambiguous. Query the TaskInstance and Submission history, then replay the same scoped key and normalized request.
+- An unfinished Submit recovers only when that exact `(task_instance_id, idempotency_key)` and normalized command are retried. The durable intent retains its Submission and ValidationRun IDs. `INTENT` replays LOCK, `LOCKED` replays FREEZE, and `FROZEN` reads its retained exact snapshot before the local commit. A restart discards process-local locks but does not allocate replacement identities. There is no autonomous pending-intent scanner; recovery requires the same Submit retry.
+- LOCK and FREEZE both keep the intent's Submission ID on the frozen V2 wire. Sandbox separates the FREEZE receipt internally from LOCK/UNLOCK receipts. Matching older LOCK receipts and retained FREEZE receipts remain replayable, and freezing preserves the active temporary lock ID. A changed scope or milestone under the same Submit key conflicts.
+- A cancelled instance or an aborted intent rejects unfinished recovery before Workspace effects. An already committed intent still returns its original Submission on replay.
+- A validation `ERROR` leaves the Submission `VALIDATING`; a new ValidationRun can retry only the same Submission, snapshot, and contract digest.
+- A missing, corrupt, or digest-mismatched snapshot is an evaluation `ERROR`; never read the current workspace instead.
+- A Sandbox bootstrap generation has revision `0`. Freeze and pinned-content responses must explicitly include a numeric revision; `0` is valid, while an omitted, null, negative, or incorrectly typed revision is rejected. The generation ID, snapshot identity, content digest, file count, and pin timestamp must still match.
+- Student evidence delivery retries the outbox item with the same final Submission ID. It cannot reverse an already committed Practice completion.
+
+## Durable Student evidence recovery
+
+Apply migration `004_practice_evidence_delivery_recovery.up.sql` before running the recovery worker. The outbox keeps its immutable evidence/submission identity and exact original payload. `student_id` comes from the persisted TaskInstance relation, and dispatch requires that owner to match the payload before calling Student. Runtime acknowledges delivery only after the exact accepted Student receipt matches schema, evidence ID, LearningAction ID and `student-mastery-v1` policy.
+
+Technical failures increment durable `attempts` and record `last_attempt_at`, `next_attempt_at` and a fixed `last_failure_code`. The codes are `EVIDENCE_PAYLOAD_INVALID`, `EVIDENCE_IDENTITY_MISMATCH`, `EVIDENCE_PROVIDER_UNAVAILABLE`, `EVIDENCE_RECEIPT_MISMATCH` and `EVIDENCE_DELIVERY_MARKER`. Raw provider errors and response bodies are not stored in this metadata or dispatch summaries. Retry delay doubles from 2 seconds up to 5 minutes; it does not declare a permanent failure or change learner state. A lost response after Student commits replays the same evidence ID and payload. Failure bookkeeping arriving after delivery is a no-op and cannot revive an acknowledged row.
+
+Pending selection admits only the earliest undelivered `(created_at,id)` fact for each persisted student, including an earlier fact whose retry is delayed. Independent student heads are ordered by their last attempt time, falling back to creation time, before applying the dispatch limit. Thus an unrelated student can progress even with `limit=1`, while a poisoned student head retains conservative FIFO over that student's mastery/path aggregate. Dispatch records and summarizes per-message failures and continues unrelated messages. Cancellation of the dispatch context or inability to persist failure metadata stops the batch. A provider's local timeout remains a per-message delivery failure while the dispatch context is live.
+
+A poisoned fact remains pending and observable; the worker never changes its payload, deletes it, fabricates acceptance, or applies a skip, repair or DLQ policy. Query all undelivered rows and their retry metadata when investigating a poison; an eligibility query alone omits delayed heads. Migration 004 down removes only its new scheduling columns and retry index. Existing facts, original attempts counters, completion state, delivery timestamps and immutable-payload trigger survive. Reapplying up initializes removed metadata to null, so undelivered facts become immediately eligible again while the original attempt count remains. Use the compatible worker version when rolling back the schema.
+
+`TestT11Postgres*` integration tests exercise real PostgreSQL in random disposable schemas, including repository reconstruction, eligible-poison fairness at limit 1, delayed-head FIFO, bounded retry and actual 004 up/down/up preservation. Their completion facts, Sandbox bindings and validator results are explicitly synthetic delivery fixtures, not a full learner-chain proof. The separately registered real Student HTTP/provider proof verifies genuine Student commit followed by an injected response loss and exact evidence replay; no provider acceptance is invented for that proof. Both require the owned proof configuration and declared integration approval.
+
+## Explicit learning commands
+
+Workspace GET projects persisted state without reconciling readiness or materializing content. Readiness reconciliation and materialization remain explicit commands for the exact frozen instance, revision and step. Materialization consumes the `learning_route.steps` array retained from Planner ResolveRoute, preserving each material key, generation key and target in requirement order. A whole-route object, null, malformed material identity or absent step fails closed; the consumer does not wrap stored data or select a different step. Materialization does not decide readiness or official results.
+
+The opt-in `TestT08WorkspaceHTTPProvider` and Course `TestT08GeneratedCourseHTTPProvider` integration harnesses expose registered HTTP handlers backed by real PostgreSQL for a serialized owned proof. Runtime obtains and persists the actual Planner route before serving commands. Root separately migrates an isolated Course database and seeds its `QUIZ_TEXT_BASIC` reference. Each harness writes safe ready metadata, waits for its explicit stop file, and records persisted receipt counts; tokens stay in process environment only. Without the explicit fixture configuration, these tests skip. The frozen instance and actor, Student mastery source, and deterministic content generator are named fixtures. Start, Sandbox, Teacher, validators and NATS delivery are outside this proof.
+
+## Result meanings
+
+`PASS` means all required semantic criteria ran and passed. `FAIL` means required semantic criteria ran and at least one failed. `ERROR` means the authoritative evaluation could not be completed, including timeouts, unavailable dependencies, protocol/digest problems, unsupported configuration, snapshot failures, and stage execution errors. Optional semantic failures do not block a result when all required criteria pass; execution errors still produce `ERROR`.
+
+## Data handling
+
+Public and Teacher DTOs contain only bounded, sanitized summaries. Never log or return private evaluation context, test assets, credentials, workspace source, or raw validator output. A Submission's snapshot reference and digest are immutable audit data; keep referenced Sandbox generations retained for the life of their pin.
+
+## Student NBA integration proof
+
+The existing PostgreSQL integration entrypoint remains
+`go test -tags=integration ./internal/infrastructure/persistence/...`. With an
+explicit disposable `PRACTICE_RUNTIME_TEST_DATABASE_URL`, the existing cross-service
+completion fixture (`PRACTICE_COMPLETION_FIXTURE`, `PRACTICE_COMPLETION_STUDENT_URL`,
+`PRACTICE_COMPLETION_STUDENT_TOKEN`) also verifies Student's authoritative NBA when
+`PRACTICE_COMPLETION_NBA_ENABLED=true`. Configure the Student process to call the
+proof Runtime listener (`PRACTICE_COMPLETION_RUNTIME_LISTEN`) using the proof's
+Runtime internal token `proof-runtime`. These values are disposable test settings.
+This proof exercises Runtime PostgreSQL and HTTP, Student HTTP and learner state,
+validation failure/retry/wait, stale command rejection, completion/outbox, and
+recalculated next-item NBA. Its explicit Catalog/Planner/Sandbox/Validator doubles
+do not constitute live proof of those provider services. Runtime process and
+database commands remain subject to the repository's declared approval gates.
+
+## Real Submit protocol integration proof
+
+`go test -tags=integration ./internal/infrastructure/persistence/postgres -run '^TestPostgresSubmitWithRealSandboxHTTP$' -count=1 -v` is a separately approved integration test. The serialized harness supplies an owned disposable `PRACTICE_RUNTIME_TEST_DATABASE_URL`, `T05_SANDBOX_URL`, an ephemeral `T05_INTERNAL_TOKEN`, and `T05_RUNTIME_PROVIDER_FIXTURE_FILE`. The fixture file contains synthetic Sandbox bindings and immutable genesis generation/digest references; it contains no credentials. The test creates and drops only its own random PostgreSQL schemas.
+
+This test uses Runtime Submit, the production Sandbox HTTP client, and PostgreSQL. Its provider harness registers actual Sandbox private HTTP handlers backed by Tarantool receipts and S3 object storage. It covers ordinary submission, restart after LOCK or FREEZE before the corresponding intent save, an older persisted LOCKED intent, exact pin/identity replay, changed payload conflict, and one durable intent/Submission/ValidationRun. Fault injection stops only the local intent save after the real provider response. The preseeded Sandbox binding/genesis fixture does not exercise production Start, runtime containers, validators, or a full platform journey. Without the explicit fixture configuration, this test skips; compilation or a skipped run does not verify integration.
+
+## Durable safe validation feedback
+
+Runtime persists `safe_summary` inside the existing ValidationRun JSON payload in the same official transition transaction. This needs no migration. The accepted run identity, outcome and known technical classification remain authoritative. Each summary contains at most 100 stages and 100 issues per stage; technical identifiers are limited to 128 ASCII identifier characters, with invalid values replaced by fixed placeholders. Every provider issue message is replaced by a fixed learner-safe message. Raw validator text, private criteria, evaluation assets and workspace files are not retained in this summary.
+
+Public Submission projections remove `safe_summary` from every historical `validation_runs` entry and derive the existing optional `current_validation_summary` only from the latest terminal run with matching ID, outcome and classification. A pending or running retry has no current explanation even though prior safe run payloads remain durable. A legacy run with no persisted summary stays unavailable; Runtime does not backfill or fabricate stages. New Submissions cannot inherit previous Submission feedback.
+
+Teacher reads the exact current owned Submission and its safe persisted summary. The existing `practice-task-teacher-validation-context.v1` envelope contains `teacher-validation-explanation.v1`, a deterministic digest of safe current content, and at most five unique required semantic FAIL issues. PASS has no blocking issues; optional failures do not block PASS. ERROR supplies one known technical classification with a fixed technical message and no learner-failure stage. A FAIL with no retained required semantic issues remains explicitly unavailable. Teacher-context counts use the retained stage count and retained issue count; an ERROR with no stage issues counts its known top-level technical error once. Terminal feedback is immutable along with the official run.
+
+`TestT12PostgresSafeFeedbackSurvivesRestartRetryAndNewSubmission` is an opt-in PostgreSQL persistence test using a random disposable schema via `PRACTICE_RUNTIME_TEST_DATABASE_URL`. It covers accepted ERROR/retry/FAIL, repository and Runtime reconstruction, immutable historical feedback, owner isolation and new Submission PASS. Its providers are explicit synthetic persistence fixtures; it is not live Sandbox or validation-provider proof. Root serializes its actual database run separately from the registered HTTP provider proof.
+
+## Durable Teacher assistance replay
+
+An owned exact `usage_id` replay returns its original assistance receipt before
+current lifecycle, action, step and hint-cap guards. The stable command consists
+only of the frozen caller schema, usage, student, instance, step, kind and hint
+level. Timestamp and policy belong to the first committed server receipt. A
+reconstructed Runtime or advanced server clock cannot change either, counters,
+version, lifecycle or later evidence. Changed stable input conflicts; the current
+instance owner is checked before receipt lookup and again under the transaction
+lock before a racing replay. The frozen Teacher HTTP request and response stay
+unchanged.
+
+New facts require `IN_PROGRESS`, a bound LearningAction, a frozen step and, for
+hints, fewer than 1000 prior hints. PostgreSQL rechecks these guards under the
+instance lock, stores one receipt and increments counters/version once. Exact
+committed replay remains available during review, completion and cancellation;
+this does not authorize any new post-lifecycle assistance.
+
+`TestT13PostgresAssistanceHTTPReplay` and
+`TestT13PostgresAssistanceHTTPConcurrentRuntimeObjects` use the registered Runtime
+HTTP handlers and real PostgreSQL in isolated random schemas. They cover clock
+advance, lifecycle changes, repository reconstruction, actor/token/payload
+rejection, concurrent Runtime objects and hint-cap races. Their revision/action
+and lifecycle setup are explicit persistence fixtures, not proof of Start,
+Student, Sandbox or validators. They require the approved disposable
+`PRACTICE_RUNTIME_TEST_DATABASE_URL`; an unconfigured or skipped run is not
+integration verification. No Runtime migration is needed for receipt replay.

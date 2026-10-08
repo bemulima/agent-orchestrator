@@ -1,0 +1,189 @@
+package handlers
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/projectauthoring"
+	"github.com/go-chi/chi/v5"
+)
+
+const maximumProjectAuthoringCommandBytes int64 = 16 << 10
+
+type ProjectAuthoringHandler struct{ Commands projectauthoring.Commands }
+
+func (handler ProjectAuthoringHandler) Create(writer http.ResponseWriter, request *http.Request) {
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	pathID := strings.TrimSpace(chi.URLParam(request, "pathID"))
+	key := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+	if !canonicalHandlerUUID(studentID) || !canonicalHandlerUUID(pathID) || !canonicalHandlerUUID(key) {
+		writeDiagnosticError(writer, domain.ErrMalformed)
+		return
+	}
+	var input domain.ProjectAuthoringCreateRequestV1
+	if err := decodeProjectAuthoringCommand(writer, request, &input); err != nil {
+		writeDiagnosticError(writer, err)
+		return
+	}
+	flow, created, err := handler.Commands.Create(request.Context(), studentID, pathID, key, input)
+	if err != nil {
+		writeDiagnosticError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeDiagnosticJSON(writer, status, projectAuthoringProjection(flow))
+}
+
+func (handler ProjectAuthoringHandler) Get(writer http.ResponseWriter, request *http.Request) {
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	flowID := strings.TrimSpace(chi.URLParam(request, "flowID"))
+	if !canonicalHandlerUUID(studentID) || !canonicalHandlerUUID(flowID) {
+		writeDiagnosticError(writer, domain.ErrMalformed)
+		return
+	}
+	flow, err := handler.Commands.Get(request.Context(), studentID, flowID)
+	if err != nil {
+		writeDiagnosticError(writer, err)
+		return
+	}
+	writeDiagnosticJSON(writer, http.StatusOK, projectAuthoringProjection(flow))
+}
+
+func (handler ProjectAuthoringHandler) GetCurrent(writer http.ResponseWriter, request *http.Request) {
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	pathID := strings.TrimSpace(chi.URLParam(request, "pathID"))
+	if !canonicalHandlerUUID(studentID) || !canonicalHandlerUUID(pathID) || !emptyProjectAuthoringGet(request) {
+		writeDiagnosticError(writer, domain.ErrMalformed)
+		return
+	}
+	flow, err := handler.Commands.GetCurrent(request.Context(), studentID, pathID)
+	if err != nil {
+		writeDiagnosticError(writer, err)
+		return
+	}
+	writeDiagnosticJSON(writer, http.StatusOK, projectAuthoringProjection(flow))
+}
+
+func emptyProjectAuthoringGet(request *http.Request) bool {
+	if request.URL.RawQuery != "" || request.URL.ForceQuery || request.ContentLength > 0 || len(request.TransferEncoding) != 0 {
+		return false
+	}
+	if request.Body == nil {
+		return true
+	}
+	var byteBuffer [1]byte
+	count, err := request.Body.Read(byteBuffer[:])
+	return count == 0 && errors.Is(err, io.EOF)
+}
+
+func (handler ProjectAuthoringHandler) Confirm(writer http.ResponseWriter, request *http.Request) {
+	handler.mutate(writer, request, true)
+}
+
+func (handler ProjectAuthoringHandler) RequestPublication(writer http.ResponseWriter, request *http.Request) {
+	handler.mutate(writer, request, false)
+}
+
+func (handler ProjectAuthoringHandler) mutate(writer http.ResponseWriter, request *http.Request, confirmation bool) {
+	studentID := strings.TrimSpace(chi.URLParam(request, "studentID"))
+	flowID := strings.TrimSpace(chi.URLParam(request, "flowID"))
+	key := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+	if !canonicalHandlerUUID(studentID) || !canonicalHandlerUUID(flowID) || !canonicalHandlerUUID(key) {
+		writeDiagnosticError(writer, domain.ErrMalformed)
+		return
+	}
+	var flow domain.ProjectAuthoringFlow
+	var err error
+	if confirmation {
+		var input domain.ProjectAuthoringConfirmRequestV1
+		if err = decodeProjectAuthoringCommand(writer, request, &input); err == nil {
+			flow, err = handler.Commands.Confirm(request.Context(), studentID, flowID, key, input)
+		}
+	} else {
+		var input domain.ProjectAuthoringPublishRequestV1
+		if err = decodeProjectAuthoringCommand(writer, request, &input); err == nil {
+			flow, err = handler.Commands.RequestPublication(request.Context(), studentID, flowID, key, input)
+		}
+	}
+	if err != nil {
+		writeDiagnosticError(writer, err)
+		return
+	}
+	status := http.StatusAccepted
+	if flow.Status == domain.ProjectAuthoringPublished {
+		status = http.StatusOK
+	}
+	writeDiagnosticJSON(writer, status, projectAuthoringProjection(flow))
+}
+
+func decodeProjectAuthoringCommand(writer http.ResponseWriter, request *http.Request, output any) error {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return domain.ErrMalformed
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, maximumProjectAuthoringCommandBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return domain.ErrMalformed
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domain.ErrMalformed
+	}
+	return nil
+}
+
+type projectAuthoringResponse struct {
+	Schema                  string                              `json:"schema"`
+	FlowID                  string                              `json:"flow_id"`
+	Status                  domain.ProjectAuthoringStatus       `json:"status"`
+	Version                 int64                               `json:"version"`
+	LearningPathID          string                              `json:"learning_path_id"`
+	LearningPathVersion     int64                               `json:"learning_path_version"`
+	AuthoringProfileVersion int64                               `json:"authoring_profile_version"`
+	AuthoringProfileDigest  string                              `json:"authoring_profile_digest"`
+	Locale                  string                              `json:"locale"`
+	GoalCode                string                              `json:"goal_code"`
+	TargetCount             int                                 `json:"target_count"`
+	AuthoringJobID          string                              `json:"authoring_job_id,omitempty"`
+	AuthoringJobStatus      domain.TZAuthoringJobStatus         `json:"authoring_job_status,omitempty"`
+	ReadyBlueprintDigest    string                              `json:"ready_blueprint_digest,omitempty"`
+	ReadyCandidateDigest    string                              `json:"ready_candidate_digest,omitempty"`
+	PublicationRequested    bool                                `json:"publication_requested"`
+	Publication             *domain.ProjectPublicationReceiptV1 `json:"publication,omitempty"`
+	Staging                 *domain.ProjectStagingReceiptV1     `json:"staging,omitempty"`
+	FailureCode             string                              `json:"failure_code,omitempty"`
+	Attempts                int                                 `json:"attempts"`
+	CreatedAt               string                              `json:"created_at"`
+	UpdatedAt               string                              `json:"updated_at"`
+}
+
+func projectAuthoringProjection(flow domain.ProjectAuthoringFlow) projectAuthoringResponse {
+	response := projectAuthoringResponse{
+		Schema: "project-authoring-flow.v1", FlowID: flow.ID, Status: flow.Status, Version: flow.Version,
+		LearningPathID: flow.LearningPathID, LearningPathVersion: flow.LearningPathVersion,
+		AuthoringProfileVersion: flow.AuthoringProfileVersion, AuthoringProfileDigest: flow.AuthoringProfileDigest,
+		Locale: flow.Input.Locale, GoalCode: flow.GoalCode, TargetCount: len(flow.Input.Targets), AuthoringJobID: flow.TZAuthoringJobID,
+		AuthoringJobStatus: flow.TZJobStatus, ReadyBlueprintDigest: flow.ReadyBlueprintDigest,
+		ReadyCandidateDigest: flow.ReadyCandidateDigest, PublicationRequested: flow.PublicationRequestedAt != nil,
+		FailureCode: flow.FailureCode, Attempts: flow.Attempts,
+		CreatedAt: flow.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999Z"),
+		UpdatedAt: flow.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999Z"),
+	}
+	if flow.Publication != nil {
+		receipt := *flow.Publication
+		response.Publication = &receipt
+	}
+	if flow.Staging != nil {
+		receipt := *flow.Staging
+		response.Staging = &receipt
+	}
+	return response
+}

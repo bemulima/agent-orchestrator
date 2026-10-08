@@ -1,0 +1,407 @@
+package onboardingpathexecution
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/courseplan"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/google/uuid"
+)
+
+type Processor struct {
+	Enabled     bool
+	Executions  repository.OnboardingPathExecutionRepository
+	Graphs      repository.ReadinessGoalGraphRepository
+	Policies    repository.PolicyRepository
+	Readiness   domainservice.StudentPlanningReadinessService
+	Students    domainservice.OnboardingPathExecutionStudentService
+	Courses     domainservice.CourseService
+	Generator   domainservice.ContentGenerator
+	IDs         courseplan.IDGenerator
+	Clock       courseplan.Clock
+	Strategies  pedagogy.Registry
+	LeaseTTL    time.Duration
+	MaxAttempts int
+}
+type Worker struct {
+	Processor    Processor
+	PollInterval time.Duration
+	Logger       *slog.Logger
+}
+
+func (w Worker) Run(ctx context.Context) {
+	interval := w.PollInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	logger := w.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		processed, err := w.Processor.ProcessNext(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.ErrorContext(ctx, "onboarding path execution failed", "error", err)
+		}
+		if processed {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p Processor) ProcessNext(ctx context.Context) (bool, error) {
+	if !p.Enabled {
+		return false, nil
+	}
+	if p.Executions == nil || p.Graphs == nil || p.Policies == nil || p.Readiness == nil || p.Students == nil || p.Courses == nil || p.Generator == nil || p.IDs == nil || p.Clock == nil || p.LeaseTTL <= 0 || p.MaxAttempts < 1 {
+		return false, domain.ErrValidation
+	}
+	now := p.Clock.Now().UTC()
+	handoff, err := p.Executions.NextAcceptedHandoff(ctx)
+	var execution domain.OnboardingPathExecution
+	if err == nil {
+		execution, err = domain.NewOnboardingPathExecution(handoff, now)
+		if err == nil {
+			execution, _, err = p.Executions.CreateOrGetOnboardingPathExecution(ctx, execution)
+		}
+	} else if errors.Is(err, domain.ErrNotFound) {
+		execution, err = p.Executions.NextOnboardingPathExecution(ctx, now)
+	} else {
+		return false, err
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	claimed, err := p.Executions.ClaimOnboardingPathExecution(ctx, execution.ExecutionID, p.IDs.NewID(), now, now.Add(p.LeaseTTL))
+	if errors.Is(err, domain.ErrNotFound) {
+		execution, err = p.Executions.NextOnboardingPathExecution(ctx, now)
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return true, err
+		}
+		claimed, err = p.Executions.ClaimOnboardingPathExecution(ctx, execution.ExecutionID, p.IDs.NewID(), now, now.Add(p.LeaseTTL))
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, nil
+		}
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, p.processClaimed(ctx, claimed)
+}
+
+func (p Processor) processClaimed(ctx context.Context, e domain.OnboardingPathExecution) error {
+	if len(e.Snapshot) == 0 {
+		return p.reserveAndFreeze(ctx, e)
+	}
+	frozen, err := DecodeFrozenSnapshot(e.Snapshot)
+	if err != nil {
+		return p.retry(ctx, e, "SNAPSHOT_INVALID", err)
+	}
+	canonicalSnapshot, err := json.Marshal(frozen)
+	if err != nil || e.SnapshotHash == "" || sha256Hex(canonicalSnapshot) != e.SnapshotHash {
+		return p.retry(ctx, e, "SNAPSHOT_HASH_MISMATCH", domain.ErrValidation)
+	}
+	// A durable materialization command is replayed verbatim after a lost ACK.
+	// It must not be preceded by another renewal, which would change its fence.
+	if e.CourseID != "" && e.StudentCommandHash != "" {
+		return p.materialize(ctx, e, frozen, e.CourseLessons, false)
+	}
+	if err := p.renew(ctx, &e); err != nil {
+		return err
+	}
+	if len(e.GeneratedCourse) == 0 {
+		course, err := p.generateCheckpointedCourse(ctx, &e, frozen)
+		if err != nil {
+			return p.retry(ctx, e, "CONTENT_GENERATION_UNAVAILABLE", err)
+		}
+		payload, err := json.Marshal(course)
+		if err != nil || len(payload) > domain.MaximumGeneratedCoursePayloadBytes {
+			return p.retry(ctx, e, "GENERATED_DRAFT_INVALID", domain.ErrValidation)
+		}
+		hash := sha256Hex(payload)
+		if err := p.Executions.CheckpointOnboardingCourse(ctx, e, e.ClaimToken, payload, hash, p.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		e.GeneratedCourse, e.GeneratedCourseHash = payload, hash
+	}
+	var course domain.GeneratedCourse
+	if json.Unmarshal(e.GeneratedCourse, &course) != nil {
+		return p.retry(ctx, e, "GENERATED_DRAFT_INVALID", domain.ErrValidation)
+	}
+	canonicalCourse, marshalErr := json.Marshal(course)
+	if marshalErr != nil || e.GeneratedCourseHash == "" || sha256Hex(canonicalCourse) != e.GeneratedCourseHash || course.Fingerprint != frozen.Course.Fingerprint {
+		return p.retry(ctx, e, "GENERATED_DRAFT_INVALID", domain.ErrValidation)
+	}
+	if e.CourseID == "" {
+		if err := p.renew(ctx, &e); err != nil {
+			return err
+		}
+		courseKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("course-onboarding-path-ensure:"+e.ExecutionID)).String()
+		result, err := p.Courses.EnsureCourse(ctx, course, courseKey)
+		if err != nil {
+			return p.retry(ctx, e, "COURSE_UNAVAILABLE", err)
+		}
+		if result.CourseID == "" || len(result.Lessons) == 0 {
+			return p.retry(ctx, e, "COURSE_INVALID_RESPONSE", domain.ErrValidation)
+		}
+		if err := p.Executions.CheckpointOnboardingCourseReceipt(ctx, e, e.ClaimToken, result.CourseID, result.Reused, result.Lessons, p.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		e.CourseID, e.CourseReused, e.CourseLessons = result.CourseID, result.Reused, result.Lessons
+		// The exact Course-owned bindings are needed for Student's atomic command.
+		return p.materialize(ctx, e, frozen, result.Lessons, true)
+	}
+	// A crash after the Course receipt has no local copy of Course bindings.
+	// Re-ensuring with the same deterministic command is the only permitted way
+	// to obtain the exact idempotent receipt; it never regenerates content.
+	return p.materialize(ctx, e, frozen, e.CourseLessons, true)
+}
+
+func (p Processor) generateCheckpointedCourse(ctx context.Context, e *domain.OnboardingPathExecution, frozen FrozenSnapshot) (domain.GeneratedCourse, error) {
+	contents, err := p.Executions.ListOnboardingPathLessonContent(ctx, e.ExecutionID)
+	if err != nil {
+		return domain.GeneratedCourse{}, err
+	}
+	byIndex := make(map[int]domain.OnboardingPathLessonContent, len(contents))
+	for _, content := range contents {
+		var generated domainservice.GeneratedLessonContent
+		if content.ExecutionID != e.ExecutionID || content.LessonIndex < 0 || content.ContentHash == "" || json.Unmarshal(content.Content, &generated) != nil {
+			return domain.GeneratedCourse{}, domain.ErrValidation
+		}
+		canonicalContent, marshalErr := json.Marshal(generated)
+		if marshalErr != nil || sha256Hex(canonicalContent) != content.ContentHash {
+			return domain.GeneratedCourse{}, domain.ErrValidation
+		}
+		if _, duplicate := byIndex[content.LessonIndex]; duplicate {
+			return domain.GeneratedCourse{}, domain.ErrValidation
+		}
+		byIndex[content.LessonIndex] = content
+	}
+	course := frozen.Course
+	index := 0
+	for mi := range course.Modules {
+		for si := range course.Modules[mi].Sections {
+			for li := range course.Modules[mi].Sections[si].Lessons {
+				lesson := &course.Modules[mi].Sections[si].Lessons[li]
+				key := uuid.NewSHA1(uuid.NameSpaceOID, []byte(e.ExecutionID+"\x00"+course.Fingerprint+"\x00"+course.Modules[mi].Code+"\x00"+course.Modules[mi].Sections[si].Code+"\x00"+lesson.Code)).String()
+				content, exists := byIndex[index]
+				var generated domainservice.GeneratedLessonContent
+				if exists {
+					if content.ModuleCode != course.Modules[mi].Code || content.SectionCode != course.Modules[mi].Sections[si].Code || content.LessonCode != lesson.Code || content.AIIdempotencyKey != key || json.Unmarshal(content.Content, &generated) != nil {
+						return domain.GeneratedCourse{}, domain.ErrValidation
+					}
+				} else {
+					if err := p.renew(ctx, e); err != nil {
+						return domain.GeneratedCourse{}, err
+					}
+					generated, err = p.Generator.GenerateLesson(ctx, domainservice.LessonGenerationInput{CourseContext: frozen.Authoring.CourseContext(), Lesson: *lesson, Language: course.Language}, key)
+					if err != nil {
+						return domain.GeneratedCourse{}, err
+					}
+					if err := courseplan.NormalizeGeneratedLessonContent(&generated); err != nil {
+						return domain.GeneratedCourse{}, err
+					}
+					raw, marshalErr := json.Marshal(generated)
+					if marshalErr != nil {
+						return domain.GeneratedCourse{}, marshalErr
+					}
+					content = domain.OnboardingPathLessonContent{ExecutionID: e.ExecutionID, LessonIndex: index, ModuleCode: course.Modules[mi].Code, SectionCode: course.Modules[mi].Sections[si].Code, LessonCode: lesson.Code, AIIdempotencyKey: key, Content: raw, ContentHash: sha256Hex(raw), CreatedAt: p.Clock.Now().UTC()}
+					if err := p.Executions.CheckpointOnboardingPathLessonContent(ctx, *e, e.ClaimToken, content); err != nil {
+						return domain.GeneratedCourse{}, err
+					}
+				}
+				if err := courseplan.NormalizeGeneratedLessonContent(&generated); err != nil {
+					return domain.GeneratedCourse{}, err
+				}
+				lesson.DescriptionMarkdown, lesson.Examples, lesson.Tasks, lesson.Status = generated.DescriptionMarkdown, generated.Examples, generated.KnowledgeChecks, domain.LessonStatusActive
+				index++
+			}
+		}
+	}
+	if len(contents) > index {
+		return domain.GeneratedCourse{}, domain.ErrValidation
+	}
+	course.Status = domain.CourseStatusActive
+	return course, nil
+}
+
+func (p Processor) reserveAndFreeze(ctx context.Context, e domain.OnboardingPathExecution) error {
+	snapshot, err := p.Readiness.GetPlanningReadiness(ctx, e.Handoff.StudentID)
+	if err != nil {
+		return p.retry(ctx, e, "STUDENT_SNAPSHOT_UNAVAILABLE", err)
+	}
+	snapshot, err = domain.NormalizeStudentPlanningReadinessSnapshot(snapshot)
+	if err != nil || snapshot.StudentID != e.Handoff.StudentID {
+		return p.retry(ctx, e, "STUDENT_SNAPSHOT_INVALID", domain.ErrValidation)
+	}
+	if snapshot.ActivePath != nil {
+		return p.complete(ctx, e, domain.OnboardingExecutionActivePathExists)
+	}
+	if snapshot.StateRef != e.Handoff.StateRef {
+		return p.complete(ctx, e, domain.OnboardingExecutionStateChanged)
+	}
+	admission, err := p.Students.ReserveOnboardingPathExecution(ctx, e.Handoff, e.ExecutionID, e.ReserveKey)
+	if errors.Is(err, domain.ErrActivePathExists) {
+		return p.complete(ctx, e, domain.OnboardingExecutionActivePathExists)
+	}
+	if errors.Is(err, domain.ErrStateChanged) {
+		return p.complete(ctx, e, domain.OnboardingExecutionStateChanged)
+	}
+	if err != nil {
+		return p.retry(ctx, e, "ADMISSION_UNAVAILABLE", err)
+	}
+	graph, err := p.Graphs.GetPublishedGoalGraphExact(ctx, e.Handoff.Goal.Code, e.Handoff.Goal.Version, e.Handoff.Goal.GraphVersion)
+	if err != nil {
+		return p.abortAndRetry(ctx, e, admission, "CANCELLED", "GOAL_GRAPH_UNAVAILABLE", err)
+	}
+	policy, err := p.Policies.GetActivePolicyBundle(ctx)
+	if err != nil {
+		return p.abortAndRetry(ctx, e, admission, "CANCELLED", "POLICY_UNAVAILABLE", err)
+	}
+	frozen, hash, err := BuildFrozenSnapshot(graph, policy, snapshot, p.Strategies)
+	if err != nil {
+		return p.abortAndRetry(ctx, e, admission, "CANCELLED", "SNAPSHOT_INVALID", err)
+	}
+	payload, err := json.Marshal(frozen)
+	if err != nil {
+		return p.abortAndRetry(ctx, e, admission, "CANCELLED", "SNAPSHOT_INVALID", err)
+	}
+	if err := p.Executions.CheckpointOnboardingSnapshot(ctx, e, e.ClaimToken, payload, hash, admission.AdmissionID, admission.Fence, admission.ExpiresAt, p.Clock.Now().UTC()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p Processor) materialize(ctx context.Context, e domain.OnboardingPathExecution, frozen FrozenSnapshot, lessons []domain.CourseLessonBinding, renew bool) error {
+	if len(lessons) == 0 || e.AdmissionID == "" || e.AdmissionFence < 1 {
+		return p.retry(ctx, e, "COURSE_RECEIPT_INVALID", domain.ErrValidation)
+	}
+	if renew {
+		if err := p.renew(ctx, &e); err != nil {
+			return err
+		}
+	}
+	command := domainservice.OnboardingPathMaterialization{StudentID: e.Handoff.StudentID, AdmissionID: e.AdmissionID, ExecutionID: e.ExecutionID, Fence: e.AdmissionFence, CourseID: e.CourseID, CourseFingerprint: frozen.Course.Fingerprint, PlannerPolicyVersion: frozen.Course.PlannerVersion, ReasonCode: "initial_onboarding", ReasonSummary: "Accepted onboarding path", Lessons: lessons, IdempotencyKey: e.StudentCommandID}
+	if e.StudentCommandHash == "" {
+		payload, marshalErr := json.Marshal(command)
+		if marshalErr != nil {
+			return p.retry(ctx, e, "MATERIALIZATION_INVALID", marshalErr)
+		}
+		if err := p.Executions.CheckpointOnboardingMaterialization(ctx, e, e.ClaimToken, sha256Hex(payload), p.Clock.Now().UTC()); err != nil {
+			return err
+		}
+		e.StudentCommandHash = sha256Hex(payload)
+	}
+	result, err := p.Students.MaterializeOnboardingPathExecution(ctx, command)
+	if errors.Is(err, domain.ErrActivePathExists) {
+		return p.abortThenComplete(ctx, e, "ACTIVE_PATH_EXISTS", domain.OnboardingExecutionActivePathExists)
+	}
+	if errors.Is(err, domain.ErrStateChanged) {
+		return p.abortThenComplete(ctx, e, "STATE_CHANGED", domain.OnboardingExecutionStateChanged)
+	}
+	if err != nil {
+		return p.retry(ctx, e, "MATERIALIZATION_UNAVAILABLE", err)
+	}
+	e.Status, e.LearningPathID, e.FirstLessonID = domain.OnboardingExecutionPathReady, result.LearningPathID, result.FirstLessonID
+	return p.complete(ctx, e, e.Status)
+}
+
+func (p Processor) renew(ctx context.Context, e *domain.OnboardingPathExecution) error {
+	if e.AdmissionID == "" || e.AdmissionFence < 1 {
+		return domain.ErrValidation
+	}
+	key := domain.OnboardingAdmissionOperationKey(e.ExecutionID, "renew", e.AdmissionFence)
+	admission, err := p.Students.RenewOnboardingPathExecution(ctx, e.Handoff, e.AdmissionID, e.AdmissionFence, e.ExecutionID, key)
+	if errors.Is(err, domain.ErrActivePathExists) {
+		if terminalErr := p.abortThenComplete(ctx, *e, "ACTIVE_PATH_EXISTS", domain.OnboardingExecutionActivePathExists); terminalErr != nil {
+			return terminalErr
+		}
+		return domain.ErrConflict
+	}
+	if errors.Is(err, domain.ErrStateChanged) {
+		if terminalErr := p.abortThenComplete(ctx, *e, "STATE_CHANGED", domain.OnboardingExecutionStateChanged); terminalErr != nil {
+			return terminalErr
+		}
+		return domain.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	now := p.Clock.Now().UTC()
+	if err := p.Executions.RenewOnboardingPathExecution(ctx, e.ExecutionID, e.ClaimToken, admission.Fence, admission.ExpiresAt, now, now.Add(p.LeaseTTL)); err != nil {
+		return err
+	}
+	e.AdmissionFence, e.AdmissionExpiresAt = admission.Fence, &admission.ExpiresAt
+	return nil
+}
+func (p Processor) abortThenComplete(ctx context.Context, e domain.OnboardingPathExecution, reason, status string) error {
+	key := domain.OnboardingAdmissionOperationKey(e.ExecutionID, "abort:"+reason, e.AdmissionFence)
+	if err := p.Students.AbortOnboardingPathExecution(ctx, e.Handoff, e.AdmissionID, e.AdmissionFence, e.ExecutionID, reason, key); err != nil {
+		return p.retry(ctx, e, "ABORT_UNAVAILABLE", err)
+	}
+	return p.complete(ctx, e, status)
+}
+func (p Processor) abortAndRetry(ctx context.Context, e domain.OnboardingPathExecution, admission domainservice.OnboardingPathAdmission, reason, code string, cause error) error {
+	key := domain.OnboardingAdmissionOperationKey(e.ExecutionID, "abort:"+reason, admission.Fence)
+	if err := p.Students.AbortOnboardingPathExecution(ctx, e.Handoff, admission.AdmissionID, admission.Fence, e.ExecutionID, reason, key); err != nil {
+		return p.retry(ctx, e, "ABORT_UNAVAILABLE", err)
+	}
+	e.Status, e.FailureCode = domain.OnboardingExecutionFailed, code
+	if completeErr := p.Executions.CompleteOnboardingPathExecution(ctx, e, e.ClaimToken, p.Clock.Now().UTC()); completeErr != nil {
+		return errors.Join(cause, completeErr)
+	}
+	return fmt.Errorf("%s: %w", code, cause)
+}
+func (p Processor) complete(ctx context.Context, e domain.OnboardingPathExecution, status string) error {
+	e.Status = status
+	return p.Executions.CompleteOnboardingPathExecution(ctx, e, e.ClaimToken, p.Clock.Now().UTC())
+}
+func (p Processor) retry(ctx context.Context, e domain.OnboardingPathExecution, code string, cause error) error {
+	now := p.Clock.Now().UTC()
+	if e.Attempts >= p.MaxAttempts {
+		e.Status, e.FailureCode = domain.OnboardingExecutionFailed, code
+		if e.AdmissionID != "" && e.AdmissionFence >= 1 {
+			key := domain.OnboardingAdmissionOperationKey(e.ExecutionID, "abort:CANCELLED", e.AdmissionFence)
+			if abortErr := p.Students.AbortOnboardingPathExecution(ctx, e.Handoff, e.AdmissionID, e.AdmissionFence, e.ExecutionID, "CANCELLED", key); abortErr != nil {
+				return errors.Join(cause, abortErr)
+			}
+		}
+		if err := p.Executions.CompleteOnboardingPathExecution(ctx, e, e.ClaimToken, now); err != nil {
+			return errors.Join(cause, err)
+		}
+		return fmt.Errorf("%s: %w", code, cause)
+	}
+	delay := time.Duration(e.Attempts*e.Attempts) * time.Second
+	if delay > time.Minute {
+		delay = time.Minute
+	}
+	if err := p.Executions.RetryOnboardingPathExecution(ctx, e, e.ClaimToken, code, now, now.Add(delay)); err != nil {
+		return errors.Join(cause, err)
+	}
+	return fmt.Errorf("%s: %w", code, cause)
+}
+func sha256Hex(raw []byte) string    { d := sha256.Sum256(raw); return hex.EncodeToString(d[:]) }
+func mustJSON(v any) json.RawMessage { raw, _ := json.Marshal(v); return raw }

@@ -1,0 +1,110 @@
+package nats
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	natsgo "github.com/nats-io/nats.go"
+)
+
+// jetStreamPublisher is deliberately the narrow part of JetStream used by the
+// outbox publisher. Keeping this seam small lets the subject policy be proven
+// without a broker while production still uses nats.JetStreamContext.
+type jetStreamPublisher interface {
+	PublishMsg(*natsgo.Msg, ...natsgo.PubOpt) (*natsgo.PubAck, error)
+}
+
+// Publisher connects lazily so a temporary broker outage cannot prevent the
+// HTTP API and durable PostgreSQL outbox from accepting work.
+type Publisher struct {
+	URL            string
+	Name           string
+	ConnectTimeout time.Duration
+
+	mu         sync.Mutex
+	connection *natsgo.Conn
+	jetStream  jetStreamPublisher
+}
+
+func (publisher *Publisher) Publish(ctx context.Context, event domain.IntegrationEvent) error {
+	if publisher == nil || strings.TrimSpace(publisher.URL) == "" || publisher.ConnectTimeout <= 0 {
+		return errors.New("invalid NATS publisher configuration")
+	}
+	if !allowedPlannerSubject(event.Subject) ||
+		event.EventID == "" || !json.Valid(event.Payload) {
+		return errors.New("invalid planner integration event")
+	}
+	jetStream, err := publisher.connectionContext()
+	if err != nil {
+		return err
+	}
+	message := natsgo.NewMsg(event.Subject)
+	message.Data = event.Payload
+	message.Header.Set(natsgo.MsgIdHdr, event.EventID)
+	message.Header.Set("X-Event-ID", event.EventID)
+	message.Header.Set("X-Correlation-ID", event.CorrelationID)
+	message.Header.Set("X-Causation-ID", event.CausationID)
+	message.Header.Set("X-Schema-Version", strconv.Itoa(event.SchemaVersion))
+	_, err = jetStream.PublishMsg(message, natsgo.Context(ctx))
+	return err
+}
+
+func (publisher *Publisher) Close() {
+	if publisher == nil {
+		return
+	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if publisher.connection != nil {
+		publisher.connection.Close()
+	}
+	publisher.connection = nil
+	publisher.jetStream = nil
+}
+
+func allowedPlannerSubject(subject string) bool {
+	switch subject {
+	case domain.SubjectCoursePlanCompleted,
+		domain.SubjectCoursePlanFailed,
+		domain.SubjectOnboardingPathOutcome:
+		return true
+	default:
+		return false
+	}
+}
+
+func (publisher *Publisher) connectionContext() (jetStreamPublisher, error) {
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	// A nil connection with an injected publisher is test-only. Production
+	// always establishes both values together below.
+	if publisher.jetStream != nil && (publisher.connection == nil || !publisher.connection.IsClosed()) {
+		return publisher.jetStream, nil
+	}
+	connection, err := natsgo.Connect(
+		publisher.URL,
+		natsgo.Name(publisher.Name),
+		natsgo.Timeout(publisher.ConnectTimeout),
+		natsgo.ReconnectWait(time.Second),
+		natsgo.MaxReconnects(-1),
+	)
+	if err != nil {
+		return nil, err
+	}
+	jetStream, err := connection.JetStream()
+	if err != nil {
+		connection.Close()
+		return nil, err
+	}
+	publisher.connection = connection
+	publisher.jetStream = jetStream
+	return jetStream, nil
+}
+
+var _ domain.EventPublisher = (*Publisher)(nil)

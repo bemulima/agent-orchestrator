@@ -1,0 +1,368 @@
+//go:build integration
+
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	httptransport "github.com/bemulima/ms-go-practice-runtime/internal/transport/http"
+)
+
+// Uses actual registered Runtime handlers and PostgreSQL receipts in a random
+// disposable schema. Revision, action and lifecycle states are named persistence
+// fixtures; this is not a Catalog/Student/Sandbox/validator lifecycle proof.
+func TestT13PostgresAssistanceHTTPReplay(t *testing.T) {
+	for _, terminal := range []domain.TaskInstanceStatus{domain.TaskInstanceInReview, domain.TaskInstanceCompleted, domain.TaskInstanceCancelled} {
+		t.Run(string(terminal), func(t *testing.T) {
+			repository, db := openTestRepository(t)
+			instance := t13AssistanceInstance(t, repository)
+			firstTime := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
+			body := t13AssistanceBody(instance, testUUID(150), 2)
+			first := t13AssistanceRequest(repository, instance.ID, body, true, firstTime)
+			if first.Code != http.StatusOK {
+				t.Fatalf("first HTTP status=%d", first.Code)
+			}
+			advanced := t13AssistanceRequest(NewRepository(db), instance.ID, body, true, firstTime.Add(time.Hour))
+			if advanced.Code != http.StatusOK || advanced.Body.String() != first.Body.String() {
+				t.Fatalf("clock-advanced replay status=%d or receipt changed", advanced.Code)
+			}
+			var wire struct {
+				CreatedAt time.Time `json:"created_at"`
+				Policy    string    `json:"policy_version"`
+				HintLevel int       `json:"hint_level"`
+			}
+			if json.Unmarshal(first.Body.Bytes(), &wire) != nil || !wire.CreatedAt.Equal(firstTime) || wire.CreatedAt.Location() != time.UTC || wire.Policy != usecase.AssistancePolicyVersion || wire.HintLevel != 2 {
+				t.Fatal("original server facts missing")
+			}
+			current, err := repository.GetInstance(context.Background(), instance.StudentID, instance.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if terminal != domain.TaskInstanceCancelled {
+				// Existing immutable Submit fixture supplies the genuine relational keys;
+				// state transitions below seed lifecycle facts without claiming validation.
+				submission := t12CommitFeedbackFixture(t, repository, current, 160)
+				current, err = repository.GetInstance(context.Background(), instance.StudentID, instance.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				current.Status = domain.TaskInstanceInReview
+				current, err = repository.SaveInstance(context.Background(), current)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if terminal == domain.TaskInstanceCompleted {
+					current.Status, current.FinalSubmissionID = domain.TaskInstanceFinalizing, submission.ID
+					current, err = repository.SaveInstance(context.Background(), current)
+					if err != nil {
+						t.Fatal(err)
+					}
+					current.Status, current.CompletedAt = domain.TaskInstanceCompleted, timePtr(firstTime.Add(2*time.Hour))
+				}
+			} else {
+				current.Status = domain.TaskInstanceCancelled
+			}
+			if current.Status != domain.TaskInstanceInReview {
+				current, err = repository.SaveInstance(context.Background(), current)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := current
+			replay := t13AssistanceRequest(NewRepository(db), instance.ID, body, true, firstTime.Add(3*time.Hour))
+			if replay.Code != http.StatusOK || replay.Body.String() != first.Body.String() {
+				t.Fatalf("lifecycle replay status=%d or receipt changed", replay.Code)
+			}
+			changed := t13AssistanceRequest(NewRepository(db), instance.ID, t13AssistanceBody(instance, testUUID(150), 3), true, firstTime.Add(4*time.Hour))
+			if changed.Code != http.StatusConflict {
+				t.Fatalf("changed payload status=%d", changed.Code)
+			}
+			fresh := t13AssistanceRequest(NewRepository(db), instance.ID, t13AssistanceBody(instance, testUUID(151), 2), true, firstTime.Add(4*time.Hour))
+			if fresh.Code != http.StatusConflict {
+				t.Fatalf("new post-lifecycle fact status=%d", fresh.Code)
+			}
+
+			changedStepBody := strings.Replace(body, instance.Steps[0].ID, "absent-step", 1)
+			changedStep := t13AssistanceRequest(NewRepository(db), instance.ID, changedStepBody, true, firstTime)
+			if changedStep.Code != http.StatusConflict || !strings.Contains(changedStep.Body.String(), "idempotency_conflict") {
+				t.Fatal("changed step did not conflict before current guards")
+			}
+			otherFixture := fixtureInstance()
+			otherFixture.ID = testUUID(195)
+			otherFixture.StartCommandDigest = "sha256:" + strings.Repeat("c", 64)
+			other, _, err := repository.CreateOrLoadStart(context.Background(), otherFixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other.Status = domain.TaskInstanceCancelled
+			other, err = repository.SaveInstance(context.Background(), other)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rebound := t13AssistanceRequest(NewRepository(db), other.ID, t13AssistanceBody(other, testUUID(150), 2), true, firstTime)
+			if rebound.Code != http.StatusConflict || !strings.Contains(rebound.Body.String(), "idempotency_conflict") {
+				t.Fatal("usage rebound was not rejected before lifecycle guards")
+			}
+			foreign := instance
+			foreign.StudentID = testUUID(999)
+			denied := t13AssistanceRequest(NewRepository(db), instance.ID, t13AssistanceBody(foreign, testUUID(150), 2), true, firstTime)
+			if denied.Code != http.StatusNotFound {
+				t.Fatalf("foreign owner status=%d", denied.Code)
+			}
+			denied = t13AssistanceRequest(NewRepository(db), instance.ID, body, false, firstTime)
+			if denied.Code != http.StatusUnauthorized {
+				t.Fatalf("wrong token status=%d", denied.Code)
+			}
+			// Direct repository replay must authorize its current locked owner, even
+			// if a caller presents a self-consistent spoofed instance and receipt.
+			stored, digest, err := repository.GetAssistance(context.Background(), instance.StudentID, instance.ID, testUUID(150))
+			if err != nil {
+				t.Fatal(err)
+			}
+			spoofed := before
+			spoofed.StudentID = testUUID(999)
+			stored.StudentID = spoofed.StudentID
+			if _, _, _, err = repository.RecordAssistance(context.Background(), spoofed, stored, digest); !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("transaction owner guard: %v", err)
+			}
+			after, err := NewRepository(db).GetInstance(context.Background(), instance.StudentID, instance.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, after) || after.HintsUsed != 1 || !after.TeacherAssistanceUsed {
+				t.Fatal("replay or negative request changed aggregate")
+			}
+			var count int
+			if err := db.QueryRow(`SELECT count(*) FROM practice_assistance_receipts`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("durable fact count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+type t13AssistanceBarrierRepository struct {
+	*Repository
+	barrier *sync.WaitGroup
+}
+
+func (r *t13AssistanceBarrierRepository) GetAssistance(ctx context.Context, student, instance, usage string) (ports.AssistanceReceipt, string, error) {
+	receipt, digest, err := r.Repository.GetAssistance(ctx, student, instance, usage)
+	r.barrier.Done()
+	r.barrier.Wait()
+	return receipt, digest, err
+}
+
+func TestT13PostgresAssistanceHTTPConcurrentRuntimeObjects(t *testing.T) {
+	for _, sameKey := range []bool{true, false} {
+		t.Run(map[bool]string{true: "same_usage", false: "distinct_usage_at_cap"}[sameKey], func(t *testing.T) {
+			repo, db := openTestRepository(t)
+			instance := t13AssistanceInstance(t, repo)
+			n := 8
+			if !sameKey {
+				n = 2
+				instance.HintsUsed = 999
+				var err error
+				instance, err = repo.SaveInstance(context.Background(), instance)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeVersion := instance.Version
+			barrier := &sync.WaitGroup{}
+			barrier.Add(n)
+			responses := make([]*httptest.ResponseRecorder, n)
+			var work sync.WaitGroup
+			work.Add(n)
+			for i := 0; i < n; i++ {
+				go func(i int) {
+					defer work.Done()
+					usage := testUUID(180)
+					if !sameKey {
+						usage = testUUID(180 + i)
+					}
+					responses[i] = t13AssistanceRequest(&t13AssistanceBarrierRepository{Repository: NewRepository(db), barrier: barrier}, instance.ID, t13AssistanceBody(instance, usage, 2), true, time.Date(2026, 10, 4, 1, i, 0, 0, time.UTC))
+				}(i)
+			}
+			work.Wait()
+			successes, conflicts := 0, 0
+			var first string
+			for _, response := range responses {
+				switch response.Code {
+				case http.StatusOK:
+					successes++
+					if first == "" {
+						first = response.Body.String()
+					} else if first != response.Body.String() {
+						t.Fatal("concurrent exact replay changed server facts")
+					}
+				case http.StatusConflict:
+					conflicts++
+				default:
+					t.Fatalf("concurrent HTTP status=%d", response.Code)
+				}
+			}
+			if sameKey && successes != n || !sameKey && (successes != 1 || conflicts != 1) {
+				t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+			}
+			after, err := NewRepository(db).GetInstance(context.Background(), instance.StudentID, instance.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantHints := 1
+			if !sameKey {
+				wantHints = 1000
+			}
+			if after.HintsUsed != wantHints || after.Version != beforeVersion+1 || after.MaxHintLevel == nil || *after.MaxHintLevel != 2 || !after.TeacherAssistanceUsed {
+				t.Fatal("transaction counted assistance more than once or bypassed cap")
+			}
+			var count int
+			if err := db.QueryRow(`SELECT count(*) FROM practice_assistance_receipts`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("durable fact count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func t13AssistanceInstance(t *testing.T, repository *Repository) domain.TaskInstance {
+	t.Helper()
+	instance, _, err := repository.CreateOrLoadStart(context.Background(), fixtureInstance())
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Status = domain.TaskInstanceInProgress
+	instance.LearningActionID = testUUID(20)
+	instance.AssistancePolicyVersion = usecase.AssistancePolicyVersion
+	instance.WorkspaceBinding = domain.WorkspaceBinding{SandboxID: "sandbox-1", Available: true}
+	instance.CurrentStep = &instance.Steps[0]
+	instance, err = repository.SaveInstance(context.Background(), instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return instance
+}
+func t13AssistanceBody(instance domain.TaskInstance, usage string, hint int) string {
+	raw, _ := json.Marshal(struct {
+		UsageID    string `json:"usage_id"`
+		StudentID  string `json:"student_id"`
+		Assistance struct {
+			Schema    string `json:"schema"`
+			StepID    string `json:"step_id"`
+			Kind      string `json:"kind"`
+			HintLevel int    `json:"hint_level"`
+		} `json:"assistance"`
+	}{UsageID: usage, StudentID: instance.StudentID, Assistance: struct {
+		Schema    string `json:"schema"`
+		StepID    string `json:"step_id"`
+		Kind      string `json:"kind"`
+		HintLevel int    `json:"hint_level"`
+	}{"practice-task-assistance-usage.v1", instance.Steps[0].ID, "HINT", hint}})
+	return string(raw)
+}
+func t13AssistanceRequest(repository ports.Repository, instanceID, body string, authorized bool, now time.Time) *httptest.ResponseRecorder {
+	server := httptransport.Server{Runtime: &usecase.Runtime{Repository: repository, Now: func() time.Time { return now }}, TeacherToken: "t13-disposable-fixture-token"}
+	request := httptest.NewRequest(http.MethodPost, "/internal/task-instances/"+instanceID+"/teacher-assistance", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	if authorized {
+		request.Header.Set("X-Internal-Token", "t13-disposable-fixture-token")
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	return response
+}
+
+func TestT13PostgresAssistanceTransactionRechecksNewFactGuards(t *testing.T) {
+	for _, guard := range []string{"action", "step", "cap", "lifecycle"} {
+		t.Run(guard, func(t *testing.T) {
+			repo, _ := openTestRepository(t)
+			var current domain.TaskInstance
+			var err error
+			if guard == "action" {
+				current, _, err = repo.CreateOrLoadStart(context.Background(), fixtureInstance())
+				if err != nil {
+					t.Fatal(err)
+				}
+				current.Status = domain.TaskInstanceInProgress
+				current.AssistancePolicyVersion = usecase.AssistancePolicyVersion
+				current, err = repo.SaveInstance(context.Background(), current)
+			} else {
+				current = t13AssistanceInstance(t, repo)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			stale := current
+			stale.LearningActionID = testUUID(20)
+			receipt := ports.AssistanceReceipt{Schema: "practice-task-assistance-usage.v1", UsageID: testUUID(190), StudentID: current.StudentID, TaskInstanceID: current.ID, StepID: current.Steps[0].ID, Kind: "HINT", HintLevel: 2, PolicyVersion: usecase.AssistancePolicyVersion, OccurredAt: time.Now().UTC()}
+			switch guard {
+			case "step":
+				receipt.StepID = "absent-step"
+			case "cap":
+				current.HintsUsed = 1000
+				current, err = repo.SaveInstance(context.Background(), current)
+			case "lifecycle":
+				current.Status = domain.TaskInstanceCancelled
+				current, err = repo.SaveInstance(context.Background(), current)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, err := domain.CommandDigest(receipt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// SaveInstance returns the caller's in-memory representation. PostgreSQL
+			// JSONB normalizes embedded RawMessages; that object is not an exact
+			// durable baseline. Read both the decoded owner-scoped instance and
+			// the complete raw row before the rejected command instead.
+			before, err := repo.GetInstance(context.Background(), current.StudentID, current.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			memoryJSON, memoryErr := marshalInstance(current)
+			durableJSON, durableErr := marshalInstance(before)
+			if !canonicalEqual(memoryJSON, durableJSON, memoryErr, durableErr) {
+				t.Fatal("fixture save and durable read differ semantically before command")
+			}
+			if !reflect.DeepEqual(current, before) {
+				t.Log("fixture JSONB representation normalized before command; durable baseline captured")
+			}
+			var rowBefore []byte
+			if err := repo.db.QueryRowContext(context.Background(), `SELECT to_jsonb(instance)::text FROM practice_task_instances instance WHERE id=$1`, current.ID).Scan(&rowBefore); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, err = repo.RecordAssistance(context.Background(), stale, receipt, digest); !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("transaction %s guard: %v", guard, err)
+			}
+			after, err := repo.GetInstance(context.Background(), current.StudentID, current.ID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("rejected new fact changed durable aggregate")
+			}
+			var rowAfter []byte
+			if err := repo.db.QueryRowContext(context.Background(), `SELECT to_jsonb(instance)::text FROM practice_task_instances instance WHERE id=$1`, current.ID).Scan(&rowAfter); err != nil {
+				t.Fatal(err)
+			}
+			// Includes payload, relational identities, status, version, timestamps
+			// and every stored counter. Values remain private to the assertion.
+			if !bytes.Equal(rowBefore, rowAfter) {
+				t.Fatal("rejected new fact changed raw persisted row")
+			}
+			var count int
+			if err := repo.db.QueryRow(`SELECT count(*) FROM practice_assistance_receipts`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("rejected fact count=%d err=%v", count, err)
+			}
+		})
+	}
+}

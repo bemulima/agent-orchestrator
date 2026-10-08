@@ -1,0 +1,125 @@
+package aiprompt
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/google/uuid"
+)
+
+const (
+	templateCode         = "course.lesson-content.v1"
+	maximumResponseBytes = 1 << 20
+)
+
+type Client struct {
+	BaseURL       string
+	InternalToken string
+	HTTPClient    *http.Client
+}
+
+func (client Client) GenerateLesson(
+	ctx context.Context,
+	input domainservice.LessonGenerationInput,
+	idempotencyKey string,
+) (domainservice.GeneratedLessonContent, error) {
+	if strings.TrimSpace(client.BaseURL) == "" || strings.TrimSpace(client.InternalToken) == "" ||
+		client.HTTPClient == nil || input.CourseContext == nil || strings.TrimSpace(input.Language) == "" {
+		return domainservice.GeneratedLessonContent{}, errors.New("ai prompt client is not configured")
+	}
+	if _, err := uuid.Parse(idempotencyKey); err != nil {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	payload, err := json.Marshal(map[string]any{
+		"idempotency_key": idempotencyKey,
+		"template_code":   templateCode,
+		"language_code":   input.Language,
+		"variables": map[string]any{
+			"course_context": input.CourseContext,
+			"lesson_plan":    input.Lesson,
+		},
+	})
+	if err != nil {
+		return domainservice.GeneratedLessonContent{}, err
+	}
+	requestURL := strings.TrimRight(client.BaseURL, "/") + "/api/v1/prompts/execute-confidential"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(payload))
+	if err != nil {
+		return domainservice.GeneratedLessonContent{}, err
+	}
+	request.Header.Set("X-Internal-Token", client.InternalToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.HTTPClient.Do(request)
+	if err != nil {
+		return domainservice.GeneratedLessonContent{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	contents, err := io.ReadAll(io.LimitReader(response.Body, maximumResponseBytes+1))
+	if err != nil {
+		return domainservice.GeneratedLessonContent{}, err
+	}
+	if len(contents) > maximumResponseBytes {
+		return domainservice.GeneratedLessonContent{}, errors.New("ai prompt response exceeds limit")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		switch response.StatusCode {
+		case http.StatusConflict:
+			return domainservice.GeneratedLessonContent{}, domain.ErrConflict
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+		default:
+			return domainservice.GeneratedLessonContent{}, fmt.Errorf("ai prompt returned status %d", response.StatusCode)
+		}
+	}
+	var envelope struct {
+		ExecutionID        string          `json:"execution_id"`
+		IdempotencyKey     string          `json:"idempotency_key"`
+		TemplateCode       string          `json:"template_code"`
+		TemplateVersion    int             `json:"template_version"`
+		ProviderCode       string          `json:"provider_code"`
+		ProviderModel      string          `json:"provider_model"`
+		LanguageCode       string          `json:"language_code"`
+		ResponseSchemaCode string          `json:"response_schema_code"`
+		ParsedResponse     json.RawMessage `json:"parsed_response"`
+		Cached             bool            `json:"cached"`
+		CreatedAt          time.Time       `json:"created_at"`
+		ExpiresAt          time.Time       `json:"expires_at"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil || envelope.TemplateCode != templateCode ||
+		envelope.ResponseSchemaCode != templateCode || envelope.IdempotencyKey != idempotencyKey ||
+		envelope.LanguageCode != strings.ToLower(strings.TrimSpace(input.Language)) || envelope.TemplateVersion < 1 ||
+		strings.TrimSpace(envelope.ProviderCode) == "" || strings.TrimSpace(envelope.ProviderModel) == "" ||
+		envelope.CreatedAt.IsZero() || !envelope.ExpiresAt.After(envelope.CreatedAt) {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	if _, err := uuid.Parse(envelope.ExecutionID); err != nil {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	var result domainservice.GeneratedLessonContent
+	decoder = json.NewDecoder(bytes.NewReader(envelope.ParsedResponse))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return domainservice.GeneratedLessonContent{}, domain.ErrValidation
+	}
+	return result, nil
+}
+
+var _ domainservice.ContentGenerator = Client{}

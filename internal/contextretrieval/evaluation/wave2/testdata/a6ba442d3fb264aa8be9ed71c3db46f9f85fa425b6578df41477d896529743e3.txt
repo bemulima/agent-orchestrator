@@ -1,0 +1,74 @@
+package diagnosticplan
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+)
+
+// ProcessCommittedResult validates the event against the frozen Planner plan
+// and actual Student aggregate before delegating to the existing route policy.
+// Its only mutation is the immutable placement receipt.
+func (c PlacementConsumer) ProcessCommittedResult(ctx context.Context, event domain.DiagnosticResultCommittedEvent) (domain.DiagnosticPlacement, bool, error) {
+	if domain.ValidateDiagnosticResultCommittedEvent(event) != nil || c.Plans == nil || c.Placements == nil || c.Students == nil || c.Clock == nil {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	plan, err := c.Plans.GetDiagnosticByID(ctx, event.Data.PlanID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if domain.ValidateDiagnosticPlan(plan.Plan) != nil || plan.Plan.StudentID != event.StudentID || plan.Plan.PlanRevision != event.Data.PlanRevision || plan.Plan.PlanDigest != event.Data.PlanDigest {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	// A committed receipt is the replay authority even during a Student outage.
+	if stored, err := c.Placements.GetDiagnosticPlacement(ctx, event.Data.PlanID); err == nil {
+		if domain.ValidateStoredDiagnosticPlacement(stored.Decision, plan.Plan, stored.RequestID, stored.RequestHash, stored.Decision.DecisionDigest) != nil || !committedDecisionMatches(event, stored.Decision) {
+			return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+		}
+		return stored.Decision, false, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	result, err := c.Students.GetDiagnosticAssessmentResult(ctx, event.StudentID, event.Data.PlanID)
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if domain.ValidateDiagnosticResult(result, plan.Plan) != nil || result.ResultDigest != event.Data.ResultDigest || !result.CompletedAt.Equal(event.OccurredAt) {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	// Consume sees the already validated owner response, avoiding a second read
+	// between trigger validation and persistence. This adapter cannot reserve or
+	// perform any owner mutation; the source response came from Students above.
+	validated := c
+	validated.Students = validatedCommittedResult{result: result}
+	decision, created, err := validated.Consume(ctx, event.StudentID, event.Data.PlanID, event.Data.PlanID, domain.DiagnosticPlacementConsumeRequest{Schema: domain.DiagnosticPlacementConsumeSchemaV1})
+	if err != nil {
+		return domain.DiagnosticPlacement{}, false, err
+	}
+	if !committedDecisionMatches(event, decision) {
+		return domain.DiagnosticPlacement{}, false, domain.ErrValidation
+	}
+	return decision, created, nil
+}
+
+func committedDecisionMatches(event domain.DiagnosticResultCommittedEvent, decision domain.DiagnosticPlacement) bool {
+	return decision.StudentID == event.StudentID && decision.AttemptID == event.Data.PlanID && decision.PlanID == event.Data.PlanID && decision.PlanRevision == event.Data.PlanRevision && decision.PlanDigest == event.Data.PlanDigest && decision.ResultDigest == event.Data.ResultDigest && decision.ResultCompletedAt.Equal(event.OccurredAt)
+}
+
+type validatedCommittedResult struct {
+	result domain.DiagnosticAssessmentResult
+}
+
+func (s validatedCommittedResult) GetDiagnosticAssessmentResult(_ context.Context, studentID, planID string) (domain.DiagnosticAssessmentResult, error) {
+	if s.result.StudentID != studentID || s.result.PlanID != planID {
+		return domain.DiagnosticAssessmentResult{}, domain.ErrValidation
+	}
+	return s.result, nil
+}
+func (validatedCommittedResult) ReserveDiagnosticAssessment(context.Context, string, domain.DiagnosticAssessmentPlan) (domain.DiagnosticAssessmentReservation, error) {
+	return domain.DiagnosticAssessmentReservation{}, domain.ErrForbidden
+}

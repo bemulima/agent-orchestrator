@@ -1,0 +1,116 @@
+package hybridreplan
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+)
+
+type ApplicationProcessor struct {
+	Applications repository.HybridApplications
+	Students     domainservice.HybridStudentApplicationService
+	Clock        Clock
+	LeaseTTL     time.Duration
+	RetryDelay   time.Duration
+}
+
+func (p ApplicationProcessor) ProcessNext(ctx context.Context) (bool, error) {
+	if p.Applications == nil || p.Students == nil || p.Clock == nil || p.LeaseTTL <= 0 || p.RetryDelay <= 0 {
+		return false, domain.ErrValidation
+	}
+	work, claimed, err := p.Applications.ClaimHybridApplication(ctx, p.Clock.Now().UTC(), p.LeaseTTL)
+	if err != nil || !claimed {
+		return false, err
+	}
+	fail := func(cause error) (bool, error) {
+		return true, errors.Join(cause, p.Applications.ReleaseHybridApplication(ctx, work, p.Clock.Now().UTC().Add(p.RetryDelay)))
+	}
+	remaining := work.LeaseUntil.Sub(p.Clock.Now().UTC())
+	if remaining <= 0 || remaining > p.LeaseTTL {
+		return fail(domain.ErrConflict)
+	}
+	bounded, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	validLease := func() error {
+		if err := bounded.Err(); err != nil {
+			return err
+		}
+		if !work.LeaseUntil.After(p.Clock.Now().UTC()) {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	if domain.ValidateHybridApplicationWork(work) != nil {
+		return fail(domain.ErrValidation)
+	}
+	if err := validLease(); err != nil {
+		return fail(err)
+	}
+	receipt, err := p.Students.ApplyHybridConsequence(bounded, work.Consequence.Consequence)
+	if err != nil {
+		if errors.Is(err, domain.ErrHybridApplicationStale) {
+			if err := validLease(); err != nil {
+				return fail(err)
+			}
+			if err := p.Applications.RecordHybridApplicationStale(bounded, work, "OWNER_APPLICATION_STALE", p.Clock.Now().UTC()); err != nil {
+				return fail(err)
+			}
+			return true, nil
+		}
+		return fail(err)
+	}
+	if err := validLease(); err != nil {
+		return fail(err)
+	}
+	if domain.ValidateHybridApplicationReceipt(receipt, work.Consequence.Consequence) != nil {
+		return fail(domain.ErrUpstreamInvalid)
+	}
+	if receipt.Status == "WAITING_SAFE_BOUNDARY" {
+		if err := p.Applications.ReleaseHybridApplication(ctx, work, p.Clock.Now().UTC().Add(p.RetryDelay)); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	if err := p.Applications.CompleteHybridApplication(bounded, work, receipt); err != nil {
+		return fail(err)
+	}
+	return true, nil
+}
+
+type ApplicationWorker struct {
+	Processor    ApplicationProcessor
+	PollInterval time.Duration
+	Logger       *slog.Logger
+}
+
+func (w ApplicationWorker) Run(ctx context.Context) {
+	interval := w.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	logger := w.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		processed, err := w.Processor.ProcessNext(ctx)
+		if err != nil {
+			logger.ErrorContext(ctx, "hybrid consequence delivery failed", "error", err)
+		}
+		if processed && err == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

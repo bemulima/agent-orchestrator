@@ -1,0 +1,424 @@
+package practiceroute
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/google/uuid"
+)
+
+type Clock interface{ Now() time.Time }
+
+type Resolver struct {
+	Routes     repository.PracticeLearningRouteRepository
+	Readiness  repository.PracticeLearningReadinessRepository
+	Catalog    repository.PracticeLearningCatalog
+	Students   domainservice.PracticeStudentMasteryService
+	Policies   repository.PolicyRepository
+	Strategies pedagogy.Registry
+	Clock      Clock
+}
+
+// ReconcileReadiness asks Student for current objective mastery and records
+// Planner's decision for one exact, frozen route step. A repeated key replays
+// the original receipt; a new key takes a new Student mastery snapshot.
+func (resolver Resolver) ReconcileReadiness(
+	ctx context.Context,
+	idempotencyKey string,
+	input domain.PracticeLearningReadinessRequestV1,
+) (domain.PracticeLearningReadinessReceiptV1, bool, error) {
+	if resolver.Routes == nil || resolver.Readiness == nil || resolver.Students == nil || resolver.Policies == nil || resolver.Clock == nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrValidation
+	}
+	normalized, err := domain.NormalizePracticeLearningReadinessRequest(input)
+	if err != nil || idempotencyKey != strings.ToLower(strings.TrimSpace(idempotencyKey)) || !validUUID(idempotencyKey) {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrValidation
+	}
+	requestHash, err := digestJSON(normalized)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	existing, err := resolver.Readiness.GetByIdempotencyKey(ctx, normalized.TaskInstanceID, normalized.StepID, idempotencyKey)
+	if err == nil {
+		if existing.RequestHash != requestHash || existing.IdempotencyKey != idempotencyKey {
+			return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrConflict
+		}
+		return existing.Receipt, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+
+	routeRecord, err := resolver.Routes.GetByID(ctx, normalized.RouteID)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	route := routeRecord.Route
+	if route.TaskInstanceID != normalized.TaskInstanceID || route.StudentID != normalized.StudentID ||
+		route.TaskRevisionID != normalized.TaskRevisionID || route.TaskRevisionDigest != normalized.TaskRevisionDigest ||
+		route.ID != normalized.RouteID || route.RouteDigest != normalized.RouteDigest {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrConflict
+	}
+	computedRouteDigest, err := routeDigest(route)
+	if err != nil || computedRouteDigest != route.RouteDigest {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrValidation
+	}
+	var step *domain.PracticeLearningRouteStep
+	for index := range route.Steps {
+		if route.Steps[index].StepID == normalized.StepID {
+			step = &route.Steps[index]
+			break
+		}
+	}
+	if step == nil || len(step.Requirements) == 0 {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrNotFound
+	}
+
+	policy, err := resolver.Policies.GetActivePolicyBundle(ctx)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	policy, err = domain.NormalizePolicyBundle(policy)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	stepInput := domain.PracticeLearningStepInput{StepID: step.StepID}
+	for _, requirement := range step.Requirements {
+		stepInput.Requirements = append(stepInput.Requirements, domain.PracticeLearningRequirement{
+			ID: requirement.ID, Target: requirement.Target, Policy: requirement.Policy, MasteryThreshold: requirement.MasteryThreshold,
+		})
+	}
+	mastery, err := resolver.queryMastery(ctx, normalized.StudentID, uniqueRouteTargets([]domain.PracticeLearningStepInput{stepInput}))
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	masteryByTarget, err := indexRouteMastery(uniqueRouteTargets([]domain.PracticeLearningStepInput{stepInput}), mastery)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	state := struct {
+		RouteID string `json:"route_id"`
+		StepID  string `json:"step_id"`
+		Items   []any  `json:"requirements"`
+	}{RouteID: route.ID, StepID: step.StepID, Items: make([]any, 0, len(step.Requirements))}
+	ready := true
+	for _, requirement := range step.Requirements {
+		projection := masteryByTarget[domain.TargetIdentity(requirement.Target)]
+		decision := resolveRequirement(domain.PracticeLearningRequirement{
+			ID: requirement.ID, Target: requirement.Target, Policy: requirement.Policy, MasteryThreshold: requirement.MasteryThreshold,
+		}, projection, policy.MasterySkipConfidence)
+		state.Items = append(state.Items, struct {
+			ID         string              `json:"id"`
+			Target     domain.TargetRef    `json:"target"`
+			State      domain.MasteryState `json:"state"`
+			Score      float64             `json:"mastery_score"`
+			Confidence float64             `json:"confidence"`
+			Policy     string              `json:"mastery_policy_version"`
+			Decision   string              `json:"decision"`
+			Blocking   bool                `json:"blocking"`
+		}{requirement.ID, projection.Target, projection.State, projection.MasteryScore, projection.Confidence,
+			projection.PolicyVersion, string(decision.Decision), decision.Blocking})
+		if decision.Blocking {
+			ready = false
+		}
+	}
+	learnerStateDigest, err := digestJSON(state)
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	observedAt := resolver.Clock.Now().UTC()
+	decision := domain.PracticeReadinessNotReady
+	if ready {
+		decision = domain.PracticeReadinessReady
+	}
+	receipt := domain.PracticeLearningReadinessReceiptV1{
+		Schema:         domain.PracticeLearningReadinessReceiptSchemaV1,
+		ID:             uuid.NewSHA1(uuid.NameSpaceOID, []byte("practice-readiness\x00"+idempotencyKey+"\x00"+requestHash)).String(),
+		TaskInstanceID: route.TaskInstanceID, StudentID: route.StudentID, TaskRevisionID: route.TaskRevisionID,
+		TaskRevisionDigest: route.TaskRevisionDigest, RouteID: route.ID, RouteDigest: route.RouteDigest,
+		StepID: step.StepID, Decision: decision, LearnerStateDigest: learnerStateDigest,
+		MasteryPolicy: domain.StudentMasteryPolicyVersion, ObservedAt: observedAt,
+	}
+	if !domain.ValidPracticeLearningReadinessReceipt(receipt) {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrValidation
+	}
+	stored, created, err := resolver.Readiness.EnsureReadiness(ctx, domain.PracticeLearningReadinessRecord{
+		IdempotencyKey: idempotencyKey, RequestHash: requestHash, Receipt: receipt,
+	})
+	if err != nil {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, err
+	}
+	if stored.RequestHash != requestHash || stored.IdempotencyKey != idempotencyKey {
+		return domain.PracticeLearningReadinessReceiptV1{}, false, domain.ErrConflict
+	}
+	return stored.Receipt, created, nil
+}
+
+func validUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func (resolver Resolver) Resolve(
+	ctx context.Context,
+	idempotencyKey string,
+	input domain.PracticeLearningRouteRequestV1,
+) (domain.PracticeLearningRoute, bool, error) {
+	if resolver.Routes == nil || resolver.Catalog == nil || resolver.Students == nil || resolver.Policies == nil || resolver.Clock == nil {
+		return domain.PracticeLearningRoute{}, false, domain.ErrValidation
+	}
+	normalized, err := domain.NormalizePracticeLearningRouteRequest(input)
+	if err != nil || strings.TrimSpace(idempotencyKey) != normalized.TaskInstanceID {
+		return domain.PracticeLearningRoute{}, false, domain.ErrValidation
+	}
+	requestHash, err := digestJSON(normalized)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	existing, err := resolver.Routes.GetByTaskInstance(ctx, normalized.TaskInstanceID)
+	switch {
+	case err == nil:
+		if existing.RequestHash != requestHash || existing.IdempotencyKey != idempotencyKey {
+			return domain.PracticeLearningRoute{}, false, domain.ErrConflict
+		}
+		return existing.Route, false, nil
+	case !errors.Is(err, domain.ErrNotFound):
+		return domain.PracticeLearningRoute{}, false, err
+	}
+
+	policy, err := resolver.Policies.GetActivePolicyBundle(ctx)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	policy, err = domain.NormalizePolicyBundle(policy)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	strategies, err := resolver.Strategies.Select(policy.PedagogyStrategies, pedagogy.LessonContext{})
+	if err != nil || len(strategies) == 0 {
+		return domain.PracticeLearningRoute{}, false, domain.ErrValidation
+	}
+	targets := uniqueRouteTargets(normalized.Steps)
+	definitions, err := resolver.Catalog.ResolveDefinitions(ctx, targets)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	definitionByTarget, err := indexDefinitions(targets, definitions)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	mastery, err := resolver.queryMastery(ctx, normalized.StudentID, targets)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	masteryByTarget, err := indexRouteMastery(targets, mastery)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+
+	route := domain.PracticeLearningRoute{
+		Schema:         domain.PracticeLearningRouteSchemaV1,
+		ID:             uuid.NewSHA1(uuid.NameSpaceOID, []byte(normalized.TaskInstanceID+"\x00"+requestHash)).String(),
+		TaskInstanceID: normalized.TaskInstanceID, TaskRevisionID: normalized.TaskRevisionID,
+		TaskRevisionDigest: normalized.TaskRevisionDigest, StudentID: normalized.StudentID,
+		Locale: normalized.Locale, PlannerVersion: policy.PlannerVersion,
+		Steps: make([]domain.PracticeLearningRouteStep, len(normalized.Steps)), CreatedAt: resolver.Clock.Now().UTC(),
+	}
+	for stepIndex, step := range normalized.Steps {
+		resolvedStep := domain.PracticeLearningRouteStep{StepID: step.StepID, Ready: true, Requirements: make([]domain.ResolvedLearningRequirement, len(step.Requirements))}
+		for requirementIndex, requirement := range step.Requirements {
+			projection := masteryByTarget[domain.TargetIdentity(requirement.Target)]
+			resolved := resolveRequirement(requirement, projection, policy.MasterySkipConfidence)
+			if resolved.Decision != domain.RequirementSatisfied {
+				definition := definitionByTarget[domain.TargetIdentity(requirement.Target)]
+				material, materialErr := buildMaterialRef(definition.Ref, normalized.Locale, policy, strategies)
+				if materialErr != nil {
+					return domain.PracticeLearningRoute{}, false, materialErr
+				}
+				resolved.Material = &material
+			}
+			if resolved.Blocking {
+				resolvedStep.Ready = false
+			}
+			resolvedStep.Requirements[requirementIndex] = resolved
+		}
+		route.Steps[stepIndex] = resolvedStep
+	}
+	route.RouteDigest, err = routeDigest(route)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	record := domain.PracticeLearningRouteRecord{IdempotencyKey: idempotencyKey, RequestHash: requestHash, Route: route}
+	stored, created, err := resolver.Routes.Ensure(ctx, record)
+	if err != nil {
+		return domain.PracticeLearningRoute{}, false, err
+	}
+	if stored.RequestHash != requestHash || stored.IdempotencyKey != idempotencyKey {
+		return domain.PracticeLearningRoute{}, false, domain.ErrConflict
+	}
+	return stored.Route, created, nil
+}
+
+func (resolver Resolver) queryMastery(ctx context.Context, studentID string, targets []domain.TargetRef) ([]domain.TargetMastery, error) {
+	result := make([]domain.TargetMastery, 0, len(targets))
+	for start := 0; start < len(targets); start += 100 {
+		end := start + 100
+		if end > len(targets) {
+			end = len(targets)
+		}
+		batch, err := resolver.Students.QueryMastery(ctx, studentID, targets[start:end])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, batch...)
+	}
+	return result, nil
+}
+
+func uniqueRouteTargets(steps []domain.PracticeLearningStepInput) []domain.TargetRef {
+	seen := make(map[string]struct{})
+	result := make([]domain.TargetRef, 0)
+	for _, step := range steps {
+		for _, requirement := range step.Requirements {
+			identity := domain.TargetIdentity(requirement.Target)
+			if _, exists := seen[identity]; exists {
+				continue
+			}
+			seen[identity] = struct{}{}
+			result = append(result, requirement.Target)
+		}
+	}
+	return result
+}
+
+func indexDefinitions(targets []domain.TargetRef, definitions []domain.LearningTargetDefinition) (map[string]domain.LearningTargetDefinition, error) {
+	expected := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		expected[domain.TargetIdentity(target)] = struct{}{}
+	}
+	result := make(map[string]domain.LearningTargetDefinition, len(definitions))
+	for _, definition := range definitions {
+		ref, err := domain.NormalizeTargetRef(definition.Ref)
+		prerequisites, prerequisitesErr := domain.NormalizeTargetRefs(definition.Prerequisites)
+		definition.Title = strings.TrimSpace(definition.Title)
+		definition.Description = strings.TrimSpace(definition.Description)
+		identity := domain.TargetIdentity(ref)
+		if err != nil || prerequisitesErr != nil || definition.Title == "" || len(definition.Title) > 255 {
+			return nil, domain.ErrValidation
+		}
+		if _, requested := expected[identity]; !requested {
+			return nil, domain.ErrValidation
+		}
+		if _, duplicate := result[identity]; duplicate {
+			return nil, domain.ErrValidation
+		}
+		definition.Ref = ref
+		definition.Prerequisites = prerequisites
+		result[identity] = definition
+	}
+	if len(result) != len(expected) {
+		return nil, domain.ErrNotFound
+	}
+	return result, nil
+}
+
+func indexRouteMastery(targets []domain.TargetRef, mastery []domain.TargetMastery) (map[string]domain.TargetMastery, error) {
+	expected := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		expected[domain.TargetIdentity(target)] = struct{}{}
+	}
+	result := make(map[string]domain.TargetMastery, len(mastery))
+	for _, item := range mastery {
+		normalized, err := domain.NormalizeTargetMastery(item)
+		if err != nil {
+			return nil, domain.ErrValidation
+		}
+		identity := domain.TargetIdentity(normalized.Target)
+		if _, requested := expected[identity]; !requested {
+			return nil, domain.ErrValidation
+		}
+		if _, duplicate := result[identity]; duplicate {
+			return nil, domain.ErrValidation
+		}
+		result[identity] = normalized
+	}
+	if len(result) != len(expected) {
+		return nil, domain.ErrValidation
+	}
+	return result, nil
+}
+
+func resolveRequirement(requirement domain.PracticeLearningRequirement, mastery domain.TargetMastery, minimumConfidence float64) domain.ResolvedLearningRequirement {
+	result := domain.ResolvedLearningRequirement{
+		ID: requirement.ID, Target: requirement.Target, Policy: requirement.Policy,
+		MasteryThreshold: requirement.MasteryThreshold, MasteryPolicyVersion: mastery.PolicyVersion,
+	}
+	if mastery.State == domain.MasteryMastered && mastery.MasteryScore >= requirement.MasteryThreshold && mastery.Confidence >= minimumConfidence {
+		result.Decision = domain.RequirementSatisfied
+		result.DecisionReason = "objective_mastery_satisfies_threshold"
+		return result
+	}
+	switch requirement.Policy {
+	case domain.RequirementPolicyRequired:
+		result.Decision, result.DecisionReason, result.Blocking = domain.RequirementLearn, "required_gap", true
+	case domain.RequirementPolicyRecommended:
+		result.Decision, result.DecisionReason = domain.RequirementRecommend, "recommended_gap"
+	case domain.RequirementPolicyOptional:
+		result.Decision, result.DecisionReason = domain.RequirementOptional, "optional_gap"
+	case domain.RequirementPolicyAdaptive:
+		result.Decision, result.DecisionReason = domain.RequirementChallengeOrLearn, "adaptive_gap_requires_challenge_or_material"
+		result.Blocking, result.ChallengeOutAllowed = true, true
+	}
+	return result
+}
+
+func buildMaterialRef(target domain.TargetRef, locale string, policy domain.PolicyBundle, strategies []domain.PedagogyStrategyRef) (domain.LearningMaterialRef, error) {
+	identity := struct {
+		FingerprintVersion string                       `json:"fingerprint_version"`
+		Target             domain.TargetRef             `json:"target"`
+		Locale             string                       `json:"locale"`
+		PlannerVersion     string                       `json:"planner_version"`
+		PedagogyProfile    string                       `json:"pedagogy_profile"`
+		PresentationStyle  string                       `json:"presentation_style"`
+		GenerationPolicy   string                       `json:"generation_policy"`
+		Strategies         []domain.PedagogyStrategyRef `json:"pedagogy_strategies"`
+	}{domain.PracticeMaterialFingerprintVersion, target, locale, policy.PlannerVersion, policy.PedagogyProfile, policy.PresentationStyle, policy.GenerationPolicy, strategies}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		return domain.LearningMaterialRef{}, err
+	}
+	digest := sha256.Sum256(payload)
+	key := hex.EncodeToString(digest[:])
+	return domain.LearningMaterialRef{
+		Key: key, GenerationKey: uuid.NewSHA1(uuid.NameSpaceOID, []byte("practice-material\x00"+key)).String(),
+		FingerprintVersion: domain.PracticeMaterialFingerprintVersion, Target: target, Locale: locale,
+		PlannerVersion: policy.PlannerVersion, PedagogyProfile: policy.PedagogyProfile,
+		PresentationStyle: policy.PresentationStyle, GenerationPolicy: policy.GenerationPolicy,
+		PedagogyStrategies: append([]domain.PedagogyStrategyRef(nil), strategies...),
+	}, nil
+}
+
+func routeDigest(route domain.PracticeLearningRoute) (string, error) {
+	copy := route
+	copy.RouteDigest = ""
+	copy.CreatedAt = time.Time{}
+	return digestJSON(copy)
+}
+
+func digestJSON(value any) (string, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}

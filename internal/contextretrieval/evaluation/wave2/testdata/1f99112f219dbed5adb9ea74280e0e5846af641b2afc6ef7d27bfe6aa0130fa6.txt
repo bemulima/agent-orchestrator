@@ -1,0 +1,409 @@
+package courseplan
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+)
+
+type DeterministicResult struct {
+	Course            domain.GeneratedCourse
+	Fingerprint       string
+	NormalizedContext json.RawMessage
+	GapTargets        []domain.TargetRef
+}
+
+type masteryDecision struct {
+	Target        domain.TargetRef `json:"target"`
+	Decision      string           `json:"decision"`
+	PolicyVersion string           `json:"policy_version"`
+}
+
+func BuildDeterministicCourse(
+	graph domain.GoalGraph,
+	profile domain.StudentPlanningProfile,
+	mastery []domain.TargetMastery,
+	policy domain.PolicyBundle,
+	strategies pedagogy.Registry,
+) (DeterministicResult, error) {
+	return BuildDeterministicCourseForIntent(graph, profile, mastery, policy, domain.PlanningIntent{
+		Source: domain.PlanningSourceSystem, Reason: domain.PlanningReasonInitial,
+		DesiredOutcome: graph.Goal.Title,
+	}, strategies)
+}
+
+func BuildDeterministicCourseForIntent(
+	graph domain.GoalGraph,
+	profile domain.StudentPlanningProfile,
+	mastery []domain.TargetMastery,
+	policy domain.PolicyBundle,
+	intent domain.PlanningIntent,
+	strategies pedagogy.Registry,
+) (DeterministicResult, error) {
+	normalizedGraph, err := domain.NormalizeGoalGraph(graph)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	normalizedProfile, err := domain.NormalizeStudentPlanningProfile(profile)
+	if err != nil || normalizedProfile.GoalCode != normalizedGraph.Goal.Code {
+		return DeterministicResult{}, domain.ErrValidation
+	}
+	normalizedPolicy, err := domain.NormalizePolicyBundle(policy)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	if _, err := domain.NormalizePlanningIntent(intent); err != nil {
+		return DeterministicResult{}, err
+	}
+	orderedTargets, err := domain.OrderGoalTargets(normalizedGraph.Targets)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	masteryByTarget, err := indexMastery(orderedTargets, mastery)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+
+	gap := make([]domain.LearningTarget, 0, len(orderedTargets))
+	gapRefs := make([]domain.TargetRef, 0, len(orderedTargets))
+	decisions := make([]masteryDecision, 0, len(orderedTargets))
+	for _, target := range orderedTargets {
+		projection := masteryByTarget[domain.TargetIdentity(target.Ref)]
+		if projection.State == domain.MasteryMastered && projection.Confidence >= normalizedPolicy.MasterySkipConfidence {
+			decisions = append(decisions, masteryDecision{
+				Target: target.Ref, Decision: "SKIP", PolicyVersion: projection.PolicyVersion,
+			})
+			continue
+		}
+		decisions = append(decisions, masteryDecision{
+			Target: target.Ref, Decision: "INCLUDE", PolicyVersion: projection.PolicyVersion,
+		})
+		gap = append(gap, target)
+		gapRefs = append(gapRefs, target.Ref)
+	}
+	transitions := applicableTransitions(normalizedGraph.Transitions, normalizedProfile.KnownStacks, gapRefs)
+	contextJSON, fingerprint, err := courseFingerprint(
+		normalizedGraph, normalizedProfile, decisions, gapRefs, transitions, normalizedPolicy,
+	)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	course, err := buildGeneratedCourse(
+		normalizedGraph, normalizedProfile, gap, transitions, normalizedPolicy, fingerprint, strategies,
+	)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	return DeterministicResult{
+		Course: course, Fingerprint: fingerprint, NormalizedContext: contextJSON, GapTargets: gapRefs,
+	}, nil
+}
+
+// BuildDeterministicCourseForDiagnosticRoute preserves the ordinary graph and
+// mastery decision path. A route only names versioned entry pedagogy in the
+// fingerprint/context; the opaque diagnostic plan ID never participates.
+func BuildDeterministicCourseForDiagnosticRoute(graph domain.GoalGraph, profile domain.StudentPlanningProfile, mastery []domain.TargetMastery, policy domain.PolicyBundle, intent domain.PlanningIntent, route string, strategies pedagogy.Registry) (DeterministicResult, error) {
+	result, err := BuildDeterministicCourseForIntent(graph, profile, mastery, policy, intent, strategies)
+	if err != nil || route == "" {
+		return result, err
+	}
+	if route != "START_FOUNDATION" && route != "START_CORE" && route != "START_ADVANCED" {
+		return DeterministicResult{}, domain.ErrValidation
+	}
+	var context map[string]any
+	if err := json.Unmarshal(result.NormalizedContext, &context); err != nil {
+		return DeterministicResult{}, err
+	}
+	context["diagnostic_entry_route_policy"] = "diagnostic-placement-route-v1"
+	context["diagnostic_entry_route"] = route
+	raw, err := json.Marshal(context)
+	if err != nil {
+		return DeterministicResult{}, err
+	}
+	sum := sha256.Sum256(raw)
+	result.Fingerprint = hex.EncodeToString(sum[:])
+	result.NormalizedContext = raw
+	result.Course.Fingerprint = result.Fingerprint
+	for mi := range result.Course.Modules {
+		for si := range result.Course.Modules[mi].Sections {
+			for li := range result.Course.Modules[mi].Sections[si].Lessons {
+				l := &result.Course.Modules[mi].Sections[si].Lessons[li]
+				l.PedagogyStrategies = routeStrategies(l.PedagogyStrategies, route)
+			}
+		}
+	}
+	return result, nil
+}
+func routeStrategies(in []domain.PedagogyStrategyRef, route string) []domain.PedagogyStrategyRef {
+	find := func(code string) (domain.PedagogyStrategyRef, bool) {
+		for _, v := range in {
+			if v.Code == code {
+				return v, true
+			}
+		}
+		return domain.PedagogyStrategyRef{}, false
+	}
+	out := make([]domain.PedagogyStrategyRef, 0, len(in))
+	add := func(code string) {
+		if v, ok := find(code); ok {
+			out = append(out, v)
+		}
+	}
+	switch route {
+	case "START_FOUNDATION":
+		add("explicit_instruction")
+		add("retrieval_practice")
+	case "START_CORE":
+		add("retrieval_practice")
+		add("explicit_instruction")
+	case "START_ADVANCED":
+		add("retrieval_practice")
+		add("prior_knowledge_bridge")
+		add("compare_contrast")
+	}
+	for _, v := range in {
+		seen := false
+		for _, existing := range out {
+			if existing.Code == v.Code && existing.Version == v.Version {
+				seen = true
+			}
+		}
+		if !seen && !(route == "START_ADVANCED" && v.Code == "explicit_instruction") {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return in
+	}
+	return out
+}
+
+func indexMastery(
+	targets []domain.LearningTarget,
+	inputs []domain.TargetMastery,
+) (map[string]domain.TargetMastery, error) {
+	if len(inputs) != len(targets) {
+		return nil, domain.ErrValidation
+	}
+	allowed := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		allowed[domain.TargetIdentity(target.Ref)] = struct{}{}
+	}
+	byTarget := make(map[string]domain.TargetMastery, len(inputs))
+	for _, input := range inputs {
+		normalized, err := domain.NormalizeTargetMastery(input)
+		identity := domain.TargetIdentity(normalized.Target)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := allowed[identity]; !exists {
+			return nil, domain.ErrValidation
+		}
+		if _, duplicate := byTarget[identity]; duplicate {
+			return nil, domain.ErrValidation
+		}
+		byTarget[identity] = normalized
+	}
+	if len(byTarget) != len(targets) {
+		return nil, domain.ErrValidation
+	}
+	return byTarget, nil
+}
+
+func applicableTransitions(
+	inputs []domain.TransitionKnowledge,
+	knownStacks []string,
+	gap []domain.TargetRef,
+) []domain.TransitionKnowledge {
+	stackSet := make(map[string]struct{}, len(knownStacks))
+	for _, stack := range knownStacks {
+		stackSet[stack] = struct{}{}
+	}
+	gapSet := make(map[string]struct{}, len(gap))
+	for _, target := range gap {
+		gapSet[domain.TargetIdentity(target)] = struct{}{}
+	}
+	result := make([]domain.TransitionKnowledge, 0)
+	for _, input := range inputs {
+		_, hasStack := stackSet[input.SourceStack]
+		_, hasGap := gapSet[domain.TargetIdentity(input.Target)]
+		if hasStack && hasGap {
+			result = append(result, input)
+		}
+	}
+	sort.Slice(result, func(left, right int) bool {
+		leftIdentity := result[left].SourceStack + "\x00" + domain.TargetIdentity(result[left].Target)
+		rightIdentity := result[right].SourceStack + "\x00" + domain.TargetIdentity(result[right].Target)
+		return leftIdentity < rightIdentity
+	})
+	return result
+}
+
+func courseFingerprint(
+	graph domain.GoalGraph,
+	profile domain.StudentPlanningProfile,
+	mastery []masteryDecision,
+	gap []domain.TargetRef,
+	transitions []domain.TransitionKnowledge,
+	policy domain.PolicyBundle,
+) (json.RawMessage, string, error) {
+	input := struct {
+		FingerprintVersion string                       `json:"fingerprint_version"`
+		GoalCode           string                       `json:"goal_code"`
+		GoalVersion        string                       `json:"goal_version"`
+		GraphVersion       string                       `json:"graph_version"`
+		ProfileVersion     string                       `json:"profile_version"`
+		DirectionCode      string                       `json:"direction_code"`
+		Experience         string                       `json:"self_assessed_experience"`
+		KnownStacks        []string                     `json:"known_stacks"`
+		DesiredStacks      []string                     `json:"desired_stacks"`
+		Language           string                       `json:"language"`
+		Mastery            []masteryDecision            `json:"mastery"`
+		Gap                []domain.TargetRef           `json:"gap"`
+		Transitions        []domain.TransitionKnowledge `json:"transitions"`
+		PlannerVersion     string                       `json:"planner_version"`
+		PedagogyProfile    string                       `json:"pedagogy_profile"`
+		PresentationStyle  string                       `json:"presentation_style"`
+		GenerationPolicy   string                       `json:"generation_policy"`
+	}{
+		FingerprintVersion: domain.CourseFingerprintVersion,
+		GoalCode:           graph.Goal.Code, GoalVersion: graph.Goal.Version, GraphVersion: graph.Goal.GraphVersion,
+		ProfileVersion: profile.ProfileVersion, DirectionCode: profile.DirectionCode,
+		Experience:    profile.SelfAssessedExperience,
+		KnownStacks:   append([]string(nil), profile.KnownStacks...),
+		DesiredStacks: append([]string(nil), profile.DesiredStacks...), Language: profile.PreferredLanguage,
+		Mastery: mastery, Gap: append([]domain.TargetRef(nil), gap...), Transitions: transitions,
+		PlannerVersion: policy.PlannerVersion, PedagogyProfile: policy.PedagogyProfile,
+		PresentationStyle: policy.PresentationStyle, GenerationPolicy: policy.GenerationPolicy,
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return nil, "", err
+	}
+	digest := sha256.Sum256(payload)
+	return payload, hex.EncodeToString(digest[:]), nil
+}
+
+func buildGeneratedCourse(
+	graph domain.GoalGraph,
+	profile domain.StudentPlanningProfile,
+	targets []domain.LearningTarget,
+	transitions []domain.TransitionKnowledge,
+	policy domain.PolicyBundle,
+	fingerprint string,
+	strategies pedagogy.Registry,
+) (domain.GeneratedCourse, error) {
+	type sectionKey struct{ module, section string }
+	type lessonKey struct{ module, section, lesson string }
+	moduleIndex := make(map[string]int)
+	sectionIndex := make(map[sectionKey]int)
+	lessonIndex := make(map[lessonKey]int)
+	modules := make([]domain.PlannedModule, 0)
+	for _, target := range targets {
+		currentModuleIndex, moduleExists := moduleIndex[target.ModuleCode]
+		if !moduleExists {
+			currentModuleIndex = len(modules)
+			moduleIndex[target.ModuleCode] = currentModuleIndex
+			modules = append(modules, domain.PlannedModule{
+				Code: target.ModuleCode, Title: target.ModuleTitle, Order: target.ModuleOrder,
+				Sections: make([]domain.PlannedSection, 0),
+			})
+		}
+		key := sectionKey{module: target.ModuleCode, section: target.SectionCode}
+		currentSectionIndex, sectionExists := sectionIndex[key]
+		if !sectionExists {
+			currentSectionIndex = len(modules[currentModuleIndex].Sections)
+			sectionIndex[key] = currentSectionIndex
+			modules[currentModuleIndex].Sections = append(modules[currentModuleIndex].Sections, domain.PlannedSection{
+				Code: target.SectionCode, Title: target.SectionTitle, Order: target.SectionOrder,
+				Lessons: make([]domain.PlannedLesson, 0),
+			})
+		}
+		lessonTransitions := make([]domain.TransitionKnowledge, 0)
+		for _, transition := range transitions {
+			if domain.TargetIdentity(transition.Target) == domain.TargetIdentity(target.Ref) {
+				lessonTransitions = append(lessonTransitions, transition)
+			}
+		}
+		section := &modules[currentModuleIndex].Sections[currentSectionIndex]
+		currentLessonKey := lessonKey{module: target.ModuleCode, section: target.SectionCode, lesson: target.LessonCode}
+		currentLessonIndex, lessonExists := lessonIndex[currentLessonKey]
+		if !lessonExists {
+			currentLessonIndex = len(section.Lessons)
+			lessonIndex[currentLessonKey] = currentLessonIndex
+			section.Lessons = append(section.Lessons, domain.PlannedLesson{
+				Code: target.LessonCode, Title: target.LessonTitle, Excerpt: target.LessonExcerpt,
+				Order: target.LessonOrder, Status: domain.LessonStatusPlanned,
+				Targets:             []domain.TargetRef{target.Ref},
+				Prerequisites:       append([]domain.TargetRef(nil), target.Prerequisites...),
+				TransitionKnowledge: lessonTransitions,
+			})
+			continue
+		}
+		lesson := &section.Lessons[currentLessonIndex]
+		lesson.Targets = appendUniqueTargets(lesson.Targets, target.Ref)
+		for _, prerequisite := range target.Prerequisites {
+			lesson.Prerequisites = appendUniqueTargets(lesson.Prerequisites, prerequisite)
+		}
+		lesson.TransitionKnowledge = append(lesson.TransitionKnowledge, lessonTransitions...)
+	}
+	for moduleIndex := range modules {
+		module := &modules[moduleIndex]
+		sort.SliceStable(module.Sections, func(left, right int) bool {
+			if module.Sections[left].Order != module.Sections[right].Order {
+				return module.Sections[left].Order < module.Sections[right].Order
+			}
+			return module.Sections[left].Code < module.Sections[right].Code
+		})
+		for sectionIndex := range module.Sections {
+			section := &module.Sections[sectionIndex]
+			sort.SliceStable(section.Lessons, func(left, right int) bool {
+				if section.Lessons[left].Order != section.Lessons[right].Order {
+					return section.Lessons[left].Order < section.Lessons[right].Order
+				}
+				return section.Lessons[left].Code < section.Lessons[right].Code
+			})
+			for lessonIndex := range section.Lessons {
+				lesson := &section.Lessons[lessonIndex]
+				lesson.Targets = domain.SortTargetRefs(lesson.Targets)
+				lesson.Prerequisites = domain.SortTargetRefs(lesson.Prerequisites)
+				selected, err := strategies.Select(policy.PedagogyStrategies, pedagogy.LessonContext{
+					Targets: lesson.Targets, TransitionKnowledge: lesson.TransitionKnowledge,
+					SelfAssessedExperience: profile.SelfAssessedExperience,
+				})
+				if err != nil {
+					return domain.GeneratedCourse{}, err
+				}
+				lesson.PedagogyStrategies = selected
+			}
+		}
+	}
+	sort.SliceStable(modules, func(left, right int) bool {
+		if modules[left].Order != modules[right].Order {
+			return modules[left].Order < modules[right].Order
+		}
+		return modules[left].Code < modules[right].Code
+	})
+	return domain.GeneratedCourse{
+		Fingerprint: fingerprint, FingerprintVersion: domain.CourseFingerprintVersion,
+		GoalCode: graph.Goal.Code, GoalVersion: graph.Goal.Version, Title: graph.Goal.Title,
+		Description: graph.Goal.Description, Language: profile.PreferredLanguage,
+		Status: domain.CourseStatusActiveBuilding, CatalogVisible: false, PlannerVersion: policy.PlannerVersion,
+		PedagogyProfile: policy.PedagogyProfile, PresentationStyle: policy.PresentationStyle,
+		GenerationPolicy: policy.GenerationPolicy, Modules: modules,
+	}, nil
+}
+
+func appendUniqueTargets(inputs []domain.TargetRef, candidate domain.TargetRef) []domain.TargetRef {
+	identity := domain.TargetIdentity(candidate)
+	for _, input := range inputs {
+		if domain.TargetIdentity(input) == identity {
+			return inputs
+		}
+	}
+	return append(inputs, candidate)
+}

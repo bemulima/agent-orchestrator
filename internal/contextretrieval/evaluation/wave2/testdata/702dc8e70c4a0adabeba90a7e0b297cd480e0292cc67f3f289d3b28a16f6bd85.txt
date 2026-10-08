@@ -1,0 +1,551 @@
+package postgres_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	domainservice "github.com/bemulima/ms-go-learning-planner/internal/domain/service"
+	aipromptclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/aiprompt"
+	courseclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/course"
+	studentclient "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/http/student"
+	plannerpostgres "github.com/bemulima/ms-go-learning-planner/internal/infrastructure/persistence/postgres"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/onboardingpathexecution"
+	"github.com/bemulima/ms-go-learning-planner/internal/usecase/pedagogy"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func TestS9OnboardingPathWorkerResumesDurableEffectsWithRealPostgresAndHTTPAdapters(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("PLANNER_S9_E2E_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("PLANNER_S9_E2E_DATABASE_URL is not configured")
+	}
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(config.ConnConfig.Database, "_test") {
+		t.Fatalf("PLANNER_S9_E2E_DATABASE_URL must target a database ending in _test, got %q", config.ConnConfig.Database)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var existing int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM onboarding_path_execution`).Scan(&existing); err != nil {
+		t.Fatal(err)
+	}
+	if existing != 0 {
+		t.Fatalf("PLANNER_S9_E2E_DATABASE_URL must be a fresh S9 test database, found %d executions", existing)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	handoff := domain.OnboardingPlanHandoffRecord{
+		HandoffID:      uuid.NewString(),
+		StudentID:      uuid.NewString(),
+		IdempotencyKey: uuid.NewString(),
+		RequestHash:    strings.Repeat("c", 64),
+		StateRef: domain.StudentReadinessStateRef{
+			Kind:    domain.StudentReadinessStateDraft,
+			Version: 1,
+		},
+		DialogID:     uuid.NewString(),
+		TeacherJobID: uuid.NewString(),
+		Goal: domain.LearningReadinessGoal{
+			Code:         "programming.foundation",
+			Version:      "v1",
+			GraphVersion: "programming-foundation-graph-v1",
+		},
+		ReadinessObservedAt: now,
+		CreatedAt:           now,
+	}
+	_, err = pool.Exec(ctx, `INSERT INTO teacher_onboarding_plan_handoff(
+		handoff_id,student_id,idempotency_key,request_hash,state_ref_kind,state_ref_version,
+		dialog_id,teacher_job_id,goal_code,goal_version,graph_version,readiness_observed_at,created_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		handoff.HandoffID, handoff.StudentID, handoff.IdempotencyKey, handoff.RequestHash,
+		handoff.StateRef.Kind, handoff.StateRef.Version, handoff.DialogID, handoff.TeacherJobID,
+		handoff.Goal.Code, handoff.Goal.Version, handoff.Goal.GraphVersion,
+		handoff.ReadinessObservedAt, handoff.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	harness := newS9PlannerHTTPHarness(t, handoff)
+	server := httptest.NewServer(harness)
+	defer server.Close()
+	httpClient := server.Client()
+	httpClient.Timeout = 2 * time.Second
+	student := studentclient.Client{BaseURL: server.URL, ReadToken: "student-read", WriteToken: "student-write", HTTPClient: httpClient}
+	store := plannerpostgres.Store{Pool: pool}
+	crashingStore := &s9CrashAfterLessonStore{Store: store, crashed: make(map[int]bool)}
+	clock := &s9MutableClock{now: now}
+	processor := onboardingpathexecution.Processor{
+		Enabled: true, Executions: crashingStore, Graphs: store, Policies: store,
+		Readiness: student, Students: student,
+		Courses:   courseclient.Client{BaseURL: server.URL, InternalToken: "course-token", HTTPClient: httpClient},
+		Generator: aipromptclient.Client{BaseURL: server.URL, InternalToken: "ai-token", HTTPClient: httpClient},
+		IDs:       s9UUIDGenerator{}, Clock: clock, Strategies: pedagogy.NewDefaultRegistry(),
+		LeaseTTL: 5 * time.Minute, MaxAttempts: 32,
+	}
+
+	var terminal bool
+	for attempt := 0; attempt < 32; attempt++ {
+		processed, processErr := processor.ProcessNext(ctx)
+		if !processed {
+			t.Fatalf("worker stopped before terminal state on attempt %d: %v", attempt, processErr)
+		}
+		if processErr != nil && !strings.Contains(processErr.Error(), "CONTENT_GENERATION_UNAVAILABLE") &&
+			!strings.Contains(processErr.Error(), "COURSE_UNAVAILABLE") &&
+			!strings.Contains(processErr.Error(), "MATERIALIZATION_UNAVAILABLE") {
+			t.Fatalf("unexpected worker error on attempt %d: %v", attempt, processErr)
+		}
+		clock.Advance(10 * time.Minute)
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM onboarding_path_execution WHERE handoff_id=$1`, handoff.HandoffID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if domain.IsOnboardingExecutionTerminal(status) {
+			terminal = true
+			break
+		}
+	}
+	if !terminal {
+		t.Fatal("worker did not reach a terminal state")
+	}
+
+	executionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("planner-onboarding-path-execution:"+handoff.HandoffID)).String()
+	var status, courseID, pathID, firstLessonID, commandHash string
+	var lessonEvidence, outboxEvents int
+	if err := pool.QueryRow(ctx, `SELECT status,course_id::text,learning_path_id::text,first_lesson_id::text,student_command_hash
+		FROM onboarding_path_execution WHERE execution_id=$1`, executionID).Scan(&status, &courseID, &pathID, &firstLessonID, &commandHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM onboarding_path_execution_lesson_content WHERE execution_id=$1`, executionID).Scan(&lessonEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM planner_outbox WHERE correlation_id=$1 AND subject=$2`, executionID, domain.SubjectOnboardingPathOutcome).Scan(&outboxEvents); err != nil {
+		t.Fatal(err)
+	}
+	if status != domain.OnboardingExecutionPathReady || courseID != harness.courseID || pathID != harness.pathID ||
+		firstLessonID != harness.firstLessonID || commandHash == "" || lessonEvidence != harness.lessonCount || outboxEvents != 1 {
+		t.Fatalf("unexpected durable result status=%s course=%s path=%s first=%s command_hash=%q lessons=%d outbox=%d",
+			status, courseID, pathID, firstLessonID, commandHash, lessonEvidence, outboxEvents)
+	}
+	harness.Assert(t, crashingStore)
+	assertS9ReadinessTerminalOutcome(t, ctx, pool, domain.OnboardingExecutionActivePathExists)
+	assertS9ReadinessTerminalOutcome(t, ctx, pool, domain.OnboardingExecutionStateChanged)
+}
+
+func assertS9ReadinessTerminalOutcome(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wantStatus string) {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	handoff := domain.OnboardingPlanHandoffRecord{
+		HandoffID: uuid.NewString(), StudentID: uuid.NewString(), IdempotencyKey: uuid.NewString(), RequestHash: strings.Repeat("d", 64),
+		StateRef: domain.StudentReadinessStateRef{Kind: domain.StudentReadinessStateDraft, Version: 1},
+		DialogID: uuid.NewString(), TeacherJobID: uuid.NewString(),
+		Goal:                domain.LearningReadinessGoal{Code: "programming.foundation", Version: "v1", GraphVersion: "programming-foundation-graph-v1"},
+		ReadinessObservedAt: now, CreatedAt: now,
+	}
+	_, err := pool.Exec(ctx, `INSERT INTO teacher_onboarding_plan_handoff(
+		handoff_id,student_id,idempotency_key,request_hash,state_ref_kind,state_ref_version,
+		dialog_id,teacher_job_id,goal_code,goal_version,graph_version,readiness_observed_at,created_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		handoff.HandoffID, handoff.StudentID, handoff.IdempotencyKey, handoff.RequestHash,
+		handoff.StateRef.Kind, handoff.StateRef.Version, handoff.DialogID, handoff.TeacherJobID,
+		handoff.Goal.Code, handoff.Goal.Version, handoff.Goal.GraphVersion,
+		handoff.ReadinessObservedAt, handoff.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downstreamWrites := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/internal/students/"+handoff.StudentID+"/planning-readiness" {
+			downstreamWrites++
+			http.NotFound(writer, request)
+			return
+		}
+		stateRef := handoff.StateRef
+		response := map[string]any{
+			"schema": "student-planning-readiness-snapshot.v1", "student_id": handoff.StudentID,
+			"state_ref":       stateRef,
+			"learning_intent": map[string]any{"code": "learn_programming", "source": "onboarding_goal_code.v1", "provenance": "accepted_student_draft"},
+			"profile": map[string]any{
+				"known_stacks": map[string]any{"state": "unanswered"}, "desired_stacks": map[string]any{"state": "unanswered"},
+				"preferred_language": map[string]any{"code": "ru", "provenance": "explicit_ui"},
+				"content_language":   map[string]any{"code": "ru", "provenance": "explicit_ui", "source": "preferred_language"},
+			},
+		}
+		if wantStatus == domain.OnboardingExecutionActivePathExists {
+			response["active_path"] = map[string]any{
+				"learning_path_id": uuid.NewString(), "version": 1, "course_id": uuid.NewString(),
+				"goal_code": "programming.foundation", "status": "ACTIVE",
+			}
+		} else {
+			stateRef.Version++
+			response["state_ref"] = stateRef
+		}
+		writeS9JSON(writer, http.StatusOK, response)
+	}))
+	defer server.Close()
+	httpClient := server.Client()
+	httpClient.Timeout = 2 * time.Second
+	student := studentclient.Client{BaseURL: server.URL, ReadToken: "student-read", WriteToken: "student-write", HTTPClient: httpClient}
+	store := plannerpostgres.Store{Pool: pool}
+	processor := onboardingpathexecution.Processor{
+		Enabled: true, Executions: store, Graphs: store, Policies: store, Readiness: student, Students: student,
+		Courses:   courseclient.Client{BaseURL: server.URL, InternalToken: "course-token", HTTPClient: httpClient},
+		Generator: aipromptclient.Client{BaseURL: server.URL, InternalToken: "ai-token", HTTPClient: httpClient},
+		IDs:       s9UUIDGenerator{}, Clock: &s9MutableClock{now: now}, Strategies: pedagogy.NewDefaultRegistry(), LeaseTTL: time.Minute, MaxAttempts: 3,
+	}
+	processed, err := processor.ProcessNext(ctx)
+	if err != nil || !processed {
+		t.Fatalf("terminal readiness outcome %s processed=%v err=%v", wantStatus, processed, err)
+	}
+	var status string
+	var events int
+	if err := pool.QueryRow(ctx, `SELECT status FROM onboarding_path_execution WHERE handoff_id=$1`, handoff.HandoffID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	executionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("planner-onboarding-path-execution:"+handoff.HandoffID)).String()
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM planner_outbox WHERE correlation_id=$1 AND subject=$2`, executionID, domain.SubjectOnboardingPathOutcome).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if status != wantStatus || events != 1 || downstreamWrites != 0 {
+		t.Fatalf("terminal readiness status=%s events=%d downstream_writes=%d", status, events, downstreamWrites)
+	}
+}
+
+type s9CrashAfterLessonStore struct {
+	plannerpostgres.Store
+	mu      sync.Mutex
+	crashed map[int]bool
+}
+
+func (store *s9CrashAfterLessonStore) CheckpointOnboardingPathLessonContent(
+	ctx context.Context,
+	execution domain.OnboardingPathExecution,
+	token string,
+	item domain.OnboardingPathLessonContent,
+) error {
+	if err := store.Store.CheckpointOnboardingPathLessonContent(ctx, execution, token, item); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.crashed[item.LessonIndex] {
+		store.crashed[item.LessonIndex] = true
+		return errors.New("simulated process crash after durable lesson checkpoint")
+	}
+	return nil
+}
+
+var _ repository.OnboardingPathExecutionRepository = (*s9CrashAfterLessonStore)(nil)
+
+type s9MutableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *s9MutableClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *s9MutableClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	clock.now = clock.now.Add(duration)
+}
+
+type s9UUIDGenerator struct{}
+
+func (s9UUIDGenerator) NewID() string { return uuid.NewString() }
+
+type s9PlannerHTTPHarness struct {
+	handoff domain.OnboardingPlanHandoffRecord
+
+	mu                  sync.Mutex
+	admissionID         string
+	fence               int64
+	courseID            string
+	pathID              string
+	firstLessonID       string
+	lessonCount         int
+	aiRequests          map[string]int
+	aiEffects           map[string]struct{}
+	renewalKeys         map[string]int64
+	courseKey           string
+	coursePayloadHash   string
+	courseRequests      int
+	courseEffects       int
+	materializeKey      string
+	materializePayload  string
+	materializeFence    int64
+	materializeRequests int
+	materializeEffects  int
+	contractErrors      []string
+}
+
+func newS9PlannerHTTPHarness(t *testing.T, handoff domain.OnboardingPlanHandoffRecord) *s9PlannerHTTPHarness {
+	t.Helper()
+	return &s9PlannerHTTPHarness{
+		handoff: handoff, admissionID: uuid.NewString(), fence: 1, courseID: uuid.NewString(), pathID: uuid.NewString(),
+		aiRequests: make(map[string]int), aiEffects: make(map[string]struct{}), renewalKeys: make(map[string]int64),
+	}
+}
+
+func (h *s9PlannerHTTPHarness) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch {
+	case request.Method == http.MethodGet && request.URL.Path == "/internal/students/"+h.handoff.StudentID+"/planning-readiness":
+		h.serveReadiness(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/internal/students/"+h.handoff.StudentID+"/onboarding-path-admissions":
+		h.serveReserve(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/internal/students/"+h.handoff.StudentID+"/onboarding-path-admissions/"+h.admissionID+"/renewal":
+		h.serveRenewal(writer, request)
+	case request.Method == http.MethodPut && request.URL.Path == "/internal/students/"+h.handoff.StudentID+"/onboarding-path-admissions/"+h.admissionID+"/materialization":
+		h.serveMaterialization(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/internal/generated-courses":
+		h.serveCourse(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/api/v1/prompts/execute-confidential":
+		h.serveAI(writer, request)
+	default:
+		h.fail("unexpected request " + request.Method + " " + request.URL.Path)
+		http.NotFound(writer, request)
+	}
+}
+
+func (h *s9PlannerHTTPHarness) serveReadiness(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "student-read" {
+		h.fail("invalid Student read token")
+	}
+	writeS9JSON(writer, http.StatusOK, map[string]any{
+		"schema": "student-planning-readiness-snapshot.v1", "student_id": h.handoff.StudentID,
+		"state_ref":       h.handoff.StateRef,
+		"learning_intent": map[string]any{"code": "learn_programming", "source": "onboarding_goal_code.v1", "provenance": "accepted_student_draft"},
+		"profile": map[string]any{
+			"direction_code": "undecided", "self_assessed_experience": "beginner",
+			"known_stacks":       map[string]any{"state": "answered", "values": []string{}},
+			"desired_stacks":     map[string]any{"state": "unanswered"},
+			"preferred_language": map[string]any{"code": "ru", "provenance": "explicit_ui"},
+			"content_language":   map[string]any{"code": "ru", "provenance": "explicit_ui", "source": "preferred_language"},
+		},
+	})
+}
+
+func (h *s9PlannerHTTPHarness) serveReserve(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "student-write" {
+		h.fail("invalid Student write token")
+	}
+	executionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("planner-onboarding-path-execution:"+h.handoff.HandoffID)).String()
+	writeS9JSON(writer, http.StatusCreated, h.admissionResponse(executionID, false))
+}
+
+func (h *s9PlannerHTTPHarness) serveRenewal(writer http.ResponseWriter, request *http.Request) {
+	key := request.Header.Get("Idempotency-Key")
+	if storedFence, replay := h.renewalKeys[key]; replay {
+		currentFence := h.fence
+		h.fence = storedFence
+		writeS9JSON(writer, http.StatusOK, h.admissionResponse(h.executionID(), true))
+		h.fence = currentFence
+		return
+	}
+	var body struct {
+		ExecutionID string `json:"execution_id"`
+		Fence       int64  `json:"fence"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExecutionID != h.executionID() || body.Fence != h.fence {
+		h.fail(fmt.Sprintf("invalid renewal body: %#v err=%v", body, err))
+		writeS9JSON(writer, http.StatusConflict, map[string]any{"error": map[string]any{"code": "state_changed"}})
+		return
+	}
+	h.fence++
+	h.renewalKeys[key] = h.fence
+	writeS9JSON(writer, http.StatusCreated, h.admissionResponse(body.ExecutionID, false))
+}
+
+func (h *s9PlannerHTTPHarness) serveMaterialization(writer http.ResponseWriter, request *http.Request) {
+	raw, _ := readS9Body(request)
+	h.materializeRequests++
+	key := request.Header.Get("Idempotency-Key")
+	if h.materializeKey == "" {
+		h.materializeKey, h.materializePayload = key, string(raw)
+		var body struct {
+			Fence int64 `json:"fence"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil || body.Fence != h.fence {
+			h.fail(fmt.Sprintf("invalid materialization fence: %#v err=%v", body, err))
+		}
+		h.materializeFence = body.Fence
+		h.materializeEffects++
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if key != h.materializeKey || string(raw) != h.materializePayload {
+		h.fail("materialization retry changed idempotency key or payload")
+		writeS9JSON(writer, http.StatusConflict, map[string]any{"error": map[string]any{"code": "idempotency_conflict"}})
+		return
+	}
+	writeS9JSON(writer, http.StatusOK, map[string]any{
+		"schema": "student-onboarding-path-materialization.v1", "admission_id": h.admissionID,
+		"status": "MATERIALIZED", "course_id": h.courseID, "assignment_id": uuid.NewSHA1(uuid.NameSpaceOID, []byte("assignment:"+h.materializeKey)).String(),
+		"learning_path_id": h.pathID, "first_lesson_id": h.firstLessonID,
+		"learning_path_version": 1, "journey_version": 1, "replayed": true,
+	})
+}
+
+func (h *s9PlannerHTTPHarness) serveCourse(writer http.ResponseWriter, request *http.Request) {
+	raw, _ := readS9Body(request)
+	h.courseRequests++
+	key := request.Header.Get("Idempotency-Key")
+	hash := s9Hash(raw)
+	if h.courseKey == "" {
+		h.courseKey, h.coursePayloadHash = key, hash
+		h.courseEffects++
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if key != h.courseKey || hash != h.coursePayloadHash {
+		h.fail("Course retry changed idempotency key or payload")
+		writer.WriteHeader(http.StatusConflict)
+		return
+	}
+	var course domain.GeneratedCourse
+	if err := json.Unmarshal(raw, &course); err != nil {
+		h.fail("invalid generated Course JSON")
+		writer.WriteHeader(http.StatusUnprocessableEntity)
+		return
+	}
+	bindings := make([]domain.CourseLessonBinding, 0)
+	for _, module := range course.Modules {
+		for _, section := range module.Sections {
+			for _, lesson := range section.Lessons {
+				bindings = append(bindings, domain.CourseLessonBinding{
+					LessonID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("course-lesson:"+h.courseID+":"+lesson.Code)).String(),
+					Order:    len(bindings), Targets: lesson.Targets,
+				})
+			}
+		}
+	}
+	h.lessonCount = len(bindings)
+	if len(bindings) > 0 {
+		h.firstLessonID = bindings[0].LessonID
+	}
+	writeS9JSON(writer, http.StatusOK, domain.EnsureCourseResult{CourseID: h.courseID, Reused: false, Lessons: bindings})
+}
+
+func (h *s9PlannerHTTPHarness) serveAI(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Internal-Token") != "ai-token" {
+		h.fail("invalid AI Prompt token")
+	}
+	var body struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		TemplateCode   string `json:"template_code"`
+		LanguageCode   string `json:"language_code"`
+		Variables      struct {
+			Lesson domain.PlannedLesson `json:"lesson_plan"`
+		} `json:"variables"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.TemplateCode != "course.lesson-content.v1" || body.LanguageCode != "ru" {
+		h.fail(fmt.Sprintf("invalid AI Prompt request: %#v err=%v", body, err))
+		writer.WriteHeader(http.StatusUnprocessableEntity)
+		return
+	}
+	h.aiRequests[body.IdempotencyKey]++
+	h.aiEffects[body.IdempotencyKey] = struct{}{}
+	createdAt := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
+	writeS9JSON(writer, http.StatusOK, map[string]any{
+		"execution_id":    uuid.NewSHA1(uuid.NameSpaceOID, []byte("ai:"+body.IdempotencyKey)).String(),
+		"idempotency_key": body.IdempotencyKey, "template_code": "course.lesson-content.v1", "template_version": 1,
+		"provider_code": "fake", "provider_model": "fake-s9", "language_code": "ru", "response_schema_code": "course.lesson-content.v1",
+		"parsed_response": domainservice.GeneratedLessonContent{
+			DescriptionMarkdown: "Описание " + body.Variables.Lesson.Code,
+			Examples:            []domain.PlannedExample{{Title: "Пример", DescriptionMarkdown: "Описание примера", Stacks: []string{"go"}, TargetConcepts: []string{"programming"}}},
+			KnowledgeChecks:     []domain.PlannedTask{{Title: "Проверка", DescriptionMarkdown: "Вопрос", ExpectedAnswers: []string{"Ответ"}}},
+		},
+		"cached": false, "created_at": createdAt, "expires_at": createdAt.Add(24 * time.Hour),
+	})
+}
+
+func (h *s9PlannerHTTPHarness) executionID() string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("planner-onboarding-path-execution:"+h.handoff.HandoffID)).String()
+}
+
+func (h *s9PlannerHTTPHarness) admissionResponse(executionID string, replayed bool) map[string]any {
+	return map[string]any{
+		"schema": "student-onboarding-path-admission.v1", "admission_id": h.admissionID,
+		"student_id": h.handoff.StudentID, "handoff_id": h.handoff.HandoffID, "execution_id": executionID,
+		"state_ref": h.handoff.StateRef, "goal": h.handoff.Goal, "status": "RESERVED", "fence": h.fence,
+		"expires_at": time.Now().UTC().Add(time.Hour), "replayed": replayed,
+	}
+}
+
+func (h *s9PlannerHTTPHarness) fail(message string) {
+	h.contractErrors = append(h.contractErrors, message)
+}
+
+func (h *s9PlannerHTTPHarness) Assert(t *testing.T, crashingStore *s9CrashAfterLessonStore) {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	crashingStore.mu.Lock()
+	defer crashingStore.mu.Unlock()
+	if len(h.contractErrors) != 0 {
+		t.Fatalf("HTTP contract errors: %v", h.contractErrors)
+	}
+	if h.lessonCount < 1 || len(h.aiEffects) != h.lessonCount || len(crashingStore.crashed) != h.lessonCount {
+		t.Fatalf("lesson evidence effects=%d crashes=%d course_lessons=%d", len(h.aiEffects), len(crashingStore.crashed), h.lessonCount)
+	}
+	for key, calls := range h.aiRequests {
+		if calls != 1 {
+			t.Fatalf("AI key %s called %d times after durable checkpoint", key, calls)
+		}
+	}
+	if h.courseEffects != 1 || h.courseRequests != 2 || h.courseKey == "" || h.coursePayloadHash == "" {
+		t.Fatalf("Course effects=%d requests=%d key=%q hash=%q", h.courseEffects, h.courseRequests, h.courseKey, h.coursePayloadHash)
+	}
+	if h.materializeEffects != 1 || h.materializeRequests != 2 || h.materializeKey == "" || h.materializePayload == "" || h.materializeFence < 1 {
+		t.Fatalf("materialization effects=%d requests=%d key=%q fence=%d", h.materializeEffects, h.materializeRequests, h.materializeKey, h.materializeFence)
+	}
+}
+
+func readS9Body(request *http.Request) ([]byte, error) {
+	var buffer bytes.Buffer
+	_, err := buffer.ReadFrom(request.Body)
+	return buffer.Bytes(), err
+}
+
+func writeS9JSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func s9Hash(raw []byte) string {
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}

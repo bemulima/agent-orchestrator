@@ -1,0 +1,260 @@
+//go:build integration
+
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/ports"
+	"github.com/bemulima/ms-go-practice-runtime/internal/application/usecase"
+	"github.com/bemulima/ms-go-practice-runtime/internal/domain"
+	"github.com/bemulima/ms-go-practice-runtime/internal/infrastructure/adapters"
+)
+
+// Delivery-only proof: real Runtime completion/outbox transaction, PostgreSQL,
+// production Student HTTP adapter and registered Student HTTP/PostgreSQL reducer.
+// Catalog/Planner/Sandbox/Validator are explicitly named existing proof doubles.
+// Their PASS is not evidence of real learner content validation or full E2E.
+func TestT11RealStudentOutboxRecovery(t *testing.T) {
+	fixtureFile := os.Getenv("T11_STUDENT_READY_FILE")
+	if fixtureFile == "" {
+		t.Skip("T11_STUDENT_READY_FILE is required")
+	}
+	var ready struct {
+		BaseURL    string `json:"base_url"`
+		RevisionID string `json:"revision_id"`
+		Fixtures   []struct {
+			StudentID string `json:"student_id"`
+			PathID    string `json:"learning_path_id"`
+		} `json:"fixtures"`
+	}
+	raw, err := os.ReadFile(fixtureFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(raw, &ready); err != nil {
+		t.Fatal(err)
+	}
+	token := os.Getenv("T11_STUDENT_INTERNAL_TOKEN")
+	if token == "" || len(ready.Fixtures) != 3 || !strings.HasPrefix(ready.BaseURL, "http://127.0.0.1:") || ready.RevisionID != testUUID(3) {
+		t.Fatal("requires owned isolated Student fixture and token")
+	}
+	repo, db := openTestRepository(t)
+	ctx := context.Background()
+	actual := adapters.NewStudentHTTPClient(ready.BaseURL, token, &http.Client{Timeout: 10 * time.Second})
+	runtime := &usecase.Runtime{Repository: repo, Revisions: proofCatalog{}, Student: actual, Evidence: actual, Planner: proofPlanner{}, Workspace: proofSandbox{}, Validator: proofValidator{}}
+	facts := make([]ports.PassedEvidence, 2)
+	payloadHashes := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		key := testUUID(int(time.Now().UnixNano() & 0x7fffffff))
+		started, _, err := runtime.Start(ctx, domain.StartCommand{StudentID: ready.Fixtures[i].StudentID, IdempotencyKey: key, TaskRevisionID: ready.RevisionID, Locale: "en", SurfaceClassification: "practice", LearningPathID: ready.Fixtures[i].PathID})
+		if err != nil {
+			t.Fatalf("actual Student reserve/open via Start fixture%d: %v", i, err)
+		}
+		if started.Instance.Status != domain.TaskInstanceInProgress {
+			t.Fatal("start not IN_PROGRESS")
+		}
+		checkpoint, _, err := runtime.Submit(ctx, domain.SubmitCommand{StudentID: started.Instance.StudentID, TaskInstanceID: key, IdempotencyKey: testUUID(int(time.Now().UnixNano() & 0x7fffffff)), Scope: "MILESTONE", MilestoneID: testUUID(5)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = runtime.ProcessValidation(ctx, ports.PendingValidation{StudentID: started.Instance.StudentID, TaskInstanceID: key, SubmissionID: checkpoint.ID, RunID: checkpoint.ValidationRuns[0].ID}); err != nil {
+			t.Fatal(err)
+		}
+		final, _, err := runtime.Submit(ctx, domain.SubmitCommand{StudentID: started.Instance.StudentID, TaskInstanceID: key, IdempotencyKey: testUUID(int(time.Now().UnixNano() & 0x7fffffff)), Scope: "FINAL"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = runtime.ProcessValidation(ctx, ports.PendingValidation{StudentID: started.Instance.StudentID, TaskInstanceID: key, SubmissionID: final.ID, RunID: final.ValidationRuns[0].ID}); err != nil {
+			t.Fatal(err)
+		}
+		saved, err := repo.GetInstance(ctx, started.Instance.StudentID, key)
+		if err != nil || saved.Status != domain.TaskInstanceCompleted || saved.FinalSubmissionID != final.ID {
+			t.Fatalf("durable completion: %+v %v", saved, err)
+		}
+		var payload []byte
+		if err = db.QueryRowContext(ctx, `SELECT payload::text FROM practice_student_evidence_outbox WHERE id=$1`, final.ID).Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		facts[i], err = usecase.DecodePassedEvidence(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(payload)
+		payloadHashes[i] = hex.EncodeToString(hash[:])
+	}
+	// A transient outage before Student, then genuine acceptance with a lost
+	// response. All successful receipts below come from the real Student owner.
+	calls := 0
+	var committedReceipt ports.EvidenceReceipt
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		isFirst := strings.Contains(r.URL.Path, "/students/"+ready.Fixtures[0].StudentID+"/") && strings.HasSuffix(r.URL.Path, "/evidence")
+		if isFirst {
+			calls++
+			if calls == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		request, err := http.NewRequestWithContext(r.Context(), r.Method, ready.BaseURL+r.URL.RequestURI(), bytes.NewReader(body))
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		request.Header = r.Header.Clone()
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		defer response.Body.Close()
+		reply, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		if isFirst && calls == 2 {
+			if response.StatusCode != 200 || json.Unmarshal(reply, &committedReceipt) != nil || !committedReceipt.Accepted {
+				t.Error("fault must happen after genuine Student accepted commit")
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = w.Write(reply)
+	}))
+	defer proxy.Close()
+	runtime.Evidence = adapters.NewStudentHTTPClient(proxy.URL, token, &http.Client{Timeout: 10 * time.Second})
+	count, dispatchErr := runtime.DispatchEvidence(ctx, 100)
+	if count != 1 || dispatchErr == nil {
+		t.Fatalf("independent student blocked by first failed fact: delivered=%d err=%v", count, dispatchErr)
+	}
+	stats := func() any {
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, ready.BaseURL+"/t11/proof/stats", nil)
+		request.Header.Set("X-Internal-Token", token)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var value any
+		if response.StatusCode != 200 || json.NewDecoder(response.Body).Decode(&value) != nil {
+			t.Fatal("actual Student stats unavailable")
+		}
+		return value
+	}
+	firstStats := stats()
+	checkPending := func(wantAttempts int) {
+		var attempts int
+		var delivered *time.Time
+		var payload []byte
+		if err := db.QueryRowContext(ctx, `SELECT attempts,delivered_at,payload::text FROM practice_student_evidence_outbox WHERE id=$1`, facts[0].EvidenceID).Scan(&attempts, &delivered, &payload); err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(payload)
+		if attempts != wantAttempts || delivered != nil || hex.EncodeToString(hash[:]) != payloadHashes[0] {
+			t.Fatalf("failed event identity/observable pending metadata lost: attempts=%d delivered=%v", attempts, delivered)
+		}
+	}
+	checkPending(1)
+	waitDue := func() {
+		var at time.Time
+		if err := db.QueryRowContext(ctx, `SELECT next_attempt_at FROM practice_student_evidence_outbox WHERE id=$1`, facts[0].EvidenceID).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		delay := time.Until(at) + 100*time.Millisecond
+		if delay > 10*time.Second {
+			t.Fatal("unexpected retry delay in two-attempt fixture")
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	waitDue()
+	runtime.Repository = NewRepository(db)
+	count, dispatchErr = runtime.DispatchEvidence(ctx, 100)
+	if count != 0 || dispatchErr == nil || !committedReceipt.Accepted {
+		t.Fatalf("lost response not kept pending: count=%d err=%v receipt=%+v", count, dispatchErr, committedReceipt)
+	}
+	checkPending(2)
+	afterCommit := stats()
+	if reflect.DeepEqual(firstStats, afterCommit) {
+		t.Fatal("Student did not commit evidence before response loss")
+	}
+	waitDue()
+	runtime = &usecase.Runtime{Repository: NewRepository(db), Evidence: adapters.NewStudentHTTPClient(ready.BaseURL, token, &http.Client{Timeout: 10 * time.Second})}
+	count, dispatchErr = runtime.DispatchEvidence(ctx, 100)
+	if count != 1 || dispatchErr != nil {
+		t.Fatalf("reconstructed owner replay failed: count=%d err=%v", count, dispatchErr)
+	}
+	afterReplay := stats()
+	if !reflect.DeepEqual(afterCommit, afterReplay) {
+		t.Fatal("exact retry changed Student evidence/mastery/completion counts")
+	}
+	for _, fact := range facts {
+		receipt, err := actual.ApplyPassedEvidence(ctx, fact)
+		if err != nil || !receipt.Accepted || receipt.EvidenceID != fact.EvidenceID || receipt.LearningActionID != fact.LearningActionID {
+			t.Fatalf("real direct exact replay: %+v %v", receipt, err)
+		}
+		if fact.EvidenceID == facts[0].EvidenceID && receipt != committedReceipt {
+			t.Fatal("exact Student receipt changed")
+		}
+	}
+	if !reflect.DeepEqual(afterReplay, stats()) {
+		t.Fatal("direct duplicate evidence changed Student counts")
+	}
+	count, err = runtime.DispatchEvidence(ctx, 100)
+	if count != 0 || err != nil {
+		t.Fatal("delivered rows redelivered")
+	}
+	var completions, outbox, delivered int
+	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM practice_task_instances WHERE status='COMPLETED'`).Scan(&completions); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRowContext(ctx, `SELECT count(*),count(delivered_at) FROM practice_student_evidence_outbox`).Scan(&outbox, &delivered); err != nil {
+		t.Fatal(err)
+	}
+	if completions != 2 || outbox != 2 || delivered != 2 {
+		t.Fatalf("durable counts: %d/%d/%d", completions, outbox, delivered)
+	}
+	for i, fact := range facts {
+		var payload []byte
+		if err = db.QueryRowContext(ctx, `SELECT payload::text FROM practice_student_evidence_outbox WHERE id=$1`, fact.EvidenceID).Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(payload)
+		if hex.EncodeToString(hash[:]) != payloadHashes[i] {
+			t.Fatal("immutable payload changed")
+		}
+	}
+	proof := map[string]any{"schema": "t11-real-student-outbox-proof.v1", "result": "PASS", "independent_student_delivered_during_outage": true, "response_loss_after_actual_student_commit": true, "exact_receipt_replay": true, "student_counts_unchanged_after_replay": true, "pending_attempts_observed": 2, "runtime_completions": completions, "outbox_rows": outbox, "delivered": delivered, "before_loss_stats": firstStats, "after_commit_stats": afterCommit, "after_replay_stats": afterReplay, "real_owners": []string{"Runtime completion/outbox PostgreSQL", "Student registered HTTP/PostgreSQL reducer"}, "doubles": []string{"Catalog", "Planner", "Sandbox", "Validator"}, "full_live_e2e": false, "restart_kind": "new repository/runtime/client objects; not OS process crash"}
+	if output := os.Getenv("T11_RESULT_FILE"); output != "" {
+		encoded, _ := json.MarshalIndent(proof, "", "  ")
+		if err = os.WriteFile(output, append(encoded, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Log(fmt.Sprintf("REAL_STUDENT_OUTBOX independent_progress=true exact_receipt=true attempts=2 completion/outbox=%d/%d full_live_e2e=false", completions, outbox))
+}

@@ -1,0 +1,163 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+)
+
+func (store Store) GetByTaskInstance(ctx context.Context, taskInstanceID string) (domain.PracticeLearningRouteRecord, error) {
+	return scanPracticeLearningRoute(store.Pool.QueryRow(ctx, `
+SELECT idempotency_key::text, request_hash, route_json
+FROM practice_learning_route_resolution
+WHERE task_instance_id=$1`, taskInstanceID))
+}
+
+func (store Store) GetByID(ctx context.Context, routeID string) (domain.PracticeLearningRouteRecord, error) {
+	return scanPracticeLearningRoute(store.Pool.QueryRow(ctx, `
+SELECT idempotency_key::text, request_hash, route_json
+FROM practice_learning_route_resolution
+WHERE id=$1`, routeID))
+}
+
+func (store Store) Ensure(ctx context.Context, record domain.PracticeLearningRouteRecord) (domain.PracticeLearningRouteRecord, bool, error) {
+	routeJSON, err := json.Marshal(record.Route)
+	if err != nil {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "practice-route:"+record.Route.TaskInstanceID); err != nil {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	existing, err := scanPracticeLearningRoute(tx.QueryRow(ctx, `
+SELECT idempotency_key::text, request_hash, route_json
+FROM practice_learning_route_resolution
+WHERE task_instance_id=$1`, record.Route.TaskInstanceID))
+	if err == nil {
+		if existing.RequestHash != record.RequestHash || existing.IdempotencyKey != record.IdempotencyKey {
+			return domain.PracticeLearningRouteRecord{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.PracticeLearningRouteRecord{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO practice_learning_route_resolution(
+    id, task_instance_id, task_revision_id, student_id, idempotency_key,
+    request_hash, route_digest, route_json, created_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		record.Route.ID, record.Route.TaskInstanceID, record.Route.TaskRevisionID, record.Route.StudentID,
+		record.IdempotencyKey, record.RequestHash, record.Route.RouteDigest, routeJSON, record.Route.CreatedAt,
+	)
+	if err != nil {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PracticeLearningRouteRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (store Store) GetByIdempotencyKey(ctx context.Context, taskInstanceID, stepID, idempotencyKey string) (domain.PracticeLearningReadinessRecord, error) {
+	return scanPracticeLearningReadiness(store.Pool.QueryRow(ctx, `
+SELECT idempotency_key::text, request_hash, receipt_json
+FROM practice_learning_readiness_receipt
+WHERE task_instance_id=$1 AND step_id=$2 AND idempotency_key=$3`, taskInstanceID, stepID, idempotencyKey))
+}
+
+func (store Store) EnsureReadiness(ctx context.Context, record domain.PracticeLearningReadinessRecord) (domain.PracticeLearningReadinessRecord, bool, error) {
+	if !domain.ValidPracticeLearningReadinessReceipt(record.Receipt) || record.RequestHash == "" || record.IdempotencyKey == "" {
+		return domain.PracticeLearningReadinessRecord{}, false, domain.ErrValidation
+	}
+	receiptJSON, err := json.Marshal(record.Receipt)
+	if err != nil {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	tx, err := store.Pool.Begin(ctx)
+	if err != nil {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	lockKey := "practice-readiness:" + record.Receipt.TaskInstanceID + ":" + record.Receipt.StepID + ":" + record.IdempotencyKey
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	existing, err := scanPracticeLearningReadiness(tx.QueryRow(ctx, `
+SELECT idempotency_key::text, request_hash, receipt_json
+FROM practice_learning_readiness_receipt
+WHERE task_instance_id=$1 AND step_id=$2 AND idempotency_key=$3`,
+		record.Receipt.TaskInstanceID, record.Receipt.StepID, record.IdempotencyKey))
+	if err == nil {
+		if existing.RequestHash != record.RequestHash || existing.IdempotencyKey != record.IdempotencyKey {
+			return domain.PracticeLearningReadinessRecord{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.PracticeLearningReadinessRecord{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO practice_learning_readiness_receipt(
+    id, task_instance_id, student_id, task_revision_id, route_id, step_id,
+    idempotency_key, request_hash, receipt_json, created_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)`,
+		record.Receipt.ID, record.Receipt.TaskInstanceID, record.Receipt.StudentID, record.Receipt.TaskRevisionID,
+		record.Receipt.RouteID, record.Receipt.StepID, record.IdempotencyKey, record.RequestHash, receiptJSON, record.Receipt.ObservedAt)
+	if err != nil {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PracticeLearningReadinessRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+type practiceRouteRow interface{ Scan(...any) error }
+
+func scanPracticeLearningRoute(row practiceRouteRow) (domain.PracticeLearningRouteRecord, error) {
+	var record domain.PracticeLearningRouteRecord
+	var routeJSON []byte
+	if err := row.Scan(&record.IdempotencyKey, &record.RequestHash, &routeJSON); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.PracticeLearningRouteRecord{}, domain.ErrNotFound
+		}
+		return domain.PracticeLearningRouteRecord{}, err
+	}
+	if err := json.Unmarshal(routeJSON, &record.Route); err != nil {
+		return domain.PracticeLearningRouteRecord{}, err
+	}
+	return record, nil
+}
+
+func scanPracticeLearningReadiness(row practiceRouteRow) (domain.PracticeLearningReadinessRecord, error) {
+	var record domain.PracticeLearningReadinessRecord
+	var receiptJSON []byte
+	if err := row.Scan(&record.IdempotencyKey, &record.RequestHash, &receiptJSON); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.PracticeLearningReadinessRecord{}, domain.ErrNotFound
+		}
+		return domain.PracticeLearningReadinessRecord{}, err
+	}
+	if err := json.Unmarshal(receiptJSON, &record.Receipt); err != nil || !domain.ValidPracticeLearningReadinessReceipt(record.Receipt) {
+		return domain.PracticeLearningReadinessRecord{}, domain.ErrValidation
+	}
+	return record, nil
+}
+
+var _ repository.PracticeLearningRouteRepository = Store{}
+var _ repository.PracticeLearningReadinessRepository = Store{}

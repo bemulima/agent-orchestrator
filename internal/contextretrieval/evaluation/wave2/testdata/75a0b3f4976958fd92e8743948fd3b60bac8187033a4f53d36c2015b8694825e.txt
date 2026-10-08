@@ -1,0 +1,236 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bemulima/ms-go-tz-planner/internal/domain"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/aiprompt"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/competency"
+	practiceclient "github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/practice"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/runtimecatalog"
+	sandboxclient "github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/sandbox"
+	validationclient "github.com/bemulima/ms-go-tz-planner/internal/infrastructure/http/validation"
+	"github.com/bemulima/ms-go-tz-planner/internal/infrastructure/persistence/memory"
+)
+
+func TestPipelineAcrossAuthenticatedHTTPContractsProducesReadyArtifact(t *testing.T) {
+	candidate := validCandidate()
+	// Simulate an untrusted provider attempting to change the v1 surface.
+	candidate.Blueprint.Classification.SurfaceClassification = domain.SurfaceClassificationProject
+	contractDigest := verificationTestDigest("b")
+	capabilitiesDigest := verificationTestDigest("c")
+	state := struct {
+		ai, discovery, competency, inspect, verify, created, deleted, staged int
+	}{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/prompts/execute-confidential", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "ai-token")
+		var input struct {
+			IdempotencyKey string         `json:"idempotency_key"`
+			TemplateCode   string         `json:"template_code"`
+			Variables      map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		catalog, catalogOK := input.Variables["learning_target_catalog"].([]any)
+		if input.TemplateCode != "practice-task.authoring-candidate.v1" || len(input.Variables) != 4 || !catalogOK || len(catalog) != 1 {
+			t.Fatalf("unexpected AI input: %#v", input)
+		}
+		state.ai++
+		writeIntegrationJSON(t, writer, http.StatusOK, map[string]any{
+			"execution_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "idempotency_key": input.IdempotencyKey,
+			"template_code": input.TemplateCode, "template_version": 2, "provider_code": "openai", "provider_model": "authoring-model",
+			"language_code": "ru", "response_schema_code": input.TemplateCode, "parsed_response": candidate,
+			"cached": false, "created_at": time.Now().UTC(), "expires_at": time.Now().UTC().Add(time.Hour),
+		})
+	})
+	mux.HandleFunc("POST /internal/learning-targets/candidates", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "learning-token")
+		var input struct {
+			Schema string   `json:"schema"`
+			Stacks []string `json:"stacks"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil || input.Schema != "learning-target-candidate-request.v1" {
+			t.Fatalf("target discovery request=%#v err=%v", input, err)
+		}
+		state.discovery++
+		writeIntegrationJSON(t, writer, http.StatusOK, map[string]any{
+			"schema": "learning-target-candidates.v1",
+			"targets": []any{domain.LearningTargetDescriptor{
+				Ref:   domain.LearningTargetRef{Type: "capability", Key: "javascript.dom-events", Version: "v1"},
+				Title: "DOM events", Description: "Handle browser events",
+			}},
+		})
+	})
+	mux.HandleFunc("POST /internal/learning-targets/resolve", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "learning-token")
+		var input struct {
+			Schema  string                     `json:"schema"`
+			Targets []domain.LearningTargetRef `json:"targets"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil || input.Schema != "learning-target-resolution-request.v1" {
+			t.Fatalf("target request=%#v err=%v", input, err)
+		}
+		state.competency++
+		writeIntegrationJSON(t, writer, http.StatusOK, map[string]any{"schema": "learning-target-resolution.v1", "resolved": input.Targets, "missing": []any{}})
+	})
+	mux.HandleFunc("GET /internal/runtime-profiles", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "sandbox-token")
+		writeIntegrationJSON(t, writer, http.StatusOK, map[string]any{
+			"schema":   "sandbox-runtime-profile-catalog.v1",
+			"profiles": []any{map[string]any{"ref": testRuntimeRef, "supported_code_structure_types": []string{"HTML_BASIC_DOCUMENT"}, "network_policy": "none"}},
+		})
+	})
+	mux.HandleFunc("POST /internal/verification-workspaces", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "sandbox-token")
+		state.created++
+		id := "verification-00000000-0000-4000-8000-" + integrationOrdinal(state.created)
+		writeIntegrationJSON(t, writer, http.StatusCreated, map[string]any{
+			"schema": "sandbox-verification-workspace.v1", "id": id, "root_path": "/workspaces/" + id,
+			"expires_at": time.Now().UTC().Add(15 * time.Minute),
+		})
+	})
+	mux.HandleFunc("DELETE /internal/verification-workspaces/{id}", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "sandbox-token")
+		if !strings.HasPrefix(request.PathValue("id"), "verification-") {
+			t.Fatalf("unsafe workspace id %q", request.PathValue("id"))
+		}
+		state.deleted++
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /api/v1/contracts/inspect", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "validation-token")
+		state.inspect++
+		writeIntegrationJSON(t, writer, http.StatusOK, map[string]any{
+			"schema": "validation-contract-inspection.v1", "contract_kind": "workspace_contract", "contract_version": 1,
+			"contract_digest": contractDigest, "capabilities_digest": capabilitiesDigest,
+			"execution_order": []string{"browser"}, "required_engines": []string{"browser.runtime"}, "missing_engines": []string{}, "runnable": true,
+		})
+	})
+	mux.HandleFunc("POST /api/v1/contracts/verify", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "validation-token")
+		var input domain.VerificationRequestV1
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		results := make([]domain.VerificationCaseResult, 0, len(input.Cases))
+		for _, item := range input.Cases {
+			expected := item.Kind == "reference"
+			resultDigest, err := jsonDigest(map[string]any{"id": item.ID, "kind": item.Kind, "passed": expected})
+			if err != nil {
+				t.Fatal(err)
+			}
+			results = append(results, domain.VerificationCaseResult{ID: item.ID, Kind: item.Kind, ExpectedPassed: expected, ActualPassed: expected, ResultDigest: resultDigest})
+		}
+		receipt := domain.VerificationReceiptV1{
+			Schema: domain.VerificationReceiptSchemaV1, BlueprintDigest: input.BlueprintDigest,
+			RuntimeProfileDigest: input.RuntimeProfileDigest, ContractDigest: contractDigest,
+			CapabilitiesDigest: capabilitiesDigest, Passed: true, Cases: results,
+			VerifiedAt: time.Now().UTC(),
+		}
+		receiptDigest, err := verificationReceiptDigest(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.ReceiptDigest = receiptDigest
+		state.verify++
+		writeIntegrationJSON(t, writer, http.StatusOK, receipt)
+	})
+	mux.HandleFunc("POST /internal/authoring/v1/task-revisions/stage", func(writer http.ResponseWriter, request *http.Request) {
+		requireIntegrationToken(t, request, "practice-token")
+		var input struct {
+			Schema             string                       `json:"schema"`
+			AuthoringJobID     string                       `json:"authoring_job_id"`
+			CandidateDigest    string                       `json:"candidate_digest"`
+			ContractDigest     string                       `json:"contract_digest"`
+			CapabilitiesDigest string                       `json:"capabilities_digest"`
+			Candidate          domain.AuthoringCandidateV1  `json:"candidate"`
+			Verification       domain.VerificationReceiptV1 `json:"verification"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		if input.Schema != "practice-task-staging-command.v1" || request.Header.Get("Idempotency-Key") != input.AuthoringJobID ||
+			input.Candidate.Blueprint.Classification.SurfaceClassification != domain.SurfaceClassificationPractice {
+			t.Fatalf("unexpected staging envelope: %#v", input)
+		}
+		candidateDigest, err := input.Candidate.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if input.CandidateDigest != candidateDigest {
+			t.Fatalf("candidate digest=%q want=%q", input.CandidateDigest, candidateDigest)
+		}
+		blueprintDigest, err := jsonDigest(input.Candidate.Blueprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.staged++
+		writeIntegrationJSON(t, writer, http.StatusCreated, map[string]any{
+			"schema": "practice-task-staging-receipt.v1", "staged_id": "22222222-2222-4222-8222-222222222222",
+			"state": "staged", "family_key": input.Candidate.Blueprint.Identity.FamilyKey,
+			"variant_key": input.Candidate.Blueprint.Identity.VariantKey, "blueprint_digest": blueprintDigest,
+			"candidate_digest": input.CandidateDigest, "authoring_job_id": input.AuthoringJobID,
+			"created": true, "created_at": time.Now().UTC(),
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	httpClient := server.Client()
+	planner := Planner{
+		Jobs:         memory.NewJobRepository(),
+		Generator:    aiprompt.Client{BaseURL: server.URL, InternalToken: "ai-token", HTTPClient: httpClient},
+		Competencies: competency.Client{BaseURL: server.URL, InternalToken: "learning-token", HTTPClient: httpClient},
+		Profiles:     runtimecatalog.Client{BaseURL: server.URL, InternalToken: "sandbox-token", HTTPClient: httpClient},
+		Validation:   validationclient.Client{BaseURL: server.URL, InternalToken: "validation-token", HTTPClient: httpClient},
+		Workspaces:   sandboxclient.Client{BaseURL: server.URL, InternalToken: "sandbox-token", HTTPClient: httpClient},
+		Stager:       practiceclient.Client{BaseURL: server.URL, StagingToken: "practice-token", HTTPClient: httpClient},
+		Policy: domain.GenerationPolicy{
+			PlannerVersion: "tz-planner-v1", GenerationPolicyVersion: "task-authoring-v1", TechnicalTaskSchema: domain.TechnicalTaskSchemaV1,
+			PromptTemplateRef: "practice-task.authoring-candidate.v1@2", Tone: "supportive_direct",
+			Methodology: "incremental_evidence_first", SkillRefs: []string{"task_analysis.v1", "step_decomposition.v1", "evaluation_design.v1"},
+		},
+	}
+	job, created, err := planner.Plan(context.Background(), "11111111-1111-4111-8111-111111111111", validRequest("Build tic-tac-toe"))
+	if err != nil {
+		t.Fatalf("pipeline: %v", err)
+	}
+	if !created || job.Status != domain.JobStatusReady || job.Artifact == nil || !job.Artifact.Verification.Passed {
+		t.Fatalf("unexpected result: created=%v job=%#v", created, job)
+	}
+	staged, err := planner.Stage(context.Background(), job.ID)
+	if err != nil || staged.Staging == nil || staged.Status != domain.JobStatusStaged || staged.Staging.StagedID == "" {
+		t.Fatalf("stage: job=%#v err=%v", staged, err)
+	}
+	if state.ai != 1 || state.discovery != 1 || state.competency != 1 || state.inspect != 1 || state.verify != 1 || state.created != 3 || state.deleted != 3 || state.staged != 1 {
+		t.Fatalf("unexpected boundary calls: %#v", state)
+	}
+}
+
+func requireIntegrationToken(t *testing.T, request *http.Request, expected string) {
+	t.Helper()
+	if request.Header.Get("X-Internal-Token") != expected {
+		t.Fatalf("token=%q want=%q path=%s", request.Header.Get("X-Internal-Token"), expected, request.URL.Path)
+	}
+}
+
+func writeIntegrationJSON(t *testing.T, writer http.ResponseWriter, status int, payload any) {
+	t.Helper()
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	if err := json.NewEncoder(writer).Encode(payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func integrationOrdinal(value int) string {
+	return []string{"000000000001", "000000000002", "000000000003"}[value-1]
+}

@@ -1,0 +1,88 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+
+	"github.com/bemulima/ms-go-learning-planner/internal/domain"
+	"github.com/bemulima/ms-go-learning-planner/internal/domain/repository"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// ProvisionDiagnosticBootstrapBinding serializes lookup and insert under a
+// table lock. The migration's append-only trigger remains a second line of
+// defense against any accidental mutable implementation.
+func (s Store) ProvisionDiagnosticBootstrapBinding(ctx context.Context, wanted domain.DiagnosticBootstrapBinding) (domain.DiagnosticBootstrapBinding, bool, error) {
+	wanted, err := domain.NormalizeDiagnosticBootstrapBinding(wanted)
+	if err != nil {
+		return domain.DiagnosticBootstrapBinding{}, false, err
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return domain.DiagnosticBootstrapBinding{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	// SHARE ROW EXCLUSIVE conflicts with INSERT/UPDATE/DELETE, so another
+	// provisioner cannot add a newer binding between this lookup and insert.
+	if _, err := tx.Exec(ctx, `LOCK TABLE diagnostic_bootstrap_binding IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return domain.DiagnosticBootstrapBinding{}, false, err
+	}
+	stored, err := latestDiagnosticBootstrapBinding(ctx, tx, wanted.GoalCode, wanted.DirectionCode)
+	if errors.Is(err, domain.ErrNotFound) {
+		stored, err = insertDiagnosticBootstrapBinding(ctx, tx, wanted)
+		if err != nil {
+			return domain.DiagnosticBootstrapBinding{}, false, err
+		}
+		if stored != wanted {
+			return domain.DiagnosticBootstrapBinding{}, false, domain.ErrValidation
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.DiagnosticBootstrapBinding{}, false, err
+		}
+		return stored, true, nil
+	}
+	if err != nil {
+		return domain.DiagnosticBootstrapBinding{}, false, err
+	}
+	if stored != wanted {
+		return domain.DiagnosticBootstrapBinding{}, false, domain.ErrConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.DiagnosticBootstrapBinding{}, false, err
+	}
+	return stored, false, nil
+}
+
+func latestDiagnosticBootstrapBinding(ctx context.Context, row pgx.Tx, goalCode, directionCode string) (domain.DiagnosticBootstrapBinding, error) {
+	var binding domain.DiagnosticBootstrapBinding
+	err := row.QueryRow(ctx, `SELECT goal_code,direction_code,course_id::text,binding_revision,policy_version,binding_digest,active,created_at FROM diagnostic_bootstrap_binding WHERE goal_code=$1 AND direction_code=$2 ORDER BY binding_revision DESC LIMIT 1`, goalCode, directionCode).Scan(
+		&binding.GoalCode, &binding.DirectionCode, &binding.CourseID, &binding.BindingRevision,
+		&binding.PolicyVersion, &binding.BindingDigest, &binding.Active, &binding.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DiagnosticBootstrapBinding{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.DiagnosticBootstrapBinding{}, err
+	}
+	return normalizeDiagnosticBootstrapBinding(binding)
+}
+
+func insertDiagnosticBootstrapBinding(ctx context.Context, row pgx.Tx, binding domain.DiagnosticBootstrapBinding) (domain.DiagnosticBootstrapBinding, error) {
+	var stored domain.DiagnosticBootstrapBinding
+	err := row.QueryRow(ctx, `INSERT INTO diagnostic_bootstrap_binding(goal_code,direction_code,binding_revision,course_id,policy_version,binding_digest,active,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING goal_code,direction_code,course_id::text,binding_revision,policy_version,binding_digest,active,created_at`, binding.GoalCode, binding.DirectionCode, binding.BindingRevision, binding.CourseID, binding.PolicyVersion, binding.BindingDigest, binding.Active, binding.CreatedAt).Scan(
+		&stored.GoalCode, &stored.DirectionCode, &stored.CourseID, &stored.BindingRevision,
+		&stored.PolicyVersion, &stored.BindingDigest, &stored.Active, &stored.CreatedAt,
+	)
+	if err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == "23505" {
+			return domain.DiagnosticBootstrapBinding{}, domain.ErrConflict
+		}
+		return domain.DiagnosticBootstrapBinding{}, err
+	}
+	return normalizeDiagnosticBootstrapBinding(stored)
+}
+
+var _ repository.DiagnosticBootstrapBindingProvisioner = Store{}
