@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/bemulima/agent-orchestrator/internal/domain"
 	"github.com/bemulima/agent-orchestrator/internal/domain/repository"
@@ -47,6 +49,16 @@ func (r *ProcessRunner) Run(
 		request.WorkingDirectory == "" || request.Prompt == "" || len(request.OutputSchema) == 0 {
 		return domain.AgentRunResponse{}, fmt.Errorf("incomplete Codex runner request: %w", domain.ErrValidation)
 	}
+	runCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+	// Each process invocation gets a fresh trusted identity, including retries.
+	request.ExecutionID = uuid.NewString()
+	if request.Attempt < 1 {
+		request.Attempt = 1
+	}
+	if deadline, ok := runCtx.Deadline(); ok {
+		request.ExecutionDeadline = deadline.UTC().Format(time.RFC3339Nano)
+	}
 	input, err := json.Marshal(request)
 	if err != nil {
 		return domain.AgentRunResponse{}, fmt.Errorf("encode Codex runner request: %w", err)
@@ -55,9 +67,9 @@ func (r *ProcessRunner) Run(
 		return domain.AgentRunResponse{}, fmt.Errorf("Codex runner request exceeds size limit: %w", domain.ErrValidation)
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	command := exec.CommandContext(runCtx, r.command[0], r.command[1:]...)
+	stopEscalation := configureRunnerProcess(command)
+	defer stopEscalation()
 	command.Stdin = bytes.NewReader(input)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -65,16 +77,26 @@ func (r *ProcessRunner) Run(
 	}
 	var stderr boundedBuffer
 	stderr.limit = maxRunnerOutput
+	stderr.onOverflow = cancel
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
 		return domain.AgentRunResponse{}, fmt.Errorf("start Codex runner: %w", err)
 	}
 
-	response, readErr := readProtocol(runCtx, stdout, request.ThreadID, onThread)
+	response, readErr := readProtocol(runCtx, stdout, request.ThreadID, request.ExecutionID, request.Attempt, onThread)
 	if readErr != nil {
 		cancel()
 	}
 	waitErr := command.Wait()
+	if err := ctx.Err(); err != nil {
+		return domain.AgentRunResponse{}, err
+	}
+	if runCtx.Err() == context.DeadlineExceeded {
+		return domain.AgentRunResponse{}, context.DeadlineExceeded
+	}
+	if stderr.exceeded {
+		return response, fmt.Errorf("Codex runner stderr exceeds output limit: %w", domain.ErrValidation)
+	}
 	if readErr != nil {
 		if message := reportedRunnerError(stderr.String()); message != "" {
 			if isTransientRunnerError(message) {
@@ -147,6 +169,8 @@ func readProtocol(
 	ctx context.Context,
 	reader io.Reader,
 	expectedThreadID string,
+	expectedExecutionID string,
+	expectedAttempt int,
 	onThread repository.AgentThreadCallback,
 ) (domain.AgentRunResponse, error) {
 	scanner := bufio.NewScanner(io.LimitReader(reader, maxRunnerOutput+1))
@@ -159,10 +183,12 @@ func readProtocol(
 			return domain.AgentRunResponse{}, err
 		}
 		var event struct {
-			Type     string                 `json:"type"`
-			ThreadID string                 `json:"thread_id"`
-			Result   json.RawMessage        `json:"result"`
-			Usage    domain.AgentTokenUsage `json:"usage"`
+			ExecutionID string                 `json:"execution_id"`
+			Attempt     int                    `json:"attempt"`
+			Type        string                 `json:"type"`
+			ThreadID    string                 `json:"thread_id"`
+			Result      json.RawMessage        `json:"result"`
+			Usage       domain.AgentTokenUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			return domain.AgentRunResponse{}, fmt.Errorf("invalid Codex runner protocol event: %w", domain.ErrValidation)
@@ -180,6 +206,10 @@ func readProtocol(
 				}
 			}
 		case "result":
+			if event.ExecutionID != expectedExecutionID || event.Attempt != expectedAttempt {
+				return domain.AgentRunResponse{}, fmt.Errorf("stale runner execution identity: %w", domain.ErrConflict)
+			}
+			response.ExecutionID, response.Attempt = event.ExecutionID, event.Attempt
 			if !threadSeen || resultSeen || event.ThreadID != response.ThreadID ||
 				len(event.Result) == 0 || len(event.Result) > maxRunnerResult || !json.Valid(event.Result) || !validTokenUsage(event.Usage) {
 				return domain.AgentRunResponse{}, fmt.Errorf("invalid Codex result event: %w", domain.ErrValidation)
@@ -206,12 +236,20 @@ func validTokenUsage(value domain.AgentTokenUsage) bool {
 }
 
 type boundedBuffer struct {
-	buffer bytes.Buffer
-	limit  int
+	buffer     bytes.Buffer
+	limit      int
+	exceeded   bool
+	onOverflow context.CancelFunc
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
 	original := len(value)
+	if original > b.limit-b.buffer.Len() {
+		if !b.exceeded && b.onOverflow != nil {
+			b.onOverflow()
+		}
+		b.exceeded = true
+	}
 	remaining := b.limit - b.buffer.Len()
 	if remaining > 0 {
 		if len(value) > remaining {

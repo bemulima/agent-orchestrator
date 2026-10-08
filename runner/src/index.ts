@@ -1,23 +1,44 @@
+import { runHardenedCertification } from "./hardened.js";
+import { assertProductionLaunch, scopedPermissionConfig } from "./sandbox.js";
 import { Codex, type ThreadOptions } from "@openai/codex-sdk";
 import {
   agentCommandEnvironment,
   consumeEvent,
   MAX_INPUT_BYTES,
   parseRequest,
+  permissionProfileForRole,
   parseStructuredResult,
   sanitizedEnvironment,
   type StreamState,
 } from "./protocol.js";
 
+// An orchestrator pipe closing must enter trusted teardown, not terminate Node
+// through an unhandled EPIPE before finally blocks can invalidate the attempt.
+if(["hardened-certification","hardened","production"].includes(process.env.CDO_SANDBOX_EXECUTION_MODE || ""))
+  for(const output of [process.stdout,process.stderr])output.on("error",()=>{process.exitCode=1;process.emit("SIGTERM");});
+
 async function main(): Promise<void> {
   const input = await readInput();
   const request = parseRequest(JSON.parse(input) as unknown);
+  if (process.env.CDO_SANDBOX_EXECUTION_MODE === "hardened-certification") {
+    await runHardenedCertification(request, value => writeLine({...value as object, execution_id:request.execution_id, attempt:request.attempt}));
+    return;
+  }
+  assertProductionLaunch(request, process.env.CDO_SANDBOX_EXECUTION_MODE);
+  if (["hardened","production"].includes(process.env.CDO_SANDBOX_EXECUTION_MODE || "")) {
+    await runHardenedCertification(request, value => writeLine({...value as object, execution_id:request.execution_id, attempt:request.attempt}));
+    return;
+  }
+  const scopedPermissions = scopedPermissionConfig(request);
   const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
   const commandEnvironment = agentCommandEnvironment(process.env);
+  const permissionProfile = request.sandbox_scope?.write_paths.length === 0 ? "cdo-read-only" : permissionProfileForRole(request.role);
   const codex = new Codex({
     apiKey,
     env: sanitizedEnvironment(process.env),
     config: {
+      ...scopedPermissions,
+      default_permissions: permissionProfile,
       shell_environment_policy: {
         inherit: "none",
         ignore_default_excludes: false,
@@ -28,10 +49,8 @@ async function main(): Promise<void> {
   const options: ThreadOptions = {
     model: request.model,
     modelReasoningEffort: request.reasoning_effort,
-    sandboxMode: request.role === "coder" ? "workspace-write" : "read-only",
     workingDirectory: request.working_directory,
     skipGitRepoCheck: false,
-    networkAccessEnabled: false,
     webSearchMode: "disabled",
     approvalPolicy: "never",
   };
@@ -58,6 +77,7 @@ async function main(): Promise<void> {
   }
   writeLine({
     type: "result",
+    execution_id:request.execution_id, attempt:request.attempt,
     thread_id: state.threadId,
     result: parseStructuredResult(state.finalResponse),
     usage: state.usage ?? {

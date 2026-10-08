@@ -5,6 +5,7 @@ import {
   agentCommandEnvironment,
   consumeEvent,
   parseRequest,
+  permissionProfileForRole,
   parseStructuredResult,
   sanitizedEnvironment,
   type StreamState,
@@ -23,6 +24,13 @@ test("parses a bounded coder request", () => {
   assert.equal(request.working_directory, "/tmp/worktree");
   assert.equal(request.model, "gpt-5.6-terra");
   assert.equal(request.reasoning_effort, "low");
+});
+
+test("uses workspace-write only for coders and read-only for every other role", () => {
+  assert.equal(permissionProfileForRole("coder"), "cdo-workspace-write");
+  for (const role of ["reviewer", "analyst", "planner", "issue-manager", "pull-request-manager", "operator"] as const) {
+    assert.equal(permissionProfileForRole(role), "cdo-read-only");
+  }
 });
 
 test("parses a read-only analyst request", () => {
@@ -99,10 +107,10 @@ test("gives agent commands an explicit secret-free environment", () => {
   assert.deepEqual(environment, {
     PATH: "/bin",
     HOME: "/tmp/home",
-    GOPATH: "/data/cache/go",
-    GOCACHE: "/data/cache/go-build",
+    GOPATH: "/tmp/cdo-agent-gopath",
+    GOCACHE: "/tmp/cdo-agent-gocache",
     GOMODCACHE: "/data/cache/go-mod",
-    npm_config_cache: "/data/cache/npm",
+    npm_config_cache: "/tmp/cdo-agent-npm-cache",
   });
 });
 
@@ -122,4 +130,13 @@ test("rejects unsupported reasoning effort", () => {
       }),
     /reasoning_effort is not supported/,
   );
+});
+
+
+test("fails closed on command count and output limits", () => {
+  const state: StreamState = {};
+  const item = {id:"command", type:"command_execution" as const, command:"fixture", aggregated_output:"", exit_code:undefined, status:"in_progress" as const};
+  for(let i=0;i<256;i++) consumeEvent(state,{type:"item.started",item});
+  assert.throws(() => consumeEvent(state,{type:"item.started",item}),/invocation limit/);
+  assert.throws(() => consumeEvent({}, {type:"item.updated",item:{...item,aggregated_output:"x".repeat(1024*1024+1)}}),/output limit/);
 });

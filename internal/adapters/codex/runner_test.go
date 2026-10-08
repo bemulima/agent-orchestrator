@@ -125,6 +125,42 @@ func TestCodexRunnerHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, `{"type":"error","message":"stream disconnected before completion: unexpected-eof"}`)
 		os.Exit(1)
 	}
-	fmt.Println(`{"type":"result","thread_id":"thread-fixture","result":{"status":"completed"},"usage":{"input_tokens":120,"cached_input_tokens":15,"output_tokens":30,"reasoning_output_tokens":10}}`)
+	b, _ := json.Marshal(map[string]any{"type": "result", "execution_id": request.ExecutionID, "attempt": request.Attempt, "thread_id": "thread-fixture", "result": map[string]string{"status": "completed"}, "usage": map[string]int{"input_tokens": 120, "cached_input_tokens": 15, "output_tokens": 30, "reasoning_output_tokens": 10}})
+	fmt.Println(string(b))
 	os.Exit(0)
+}
+
+func TestOutputLimitBreachCancelsAndCannotBeReportedSuccess(t *testing.T) {
+	canceled := false
+	buffer := boundedBuffer{limit: 4, onOverflow: func() { canceled = true }}
+	_, err := buffer.Write([]byte("12345"))
+	if err != nil || !buffer.exceeded || !canceled || buffer.String() != "1234" {
+		t.Fatalf("limit breach not enforced: %#v %v", buffer, err)
+	}
+}
+
+func TestRunnerRejectsStaleAttemptAndCancelledLateGreen(t *testing.T) {
+	for _, identity := range []string{`"execution_id":"old","attempt":1`, `"execution_id":"current","attempt":2`} {
+		protocol := "{\"type\":\"thread_started\",\"thread_id\":\"thread\"}\n" + "{\"type\":\"result\",\"thread_id\":\"thread\"," + identity + ",\"result\":{}}\n"
+		_, err := readProtocol(context.Background(), strings.NewReader(protocol), "", "current", 1, nil)
+		require.ErrorIs(t, err, domain.ErrConflict)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := readProtocol(ctx, strings.NewReader("{\"type\":\"thread_started\",\"thread_id\":\"thread\"}\n"), "", "current", 1, nil)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestEachRunnerInvocationHasFreshExecutionIdentity(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_HELPER", "success")
+	runner, err := NewProcessRunner(fmt.Sprintf("%s -test.run=TestCodexRunnerHelper --", os.Args[0]))
+	require.NoError(t, err)
+	req := domain.AgentRunRequest{Role: domain.AgentRunCoder, WorkingDirectory: t.TempDir(), Prompt: "fixture", OutputSchema: map[string]any{"type": "object"}}
+	first, err := runner.Run(context.Background(), req, nil)
+	require.NoError(t, err)
+	second, err := runner.Run(context.Background(), req, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, first.ExecutionID)
+	require.NotEqual(t, first.ExecutionID, second.ExecutionID)
+	require.Equal(t, 1, second.Attempt)
 }

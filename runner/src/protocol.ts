@@ -1,7 +1,10 @@
+import { parseSandboxScope, type SandboxScope } from "./sandbox.js";
 import type { AgentMessageItem, ThreadEvent, Usage } from "@openai/codex-sdk";
 
 export const MAX_INPUT_BYTES = 1024 * 1024;
 export const MAX_RESULT_BYTES = 512 * 1024;
+export const MAX_COMMAND_STARTS = 256;
+export const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 
 export type RunnerRole =
   | "coder"
@@ -13,6 +16,9 @@ export type RunnerRole =
   | "operator";
 
 export interface RunRequest {
+ execution_deadline?: string;
+ execution_id?: string;
+ attempt?: number;
   role: RunnerRole;
   thread_id?: string;
   working_directory: string;
@@ -20,12 +26,14 @@ export interface RunRequest {
   reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   prompt: string;
   output_schema: Record<string, unknown>;
+  sandbox_scope?: SandboxScope;
 }
 
 export interface StreamState {
   threadId?: string;
   finalResponse?: string;
   usage?: Usage;
+  commandStarts?: number;
 }
 
 export function parseRequest(value: unknown): RunRequest {
@@ -49,6 +57,14 @@ export function parseRequest(value: unknown): RunRequest {
     prompt: requiredString(value, "prompt"),
     output_schema: requiredRecord(value, "output_schema"),
   };
+  if (value.execution_deadline !== undefined) {
+    if(typeof value.execution_deadline!=="string" || !Number.isFinite(Date.parse(value.execution_deadline)))throw new Error("RUNNER_DEADLINE_INVALID");
+    request.execution_deadline=value.execution_deadline;
+  }
+  if (value.execution_id !== undefined) {
+    if (typeof value.execution_id !== "string" || !/^[a-f0-9-]{36}$/.test(value.execution_id) || !Number.isInteger(value.attempt) || (value.attempt as number) < 1) throw new Error("RUNNER_EXECUTION_IDENTITY_INVALID");
+    request.execution_id = value.execution_id; request.attempt = value.attempt as number;
+  }
   if (value.thread_id !== undefined) {
     request.thread_id = requiredString(value, "thread_id");
   }
@@ -67,10 +83,22 @@ export function parseRequest(value: unknown): RunRequest {
     }
     request.reasoning_effort = value.reasoning_effort;
   }
+  if (value.sandbox_scope !== undefined) request.sandbox_scope = parseSandboxScope(value.sandbox_scope, request.role);
   return request;
 }
 
+export function permissionProfileForRole(role: RunnerRole): string {
+  return role === "coder" ? "cdo-workspace-write" : "cdo-read-only";
+}
+
 export function consumeEvent(state: StreamState, event: ThreadEvent): void {
+  if (event.type === "item.started" && event.item.type === "command_execution") {
+    state.commandStarts = (state.commandStarts ?? 0) + 1;
+    if (state.commandStarts > MAX_COMMAND_STARTS) throw new Error("runner command invocation limit exceeded");
+  }
+  if ((event.type === "item.completed" || event.type === "item.updated") && event.item.type === "command_execution") {
+    if (Buffer.byteLength(event.item.aggregated_output, "utf8") > MAX_COMMAND_OUTPUT_BYTES) throw new Error("runner command output limit exceeded");
+  }
   if (event.type === "thread.started") {
     state.threadId = event.thread_id;
     return;
@@ -144,10 +172,6 @@ export function agentCommandEnvironment(source: NodeJS.ProcessEnv): Record<strin
     "LC_ALL",
     "TERM",
     "CI",
-    "GOPATH",
-    "GOCACHE",
-    "GOMODCACHE",
-    "npm_config_cache",
   ];
   const environment: Record<string, string> = {};
   for (const key of allowed) {
@@ -155,6 +179,10 @@ export function agentCommandEnvironment(source: NodeJS.ProcessEnv): Record<strin
       environment[key] = source[key] as string;
     }
   }
+  environment.GOPATH = "/tmp/cdo-agent-gopath";
+  environment.GOCACHE = "/tmp/cdo-agent-gocache";
+  environment.GOMODCACHE = "/data/cache/go-mod";
+  environment.npm_config_cache = "/tmp/cdo-agent-npm-cache";
   return environment;
 }
 
