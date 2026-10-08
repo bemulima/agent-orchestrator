@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bemulima/agent-orchestrator/internal/agentpolicy"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -56,6 +57,14 @@ func (s Service) Execute(
 	if err != nil {
 		return domain.TaskExecutionOutcome{}, err
 	}
+	defer func() {
+		if ctx.Err() != nil {
+			terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			// Persist failure through a detached bounded context; no result is accepted.
+			_ = s.Repository.FailAttempt(terminalCtx, attempt.ID, domain.TaskAttemptStatusCancelled, ctx.Err().Error(), nil)
+		}
+	}()
 	if terminal, ok := terminalAttemptOutcome(attempt); ok {
 		return terminal, nil
 	}
@@ -77,7 +86,7 @@ func (s Service) Execute(
 			coderRoute = agentpolicy.Decision{Model: s.Models[executionContext.Task.ModelProfile], Reasoning: s.Reasoning[executionContext.Task.ModelProfile], Reason: "legacy task profile"}
 		}
 		response, err := s.Runner.Run(ctx, domain.AgentRunRequest{
-			Role: domain.AgentRunCoder, ThreadID: threadID, WorkingDirectory: workspace.Path,
+			Attempt: attempt.AttemptNumber, Role: domain.AgentRunCoder, ThreadID: threadID, WorkingDirectory: workspace.Path,
 			Model: coderRoute.Model, ReasoningEffort: coderRoute.Reasoning, Prompt: prompt,
 			OutputSchema: s.Validator.AgentSchema(),
 			UsageContext: &domain.AgentUsageContext{ResourceType: "task", ResourceID: executionContext.Task.ID, RouteReason: coderRoute.Reason},
@@ -229,6 +238,16 @@ func (s Service) Execute(
 			continue
 		}
 
+		if err := ctx.Err(); err != nil {
+			return domain.TaskExecutionOutcome{}, err
+		}
+		accepted, acceptedErr := s.Repository.ListAttempts(ctx, taskID)
+		if acceptedErr != nil {
+			return domain.TaskExecutionOutcome{}, acceptedErr
+		}
+		if !domain.TaskExecutionCurrent(attempt.ID, attempt.AttemptNumber, taskID, accepted) {
+			return domain.TaskExecutionOutcome{}, fmt.Errorf("obsolete execution cannot commit: %w", domain.ErrConflict)
+		}
 		commitSHA, err := s.Worktrees.Commit(ctx, executionContext.Project, executionContext.Task, workspace, state.ChangedFiles)
 		if err != nil {
 			return domain.TaskExecutionOutcome{}, err

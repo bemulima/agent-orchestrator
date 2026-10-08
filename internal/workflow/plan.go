@@ -51,14 +51,18 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 			MaximumInterval: 10 * time.Second, MaximumAttempts: int32(schedule.MaxActivityAttempts),
 		},
 	})
+	executionTimeout := 2 * time.Hour
+	if schedule.ExecutionTimeout > 0 && schedule.ExecutionTimeout < executionTimeout {
+		executionTimeout = schedule.ExecutionTimeout
+	}
 	executionCtx := temporalworkflow.WithActivityOptions(ctx, temporalworkflow.ActivityOptions{
-		StartToCloseTimeout:    2 * time.Hour,
+		StartToCloseTimeout:    executionTimeout,
 		HeartbeatTimeout:       45 * time.Second,
 		ScheduleToCloseTimeout: 6 * time.Hour,
 		WaitForCancellation:    true,
 		RetryPolicy: &temporal.RetryPolicy{
 			InitialInterval: 5 * time.Second, BackoffCoefficient: 2,
-			MaximumInterval: time.Minute, MaximumAttempts: int32(schedule.MaxActivityAttempts),
+			MaximumInterval: time.Minute, MaximumAttempts: 1,
 		},
 	})
 	state := PlanWorkflowState{
@@ -98,6 +102,12 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 	var pendingExecution *taskExecutionCompletion
 
 	for {
+		if ctx.Err() != nil {
+			cleanupCtx, _ := temporalworkflow.NewDisconnectedContext(ctx)
+			cancelAndJoinExecutions(cleanupCtx, activeFutures, activeCancels)
+			_ = setRunStatus(cleanupCtx, schedule.RunID, domain.PlanRunStatusCancelled, "workflow cancelled")
+			return PlanWorkflowOutput{}, temporal.NewCanceledError("workflow cancelled after activity teardown")
+		}
 		control, result, retryTaskID, completedExecution := pendingControl, pendingResult, pendingRetry, pendingExecution
 		pendingControl, pendingResult, pendingRetry, pendingExecution = "", nil, "", nil
 		if control == "" && result == nil && retryTaskID == "" && completedExecution == nil {
@@ -143,7 +153,7 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 				return failPlanWorkflow(ctx, schedule, state, active, "task execution returned a non-terminal status")
 			}
 		}
-		if result != nil {
+		if result != nil && !schedule.ExecuteTasks {
 			current, exists := state.TaskStatus[result.TaskID]
 			if exists && current != domain.TaskStatusCompleted && current != domain.TaskStatusFailed &&
 				current != domain.TaskStatusCancelled && current != domain.TaskStatusBlocked {
@@ -187,6 +197,7 @@ func PlanWorkflow(ctx temporalworkflow.Context, schedule domain.PlanSchedule) (P
 					cancel()
 				}
 			}
+			cancelAndJoinExecutions(ctx, activeFutures, activeCancels)
 			if err := setRunStatus(ctx, schedule.RunID, domain.PlanRunStatusCancelled, ""); err != nil {
 				return PlanWorkflowOutput{}, err
 			}
@@ -476,5 +487,22 @@ func workflowOutput(state PlanWorkflowState) PlanWorkflowOutput {
 	return PlanWorkflowOutput{
 		RunID: state.RunID, PlanID: state.PlanID, Status: state.Status,
 		TaskStatus: copyPlanState(state).TaskStatus, Error: state.LastError,
+	}
+}
+
+// WaitForCancellation keeps the activity future pending until teardown returns.
+func cancelAndJoinExecutions(ctx temporalworkflow.Context, futures map[string]temporalworkflow.Future, cancels map[string]temporalworkflow.CancelFunc) {
+	ids := make([]string, 0, len(futures))
+	for id := range futures {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if cancel := cancels[id]; cancel != nil {
+			cancel()
+		}
+	}
+	for _, id := range ids {
+		_ = futures[id].Get(ctx, nil)
 	}
 }

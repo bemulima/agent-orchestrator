@@ -90,7 +90,11 @@ func (a PlanActivities) ExecutePlanTask(
 			}
 		}
 	}()
-	return a.Executor.Execute(ctx, input.TaskID, input.WorkflowID)
+	result, err := a.Executor.Execute(ctx, input.TaskID, input.WorkflowID)
+	if failure := lifecycleActivityError(ctx, err); failure != nil {
+		return domain.TaskExecutionOutcome{}, failure
+	}
+	return result, nil
 }
 
 func (a PlanActivities) RetryPlanTask(ctx context.Context, input RetryPlanTaskInput) (domain.Task, error) {

@@ -97,6 +97,7 @@ func TestServicePassesPersistedReviewerFeedbackToANewAttempt(t *testing.T) {
 	require.NoError(t, err)
 	repo := newFakeExecutionRepository()
 	repo.attempt.AttemptNumber = 2
+	repo.attempt.ID = "attempt-2"
 	repo.attempts = []domain.TaskAttempt{{
 		ID:               "attempt-1",
 		TaskID:           "task-1",
@@ -483,7 +484,18 @@ func (r *fakeExecutionRepository) StoreArtifact(_ context.Context, artifact doma
 	return artifact, nil
 }
 func (r *fakeExecutionRepository) ListAttempts(context.Context, string) ([]domain.TaskAttempt, error) {
-	return r.attempts, nil
+	// The durable repository includes its active BeginAttempt row.
+	result := append([]domain.TaskAttempt(nil), r.attempts...)
+	if r.attempt.ID != "" {
+		found := false
+		for _, a := range result {
+			found = found || a.ID == r.attempt.ID
+		}
+		if !found {
+			result = append(result, r.attempt)
+		}
+	}
+	return result, nil
 }
 func (r *fakeExecutionRepository) ListArtifacts(context.Context, string) ([]domain.Artifact, error) {
 	return nil, nil

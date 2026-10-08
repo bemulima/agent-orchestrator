@@ -288,3 +288,19 @@ func registerPlanStatusMocks(environment *testsuite.TestWorkflowEnvironment) {
 	environment.OnActivity("SetPlanRunStatus", mock.Anything, mock.Anything).Return(domain.PlanRun{}, nil)
 	environment.OnActivity("RecordPlanTaskResult", mock.Anything, mock.Anything).Return(domain.Task{}, nil)
 }
+
+func TestExecutablePlanIgnoresObsoleteExternalGreen(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&activities.PlanActivities{})
+	registerPlanStatusMocks(env)
+	env.OnActivity("DispatchPlanTask", mock.Anything, mock.Anything).Return(domain.Task{}, nil)
+	env.OnActivity("ExecutePlanTask", mock.Anything, mock.Anything).After(2*time.Second).Return(domain.TaskExecutionOutcome{Result: domain.TaskResult{TaskID: "task", Status: domain.TaskStatusFailed, Error: "current execution failed"}}, nil)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(PlanTaskResultSignal, domain.TaskResult{TaskID: "task", Status: domain.TaskStatusCompleted})
+	}, time.Second)
+	env.ExecuteWorkflow(PlanWorkflow, domain.PlanSchedule{RunID: "run", PlanID: "plan", MaxParallelTasks: 1, MaxActivityAttempts: 3, ExecuteTasks: true, Tasks: []domain.ScheduledTask{{TaskID: "task"}}})
+	var output PlanWorkflowOutput
+	require.NoError(t, env.GetWorkflowResult(&output))
+	require.Equal(t, domain.PlanRunStatusFailed, output.Status)
+}
