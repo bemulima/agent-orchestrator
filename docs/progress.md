@@ -1532,3 +1532,48 @@ Next: independently specify a source-bound read-only R1 analysis/typed-boundary
 compatibility contract without granting business/write ownership; retain all
 27 tasks,82 layer obligations and198 plan-wide requirements for acceptance.
 Wave3 has not started. See go-context-retrieval-wave2.md for the bounded scope.
+
+
+2026-10-09 — Go Wave2 closure contract and shared source fixes
+----------------------------------------------------------
+
+Fresh remote main8e7eeb50/featurecf441575 and all three target content snapshots
+match the prior baseline. Four independent read-only audits retain27/82/198/135.
+Both T08 misses are CDO source projection gaps, not missing business contracts.
+The source-bound-analysis.v1.1 compatibility contract passed independent review
+before implementation; no separate retrieval design approval channel was found.
+Root is the sole implementation writer. Original dirty CDO and unrelated592f
+workstream remain excluded.
+
+RED reproduces196/198 plan requirements and12/82 historical routing layers.
+Opt-in analysis closure tests now prove198/198 and82/82 companion acquisition.
+Original135 Gold/default behavior is retained; additional generic regressions
+cover mutation/conditional/ambiguous intent, stale/hash/module/proof conflicts,
+interface/signature ambiguity, cross-file duplicates and lexical receiver
+shadowing. Source evidence grants no writes and ContractPlan FREEZE_REQUIRED
+remains unchanged. Raw PARTIAL due to unsupported Git-object pins is retained.
+
+Full native/CLI replay, old regressions, make verify and final independent
+readiness certificate remain gates before main publication. Wave3 not started.
+
+2026-10-09 — Go Wave2 final closure verified
+-----------------------------------------
+
+GO_RETRIEVAL_PROFILE_V2 READY under independently approved additive
+source-bound-analysis.v1.1. Final readiness review passes all15 checks,
+P0=0/P1=0. Original27 tasks/82 layers/198 facets/135 Gold are preserved.
+Supported acceptance:62/62 Prepare,111/111 Expand,56/56 tests,82/82 companion
+layers,198/198 plan requirements; two T08 misses resolved from actual source.
+ContextPack path footprint59/82 and precision1.00 remain distinct from180
+companion syntax witnesses/98extras (original Relevant path overlap34/180,
+minimumcase0.0; no semantic precision/caller/write-ownership claim).
+
+Raw27 VALID_PARTIAL retains unsupported Git-object pins; capability-aware27
+PASS. All critical safety counters zero. Legacy writer prerequisites stay
+visible, actual missing read contracts remain blocking. Secret-free makeverify,
+gofmt/vet,162 Gold,70 additional generic controls, native/CLI27+75Expand/repeat
+and Wave1 native/CLI39 (33/3/3) pass on unchanged final source. All497 target
+document hashes match fresh captures. Original dirty checkout and unrelated
+workstreams remain preserved. Ready decision precedes normal publication;
+external closure result records the final candidate and fresh remote SHA.
+No business runtime changes, per-service RAG, vector database or Wave3 work.

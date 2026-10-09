@@ -261,3 +261,18 @@ func TestContextExpandMarkdownPreservesBlockedDeltaWithCompleteBase(t *testing.T
 		})
 	}
 }
+
+func TestContextAnalysisFlagCompatibility(t *testing.T) {
+	args := []string{"--request-json", "request.json", "--route-json", "route.json", "--root", "local:fixture=/tmp/fixture"}
+	values, e := parseContextCommandFlags("context-prepare", args, false)
+	if e != nil || values.analysisScope {
+		t.Fatal("legacy default changed", e)
+	}
+	if _, e = parseContextCommandFlags("context-prepare", append(args, "--analysis-report-json", "new-report.json"), false); e == nil {
+		t.Fatal("analysis output without opt-in accepted")
+	}
+	values, e = parseContextCommandFlags("context-prepare", append(args, "--analysis-scope", "--analysis-report-json", "new-report.json"), false)
+	if e != nil || !values.analysisScope || values.analysisReportPath != "new-report.json" {
+		t.Fatal("analysis flag binding", e)
+	}
+}

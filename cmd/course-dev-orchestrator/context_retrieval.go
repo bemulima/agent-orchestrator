@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	contextadapter "github.com/bemulima/agent-orchestrator/internal/adapters/contextretrieval"
+	"github.com/bemulima/agent-orchestrator/internal/agentcontrol"
 	"github.com/bemulima/agent-orchestrator/internal/contextretrieval"
 	"github.com/bemulima/agent-orchestrator/internal/contextretrieval/evaluation"
 	"github.com/bemulima/agent-orchestrator/internal/domain"
@@ -41,12 +42,16 @@ func (r *contextRootFlags) Set(value string) error {
 type contextCommandFlags struct {
 	requestPath, routePath, contractPath, coveragePath, basePath, expandPath, format string
 	roots                                                                            contextRootFlags
+	analysisScope                                                                    bool
+	analysisReportPath                                                               string
 }
 
 func parseContextCommandFlags(command string, args []string, expand bool) (contextCommandFlags, error) {
 	var values contextCommandFlags
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	flags.StringVar(&values.analysisReportPath, "analysis-report-json", "", "optional versioned read-scope evidence companion output (requires --analysis-scope)")
+	flags.BoolVar(&values.analysisScope, "analysis-scope", false, "opt into source-bound-analysis.v1.1 read-only acquisition; no write authority")
 	flags.StringVar(&values.requestPath, "request-json", "", "explicit current retrieval request JSON")
 	flags.StringVar(&values.routePath, "route-json", "", "existing RoutingResult JSON")
 	flags.StringVar(&values.contractPath, "contract-plan-json", "", "optional existing ContractPlan JSON")
@@ -64,6 +69,9 @@ func parseContextCommandFlags(command string, args []string, expand bool) (conte
 		(expand && (values.basePath == "" || values.expandPath == "")) {
 		return values, fmt.Errorf("%s requires --request-json, --route-json and repeated --root identity=absolute-path%s: %w", command,
 			contextExpandUsage(expand), domain.ErrValidation)
+	}
+	if values.analysisReportPath != "" && !values.analysisScope {
+		return values, fmt.Errorf("analysis report requires --analysis-scope: %w", domain.ErrValidation)
 	}
 	if values.format != "json" && values.format != "markdown" {
 		return values, fmt.Errorf("format must be json or markdown: %w", domain.ErrValidation)
@@ -132,6 +140,35 @@ func loadContextCommandRequest(values contextCommandFlags) (contextretrieval.Ret
 	}
 	// Caller-serialized route context never overrides the actual current route.
 	request.Route = adapted
+	if values.analysisScope {
+		catalog, err := agentcontrol.LoadCatalog(os.DirFS("."))
+		if err != nil {
+			return request, fmt.Errorf("load analysis catalog: %w", err)
+		}
+		var scope contextadapter.AnalysisScope
+		request, scope, err = contextadapter.PrepareAnalysisRequest(context.Background(), request, route, contract, coverage, catalog)
+		if err != nil {
+			return request, fmt.Errorf("bind analysis scope: %w", err)
+		}
+		if values.analysisReportPath != "" {
+			b, err := json.MarshalIndent(scope, "", "  ")
+			if err != nil {
+				return request, err
+			}
+			file, err := os.OpenFile(values.analysisReportPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				return request, fmt.Errorf("create new analysis report: %w", err)
+			}
+			_, err = file.Write(append(b, '\n'))
+			closeErr := file.Close()
+			if err != nil {
+				return request, err
+			}
+			if closeErr != nil {
+				return request, closeErr
+			}
+		}
+	}
 	return request, nil
 }
 
@@ -144,7 +181,11 @@ func runContextPrepare(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	pack, _, err := contextadapter.NewEngine().Prepare(context.Background(), request)
+	engine := contextadapter.NewEngine()
+	if values.analysisScope {
+		engine = contextadapter.NewAnalysisEngine()
+	}
+	pack, _, err := engine.Prepare(context.Background(), request)
 	if err != nil {
 		return fmt.Errorf("prepare context: %w", err)
 	}
@@ -171,7 +212,11 @@ func runContextExpand(args []string, output io.Writer) error {
 	if err := readContextCommandJSON(values.expandPath, &expansion); err != nil {
 		return fmt.Errorf("read expansion: %w", err)
 	}
-	delta, _, err := contextadapter.NewEngine().Expand(context.Background(), base, request, expansion)
+	engine := contextadapter.NewEngine()
+	if values.analysisScope {
+		engine = contextadapter.NewAnalysisEngine()
+	}
+	delta, _, err := engine.Expand(context.Background(), base, request, expansion)
 	if err != nil {
 		return fmt.Errorf("expand context: %w", err)
 	}
