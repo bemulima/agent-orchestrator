@@ -1577,3 +1577,55 @@ document hashes match fresh captures. Original dirty checkout and unrelated
 workstreams remain preserved. Ready decision precedes normal publication;
 external closure result records the final candidate and fresh remote SHA.
 No business runtime changes, per-service RAG, vector database or Wave3 work.
+
+
+## 2026-10-09 — Go retrieval Wave 3 discovery and contract barrier
+
+Fresh published baseline d8c3adea47e0b42e898fd8084c93898808fc613f and all162 prior Gold verified before parallel discovery. Four target researchers plus cross-service, source-expectation, adapter and security audits froze36 cases,75 Prepare/180 Expand label occurrences,84 tests,77 contracts and140 read-layer obligations before retrieval. Validation admission extended from198 to206 documents through the production security loader, preserving every original hash. AI Prompt/Sandbox are private and CDO public; source bodies remain local only. Baseline reproduced33 intent rejections, one writer-boundary ownership conflict and a proposed application-boundary retrieval miss. Separate v1.2 contracts passed independent adapter/security review at SHA256 6eef896beedd310a81acb3e0803c0f57ef35825692352a8686fb26cb0a9752f9. Barrier2 permits one shared implementation writer and an independent synthetic fixture package writer. Implementation/GREEN/profile readiness/publication are not yet claimed.
+
+
+## 2026-10-09 — Go retrieval Wave 3 implementation controls
+
+Opt-in source-bound-analysis.v1.2 now implements bounded read intent, current noncanonical authored layers, cumulative Prepare/Expand companions, typed application source equivalence, explicit missing authored-area diagnostics and current-only unpinned operation references. Frozen v1.1/default R1, catalog, ContextPack v1, route/contract schemas and approval fingerprints remain unchanged. Independent contract reviews preceded each capability; the S08 authored-checksum assumption was explicitly corrected after actual RED without changing source expectations. Retained source/task/facet labels and denominators remain75/180/84/77/140. Two repository-owned metadata proposals remain unapplied; accounting separately retains138 supported layers and2 unresolved author dimensions.
+
+168 named focused analysis/project controls pass, including malformed/omitted package acquisition, metadata ancestors, conflicting profile fingerprints, local HTTP alias shadowing, original caller provenance, Unicode duplicate proof keys, current-only unpinned references, source freshness, whole-unit joint budgets and portable concrete/interface Expand replay. General metadata citation failures remain visible separately from scoped authored-area search coverage. Final native36, standalone CLI,198 Gold, legacy39/27 replays, secret-free make verify and the15-check independent readiness review are in progress; READY and publication are not yet claimed.
+
+
+## 2026-10-10 — Go retrieval Wave 3 final closure
+
+GO_RETRIEVAL_PROFILE_V3 READY under independently reviewed opt-in
+source-bound-analysis.v1.2. All 15 readiness checks pass with P0=0/P1=0.
+The original 36 scenarios, 75 Prepare/180 Expand anchors, 84 tests, 77 contracts
+and 140 layer dimensions are retained. Final source-bound replay finds all
+138 supported layers; two S04/S07 repository-author area dimensions remain
+explicit typed NOT_VERIFIED gaps with unapplied metadata-owner proposals.
+Capability-aware classification is 34 PASS and two VALID_PARTIAL; all 36 raw
+packs retain PARTIAL and unsupported Git-object pins. No retrieval defect is
+waived. Minimum per-case pack source/path precision is 0.8888889.
+
+Pack mandatory human evidence is 416/416 and core facets 490/490. Companion
+raw layer recall 138/140 differs from pack witness-path footprint 121/140.
+Pack/companion path occurrences are 315/400, overlap 172, with 224 unresolved
+syntax candidates reported separately. Current source/type proofs do not
+claim runtime call graphs, execution certification or write ownership.
+All 1912 admitted source hashes and current revision labels verify freshly.
+
+The acquisition correction preserves caller provenance when generated
+whole-file seeds acquire adjacent declarations first, while enforcing one
+global 1000-context limit. Actual RED cases and a cap-isolated mutant precede
+245 passing focused controls. All old authority, package, module, freshness,
+selector-origin and joint-budget safeguards remain effective.
+
+Native 36/324 Expand stages, all 360 bindings, 36 joint-budget certificates,
+physical CLI full-object parity, 720 deterministic operations
+(360 initial +360 repeats) and 144 negative cache controls pass. Gold totals 198/198 (162 preserved +36 synthetic).
+Wave 1 retains 39 cases with33/3/3 classification; Wave 2 retains27 cases,
+198 plan facets and82 companion layers. Prior accepted packs and Wave 2
+companions remain byte-identical. Secret-free make verify passes on the
+frozen source and exact publication tree. Public fixtures contain independent
+synthetic bodies; private-source and all critical safety violations are zero.
+
+Normal main publication follows this readiness decision; the external closure
+result records the final tree, commit and freshly fetched remote SHA. Original
+dirty checkout and unrelated workstreams remain preserved. No service runtime
+changes, per-service RAG, vector storage or next-wave work.

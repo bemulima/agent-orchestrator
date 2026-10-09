@@ -146,7 +146,15 @@ func NewAnalysisEngine() *core.Engine {
 // PrepareAnalysisRequest acquires bounded read scope through the same production
 // loader used by Prepare/Expand. Expected labels and case IDs are not inputs.
 func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, route domain.RoutingResult, contract *domain.ContractPlan, legacyCoverage []core.CoverageResult, catalog agentcontrol.Catalog) (core.RetrievalRequest, AnalysisScope, error) {
-	scope := AnalysisScope{Version: AnalysisVersion, Intent: AnalysisIntent(request.Task), LegacyRouteDigest: hashJSON(route), ContractDigest: hashJSON(contract), CatalogDigest: catalog.Digest, WritableOwners: []string{}, LegacyCoverage: legacyCoverage, Limitations: []string{"read evidence only; every source forbidden for writes", "AST syntax candidates; cross-package type-aware semantic resolution UNSUPPORTED", "finding tests is not execution certification", "ContractPlan ownership/freeze/approval are unchanged"}}
+	return prepareAnalysisRequest(ctx, request, route, contract, legacyCoverage, catalog, false, nil)
+}
+
+func prepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, route domain.RoutingResult, contract *domain.ContractPlan, legacyCoverage []core.CoverageResult, catalog agentcontrol.Catalog, projectMode bool, explicitProjectSelectors *[]core.Facet) (core.RetrievalRequest, AnalysisScope, error) {
+	version, intent := AnalysisVersion, AnalysisIntent(request.Task)
+	if projectMode {
+		version, intent = ProjectAnalysisVersion, ProjectAnalysisIntent(request.Task)
+	}
+	scope := AnalysisScope{Version: version, Intent: intent, LegacyRouteDigest: hashJSON(route), ContractDigest: hashJSON(contract), CatalogDigest: catalog.Digest, WritableOwners: []string{}, LegacyCoverage: legacyCoverage, Limitations: []string{"read evidence only; every source forbidden for writes", "AST syntax candidates; cross-package type-aware semantic resolution UNSUPPORTED", "finding tests is not execution certification", "ContractPlan ownership/freeze/approval are unchanged"}}
 	if scope.Intent != "READ_ONLY_ANALYSIS" && scope.Intent != "EXPLANATION" {
 		return request, scope, fmt.Errorf("analysis requires unambiguous read intent: %s", scope.Intent)
 	}
@@ -195,6 +203,9 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 		}
 	}
 	declarations := analysisDeclarations(snapshot)
+	if projectMode {
+		declarations = projectAnalysisDeclarations(snapshot)
+	}
 	namesByNode := map[ast.Node]map[string]bool{}
 	for _, d := range declarations {
 		namesByNode[d.node] = analysisNames(d.node)
@@ -212,6 +223,12 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 				matches = append(matches, d)
 			}
 		}
+		if projectMode && len(matches) == 0 {
+			if d, ok := projectDocumentAnchor(snapshot, f); ok {
+				matches = append(matches, d)
+				declarations = append(declarations, d)
+			}
+		}
 		if len(matches) == 0 {
 			diagnostics = append(diagnostics, core.RetrievalDiagnostic{Code: "ANALYSIS_ANCHOR_NOT_VERIFIED", Status: core.Partial, FacetID: f.ID, RelativePath: f.Path, Message: "No exact admitted AST declaration matches this analysis anchor."})
 		}
@@ -224,7 +241,7 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 		if !ok {
 			return request, scope, fmt.Errorf("analysis profile source is not admitted")
 		}
-		if p.Status == domain.ProfileResolutionResolved {
+		if p.Status == domain.ProfileResolutionResolved && (!projectMode || projectVerifiedProfile(catalog, p)) {
 			profileBySource[s.Identity] = catalog.Profiles[p.ProfileID]
 			if !s.Neighbor && !s.External {
 				owners = append(owners, s.Identity)
@@ -307,6 +324,9 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 			continue
 		}
 		for _, a := range anchors {
+			if projectMode && a.node == nil {
+				continue
+			}
 			if a.doc.Source.Identity != d.Source.Identity {
 				continue
 			}
@@ -341,6 +361,9 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 			}
 			k := d.doc.Source.Identity + "\x00" + r.ID
 			w := AnalysisLayer{Evidence: analysisWitnessEvidence(d), Chain: chains[key(d)], Source: d.doc.Source.Identity, Layer: r.ID, Witness: analysisAnchor(d), Relation: relation}
+			if projectMode {
+				w.Evidence = projectEvidence(d)
+			}
 			old, exists := witnesses[k]
 			if !exists || w.Witness.Path+w.Witness.Symbol < old.Witness.Path+old.Witness.Symbol {
 				witnesses[k] = w
@@ -353,13 +376,39 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 	sort.Slice(scope.Layers, func(i, j int) bool {
 		return scope.Layers[i].Source+scope.Layers[i].Layer < scope.Layers[j].Source+scope.Layers[j].Layer
 	})
+	projectSelectors := facets
+	if explicitProjectSelectors != nil {
+		projectSelectors = *explicitProjectSelectors
+	}
+	if projectMode {
+		extra, projectDiagnostics := projectReadLayers(snapshot, anchors, projectSelectors, acquired)
+		for _, d := range projectDiagnostics {
+			if d.Code == "ANALYSIS_HTTP_CLIENT_TYPE_AMBIGUOUS" || d.Code == "ANALYSIS_HTTP_CLIENT_CONTEXT_LIMIT" {
+				diagnostics = append(diagnostics, d)
+			}
+		}
+		scope.Layers = append(scope.Layers, extra...)
+		sort.Slice(scope.Layers, func(i, j int) bool {
+			return scope.Layers[i].Source+scope.Layers[i].Layer+scope.Layers[i].Witness.Path+scope.Layers[i].Witness.Symbol < scope.Layers[j].Source+scope.Layers[j].Layer+scope.Layers[j].Witness.Path+scope.Layers[j].Witness.Symbol
+		})
+	}
 	scope.Bindings = analysisBindings(adapted.SeedFacets, anchors, declarations, snapshot)
+	projectBindings := []ProjectBoundaryProof{}
+	if projectMode {
+		projectBindings = projectBoundaryProofs(adapted.SeedFacets, anchors, declarations, snapshot, request.Sources, projectSelectors)
+	}
 	seeds := append([]core.Facet(nil), adapted.SeedFacets...)
 	for i := range seeds {
 		for _, b := range scope.Bindings {
 			if seeds[i].ID == b.FacetID {
 				seeds[i].Resolver = "analysis-boundary"
 				seeds[i].Text = analysisBindingJSON(b)
+			}
+		}
+		for _, b := range projectBindings {
+			if seeds[i].ID == b.FacetID {
+				seeds[i].Resolver = "analysis-project-boundary"
+				seeds[i].Text = projectProofJSON(b)
 			}
 		}
 	}
@@ -379,13 +428,16 @@ func PrepareAnalysisRequest(ctx context.Context, request core.RetrievalRequest, 
 			for _, b := range scope.Bindings {
 				bound = bound || b.FacetID == d.FacetID
 			}
+			for _, b := range projectBindings {
+				bound = bound || b.FacetID == d.FacetID
+			}
 			if !bound {
 				diagnostics = append(diagnostics, d)
 			}
 		}
 	}
 	scope.Digest = hashJSON(scope)
-	read := core.RouteContext{Digest: AnalysisVersion + ":" + scope.Digest, CatalogDigest: catalog.Digest, Status: core.Complete, Owners: uniqueStrings(owners), SeedFacets: seeds, Diagnostics: diagnostics, Coverage: append([]core.CoverageResult{}, snapshot.Coverage...)}
+	read := core.RouteContext{Digest: version + ":" + scope.Digest, CatalogDigest: catalog.Digest, Status: core.Complete, Owners: uniqueStrings(owners), SeedFacets: seeds, Diagnostics: diagnostics, Coverage: append([]core.CoverageResult{}, snapshot.Coverage...)}
 	if len(anchors) == 0 || len(owners) == 0 {
 		read.Status = core.Partial
 		read.Diagnostics = append(read.Diagnostics, core.RetrievalDiagnostic{Code: "ANALYSIS_SOURCE_SCOPE_UNRESOLVED", Status: core.Partial, Message: "No verified non-neighbor source custodian and anchored analysis scope."})

@@ -19,3 +19,5 @@ Machine-readable mirrors for agent use live under `.ai/contracts`. The canonical
 
 - [Context retrieval audit and design](agent-context-retrieval-audit.md): existing retrieval foundations, evidence and security gaps, reusable architecture, Student pilot, and staged rollout.
 - [Local context retrieval](agent-context-retrieval.md): implemented read-only core, coverage, trust and freshness, canonical pack, offline Prepare/Expand CLI and deterministic Gold evaluation.
+
+- [Go context retrieval Wave 3](go-context-retrieval-wave3.md): opt-in v1.2, cumulative companion and joint budgets, source-bound syntax proofs, authored-area diagnostics and synthetic Gold.

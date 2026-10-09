@@ -44,6 +44,7 @@ type contextCommandFlags struct {
 	roots                                                                            contextRootFlags
 	analysisScope                                                                    bool
 	analysisReportPath                                                               string
+	analysisVersion                                                                  string
 }
 
 func parseContextCommandFlags(command string, args []string, expand bool) (contextCommandFlags, error) {
@@ -51,6 +52,7 @@ func parseContextCommandFlags(command string, args []string, expand bool) (conte
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&values.analysisReportPath, "analysis-report-json", "", "optional versioned read-scope evidence companion output (requires --analysis-scope)")
+	flags.StringVar(&values.analysisVersion, "analysis-version", "", "explicit source-bound-analysis.v1.2 opt-in; default analysis remains v1.1")
 	flags.BoolVar(&values.analysisScope, "analysis-scope", false, "opt into source-bound-analysis.v1.1 read-only acquisition; no write authority")
 	flags.StringVar(&values.requestPath, "request-json", "", "explicit current retrieval request JSON")
 	flags.StringVar(&values.routePath, "route-json", "", "existing RoutingResult JSON")
@@ -69,6 +71,9 @@ func parseContextCommandFlags(command string, args []string, expand bool) (conte
 		(expand && (values.basePath == "" || values.expandPath == "")) {
 		return values, fmt.Errorf("%s requires --request-json, --route-json and repeated --root identity=absolute-path%s: %w", command,
 			contextExpandUsage(expand), domain.ErrValidation)
+	}
+	if values.analysisVersion != "" && (!values.analysisScope || values.analysisVersion != contextadapter.ProjectAnalysisVersion) {
+		return values, fmt.Errorf("unsupported analysis version or missing --analysis-scope: %w", domain.ErrValidation)
 	}
 	if values.analysisReportPath != "" && !values.analysisScope {
 		return values, fmt.Errorf("analysis report requires --analysis-scope: %w", domain.ErrValidation)
@@ -140,7 +145,7 @@ func loadContextCommandRequest(values contextCommandFlags) (contextretrieval.Ret
 	}
 	// Caller-serialized route context never overrides the actual current route.
 	request.Route = adapted
-	if values.analysisScope {
+	if values.analysisScope && values.analysisVersion == "" {
 		catalog, err := agentcontrol.LoadCatalog(os.DirFS("."))
 		if err != nil {
 			return request, fmt.Errorf("load analysis catalog: %w", err)
@@ -181,6 +186,9 @@ func runContextPrepare(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if values.analysisVersion == contextadapter.ProjectAnalysisVersion {
+		return runProjectContextPrepare(values, request, output)
+	}
 	engine := contextadapter.NewEngine()
 	if values.analysisScope {
 		engine = contextadapter.NewAnalysisEngine()
@@ -211,6 +219,9 @@ func runContextExpand(args []string, output io.Writer) error {
 	var expansion contextretrieval.ExpandRequest
 	if err := readContextCommandJSON(values.expandPath, &expansion); err != nil {
 		return fmt.Errorf("read expansion: %w", err)
+	}
+	if values.analysisVersion == contextadapter.ProjectAnalysisVersion {
+		return runProjectContextExpand(values, request, base, expansion, output)
 	}
 	engine := contextadapter.NewEngine()
 	if values.analysisScope {

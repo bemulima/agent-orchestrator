@@ -64,6 +64,10 @@ type plannerRepositoryFact struct {
 }
 
 func buildRoutingMetadata(requestText string, baseline domain.PlannerOutput, projects []domain.Project, catalog agentcontrol.Catalog) (domain.RoutingResult, domain.ContractPlan, map[string]repositoryInventory, error) {
+	return buildRoutingMetadataMode(requestText, baseline, projects, catalog, false)
+}
+
+func buildRoutingMetadataMode(requestText string, baseline domain.PlannerOutput, projects []domain.Project, catalog agentcontrol.Catalog, readMode bool) (domain.RoutingResult, domain.ContractPlan, map[string]repositoryInventory, error) {
 	if err := agentcontrol.ValidateCatalog(catalog); err != nil {
 		return domain.RoutingResult{}, domain.ContractPlan{}, nil, fmt.Errorf("validate canonical routing catalog: %w", err)
 	}
@@ -181,7 +185,15 @@ func buildRoutingMetadata(requestText string, baseline domain.PlannerOutput, pro
 	}
 	contractPlan, err := buildContractPlan(result.Status, result.Routes, result.SharedBoundaryCandidates, inventories, resolvedProfiles, requestText)
 	if err != nil {
-		return domain.RoutingResult{}, domain.ContractPlan{}, nil, err
+		if !readMode || !isReadBoundaryOwnerConflict(err) {
+			return domain.RoutingResult{}, domain.ContractPlan{}, nil, err
+		}
+		result.Status = domain.RoutingStatusUnresolved
+		result.OwnerReviewRequired = true
+		result.Confidence = "low"
+		result.UnresolvedReason = joinReason(result.UnresolvedReason, err.Error())
+		result.ScopeMode = "source_read_analysis_v1_2"
+		contractPlan = domain.ContractPlan{Required: true, State: domain.ContractPlanPlanned, FreezeRequired: true, Reason: err.Error()}
 	}
 	recordRoutingRequirements(result, contractPlan, inventories)
 	result.EvidenceIndex = buildBoundedEvidenceIndex(allEvidence, result, contractPlan)
@@ -1804,7 +1816,7 @@ func resolveContractOwner(candidate domain.SharedBoundaryCandidate, profiles map
 			return owner, nil
 		}
 	}
-	return domain.RouteReference{}, fmt.Errorf("ARCHITECTURE_CONFLICT: boundary %s has no evidence-backed owner allowed by consumer dependencies: %w", candidate.Kind, domain.ErrValidation)
+	return domain.RouteReference{}, readBoundaryOwnerConflict{kind: candidate.Kind}
 }
 func contractImplementers(profile agentcontrol.Profile, kind string, consumers []domain.RouteReference) []domain.RouteReference {
 	rule, _ := agentcontrol.BoundaryOwnershipFor(profile, kind)

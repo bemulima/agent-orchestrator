@@ -330,15 +330,30 @@ type AnalysisBoundaryResolver struct{}
 func (AnalysisBoundaryResolver) ID() string      { return "analysis-boundary" }
 func (AnalysisBoundaryResolver) Version() string { return AnalysisVersion }
 func (r AnalysisBoundaryResolver) Resolve(ctx context.Context, plan core.RetrievalPlan, facet core.Facet, snapshot core.SnapshotResult) (core.RetrievalResult, error) {
-	if !strings.HasPrefix(plan.Route.Digest, AnalysisVersion+":") || facet.QueryKind != core.QueryContract {
+	return resolveAnalysisBoundary(ctx, plan, facet, snapshot, false)
+}
+
+func resolveAnalysisBoundary(ctx context.Context, plan core.RetrievalPlan, facet core.Facet, snapshot core.SnapshotResult, project bool) (core.RetrievalResult, error) {
+	r := AnalysisBoundaryResolver{}
+	version := AnalysisVersion
+	if project {
+		version = ProjectAnalysisVersion
+	}
+	if !strings.HasPrefix(plan.Route.Digest, version+":") || facet.QueryKind != core.QueryContract {
 		return unsupportedResult(facet, r.ID()), nil
 	}
 	var b AnalysisBinding
+	if project && (!projectOriginalSeed(plan, facet) || !projectTargetAbsent(plan.Sources, snapshot, facet) || strictProjectProof(facet.Text, &b) != nil) {
+		return unavailableFacet(facet, core.NotVerified, "ANALYSIS_BOUNDARY_PROOF_INVALID", "Current original seed, verified target absence and strict proof required."), nil
+	}
 	if json.Unmarshal([]byte(facet.Text), &b) != nil || b.FacetID != facet.ID || b.OriginalPath != facet.Path || b.Kind != facet.ClaimKey {
 		return unavailableFacet(facet, core.NotVerified, "ANALYSIS_BOUNDARY_PROOF_INVALID", "Exact versioned source-equivalence proof required."), nil
 	}
 	anchors := []analysisDeclaration{}
 	decls := analysisDeclarations(snapshot)
+	if project {
+		decls = projectAnalysisDeclarations(snapshot)
+	}
 	for _, a := range []AnalysisAnchor{b.Owner, b.Domain, b.Consumer} {
 		admitted := false
 		for _, s := range plan.Sources {
@@ -356,6 +371,13 @@ func (r AnalysisBoundaryResolver) Resolve(ctx context.Context, plan core.Retriev
 			return unavailableFacet(facet, core.NotVerified, "ANALYSIS_BOUNDARY_PROOF_STALE", "Source-equivalence declaration/hash/admission is missing or ambiguous."), nil
 		}
 		anchors = append(anchors, matches[0])
+	}
+	if project {
+		for _, a := range anchors {
+			if projectCallerSelector(a, append(append([]core.Facet{}, plan.RequiredFacets...), plan.OptionalFacets...)) == "" {
+				return unavailableFacet(facet, core.NotVerified, "ANALYSIS_BOUNDARY_ORIGINAL_SELECTOR_REQUIRED", "Proof declarations must be current original caller selectors."), nil
+			}
+		}
 	}
 	bindings := analysisBindings([]core.Facet{facet}, anchors, decls, snapshot)
 	if len(bindings) != 1 || analysisBindingJSON(bindings[0]) != analysisBindingJSON(b) {
