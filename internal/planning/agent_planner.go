@@ -228,8 +228,17 @@ func buildPlannerAgentContext(
 		serviceByID[service.ProjectID] = service
 	}
 
+	// The deterministic baseline repeats the shared request in every task.
+	// Keep it once in the prompt without changing persisted baseline semantics.
+	promptBaseline := baseline
+	promptBaseline.Tasks = append([]domain.PlannedTask(nil), baseline.Tasks...)
+	for index := range promptBaseline.Tasks {
+		if promptBaseline.Tasks[index].Description == requestText {
+			promptBaseline.Tasks[index].Description = "Apply CONTEXT.request within this project's approved scope and acceptance constraints."
+		}
+	}
 	result := plannerAgentContext{
-		Request: requestText, Baseline: baseline, Routing: routing,
+		Request: requestText, Baseline: promptBaseline, Routing: routing,
 		ContractPlan: contractPlan, CanonicalAssets: canonicalAssets,
 		RepositoryFacts: make(map[string][]plannerRepositoryFact, len(inventories)),
 	}
