@@ -276,7 +276,7 @@ def decode_request(data):
 
 class DockerCLI:
     """Privileged host adapter. Its six methods accept only controller values."""
-    def __init__(self, executable, endpoint, expected_daemon_id, timeout=15):
+    def __init__(self, executable, endpoint, expected_daemon_id, timeout=15, images=None):
         executable = Path(executable)
         if (not executable.is_absolute() or timeout <= 0 or timeout > 15
                 or not isinstance(endpoint, str) or not endpoint.startswith("unix://")
@@ -303,6 +303,10 @@ class DockerCLI:
         self.endpoint = endpoint
         self.expected_daemon_id = expected_daemon_id
         self.timeout = timeout
+        if images is not None and (not isinstance(images, dict) or set(images) != {"runner", "sdk", "command"}
+                                   or not all(_hex(v, image=True) for v in images.values())):
+            raise ControllerDenied("DOCKER_ATTESTATION_IMAGES_DENIED")
+        self._attestation_images = dict(images) if images is not None else None
 
     def _run(self, arguments):
         # No shell, inherited Docker context, ambient credential environment,
@@ -348,6 +352,32 @@ class DockerCLI:
         code, out, _ = self._run(["info", "--format", "{{.ID}}"])
         if code or out.decode("ascii", errors="replace").strip() != self.expected_daemon_id:
             raise RuntimeUnknown("DAEMON_IDENTITY_UNKNOWN")
+
+    def active_attestation(self):
+        """Observe only the three immutable image pins configured by the host."""
+        if self._attestation_images is None:
+            raise ControllerDenied("DOCKER_ATTESTATION_IMAGES_UNCONFIGURED")
+        self._check_daemon()
+        code, out, _ = self._run(["version", "--format", "{{.Server.Version}}"])
+        try:
+            version = out.decode("ascii").strip()
+        except UnicodeError:
+            raise RuntimeUnknown("DAEMON_VERSION_UNKNOWN") from None
+        if code or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.]+)?", version):
+            raise RuntimeUnknown("DAEMON_VERSION_UNKNOWN")
+        actual = {}
+        for role, image in sorted(self._attestation_images.items()):
+            code, out, _ = self._run(["image", "inspect", "--format", "{{.Id}}", image])
+            try:
+                value = out.decode("ascii").strip()
+            except UnicodeError:
+                raise RuntimeUnknown("DOCKER_IMAGE_IDENTITY_UNKNOWN") from None
+            if code or value != image:
+                raise RuntimeUnknown("DOCKER_IMAGE_IDENTITY_UNKNOWN")
+            actual[role] = value
+        self._check_daemon()
+        return {"executable": self.executable, "endpoint": self.endpoint,
+                "daemon_id": self.expected_daemon_id, "server_version": version, "images": actual}
 
     def create(self, arguments):
         if not arguments or arguments[0] != "create":

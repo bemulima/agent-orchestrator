@@ -695,5 +695,45 @@ class DockerAdapterTests(unittest.TestCase):
                     runtime.DockerCLI(executable, "tcp://localhost:2375", "trusted-daemon-id")
 
 
+class ActiveAttestationAdapterTests(unittest.TestCase):
+    def adapter(self, responses):
+        adapter = runtime.DockerCLI.__new__(runtime.DockerCLI)
+        adapter.executable = "/trusted/docker"
+        adapter.endpoint = "unix:///trusted/socket"
+        adapter.expected_daemon_id = "trusted-daemon-id"
+        adapter._attestation_images = {key: "sha256:" + value * 64 for key, value in (("runner", "1"), ("sdk", "2"), ("command", "3"))}
+        calls = []
+        def run(arguments):
+            calls.append(arguments)
+            return responses.pop(0)
+        adapter._run = run
+        return adapter, calls
+
+    def test_fixed_pinned_images_daemon_and_server_version_observer(self):
+        values = [(0, b"trusted-daemon-id", b""), (0, b"29.8.1\n", b"")]
+        values += [(0, ("sha256:" + v * 64).encode(), b"") for v in ("3", "1", "2")]
+        values += [(0, b"trusted-daemon-id", b"")]
+        adapter, calls = self.adapter(values)
+        result = adapter.active_attestation()
+        self.assertEqual(result["images"], adapter._attestation_images)
+        self.assertEqual(result["server_version"], "29.8.1")
+        self.assertEqual(calls[1], ["version", "--format", "{{.Server.Version}}"])
+        self.assertEqual(calls[2], ["image", "inspect", "--format", "{{.Id}}", "sha256:" + "3" * 64])
+        self.assertEqual(calls[-1], ["info", "--format", "{{.ID}}"])
+
+    def test_image_or_daemon_unknown_fails_closed(self):
+        for values in [[(0, b"wrong-daemon", b"")],
+                       [(0, b"trusted-daemon-id", b""), (1, b"", b"unknown")],
+                       [(0, b"trusted-daemon-id", b""), (0, b"29.8.1", b""), (0, b"sha256:" + b"f" * 64, b"")]]:
+            adapter, _ = self.adapter(values)
+            with self.assertRaises(runtime.RuntimeUnknown):
+                adapter.active_attestation()
+
+    def test_unconfigured_images_do_not_query_docker(self):
+        adapter, calls = self.adapter([]); adapter._attestation_images = None
+        with self.assertRaises(runtime.ControllerDenied): adapter.active_attestation()
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2461,6 +2461,316 @@ does not renew their source/image/runtime identity or qualification grants.
 Wave1 retrieval READY, all 39 capability results and the 108 Gold regressions
 remain separate from these incomplete execution workstreams.
 
+## Trusted runtime source remediation — 2026-10-09
+
+Source-only continuation closes the gateway/coordinator cleanup P1 with durable
+execution/process ownership, registration acknowledgment before Node workload,
+15-second coordinator teardown wait, positive complete host-group observations,
+owned OCI absence and fd-safe private storage cleanup. Missing/denied evidence
+remains UNKNOWN; restart reconciliation never signals saved PIDs or revives an
+UNKNOWN outcome. Runtime broker now inherits the owned Node group. Bounded Node
+failure journals preserve typed causes without authorizing cleanup or success.
+
+Release observer fixture now includes mandatory `template.image_id`; missing,
+mismatched and valid identities are tested without weakening the validator.
+Complete harness source invokes backend adversarial probes, observes the exact
+original Temporal run after backend loss, stops authenticated renewal for lease
+expiry, and dispatches all 19 required scenarios. Runtime scenario PASS requires
+actual execution/history evidence.
+
+347 selected deterministic Python/Node checks PASS; Go vet/test, TypeScript and
+Linux arm64 Temporal driver build, and diff check PASS. Preserved publication,
+minimal signal handler, pre-directory capacity and strict attestation regressions
+PASS. New independent read-only SOURCE security review PASS, no open P1 source
+finding. Full sandbox/`make verify` NOT_RUN: mandatory host process observation,
+owned signaling, Unix/loopback socket binds and Docker runtime operations remain
+pending an authorized environment. Both live coordinator fixtures are updated
+in source but were not executed. No complete runtime PASS is claimed.
+
+Evidence and required result:
+`.cache/sandbox-certification/source-remediation-20261009/TRUSTED_RUNTIME_SOURCE_REMEDIATION_RESULT.json`.
+Model runs0; budget20/enforce unchanged. No release identity, image build,
+qualification grant, production admission, Git mutation, product execution or
+Docker reset/prune. AdmissionDENIED; readinessNO; pilotNO. Source remediation
+COMPLETE; stop. Next task: authorized-environment runtime certification.
+
+
+## Final owner mandate — source preparation and authorized host handoff, 2026-10-09
+
+Completed the permitted source preparation for the complete runtime/release
+workstream. Captured build inputs now use bounded immutable TAR bytes and
+fd-relative identity-checked reads; build outputs bind the actual iidfile image.
+Qualification policies pin candidate receipts and the exact irreversible one-use
+consumption directory. Complete-route harness cleanup retains restarted controller
+handles, checks Docker daemon identity before each operation and latches UNKNOWN.
+Approved Go dependency manifest/inventory/source pins propagate unchanged through
+the audited host entrypoint to the worker boundary.
+
+Final 115 deterministic checks PASS (build13, qualification26, complete harness54,
+host entrypoint22); Go vet/test, Temporal preflight source compilation and diff
+check PASS. New independent read-only SOURCE security review PASS, open P1/P2=0.
+Eighteen prior reviewed security files retain their hashes; the two changed
+harness files were reviewed again. These checks do not certify live runtime.
+
+The existing trusted observer previously returned EPERM/errno1. This unchanged
+restricted tool environment was not retried or bypassed. make sandbox-test and
+make verify remain NOT_RUN due required process/socket/Docker runtime checks.
+The reviewed scripts/certify-runtime-host.py provides one visible normal macOS
+Terminal action, preflight first, all19 complete cases and exact owned cleanup.
+Its runbook is docs/authorized-runtime-host-certification.md. Source-only plan
+was checked; the execute command was not run here.
+
+Evidence: .cache/sandbox-certification/final-completion-source-20261009/.
+No real AgentRunner/provider calls, grants, final release identity/images, PASS
+certificate, product execution, Git/worktree operations or Docker reset/prune.
+Budget defaults20/enforce and no task overrides. Production admission DENIED;
+readinessNO; pilotNO. FINAL_STATUS=OWNER_ACTION_REQUIRED. After operator evidence,
+continue the same task with runtime review, release identity/approval, one final
+hardened model canary and production certification; do not infer runtime PASS
+from these deterministic/source results.
+
+
+## Host process observer diagnosis — 2026-10-09
+
+Owner proved direct and Python3.14 host ps success. Source diagnosis reproduced
+successful exit0/empty-stderr ps rejected by the old parser on Darwin kernel
+PID/PGID0. Parser now retains canonical Darwin kernel0 and zero-group observation
+records, while positive owned identities/group selectors, caller/observer UID
+anchors, strict snapshot completeness and UNKNOWN remain required. Wrapper's
+getattr fallback previously retained CoordinatorDenied.detail=None; failures now
+carry specific bounded parser/IO/exit/timeout/quota reasons and runtime context.
+No raw process records, unrelated IDs, stderr or environment values are saved.
+
+New --observe-only entry prints read-only JSON using the exact existing trusted
+observer. It disables bytecode and performs no certification/file/socket/Docker
+or owned execution-group work. The previous failed attempt remains byte-identical.
+Its null detail cannot establish the actual failed host row; a single normal-host
+read-only diagnostic is required before full certification is resumed. Runbook
+contains the exact Python3.14 command and conditional fresh-output -02 restart.
+
+Semantic RED captured before implementation; 124 focused deterministic checks
+PASS (new observer15, host22, coordinator33 excluding2live, harness54).
+Independent read-only SOURCE review PASS. Diff check PASS. Full runtime suites
+NOT_RUN per the owner's narrow diagnosis request and unchanged tool restrictions.
+No OS-denial bypass, real model/provider calls, grants, Docker permissions or
+sandbox policy changes, Git/worktree actions or product execution. Budget remains
+20/enforce. Production admissionDENIED/readinessNO. Evidence under
+.cache/sandbox-certification/host-process-observer-diagnosis-20261009/.
+
+
+## Host observer anchor remediation — 2026-10-09
+
+Owner's actual observe-only reached ps exit0/empty stderr and snapshot parsing,
+then failed the observer anchor's combined missing/UID check. Read-only metadata
+on this Mac confirms root-owned /bin/ps04755. Darwin uid is EUID; source wrongly
+expected callerEUID501 for the setuid observer too. Semantic RED reproduces this
+with observerUID0/callerUID501 and independently exposes missing/UID reason
+conflation and absent observer-parent validation.
+
+Expected observer EUID now derives only from the verified fixed ps executable's
+setuid/file ownership; its metadata fingerprint is checked before/after, with
+root-owned nonwritable namespace trust revalidated. CallerPID/EUID/PPID is
+captured and checked unchanged, both snapshot anchors must exist, and observer
+PPID must equal callerPID. Five distinct missing/UID/parent reasons and boolean
+anchor evidence replace the aggregate check. Owned PID/PGID/SID/UID, signaling
+and positive cleanup requirements are unchanged. Missing observer remainsUNKNOWN;
+there is no accept-eitherUID fallback or permission bypass. Current Apple ps
+source has no intentional self-PID exclusion for -ax; no timing exception is
+introduced. Historical combined evidence cannot itself establish which row failed.
+
+134 focused deterministic checksPASS (observer25, host22, coordinator33 excluding
+2live, complete harness54); independent fresh read-only SOURCE reviewPASS;
+diffcheckPASS. Real observer/certification/Docker/Temporal/model canaryNOT_RUN.
+One normal-host Python3.14 -B --observe-only command must confirmPASS before any
+certification attempt. Prior failed attempt and UNKNOWN evidence remain unchanged.
+Model/provider calls0 in this slice, budget20/enforce unchanged, production
+admissionDENIED/readinessNO. Evidence under
+.cache/sandbox-certification/host-observer-anchor-remediation-20261009/.
+
+
+## Owned signal diagnosis and source remediation — 2026-10-10
+
+Actual host attempt f2b36ef5-34d3-4177-942a-1fde62ea07bf passed host-observation,
+then returned OWNED_SIGNAL_CAPABILITY_UNKNOWN with null detail. Its saved ledger
+proves Popen returned child PID51908; expected PGID/SID do not prove validation,
+signal attempt, waitid phase or cleanup. Historical internal phase/errno remain
+UNDETERMINED. Both old evidence files were hash-verified unchanged. Old resources
+require read-only positive PID/group absence; saved PID is never signal authority.
+
+Four semantic regressions failed before implementation: lost killpg phase/errno,
+natural exit accepted as SIGTERM proof, missing durable cleanup disposition, and
+lost Darwin waitid errno. Minimal source remediation preserves bounded original
+phase/type/code/errno, requires exact CLD_KILLED/SIGTERM/real-UID WNOWAIT receipt,
+protects post-creation ledger writes with exact-child cleanup, and persists reap
+and complete absence evidence. Observer denial is latched with no retry/fallback.
+Primary UNKNOWN remains UNKNOWN even after physically proven cleanup. Durable
+pre-syscall intent has unknown signal-attempt disposition until actual execution.
+
+The isolated --owned-signal-only operator mode first reconciles old absence
+read-only. Any saved PID/group record or observation UNKNOWN stops before fresh
+creation. Only positive absence permits one fresh self-expiring owned child and
+at most one SIGTERM after two complete owned PID/PPID/PGID/SID/UID validations.
+It performs no binds, Docker, Temporal, full certification, model, old-resource
+signals or deletion. Exact normal-host command and conditional fresh full restart
+are documented in docs/authorized-runtime-host-certification.md. Neither ran here.
+
+163 focused deterministic checks PASS: signal29, host22, observer25, coordinator33
+(excluding2live), complete harness54. New independent read-only source security
+review PASS on pinned final source/runbook bytes; git diff --check and scoped
+untracked whitespace checks PASS. Full make verify and actual runtime NOT_RUN,
+not a full-suite PASS. Model/AgentRunner provider calls0, budget20/enforce unchanged,
+production admission DENIED/readinessNO. Evidence:
+.cache/sandbox-certification/owned-signal-diagnosis-20261010/OWNED_SIGNAL_DIAGNOSIS_RESULT.json.
+
+
+## Owned signal Darwin waitid UID remediation — 2026-10-10
+
+Owner's actual isolated host attempt ea32acc6-74a4-4ab0-abbd-e05f12fc80b2
+positively reconciled old absence, validated the fresh child twice, accepted
+SIGTERM and proved cleanup absence. Its waitid receipt was PID50084/code2/status15/
+UID0 with captured owner RUID/EUID501. Only the old receipt UID predicate failed.
+Apple XNU waitid zeroes siginfo and fills PID/code/status but not si_uid; current
+ABI offsets and WEXITED/WNOWAIT flags are correct. The source defect is PROVEN.
+OS errno null denotes validation failure, not a reported denied syscall.
+
+The trusted receipt now marks Darwin raw UID as unavailable, without treating
+zero as identity. Exact PID/CLD_KILLED/SIGTERM and WNOWAIT remain mandatory.
+A fresh complete trusted observation must identify one exact unreaped zombie
+PID/PPID/PGID/effective UID with stable caller before reap. Missing/wrong identity
+remains UNKNOWN. Native non-Darwin realUID matching remains strict. Live SID/PGID
+syscalls are preserved; none are added on Darwin zombies, which can return ESRCH.
+Reap must independently return -SIGTERM; complete post-reap PID/group absence is
+still required. Detailed predicate/UID-source/reap diagnostics redact foreign
+receipt PIDs and expose no unrelated process rows. No alternate signal path.
+
+Actual Darwin-shaped receipt and missing UID metadata regressions failed before
+implementation. New waitid13 checks and all163 prior focused deterministic checks
+PASS, total176; two live coordinator checks are not run. Focused source command:
+python3 -B scripts/test_owned_signal_waitid.py. New independent read-only source
+security review and scoped runbook supplement PASS, open sourceP1=0. Diff/whitespace
+checks PASS. Both prior failed attempts and their UNKNOWN evidence remain byte
+identical; physical cleanup of the last host probe remains PROVEN_ABSENT, without
+promoting its historical UNKNOWN to PASS.
+
+New isolated host confirmation command uses fresh owned-signal-host-20261010-02;
+prepared only, not executed here. Actual process probes, full certification,
+Docker, Temporal and model canary NOT_RUN. Full make verify is NOT_RUN because
+this slice excludes its live/Docker subchecks. Model/AgentRunner provider runs0,
+budget20/enforce unchanged, production admissionDENIED/readinessNO. Evidence:
+.cache/sandbox-certification/owned-signal-waitid-remediation-20261010/OWNED_SIGNAL_WAITID_REMEDIATION_RESULT.json.
+
+## Host release build / retained Temporal cleanup diagnosis — 2026-10-10
+
+Diagnosed only saved authorized-host-final-20261010-04. Actual recorded attempt
+d92da144-20af-4a7f-b02f-d175383e526a differs from the requested307c7d31 ID; operator
+confirmation is required before later mutation/restart. Existing observer,
+signals/waitid/cleanup, binds, Docker image, Temporal history and runner-build
+PASS evidence was preserved and not rerun.
+
+Saved Python3.14.6 build child exited1 with empty stdout and ValueError name is
+too long in USTAR context serialization, before Docker build. Exact manifest
+endpoint leaves104/105bytes reproduce semantic RED. Minimal deterministic PAX
+serialization now preserves names/bytes; pre-write quota includes extended
+headers, block padding and end-record reserve. Safe read/hash/type/link/secret
+guards and configured limits remain unchanged. Two valid-fixture regressions
+RED -> GREEN; 39 focused builder/host-wrapper tests plus7 fully mocked operator
+diagnostic tests PASS (46 total), syntax and git diff --check PASS. Read-only
+serialization of the original saved capture preserved all702 paths/hashes and
+was byte-identical on repetition. Actual image build NOT_RUN, no new identity.
+
+All13 saved Docker actions exited0 through Temporal start. Parent wrapper
+unconditionally latches Docker UNKNOWN after an unclassified child exception;
+DOCKER_DENIED_NO_RETRY therefore denotes skipped cleanup, not a recorded Docker
+permission denial. No cleanup inspect/remove occurred. Current exact Temporal
+container state remains UNKNOWN, REGISTERED ledger retained, reconciliation
+required until positive absence. No Docker observation/mutation performed here.
+
+New independent read-only source review PASS for builder fix and diagnostic
+operator/runbook supplement; no new P1/P2 findings. One pinned metadata-only
+host command prepared; it prints bounded JSON, retains UNKNOWN on missing
+identity/daemon/error evidence, and never deletes/signals/writes the old attempt.
+Prepared full-certification attempt05 command remains gated on ID resolution
+and reviewed exact old-resource absence. Full certification/make verify/runtime
+NOT_RUN; no model/provider calls, grants, admission, Git mutations or product
+execution. Budget20/enforce unchanged, productionDENIED/readinessNO. Prior
+UNKNOWN evidence hashes unchanged. Stopped after narrow source remediation and
+diagnosis; evidence:
+.cache/sandbox-certification/host-release-cleanup-diagnosis-20261010/.
+
+
+## Exact owner-authorized Temporal cleanup remediation — 2026-10-10
+
+Owner explicitly confirmed attempt d92da144-20af-4a7f-b02f-d175383e526a and only
+container c5a12db6f36abe2588ee453bc5ce23af99e23013248de29036270f7e5bd0c975,
+immutable image sha256:ad4c82c97bd12b417d1ea942610dbcd511afb250c4d5ed26c694009533df447e,
+and ownership label e58e96da-d8c4-460b-b0a3-489d3687379c. Added an isolated exact
+reconciliation entrypoint using the existing trusted Docker/cleanup adapter.
+The independent preserved Docker metadata SHA pins executable/endpoint/daemon
+before subprocess; exact container identity and daemon are checked before
+mutation, and only positive absence with matching daemon may produce PASS.
+Separate exclusive/fsynced/read-only receipts preserve historical UNKNOWN.
+
+Fixed the child build failure control flow with semantic RED (two behavioral
+failures) then GREEN. The trusted builder captures/serializes source before
+Docker; a fresh typed local-failure receipt proves no Docker call occurred.
+Only verified local failures permit normal exact cleanup. Other child runtime
+uncertainty retains UNKNOWN without fabricating Docker denial. Actual Docker
+denials remain no-retry. The prior PAX source and exact-quota functions retain
+identical AST. All 53 focused mocked checks, syntax and whitespace checks PASS.
+Independent source and exact operator command review PASS; runtime was not
+performed by the reviewer. Full make verify/certification NOT_RUN.
+
+One reviewed default-permission cleanup attempt stopped before inspect/removal:
+trusted Docker info returned exit1 and permission denied on the approved socket.
+The internal DOCKER_DAEMON_IDENTITY_CHANGED wrapper code does not establish
+daemon replacement; the actual recorded failure is access denial. No signal,
+remove, escalation, alternate path or retry occurred. Container absence UNKNOWN;
+ownership retained. All 717 original files and permissions remain unchanged.
+Receipt: .cache/sandbox-certification/temporal-reconciliation-agent-20261010-01/
+temporal-reconciliation-receipt.json (mode0400).
+
+The independently reviewed normal macOS Terminal cleanup command is prepared
+for fresh temporal-reconciliation-host-20261010-01. Full certification command
+for authorized-host-final-20261010-05 is prepared only, gated on that receipt
+PASS/exact absence/original evidence preservation. Both output directories
+remain unused. Evidence: .cache/sandbox-certification/
+exact-temporal-cleanup-remediation-20261010/. Model calls0; budget20/enforce;
+production admissionDENIED/readinessNO. Stop; no automatic full certification.
+
+
+## Temporal post-removal absence parser remediation — 2026-10-10
+
+Actual host temporal-reconciliation-host-20261010-01 validates exact approved
+identity and successfully removes the one authorized container. Final inspect
+returns exit1/stdout[] and lowercase error: no such object: followed by exact
+64-hex ID. Previous allowlist had capitalized formats only; actual recorded
+response replays false against sealed original function and true after a single
+explicit lowercase-prefix addition. No substring/case-normalization fallback.
+Exit code, empty-array stdout, complete ID, and single-diagnostic checks remain.
+
+Semantic RED: two behavioral assertion failures plus typed adapter rejection;
+GREEN: all three checks plus 61 focused mocked checks PASS. No Docker/model
+execution by this source slice. Full make verify/certification NOT_RUN. PAX
+source fix unchanged. All 725 historical files and permissions unchanged; old
+UNKNOWN receipts stay UNKNOWN. The previous host attempt lacks a successful
+daemon observation after final inspect, so no retrospective runtime PASS.
+
+Added strictly read-only --observe-temporal-absence-only under existing
+pinned-ledger/endpoint/daemon adapter. It never calls cleanup/removal, rejects
+present IDs, and requires successful same-daemon observation after absence.
+Prepared one normal Terminal confirmation for fresh temporal-absence-host-
+20261010-01. Known tool socket denial is not retried or bypassed. Full host
+certification authorized-host-final-20261010-05 stays gated on this receipt PASS
+and independent source/command review. Review pending at this checkpoint.
+Evidence: .cache/sandbox-certification/temporal-absence-observer-remediation-
+20261010/. Budget20/enforce, model calls0, production admissionDENIED/readinessNO.
+
+Independent source/command review terminal supplement: PASS. Reviewer compared
+all 725 historical file hashes/modes independently; read-only observation NOT_RUN.
+Frozen source c857eb971cf9138415c6e40deae318a2b0d281aee0c10166e2243ed2c68045a6.
+Source remediation COMPLETE; live absence proof pending the reviewed normal-host
+read-only command. Stop after result; production remains DENIED.
+
 ## 2026-10-11 — Agent workflow closure
 
 Added the task-scoped owner checkpoint to canonical managed policy/skills and

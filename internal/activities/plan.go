@@ -71,6 +71,7 @@ func (a PlanActivities) ExecutePlanTask(
 	ctx context.Context,
 	input ExecutePlanTaskInput,
 ) (domain.TaskExecutionOutcome, error) {
+	ctx = bindAgentRuntimeContext(ctx)
 	activity.RecordHeartbeat(ctx, map[string]string{
 		"run_id": input.RunID, "plan_id": input.PlanID, "task_id": input.TaskID,
 	})

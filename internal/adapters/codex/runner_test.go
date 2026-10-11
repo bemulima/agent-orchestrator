@@ -125,6 +125,11 @@ func TestCodexRunnerHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, `{"type":"error","message":"stream disconnected before completion: unexpected-eof"}`)
 		os.Exit(1)
 	}
+	if mode == "runtime-context" {
+		b, _ := json.Marshal(map[string]any{"type": "result", "execution_id": request.ExecutionID, "attempt": request.Attempt, "thread_id": "thread-fixture", "result": map[string]any{"runtime_context": request.RuntimeContext}})
+		fmt.Println(string(b))
+		os.Exit(0)
+	}
 	b, _ := json.Marshal(map[string]any{"type": "result", "execution_id": request.ExecutionID, "attempt": request.Attempt, "thread_id": "thread-fixture", "result": map[string]string{"status": "completed"}, "usage": map[string]int{"input_tokens": 120, "cached_input_tokens": 15, "output_tokens": 30, "reasoning_output_tokens": 10}})
 	fmt.Println(string(b))
 	os.Exit(0)

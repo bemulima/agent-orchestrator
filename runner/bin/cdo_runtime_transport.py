@@ -156,6 +156,51 @@ def listener(controller, registrations):
     return BoundedServer(("127.0.0.1", 0), handler_for(controller, registrations))
 
 
+def agent_handler_for(controller):
+    """Six typed agent operations with template authentication owned by the host."""
+    class AgentHandler(handler_for(controller, [])):
+        def do_POST(self):
+            if self.path != "/v1/agent-executions" or self.headers.get("Content-Type") != "application/json":
+                self.send_error(400); return
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,5}", lengths[0]) or self.headers.get("Transfer-Encoding"):
+                self.send_error(400); return
+            size = int(lengths[0])
+            if not 0 < size <= MAX_REQUEST_BYTES:
+                self.send_error(413); return
+            try:
+                body = self.rfile.read(size)
+                if len(body) != size:
+                    raise ValueError("short body")
+                request = decode(body)
+                if not isinstance(request, dict):
+                    raise ValueError("object required")
+                # Authentication precedes cancellation of the absolute read timer.
+                controller._authenticate(request)
+                self.read_timer.cancel()
+                encoded = canonical(controller.response(request))
+                if len(encoded) > MAX_RESPONSE_BYTES:
+                    raise ValueError("response limit")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers(); self.wfile.write(encoded)
+            except RuntimeDenied:
+                self.send_error(403)
+            except (ValueError, TypeError, TimeoutError, OSError, RecursionError):
+                self.send_error(400)
+    return AgentHandler
+
+
+def agent_listener(controller, address=("127.0.0.1", 0)):
+    """The trusted host chooses reachability; HTTP requests cannot choose it."""
+    if (not isinstance(address, tuple) or len(address) != 2
+            or address[0] not in {"127.0.0.1", "0.0.0.0"}
+            or type(address[1]) is not int or not 0 <= address[1] <= 65535):
+        raise RuntimeDenied("AGENT_LISTENER_ADDRESS_DENIED")
+    return BoundedServer(address, agent_handler_for(controller))
+
+
 class RuntimeClient:
     def __init__(self, url, registration, controller_id):
         parsed = urllib.parse.urlsplit(url)

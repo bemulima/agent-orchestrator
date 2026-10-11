@@ -38,6 +38,7 @@ func (a ShardFanoutActivities) PrepareShardFanout(ctx context.Context, input Pre
 }
 
 func (a ShardFanoutActivities) RunShardWorker(ctx context.Context, input RunShardWorkerInput) (domain.ShardAttempt, error) {
+	ctx = bindAgentRuntimeContext(ctx)
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -91,6 +92,7 @@ func (a ShardFanoutActivities) VerifyShardIntegration(ctx context.Context, prepa
 }
 
 func (a ShardFanoutActivities) ReviewShardIntegration(ctx context.Context, prepared shardexecution.PreparedFanout) (domain.ShardFanoutExecution, error) {
+	ctx = bindAgentRuntimeContext(ctx)
 	stop := startShardHeartbeats(ctx, 20*time.Second, func() {
 		activity.RecordHeartbeat(ctx, map[string]string{"plan_id": prepared.PlanID, "phase": "independent_review"})
 	})
@@ -129,6 +131,7 @@ func (a ShardFanoutActivities) AssembleWorkersForComposition(ctx context.Context
 }
 
 func (a ShardFanoutActivities) RunSerializedComposition(ctx context.Context, prepared shardexecution.PreparedFanout) (domain.ShardFanoutExecution, error) {
+	ctx = bindAgentRuntimeContext(ctx)
 	stop := startShardHeartbeats(ctx, 20*time.Second, func() {
 		activity.RecordHeartbeat(ctx, map[string]string{"plan_id": prepared.PlanID, "phase": "serialized_composition"})
 	})

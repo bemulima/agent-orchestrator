@@ -101,3 +101,44 @@ Full report, per-run history JSONL, exact event/attempt timestamps, trusted OCI
 observations, rejected pre-fix evidence, tests and hashes are retained under
 `.cache/sandbox-certification/lifecycle-temporal` and
 `.cache/sandbox-certification/LIFECYCLE_TEMPORAL_CERTIFICATION_RESULT.md`.
+
+## Complete transport source remediation (2026-10-09)
+
+The complete transport has a separate durable host ownership protocol. The
+gateway records the exact coordinator child in authenticated execution state.
+The coordinator publishes a ledger bound to execution/attempt, runtime context,
+job/configuration hashes, controller boot and a fresh owner nonce. Gateway
+registration acknowledgment precedes Node launch; the Node identity is durable
+before its request is delivered. The runtime broker inherits Node's process
+group. Workers and SDK code cannot register host processes or change this ledger.
+
+Gateway cleanup waits up to 15 seconds for coordinator teardown without killing
+the producer of that proof. `CLEANUP_PROVEN` requires positive OCI absence,
+coordinator and Node group absence, private storage absence, and no unresolved
+UNKNOWN. The original fixed `/bin/ps` observer must return a complete valid table;
+empty output, missing observer/caller identity, denial or malformed data is UNKNOWN.
+Live teardown retains child ownership until group termination. Restart recovery
+only observes registered identities; a matching or reused PID/group, a missing
+launch record or an incomplete receipt cannot authorize signals or prove cleanup.
+
+`CDO_RUNTIME_CONTROL_ROOT` retains ownership, publication fences and bounded
+evidence. Temporary broker/SDK files live in the separate
+`CDO_RUNTIME_PRIVATE_ROOT`, which is deleted using directory-relative no-follow
+operations after positive host/OCI evidence. `host-node-outcome.json` preserves
+only an exact-owner-bound, finite failure code; it cannot assert cleanup or
+success. Reconciliation can record later physical cleanup while the attempt's
+UNKNOWN outcome remains terminal.
+
+The deterministic complete-route harness dispatches every declared scenario,
+invokes the backend adversarial probe, stops authenticated renewal for lease
+expiry, and uses a credential-free metadata observer of the original Temporal
+workflow/run after backend interruption. Runtime PASS requires actual execution
+and collected history; mocked harness tests do not provide that evidence.
+
+This continuation performs source tests only. Complete transport runtime
+certification remains `RUNTIME_CERTIFICATION_PENDING_AUTHORIZED_ENVIRONMENT`.
+The required environment must permit exact owned process observation/signaling,
+local test socket binds, the fixed Docker socket's bounded owned-container
+operations, and disposable Temporal execution/history reads. Production admission
+remains DENIED; budget remains `20/enforce`. No release identity or qualification
+grant is created by this source remediation.

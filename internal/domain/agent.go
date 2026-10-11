@@ -187,18 +187,19 @@ const (
 )
 
 type AgentRunRequest struct {
-	ExecutionDeadline string             `json:"execution_deadline,omitempty"`
-	ExecutionID       string             `json:"execution_id,omitempty"`
-	Attempt           int                `json:"attempt,omitempty"`
-	Role              AgentRunRole       `json:"role"`
-	ThreadID          string             `json:"thread_id,omitempty"`
-	WorkingDirectory  string             `json:"working_directory"`
-	Model             string             `json:"model,omitempty"`
-	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
-	Prompt            string             `json:"prompt"`
-	OutputSchema      map[string]any     `json:"output_schema"`
-	UsageContext      *AgentUsageContext `json:"-"`
-	SandboxScope      *AgentSandboxScope `json:"sandbox_scope,omitempty"`
+	ExecutionDeadline string               `json:"execution_deadline,omitempty"`
+	ExecutionID       string               `json:"execution_id,omitempty"`
+	Attempt           int                  `json:"attempt,omitempty"`
+	RuntimeContext    *AgentRuntimeContext `json:"runtime_context,omitempty"`
+	Role              AgentRunRole         `json:"role"`
+	ThreadID          string               `json:"thread_id,omitempty"`
+	WorkingDirectory  string               `json:"working_directory"`
+	Model             string               `json:"model,omitempty"`
+	ReasoningEffort   string               `json:"reasoning_effort,omitempty"`
+	Prompt            string               `json:"prompt"`
+	OutputSchema      map[string]any       `json:"output_schema"`
+	UsageContext      *AgentUsageContext   `json:"-"`
+	SandboxScope      *AgentSandboxScope   `json:"sandbox_scope,omitempty"`
 }
 
 type AgentRunResponse struct {

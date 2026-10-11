@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 
-export const RUNTIME_TRANSPORT_IDENTITY_KEYS = ["runtime_controller_sha256", "runtime_protocol_sha256", "runtime_transport_sha256"] as const;
+export const RUNTIME_TRANSPORT_IDENTITY_KEYS = ["runtime_controller_sha256", "runtime_protocol_sha256", "runtime_transport_sha256", "agent_runtime_controller_sha256", "agent_runtime_protocol_sha256", "agent_runtime_transport_sha256", "active_host_attestation_sha256"] as const;
 export const RELEASE_IDENTITY_KEYS = ["source_manifest_sha256", "orchestrator_sha256", "runner_manifest_sha256", "runner_image", "command_image", "sdk_image", "broker_sha256", "publisher_sha256", "dependency_preparer_sha256", "reconciliation_sha256", ...RUNTIME_TRANSPORT_IDENTITY_KEYS, "profile_sha256", "role_policy_sha256", "sdk_version", "cli_version", "go_version", "docker_version", "security_policy_sha256", "resource_policy_sha256"] as const;
 export interface ReleaseCertification {schema_version:number; result:string; issued_at:string; identity:Record<string,string>; conditions:Record<string,unknown>; roles:string[]; evidence:Record<string,string>;}
 export function compareRelease(cert:ReleaseCertification, actual:Record<string,string>, role:string, required:readonly string[]):void {

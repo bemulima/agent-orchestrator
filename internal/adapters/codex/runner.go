@@ -53,6 +53,10 @@ func (r *ProcessRunner) Run(
 	defer cancel()
 	// Each process invocation gets a fresh trusted identity, including retries.
 	request.ExecutionID = uuid.NewString()
+	request.RuntimeContext = nil
+	if identity, ok := domain.AgentRuntimeContextFromContext(ctx); ok {
+		request.RuntimeContext = &identity
+	}
 	if request.Attempt < 1 {
 		request.Attempt = 1
 	}
