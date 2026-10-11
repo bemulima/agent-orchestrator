@@ -45,3 +45,16 @@
   real user repositories.
 - Run only commands declared in `.ai/commands.yaml`; commands marked
   `requires_approval: true` need a separate owner gate.
+
+## Future task owner checkpoint
+
+Before any new development task, apply
+`agent-system/skills/task-route/references/future-task-decision.md` and inspect
+`agent-system/manifest.yaml` together with current repository/task evidence.
+READY uses existing rules; PARTIAL/BLOCKED/NOT_STARTED waits for owner choice;
+UNKNOWN gets bounded read-only discovery then waits. No setup or writer
+subtask before that decision. Existing task-specific approvals remain valid.
+Production admission remains DENIED and production sandbox readiness NO.
+The sandbox certification workstream is deferred; resume only after a fresh
+explicit owner decision. Ordinary development may use established permitted
+paths without automatically reopening certification.

@@ -2460,3 +2460,12 @@ Historical progress entries are retained as dated evidence; this checkpoint
 does not renew their source/image/runtime identity or qualification grants.
 Wave1 retrieval READY, all 39 capability results and the 108 Gold regressions
 remain separate from these incomplete execution workstreams.
+
+## 2026-10-11 — Agent workflow closure
+
+Added the task-scoped owner checkpoint to canonical managed policy/skills and
+local AGENTS.md, with capability evidence in the existing agent manifest.
+Runtime certification is deferred; production DENIED, readiness NO.
+See [closure handoff](agent-workflow-closure.md) and the immutable publication
+receipts in `.cache/agent-workflow-closure/20261011-01` for exact verification
+and remote status. Resource retention/GC is a separate deferred backlog item.

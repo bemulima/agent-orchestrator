@@ -270,6 +270,7 @@ func applyProposalFiles(ctx context.Context, snapshot agentcontrol.RepositorySna
 	}
 	recomputed, err := agentcontrol.BuildDistributionProposal(agentcontrol.Catalog{
 		Assets: proposalAssets(proposal), Digest: proposal.CatalogDigest,
+		Manifest: agentcontrol.Manifest{WorkflowCapabilities: proposal.NextManifest.WorkflowCapabilities},
 	}, fresh)
 	if err != nil {
 		return agentcontrol.ApplyResult{}, err

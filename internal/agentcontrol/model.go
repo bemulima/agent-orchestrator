@@ -31,8 +31,9 @@ const (
 )
 
 type Manifest struct {
-	SchemaVersion int     `yaml:"schema_version" json:"schema_version"`
-	Assets        []Asset `yaml:"assets" json:"assets"`
+	SchemaVersion        int                  `yaml:"schema_version" json:"schema_version"`
+	Assets               []Asset              `yaml:"assets" json:"assets"`
+	WorkflowCapabilities []WorkflowCapability `yaml:"workflow_capabilities,omitempty" json:"workflow_capabilities,omitempty"`
 }
 
 // Asset describes one canonical source and its managed target. A checksum of

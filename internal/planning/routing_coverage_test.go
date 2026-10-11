@@ -15,7 +15,7 @@ import (
 )
 
 func TestRoutingCoverageCompatibilityBaseline(t *testing.T) {
-	catalog, err := agentcontrol.LoadCatalog(legacyRoutingCatalogFS{FS: os.DirFS("../..")})
+	catalog, err := agentcontrol.LoadCatalog(legacyRoutingCatalogFS{FS: os.DirFS("../../test/fixtures/context-retrieval/routing/legacy-catalog")})
 	if err != nil {
 		t.Fatal(err)
 	}

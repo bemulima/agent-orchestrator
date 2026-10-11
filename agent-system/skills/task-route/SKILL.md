@@ -9,6 +9,14 @@ Answer **where in this repository architecture the task belongs**. This skill
 does not create task IDs, build the execution DAG, implement business code, or
 expand the authorized scope.
 
+## Before implementation or setup
+
+Apply [the future-task decision procedure](references/future-task-decision.md)
+before starting a new task or assigning any writer. Routing discovery is
+read-only and may proceed while awaiting an owner choice. Central capability
+status is implementation evidence; establish applicability in this repository
+and for this operation separately.
+
 ## Evidence procedure
 
 1. Read the repository `AGENTS.md` and identify the repository's ownership and

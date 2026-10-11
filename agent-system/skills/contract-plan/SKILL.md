@@ -9,6 +9,14 @@ Use this procedure only when Task Route identifies multiple affected routes
 that independent workers must implement. **Skip it** when one isolated route
 can safely complete the change.
 
+## Owner checkpoint
+
+First apply Task Route's [future-task decision procedure](../task-route/references/future-task-decision.md).
+An unresolved PARTIAL, NOT_STARTED, BLOCKED or UNKNOWN requirement cannot
+authorize contract writes or worker fan-out. An existing owner choice applies
+only to its repository, task and capability requirements. Production admission
+remains an independent gate.
+
 ## Procedure
 
 1. Start from evidence-backed affected routes and repository-local contracts.

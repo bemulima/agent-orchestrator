@@ -47,6 +47,8 @@ type DistributionManifest struct {
 	Ownership     Ownership         `yaml:"ownership" json:"ownership"`
 	Generator     string            `yaml:"generator" json:"generator"`
 	Assets        []ProvenanceEntry `yaml:"managed_assets" json:"managed_assets"`
+	// Central implementation evidence, never a claim of target task readiness.
+	WorkflowCapabilities []WorkflowCapability `yaml:"workflow_capabilities,omitempty" json:"workflow_capabilities,omitempty"`
 }
 
 type TargetAsset struct {
@@ -111,6 +113,9 @@ func (proposal Proposal) Change(assetID string) AssetChange {
 }
 
 func BuildDistributionProposal(catalog Catalog, snapshot RepositorySnapshot) (Proposal, error) {
+	if err := ValidateWorkflowCapabilities(catalog.Manifest.WorkflowCapabilities); err != nil {
+		return Proposal{}, err
+	}
 	if strings.TrimSpace(snapshot.Root) == "" || strings.TrimSpace(snapshot.Revision) == "" {
 		return Proposal{}, errors.New("repository snapshot requires canonical root and base revision")
 	}
@@ -206,10 +211,13 @@ func nextProvenance(catalog Catalog, previous DistributionManifest) Distribution
 		entries = append(entries, entry)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].AssetID < entries[j].AssetID })
-	return DistributionManifest{SchemaVersion: ManifestSchemaVersion, Ownership: OwnershipGenerated, Generator: "course-dev-orchestrator/agentcontrol-v1", Assets: entries}
+	return DistributionManifest{SchemaVersion: ManifestSchemaVersion, Ownership: OwnershipGenerated, Generator: "course-dev-orchestrator/agentcontrol-v1", Assets: entries, WorkflowCapabilities: catalog.Manifest.WorkflowCapabilities}
 }
 
 func ValidateDistributionManifest(manifest DistributionManifest, exists bool) error {
+	if err := ValidateWorkflowCapabilities(manifest.WorkflowCapabilities); err != nil {
+		return err
+	}
 	if !exists {
 		return nil
 	}

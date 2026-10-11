@@ -31,6 +31,7 @@ files; conditional procedures belong in `.agents/skills`.
 - Only the approved `course-dev-orchestrator` isolation subsystem may manage
   worktree lifecycle.
 - Workers operate only in the workspace assigned by the orchestrator.
+- Do not create or switch branches unless the user explicitly authorizes it.
 
 ## Managed policy and skills
 
@@ -41,3 +42,27 @@ files; conditional procedures belong in `.agents/skills`.
   commands, and testing capability.
 - Never replace an unlisted/local skill with a managed copy. Respect the
   managed-asset provenance manifest and report drift or conflicts.
+
+## Future development tasks
+
+Before any new development task, inspect repository and operation specific
+workflow evidence. Use the Task Route future-task decision procedure from the
+managed skill (or the repository's documented canonical source).
+
+- READY_VERIFIED with matching scope, installed rules, permitted execution and
+  no blocking gate: apply existing rules automatically, without new setup.
+- PARTIALLY_IMPLEMENTED, BLOCKED or NOT_STARTED: explain what this task needs
+  and wait for the owner's choice: finish only required setup, use an existing
+  permitted ordinary development path, or stop. No writer subtask, migration,
+  setup or delivery commit may start before that choice.
+- CANARY_VERIFIED requires exact canary scope and current execution evidence;
+  it never implies unrestricted readiness. Unproven coverage requires a choice.
+- UNKNOWN: bounded read-only discovery, then disclose remaining uncertainty
+  and wait. Never treat missing evidence as READY.
+- Reuse an explicit choice for the same task, repository and requirements.
+  Reevaluate when they change; do not ask to reinstall verified infrastructure.
+- Owner choices cannot bypass production admission or another security gate.
+  Ordinary development never silently selects an uncertified CDO backend.
+- Advanced runtime certification is optional and resumes only with a fresh
+  explicit owner decision. Distribution outside the approved repository needs
+  an exact dry-run diff and separate owner approval before application.

@@ -93,11 +93,14 @@ func LoadCatalog(source fs.FS) (Catalog, error) {
 	if err := ValidateCatalog(catalog); err != nil {
 		return Catalog{}, err
 	}
-	catalog.Digest = catalogDigest(catalog.Assets)
+	catalog.Digest = workflowCatalogDigest(catalog.Assets, manifest.WorkflowCapabilities)
 	return catalog, nil
 }
 
 func ValidateCatalog(catalog Catalog) error {
+	if err := ValidateWorkflowCapabilities(catalog.Manifest.WorkflowCapabilities); err != nil {
+		return err
+	}
 	if catalog.Manifest.SchemaVersion != 0 && catalog.Manifest.SchemaVersion != ManifestSchemaVersion {
 		return fmt.Errorf("unsupported agent-system manifest schema %d", catalog.Manifest.SchemaVersion)
 	}
@@ -251,6 +254,23 @@ func catalogDigest(assets []ResolvedAsset) string {
 		}{asset.Asset.ID, asset.Asset.Kind, asset.Asset.SourcePath, asset.Asset.Ownership, asset.Asset.Version, asset.Asset.TargetPath, profiles, asset.Checksum})
 	}
 	encoded, _ := json.Marshal(material)
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+// Capability evidence participates in the approved distribution identity. The
+// old digest is retained for catalogs without the optional inventory.
+func workflowCatalogDigest(assets []ResolvedAsset, capabilities []WorkflowCapability) string {
+	assetDigest := catalogDigest(assets)
+	if len(capabilities) == 0 {
+		return assetDigest
+	}
+	ordered := append([]WorkflowCapability(nil), capabilities...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
+	encoded, _ := json.Marshal(struct {
+		Assets       string               `json:"assets"`
+		Capabilities []WorkflowCapability `json:"workflow_capabilities"`
+	}{assetDigest, ordered})
 	digest := sha256.Sum256(encoded)
 	return "sha256:" + hex.EncodeToString(digest[:])
 }

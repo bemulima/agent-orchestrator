@@ -22,3 +22,5 @@ Repository code, migrations, tests, configuration, and the documents below are t
 Machine-readable mirrors for agent use live under `.ai/contracts`. The canonical shared policy distributed to other repositories lives in `internal/onboarding/templates/v1`; the root `.ai/rules/common.md` must remain byte-identical to that embedded common-rules file.
 
 - [Release-bound production certification](release-bound-production-certification.md): exact source/build/runtime binding and fail-closed admission.
+
+- [Agent workflow closure and future-task entry](agent-workflow-closure.md).
