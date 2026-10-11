@@ -493,7 +493,50 @@ func verificationCommands(project domain.Project) ([]string, error) {
 
 type commandManifest struct {
 	SchemaVersion int                    `yaml:"schema_version"`
-	Commands      []commandManifestEntry `yaml:"commands"`
+	Commands      commandManifestEntries `yaml:"commands"`
+}
+
+type commandManifestEntries []commandManifestEntry
+
+func (entries *commandManifestEntries) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.SequenceNode:
+		var values []commandManifestEntry
+		if err := node.Decode(&values); err != nil {
+			return err
+		}
+		*entries = values
+		return nil
+	case yaml.MappingNode:
+		for i := 0; i < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" || strings.TrimSpace(key.Value) == "" {
+				return fmt.Errorf("invalid command name: %w", domain.ErrValidation)
+			}
+		}
+		var values map[string]commandManifestEntry
+		if err := node.Decode(&values); err != nil {
+			return err
+		}
+		names := make([]string, 0, len(values))
+		for name := range values {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		result := make(commandManifestEntries, 0, len(names))
+		for _, name := range names {
+			value := values[name]
+			if value.Name != "" && value.Name != name {
+				return fmt.Errorf("conflicting command name: %w", domain.ErrValidation)
+			}
+			value.Name = name
+			result = append(result, value)
+		}
+		*entries = result
+		return nil
+	default:
+		return fmt.Errorf("commands must be a sequence or mapping: %w", domain.ErrValidation)
+	}
 }
 
 type commandManifestEntry struct {
@@ -589,7 +632,7 @@ func canonicalVerificationCommand(value string) string {
 	switch strings.Join(strings.Fields(strings.TrimSpace(value)), " ") {
 	case "go test ./...":
 		return "go test ./..."
-	case "go test ./... -count=1":
+	case "go test ./... -count=1", "go test -count=1 ./...":
 		return "go test ./... -count=1"
 	case "npm test", "npm run test":
 		return "npm test"
