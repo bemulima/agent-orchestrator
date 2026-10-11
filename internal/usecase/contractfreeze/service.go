@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -73,9 +74,10 @@ type approvedTaskIntent struct {
 	TaskTitle                 string   `json:"task_title"`
 	TaskDescription           string   `json:"task_description"`
 	TaskAcceptanceCriteria    []string `json:"task_acceptance_criteria"`
-	PlannedTaskTitle          string   `json:"planned_task_title"`
-	PlannedTaskDescription    string   `json:"planned_task_description"`
-	PlannedAcceptanceCriteria []string `json:"planned_acceptance_criteria"`
+	PlannedTaskTitle          string   `json:"planned_task_title,omitempty"`
+	PlannedTaskDescription    string   `json:"planned_task_description,omitempty"`
+	PlannedAcceptanceCriteria []string `json:"planned_acceptance_criteria,omitempty"`
+	PlannedTaskMatchesTask    bool     `json:"planned_task_matches_task,omitempty"`
 }
 
 type agentContext struct {
@@ -464,6 +466,19 @@ func boundedTaskIntent(task domain.Task, planned domain.PlannedTask) (approvedTa
 			}
 			used += len(item)
 		}
+	}
+	// Persisted Task and PlannedTask can repeat the same approved intent. Keep
+	// one complete copy and its provenance; distinct requirements stay intact.
+	// Validate both representations' field/count limits before deduplicating.
+	if intent.TaskTitle == intent.PlannedTaskTitle && intent.TaskDescription == intent.PlannedTaskDescription &&
+		slices.Equal(intent.TaskAcceptanceCriteria, intent.PlannedAcceptanceCriteria) {
+		used -= len(intent.PlannedTaskTitle) + len(intent.PlannedTaskDescription)
+		for _, item := range intent.PlannedAcceptanceCriteria {
+			used -= len(item)
+		}
+		intent.PlannedTaskTitle, intent.PlannedTaskDescription = "", ""
+		intent.PlannedAcceptanceCriteria = nil
+		intent.PlannedTaskMatchesTask = true
 	}
 	if used > maxTaskIntentBytes {
 		return approvedTaskIntent{}, fmt.Errorf("approved task intent exceeds %d bytes", maxTaskIntentBytes)
