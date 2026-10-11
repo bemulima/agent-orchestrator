@@ -353,8 +353,9 @@ func validateExistingArtifact(ctx context.Context, root string, profile agentcon
 		if path.Ext(relative) != profile.ContractLocation.Extension {
 			return fmt.Errorf("existing contract extension does not match profile")
 		}
-		if !token.IsIdentifier(symbol) || token.Lookup(symbol).IsKeyword() {
-			return fmt.Errorf("invalid Go contract symbol %q", symbol)
+		symbols, err := goContractSymbols(symbol, true)
+		if err != nil {
+			return err
 		}
 		parsed, err := parseGoArtifact(relative, content)
 		if err != nil {
@@ -366,8 +367,10 @@ func validateExistingArtifact(ctx context.Context, root string, profile agentcon
 		if err := goImportsAllowed(ctx, root, profile, routeID, parsed); err != nil {
 			return err
 		}
-		if symbol != "" && !declaresGoSymbol(parsed, symbol) {
-			return fmt.Errorf("existing contract does not declare symbol %q", symbol)
+		for _, member := range symbols {
+			if !declaresGoSymbol(parsed, member) {
+				return fmt.Errorf("existing contract does not declare symbol %q", member)
+			}
 		}
 		return nil
 	}
@@ -389,6 +392,27 @@ func validateExistingArtifact(ctx context.Context, root string, profile agentcon
 		return fmt.Errorf("existing contract does not declare type symbol %q", symbol)
 	}
 	return fmt.Errorf("unsupported contract language %q", profile.ContractLocation.Language)
+}
+
+// Source evidence joins existing Go type names with this exact separator. Keep
+// the reference identity intact while validating every member independently.
+// New contract files still require a single identifier.
+func goContractSymbols(symbol string, existing bool) ([]string, error) {
+	symbols := []string{symbol}
+	if existing {
+		symbols = strings.Split(symbol, ", ")
+	}
+	seen := make(map[string]struct{}, len(symbols))
+	for _, member := range symbols {
+		if !token.IsIdentifier(member) || token.Lookup(member).IsKeyword() {
+			return nil, fmt.Errorf("invalid Go contract symbol %q", symbol)
+		}
+		if _, duplicate := seen[member]; duplicate {
+			return nil, fmt.Errorf("duplicate Go contract symbol %q", member)
+		}
+		seen[member] = struct{}{}
+	}
+	return symbols, nil
 }
 
 func validateFileByProfile(ctx context.Context, root string, profile agentcontrol.Profile, routeID, relative, packageName string, content []byte, generated bool) error {

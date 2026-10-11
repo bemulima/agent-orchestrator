@@ -66,6 +66,11 @@ func VerifyContractDiff(
 			addDiffReason(&report, "contract reference is outside the approved file set: "+contract.Path)
 			continue
 		}
+		if profile.ContractLocation.Language == "go" && allowedPaths[contract.Path].Generated {
+			if _, err := goContractSymbols(contract.Symbol, false); err != nil {
+				addDiffReason(&report, contract.Path+": "+err.Error())
+			}
+		}
 		if strings.TrimSpace(contract.Symbol) == "" {
 			addDiffReason(&report, "contract reference is outside the approved file set: "+contract.Path)
 			continue
@@ -233,6 +238,12 @@ func VerifyCommittedBaseline(
 	}
 	contractByPath := map[string][]domain.ContractReference{}
 	for _, contract := range contracts {
+		if profile.ContractLocation.Language == "go" && filesByPath[contract.Path].Generated {
+			if _, err := goContractSymbols(contract.Symbol, false); err != nil {
+				validation.Passed = false
+				validation.Reasons = append(validation.Reasons, contract.Path+": "+err.Error())
+			}
+		}
 		if strings.TrimSpace(contract.Symbol) == "" {
 			validation.Passed = false
 			validation.Reasons = append(validation.Reasons, "persisted contract reference has no boundary symbol: "+contract.Path)
@@ -362,14 +373,23 @@ func verifyGoContractFile(ctx context.Context, root, relative string, content, b
 			return fmt.Errorf("removed Go declaration %q is outside the approved contract change", key)
 		}
 	}
-	for symbol := range targetSymbols(refs) {
-		if _, ok := currentDecls["type:"+symbol]; !ok {
-			return fmt.Errorf("approved boundary type %q is missing", symbol)
-		}
-	}
 	for _, ref := range refs {
-		if ref.Kind == "repository-port" && !callableGoPort(parsed, ref.Symbol) {
-			return fmt.Errorf("repository port %q has no exported callable operation signature", ref.Symbol)
+		symbols, err := goContractSymbols(ref.Symbol, existed)
+		if err != nil {
+			return err
+		}
+		for _, symbol := range symbols {
+			if len(symbols) > 1 {
+				if _, ok := baseDecls["type:"+symbol]; !ok {
+					return fmt.Errorf("source-base boundary type %q is missing", symbol)
+				}
+			}
+			if _, ok := currentDecls["type:"+symbol]; !ok {
+				return fmt.Errorf("approved boundary type %q is missing", symbol)
+			}
+			if ref.Kind == "repository-port" && !callableGoPort(parsed, symbol) {
+				return fmt.Errorf("repository port %q has no exported callable operation signature", symbol)
+			}
 		}
 	}
 	return nil
@@ -480,16 +500,6 @@ func refsForPath(refs []domain.ContractReference, relative string) []domain.Cont
 	for _, ref := range refs {
 		if ref.Path == relative {
 			result = append(result, ref)
-		}
-	}
-	return result
-}
-
-func targetSymbols(refs []domain.ContractReference) map[string]struct{} {
-	result := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		if strings.TrimSpace(ref.Symbol) != "" {
-			result[ref.Symbol] = struct{}{}
 		}
 	}
 	return result
