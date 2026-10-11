@@ -74,3 +74,24 @@ RunFutureTaskAction rejects a
 guarded callback before any write when the decision is unresolved. It must be
 called by a dispatcher to guard that dispatcher; it does not retrofit every
 legacy API. Always-on policy is the entry barrier for interactive agents.
+
+## Authorized task closure
+
+Start with an ownership inventory for source, evidence and disposable resources.
+After authorized development and verification, inspect the exact owned diff.
+Commit completed work and push verified commits only with the applicable owner
+authorization. Archive incomplete owned source only with separate explicit
+authorization, a verified dependency baseline, a source allowlist and a public
+visibility/secrets review. Preserve original bytes and paths; label the archive
+WIP, disable automatic execution, and require a new owner decision to resume.
+Never promote an archive to runtime readiness or merge it into main implicitly.
+
+Verify remote commit identities and source reconstruction before reconciling
+task-owned checkout changes. Preserve unrelated hunks, the original shared
+index, private configuration and durable evidence. Remove only exact owned,
+disposable resources after proving no active use and retaining required
+evidence, through the approved isolation/cleanup mechanism. UNKNOWN ownership
+or cleanup stays protected. Verify positive absence, remote state and workspace
+preservation, then report exact remaining blockers. No broad garbage collector,
+automatic push, public WIP publication or worktree management by ordinary agents
+is authorized by this procedure.

@@ -2476,3 +2476,14 @@ source-preservation branch; verified remote source tip
 Full fresh Go suite has three unchanged loopback-bind EPERM blockers; no full
 PASS claimed. Local owner checkpoint ACTIVE; global rollout awaits explicit
 approval of the prepared exact diff. Main/index and unrelated dirty bytes retained.
+
+
+## 2026-10-11 — Authorized publication and cleanup lifecycle
+
+The canonical Task Route future-task procedure now records the existing owner
+gates for scoped completed delivery, separately approved WIP archival and exact
+owned disposable-resource cleanup. Remote source reconstruction precedes local
+reconciliation; unrelated work, shared index, private configuration and durable
+evidence remain protected. No runtime, model or production permission is added.
+Production admission remains DENIED; production sandbox remains deferred and
+not certified. Installed global policy is unchanged.
