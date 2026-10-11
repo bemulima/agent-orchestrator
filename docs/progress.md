@@ -2469,3 +2469,10 @@ Runtime certification is deferred; production DENIED, readiness NO.
 See [closure handoff](agent-workflow-closure.md) and the immutable publication
 receipts in `.cache/agent-workflow-closure/20261011-01` for exact verification
 and remote status. Resource retention/GC is a separate deferred backlog item.
+
+Publication stage: seven scoped source commits pushed to the existing CDO
+source-preservation branch; verified remote source tip
+`e61d3f80b294b8482a408b10eb03696598730dd2`. Independent source review PASS.
+Full fresh Go suite has three unchanged loopback-bind EPERM blockers; no full
+PASS claimed. Local owner checkpoint ACTIVE; global rollout awaits explicit
+approval of the prepared exact diff. Main/index and unrelated dirty bytes retained.

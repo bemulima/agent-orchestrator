@@ -107,3 +107,67 @@ partial runtime work remains in an immutable checkpoint, not READY publication.
 exact ownership inventory, resource report, dry-run cleanup, per-execution
 cleanup, evidence retention and safe cache policies. No global Docker prune.
 No resource deletion or GC implementation occurs in this closure.
+
+## Closure verification and published commits
+
+The new owner checkpoint and canonical skill behavior have independent source
+review PASS, with zero new actionable P1/P2 in the 39-path overlay. Guarded
+callback tests prove zero writes without a valid decision; mandatory exact
+evidence fingerprints invalidate stale choices. Five forward-test scenarios
+cover READY, PARTIAL, NOT_STARTED, UNKNOWN and production denial.
+
+Verification:
+
+- Changed Go packages PASS in the fresh candidate `go test ./... -count=1`: policy,
+  routing/planning, contracts/freeze, shard planning/execution, workflow and CLI.
+- `go vet ./...` PASS; candidate and working `git diff --check` PASS.
+- Builder mocked source tests: 19 PASS. Qualification library: 26 PASS.
+- Full fresh Go suite is BLOCKED_ENVIRONMENT: unchanged GitLab, Telegram and
+  Workitem adapter tests fail to bind tcp6 loopback with EPERM. No tests were
+  removed, weakened or represented as passing. The earlier shared checkout
+  default Go run exited 0 using cached results; it is not fresh full proof.
+- `make verify` NOT_RUN: required loopback operations are denied and the
+  sandbox/runner suites include host process/transport checks expressly deferred
+  by this closure. No runtime or Docker certification was rerun.
+- Python skill quick_validate was unavailable because PyYAML is absent. Go
+  checks validate managed frontmatter and reachable decision references, and
+  independent skill forward testing PASS. No dependency installation performed.
+
+The following source-preservation commits were pushed normally and their parent
+chain is present under the verified remote tip:
+
+| Change | Commit |
+| --- | --- |
+| fix(planning): accept canonical command map manifests | `2132f82e04a5a5e736e063be976787ba00c7cb03` |
+| fix(planning): deduplicate shared request in agent context | `a0c0a5c2d491cbc3abd8f783fbaa86faaa4807a5` |
+| fix(contracts): validate grouped existing Go source symbols | `942e045f86861f278fa12dbed6d40b06bf235460` |
+| fix(contracts): deduplicate identical approved task intent | `e29dfc9c4ebce7dc6a0cc678f00012c1ff50a645` |
+| feat(agent-control): require task-scoped owner decisions | `9aa81b12a62957417b4edff7f05da430b1acc9ef` |
+| fix(release): preserve verified builder source only | `f019acfc59ad3392b993250e12764316e3e9a6f3` |
+| fix(release): preserve verified qualification library source only | `e61d3f80b294b8482a408b10eb03696598730dd2` |
+
+Verified source tip: `e61d3f80b294b8482a408b10eb03696598730dd2`. A documentation-only receipt commit
+records this handoff afterward; discover its identity from the branch history
+or the external remote-confirmation receipt. Local main and its original index
+remain byte-identical. Source-only publication does not activate production.
+
+Remaining publication blockers:
+
+- Shared routing/profile repairs need exact integration preserving published
+  RAG helpers and assertions; whole-file transplant is unsafe.
+- Host/coordinator/complete-runtime changes depend on an incomplete transitive
+  source group. An immutable local checkpoint preserves them.
+- Ambiguous RAG docs, testing evidence deletions and mixed-owner dirty changes
+  remain unstaged and untouched. Architecture consolidation already exists on
+  origin/main and is not duplicated.
+
+The local future-task checkpoint is ACTIVE. Universal installation is
+PENDING_OWNER_APPROVAL, with exact global dry-run fingerprint
+`sha256:cbafe75d4f4f2306c6d1e23db336ee216540ed58eefbb9037baf1255bfda415d`.
+No global or unrelated repository installation occurred. Global applicability
+cannot be called active until that separate owner decision and permitted apply.
+The managed global installer remains fail-closed/unavailable.
+
+Final preserved state: production admission DENIED, sandbox readiness NO,
+automatic certification resumption disabled for this workstream, no new
+qualification grants or model calls, budget 20/enforce, resource GC DEFERRED.
